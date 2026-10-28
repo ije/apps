@@ -258,9 +258,10 @@
       this._loading = (async () => {
         let data;
         if (source.startsWith('data:')) { const comma=source.indexOf(','); const payload=source.slice(comma+1); data=source.slice(0,comma).endsWith(';base64') ? Uint8Array.from(atob(payload),c=>c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(payload)); }
+        else if (/^(apps|file):$/.test(new URL(source, globalThis.location?.href).protocol)) data = source;
         else { const response=await fetch(source); if (!response.ok) throw new Error('Image request failed: '+response.status); data=new Uint8Array(await response.arrayBuffer()); }
         if (this.src !== source) return;
-        this._dimensions=call('dom.image',this._id,data); this._complete=true; this.dispatchEvent(new Event('load'));
+        this._dimensions=call(typeof data === 'string' ? 'dom.imageURL' : 'dom.image',this._id,data); this._complete=true; this.dispatchEvent(new Event('load'));
       })();
       this._loading.catch(error=>{ if (this.src===source) {this._complete=true; this.dispatchEvent(new Event('error'));} });
     }
@@ -714,6 +715,7 @@
   globalThis.__appsDispatch = (name, ids, data = {}) => {
     if (name === 'pointerexit') { hover(null, data); return true; }
     if (name.startsWith('window:')) return dispatchEvent(new Event(name.slice(7)));
+    if (name === 'animationend' || name === 'transitionend') { const target = wrap(ids[0]); return !!target && dispatch(target, Object.assign(new Event(name, { bubbles: true, composed: true }), data, { pseudoElement: '' })); }
     if (name === 'modifiers') {
       const previous = modifiers; modifiers = data;
       for (const [field,key] of Object.entries({ shiftKey:'Shift', ctrlKey:'Control', altKey:'Alt', metaKey:'Meta' })) {

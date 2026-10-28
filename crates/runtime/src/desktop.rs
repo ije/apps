@@ -97,6 +97,12 @@ impl Desktop {
             app_version: Some(version),
             app_name: Some(name.clone()),
             packaged,
+            assets: files
+                .get("assets.json")
+                .map(|source| serde_json::from_str(source))
+                .transpose()
+                .context("Invalid assets.json")?
+                .unwrap_or_default(),
             ..Host::default()
         }));
         host.borrow_mut().browsers.application = name;
@@ -687,7 +693,7 @@ impl Render for WebView {
             let state = host.dom.entry(id).or_default();
             state.text_system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
-            std::mem::take(&mut state.frame_requested)
+            !state.container_pass && std::mem::take(&mut state.frame_requested)
         };
         if frame_requested {
             if let Err(error) = self.evaluate("__appsAnimationFrame()") {
@@ -812,7 +818,7 @@ impl Render for WebView {
         page.dirty = false;
         let mut doc = std::mem::take(&mut page.doc);
         let dom = host.dom.entry(self.id).or_default();
-        let styles = crate::dom::styles(&mut doc, dom, [width, height], Some(cx.text_system()));
+        let mut styles = crate::dom::styles(&mut doc, dom, [width, height], Some(cx.text_system()));
         let children: Vec<_> = styles
             .children
             .iter()
@@ -834,7 +840,69 @@ impl Render for WebView {
                 pending.extend(&doc.nodes[node].children);
             }
         }
+        let mut events = Vec::new();
+        let (animated, running) = dom.motion.update(
+            &doc,
+            &styles,
+            &visible,
+            std::time::Instant::now(),
+            dom.container_pass,
+            &mut events,
+        );
+        if running {
+            let entity = cx.entity();
+            window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+        }
+        if !events.is_empty() {
+            let runtime = self.runtime.clone();
+            let id = self.id;
+            cx.defer(move |cx| {
+                let renderer = runtime
+                    .borrow()
+                    .views
+                    .get(&id)
+                    .and_then(|view| view.renderer.clone());
+                for (node, kind, name, elapsed) in events {
+                    let data = if kind == "animationend" {
+                        serde_json::json!({"animationName": name, "elapsedTime": elapsed})
+                    } else {
+                        serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
+                    };
+                    if let Some(renderer) = &renderer
+                        && let Err(error) = renderer.eval(
+                            &format!("__appsDispatch('{kind}',[{node}],{data})"),
+                            "apps:animation",
+                        )
+                    {
+                        eprintln!("apps: {error}");
+                    }
+                }
+                Desktop::drive(runtime, cx);
+            });
+        }
+        // WARNING: animated values replace `styles.values` only while this frame is built; `restore` puts the cascade back.
+        let mut restore = Vec::new();
+        let mut paint = Vec::new();
+        if !animated.is_empty() {
+            dom.computed = None;
+            let values = &mut Rc::make_mut(&mut styles).values;
+            for (id, style, layout) in animated {
+                if layout {
+                    restore.push((id, std::mem::replace(&mut values[id], style)));
+                } else {
+                    paint.push((id, style));
+                }
+            }
+        }
         dom.svgs.retain(|id, (_, image)| {
+            if visible.contains(id) {
+                true
+            } else {
+                let _ = window.drop_image(image.clone());
+                false
+            }
+        });
+        dom.image_crops.retain(|id, (_, image)| {
             if visible.contains(id) {
                 true
             } else {
@@ -959,14 +1027,177 @@ impl Render for WebView {
                 changed.insert(id);
             }
         }
+        if !paint.is_empty() {
+            let values = &mut Rc::make_mut(&mut styles).values;
+            for (id, style) in paint {
+                restore.push((id, std::mem::replace(&mut values[id], style)));
+            }
+        }
         if !changed.is_empty() {
             dom.grids.retain(|id, _| !changed.contains(id));
             dom.measurements.retain(|(id, ..), _| !changed.contains(id));
             dom.inline_text.retain(|id, _| !changed.contains(id));
         }
         dom.text_layouts.clear();
+        let mut warnings = Vec::new();
+        if inspectable && !dom.linted {
+            dom.linted = true;
+            for (id, style) in styles.values.iter().enumerate() {
+                let node = &doc.nodes[id];
+                if node.tag.starts_with('#') {
+                    continue;
+                }
+                let svg = node.tag == "svg"
+                    || node.tag == "img"
+                        && node.attrs.get("src").is_some_and(|src| {
+                            src.starts_with("data:image/svg")
+                                || src
+                                    .split(['?', '#'])
+                                    .next()
+                                    .is_some_and(|path| path.ends_with(".svg"))
+                        });
+                let pseudos = styles.text_pseudos.get(&id);
+                for (pseudo, values) in [
+                    ("", Some(&**style)),
+                    ("::first-letter", pseudos.and_then(|values| values[1].as_ref())),
+                    ("::first-line", pseudos.and_then(|values| values[2].as_ref())),
+                ] {
+                    let Some(values) = values else { continue };
+                    for (key, value) in values {
+                        if !pseudo.is_empty() && style.get(key) == Some(value) {
+                            continue;
+                        }
+                        let reason = match key.as_str() {
+                            "font-size" | "line-height" | "vertical-align" if !pseudo.is_empty() => {
+                                "size and baseline can't change inside a line of text"
+                            }
+                            "transform"
+                                if !svg
+                                    && value
+                                        .split(')')
+                                        .filter_map(|part| part.split_once('('))
+                                        .any(|(name, _)| !name.trim().starts_with("translate")) =>
+                            {
+                                "only translate() works, other transforms work on <svg> only"
+                            }
+                            "rotate" | "scale" if !svg && value != "none" => {
+                                "this works on <svg> only"
+                            }
+                            "filter" if value.contains("blur(") || value.contains("url(") => {
+                                "blur() and url() filters are not supported"
+                            }
+                            "filter"
+                                if !svg
+                                    && matches!(node.tag.as_str(), "img" | "canvas" | "video")
+                                    && ["sepia(", "saturate(", "hue-rotate(", "invert(", "brightness(", "contrast("]
+                                        .iter()
+                                        .any(|name| value.contains(name)) =>
+                            {
+                                "only grayscale() and opacity() filters apply to images"
+                            }
+                            "backdrop-filter" | "-webkit-backdrop-filter" if value != "none" => {
+                                "backdrop filters are not supported"
+                            }
+                            "mix-blend-mode" | "background-blend-mode"
+                                if value.split(',').any(|value| value.trim() != "normal") =>
+                            {
+                                "blend modes are not supported"
+                            }
+                            "clip-path"
+                                if ["polygon(", "path(", "url(", "shape("]
+                                    .iter()
+                                    .any(|shape| value.contains(shape)) =>
+                            {
+                                "only inset(), circle(), ellipse(), rect() and xywh() shapes are supported"
+                            }
+                            "mask" | "mask-image" | "-webkit-mask" | "-webkit-mask-image"
+                                if value != "none" =>
+                            {
+                                "masks are not supported"
+                            }
+                            "letter-spacing" | "word-spacing"
+                                if !matches!(value.as_str(), "normal" | "0" | "0px") =>
+                            {
+                                "letter and word spacing are not supported"
+                            }
+                            "text-indent" if !matches!(value.as_str(), "0" | "0px") => {
+                                "text indent is not supported"
+                            }
+                            "text-align" | "text-align-last" if value == "justify" => {
+                                "justified text is not supported"
+                            }
+                            "writing-mode" if value != "horizontal-tb" => {
+                                "vertical writing modes are not supported"
+                            }
+                            "float" if value != "none" => "floats are not supported",
+                            "columns" | "column-count" | "column-width" if value != "auto" => {
+                                "multi-column layout is not supported"
+                            }
+                            "border-top-style" | "border-right-style" | "border-bottom-style"
+                            | "border-left-style" | "outline-style"
+                                if matches!(
+                                    value.as_str(),
+                                    "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
+                                ) =>
+                            {
+                                "only solid and dashed lines are supported"
+                            }
+                            "overflow-x"
+                                if value != "visible"
+                                    && [
+                                        "border-top-left-radius",
+                                        "border-top-right-radius",
+                                        "border-bottom-right-radius",
+                                        "border-bottom-left-radius",
+                                    ]
+                                    .iter()
+                                    .any(|key| style.get(*key).is_some_and(|value| !matches!(value.as_str(), "0" | "0px")))
+                                    && !(node.children.iter().filter(|&&child| !doc.nodes[child].tag.starts_with('#')).count() == 1
+                                        && node.children.iter().any(|&child| doc.nodes[child].tag == "img"))
+                                    && node.children.iter().any(|&child| {
+                                        matches!(doc.nodes[child].tag.as_str(), "img" | "video" | "canvas" | "svg" | "iframe")
+                                            || styles.values[child].get("background-image").is_some_and(|value| value != "none")
+                                            || styles.values[child]
+                                                .get("background-color")
+                                                .and_then(|value| render::color(value))
+                                                .is_some_and(|(_, alpha)| alpha > 0)
+                                    }) =>
+                            {
+                                "children are clipped to a rectangle, not to the rounded corners"
+                            }
+                            _ => continue,
+                        };
+                        if dom.warned.insert(format!("{pseudo}{reason}")) {
+                            let mut name = node.tag.clone();
+                            if let Some(value) = node.attrs.get("id") {
+                                name = format!("{name}#{value}");
+                            }
+                            for class in node
+                                .attrs
+                                .get("class")
+                                .into_iter()
+                                .flat_map(|value| value.split_whitespace())
+                                .take(3)
+                            {
+                                name = format!("{name}.{class}");
+                            }
+                            warnings.push(format!(
+                                "Unsupported CSS `{key}: {value}` on <{name}>{pseudo}: {reason}."
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        dom.containers.clear();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
+        for text in warnings {
+            if host.logs.len() == 500 {
+                host.logs.pop_front();
+            }
+            host.logs.push_back(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::host::Role::Renderer(self.id)}}));
+        }
         drop(host);
         let root = element(
             &Build {
@@ -980,6 +1211,7 @@ impl Render for WebView {
                 flex_parent: false,
                 measured: &measured,
                 inline_text: &inline_text,
+                filter: None,
             },
             0,
             [width, height],
@@ -998,6 +1230,21 @@ impl Render for WebView {
             let dom = host.dom.entry(self.id).or_default();
             dom.measurements = measured.into_inner();
             dom.inline_text = inline_text.into_inner();
+            if !restore.is_empty() {
+                let values = &mut Rc::make_mut(&mut styles).values;
+                for (id, style) in restore {
+                    values[id] = style;
+                }
+                dom.computed = Some(styles);
+            }
+            // WARNING: one extra pass per frame at most, so container queries that resize their container cannot loop.
+            let changed = dom.update_containers();
+            let repass = changed && !dom.container_pass;
+            dom.container_pass = repass;
+            if repass {
+                drop(host);
+                return self.render(window, cx).into_any_element();
+            }
         }
         let runtime = self.runtime.clone();
         let id = self.id;
@@ -1060,6 +1307,7 @@ impl Render for WebView {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn css_background(
     style: &render::Style,
     units: render::Lengths,
@@ -1068,6 +1316,8 @@ fn css_background(
     radius: [f32; 4],
     view: gpui::Entity<WebView>,
     base: Option<&url::Url>,
+    assets: &HashMap<String, std::path::PathBuf>,
+    filter: Option<render::Filter>,
 ) -> Vec<AnyElement> {
     let list = |name: &str| {
         render::components(style.get(name).map_or("", String::as_str), ',')
@@ -1102,8 +1352,11 @@ fn css_background(
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
             if let Some(path) = base
                 .and_then(|base| base.join(source.trim().trim_matches(['"', '\''])).ok())
-                .filter(|url| url.scheme() == "file")
-                .and_then(|url| url.to_file_path().ok())
+                .and_then(|url| match url.scheme() {
+                    "file" => url.to_file_path().ok(),
+                    "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
+                    _ => None,
+                })
             {
                 layers.push(
                     div()
@@ -1112,12 +1365,17 @@ fn css_background(
                         .left_0()
                         .size_full()
                         .overflow_hidden()
-                        .child(img(path).size_full().object_fit(match size.as_str() {
-                            "cover" => gpui::ObjectFit::Cover,
-                            "contain" => gpui::ObjectFit::Contain,
-                            "" | "auto" | "auto auto" => gpui::ObjectFit::None,
-                            _ => gpui::ObjectFit::Fill,
-                        }))
+                        .child(
+                            img(path)
+                                .size_full()
+                                .grayscale(filter.is_some_and(|filter| filter.grayscale()))
+                                .object_fit(match size.as_str() {
+                                    "cover" => gpui::ObjectFit::Cover,
+                                    "contain" => gpui::ObjectFit::Contain,
+                                    "" | "auto" | "auto auto" => gpui::ObjectFit::None,
+                                    _ => gpui::ObjectFit::Fill,
+                                }),
+                        )
                         .into_any_element(),
                 );
             }
@@ -1281,6 +1539,7 @@ fn css_background(
                 let Some(ink) = tokens.iter().find_map(|token| render::color(token)) else {
                     continue;
                 };
+                let ink = filter.map_or(ink, |filter| filter.color(ink));
                 let offsets: Vec<f32> = tokens
                     .iter()
                     .filter(|token| render::color(token).is_none())
@@ -1395,7 +1654,7 @@ fn css_background(
             let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
             let key = (id, slot * 64 + index);
             if backgrounds.get(&key).is_none_or(|(old, image)| old != &source || u32::from(image.size(0).width) != rw || u32::from(image.size(0).height) != rh)
-                && let Ok(image) = crate::canvas::svg(&source, rw, rh)
+                && let Ok(image) = crate::canvas::svg(&source, rw, rh, None)
                 && let Some((_, old)) = backgrounds.insert(key, (source, image))
             {
                 let _ = window.drop_image(old);
@@ -1415,9 +1674,7 @@ fn css_background(
 
 struct DomBox {
     inner: Option<gpui::Stateful<gpui::Div>>,
-    animations: Vec<render::Animation>,
-    opacity: f32,
-    visible: bool,
+    anchor: Option<([bool; 2], bool, [f32; 2])>,
     id: usize,
     view: gpui::Entity<WebView>,
     sticky: Option<(gpui::ScrollHandle, [f32; 4])>,
@@ -1445,52 +1702,12 @@ impl gpui::Element for DomBox {
     }
     fn request_layout(
         &mut self,
-        global_id: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, AnyElement) {
-        let mut inner = self.inner.take().unwrap();
-        if self.animations.is_empty() {
-            let mut inner = inner.into_any_element();
-            return (inner.request_layout(window, cx), inner);
-        }
-        let opacity = window.with_element_state(global_id.unwrap(), |state, window| {
-            let mut clocks: Vec<(String, f64, std::time::Instant, bool)> =
-                state.unwrap_or_default();
-            clocks.truncate(self.animations.len());
-            let now = std::time::Instant::now();
-            let mut opacity = self.opacity;
-            for (index, animation) in self.animations.iter().enumerate() {
-                if clocks
-                    .get(index)
-                    .is_none_or(|clock| clock.0 != animation.name)
-                {
-                    let clock = (animation.name.clone(), 0., now, animation.paused);
-                    if index == clocks.len() {
-                        clocks.push(clock);
-                    } else {
-                        clocks[index] = clock;
-                    }
-                }
-                let clock = &mut clocks[index];
-                if !clock.3 {
-                    clock.1 += now.duration_since(clock.2).as_secs_f64();
-                }
-                clock.2 = now;
-                clock.3 = animation.paused;
-                let (value, running) = animation.sample(clock.1);
-                if let Some(value) = value {
-                    opacity = value;
-                }
-                if running && self.visible {
-                    window.request_animation_frame();
-                }
-            }
-            (opacity, clocks)
-        });
-        inner = inner.opacity(opacity);
-        let mut inner = inner.into_any_element();
+        let mut inner = self.inner.take().unwrap().into_any_element();
         (inner.request_layout(window, cx), inner)
     }
     fn prepaint(
@@ -1503,6 +1720,24 @@ impl gpui::Element for DomBox {
         cx: &mut App,
     ) {
         let mut offset = point(px(0.), px(0.));
+        if let Some((axes, block, margin)) = self.anchor
+            && let Some(anchor) = {
+                let view = self.view.read(cx);
+                let host = view.host.borrow();
+                host.dom
+                    .get(&view.id)
+                    .and_then(|dom| dom.anchors.get(&self.id).copied())
+            }
+        {
+            if axes[0] && !block {
+                offset.x = anchor.left() + px(margin[0]) - bounds.left();
+            }
+            if axes[1] {
+                offset.y = if block { anchor.bottom() } else { anchor.top() } + px(margin[1])
+                    - bounds.top();
+            }
+            bounds.origin += offset;
+        }
         if let Some((scroll, border)) = &self.sticky {
             let mut viewport = scroll.bounds();
             viewport.origin += point(px(border[3]), px(border[0]));
@@ -1600,6 +1835,7 @@ struct TextHighlight {
     background: gpui::Hsla,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_text(
     line: &gpui::LineLayout,
     wraps: &[gpui::WrapBoundary],
@@ -1608,10 +1844,19 @@ fn paint_text(
     runs: &[gpui::TextRun],
     offset: usize,
     highlights: &[TextHighlight],
+    rows: &[(Pixels, Pixels)],
+    ink: Option<gpui::Hsla>,
     window: &mut Window,
 ) {
+    let shift = |row: usize| rows.get(row).map_or(px(0.), |row| row.0);
     window.paint_layer(
-        Bounds::new(origin, size(line.width, line_height * (wraps.len() + 1))),
+        Bounds::new(
+            origin,
+            size(
+                line.width + rows.iter().fold(px(0.), |max, row| max.max(row.0)),
+                line_height * (wraps.len() + 1),
+            ),
+        ),
         |window| {
             let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
             let mut start = 0;
@@ -1621,6 +1866,61 @@ fn paint_text(
                     let glyph = &line.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
                     (glyph.index, glyph.position.x)
                 });
+                let row_left = origin.x + shift(row) - left;
+                let top = origin.y + line_height * row;
+                let mut run_start = 0;
+                for run in runs {
+                    if run_start >= offset + end {
+                        break;
+                    }
+                    let (a, b) = (
+                        run_start.max(offset + start),
+                        (run_start + run.len).min(offset + end),
+                    );
+                    run_start += run.len;
+                    if a >= b
+                        || run.underline.is_none()
+                            && run.strikethrough.is_none()
+                            && run.background_color.is_none()
+                    {
+                        continue;
+                    }
+                    let x = line.x_for_index(a - offset);
+                    let end_x = if b == offset + end {
+                        right
+                    } else {
+                        line.x_for_index(b - offset)
+                    };
+                    if let Some(background) = run.background_color.filter(|_| ink.is_none()) {
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                point(row_left + x, top + baseline - line.ascent),
+                                size(end_x - x, line.ascent + line.descent),
+                            ),
+                            background,
+                        ));
+                    }
+                    if let Some(underline) = &run.underline {
+                        window.paint_underline(
+                            point(row_left + x, top + baseline + line.descent * 0.618),
+                            end_x - x,
+                            &gpui::UnderlineStyle {
+                                color: ink.or(underline.color),
+                                ..*underline
+                            },
+                        );
+                    }
+                    if let Some(strikethrough) = &run.strikethrough {
+                        window.paint_strikethrough(
+                            point(row_left + x, top + (line.ascent * 0.5 + baseline) * 0.5),
+                            end_x - x,
+                            &gpui::StrikethroughStyle {
+                                color: ink.or(strikethrough.color),
+                                ..*strikethrough
+                            },
+                        );
+                    }
+                }
                 for highlight in highlights {
                     let a = highlight.range.start.max(offset + start);
                     let b = highlight.range.end.min(offset + end);
@@ -1635,50 +1935,9 @@ fn paint_text(
                     };
                     if end_x > x && highlight.background.a > 0. {
                         window.paint_quad(gpui::fill(
-                            Bounds::new(
-                                point(origin.x + x - left, origin.y + line_height * row),
-                                size(end_x - x, line_height),
-                            ),
+                            Bounds::new(point(row_left + x, top), size(end_x - x, line_height)),
                             highlight.background,
                         ));
-                    }
-                }
-                let mut run_start = 0;
-                for run in runs {
-                    if run_start >= offset + end {
-                        break;
-                    }
-                    let (a, b) = (
-                        run_start.max(offset + start),
-                        (run_start + run.len).min(offset + end),
-                    );
-                    run_start += run.len;
-                    if a >= b || run.underline.is_none() && run.strikethrough.is_none() {
-                        continue;
-                    }
-                    let x = line.x_for_index(a - offset);
-                    let end_x = if b == offset + end {
-                        right
-                    } else {
-                        line.x_for_index(b - offset)
-                    };
-                    let top = origin.y + line_height * row;
-                    if let Some(underline) = &run.underline {
-                        window.paint_underline(
-                            point(origin.x + x - left, top + baseline + line.descent * 0.618),
-                            end_x - x,
-                            underline,
-                        );
-                    }
-                    if let Some(strikethrough) = &run.strikethrough {
-                        window.paint_strikethrough(
-                            point(
-                                origin.x + x - left,
-                                top + (line.ascent * 0.5 + baseline) * 0.5,
-                            ),
-                            end_x - x,
-                            strikethrough,
-                        );
                     }
                 }
                 start = end;
@@ -1703,16 +1962,18 @@ fn paint_text(
                         run_index += 1;
                         run_end += runs[run_index].len;
                     }
-                    let color = highlights
-                        .iter()
-                        .find(|highlight| highlight.range.contains(&index))
-                        .and_then(|highlight| highlight.color)
-                        .unwrap_or(runs[run_index].color);
+                    let color = ink.unwrap_or_else(|| {
+                        highlights
+                            .iter()
+                            .find(|highlight| highlight.range.contains(&index))
+                            .and_then(|highlight| highlight.color)
+                            .unwrap_or(runs[run_index].color)
+                    });
                     if color.a == 0. {
                         continue;
                     }
                     let position = point(
-                        origin.x + glyph.position.x - left,
+                        origin.x + shift(wrap) + glyph.position.x - left,
                         origin.y + line_height * wrap + baseline,
                     );
                     if !Bounds::new(point(position.x, position.y - baseline), glyph_size)
@@ -1737,10 +1998,71 @@ fn paint_text(
     );
 }
 
+pub(crate) fn text_position(
+    layout: &gpui::TextLayout,
+    rows: &[(Pixels, Pixels)],
+    index: usize,
+) -> Option<Point<Pixels>> {
+    let mut position = layout.position_for_index(index)?;
+    let row = ((position.y - layout.bounds().top()) / layout.line_height()).round();
+    position.x += rows.get(row as usize).map_or(px(0.), |row| row.0);
+    Some(position)
+}
+
+pub(crate) fn text_index(
+    layout: &gpui::TextLayout,
+    rows: &[(Pixels, Pixels)],
+    mut position: Point<Pixels>,
+) -> Result<usize, usize> {
+    let row = ((position.y - layout.bounds().top()) / layout.line_height()).floor();
+    position.x -= rows.get(row.max(0.) as usize).map_or(px(0.), |row| row.0);
+    layout.index_for_position(position)
+}
+
+fn first_line(
+    data: &render::InlineText,
+    width: Option<Pixels>,
+    font_size: Pixels,
+    text_system: &gpui::WindowTextSystem,
+) -> (SharedString, Vec<gpui::TextRun>) {
+    let mut text = data.text.to_string();
+    let Some((base, pseudo, mode)) = &data.first_line else {
+        return (text.into(), data.runs.clone());
+    };
+    let len = text.find('\n').unwrap_or(text.len());
+    let mut first = text[..len].to_owned();
+    if let Some(mode) = mode {
+        render::text_transform(&mut first, 0..len, mode);
+    }
+    let end = text_system
+        .shape_text(
+            first.into(),
+            font_size,
+            &render::restyle(&data.runs, 0..len, base, pseudo),
+            width,
+            Some(2),
+        )
+        .ok()
+        .and_then(|lines| {
+            let line = lines.first()?;
+            let boundary = line.wrap_boundaries.first()?;
+            Some(line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+        })
+        .unwrap_or(len);
+    if let Some(mode) = mode {
+        render::text_transform(&mut text, 0..end, mode);
+    }
+    (
+        text.into(),
+        render::restyle(&data.runs, 0..end, base, pseudo),
+    )
+}
+
 struct InlineText {
     inner: gpui::StyledText,
     data: Rc<render::InlineText>,
     view: gpui::Entity<WebView>,
+    runs: Option<Vec<gpui::TextRun>>,
 }
 
 impl IntoElement for InlineText {
@@ -1752,7 +2074,7 @@ impl IntoElement for InlineText {
 
 impl gpui::Element for InlineText {
     type RequestLayoutState = ();
-    type PrepaintState = Vec<(gpui::Hitbox, gpui::CursorStyle)>;
+    type PrepaintState = (Vec<(gpui::Hitbox, gpui::CursorStyle)>, crate::dom::Rows);
     fn id(&self) -> Option<gpui::ElementId> {
         None
     }
@@ -1766,7 +2088,45 @@ impl gpui::Element for InlineText {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, ()) {
-        self.inner.request_layout(id, inspector, window, cx)
+        if self.data.first_line.is_none() {
+            return self.inner.request_layout(id, inspector, window, cx);
+        }
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let data = self.data.clone();
+        let mut cached = None;
+        let layout = window.request_measured_layout(
+            Default::default(),
+            move |known, available, window, _| {
+                let width = known
+                    .width
+                    .or(match available.width {
+                        gpui::AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    })
+                    .filter(|_| style.white_space == gpui::WhiteSpace::Normal);
+                if let Some((_, size)) = cached.filter(|(cached, _)| *cached == width) {
+                    return size;
+                }
+                let (text, runs) = first_line(&data, width, font_size, window.text_system());
+                let mut size = gpui::Size::<Pixels>::default();
+                for line in window
+                    .text_system()
+                    .shape_text(text, font_size, &runs, width, style.line_clamp)
+                    .unwrap_or_default()
+                {
+                    let line = line.size(line_height);
+                    size.height += line.height;
+                    size.width = size.width.max(line.width).ceil();
+                }
+                cached = Some((width, size));
+                size
+            },
+        );
+        (layout, ())
     }
     fn prepaint(
         &mut self,
@@ -1777,18 +2137,76 @@ impl gpui::Element for InlineText {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let style = window.text_style();
+        if self.data.first_line.is_some() {
+            let width =
+                (style.white_space == gpui::WhiteSpace::Normal).then_some(bounds.size.width);
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let (text, runs) = first_line(&self.data, width, font_size, window.text_system());
+            self.inner = gpui::StyledText::new(text).with_runs(runs.clone());
+            let (layout, _) = self.inner.request_layout(id, inspector, window, cx);
+            window.compute_layout(
+                layout,
+                size(
+                    gpui::AvailableSpace::Definite(bounds.size.width),
+                    gpui::AvailableSpace::MinContent,
+                ),
+                cx,
+            );
+            self.runs = Some(runs);
+        }
         self.inner
             .prepaint(id, inspector, bounds, state, window, cx);
         let layout = self.inner.layout();
+        let mut rows = Vec::new();
+        if style.text_align != gpui::TextAlign::Left || !self.data.backgrounds.is_empty() {
+            let mut offset = 0;
+            while let Some(line) = layout.line_layout_for_index(offset) {
+                let glyphs = &line.unwrapped_layout.runs;
+                let mut left = px(0.);
+                for boundary in line.wrap_boundaries.iter().map(Some).chain([None]) {
+                    let (right, end) = boundary.map_or(
+                        (line.unwrapped_layout.width, line.unwrapped_layout.width),
+                        |boundary| {
+                            let x = glyphs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x;
+                            let previous = boundary
+                                .glyph_ix
+                                .checked_sub(1)
+                                .map(|glyph| &glyphs[boundary.run_ix].glyphs[glyph])
+                                .or_else(|| {
+                                    let run = boundary.run_ix.checked_sub(1)?;
+                                    glyphs[run].glyphs.last()
+                                });
+                            let hanging = previous.filter(|glyph| {
+                                self.data.text.as_bytes().get(offset + glyph.index) == Some(&b' ')
+                            });
+                            (x, hanging.map_or(x, |glyph| glyph.position.x))
+                        },
+                    );
+                    let free = (bounds.size.width - (end - left)).max(px(0.));
+                    let shift = match style.text_align {
+                        gpui::TextAlign::Left => px(0.),
+                        gpui::TextAlign::Center => free / 2.,
+                        gpui::TextAlign::Right => free,
+                    };
+                    rows.push((shift, shift + end - left));
+                    left = right;
+                }
+                offset += line.len() + 1;
+                if offset > self.data.text.len() {
+                    break;
+                }
+            }
+        }
+        let rows: crate::dom::Rows = rows.into();
         let hitboxes = self
             .data
             .cursors
             .iter()
             .filter_map(|&(index, cursor)| {
                 let range = &self.data.ranges.get(index)?.1;
-                let (a, b) = layout
-                    .position_for_index(range.start)
-                    .zip(layout.position_for_index(range.end))?;
+                let (a, b) = text_position(layout, &rows, range.start)
+                    .zip(text_position(layout, &rows, range.end))?;
                 let rect = if a.y == b.y {
                     Bounds::new(a, size(b.x - a.x, layout.line_height()))
                 } else {
@@ -1808,9 +2226,8 @@ impl gpui::Element for InlineText {
         let dom = host.dom.entry(view.id).or_default();
         let layout = self.inner.layout();
         for (id, range) in &self.data.ranges {
-            if let Some((a, b)) = layout
-                .position_for_index(range.start)
-                .zip(layout.position_for_index(range.end))
+            if let Some((a, b)) = text_position(layout, &rows, range.start)
+                .zip(text_position(layout, &rows, range.end))
             {
                 dom.bounds.insert(
                     *id,
@@ -1829,11 +2246,18 @@ impl gpui::Element for InlineText {
                         (b.y - a.y + layout.line_height()).into(),
                     ],
                 );
-                dom.text_layouts
-                    .insert(*id, (layout.clone(), self.data.text.clone(), range.clone()));
+                dom.text_layouts.insert(
+                    *id,
+                    (
+                        layout.clone(),
+                        self.data.text.clone(),
+                        range.clone(),
+                        rows.clone(),
+                    ),
+                );
             }
         }
-        hitboxes
+        (hitboxes, rows)
     }
     fn paint(
         &mut self,
@@ -1841,7 +2265,7 @@ impl gpui::Element for InlineText {
         _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut (),
-        hitboxes: &mut Self::PrepaintState,
+        (hitboxes, rows): &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1859,9 +2283,8 @@ impl gpui::Element for InlineText {
                     let (id, range) = &self.data.ranges[index];
                     let style = &styles.values[*id];
                     let units = styles.lengths[*id];
-                    if let Some((a, b)) = layout
-                        .position_for_index(range.start)
-                        .zip(layout.position_for_index(range.end))
+                    if let Some((a, b)) = text_position(layout, rows, range.start)
+                        .zip(text_position(layout, rows, range.end))
                     {
                         let font = cx.text_system().resolve_font(&render::font(style));
                         let height = cx.text_system().ascent(font, px(units.font.em))
@@ -1875,21 +2298,49 @@ impl gpui::Element for InlineText {
                                     .unwrap_or(0.))
                             },
                         );
-                        window.paint_quad(
-                            gpui::fill(
-                                Bounds::new(
-                                    point(a.x, a.y + (layout.line_height() - height) / 2.),
-                                    size(b.x - a.x, height),
-                                ),
-                                rgba(ink),
-                            )
-                            .corner_radii(gpui::Corners {
-                                top_left: radii[0],
-                                top_right: radii[1],
-                                bottom_right: radii[2],
-                                bottom_left: radii[3],
-                            }),
-                        );
+                        let (top, line_height) = (layout.bounds().top(), layout.line_height());
+                        let [first, last] = [a.y, b.y].map(|y| {
+                            (((y - top) / line_height).round() as usize)
+                                .min(rows.len().saturating_sub(1))
+                        });
+                        let clone = style
+                            .get("box-decoration-break")
+                            .is_some_and(|value| value == "clone");
+                        for row in first..=last {
+                            let (start, end) = (row == first, row == last);
+                            let extent = rows
+                                .get(row)
+                                .map_or((px(0.), layout.bounds().size.width), |&extent| extent);
+                            let x = if start {
+                                a.x
+                            } else {
+                                layout.bounds().left() + extent.0
+                            };
+                            let right = if end {
+                                b.x
+                            } else {
+                                layout.bounds().left() + extent.1
+                            };
+                            let [left_side, right_side] = [start || clone, end || clone];
+                            window.paint_quad(
+                                gpui::fill(
+                                    Bounds::new(
+                                        point(
+                                            x,
+                                            top + line_height * row + (line_height - height) / 2.,
+                                        ),
+                                        size(right - x, height),
+                                    ),
+                                    rgba(ink),
+                                )
+                                .corner_radii(gpui::Corners {
+                                    top_left: if left_side { radii[0] } else { px(0.) },
+                                    top_right: if right_side { radii[1] } else { px(0.) },
+                                    bottom_right: if right_side { radii[2] } else { px(0.) },
+                                    bottom_left: if left_side { radii[3] } else { px(0.) },
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -1915,7 +2366,7 @@ impl gpui::Element for InlineText {
                         .and_then(|value| render::color(value))
                         .map(|(color, alpha)| color << 8 | alpha as u32)
                         .unwrap_or(0x000000ff);
-                    if let Some(position) = layout.position_for_index(start) {
+                    if let Some(position) = text_position(layout, rows, start) {
                         window.paint_quad(gpui::fill(
                             Bounds::new(position, size(px(1.), layout.line_height())),
                             rgba(ink),
@@ -1933,23 +2384,52 @@ impl gpui::Element for InlineText {
             }
         }
         let layout = self.inner.layout();
-        let mut offset = 0;
-        let mut origin = layout.bounds().origin;
-        while let Some(line) = layout.line_layout_for_index(offset) {
-            paint_text(
-                &line.unwrapped_layout,
-                &line.wrap_boundaries,
-                origin,
-                layout.line_height(),
-                &self.data.runs,
-                offset,
-                &highlights,
-                window,
-            );
-            offset += line.len() + 1;
-            origin.y += line.size(layout.line_height()).height;
-            if offset > self.data.text.len() {
-                break;
+        let runs = self.runs.as_deref().unwrap_or(&self.data.runs);
+        let passes = self
+            .data
+            .shadows
+            .iter()
+            .flat_map(|&(x, y, blur, color)| {
+                let mut ink: gpui::Hsla = rgba(color).into();
+                // WARNING: blur is faked with a few faint copies; real blur needs a GPUI filter.
+                let copies: &[(f32, f32)] = if blur > 0. {
+                    ink.a /= 3.;
+                    &[(0., 0.), (-1., -1.), (1., -1.), (-1., 1.), (1., 1.)]
+                } else {
+                    &[(0., 0.)]
+                };
+                copies.iter().map(move |&(dx, dy)| {
+                    (
+                        point(px(x + dx * blur / 2.), px(y + dy * blur / 2.)),
+                        Some(ink),
+                    )
+                })
+            })
+            .chain([(point(px(0.), px(0.)), None)]);
+        for (shift, ink) in passes {
+            let mut offset = 0;
+            let mut row = 0;
+            let mut origin = layout.bounds().origin + shift;
+            while let Some(line) = layout.line_layout_for_index(offset) {
+                let count = line.wrap_boundaries.len() + 1;
+                paint_text(
+                    &line.unwrapped_layout,
+                    &line.wrap_boundaries,
+                    origin,
+                    layout.line_height(),
+                    runs,
+                    offset,
+                    if ink.is_some() { &[] } else { &highlights },
+                    rows.get(row..row + count).unwrap_or_default(),
+                    ink,
+                    window,
+                );
+                row += count;
+                offset += line.len() + 1;
+                origin.y += line.size(layout.line_height()).height;
+                if offset > self.data.text.len() {
+                    break;
+                }
             }
         }
     }
@@ -2074,6 +2554,7 @@ struct Build<'a> {
     flex_parent: bool,
     measured: &'a RefCell<crate::grid::Measurements>,
     inline_text: &'a RefCell<HashMap<usize, Option<Rc<render::InlineText>>>>,
+    filter: Option<render::Filter>,
 }
 
 fn element(
@@ -2095,6 +2576,7 @@ fn element(
         flex_parent,
         measured,
         inline_text,
+        filter: parent_filter,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -2119,10 +2601,35 @@ fn element(
             .is_some_and(|value| matches!(value.as_str(), "fixed" | "sticky"))
         || positioned && order.is_some()
         || style.get("transform").is_some_and(|value| value != "none")
+        || ["filter", "clip-path"]
+            .iter()
+            .any(|key| style.get(*key).is_some_and(|value| value != "none"))
         || style
             .get("opacity")
             .and_then(|value| value.parse::<f32>().ok())
             .is_some_and(|value| value < 1.);
+    let (own_filter, filter_opacity, mut drop_shadows) = style
+        .get("filter")
+        .filter(|value| *value != "none")
+        .map_or((None, 1., Vec::new()), |value| {
+            render::Filter::parse(value, &styles.lengths[id])
+        });
+    if let Some(outer) = parent_filter {
+        for shadow in &mut drop_shadows {
+            shadow.color = outer.hsla(shadow.color);
+        }
+    }
+    let filter = match (own_filter, parent_filter) {
+        (Some(own), Some(outer)) => Some(own.then(outer)),
+        (own, outer) => own.or(outer),
+    };
+    let tint = move |color: (u32, u8)| filter.map_or(color, |filter| filter.color(color));
+    let shade = move |mut shadow: gpui::BoxShadow| {
+        if let Some(filter) = filter {
+            shadow.color = filter.hsla(shadow.color);
+        }
+        shadow
+    };
     let child_build = Build {
         doc,
         styles,
@@ -2142,6 +2649,7 @@ fn element(
             path.iter().copied().chain([id]).collect()
         },
         flex_parent: matches!(display, "flex" | "inline-flex"),
+        filter,
     };
     let build = &child_build;
     let mut units = styles.lengths[id];
@@ -2206,9 +2714,21 @@ fn element(
         Some("center" | "-webkit-center") => Some(gpui::JustifyContent::Center),
         _ => None,
     };
+    let line_align = Some(
+        if flat.iter().any(|&child| {
+            styles.values[child]
+                .get("vertical-align")
+                .is_some_and(|value| value == "middle")
+        }) {
+            gpui::AlignItems::Center
+        } else {
+            gpui::AlignItems::Baseline
+        },
+    );
     if all_inline || display == "inline" {
         el = el.flex_row().flex_wrap();
         el.style().justify_content = line_justify;
+        el.style().align_items = line_align;
     }
     if node.tag == "canvas" {
         el = el
@@ -2222,8 +2742,9 @@ fn element(
                 .get("height")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(150.)));
+        let grayscale = filter.is_some_and(|filter| filter.grayscale());
         if let Some(image) = view.images.get(&id) {
-            el = el.child(img(image.clone()).size_full());
+            el = el.child(img(image.clone()).size_full().grayscale(grayscale));
         }
         if let Some(image) = view
             .host
@@ -2233,20 +2754,31 @@ fn element(
             .and_then(|state| state.canvases.get(&id))
             .map(|canvas| canvas.image.clone())
         {
-            el = el.child(img(image).absolute().size_full());
+            el = el.child(img(image).absolute().size_full().grayscale(grayscale));
         }
     }
+    let mut image_child = None;
+    let mut cropped = None;
     if node.tag == "img" {
-        if let Some(image) = view
+        let (image, vector) = view
             .host
             .borrow()
             .dom
             .get(&view.id)
-            .and_then(|state| state.images.get(&id))
-            .cloned()
+            .map_or((None, None), |state| {
+                (
+                    state.images.get(&id).cloned(),
+                    state.svg_images.get(&id).cloned(),
+                )
+            });
+        if let Some(natural) = image
+            .as_ref()
+            .map(|image| {
+                let size = image.size(0);
+                [u32::from(size.width) as f32, u32::from(size.height) as f32]
+            })
+            .or(vector.as_ref().map(|(_, natural)| *natural))
         {
-            let size = image.size(0);
-            let natural = [u32::from(size.width) as f32, u32::from(size.height) as f32];
             let attr = |name: &str| {
                 node.attrs
                     .get(name)
@@ -2267,15 +2799,31 @@ fn element(
             {
                 el = el.h(px(height));
             }
-            el = el.child(img(image).size_full().object_fit(
-                match style.get("object-fit").map(String::as_str) {
-                    Some("contain") => gpui::ObjectFit::Contain,
-                    Some("cover") => gpui::ObjectFit::Cover,
-                    Some("none") => gpui::ObjectFit::None,
-                    Some("scale-down") => gpui::ObjectFit::ScaleDown,
-                    _ => gpui::ObjectFit::Fill,
-                },
-            ));
+            let fit = match style.get("object-fit").map(String::as_str) {
+                Some("contain") => gpui::ObjectFit::Contain,
+                Some("cover") => gpui::ObjectFit::Cover,
+                Some("none") => gpui::ObjectFit::None,
+                Some("scale-down") => gpui::ObjectFit::ScaleDown,
+                _ => gpui::ObjectFit::Fill,
+            };
+            if let Some(image) = image {
+                if matches!(fit, gpui::ObjectFit::Cover | gpui::ObjectFit::None) {
+                    cropped = Some((image, fit));
+                } else {
+                    image_child = Some(img(image).size_full().object_fit(fit));
+                }
+            } else if let Some((source, _)) = vector {
+                el = el.child(svg_layer(
+                    source.to_string(),
+                    id,
+                    style.clone(),
+                    units,
+                    styles.animations.contains_key(&id),
+                    filter,
+                    std::mem::take(&mut drop_shadows),
+                    cx.entity(),
+                ));
+            }
         } else if let Some(path) = node.attrs.get("src").and_then(|source| {
             let base = view
                 .host
@@ -2316,7 +2864,8 @@ fn element(
                 Some("scale-down") => gpui::ObjectFit::ScaleDown,
                 _ => gpui::ObjectFit::Fill,
             });
-            el = el.overflow_hidden().child(match sized {
+            el = el.overflow_hidden();
+            image_child = Some(match sized {
                 [true, true] => image.size_full(),
                 [true, false] => image.w_full(),
                 [false, true] => image.h_full(),
@@ -2444,28 +2993,16 @@ fn element(
                 );
             source
         };
-        let mut host = view.host.borrow_mut();
-        let state = host.dom.entry(view.id).or_default();
-        let raster_width = (width * pixel_ratio).ceil().clamp(1., 4096.) as u32;
-        let raster_height = (height * pixel_ratio).ceil().clamp(1., 4096.) as u32;
-        if state.svgs.get(&id).is_none_or(|(old, image)| {
-            old != &source
-                || u32::from(image.size(0).width) != raster_width
-                || u32::from(image.size(0).height) != raster_height
-        }) {
-            match crate::canvas::svg(&source, raster_width, raster_height) {
-                Ok(image) => {
-                    state.svgs.insert(id, (source, image));
-                }
-                Err(error) => eprintln!("apps: SVG: {error}"),
-            }
-        }
-        if let Some((_, image)) = state.svgs.get(&id) {
-            el = el
-                .w(px(width))
-                .h(px(height))
-                .child(img(image.clone()).absolute().size_full());
-        }
+        el = el.w(px(width)).h(px(height)).child(svg_layer(
+            source,
+            id,
+            style.clone(),
+            units,
+            styles.animations.contains_key(&id),
+            filter,
+            std::mem::take(&mut drop_shadows),
+            cx.entity(),
+        ));
     }
     if node.tag == "iframe" {
         el = el.min_w(px(300.)).min_h(px(150.));
@@ -2518,14 +3055,17 @@ fn element(
         let font_size = units.font.em;
         let line_height = units.font.lh;
         let text_color = render::color(&style["color"])
+            .map(tint)
             .map(|(c, a)| rgba((c << 8) | a as u32))
             .unwrap_or(gpui::black().into());
         let caret_color = style
             .get("caret-color")
             .filter(|value| !matches!(value.as_str(), "auto" | "currentColor"))
             .and_then(|value| render::color(value))
+            .map(tint)
             .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
             .unwrap_or(text_color);
+        let placeholder_color = rgba(tint((0x888888, 255)).0 << 8 | 0xff);
         let entity = cx.entity();
         el = el.cursor(gpui::CursorStyle::IBeam).child(
             gpui::canvas(
@@ -2543,7 +3083,7 @@ fn element(
                         text.clone()
                     };
                     let color = if text.is_empty() {
-                        rgba(0x888888ff)
+                        placeholder_color
                     } else {
                         text_color
                     };
@@ -2609,6 +3149,8 @@ fn element(
                                 std::slice::from_ref(&run),
                                 0,
                                 &highlights,
+                                &[],
+                                None,
                                 window,
                             );
                         }
@@ -2620,13 +3162,14 @@ fn element(
             .size_full(),
         );
     }
-    if let Some((ink, alpha)) = render::color(&style["color"]) {
+    if let Some((ink, alpha)) = render::color(&style["color"]).map(tint) {
         el = el.text_color(rgba((ink << 8) | alpha as u32));
     }
     if let Some(color) = style
         .get("background-color")
         .and_then(|s| render::color(s))
         .filter(|(_, alpha)| *alpha > 0)
+        .map(tint)
     {
         let color = rgba((color.0 << 8) | color.1 as u32);
         if display == "inline"
@@ -2821,9 +3364,11 @@ fn element(
             };
         }
     }
-    let ink = render::color(&style["color"]).map_or(rgba(0x000000ff), |(ink, alpha)| {
-        rgba(ink << 8 | alpha as u32)
-    });
+    let ink = render::color(&style["color"])
+        .map(tint)
+        .map_or(rgba(0x000000ff), |(ink, alpha)| {
+            rgba(ink << 8 | alpha as u32)
+        });
     let sides = [
         ("border-top-width", "border-top-style", "border-top-color"),
         (
@@ -2859,6 +3404,7 @@ fn element(
         style
             .get(name)
             .and_then(|value| render::color(value))
+            .map(tint)
             .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
     });
     el = el
@@ -2907,6 +3453,7 @@ fn element(
     let flexbox = matches!(display, "flex" | "inline-flex");
     let position = style.get("position").map_or("static", String::as_str);
     let mut radius = [0.; 4];
+    let mut inner_shadows = Vec::new();
     let mut intrinsic_width = None;
     for (name, value) in
         style.range::<str, _>((std::ops::Bound::Included("a"), std::ops::Bound::Unbounded))
@@ -2999,7 +3546,11 @@ fn element(
                     _ => el.rounded_bl(px(length)),
                 };
             }
-            "box-shadow" => el.style().box_shadow = Some(units.shadows(value)),
+            "box-shadow" => {
+                el.style().box_shadow =
+                    Some(units.shadows(value, false).into_iter().map(shade).collect());
+                inner_shadows = units.shadows(value, true).into_iter().map(shade).collect();
+            }
             "aspect-ratio" => {
                 let value = value.replace('/', " / ");
                 let parts = render::components(&value, ' ');
@@ -3160,6 +3711,73 @@ fn element(
             _ => {}
         }
     }
+    if !flex_parent
+        && slot.is_none()
+        && !matches!(position, "absolute" | "fixed")
+        && display.starts_with("inline")
+        && let Some(parent) = node.parent
+    {
+        let align = style
+            .get("vertical-align")
+            .map_or("baseline", String::as_str);
+        el.style().align_self = match align {
+            "middle" => Some(gpui::AlignItems::Center),
+            "top" | "text-top" => Some(gpui::AlignItems::FlexStart),
+            "bottom" => Some(gpui::AlignItems::FlexEnd),
+            _ => None,
+        };
+        let below = |style: &render::Style, font: render::FontUnits| {
+            let face = text.resolve_font(&render::font(style));
+            let ascent = f32::from(text.ascent(face, px(font.em)));
+            let descent = -f32::from(text.descent(face, px(font.em)));
+            (font.lh - ascent - descent) / 2. + descent
+        };
+        let line = styles.lengths[parent].font;
+        let replaced = matches!(
+            node.tag.as_str(),
+            "img"
+                | "svg"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "embed"
+                | "object"
+                | "progress"
+                | "meter"
+        ) || check
+            || display != "inline"
+                && !node.tag.starts_with('#')
+                && node.children.iter().all(|&child| {
+                    doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty()
+                });
+        let field = editable && node.tag == "input";
+        // WARNING: line boxes align text bottoms, so boxes without text are lifted by the parent's descent and half-leading.
+        let lift =
+            if (replaced || field) && el.style().align_self.is_none() && align != "text-bottom" {
+                below(&styles.values[parent], line)
+                    - if field {
+                        padding[2] + borders[2] + below(style, units.font)
+                    } else {
+                        0.
+                    }
+            } else {
+                0.
+            };
+        let raise = match align {
+            _ if style.contains_key("top") || style.contains_key("bottom") => 0.,
+            "super" => line.em / 3. + lift,
+            "sub" => -line.em / 5. + lift,
+            "baseline" => lift,
+            value => units.resolve(value, units.font.lh).unwrap_or(0.) + lift,
+        };
+        // WARNING: the margin reserves the shift so the line box grows instead of overlapping its neighbors.
+        if raise > 0. {
+            el = el.mt(px(margin[0] + raise)).top(px(-raise));
+        } else if raise < 0. {
+            el = el.mb(px(margin[2] - raise)).top(px(-raise));
+        }
+    }
     if style
         .get("background-image")
         .is_some_and(|value| value != "none")
@@ -3178,8 +3796,241 @@ fn element(
             radius,
             cx.entity(),
             base.as_ref(),
+            &view.host.borrow().assets,
+            filter,
         ));
     }
+    if !inner_shadows.is_empty() {
+        el = el.child(inset_shadows(inner_shadows, radius, borders));
+    }
+    if image_child.is_some() || cropped.is_some() {
+        let inner = |corner: usize, a: usize, b: usize| {
+            (radius[corner] - (borders[a] + padding[a]).max(borders[b] + padding[b])).max(0.)
+        };
+        let mut corners = [
+            inner(0, 0, 3),
+            inner(1, 0, 1),
+            inner(2, 2, 1),
+            inner(3, 2, 3),
+        ];
+        let own = [("width", 0), ("height", 1)].map(|(name, axis)| {
+            style
+                .get(name)
+                .and_then(|value| units.resolve(value, containing[axis]))
+                .unwrap_or(containing[axis])
+        });
+        let mut shapes = vec![(style.as_ref(), units, own)];
+        if let Some(parent) = node.parent.filter(|&parent| {
+            let (outer, outer_units) = (&styles.values[parent], styles.lengths[parent]);
+            doc.nodes[parent].children.iter().all(|&child| {
+                child == id
+                    || doc.nodes[child].tag == "#comment"
+                    || doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty()
+            }) && outer_units
+                .edges(outer, "padding", containing[0])
+                .iter()
+                .all(|value| *value == 0.)
+                && sides.iter().all(|(width, kind, _)| {
+                    outer
+                        .get(*kind)
+                        .is_none_or(|kind| matches!(kind.as_str(), "none" | "hidden"))
+                        || outer
+                            .get(*width)
+                            .and_then(|value| outer_units.resolve(value, 0.))
+                            == Some(0.)
+                })
+        }) {
+            let (outer, outer_units) = (&styles.values[parent], styles.lengths[parent]);
+            if ["overflow-x", "overflow-y"].iter().all(|key| {
+                outer
+                    .get(*key)
+                    .is_some_and(|value| matches!(value.as_str(), "hidden" | "clip"))
+            }) {
+                for (corner, name) in [
+                    "border-top-left-radius",
+                    "border-top-right-radius",
+                    "border-bottom-right-radius",
+                    "border-bottom-left-radius",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if let Some(value) = outer
+                        .get(name)
+                        .and_then(|value| outer_units.resolve(value, containing[0]))
+                    {
+                        corners[corner] = corners[corner].max(value);
+                    }
+                }
+            }
+            shapes.push((outer.as_ref(), outer_units, containing));
+        }
+        for (owner, owner_units, size) in shapes {
+            if let Some((_, radii)) = owner
+                .get("clip-path")
+                .and_then(|value| render::clip_path(value, &owner_units, size))
+            {
+                corners = std::array::from_fn(|corner| corners[corner].max(radii[corner]));
+            }
+        }
+        let grayscale = filter.is_some_and(|filter| filter.grayscale());
+        if let Some(image) = image_child {
+            el = el.child(
+                image
+                    .rounded_tl(px(corners[0]))
+                    .rounded_tr(px(corners[1]))
+                    .rounded_br(px(corners[2]))
+                    .rounded_bl(px(corners[3]))
+                    .grayscale(grayscale),
+            );
+        } else if let Some((image, fit)) = cropped {
+            let view = cx.entity();
+            // WARNING: gpui rounds the fitted image bounds, so overflowing fits paint a cached crop of the visible part.
+            el = el.child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let natural = image.size(0);
+                        let [width, height] = [u32::from(natural.width), u32::from(natural.height)];
+                        let fitted = fit.get_bounds(bounds, natural);
+                        let visible = fitted.intersect(&bounds);
+                        if width == 0
+                            || height == 0
+                            || visible.size.width <= px(0.)
+                            || visible.size.height <= px(0.)
+                        {
+                            return;
+                        }
+                        let scale = [
+                            width as f32 / f32::from(fitted.size.width),
+                            height as f32 / f32::from(fitted.size.height),
+                        ];
+                        let x = ((f32::from(visible.left() - fitted.left()) * scale[0]).round()
+                            as u32)
+                            .min(width - 1);
+                        let y = ((f32::from(visible.top() - fitted.top()) * scale[1]).round()
+                            as u32)
+                            .min(height - 1);
+                        let crop = [
+                            x,
+                            y,
+                            ((f32::from(visible.size.width) * scale[0]).round() as u32)
+                                .clamp(1, width - x),
+                            ((f32::from(visible.size.height) * scale[1]).round() as u32)
+                                .clamp(1, height - y),
+                        ];
+                        let shown = if crop == [0, 0, width, height] {
+                            Some(image.clone())
+                        } else {
+                            let view = view.read(cx);
+                            let mut host = view.host.borrow_mut();
+                            let state = host.dom.entry(view.id).or_default();
+                            let key = {
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = std::hash::DefaultHasher::new();
+                                (image.id, crop).hash(&mut hasher);
+                                hasher.finish()
+                            };
+                            match state.image_crops.get(&id) {
+                                Some((cached, shown)) if *cached == key => Some(shown.clone()),
+                                _ => image.as_bytes(0).map(|bytes| {
+                                    let pixels = image::RgbaImage::from_fn(
+                                        crop[2],
+                                        crop[3],
+                                        |column, row| {
+                                            let at = ((crop[1] + row) * width + crop[0] + column)
+                                                as usize
+                                                * 4;
+                                            image::Rgba([
+                                                bytes[at],
+                                                bytes[at + 1],
+                                                bytes[at + 2],
+                                                bytes[at + 3],
+                                            ])
+                                        },
+                                    );
+                                    let shown =
+                                        Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+                                            pixels,
+                                        )]));
+                                    if let Some((_, old)) =
+                                        state.image_crops.insert(id, (key, shown.clone()))
+                                    {
+                                        let _ = window.drop_image(old);
+                                    }
+                                    shown
+                                }),
+                            }
+                        };
+                        if let Some(shown) = shown {
+                            let corners = gpui::Corners {
+                                top_left: px(corners[0]),
+                                top_right: px(corners[1]),
+                                bottom_right: px(corners[2]),
+                                bottom_left: px(corners[3]),
+                            }
+                            .clamp_radii_for_quad_size(visible.size);
+                            let _ = window.paint_image(visible, corners, shown, 0, grayscale);
+                        }
+                    },
+                )
+                .size_full(),
+            );
+        }
+    }
+    if !drop_shadows.is_empty()
+        && (node.tag == "img" || el.style().background.is_some() || !visible.is_empty())
+    {
+        el.style()
+            .box_shadow
+            .get_or_insert_with(Vec::new)
+            .splice(0..0, drop_shadows.into_iter().rev());
+    }
+    if filter_opacity < 1. {
+        el.style().opacity = Some(el.style().opacity.unwrap_or(1.) * filter_opacity);
+    }
+    let clip = style
+        .get("clip-path")
+        .filter(|value| render::clip_path(value, &units, containing).is_some())
+        .cloned();
+    let clip_fill = clip
+        .as_ref()
+        .filter(|value| {
+            render::clip_path(value, &units, containing)
+                .is_some_and(|(_, radii)| radii.iter().any(|radius| *radius > 0.))
+        })
+        .map(|_| {
+            let opacity = style
+                .get("opacity")
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(1.)
+                .clamp(0., 1.)
+                * filter_opacity;
+            el.style().background = None;
+            el.style().box_shadow = None;
+            let mut background: gpui::Hsla = style
+                .get("background-color")
+                .and_then(|value| render::color(value))
+                .map(tint)
+                .map_or(gpui::transparent_black(), |(ink, alpha)| {
+                    rgba(ink << 8 | alpha as u32).into()
+                });
+            background.a *= opacity;
+            let border = visible
+                .first()
+                .filter(|&&first| {
+                    visible
+                        .iter()
+                        .all(|&side| border_colors[side] == border_colors[first])
+                })
+                .map_or(gpui::transparent_black(), |&first| {
+                    el.style().border_color = Some(gpui::transparent_black());
+                    let mut color: gpui::Hsla = border_colors[first].into();
+                    color.a *= opacity;
+                    color
+                });
+            (background, borders, border)
+        });
     if let Some(lines) = style
         .get("-webkit-line-clamp")
         .or_else(|| style.get("line-clamp"))
@@ -3242,6 +4093,7 @@ fn element(
         let color = style
             .get("outline-color")
             .and_then(|v| render::color(v))
+            .map(tint)
             .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32));
         let mut outline = div()
             .absolute()
@@ -3316,9 +4168,11 @@ fn element(
         let accent = style
             .get("accent-color")
             .and_then(|value| render::color(value))
-            .map_or(rgba(0x0a84ffff), |(ink, alpha)| {
+            .map_or(rgba(tint((0x0a84ff, 255)).0 << 8 | 0xff), |color| {
+                let (ink, alpha) = tint(color);
                 rgba(ink << 8 | alpha as u32)
             });
+        let mark = rgba(tint((0xffffff, 255)).0 << 8 | 0xff);
         el = el
             .bg(accent)
             .border_color(accent)
@@ -3326,13 +4180,10 @@ fn element(
             .justify_center()
             .child(
                 if input.is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) {
-                    div()
-                        .size(px(units.font.em * 0.35))
-                        .rounded_full()
-                        .bg(gpui::white())
+                    div().size(px(units.font.em * 0.35)).rounded_full().bg(mark)
                 } else {
                     div()
-                        .text_color(gpui::white())
+                        .text_color(mark)
                         .text_size(px(units.font.em * 0.75))
                         .line_height(px(units.font.em * 0.75))
                         .child("✓")
@@ -3362,10 +4213,18 @@ fn element(
                 .size(px(0.)),
         );
     }
+    let marker_style = styles
+        .text_pseudos
+        .get(&id)
+        .and_then(|pseudos| pseudos[0].as_ref());
+    let content = marker_style
+        .and_then(|marker| marker.get("content"))
+        .filter(|value| *value != "normal");
     if display == "list-item"
+        && content.is_none_or(|value| value != "none")
         && let Some(kind) = style
             .get("list-style-type")
-            .filter(|kind| kind.as_str() != "none")
+            .filter(|kind| kind.as_str() != "none" || content.is_some())
     {
         let list = node.parent.map(|parent| &doc.nodes[parent]);
         let items: Vec<usize> = list.map_or(vec![id], |list| {
@@ -3455,25 +4314,55 @@ fn element(
             other if other.starts_with(['"', '\'']) => other.trim_matches(['"', '\'']).to_owned(),
             _ => format!("{number}."),
         };
-        el = el.child(
-            if style
-                .get("list-style-position")
-                .is_some_and(|value| value == "inside")
+        let marker = content.map_or(marker, |content| {
+            let mut text = String::new();
+            for part in render::components(content, ' ') {
+                if part.starts_with("counter(") || part.starts_with("counters(") {
+                    text.push_str(&number.to_string());
+                    continue;
+                }
+                let mut input = cssparser::Parser::new(part);
+                if let Ok(string) = input.expect_string() {
+                    text.push_str(string);
+                }
+            }
+            text
+        });
+        let mut marker_box = if style
+            .get("list-style-position")
+            .is_some_and(|value| value == "inside")
+        {
+            div()
+                .flex_shrink_0()
+                .mr(px(units.font.em * 0.3))
+                .child(marker)
+        } else {
+            div()
+                .absolute()
+                .top(px(padding[0]))
+                .right(relative(1.))
+                .pr(px(units.font.em * 0.5))
+                .whitespace_nowrap()
+                .child(marker)
+        };
+        if let Some(marker) = marker_style {
+            let face = render::font(marker);
+            marker_box = marker_box.font_family(face.family).font_weight(face.weight);
+            marker_box
+                .text_style()
+                .get_or_insert_with(Default::default)
+                .font_style = Some(face.style);
+            if let Some((ink, alpha)) = marker.get("color").and_then(|value| render::color(value)) {
+                marker_box = marker_box.text_color(rgba(ink << 8 | alpha as u32));
+            }
+            if let Some(size) = marker
+                .get("font-size")
+                .and_then(|value| units.resolve(value, units.font.em))
             {
-                div()
-                    .flex_shrink_0()
-                    .mr(px(units.font.em * 0.3))
-                    .child(marker)
-            } else {
-                div()
-                    .absolute()
-                    .top(px(padding[0]))
-                    .right(relative(1.))
-                    .pr(px(units.font.em * 0.5))
-                    .whitespace_nowrap()
-                    .child(marker)
-            },
-        );
+                marker_box = marker_box.text_size(px(size));
+            }
+        }
+        el = el.child(marker_box);
     }
     let mut after = None;
     if let Some(pseudos) = styles.pseudos.get(&id) {
@@ -3540,7 +4429,8 @@ fn element(
                 .text_size(px(pseudo_units.font.em))
                 .font_family(face.family)
                 .font_weight(face.weight);
-            if let Some((ink, alpha)) = pseudo.get("color").and_then(|v| render::color(v)) {
+            if let Some((ink, alpha)) = pseudo.get("color").and_then(|v| render::color(v)).map(tint)
+            {
                 decoration = decoration.text_color(rgba(ink << 8 | alpha as u32));
             }
             let absolute = pseudo
@@ -3590,9 +4480,12 @@ fn element(
                     pseudo
                         .get(sides[side].2)
                         .and_then(|v| render::color(v))
+                        .map(tint)
                         .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32)),
                 );
             }
+            let mut pseudo_radius = [0.; 4];
+            let mut pseudo_shadows = Vec::new();
             for (name, value) in pseudo {
                 let vertical =
                     name.ends_with("height") || matches!(name.as_str(), "top" | "bottom");
@@ -3637,6 +4530,13 @@ fn element(
                         else {
                             continue;
                         };
+                        let corner = match name.as_str() {
+                            "border-top-left-radius" => 0,
+                            "border-top-right-radius" => 1,
+                            "border-bottom-right-radius" => 2,
+                            _ => 3,
+                        };
+                        pseudo_radius[corner] = f32::from(length);
                         decoration = match name.as_str() {
                             "border-top-left-radius" => decoration.rounded_tl(length),
                             "border-top-right-radius" => decoration.rounded_tr(length),
@@ -3645,7 +4545,7 @@ fn element(
                         };
                     }
                     "background-color" => {
-                        if let Some((color, alpha)) = render::color(value) {
+                        if let Some((color, alpha)) = render::color(value).map(tint) {
                             decoration = decoration.bg(rgba(color << 8 | alpha as u32));
                         }
                     }
@@ -3655,7 +4555,18 @@ fn element(
                         }
                     }
                     "box-shadow" => {
-                        decoration.style().box_shadow = Some(pseudo_units.shadows(value))
+                        decoration.style().box_shadow = Some(
+                            pseudo_units
+                                .shadows(value, false)
+                                .into_iter()
+                                .map(shade)
+                                .collect(),
+                        );
+                        pseudo_shadows = pseudo_units
+                            .shadows(value, true)
+                            .into_iter()
+                            .map(shade)
+                            .collect();
                     }
                     _ => {}
                 }
@@ -3678,7 +4589,13 @@ fn element(
                     [0.; 4],
                     cx.entity(),
                     base.as_ref(),
+                    &view.host.borrow().assets,
+                    filter,
                 ));
+            }
+            if !pseudo_shadows.is_empty() {
+                decoration =
+                    decoration.child(inset_shadows(pseudo_shadows, pseudo_radius, pseudo_borders));
             }
             if !text.is_empty() {
                 decoration = decoration.child(SharedString::from(text));
@@ -3740,6 +4657,66 @@ fn element(
         el = el.cursor(gpui::CursorStyle::IBeam);
     }
     if let Some(data) = inline {
+        if style
+            .get("container-type")
+            .is_some_and(|v| matches!(v.as_str(), "inline-size" | "size"))
+        {
+            let size = [0, 1].map(|axis| {
+                (style
+                    .get(["width", "height"][axis])
+                    .and_then(|v| units.resolve(v, containing[axis]))
+                    .map_or(
+                        containing[axis] - [margin[1] + margin[3], 0.][axis],
+                        |value| value + extra[axis],
+                    )
+                    - padding[1 - axis]
+                    - padding[3 - axis]
+                    - borders[1 - axis]
+                    - borders[3 - axis])
+                    .max(0.)
+            });
+            view.host
+                .borrow_mut()
+                .dom
+                .entry(view.id)
+                .or_default()
+                .containers
+                .insert(id, size);
+        }
+        let data = match filter {
+            Some(filter) => Rc::new(render::InlineText {
+                runs: data
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        let mut run = run.clone();
+                        run.color = filter.hsla(run.color);
+                        for color in [
+                            run.underline.as_mut().and_then(|line| line.color.as_mut()),
+                            run.strikethrough
+                                .as_mut()
+                                .and_then(|line| line.color.as_mut()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            *color = filter.hsla(*color);
+                        }
+                        run
+                    })
+                    .collect(),
+                backgrounds: data
+                    .backgrounds
+                    .iter()
+                    .map(|&(index, ink)| {
+                        let (color, alpha) = filter.color((ink >> 8, ink as u8));
+                        (index, color << 8 | alpha as u32)
+                    })
+                    .collect(),
+                ..(*data).clone()
+            }),
+            None => data,
+        };
         let inner = gpui::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
         el = el.child(
             div()
@@ -3750,6 +4727,7 @@ fn element(
                     inner,
                     data,
                     view: cx.entity(),
+                    runs: None,
                 }),
         );
     } else if !node.children.is_empty()
@@ -3769,6 +4747,7 @@ fn element(
             if let Some(value) = style
                 .get(name)
                 .and_then(|v| units.resolve(v, containing[axis]))
+                .map(|value| value + extra[axis])
                 .or(intrinsic_width.filter(|_| axis == 0))
             {
                 content[axis] = value;
@@ -3779,13 +4758,13 @@ fn element(
                 .get(max)
                 .and_then(|v| units.resolve(v, containing[axis]))
             {
-                content[axis] = content[axis].min(value);
+                content[axis] = content[axis].min(value + extra[axis]);
             }
             if let Some(value) = style
                 .get(min)
                 .and_then(|v| units.resolve(v, containing[axis]))
             {
-                content[axis] = content[axis].max(value);
+                content[axis] = content[axis].max(value + extra[axis]);
             }
             content[axis] = (content[axis]
                 - padding[1 - axis]
@@ -3816,6 +4795,13 @@ fn element(
             .get("container-type")
             .is_some_and(|v| matches!(v.as_str(), "inline-size" | "size"))
         {
+            view.host
+                .borrow_mut()
+                .dom
+                .entry(view.id)
+                .or_default()
+                .containers
+                .insert(id, content);
             content
         } else {
             container
@@ -3960,17 +4946,74 @@ fn element(
                 let out_of_flow = styles.values[child]
                     .get("position")
                     .is_some_and(|value| matches!(value.as_str(), "absolute" | "fixed"));
+                let child_style = &styles.values[child];
+                if flow
+                    && grid.is_none()
+                    && child_style
+                        .get("position")
+                        .is_some_and(|value| value == "absolute")
+                    && child_style
+                        .get("display")
+                        .is_none_or(|value| value != "none")
+                    && [["left", "right"], ["top", "bottom"]].iter().any(|axis| {
+                        axis.iter()
+                            .all(|name| child_style.get(*name).is_none_or(|value| value == "auto"))
+                    })
+                {
+                    // WARNING: the placeholder must come before the box, which reads its bounds in prepaint.
+                    let block = child_style
+                        .get("display")
+                        .is_some_and(|value| !value.starts_with("inline"));
+                    let entity = cx.entity();
+                    let mut placeholder = gpui::canvas(
+                        move |bounds, _, cx| {
+                            let view = entity.read(cx);
+                            view.host
+                                .borrow_mut()
+                                .dom
+                                .entry(view.id)
+                                .or_default()
+                                .anchors
+                                .insert(child, bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .w(px(0.))
+                    .flex_shrink_0()
+                    .h(px(
+                        if block
+                            && (line.is_some()
+                                || all_inline
+                                    && flat.iter().any(|&other| other != child && in_flow(other)))
+                        {
+                            units.font.lh
+                        } else {
+                            0.
+                        },
+                    ));
+                    placeholder.style().align_self = Some(gpui::AlignSelf::FlexStart);
+                    match line.take() {
+                        Some(open) => line = Some(open.child(placeholder)),
+                        None if all_inline || block => el = el.child(placeholder),
+                        None => {
+                            let mut next = div().flex().flex_row().flex_wrap();
+                            next.style().justify_content = line_justify;
+                            line = Some(next.child(placeholder));
+                        }
+                    }
+                }
                 if flow && !all_inline && grid.is_none() && inline_level(child) && !out_of_flow {
                     let mut next = line
                         .take()
                         .unwrap_or_else(|| div().flex().flex_row().flex_wrap());
                     next.style().justify_content = line_justify;
+                    next.style().align_items = line_align;
                     line = Some(next.child(child_element));
-                } else if out_of_flow && line.is_some() {
+                } else if out_of_flow {
                     floating.push(child_element);
                 } else {
                     if let Some(line) = line.take() {
-                        el = el.child(line).children(floating.drain(..));
+                        el = el.child(line);
                     }
                     el = el.child(child_element);
                 }
@@ -3983,6 +5026,18 @@ fn element(
     }
     if let Some(after) = after {
         el = el.child(after);
+    }
+    if slot.is_some() && flow && matches!(node.tag.as_str(), "td" | "th") {
+        let align = match style.get("vertical-align").map(String::as_str) {
+            Some("middle") => Some(gpui::AlignContent::Center),
+            Some("bottom") => Some(gpui::AlignContent::FlexEnd),
+            _ => None,
+        };
+        if all_inline {
+            el.style().align_content = align;
+        } else {
+            el.style().justify_content = align;
+        }
     }
     if let Some((bounds, _)) = &slot {
         el = el
@@ -4006,6 +5061,46 @@ fn element(
             cx.stop_propagation();
             Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", if hit_test { &[] } else { &path }, serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":0,"buttons":1,"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), cx);
         }));
+    }
+    let mut parent = node.parent;
+    while let Some(ancestor) = parent
+        && styles.values[ancestor]
+            .get("display")
+            .is_some_and(|value| value == "contents")
+    {
+        parent = doc.nodes[ancestor].parent;
+    }
+    let parent_display = parent
+        .and_then(|parent| styles.values[parent].get("display"))
+        .map_or("block", String::as_str);
+    let axes = [["left", "right"], ["top", "bottom"]].map(|axis| {
+        axis.iter()
+            .all(|name| style.get(*name).is_none_or(|v| v == "auto"))
+    });
+    let mut anchor = None;
+    if position == "absolute" && slot.is_none() && axes.contains(&true) {
+        if matches!(parent_display, "grid" | "inline-grid") {
+            if axes[0] {
+                el = el.left(px(0.));
+            }
+            if axes[1] {
+                el = el.top(px(0.));
+            }
+        } else if !matches!(parent_display, "flex" | "inline-flex") {
+            let block = !display.starts_with("inline");
+            if block
+                && axes[0]
+                && let Some(parent) = parent
+            {
+                el = el.left(px(styles.lengths[parent].edges(
+                    &styles.values[parent],
+                    "padding",
+                    containing[0],
+                )[3]
+                .max(0.)));
+            }
+            anchor = Some((axes, block, [margin[3], margin[0]]));
+        }
     }
     if stacking {
         el = el.child(paint_layers(build.layers.clone(), false));
@@ -4091,14 +5186,7 @@ fn element(
     }
     let element = DomBox {
         inner: Some(el),
-        animations: styles.animations.get(&id).cloned().unwrap_or_default(),
-        opacity: style
-            .get("opacity")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1.),
-        visible: style
-            .get("visibility")
-            .is_none_or(|value| value == "visible"),
+        anchor,
         translate,
         units,
         id,
@@ -4120,6 +5208,18 @@ fn element(
         }),
     }
     .into_any_element();
+    let element = match clip {
+        Some(shape) => Clipped {
+            inner: element,
+            shape,
+            units,
+            fill: clip_fill,
+            id,
+            view: cx.entity(),
+        }
+        .into_any_element(),
+        None => element,
+    };
     if positioned && let Some(order) = order.filter(|order| *order != 0) {
         Stacked {
             inner: Some(element),
@@ -4326,6 +5426,410 @@ impl EntityInputHandler for WebView {
         let index = line.closest_index_for_x(point.x - px(bounds[0]));
         Some((offset + selected[..index].encode_utf16().count()).min(text.encode_utf16().count()))
     }
+}
+
+fn inset_shadows(shadows: Vec<gpui::BoxShadow>, radius: [f32; 4], borders: [f32; 4]) -> AnyElement {
+    let inner =
+        |corner: usize, a: usize, b: usize| (radius[corner] - borders[a].max(borders[b])).max(0.);
+    let radii = [
+        inner(0, 0, 3),
+        inner(1, 0, 1),
+        inner(2, 2, 1),
+        inner(3, 2, 3),
+    ];
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+            let corners = gpui::Corners {
+                top_left: px(radii[0]),
+                top_right: px(radii[1]),
+                bottom_right: px(radii[2]),
+                bottom_left: px(radii[3]),
+            }
+            .clamp_radii_for_quad_size(bounds.size);
+            for shadow in &shadows {
+                let [x, y, spread, sigma] = [
+                    shadow.offset.x,
+                    shadow.offset.y,
+                    shadow.spread_radius,
+                    shadow.blur_radius,
+                ]
+                .map(f32::from);
+                let edges = [spread + y, spread - x, spread - y, spread + x];
+                let steps = if sigma > 0. {
+                    (sigma * 10. / 3.).ceil().clamp(2., 24.) as usize
+                } else {
+                    1
+                };
+                let coverage = |step: usize| -> f32 {
+                    let z = 2.5 - 5. * step as f32 / steps as f32;
+                    shadow.color.a
+                        * if sigma > 0. {
+                            1. / (1. + (-1.702 * z).exp())
+                        } else {
+                            1.
+                        }
+                };
+                for step in (0..steps).rev() {
+                    let alpha = if step + 1 == steps {
+                        coverage(step)
+                    } else {
+                        1. - (1. - coverage(step)) / (1. - coverage(step + 1)).max(1e-6)
+                    };
+                    let z = if sigma > 0. {
+                        2.5 - 5. * (step as f32 + 0.5) / steps as f32
+                    } else {
+                        0.
+                    };
+                    let [top, right, bottom, left] = edges.map(|edge| (edge - sigma * z).max(0.));
+                    if alpha <= 0. || top + right + bottom + left <= 0. {
+                        continue;
+                    }
+                    let mut color = shadow.color;
+                    color.a = alpha.clamp(0., 1.);
+                    let ring = gpui::quad(
+                        bounds,
+                        corners,
+                        gpui::transparent_black(),
+                        gpui::Edges {
+                            top: px(top),
+                            right: px(right),
+                            bottom: px(bottom),
+                            left: px(left),
+                        },
+                        color,
+                        gpui::BorderStyle::Solid,
+                    );
+                    let top = top.max(radii[0]).max(radii[1]).min(height);
+                    let bottom = bottom.max(radii[2]).max(radii[3]).min(height - top);
+                    let left = left.max(radii[0]).max(radii[3]).min(width);
+                    let right = right.max(radii[1]).max(radii[2]).min(width - left);
+                    for [x0, y0, x1, y1] in [
+                        [0., 0., width, top],
+                        [0., height - bottom, width, height],
+                        [0., top, left, height - bottom],
+                        [width - right, top, width, height - bottom],
+                    ] {
+                        if x1 > x0 && y1 > y0 {
+                            let strip = Bounds::from_corners(
+                                bounds.origin + point(px(x0), px(y0)),
+                                bounds.origin + point(px(x1), px(y1)),
+                            );
+                            window.with_content_mask(
+                                Some(gpui::ContentMask { bounds: strip }),
+                                |window| window.paint_quad(ring.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
+
+struct Clipped {
+    inner: AnyElement,
+    shape: String,
+    units: render::Lengths,
+    fill: Option<(gpui::Hsla, [f32; 4], gpui::Hsla)>,
+    id: usize,
+    view: gpui::Entity<WebView>,
+}
+
+impl IntoElement for Clipped {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for Clipped {
+    type RequestLayoutState = ();
+    type PrepaintState = Bounds<Pixels>;
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Bounds<Pixels> {
+        self.inner.prepaint(window, cx);
+        let view = self.view.read(cx);
+        let host = view.host.borrow();
+        host.dom
+            .get(&view.id)
+            .and_then(|state| state.bounds.get(&self.id))
+            .map_or(bounds, |&[x, y, width, height]| {
+                Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+            })
+    }
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        bounds: &mut Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+        let Some((rect, radii)) = render::clip_path(&self.shape, &self.units, [width, height])
+        else {
+            return self.inner.paint(window, cx);
+        };
+        let shape = Bounds::new(
+            bounds.origin + point(px(rect[0]), px(rect[1])),
+            size(px(rect[2]), px(rect[3])),
+        );
+        window.with_content_mask(Some(gpui::ContentMask { bounds: shape }), |window| {
+            if let Some((background, widths, border)) = self.fill {
+                let whole = [rect[0], rect[1], rect[2] - width, rect[3] - height]
+                    .iter()
+                    .all(|delta| delta.abs() < 0.5);
+                let [top, right, bottom, left] =
+                    widths.map(|width| px(if whole { width } else { 0. }));
+                window.with_content_mask(Some(gpui::ContentMask { bounds: *bounds }), |window| {
+                    window.paint_quad(gpui::quad(
+                        shape,
+                        gpui::Corners {
+                            top_left: px(radii[0]),
+                            top_right: px(radii[1]),
+                            bottom_right: px(radii[2]),
+                            bottom_left: px(radii[3]),
+                        }
+                        .clamp_radii_for_quad_size(shape.size),
+                        background,
+                        gpui::Edges {
+                            top,
+                            right,
+                            bottom,
+                            left,
+                        },
+                        border,
+                        gpui::BorderStyle::Solid,
+                    ))
+                });
+            }
+            self.inner.paint(window, cx);
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn svg_layer(
+    source: String,
+    id: usize,
+    style: Rc<render::Style>,
+    units: render::Lengths,
+    animated: bool,
+    filter: Option<render::Filter>,
+    shadows: Vec<gpui::BoxShadow>,
+    view: gpui::Entity<WebView>,
+) -> AnyElement {
+    const BUDGET: usize = 16 << 20;
+    let root = source
+        .find("<svg")
+        .and_then(|start| Some(start + source[start..].find('>')?));
+    let source = match (root, source.rfind("</svg>")) {
+        (Some(end), Some(close)) if (filter.is_some() || !shadows.is_empty()) && end < close => {
+            let mut primitives = String::new();
+            if let Some(render::Filter(rows)) = filter {
+                let row = |[r, g, b, offset]: [f32; 4]| format!("{r} {g} {b} 0 {offset} ");
+                primitives.push_str(&format!(
+                    "<feColorMatrix type=\"matrix\" values=\"{}{}{}0 0 0 1 0\"/>",
+                    row(rows[0]),
+                    row(rows[1]),
+                    row(rows[2])
+                ));
+            }
+            for shadow in &shadows {
+                let color = shadow.color.to_rgb();
+                primitives.push_str(&format!(
+                    "<feDropShadow dx=\"{}\" dy=\"{}\" stdDeviation=\"{}\" flood-color=\"rgb({},{},{})\" flood-opacity=\"{}\"/>",
+                    f32::from(shadow.offset.x),
+                    f32::from(shadow.offset.y),
+                    f32::from(shadow.blur_radius),
+                    (color.r * 255.).round(),
+                    (color.g * 255.).round(),
+                    (color.b * 255.).round(),
+                    color.a
+                ));
+            }
+            format!(
+                "{}<defs><filter id=\"h2o-filter\" x=\"-50%\" y=\"-50%\" width=\"200%\" height=\"200%\" color-interpolation-filters=\"sRGB\">{primitives}</filter></defs><g filter=\"url(#h2o-filter)\">{}</g>{}",
+                &source[..=end],
+                &source[end + 1..close],
+                &source[close..]
+            )
+        }
+        _ => source,
+    };
+    let outset = shadows
+        .iter()
+        .map(|shadow| {
+            f32::from(shadow.offset.x)
+                .abs()
+                .max(f32::from(shadow.offset.y).abs())
+                + f32::from(shadow.blur_radius) * 3.
+        })
+        .fold(0., f32::max);
+    let key = if outset > 0.
+        || ["transform", "rotate", "scale"]
+            .iter()
+            .any(|name| style.contains_key(*name))
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        source.hash(&mut hasher);
+        hasher.finish()
+    } else {
+        0
+    };
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, cx| {
+            let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+            if width <= 0. || height <= 0. {
+                return;
+            }
+            let scale = window.scale_factor();
+            let matrix = render::transform(
+                &style,
+                &units,
+                [width, height],
+                if animated { 3. } else { 0. },
+            );
+            let [a, b, c, d, e, f] = matrix.unwrap_or([1., 0., 0., 1., 0., 0.]);
+            let xs = [e, a * width + e, c * height + e, a * width + c * height + e];
+            let ys = [f, b * width + f, d * height + f, b * width + d * height + f];
+            let [x0, y0] = [xs, ys].map(|values| {
+                ((values.into_iter().fold(f32::MAX, f32::min) - outset) * scale).floor()
+            });
+            let [x1, y1] = [xs, ys].map(|values| {
+                ((values.into_iter().fold(f32::MIN, f32::max) + outset) * scale).ceil()
+            });
+            let raster = [
+                (x1 - x0).clamp(1., 4096.) as u32,
+                (y1 - y0).clamp(1., 4096.) as u32,
+            ];
+            let placement = Bounds::new(
+                bounds.origin + point(px(x0 / scale), px(y0 / scale)),
+                size(px(raster[0] as f32 / scale), px(raster[1] as f32 / scale)),
+            );
+            let view = view.read(cx);
+            let mut host = view.host.borrow_mut();
+            let state = host.dom.entry(view.id).or_default();
+            let image = if matrix.is_none() && outset == 0. {
+                if state.svgs.get(&id).is_none_or(|(old, image)| {
+                    *old != source
+                        || u32::from(image.size(0).width) != raster[0]
+                        || u32::from(image.size(0).height) != raster[1]
+                }) {
+                    match crate::canvas::svg(&source, raster[0], raster[1], None) {
+                        Ok(image) => {
+                            if let Some((_, old)) = state.svgs.insert(id, (source.clone(), image)) {
+                                let _ = window.drop_image(old);
+                            }
+                        }
+                        Err(error) => eprintln!("apps: SVG: {error}"),
+                    }
+                }
+                state.svgs.get(&id).map(|(_, image)| image.clone())
+            } else {
+                let transform = (
+                    [width, height],
+                    [
+                        a * scale,
+                        b * scale,
+                        c * scale,
+                        d * scale,
+                        e * scale - x0,
+                        f * scale - y0,
+                    ],
+                );
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    (key, raster).hash(&mut hasher);
+                    for value in transform.0.iter().chain(&transform.1) {
+                        value.to_bits().hash(&mut hasher);
+                    }
+                    hasher.finish()
+                };
+                state.svg_clock += 1;
+                let clock = state.svg_clock;
+                if let Some((image, used)) = state.svg_rasters.get_mut(&key) {
+                    *used = clock;
+                    Some(image.clone())
+                } else {
+                    match crate::canvas::svg(&source, raster[0], raster[1], Some(transform)) {
+                        Ok(image) => {
+                            let bytes = |image: &gpui::RenderImage| {
+                                let size = image.size(0);
+                                u32::from(size.width) as usize * u32::from(size.height) as usize * 4
+                            };
+                            let mut total = state
+                                .svg_rasters
+                                .values()
+                                .map(|(image, _)| bytes(image))
+                                .sum::<usize>()
+                                + bytes(&image);
+                            while total > BUDGET
+                                && let Some(oldest) = state
+                                    .svg_rasters
+                                    .iter()
+                                    .min_by_key(|(_, (_, used))| *used)
+                                    .map(|(key, _)| *key)
+                                && let Some((old, _)) = state.svg_rasters.remove(&oldest)
+                            {
+                                total -= bytes(&old);
+                                let _ = window.drop_image(old);
+                            }
+                            state.svg_rasters.insert(key, (image.clone(), clock));
+                            Some(image)
+                        }
+                        Err(error) => {
+                            eprintln!("apps: SVG: {error}");
+                            None
+                        }
+                    }
+                }
+            };
+            drop(host);
+            if let Some(image) = image {
+                let _ = window.paint_image(placement, gpui::Corners::default(), image, 0, false);
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
 }
 
 #[cfg(test)]

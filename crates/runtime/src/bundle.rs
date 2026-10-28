@@ -103,6 +103,11 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
                 name.clone(),
                 copy_native(path.parent().context("Missing bundle directory")?, source)?,
             );
+        } else if name == "assets.json" {
+            bundle.files.insert(
+                name.clone(),
+                copy_assets(path.parent().context("Missing bundle directory")?, source)?,
+            );
         } else {
             ensure!(
                 name.ends_with(".js") || name == "package.json",
@@ -194,7 +199,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             if (name.ends_with(".html")
                 || matches!(
                     name.as_str(),
-                    "app.js" | "deps.js" | "native.json" | "package.json"
+                    "app.js" | "deps.js" | "native.json" | "package.json" | "assets.json"
                 ))
                 && entry.file_type()?.is_file()
             {
@@ -211,6 +216,16 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             validate_native_path(&relative)?;
             ensure!(*path == Path::new(&relative), "Invalid native addon path");
             *path = directory.join(relative);
+        }
+        *source = serde_json::to_string(&paths)?;
+    }
+    if let Some(source) = bundle.files.get_mut("assets.json") {
+        let mut paths: std::collections::BTreeMap<String, std::path::PathBuf> =
+            serde_json::from_str(source)?;
+        for (name, path) in &mut paths {
+            validate_asset_path(name)?;
+            ensure!(*path == Path::new(name), "Invalid asset path");
+            *path = directory.join(name.as_str());
         }
         *source = serde_json::to_string(&paths)?;
     }
@@ -234,6 +249,35 @@ fn validate_native_path(name: &str) -> Result<()> {
         "Invalid native addon path: {name}"
     );
     Ok(())
+}
+
+fn validate_asset_path(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    ensure!(
+        name.starts_with("assets/")
+            && !name.contains('\\')
+            && path.components().count() == 2
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Invalid asset path: {name}"
+    );
+    Ok(())
+}
+
+pub fn copy_assets(directory: &Path, source: &str) -> Result<String> {
+    let paths: std::collections::BTreeMap<String, std::path::PathBuf> =
+        serde_json::from_str(source)?;
+    let mut output = std::collections::BTreeMap::new();
+    for (name, source) in paths {
+        validate_asset_path(&name)?;
+        let destination = directory.join(&name);
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::copy(&source, &destination)
+            .with_context(|| format!("Cannot copy asset {}", source.display()))?;
+        output.insert(name.clone(), name);
+    }
+    Ok(serde_json::to_string(&output)?)
 }
 
 pub fn copy_native(directory: &Path, source: &str) -> Result<String> {

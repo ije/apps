@@ -24,6 +24,7 @@ pub struct Host {
     pub app_version: Option<String>,
     pub packaged: bool,
     pub native_modules: HashMap<String, PathBuf>,
+    pub assets: HashMap<String, PathBuf>,
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
     pub dom: HashMap<u64, crate::dom::State>,
@@ -114,6 +115,26 @@ impl Host {
                 return Ok(Value::Null);
             }
             let state = self.dom.entry(id).or_default();
+            if op == "dom.imageURL" {
+                let node = args[0].as_u64().context("Invalid node")? as usize;
+                ensure!(node < page.doc.nodes.len(), "Invalid node id");
+                let base = state.base.as_ref().context("Missing page URL")?;
+                let url = base.join(args[1].as_str().context("Expected image URL")?)?;
+                let path = match url.scheme() {
+                    "apps" => self.assets.get(url.path().trim_start_matches('/')).cloned(),
+                    "file" if base.scheme() == "file" => url.to_file_path().ok(),
+                    _ => None,
+                }
+                .context("Image is not a bundled asset or local file")?;
+                let metadata = std::fs::metadata(&path)?;
+                ensure!(
+                    metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
+                    "Image is not a file or is too large"
+                );
+                let result = crate::dom::load_image(state, node, &std::fs::read(&path)?);
+                page.dirty |= std::mem::take(&mut state.dirty);
+                return result;
+            }
             if matches!(
                 op,
                 "dom.setText"

@@ -341,9 +341,16 @@ impl Selector {
             };
             Some((
                 index,
-                ["before", "after", "selection"]
-                    .iter()
-                    .position(|n| n == name)?,
+                [
+                    "before",
+                    "after",
+                    "selection",
+                    "marker",
+                    "first-letter",
+                    "first-line",
+                ]
+                .iter()
+                .position(|n| n == name)?,
             ))
         })?;
         let mut selector = self.clone();

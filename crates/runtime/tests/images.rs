@@ -76,3 +76,66 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
         ));
     }
 }
+
+#[test]
+fn svg_and_bundled_images_load_through_the_host() {
+    use apps_runtime::host::{Host, Page, Role};
+    let mut doc = Document::parse("<body><img></body>");
+    let mut state = dom::State::default();
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"><rect width="30" height="12"/></svg>"#;
+    let result = dom::call(
+        "dom.image",
+        &json!([1, svg.as_slice()]),
+        &mut doc,
+        &mut state,
+        [640., 480.],
+    );
+    assert_eq!(result.unwrap().unwrap(), json!([30., 12.]));
+    assert!(!state.images.contains_key(&1));
+    assert!(
+        dom::call(
+            "dom.image",
+            &json!([1, b"not an image".as_slice()]),
+            &mut doc,
+            &mut state,
+            [640., 480.]
+        )
+        .unwrap()
+        .is_err()
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let png = directory.path().join("sample.png");
+    std::fs::write(&png, include_bytes!("images/sample.png")).unwrap();
+    let mut host = Host::default();
+    host.assets.insert("assets/sample.png".into(), png.clone());
+    host.pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body><img></body>"),
+            dirty: false,
+        },
+    );
+    host.dom.entry(1).or_default().base = Some(url::Url::parse("apps:///page-0.html").unwrap());
+    let mut load = |source: &str| {
+        host.call(
+            Role::Renderer(1),
+            json!({"op":"dom.imageURL","args":[1, source]}),
+        )
+    };
+    assert_eq!(load("assets/sample.png").unwrap(), json!([4, 3]));
+    assert!(load("apps:///assets/missing.png").is_err());
+    assert!(load(png.to_str().unwrap()).is_err());
+    assert!(load(url::Url::from_file_path(&png).unwrap().as_str()).is_err());
+    assert!(host.pages[&1].dirty && host.dom[&1].images.contains_key(&1));
+    host.dom.get_mut(&1).unwrap().base =
+        Some(url::Url::from_directory_path(directory.path()).unwrap());
+    assert_eq!(
+        host.call(
+            Role::Renderer(1),
+            json!({"op":"dom.imageURL","args":[1, "sample.png"]})
+        )
+        .unwrap(),
+        json!([4, 3])
+    );
+}

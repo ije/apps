@@ -318,7 +318,12 @@ impl Canvas {
     }
 }
 
-pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<gpui::RenderImage>> {
+pub fn svg(
+    source: &str,
+    width: u32,
+    height: u32,
+    transform: Option<([f32; 2], [f32; 6])>,
+) -> Result<Arc<gpui::RenderImage>> {
     let tree = usvg::Tree::from_str(
         source,
         &usvg::Options {
@@ -328,9 +333,12 @@ pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<gpui::RenderImag
     )?;
     let mut pixels = skia::Pixmap::new(width, height).context("Cannot allocate SVG image")?;
     let size = tree.size();
+    let ([fit_width, fit_height], [a, b, c, d, e, f]) =
+        transform.unwrap_or(([width as f32, height as f32], [1., 0., 0., 1., 0., 0.]));
     resvg::render(
         &tree,
-        skia::Transform::from_scale(width as f32 / size.width(), height as f32 / size.height()),
+        skia::Transform::from_row(a, b, c, d, e, f)
+            .pre_scale(fit_width / size.width(), fit_height / size.height()),
         &mut pixels.as_mut(),
     );
     Ok(render_image(&pixels))
@@ -346,8 +354,13 @@ mod tests {
         canvas.draw(&[serde_json::json!({"op":"fillRect","x":0,"y":0,"width":2,"height":2,"fillStyle":"#ff0000","globalAlpha":0.5})]).unwrap();
         assert_eq!(&canvas.image.as_bytes(0).unwrap()[..4], &[0, 0, 255, 128]);
         assert_eq!(canvas.pixels.pixels()[0].red(), 128);
-        let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4).unwrap();
+        let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
         assert_eq!(u32::from(image.size(0).width), 4);
         assert_eq!(image.as_bytes(0).unwrap(), [0, 0, 255, 128].repeat(16));
+        let rotated = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
+        assert_eq!(
+            rotated.as_bytes(0).unwrap(),
+            [[0, 0, 255, 255], [255, 0, 0, 255]].concat()
+        );
     }
 }

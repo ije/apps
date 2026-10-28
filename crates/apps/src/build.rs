@@ -123,6 +123,11 @@ pub fn write_bundle(
                     assets.join(name),
                     apps_runtime::bundle::copy_native(&assets, source)?,
                 )?;
+            } else if name == "assets.json" {
+                fs::write(
+                    assets.join(name),
+                    apps_runtime::bundle::copy_assets(&assets, source)?,
+                )?;
             } else {
                 fs::write(assets.join(name), source)?;
             }
@@ -212,6 +217,7 @@ pub fn write_bundle(
                                 "app.h2o"
                                     | "deps.js"
                                     | "native.json"
+                                    | "assets.json"
                                     | "package.json"
                                     | ".apps-build"
                             )

@@ -1407,6 +1407,15 @@ pub fn compile(
     if !native.is_empty() {
         files.insert("native.json".into(), serde_json::to_string(&native)?);
     }
+    let assets: std::collections::BTreeMap<_, _> = builder
+        .files
+        .borrow()
+        .iter()
+        .filter_map(|path| Some((asset_name(path)?, path.clone())))
+        .collect();
+    if !assets.is_empty() {
+        files.insert("assets.json".into(), serde_json::to_string(&assets)?);
+    }
     if realm == Realm::Main {
         let root = entry.parent().context("Missing entry directory")?;
         let mut package = json!({});
@@ -1581,11 +1590,73 @@ fn resolve_file(path: &Path) -> Result<PathBuf> {
     bail!("Cannot resolve {}", path.display())
 }
 
+fn asset_name(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "svg"
+    ) {
+        return None;
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(path, &mut hasher);
+    Some(format!(
+        "assets/{:016x}.{extension}",
+        std::hash::Hasher::finish(&hasher)
+    ))
+}
+
+fn asset(
+    directory: &Path,
+    reference: &str,
+    files: &Rc<RefCell<BTreeSet<PathBuf>>>,
+) -> Option<String> {
+    let reference = reference.trim().trim_matches(['"', '\'']);
+    if reference.contains(':') || reference.starts_with(['/', '#']) {
+        return None;
+    }
+    let path = directory
+        .join(reference.split(['?', '#']).next()?)
+        .canonicalize()
+        .ok()?;
+    let name = asset_name(&path)?;
+    files.borrow_mut().insert(path);
+    Some(format!("apps:///{name}"))
+}
+
+fn urls(source: &str, directory: &Path, files: &Rc<RefCell<BTreeSet<PathBuf>>>) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("url(") {
+        let (head, tail) = rest.split_at(start + 4);
+        result.push_str(head);
+        let end = tail.find(')').unwrap_or(tail.len());
+        match asset(directory, &tail[..end], files) {
+            Some(url) => result.push_str(&format!("\"{url}\"")),
+            None => result.push_str(&tail[..end]),
+        }
+        rest = &tail[end..];
+    }
+    result.push_str(rest);
+    result
+}
+
 fn html(path: &Path, files: Rc<RefCell<BTreeSet<PathBuf>>>, production: bool) -> Result<String> {
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
     for node in &mut doc.nodes {
-        if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
+        if let Some(style) = node.attrs.get_mut("style") {
+            *style = urls(style, parent, &files);
+        }
+        if node.tag == "img"
+            && let Some(source) = node.attrs.get_mut("src")
+            && let Some(url) = asset(parent, source, &files)
+        {
+            *source = url;
+        }
+        if node.tag == "style" {
+            node.text = urls(&node.text, parent, &files);
+        } else if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
             ensure!(
                 !href.contains("://") && !href.starts_with("//"),
@@ -1660,7 +1731,11 @@ fn css(
     );
     stack.push(path.to_owned());
     files.borrow_mut().insert(path.to_owned());
-    let source = fs::read_to_string(path)?;
+    let source = urls(
+        &fs::read_to_string(path)?,
+        path.parent().context("Missing CSS directory")?,
+        files,
+    );
     let mut result = String::new();
     let mut rest = source.as_str();
     loop {
@@ -1961,6 +2036,59 @@ mod tests {
                 .iter()
                 .any(|item| item["source"] == source)
         );
+    }
+
+    #[test]
+    fn html_and_css_images_become_bundled_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("main.ts");
+        fs::write(
+            &entry,
+            "console.log(import.meta.resolve('./web/index.html'));",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("web/css")).unwrap();
+        fs::create_dir_all(dir.path().join("img")).unwrap();
+        fs::write(dir.path().join("img/logo.png"), b"png").unwrap();
+        fs::write(dir.path().join("img/icon.svg"), b"<svg/>").unwrap();
+        fs::write(
+            dir.path().join("web/css/style.css"),
+            ".a { background: url(\"../../img/icon.svg\") }",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("web/index.html"),
+            r#"<link rel="stylesheet" href="css/style.css"><style>.b{background:url(../img/logo.png)}.c{background:url(data:image/png;base64,AA==)}</style><img src="../img/logo.png"><img src="https://example.com/x.png"><div style="background-image:url('../img/missing.png')"></div>"#,
+        )
+        .unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), true).unwrap();
+        let assets: std::collections::BTreeMap<String, PathBuf> =
+            serde_json::from_str(&files["assets.json"]).unwrap();
+        assert_eq!(assets.len(), 2);
+        let logo = asset_name(&dir.path().join("img/logo.png").canonicalize().unwrap()).unwrap();
+        let icon = asset_name(&dir.path().join("img/icon.svg").canonicalize().unwrap()).unwrap();
+        assert!(logo.starts_with("assets/") && logo.ends_with(".png"));
+        assert_eq!(
+            assets[&icon],
+            dir.path().join("img/icon.svg").canonicalize().unwrap()
+        );
+        let page = &files["page-0.html"];
+        assert_eq!(page.matches(&format!("apps:///{logo}")).count(), 2);
+        assert!(page.contains(&format!("url(\"apps:///{icon}\")")));
+        assert!(
+            page.contains("https://example.com/x.png")
+                && page.contains("data:image/png;base64,AA==")
+        );
+        assert!(page.contains("../img/missing.png"));
+
+        let out = dir.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        apps_runtime::bundle::write(&out.join("app.h2o"), &files).unwrap();
+        assert_eq!(fs::read(out.join(&logo)).unwrap(), b"png");
+        let bundle = apps_runtime::bundle::read(&out).unwrap();
+        let resolved: std::collections::BTreeMap<String, PathBuf> =
+            serde_json::from_str(&bundle.files["assets.json"]).unwrap();
+        assert_eq!(resolved[&logo], out.canonicalize().unwrap().join(&logo));
     }
 
     #[test]

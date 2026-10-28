@@ -6,6 +6,8 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::HashMap, rc::Rc};
 
+pub(crate) type Rows = Rc<[(gpui::Pixels, gpui::Pixels)]>;
+
 pub(crate) struct LayoutNode {
     pub node: Node,
     pub style: Rc<render::Style>,
@@ -19,7 +21,8 @@ pub struct State {
     pub(crate) free: Vec<usize>,
     live: std::collections::HashSet<usize>,
     pub bounds: HashMap<usize, [f32; 4]>,
-    pub(crate) text_layouts: HashMap<usize, (gpui::TextLayout, Rc<str>, std::ops::Range<usize>)>,
+    pub(crate) text_layouts:
+        HashMap<usize, (gpui::TextLayout, Rc<str>, std::ops::Range<usize>, Rows)>,
     pub scroll: HashMap<usize, gpui::ScrollHandle>,
     scroll_offsets: HashMap<usize, gpui::Point<gpui::Pixels>>,
     pub(crate) computed: Option<Rc<render::ComputedStyles>>,
@@ -52,14 +55,34 @@ pub struct State {
     pub images: HashMap<usize, std::sync::Arc<gpui::RenderImage>>,
     pub shadows: HashMap<usize, usize>,
     pub(crate) svg_sources: HashMap<usize, ([f32; 2], String, String)>,
+    pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
+    pub(crate) svg_rasters: HashMap<u64, (std::sync::Arc<gpui::RenderImage>, u64)>,
+    pub(crate) svg_clock: u64,
+    pub(crate) image_crops: HashMap<usize, (u64, std::sync::Arc<gpui::RenderImage>)>,
     pub svgs: HashMap<usize, (String, std::sync::Arc<gpui::RenderImage>)>,
     pub backgrounds: HashMap<(usize, usize), (String, std::sync::Arc<gpui::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
     pub text_system: Option<std::sync::Arc<gpui::WindowTextSystem>>,
     pub pixel_ratio: f32,
+    pub(crate) linted: bool,
+    pub(crate) warned: std::collections::HashSet<String>,
+    pub(crate) motion: render::Motion,
+    pub(crate) containers: HashMap<usize, [f32; 2]>,
+    pub(crate) container_pass: bool,
+    pub(crate) anchors: HashMap<usize, gpui::Bounds<gpui::Pixels>>,
 }
 
 impl State {
+    pub(crate) fn update_containers(&mut self) -> bool {
+        let changed = self
+            .style_cache
+            .set_containers(std::mem::take(&mut self.containers));
+        if changed {
+            self.computed = None;
+        }
+        changed
+    }
+
     fn slots(&self, doc: &Document) -> HashMap<usize, Vec<usize>> {
         let mut slots = HashMap::new();
         for (&host, &root) in &self.shadows {
@@ -113,6 +136,47 @@ impl State {
         }
         id
     }
+}
+
+pub(crate) fn load_image(state: &mut State, id: usize, bytes: &[u8]) -> Result<Value> {
+    ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    state.dirty = true;
+    let mut pixels = match crate::images::decode(bytes, limits) {
+        Ok(image) => image.into_rgba8(),
+        Err(error) => {
+            let size = resvg::usvg::Tree::from_data(bytes, &Default::default())
+                .map_err(|_| error)?
+                .size();
+            state.images.remove(&id);
+            let text = if bytes.starts_with(&[0x1f, 0x8b]) {
+                resvg::usvg::decompress_svgz(bytes)?
+            } else {
+                bytes.to_vec()
+            };
+            state.svg_images.insert(
+                id,
+                (
+                    String::from_utf8_lossy(&text).into(),
+                    [size.width(), size.height()],
+                ),
+            );
+            return Ok(json!([size.width(), size.height()]));
+        }
+    };
+    let dimensions = [pixels.width(), pixels.height()];
+    for pixel in pixels.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    state.svg_images.remove(&id);
+    state.images.insert(
+        id,
+        std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(pixels)])),
+    );
+    Ok(json!(dimensions))
 }
 
 pub fn call(
@@ -252,7 +316,11 @@ pub fn call(
                     state.canvases.remove(&id);
                     state.svgs.remove(&id);
                     state.svg_sources.remove(&id);
+                    state.svg_images.remove(&id);
+                    state.image_crops.remove(&id);
                     state.shadows.remove(&id);
+                    state.motion.forget(id);
+                    state.anchors.remove(&id);
                     state.backgrounds.retain(|(node, _), _| *node != id);
                     if state.focus == Some(id) {
                         state.focus = None;
@@ -844,25 +912,7 @@ pub fn call(
                 }
                 Ok(crate::web::base64(&bytes))
             }
-            "dom.image" => {
-                let bytes = crate::web::bytes(&args[1])?;
-                ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
-                let mut limits = image::Limits::default();
-                limits.max_image_width = Some(16384);
-                limits.max_image_height = Some(16384);
-                limits.max_alloc = Some(256 * 1024 * 1024);
-                let mut pixels = crate::images::decode(&bytes, limits)?.into_rgba8();
-                let dimensions = [pixels.width(), pixels.height()];
-                for pixel in pixels.pixels_mut() {
-                    pixel.0.swap(0, 2);
-                }
-                state.images.insert(
-                    id,
-                    std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(pixels)])),
-                );
-                state.dirty = true;
-                Ok(json!(dimensions))
-            }
+            "dom.image" => load_image(state, id, &crate::web::bytes(&args[1])?),
             "dom.font" => {
                 let system = state
                     .text_system
@@ -959,23 +1009,30 @@ pub fn call(
                         json!(0)
                     });
                 };
-                if let Some((layout, text, range)) = state.text_layouts.get(&id) {
+                if let Some((layout, text, range, rows)) = state.text_layouts.get(&id) {
                     let content = &text[range.clone()];
                     if op == "dom.textIndex" {
                         let position = gpui::point(
                             gpui::px(args[1].as_f64().unwrap_or(0.) as f32),
                             gpui::px(args[2].as_f64().unwrap_or(0.) as f32),
                         );
-                        let index = layout
-                            .index_for_position(position)
+                        let index = crate::desktop::text_index(layout, rows, position)
                             .unwrap_or_else(|index| index)
                             .clamp(range.start, range.end);
                         return Ok(json!(text[range.start..index].encode_utf16().count()));
                     }
                     let start = args[1].as_u64().unwrap_or(0) as usize;
                     let end = args[2].as_u64().unwrap_or(start as u64) as usize;
-                    let a = layout.position_for_index(range.start + utf16_index(content, start));
-                    let b = layout.position_for_index(range.start + utf16_index(content, end));
+                    let a = crate::desktop::text_position(
+                        layout,
+                        rows,
+                        range.start + utf16_index(content, start),
+                    );
+                    let b = crate::desktop::text_position(
+                        layout,
+                        rows,
+                        range.start + utf16_index(content, end),
+                    );
                     return Ok(json!(
                         a.zip(b)
                             .map(|(a, b)| vec![[
@@ -1305,6 +1362,9 @@ pub(crate) fn styles(
                     if let Some(pseudos) = scoped.pseudos.remove(&child) {
                         result.pseudos.insert(child, pseudos);
                     }
+                    if let Some(pseudos) = scoped.text_pseudos.remove(&child) {
+                        result.text_pseudos.insert(child, pseudos);
+                    }
                     result.values[child] = std::mem::take(&mut scoped.values[child]);
                     result.lengths[child] = scoped.lengths[child];
                     children.extend(&doc.nodes[child].children);
@@ -1398,6 +1458,7 @@ pub(crate) fn styles(
     state.style_reduced_motion = reduced_motion;
     state.style_theme = theme;
     let result = Rc::new(result);
+    state.linted = false;
     state.computed = Some(result.clone());
     result
 }

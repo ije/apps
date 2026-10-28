@@ -204,6 +204,68 @@ impl<'i> AtRuleParser<'i> for Rules {
             source(input, &mut value)?;
             return Ok(Item::Rule(Rule::Supports(value, supported, Vec::new())));
         }
+        if name.eq_ignore_ascii_case("container") && !self.declarations_only {
+            let container = input
+                .try_parse(|input| -> Result<String, ParseError<()>> {
+                    let name = input.expect_ident_cloned()?;
+                    if ["not", "and", "or", "none"]
+                        .iter()
+                        .any(|word| name.eq_ignore_ascii_case(word))
+                    {
+                        return Err(ParseError::unexpected_token());
+                    }
+                    Ok(name.to_string())
+                })
+                .ok();
+            let mut query = condition(input, true, false)?;
+            input.expect_exhausted()?;
+            let mut block = false;
+            let mut pending = vec![&mut query];
+            while let Some(query) = pending.pop() {
+                let replaced = match query {
+                    MediaQuery::Not(inner) => {
+                        pending.push(inner);
+                        continue;
+                    }
+                    MediaQuery::And(items) | MediaQuery::Or(items) => {
+                        pending.extend(items.iter_mut());
+                        continue;
+                    }
+                    MediaQuery::Feature(name, op, value) => match name.as_str() {
+                        "width" | "inline-size" => {
+                            *name = "width".into();
+                            continue;
+                        }
+                        "height" | "block-size" | "aspect-ratio" => {
+                            block = true;
+                            if name == "block-size" {
+                                *name = "height".into();
+                            }
+                            continue;
+                        }
+                        "orientation"
+                            if op == ":" && matches!(value.as_str(), "portrait" | "landscape") =>
+                        {
+                            block = true;
+                            MediaQuery::Feature(
+                                "aspect-ratio".into(),
+                                if value == "portrait" { "<=" } else { ">" }.into(),
+                                "1".into(),
+                            )
+                        }
+                        _ => MediaQuery::Unknown(format!("({name}{op}{value})")),
+                    },
+                    _ => continue,
+                };
+                *query = replaced;
+            }
+            return Ok(Item::Rule(Rule::Container(
+                container,
+                block,
+                query,
+                Vec::new(),
+            )));
+        }
         if name.eq_ignore_ascii_case("media") && !self.declarations_only {
             let queries = if input.is_exhausted() {
                 Vec::new()
@@ -300,6 +362,16 @@ impl<'i> AtRuleParser<'i> for Rules {
             ),
             Item::Rule(Rule::Media(queries, _)) => Rule::Media(
                 queries,
+                Rules {
+                    parent: self.parent.clone(),
+                    ..Rules::default()
+                }
+                .body(input),
+            ),
+            Item::Rule(Rule::Container(name, block, query, _)) => Rule::Container(
+                name,
+                block,
+                query,
                 Rules {
                     parent: self.parent.clone(),
                     ..Rules::default()
