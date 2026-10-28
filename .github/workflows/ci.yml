@@ -1,0 +1,53 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.arch == 'X64'
+        uses: ilammy/setup-nasm@v1
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev xvfb xauth
+      - uses: actions/cache@v4
+        id: jsc
+        with:
+          path: target/bun-jsc
+          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch') }}
+      - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+      - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          vcpkg install icu:x64-windows-static-md
+          bash scripts/build-jsc.sh -- -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DICU_ROOT=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md"
+      - if: runner.os == 'Linux' && steps.jsc.outputs.cache-hit != 'true'
+        run: bash scripts/build-jsc.sh -- -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19
+      - if: runner.os == 'macOS' && steps.jsc.outputs.cache-hit != 'true'
+        run: bash scripts/build-jsc.sh
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --locked
+      - if: runner.os != 'Windows'
+        run: cargo test --workspace --locked
+      - if: runner.os == 'Windows'
+        run: cargo test -p apps --test build --locked
+      - if: runner.os == 'Windows'
+        run: cargo test -p apps-runtime --test images --locked
+      - if: runner.os == 'Windows'
+        run: cargo test -p apps-runtime --lib jsc::tests::contexts_isolate_privileges_and_share_dom_only --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a cargo test -p apps-webview --lib wry::tests::system_webview --locked -- --ignored --test-threads=1
+        env:
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+      - if: runner.os == 'Windows'
+        run: cargo test -p apps-webview --lib wry::tests::system_webview --locked -- --ignored --test-threads=1

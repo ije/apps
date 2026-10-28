@@ -1,0 +1,453 @@
+#import <AppKit/AppKit.h>
+#import <Security/Security.h>
+#import <CommonCrypto/CommonCrypto.h>
+#import <UserNotifications/UserNotifications.h>
+#import <Carbon/Carbon.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <errno.h>
+
+bool apps_reduce_motion(void) { return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion; }
+
+static NSString *AppsThemeSource = @"system";
+static void (*AppsThemeWake)(void);
+static _Atomic(uint32_t) AppsThemeCache = UINT32_MAX;
+
+static uint32_t AppsReadTheme(void) {
+    NSWorkspace *workspace = NSWorkspace.sharedWorkspace;
+    NSAppearance *appearance = NSApp.effectiveAppearance ?: NSAppearance.currentDrawingAppearance;
+    BOOL dark = [AppsThemeSource isEqual:@"dark"] || ([AppsThemeSource isEqual:@"system"] && [[appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] isEqual:NSAppearanceNameDarkAqua]);
+    return dark | (workspace.accessibilityDisplayShouldIncreaseContrast << 1)
+        | (workspace.accessibilityDisplayShouldInvertColors << 2)
+        | (workspace.accessibilityDisplayShouldReduceTransparency << 3)
+        | (workspace.accessibilityDisplayShouldDifferentiateWithoutColor << 4)
+        | (workspace.accessibilityDisplayShouldReduceMotion << 5);
+}
+
+uint32_t apps_theme_state(void) {
+    uint32_t state = atomic_load_explicit(&AppsThemeCache, memory_order_relaxed);
+    return state == UINT32_MAX ? AppsReadTheme() : state;
+}
+
+static NSString *AppsString(const char *text) { return text ? [NSString stringWithUTF8String:text] : @""; }
+static NSString *AppsJSON(id value) {
+    if (!value) value = [NSNull null];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingFragmentsAllowed error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"null";
+}
+static id AppsValue(const char *text) {
+    NSData *data = [AppsString(text) dataUsingEncoding:NSUTF8StringEncoding];
+    return [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
+}
+
+static NSData *AppsSecret(OSStatus *status) {
+    NSString *service = [NSBundle.mainBundle.bundleIdentifier ?: @"org.apps.runtime" stringByAppendingString:@".safe-storage"];
+    NSDictionary *query = @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword, (__bridge id)kSecAttrService: service, (__bridge id)kSecAttrAccount: @"encryption-key", (__bridge id)kSecReturnData: @YES };
+    CFTypeRef existing = NULL;
+    *status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &existing);
+    if (*status == errSecSuccess) return CFBridgingRelease(existing);
+    if (*status != errSecItemNotFound) return nil;
+    NSMutableData *secret = [NSMutableData dataWithLength:64];
+    *status = SecRandomCopyBytes(kSecRandomDefault, secret.length, secret.mutableBytes);
+    if (*status != errSecSuccess) return nil;
+    NSMutableDictionary *item = [query mutableCopy];
+    [item removeObjectForKey:(__bridge id)kSecReturnData];
+    item[(__bridge id)kSecValueData] = secret;
+    item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    *status = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
+    if (*status == errSecDuplicateItem) {
+        *status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &existing);
+        return *status == errSecSuccess ? CFBridgingRelease(existing) : nil;
+    }
+    return *status == errSecSuccess ? secret : nil;
+}
+
+static NSMutableArray *AppsNativeEvents(void) {
+    static NSMutableArray *events;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ events = [NSMutableArray new]; });
+    return events;
+}
+static void AppsNativeEmit(NSDictionary *event) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableArray *events = AppsNativeEvents();
+        if (events.count >= 4096) [events removeObjectAtIndex:0];
+        [events addObject:event];
+        if ([event[@"type"] isEqual:@"theme"] && AppsThemeWake) AppsThemeWake();
+    });
+}
+
+@interface AppsNative : NSObject <UNUserNotificationCenterDelegate>
+@property(nonatomic, strong) NSMutableDictionary *hotkeys;
+@property(nonatomic) int lockFD;
+@property(nonatomic, copy) NSString *instanceNotice;
+@property(nonatomic) uint32_t themeState;
+- (void)menuAction:(NSMenuItem *)item;
+- (void)keyAction:(NSMenuItem *)item;
+- (void)themeChanged:(NSNotification *)notification;
+- (void)powerChanged:(NSNotification *)notification;
+- (void)secondInstance:(NSNotification *)notification;
+- (void)openURL:(NSAppleEventDescriptor *)event reply:(NSAppleEventDescriptor *)reply;
+@end
+@implementation AppsNative
+- (void)secondInstance:(NSNotification *)notification {
+    if (self.lockFD < 0) return;
+    NSString *message = notification.userInfo[@"message"];
+    if (![message isKindOfClass:[NSString class]]) return;
+    id value = AppsValue(message.UTF8String);
+    if ([value isKindOfClass:[NSDictionary class]]) AppsNativeEmit(@{ @"type": @"app", @"event": @"second-instance", @"args": value[@"argv"] ?: @[], @"cwd": value[@"cwd"] ?: @"", @"data": value[@"data"] ?: [NSNull null] });
+}
+- (void)openURL:(NSAppleEventDescriptor *)event reply:(NSAppleEventDescriptor *)reply {
+    NSString *url = [event paramDescriptorForKeyword:keyDirectObject].stringValue;
+    if (url) AppsNativeEmit(@{ @"type": @"app", @"event": @"open-url", @"url": url });
+}
+- (void)menuAction:(NSMenuItem *)item {
+    if ([item.representedObject isEqual:@"checkbox"]) item.state = item.state == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn;
+    AppsNativeEmit(@{ @"type": @"menu", @"id": @(item.tag), @"checked": @(item.state == NSControlStateValueOn) });
+}
+- (void)keyAction:(NSMenuItem *)item {
+    NSArray *command = item.representedObject;
+    if ([command[0] length] && [NSApp sendAction:NSSelectorFromString(command[0]) to:nil from:item]) return;
+    NSWindow *window = NSApp.keyWindow;
+    NSResponder *responder = [command[2] boolValue] ? window.contentView : window.firstResponder;
+    if (![responder isKindOfClass:NSClassFromString(@"GPUIView")]) return;
+    NSArray *key = command[1];
+    NSString *text = [key[0] isEqual:@"backspace"] ? @"\177" : key[0];
+    NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:[key[1] unsignedIntegerValue] timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:[key[2] unsignedShortValue]];
+    [responder performKeyEquivalent:event];
+}
+- (void)themeChanged:(NSNotification *)notification {
+    uint32_t state = AppsReadTheme();
+    if (state == self.themeState) return;
+    self.themeState = state;
+    if (atomic_load_explicit(&AppsThemeCache, memory_order_relaxed) != UINT32_MAX) atomic_store_explicit(&AppsThemeCache, state, memory_order_relaxed);
+    AppsNativeEmit(@{ @"type": @"theme" });
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    [self themeChanged:nil];
+}
+- (void)powerChanged:(NSNotification *)notification {
+    NSDictionary *events = @{ NSWorkspaceWillSleepNotification: @"suspend", NSWorkspaceDidWakeNotification: @"resume", NSWorkspaceWillPowerOffNotification: @"shutdown", NSProcessInfoThermalStateDidChangeNotification: @"thermal-state-change" };
+    NSString *event = events[notification.name];
+    if (event) AppsNativeEmit(@{ @"type": @"power", @"event": event });
+}
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completionHandler {
+    AppsNativeEmit(@{ @"type": @"notification", @"id": response.notification.request.identifier, @"event": @"click" });
+    completionHandler();
+}
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
+    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+}
+@end
+
+static OSStatus AppsHotkey(EventHandlerCallRef handler, EventRef event, void *data) {
+    (void)handler; (void)data;
+    EventHotKeyID key;
+    OSStatus status = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(key), NULL, &key);
+    if (status == noErr) AppsNativeEmit(@{ @"type": @"shortcut", @"id": @(key.id) });
+    return status;
+}
+
+static AppsNative *AppsNativeOwner(void) {
+    static AppsNative *owner;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        owner = [AppsNative new];
+        owner.lockFD = -1;
+        owner.hotkeys = [NSMutableDictionary new];
+        owner.themeState = apps_theme_state();
+        [[NSAppleEventManager sharedAppleEventManager] setEventHandler:owner andSelector:@selector(openURL:reply:) forEventClass:kInternetEventClass andEventID:kAEGetURL];
+        [[NSDistributedNotificationCenter defaultCenter] addObserver:owner selector:@selector(themeChanged:) name:@"AppleInterfaceThemeChangedNotification" object:nil];
+        [NSWorkspace.sharedWorkspace.notificationCenter addObserver:owner selector:@selector(themeChanged:) name:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification object:nil];
+        for (NSString *name in @[NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification, NSWorkspaceWillPowerOffNotification]) [[NSWorkspace sharedWorkspace].notificationCenter addObserver:owner selector:@selector(powerChanged:) name:name object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:owner selector:@selector(powerChanged:) name:NSProcessInfoThermalStateDidChangeNotification object:nil];
+        EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
+        InstallApplicationEventHandler(AppsHotkey, 1, &type, NULL, NULL);
+    });
+    return owner;
+}
+
+void apps_theme_observe(void (*wake)(void)) {
+    AppsThemeWake = wake;
+    NSApp.appearance = [AppsThemeSource isEqual:@"system"] ? nil : [NSAppearance appearanceNamed:[AppsThemeSource isEqual:@"dark"] ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+    AppsNative *owner = AppsNativeOwner();
+    atomic_store_explicit(&AppsThemeCache, owner.themeState, memory_order_relaxed);
+    [NSApp addObserver:owner forKeyPath:@"effectiveAppearance" options:0 context:NULL];
+    [owner themeChanged:nil];
+}
+
+static NSArray *AppsAccelerator(NSString *accelerator) {
+    NSArray *parts = [accelerator componentsSeparatedByString:@"+"];
+    NSString *key = [parts.lastObject lowercaseString];
+    NSUInteger modifiers = 0;
+    for (NSUInteger i = 0; i + 1 < parts.count; i++) {
+        NSString *part = [parts[i] lowercaseString];
+        if ([@[@"command", @"cmd", @"commandorcontrol", @"cmdorctrl", @"super"] containsObject:part]) modifiers |= NSEventModifierFlagCommand;
+        else if ([@[@"control", @"ctrl"] containsObject:part]) modifiers |= NSEventModifierFlagControl;
+        else if ([@[@"alt", @"option"] containsObject:part]) modifiers |= NSEventModifierFlagOption;
+        else if ([part isEqual:@"shift"]) modifiers |= NSEventModifierFlagShift;
+        else return nil;
+    }
+    NSDictionary *keys = @{ @"plus": @(kVK_ANSI_Equal), @"num0": @(kVK_ANSI_Keypad0), @"numadd": @(kVK_ANSI_KeypadPlus), @"numsub": @(kVK_ANSI_KeypadMinus), @"a": @(kVK_ANSI_A), @"b": @(kVK_ANSI_B), @"c": @(kVK_ANSI_C), @"d": @(kVK_ANSI_D), @"e": @(kVK_ANSI_E), @"f": @(kVK_ANSI_F), @"g": @(kVK_ANSI_G), @"h": @(kVK_ANSI_H), @"i": @(kVK_ANSI_I), @"j": @(kVK_ANSI_J), @"k": @(kVK_ANSI_K), @"l": @(kVK_ANSI_L), @"m": @(kVK_ANSI_M), @"n": @(kVK_ANSI_N), @"o": @(kVK_ANSI_O), @"p": @(kVK_ANSI_P), @"q": @(kVK_ANSI_Q), @"r": @(kVK_ANSI_R), @"s": @(kVK_ANSI_S), @"t": @(kVK_ANSI_T), @"u": @(kVK_ANSI_U), @"v": @(kVK_ANSI_V), @"w": @(kVK_ANSI_W), @"x": @(kVK_ANSI_X), @"y": @(kVK_ANSI_Y), @"z": @(kVK_ANSI_Z), @"0": @(kVK_ANSI_0), @"1": @(kVK_ANSI_1), @"2": @(kVK_ANSI_2), @"3": @(kVK_ANSI_3), @"4": @(kVK_ANSI_4), @"5": @(kVK_ANSI_5), @"6": @(kVK_ANSI_6), @"7": @(kVK_ANSI_7), @"8": @(kVK_ANSI_8), @"9": @(kVK_ANSI_9), @"space": @(kVK_Space), @"enter": @(kVK_Return), @"return": @(kVK_Return), @"escape": @(kVK_Escape), @"esc": @(kVK_Escape), @"tab": @(kVK_Tab), @"backspace": @(kVK_Delete), @"delete": @(kVK_ForwardDelete), @"up": @(kVK_UpArrow), @"down": @(kVK_DownArrow), @"left": @(kVK_LeftArrow), @"right": @(kVK_RightArrow), @"f1": @(kVK_F1), @"f2": @(kVK_F2), @"f3": @(kVK_F3), @"f4": @(kVK_F4), @"f5": @(kVK_F5), @"f6": @(kVK_F6), @"f7": @(kVK_F7), @"f8": @(kVK_F8), @"f9": @(kVK_F9), @"f10": @(kVK_F10), @"f11": @(kVK_F11), @"f12": @(kVK_F12), @"-": @(kVK_ANSI_Minus), @"=": @(kVK_ANSI_Equal), @",": @(kVK_ANSI_Comma), @".": @(kVK_ANSI_Period), @"/": @(kVK_ANSI_Slash), @"[": @(kVK_ANSI_LeftBracket), @"]": @(kVK_ANSI_RightBracket), @";": @(kVK_ANSI_Semicolon) };
+    if (!keys[key]) return nil;
+    return @[key, @(modifiers), keys[key]];
+}
+
+static NSMenu *AppsMenu(NSArray *template) {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+    NSDictionary *roles = @{ @"about": @"orderFrontStandardAboutPanel:", @"hide": @"hide:", @"hideOthers": @"hideOtherApplications:", @"unhide": @"unhideAllApplications:", @"delete": @"delete:", @"startSpeaking": @"startSpeaking:", @"stopSpeaking": @"stopSpeaking:", @"front": @"arrangeInFront:", @"quit": @"terminate:", @"copy": @"copy:", @"paste": @"paste:", @"pasteAndMatchStyle": @"pasteAsPlainText:", @"cut": @"cut:", @"selectAll": @"selectAll:", @"undo": @"undo:", @"redo": @"redo:", @"minimize": @"performMiniaturize:", @"zoom": @"performZoom:", @"close": @"performClose:", @"togglefullscreen": @"toggleFullScreen:", @"toggleDevTools": @"keyAction:" };
+    NSDictionary *keys = @{ @"copy": @"Command+C", @"cut": @"Command+X", @"paste": @"Command+V", @"pasteAndMatchStyle": @"Command+V", @"selectAll": @"Command+A", @"undo": @"Command+Z", @"redo": @"Command+Shift+Z", @"delete": @"Backspace", @"toggleDevTools": @"Command+Alt+I" };
+    for (NSDictionary *__strong description in template) {
+        if ([description[@"type"] isEqual:@"separator"]) { [menu addItem:[NSMenuItem separatorItem]]; continue; }
+        NSString *role = description[@"role"];
+        BOOL windows = [role isEqual:@"windowMenu"], help = [role isEqual:@"help"];
+        if (windows) {
+            if (!description[@"submenu"]) description = @{ @"label": @"Window", @"submenu": @[@{ @"label": @"Minimize", @"role": @"minimize", @"accelerator": @"Command+M" }, @{ @"label": @"Zoom", @"role": @"zoom" }, @{ @"type": @"separator" }, @{ @"label": @"Bring All to Front", @"role": @"front" }] };
+            role = nil;
+        }
+        BOOL services = [role isEqual:@"services"];
+        if ([role isEqual:@"help"] && description[@"submenu"]) role = nil;
+        if (role && !services && !roles[role] && !description[@"click"]) return nil;
+        if (role && !roles[role]) role = nil;
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:description[@"label"] ?: description[@"role"] ?: @"" action:role ? NSSelectorFromString(roles[role]) : @selector(menuAction:) keyEquivalent:@""];
+        if (!role) { item.target = AppsNativeOwner(); item.tag = [description[@"click"] integerValue]; }
+        if (description[@"accelerator"]) {
+            NSArray *accelerator = AppsAccelerator(description[@"accelerator"]);
+            if (!accelerator) return nil;
+            NSString *key = accelerator[0];
+            if ([key isEqual:@"space"]) key = @" ";
+            if ([key isEqual:@"enter"] || [key isEqual:@"return"]) key = @"\r";
+            if ([key isEqual:@"plus"] || [key isEqual:@"numadd"]) key = @"+";
+            if ([key isEqual:@"numsub"]) key = @"-";
+            if ([key isEqual:@"num0"]) key = @"0";
+            if ([key hasPrefix:@"f"] && key.length > 1 && [[key substringFromIndex:1] integerValue] > 0) { unichar value = NSF1FunctionKey + [[key substringFromIndex:1] intValue] - 1; key = [NSString stringWithCharacters:&value length:1]; }
+            item.keyEquivalent = key;
+            item.keyEquivalentModifierMask = [accelerator[1] unsignedIntegerValue];
+        }
+        item.enabled = description[@"enabled"] ? [description[@"enabled"] boolValue] : YES;
+        item.hidden = description[@"visible"] ? ![description[@"visible"] boolValue] : NO;
+        item.state = [description[@"checked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+        item.representedObject = description[@"type"];
+        if (role && keys[role]) {
+            item.target = AppsNativeOwner();
+            item.action = @selector(keyAction:);
+            item.representedObject = @[[role isEqual:@"toggleDevTools"] ? @"" : roles[role], AppsAccelerator(keys[role]), @([role isEqual:@"toggleDevTools"])];
+        }
+        if (services) { item.submenu = [[NSMenu alloc] initWithTitle:@"Services"]; NSApp.servicesMenu = item.submenu; }
+        if (description[@"submenu"]) {
+            item.submenu = AppsMenu(description[@"submenu"]);
+            if (!item.submenu) return nil;
+            item.submenu.title = item.title;
+            if (windows) NSApp.windowsMenu = item.submenu;
+            if (help) NSApp.helpMenu = item.submenu;
+        }
+        [menu addItem:item];
+    }
+    return menu;
+}
+
+char *apps_native_call(const char *operation, const char *argumentsJSON) {
+    NSString *op = AppsString(operation);
+    id args = AppsValue(argumentsJSON);
+    id result = [NSNull null];
+    if (![NSThread isMainThread]) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
+    if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
+    if ([op isEqualToString:@"poll"]) { result = [AppsNativeEvents() copy]; [AppsNativeEvents() removeAllObjects]; }
+    else if ([op isEqualToString:@"app.events"]) AppsNativeOwner();
+    else if ([op isEqualToString:@"app.singleInstance"]) {
+        AppsNative *owner = AppsNativeOwner();
+        if (owner.lockFD >= 0) result = @YES;
+        else {
+            NSData *identifier = [args[@"id"] dataUsingEncoding:NSUTF8StringEncoding];
+            unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+            CCHmac(kCCHmacAlgSHA256, "apps-instance", sizeof("apps-instance"), identifier.bytes, identifier.length, digest);
+            NSMutableString *name = [NSMutableString stringWithString:@"org.apps.instance."];
+            for (size_t i = 0; i < sizeof(digest); i++) [name appendFormat:@"%02x", digest[i]];
+            if (owner.instanceNotice) [[NSDistributedNotificationCenter defaultCenter] removeObserver:owner name:owner.instanceNotice object:nil];
+            owner.instanceNotice = name;
+            [[NSDistributedNotificationCenter defaultCenter] addObserver:owner selector:@selector(secondInstance:) name:name object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+            NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+            int fd = open(path.fileSystemRepresentation, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (fd < 0) return strdup("{\"error\":\"Cannot open application instance lock\"}");
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) { owner.lockFD = fd; result = @YES; }
+            else {
+                int failure = errno; close(fd);
+                if (failure != EWOULDBLOCK) return strdup("{\"error\":\"Cannot lock application instance\"}");
+                [[NSDistributedNotificationCenter defaultCenter] postNotificationName:name object:nil userInfo:@{ @"message": AppsJSON(args) } deliverImmediately:YES];
+                result = @NO;
+            }
+        }
+    } else if ([op isEqualToString:@"app.releaseInstance"]) {
+        AppsNative *owner = AppsNativeOwner();
+        if (owner.lockFD >= 0) { flock(owner.lockFD, LOCK_UN); close(owner.lockFD); owner.lockFD = -1; }
+    } else if ([op isEqualToString:@"app.hasInstance"]) result = @(AppsNativeOwner().lockFD >= 0);
+    else if ([op isEqualToString:@"power.init"]) AppsNativeOwner();
+    else if ([op isEqualToString:@"power.idle"]) result = @(CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGAnyInputEventType));
+    else if ([op isEqualToString:@"power.thermal"]) result = @[@"nominal", @"fair", @"serious", @"critical"][MIN(3, MAX(0, NSProcessInfo.processInfo.thermalState))];
+    else if ([op isEqualToString:@"power.battery"]) {
+        CFTypeRef info = IOPSCopyPowerSourcesInfo();
+        result = @(info && CFEqual(IOPSGetProvidingPowerSourceType(info), CFSTR(kIOPSBatteryPowerValue)));
+        if (info) CFRelease(info);
+    }
+    else if ([op isEqualToString:@"menu.set"]) {
+        NSMenu *menu = args == [NSNull null] ? nil : AppsMenu(args);
+        if (args != [NSNull null] && !menu) return strdup("{\"error\":\"Unsupported menu role or accelerator\"}");
+        NSApp.mainMenu = menu;
+    } else if ([op isEqualToString:@"menu.popup"]) {
+        NSMenu *menu = AppsMenu(args[@"template"]);
+        if (!menu) return strdup("{\"error\":\"Unsupported menu role or accelerator\"}");
+        NSView *view = NSApp.keyWindow.contentView;
+        NSPoint point = args[@"x"] && args[@"y"] ? NSMakePoint([args[@"x"] doubleValue], [args[@"y"] doubleValue]) : [view convertPoint:NSApp.keyWindow.mouseLocationOutsideOfEventStream fromView:nil];
+        if (view && !view.isFlipped && args[@"y"]) point.y = view.bounds.size.height - point.y;
+        [menu popUpMenuPositioningItem:nil atLocation:point inView:view];
+    } else if ([op isEqualToString:@"shortcut.register"]) {
+        NSArray *accelerator = AppsAccelerator(args[@"accelerator"]);
+        if (!accelerator) return strdup("{\"error\":\"Unsupported shortcut accelerator\"}");
+        NSUInteger flags = [accelerator[1] unsignedIntegerValue];
+        UInt32 modifiers = (flags & NSEventModifierFlagCommand ? cmdKey : 0) | (flags & NSEventModifierFlagControl ? controlKey : 0) | (flags & NSEventModifierFlagOption ? optionKey : 0) | (flags & NSEventModifierFlagShift ? shiftKey : 0);
+        EventHotKeyRef hotkey = NULL;
+        EventHotKeyID key = { 'apps', [args[@"id"] unsignedIntValue] };
+        AppsNative *owner = AppsNativeOwner();
+        OSStatus status = RegisterEventHotKey([accelerator[2] unsignedIntValue], modifiers, key, GetApplicationEventTarget(), 0, &hotkey);
+        if (status == noErr) owner.hotkeys[args[@"id"]] = [NSValue valueWithPointer:hotkey];
+        result = @(status == noErr);
+    } else if ([op isEqualToString:@"shortcut.unregister"]) {
+        NSValue *hotkey = AppsNativeOwner().hotkeys[args];
+        if (hotkey) { UnregisterEventHotKey(hotkey.pointerValue); [AppsNativeOwner().hotkeys removeObjectForKey:args]; }
+    } else if ([op isEqualToString:@"clipboard.readText"]) result = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString] ?: @"";
+    else if ([op isEqualToString:@"clipboard.readHTML"]) result = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeHTML] ?: @"";
+    else if ([op isEqualToString:@"clipboard.writeText"] || [op isEqualToString:@"clipboard.writeHTML"]) {
+        NSPasteboard *board = [NSPasteboard generalPasteboard];
+        [board clearContents];
+        [board setString:args forType:[op hasSuffix:@"Text"] ? NSPasteboardTypeString : NSPasteboardTypeHTML];
+    } else if ([op isEqualToString:@"clipboard.clear"]) [[NSPasteboard generalPasteboard] clearContents];
+    else if ([op isEqualToString:@"shell.openExternal"]) {
+        NSURL *url = [NSURL URLWithString:args];
+        if (!url || ![@[@"http", @"https", @"mailto", @"tel"] containsObject:url.scheme.lowercaseString]) return strdup("{\"error\":\"Unsupported external URL scheme\"}");
+        result = @([[NSWorkspace sharedWorkspace] openURL:url]);
+    } else if ([op isEqualToString:@"shell.openPath"]) result = @([[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:args]]);
+    else if ([op isEqualToString:@"shell.showItemInFolder"]) {
+        NSURL *url = [NSURL fileURLWithPath:args];
+        if (!url) return strdup("{\"error\":\"Expected a file path\"}");
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]];
+    }
+    else if ([op isEqualToString:@"theme.get"]) {
+        AppsNativeOwner();
+        uint32_t state = apps_theme_state();
+        result = @{ @"themeSource": AppsThemeSource, @"shouldUseDarkColors": @((BOOL)((state & 1) != 0)),
+            @"shouldUseHighContrastColors": @((BOOL)((state & 2) != 0)), @"shouldUseInvertedColorScheme": @((BOOL)((state & 4) != 0)),
+            @"shouldUseDarkColorsForSystemIntegratedUI": @((BOOL)((state & 1) != 0)), @"inForcedColorsMode": @NO,
+            @"prefersReducedTransparency": @((BOOL)((state & 8) != 0)), @"shouldDifferentiateWithoutColor": @((BOOL)((state & 16) != 0)) };
+    }
+    else if ([op isEqualToString:@"theme.set"]) {
+        AppsNative *owner = AppsNativeOwner();
+        AppsThemeSource = [args copy];
+        NSApp.appearance = [args isEqual:@"system"] ? nil : [NSAppearance appearanceNamed:[args isEqual:@"dark"] ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+        [owner themeChanged:nil];
+    }
+    else if ([op hasPrefix:@"safeStorage."]) {
+        OSStatus status;
+        NSData *secret = AppsSecret(&status);
+        if ([op isEqualToString:@"safeStorage.available"]) result = @(secret.length == 64);
+        else {
+            if (secret.length != 64) return strdup(AppsJSON(@{ @"error": [NSString stringWithFormat:@"Keychain access failed (%d)", (int)status] }).UTF8String);
+            const unsigned char *key = secret.bytes;
+            if ([op isEqualToString:@"safeStorage.encrypt"]) {
+                NSData *plain = [args dataUsingEncoding:NSUTF8StringEncoding];
+                NSMutableData *encrypted = [NSMutableData dataWithLength:20 + plain.length + kCCBlockSizeAES128];
+                unsigned char *bytes = encrypted.mutableBytes;
+                memcpy(bytes, "APPS", 4);
+                if (SecRandomCopyBytes(kSecRandomDefault, 16, bytes + 4) != errSecSuccess) return strdup("{\"error\":\"Secure randomness failed\"}");
+                size_t written = 0;
+                CCCryptorStatus cryptStatus = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding, key, 32, bytes + 4, plain.bytes, plain.length, bytes + 20, encrypted.length - 20, &written);
+                if (cryptStatus != kCCSuccess) return strdup("{\"error\":\"Encryption failed\"}");
+                encrypted.length = 20 + written;
+                unsigned char mac[CC_SHA256_DIGEST_LENGTH];
+                CCHmac(kCCHmacAlgSHA256, key + 32, 32, encrypted.bytes, encrypted.length, mac);
+                [encrypted appendBytes:mac length:sizeof(mac)];
+                result = [encrypted base64EncodedStringWithOptions:0];
+            } else if ([op isEqualToString:@"safeStorage.decrypt"]) {
+                NSData *encrypted = [[NSData alloc] initWithBase64EncodedString:args options:0];
+                const unsigned char *bytes = encrypted.bytes;
+                if (encrypted.length < 68 || memcmp(bytes, "APPS", 4)) return strdup("{\"error\":\"Invalid encrypted data\"}");
+                unsigned char mac[CC_SHA256_DIGEST_LENGTH];
+                CCHmac(kCCHmacAlgSHA256, key + 32, 32, bytes, encrypted.length - sizeof(mac), mac);
+                unsigned char difference = 0;
+                for (size_t i = 0; i < sizeof(mac); i++) difference |= mac[i] ^ bytes[encrypted.length - sizeof(mac) + i];
+                if (difference) return strdup("{\"error\":\"Encrypted data authentication failed\"}");
+                NSMutableData *plain = [NSMutableData dataWithLength:encrypted.length];
+                size_t written = 0;
+                CCCryptorStatus cryptStatus = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding, key, 32, bytes + 4, bytes + 20, encrypted.length - 52, plain.mutableBytes, plain.length, &written);
+                if (cryptStatus != kCCSuccess) return strdup("{\"error\":\"Decryption failed\"}");
+                plain.length = written;
+                result = [[NSString alloc] initWithData:plain encoding:NSUTF8StringEncoding];
+                if (!result) return strdup("{\"error\":\"Decrypted data is not UTF-8\"}");
+            } else return strdup("{\"error\":\"Unknown secure storage operation\"}");
+        }
+    }
+    else if ([op isEqualToString:@"notification.show"]) {
+        if (!NSBundle.mainBundle.bundleIdentifier) return strdup("{\"error\":\"Notifications require an app bundle identifier\"}");
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        center.delegate = AppsNativeOwner();
+        UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+        content.title = args[@"title"] ?: @"";
+        content.body = args[@"body"] ?: @"";
+        if (![args[@"silent"] boolValue]) content.sound = [UNNotificationSound defaultSound];
+        NSString *identifier = args[@"id"] ?: NSUUID.UUID.UUIDString;
+        [center requestAuthorizationWithOptions:UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge completionHandler:^(BOOL granted, NSError *error) {
+            if (!granted || error) { AppsNativeEmit(@{ @"type": @"notification", @"id": identifier, @"event": @"error", @"error": error.localizedDescription ?: @"Notification permission denied" }); return; }
+            [center addNotificationRequest:[UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil] withCompletionHandler:^(NSError *failure) {
+                AppsNativeEmit(failure ? @{ @"type": @"notification", @"id": identifier, @"event": @"error", @"error": failure.localizedDescription } : @{ @"type": @"notification", @"id": identifier, @"event": @"show" });
+            }];
+        }];
+        result = identifier;
+    } else if ([op isEqualToString:@"notification.close"]) [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[args]];
+    else if ([op isEqualToString:@"app.badge"]) NSApp.dockTile.badgeLabel = [args integerValue] > 0 ? [args stringValue] : nil;
+    else if ([op isEqualToString:@"dialog.open"]) {
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        NSArray *properties = args[@"properties"] ?: @[@"openFile"];
+        panel.canChooseDirectories = [properties containsObject:@"openDirectory"];
+        panel.canChooseFiles = [properties containsObject:@"openFile"] || !panel.canChooseDirectories;
+        panel.allowsMultipleSelection = [properties containsObject:@"multiSelections"];
+        panel.canCreateDirectories = [properties containsObject:@"createDirectory"];
+        panel.title = args[@"title"] ?: @"Open";
+        if (args[@"defaultPath"]) panel.directoryURL = [NSURL fileURLWithPath:args[@"defaultPath"]];
+        BOOL ok = [panel runModal] == NSModalResponseOK;
+        NSMutableArray *paths = [NSMutableArray new];
+        if (ok) for (NSURL *url in panel.URLs) [paths addObject:url.path];
+        result = @{ @"canceled": @(!ok), @"filePaths": paths };
+    } else if ([op isEqualToString:@"dialog.save"]) {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        panel.title = args[@"title"] ?: @"Save";
+        if (args[@"defaultPath"]) {
+            NSString *path = args[@"defaultPath"];
+            panel.directoryURL = [NSURL fileURLWithPath:path.stringByDeletingLastPathComponent];
+            panel.nameFieldStringValue = path.lastPathComponent;
+        }
+        BOOL ok = [panel runModal] == NSModalResponseOK;
+        result = @{ @"canceled": @(!ok), @"filePath": ok ? panel.URL.path : [NSNull null] };
+    } else if ([op isEqualToString:@"dialog.message"]) {
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = args[@"message"] ?: @"";
+        alert.informativeText = args[@"detail"] ?: @"";
+        for (NSString *button in args[@"buttons"] ?: @[@"OK"]) [alert addButtonWithTitle:button];
+        if (args[@"checkboxLabel"]) {
+            alert.showsSuppressionButton = YES;
+            alert.suppressionButton.title = args[@"checkboxLabel"];
+            alert.suppressionButton.state = [args[@"checkboxChecked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+        NSInteger response = [alert runModal] - NSAlertFirstButtonReturn;
+        result = @{ @"response": @(response), @"checkboxChecked": @(alert.suppressionButton.state == NSControlStateValueOn) };
+    } else return strdup("{\"error\":\"Unknown native operation\"}");
+    return strdup(AppsJSON(@{ @"value": result }).UTF8String);
+}
+
+void apps_native_free(char *text) { free(text); }

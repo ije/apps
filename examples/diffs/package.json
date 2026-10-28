@@ -1,0 +1,14 @@
+{
+  "name": "diffs",
+  "productName": "Diffs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  },
+  "dependencies": {
+    "@pierre/diffs": "1.6.2",
+    "@pierre/highlights": "0.3.0"
+  }
+}

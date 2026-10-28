@@ -1,0 +1,35 @@
+[package]
+name = "apps-webview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+raw-window-handle = { version = "0.6", features = ["std"] }
+url = "2.5"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+wry = { version = "=0.57.1", default-features = false, features = ["os-webview", "devtools"] }
+tempfile = "3"
+base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.10"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdkx11 = "0.18"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dom_query = "0.28"
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_WinRT"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"

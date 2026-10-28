@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>HTTP server · apps</title>
+  <style>
+    body { margin: 0; background: #edf2ed; color: #172c29; font-size: 16px; }
+    main { padding: 32px; }
+    h1 { font-size: 28px; margin: 0 0 12px; }
+    p { margin: 0 0 24px; color: #5e7069; }
+    #response { padding: 20px; background: white; color: #172c29; font-size: 24px; border-radius: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>HTTP server</h1>
+    <p>http://localhost:8080</p>
+    <p id="response">Waiting for response…</p>
+  </main>
+  <script type="module" src="./page.ts"></script>
+</body>
+</html>

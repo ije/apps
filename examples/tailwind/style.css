@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+@theme {
+  --color-mint-500: oklch(0.72 0.11 178);
+  --color-ink: #172c29;
+  --color-muted: #5e7069;
+  --color-paper: #edf2ed;
+}
+
+.select2-dropdown {
+  @apply rounded-b-lg shadow-md;
+}

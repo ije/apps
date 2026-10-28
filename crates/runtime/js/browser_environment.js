@@ -1,0 +1,234 @@
+globalThis.__appsBrowserEnvironment = call => {
+  const codec = globalThis.__appsStorageClone;
+  delete globalThis.__appsStorageClone;
+  const clone = value => codec.decode(codec.encode(value));
+  const fail = (name, message = name) => new DOMException(message, name);
+  const native = (op, ...args) => {
+    try { return call('web.storage.' + op, ...args); }
+    catch (error) { throw fail(error.message.includes('UNIQUE constraint') ? 'ConstraintError' : error.message.startsWith('QuotaExceededError') ? 'QuotaExceededError' : 'UnknownError', error.message); }
+  };
+  const storageKinds = new WeakMap();
+  class Storage {
+    constructor(kind) { storageKinds.set(this, kind); }
+    get length() { return native(storageKinds.get(this) + '.keys').length; }
+    key(index) { return native(storageKinds.get(this) + '.keys')[Number(index) >>> 0] ?? null; }
+    getItem(key) { return native(storageKinds.get(this) + '.get', String(key)); }
+    setItem(key, value) { native(storageKinds.get(this) + '.set', String(key), String(value)); }
+    removeItem(key) { native(storageKinds.get(this) + '.remove', String(key)); }
+    clear() { native(storageKinds.get(this) + '.clear'); }
+  }
+  for (const [name, kind] of [['localStorage', 'local'], ['sessionStorage', 'session']]) globalThis[name] = new Proxy(new Storage(kind), {
+    get(target, key) { if (typeof key === 'symbol' || key in target) { const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value; } return target.getItem(key) ?? undefined; },
+    set(target, key, value) { target.setItem(key, value); return true; },
+    deleteProperty(target, key) { target.removeItem(key); return true; },
+    ownKeys(target) { return native(storageKinds.get(target) + '.keys'); },
+    getOwnPropertyDescriptor(target, key) { const value = target.getItem(key); return value === null ? undefined : { value, enumerable: true, configurable: true, writable: true }; },
+  });
+  const keyWire = (key, seen = new Set()) => {
+    if (typeof key === 'number' && !Number.isNaN(key)) return [0, key === Infinity ? '+' : key === -Infinity ? '-' : key];
+    if (key instanceof Date && !Number.isNaN(+key)) return [1, +key];
+    if (typeof key === 'string') return [2, key];
+    if (key instanceof ArrayBuffer || ArrayBuffer.isView(key)) return [3, Array.from(new Uint8Array(key.buffer ?? key, key.byteOffset ?? 0, key.byteLength))];
+    if (Array.isArray(key) && !seen.has(key) && Array.from({ length: key.length }, (_, i) => i in key).every(Boolean)) { seen.add(key); const wire = [4, key.map(value => keyWire(value, seen))]; seen.delete(key); return wire; }
+    throw fail('DataError', 'Invalid IndexedDB key');
+  };
+  const keyValue = key => key[0] === 0 ? key[1] === '+' ? Infinity : key[1] === '-' ? -Infinity : key[1] : key[0] === 1 ? new Date(key[1]) : key[0] === 3 ? new Uint8Array(key[1]).buffer : key[0] === 4 ? key[1].map(keyValue) : key[1];
+  const compare = (a, b) => {
+    if (a[0] !== b[0]) return Math.sign(a[0] - b[0]);
+    if (a[0] >= 3) { for (let i = 0; i < Math.min(a[1].length, b[1].length); i++) { const c = a[0] === 4 ? compare(a[1][i], b[1][i]) : Math.sign(a[1][i] - b[1][i]); if (c) return c; } return Math.sign(a[1].length - b[1].length); }
+    const x = a[0] === 0 ? keyValue(a) : a[1], y = b[0] === 0 ? keyValue(b) : b[1]; return x < y ? -1 : x > y ? 1 : 0;
+  };
+  class IDBKeyRange {
+    constructor(lower, upper, lowerOpen, upperOpen) { Object.assign(this, { lower, upper, lowerOpen, upperOpen }); if (lower !== undefined && upper !== undefined) { const c = compare(keyWire(lower), keyWire(upper)); if (c > 0 || c === 0 && (lowerOpen || upperOpen)) throw fail('DataError'); } }
+    includes(key) { const k = keyWire(key); return (this.lower === undefined || compare(k, keyWire(this.lower)) >= Number(this.lowerOpen)) && (this.upper === undefined || compare(k, keyWire(this.upper)) <= -Number(this.upperOpen)); }
+    static only(key) { keyWire(key); return new this(key, key, false, false); }
+    static lowerBound(key, open = false) { keyWire(key); return new this(key, undefined, !!open, false); }
+    static upperBound(key, open = false) { keyWire(key); return new this(undefined, key, false, !!open); }
+    static bound(lower, upper, lowerOpen = false, upperOpen = false) { keyWire(lower); keyWire(upper); return new this(lower, upper, !!lowerOpen, !!upperOpen); }
+  }
+  const names = values => Object.assign([...values].sort(), { contains(value) { return this.includes(String(value)); }, item(index) { return this[index] ?? null; } });
+  const connections = new Map(), transactions = [];
+  let running = false;
+  const schedule = () => {
+    if (running || !transactions.length) return;
+    running = true;
+    const tx = transactions[0];
+    const begin = () => {
+      if (tx._done) { running = false; transactions.shift(); schedule(); return; }
+      try { const result = native('begin', tx.db.name, tx.mode); if (result.busy) { setTimeout(begin, 4); return; } tx._id = result.id; tx._start?.(); tx._drain(); }
+      catch (error) { tx._abort(error); }
+    };
+    setTimeout(begin, 0);
+  };
+  class IDBRequest extends EventTarget {
+    constructor(source = null, transaction = null) { super(); Object.assign(this, { source, transaction, readyState: 'pending', result: undefined, error: null }); }
+    _success(result) { this.result = result; this.readyState = 'done'; this.dispatchEvent(new Event('success')); }
+    _error(error) { this.error = error; this.readyState = 'done'; const event = new Event('error', { cancelable: true }); this.dispatchEvent(event); return event.defaultPrevented; }
+  }
+  class IDBOpenDBRequest extends IDBRequest {}
+  class IDBTransaction extends EventTarget {
+    constructor(db, stores, mode, start) {
+      super(); if (!['readonly', 'readwrite', 'versionchange'].includes(mode)) throw new TypeError('Invalid transaction mode');
+      Object.assign(this, { db, mode, durability: 'default', objectStoreNames: names(stores), error: null, _queue: [], _done: false, _id: null, _start: start });
+      transactions.push(this); schedule();
+    }
+    objectStore(name) { name = String(name); if (this._done) throw fail('InvalidStateError'); if (!this.objectStoreNames.contains(name) || !Object.hasOwn(this.db._stores, name)) throw fail('NotFoundError'); return new IDBObjectStore(this, name); }
+    abort() { if (this._done) throw fail('InvalidStateError'); this._abort(fail('AbortError')); }
+    commit() { if (this._done) throw fail('InvalidStateError'); this._drain(); }
+    _request(source, operation, request = new IDBRequest(source, this)) { if (this._done) throw fail('TransactionInactiveError'); this._queue.push([request, operation]); if (this._id !== null) this._drain(); return request; }
+    _drain() {
+      if (this._scheduled || this._done || this._id === null) return;
+      this._scheduled = true;
+      setTimeout(() => {
+        this._scheduled = false; if (this._done) return;
+        const next = this._queue.shift();
+        if (next) {
+          try { const result = next[1](); next[0]._success(result); }
+          catch (error) { if (!next[0]._error(error)) { this._abort(error); return; } }
+          this._drain();
+        } else {
+          try { native('commit', this._id); this._finish(); this.dispatchEvent(new Event('complete')); }
+          catch (error) { this._abort(error); }
+        }
+      }, 0);
+    }
+    _finish() { this._done = true; this.db._transactions.delete(this); if (this.db._closed && !this.db._transactions.size) connections.get(this.db.name)?.delete(this.db); if (transactions[0] === this) { transactions.shift(); running = false; schedule(); } }
+    _abort(error) {
+      if (this._done) return;
+      if (this._id !== null) { try { native('abort', this._id); } catch {} }
+      this.error = error;
+      for (const [request] of this._queue.splice(0)) request._error(fail('AbortError'));
+      if (this.mode === 'versionchange') this.db._stores = this._previousStores;
+      this._finish(); this.dispatchEvent(new Event('error')); this.dispatchEvent(new Event('abort'));
+    }
+  }
+  class IDBObjectStore {
+    constructor(transaction, name) { Object.assign(this, { transaction, name }); }
+    get keyPath() { return this.transaction.db._stores[this.name].keyPath; }
+    get autoIncrement() { return !!this.transaction.db._stores[this.name].autoIncrement; }
+    get indexNames() { return names([]); }
+    _rows(query, direction = 'next') {
+      const range = query === undefined || query === null ? null : query instanceof IDBKeyRange ? query : IDBKeyRange.only(query);
+      const rows = native('scan', this.transaction._id, this.name).map(([k, v]) => [JSON.parse(k), v]).filter(([key]) => !range || range.includes(keyValue(key))).sort((a, b) => compare(a[0], b[0]));
+      if (direction.startsWith('prev')) rows.reverse(); return rows;
+    }
+    get(query) { if (query === undefined || query === null) throw fail('DataError'); const key = query instanceof IDBKeyRange ? null : JSON.stringify(keyWire(query)); return this.transaction._request(this, () => { const value = key === null ? this._rows(query)[0]?.[1] : native('get', this.transaction._id, this.name, key); return value == null ? undefined : codec.decode(JSON.parse(value)); }); }
+    getKey(query) { if (query === undefined || query === null) throw fail('DataError'); return this.transaction._request(this, () => { const row = this._rows(query)[0]; return row ? keyValue(row[0]) : undefined; }); }
+    getAll(query, count) { return this.transaction._request(this, () => this._rows(query).slice(0, count ?? Infinity).map(row => codec.decode(JSON.parse(row[1])))); }
+    getAllKeys(query, count) { return this.transaction._request(this, () => this._rows(query).slice(0, count ?? Infinity).map(row => keyValue(row[0]))); }
+    count(query) { return this.transaction._request(this, () => this._rows(query).length); }
+    _write(op, value, key) {
+      if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError');
+      if (this.keyPath !== null) { if (key !== undefined) throw fail('DataError'); const read = path => path === '' ? value : String(path).split('.').reduce((v, part) => v?.[part], value); key = Array.isArray(this.keyPath) ? this.keyPath.map(read) : read(this.keyPath); }
+      const encoded = JSON.stringify(keyWire(key)), data = JSON.stringify(codec.encode(value));
+      return this.transaction._request(this, () => { native(op, this.transaction._id, this.name, encoded, data); return keyValue(JSON.parse(encoded)); });
+    }
+    put(value, key) { return this._write('put', value, key); }
+    add(value, key) { return this._write('add', value, key); }
+    delete(query) { if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError'); if (query === undefined || query === null) throw fail('DataError'); const key = query instanceof IDBKeyRange ? null : JSON.stringify(keyWire(query)); return this.transaction._request(this, () => { if (key !== null) native('delete', this.transaction._id, this.name, key); else for (const [key] of this._rows(query)) native('delete', this.transaction._id, this.name, JSON.stringify(key)); }); }
+    clear() { if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError'); return this.transaction._request(this, () => { native('clear', this.transaction._id, this.name); }); }
+    openCursor(query, direction = 'next') { return this._cursor(query, direction, false); }
+    openKeyCursor(query, direction = 'next') { return this._cursor(query, direction, true); }
+    _cursor(query, direction, keyOnly) {
+      if (!['next', 'nextunique', 'prev', 'prevunique'].includes(direction)) throw new TypeError('Invalid cursor direction');
+      const request = new IDBRequest(this, this.transaction); let rows, index = 0;
+      const step = () => {
+        rows ??= this._rows(query, direction); const row = rows[index++]; if (!row) return null;
+        const cursor = new IDBCursor(this, request, direction, keyValue(row[0]), keyOnly ? undefined : codec.decode(JSON.parse(row[1])));
+        cursor._continue = key => { if (key !== undefined) { const target = keyWire(key), order = compare(target, row[0]); if (direction.startsWith('prev') ? order >= 0 : order <= 0) throw fail('DataError'); while (index < rows.length && (direction.startsWith('prev') ? compare(rows[index][0], target) > 0 : compare(rows[index][0], target) < 0)) index++; } this.transaction._request(this, step, request); };
+        return cursor;
+      };
+      return this.transaction._request(this, step, request);
+    }
+  }
+  class IDBCursor {
+    constructor(source, request, direction, key, value) { Object.assign(this, { source, request, direction, key, primaryKey: key, value, _advanced: false }); }
+    continue(key) { if (this._advanced) throw fail('InvalidStateError'); this._continue(key); this._advanced = true; this.request.readyState = 'pending'; }
+    delete() { return this.source.delete(this.primaryKey); }
+    update(value) { return this.source.put(value, this.source.keyPath === null ? this.primaryKey : undefined); }
+  }
+  class IDBDatabase extends EventTarget {
+    constructor(name, version, stores) { super(); Object.assign(this, { name, version, _stores: Object.assign(Object.create(null), stores), _transactions: new Set(), _closed: false }); const list = connections.get(name) ?? new Set(); list.add(this); connections.set(name, list); }
+    get objectStoreNames() { return names(Object.keys(this._stores)); }
+    createObjectStore(name, options = {}) {
+      name = String(name); const tx = this._upgrade; if (!tx || tx._done) throw fail('InvalidStateError'); if (Object.hasOwn(this._stores, name)) throw fail('ConstraintError');
+      if (options.autoIncrement) throw fail('NotSupportedError', 'Automatic key generators are not supported');
+      const config = { keyPath: options.keyPath ?? null, autoIncrement: false }; native('createStore', tx._id, name, config); this._stores[name] = config; tx.objectStoreNames = this.objectStoreNames; return tx.objectStore(name);
+    }
+    deleteObjectStore(name) { const tx = this._upgrade; if (!tx || tx._done) throw fail('InvalidStateError'); if (!Object.hasOwn(this._stores, name)) throw fail('NotFoundError'); native('deleteStore', tx._id, name); delete this._stores[name]; tx.objectStoreNames = this.objectStoreNames; }
+    transaction(stores, mode = 'readonly') { if (this._closed || this._upgrade && !this._upgrade._done) throw fail('InvalidStateError'); stores = typeof stores === 'string' ? [stores] : Array.from(stores); if (!stores.length) throw fail('InvalidAccessError'); for (const name of stores) if (!Object.hasOwn(this._stores, name)) throw fail('NotFoundError'); const tx = new IDBTransaction(this, stores, mode); this._transactions.add(tx); return tx; }
+    close() { this._closed = true; if (!this._transactions.size) connections.get(this.name)?.delete(this); }
+  }
+  class IDBFactory {
+    cmp(a, b) { return compare(keyWire(a), keyWire(b)); }
+    databases() { return Promise.resolve(native('databases')); }
+    open(name, version) {
+      name = String(name); if (version !== undefined && (!Number.isSafeInteger(version) || version <= 0)) throw new TypeError('Invalid database version');
+      const request = new IDBOpenDBRequest();
+      setTimeout(() => {
+        try {
+          const info = native('open', name), target = version ?? (info.version || 1);
+          if (target < info.version) throw fail('VersionError');
+          if (target === info.version) { request._success(new IDBDatabase(name, target, info.stores)); return; }
+          const prior = [...connections.get(name) ?? []];
+          for (const db of prior) if (!db._closed) db.dispatchEvent(Object.assign(new Event('versionchange'), { oldVersion: info.version, newVersion: target }));
+          let blocked = false;
+          const upgrade = () => {
+            if (prior.some(db => !db._closed || db._transactions.size)) { if (!blocked) { request.dispatchEvent(Object.assign(new Event('blocked'), { oldVersion: info.version, newVersion: target })); blocked = true; } setTimeout(upgrade, 4); return; }
+            const db = new IDBDatabase(name, target, info.stores), tx = new IDBTransaction(db, Object.keys(info.stores), 'versionchange', () => {
+              native('version', tx._id, target); request.result = db; request.transaction = tx; request.readyState = 'done'; request.dispatchEvent(Object.assign(new Event('upgradeneeded'), { oldVersion: info.version, newVersion: target }));
+            });
+            tx._previousStores = clone(info.stores); db._upgrade = tx; db._transactions.add(tx);
+            tx.addEventListener('complete', () => { request.transaction = null; db._upgrade = null; request._success(db); });
+            tx.addEventListener('abort', () => { db.close(); request._error(tx.error); });
+          }; upgrade();
+        } catch (error) { request._error(error); }
+      }, 0); return request;
+    }
+    deleteDatabase(name) {
+      name = String(name); const request = new IDBOpenDBRequest();
+      setTimeout(() => {
+        try {
+          const info = native('open', name), prior = [...connections.get(name) ?? []];
+          for (const db of prior) if (!db._closed) db.dispatchEvent(Object.assign(new Event('versionchange'), { oldVersion: info.version, newVersion: null }));
+          let blocked = false;
+          const remove = () => {
+            if (prior.some(db => !db._closed || db._transactions.size)) { if (!blocked) { request.dispatchEvent(new Event('blocked')); blocked = true; } setTimeout(remove, 4); return; }
+            const db = new IDBDatabase(name, info.version, info.stores), tx = new IDBTransaction(db, [], 'versionchange', () => native('deleteDatabase', tx._id));
+            tx.addEventListener('complete', () => { db.close(); request._success(undefined); }); tx.addEventListener('abort', () => { db.close(); request._error(tx.error); });
+          }; remove();
+        } catch (error) { request._error(error); }
+      }, 0); return request;
+    }
+  }
+  Object.assign(globalThis, { Storage, IDBFactory, IDBDatabase, IDBTransaction, IDBRequest, IDBOpenDBRequest, IDBObjectStore, IDBCursor, IDBCursorWithValue: IDBCursor, IDBKeyRange, indexedDB: new IDBFactory() });
+  let current = new URL('apps://app/'), entries = [{ url: current.href, state: null }], position = 0;
+  const changed = oldURL => { if (new URL(oldURL).hash !== current.hash) setTimeout(() => dispatchEvent(Object.assign(new Event('hashchange'), { oldURL, newURL: current.href })), 0); };
+  const navigate = (url, replace = false, reload = false) => {
+    const target = new URL(String(url), current), oldURL = current.href;
+    if (!reload && target.href.split('#')[0] === current.href.split('#')[0]) {
+      current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); } changed(oldURL);
+    } else call('dom.navigate', target.href, replace, reload);
+  };
+  class Location {
+    assign(url) { navigate(url); }
+    replace(url) { navigate(url, true); }
+    reload() { navigate(current.href, true, true); }
+    toString() { return current.href; }
+    valueOf() { return this.toString(); }
+  }
+  for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(Location.prototype, name, { enumerable: true, get: () => current[name], ...(name === 'origin' ? {} : { set: value => { const url = new URL(current); url[name] = value; navigate(url); } }) });
+  class History {
+    get length() { return entries.length; }
+    get state() { return clone(entries[position].state); }
+    scrollRestoration = 'auto';
+    pushState(state, _, url) { this._set(state, url, false); }
+    replaceState(state, _, url) { this._set(state, url, true); }
+    _set(state, url, replace) { const target = url === undefined || url === null ? new URL(current) : new URL(String(url), current); if (target.origin !== current.origin || target.protocol !== current.protocol || target.host !== current.host) throw fail('SecurityError'); const entry = { url: target.href, state: clone(state) }; current = target; if (replace) entries[position] = entry; else { entries.splice(++position); entries.push(entry); } }
+    go(delta = 0) { delta = Math.trunc(Number(delta) || 0); if (!delta) { navigate(current.href, true, true); return; } const next = position + delta; if (next < 0 || next >= entries.length) return; setTimeout(() => { const oldURL = current.href; position = next; current = new URL(entries[position].url); dispatchEvent(Object.assign(new Event('popstate'), { state: this.state })); changed(oldURL); }, 0); }
+    back() { this.go(-1); }
+    forward() { this.go(1); }
+  }
+  Object.assign(globalThis, { Location, History, location: new Location(), history: new History() });
+  globalThis.__appsSetLocation = url => { current = new URL(String(url)); entries = [{ url: current.href, state: null }]; position = 0; };
+};

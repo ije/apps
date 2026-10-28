@@ -1,0 +1,38 @@
+[package]
+name = "apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apps"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bbtree.workspace = true
+serde_json.workspace = true
+apps-runtime = { path = "../runtime" }
+notify = "8"
+object = { version = "0.39.1", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
+oxc_parser = { version = "=0.155.0", default-features = false }
+oxc_allocator = "=0.155.0"
+oxc_span = "=0.155.0"
+oxc_ast = "=0.155.0"
+oxc_ast_visit = "=0.155.0"
+oxc_codegen = "=0.155.0"
+oxc_minifier = "=0.155.0"
+oxc_semantic = "=0.155.0"
+oxc_transformer = "=0.155.0"
+base64 = "0.22"
+ctrlc = "3"
+tempfile = "3"
+url = "2.5"
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tempfile = "3"
+oxc_sourcemap = "=9.0.0"
+
+[build-dependencies]
+cc = "1"

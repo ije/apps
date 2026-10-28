@@ -1,0 +1,55 @@
+[package]
+name = "apps-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+apps-webview = { path = "../webview" }
+anyhow.workspace = true
+bbtree.workspace = true
+cssparser = "0.38"
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+libloading = "0.8"
+libffi = "5.2.0"
+url = "2.5"
+getrandom = "0.3"
+sha2 = "0.10"
+sha1_smol = "1"
+bytes = "1"
+futures-util = "0.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+base64 = "0.22"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+ring = "0.17.14"
+portable-pty = "0.9"
+notify = "8.2"
+resvg = "0.45.1"
+socket2 = "0.6"
+libc = "0.2"
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
+wgpu = { version = "=26.0.1", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl", "serde"] }
+pollster = "0.4"
+naga = { version = "=26.0.0", features = ["termcolor"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+avif-parse = "=2.1.0"
+# The published rav1d can abort on corrupt AV1 data.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+[[bin]]
+name = "apps-runtime"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"
