@@ -1288,57 +1288,93 @@ fn paint_text(
     highlights: &[TextHighlight],
     window: &mut Window,
 ) {
-    let mut start = 0;
-    let mut left = px(0.);
-    for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
-        let (end, right) = boundary.map_or((line.len, line.width), |boundary| {
-            let glyph = &line.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
-            (glyph.index, glyph.position.x)
-        });
-        for highlight in highlights {
-            let a = highlight.range.start.max(offset + start);
-            let b = highlight.range.end.min(offset + end);
-            if a >= b { continue; }
-            let x = line.x_for_index(a - offset);
-            let end_x = if b == offset + end { right } else { line.x_for_index(b - offset) };
-            if end_x > x && highlight.background.a > 0. {
-                window.paint_quad(gpui::fill(
-                    Bounds::new(point(origin.x + x - left, origin.y + line_height * row), size(end_x - x, line_height)),
-                    highlight.background,
-                ));
+    window.paint_layer(
+        Bounds::new(origin, size(line.width, line_height * (wraps.len() + 1))),
+        |window| {
+            let mut start = 0;
+            let mut left = px(0.);
+            for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
+                let (end, right) = boundary.map_or((line.len, line.width), |boundary| {
+                    let glyph = &line.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    (glyph.index, glyph.position.x)
+                });
+                for highlight in highlights {
+                    let a = highlight.range.start.max(offset + start);
+                    let b = highlight.range.end.min(offset + end);
+                    if a >= b {
+                        continue;
+                    }
+                    let x = line.x_for_index(a - offset);
+                    let end_x = if b == offset + end {
+                        right
+                    } else {
+                        line.x_for_index(b - offset)
+                    };
+                    if end_x > x && highlight.background.a > 0. {
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                point(origin.x + x - left, origin.y + line_height * row),
+                                size(end_x - x, line_height),
+                            ),
+                            highlight.background,
+                        ));
+                    }
+                }
+                start = end;
+                left = right;
             }
-        }
-        start = end;
-        left = right;
-    }
-    let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
-    let mut wrap = 0;
-    let mut left = px(0.);
-    let mut run_index = 0;
-    let mut run_end = runs.first().map_or(0, |run| run.len);
-    for (run_ix, run) in line.runs.iter().enumerate() {
-        for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-            if wraps.get(wrap) == Some(&gpui::WrapBoundary { run_ix, glyph_ix }) {
-                wrap += 1;
-                left = glyph.position.x;
+            let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
+            let mut wrap = 0;
+            let mut left = px(0.);
+            let mut run_index = 0;
+            let mut run_end = runs.first().map_or(0, |run| run.len);
+            for (run_ix, run) in line.runs.iter().enumerate() {
+                let glyph_size = window
+                    .text_system()
+                    .bounding_box(run.font_id, line.font_size)
+                    .size;
+                for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                    if wraps.get(wrap) == Some(&gpui::WrapBoundary { run_ix, glyph_ix }) {
+                        wrap += 1;
+                        left = glyph.position.x;
+                    }
+                    let index = offset + glyph.index;
+                    while index >= run_end && run_index + 1 < runs.len() {
+                        run_index += 1;
+                        run_end += runs[run_index].len;
+                    }
+                    let color = highlights
+                        .iter()
+                        .find(|highlight| highlight.range.contains(&index))
+                        .and_then(|highlight| highlight.color)
+                        .unwrap_or(runs[run_index].color);
+                    if color.a == 0. {
+                        continue;
+                    }
+                    let position = point(
+                        origin.x + glyph.position.x - left,
+                        origin.y + line_height * wrap + baseline,
+                    );
+                    if !Bounds::new(point(position.x, position.y - baseline), glyph_size)
+                        .intersects(&window.content_mask().bounds)
+                    {
+                        continue;
+                    }
+                    if glyph.is_emoji {
+                        let _ = window.paint_emoji(position, run.font_id, glyph.id, line.font_size);
+                    } else {
+                        let _ = window.paint_glyph(
+                            position,
+                            run.font_id,
+                            glyph.id,
+                            line.font_size,
+                            color,
+                        );
+                    }
+                }
             }
-            let index = offset + glyph.index;
-            while index >= run_end && run_index + 1 < runs.len() {
-                run_index += 1;
-                run_end += runs[run_index].len;
-            }
-            let color = highlights.iter().find(|highlight| highlight.range.contains(&index))
-                .and_then(|highlight| highlight.color)
-                .unwrap_or(runs[run_index].color);
-            if color.a == 0. { continue; }
-            let position = point(origin.x + glyph.position.x - left, origin.y + line_height * wrap + baseline);
-            if glyph.is_emoji {
-                let _ = window.paint_emoji(position, run.font_id, glyph.id, line.font_size);
-            } else {
-                let _ = window.paint_glyph(position, run.font_id, glyph.id, line.font_size, color);
-            }
-        }
-    }
+        },
+    );
 }
 
 struct InlineText {
@@ -1395,9 +1431,17 @@ impl gpui::Element for InlineText {
                 dom.bounds.insert(
                     *id,
                     [
-                        if a.y == b.y { a.x.into() } else { bounds.left().into() },
+                        if a.y == b.y {
+                            a.x.into()
+                        } else {
+                            bounds.left().into()
+                        },
                         a.y.into(),
-                        if a.y == b.y { (b.x - a.x).into() } else { bounds.size.width.into() },
+                        if a.y == b.y {
+                            (b.x - a.x).into()
+                        } else {
+                            bounds.size.width.into()
+                        },
                         (b.y - a.y + layout.line_height()).into(),
                     ],
                 );
@@ -1408,11 +1452,11 @@ impl gpui::Element for InlineText {
     }
     fn paint(
         &mut self,
-        id: Option<&gpui::GlobalElementId>,
-        inspector: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        state: &mut (),
-        painted: &mut (),
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1434,13 +1478,15 @@ impl gpui::Element for InlineText {
                         let font = cx.text_system().resolve_font(&render::font(style));
                         let height = cx.text_system().ascent(font, px(units.font.em))
                             - cx.text_system().descent(font, px(units.font.em));
-                        let radii = ["top-left", "top-right", "bottom-right", "bottom-left"].map(|corner| {
-                            px(style
-                                .get(&format!("border-{corner}-radius"))
-                                .or_else(|| style.get("border-radius"))
-                                .and_then(|v| units.resolve(v, (b.x - a.x).into()))
-                                .unwrap_or(0.))
-                        });
+                        let radii = ["top-left", "top-right", "bottom-right", "bottom-left"].map(
+                            |corner| {
+                                px(style
+                                    .get(&format!("border-{corner}-radius"))
+                                    .or_else(|| style.get("border-radius"))
+                                    .and_then(|v| units.resolve(v, (b.x - a.x).into()))
+                                    .unwrap_or(0.))
+                            },
+                        );
                         window.paint_quad(
                             gpui::fill(
                                 Bounds::new(
@@ -1483,11 +1529,13 @@ impl gpui::Element for InlineText {
                         .unwrap_or(0x000000ff);
                     if let Some(position) = layout.position_for_index(start) {
                         window.paint_quad(gpui::fill(
-                            Bounds::new(position, size(px(1.), layout.line_height())), rgba(ink),
+                            Bounds::new(position, size(px(1.), layout.line_height())),
+                            rgba(ink),
                         ));
                     }
                 } else if start != end {
-                    let (color, background) = render::selection_colors(&styles.values[*id], styles.selections.get(id));
+                    let (color, background) =
+                        render::selection_colors(&styles.values[*id], styles.selections.get(id));
                     highlights.push(TextHighlight {
                         range: start.min(end)..start.max(end),
                         color: color.map(|color| rgba(color).into()),
@@ -1496,17 +1544,24 @@ impl gpui::Element for InlineText {
                 }
             }
         }
-        if highlights.is_empty() {
-            self.inner.paint(id, inspector, bounds, state, painted, window, cx);
-        } else {
-            let layout = self.inner.layout();
-            let mut offset = 0;
-            while let Some(line) = layout.line_layout_for_index(offset) {
-                let origin = layout.position_for_index(offset).unwrap();
-                paint_text(&line.unwrapped_layout, &line.wrap_boundaries, origin,
-                    layout.line_height(), &self.data.runs, offset, &highlights, window);
-                offset += line.len() + 1;
-                if offset > self.data.text.len() { break; }
+        let layout = self.inner.layout();
+        let mut offset = 0;
+        let mut origin = layout.bounds().origin;
+        while let Some(line) = layout.line_layout_for_index(offset) {
+            paint_text(
+                &line.unwrapped_layout,
+                &line.wrap_boundaries,
+                origin,
+                layout.line_height(),
+                &self.data.runs,
+                offset,
+                &highlights,
+                window,
+            );
+            offset += line.len() + 1;
+            origin.y += line.size(layout.line_height()).height;
+            if offset > self.data.text.len() {
+                break;
             }
         }
     }
@@ -1983,7 +2038,10 @@ fn element(
                             let end_x = line.x_for_index(right);
                             if start == end {
                                 window.paint_quad(gpui::fill(
-                                    Bounds::new(point(bounds.left() + x, top), size(px(1.), px(line_height))),
+                                    Bounds::new(
+                                        point(bounds.left() + x, top),
+                                        size(px(1.), px(line_height)),
+                                    ),
                                     caret_color,
                                 ));
                             } else if end_x > x {
@@ -1995,10 +2053,19 @@ fn element(
                             }
                         }
                         if highlights.is_empty() {
-                            let _ = line.paint(point(bounds.left(), top), px(line_height), window, cx);
+                            let _ =
+                                line.paint(point(bounds.left(), top), px(line_height), window, cx);
                         } else {
-                            paint_text(&line, &[], point(bounds.left(), top), px(line_height),
-                                std::slice::from_ref(&run), 0, &highlights, window);
+                            paint_text(
+                                &line,
+                                &[],
+                                point(bounds.left(), top),
+                                px(line_height),
+                                std::slice::from_ref(&run),
+                                0,
+                                &highlights,
+                                window,
+                            );
                         }
                         offset += length + 1;
                     }
@@ -2383,6 +2450,13 @@ fn element(
         .get("white-space")
         .is_some_and(|v| matches!(v.as_str(), "pre" | "pre-wrap" | "break-spaces"))
         || node.tag == "pre";
+    if node.tag == "#text"
+        && style
+            .get("white-space")
+            .is_none_or(|value| !matches!(value.as_str(), "pre" | "nowrap"))
+    {
+        el = el.min_w(px(0.)).max_w(relative(1.)).flex_shrink();
+    }
     if !node.text.is_empty() && !editable {
         let text = if preserve && node.text == "\n" {
             el = el.min_h(px(units.font.lh));
@@ -2396,7 +2470,9 @@ fn element(
             let runs = vec![gpui::TextRun {
                 len: text.len(),
                 font: render::font(style),
-                color: style.get("color").and_then(|value| render::color(value))
+                color: style
+                    .get("color")
+                    .and_then(|value| render::color(value))
                     .map(|(color, alpha)| rgba(color << 8 | alpha as u32).into())
                     .unwrap_or_else(gpui::black),
                 background_color: None,

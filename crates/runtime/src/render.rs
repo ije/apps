@@ -1051,30 +1051,71 @@ pub(crate) fn compute_styles(
         {
             let parent = node.parent.and_then(|parent| selections.get(&parent));
             let mut values = parent.cloned().unwrap_or_default();
-            values.extend(style.iter().filter(|(key, _)| key.starts_with("--") || key.as_str() == "color-scheme").map(|(key, value)| (key.clone(), value.clone())));
+            values.extend(
+                style
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("--") || key.as_str() == "color-scheme")
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
             for (key, (_, value)) in selected {
-                if matches!(key.as_str(), "color" | "background-color" | "-webkit-text-fill-color") {
+                if matches!(
+                    key.as_str(),
+                    "color" | "background-color" | "-webkit-text-fill-color"
+                ) {
                     let value = if matches!(value.as_str(), "inherit" | "unset") {
-                        parent.and_then(|parent| parent.get(&key)).cloned().unwrap_or_else(|| {
-                            if key == "background-color" { "transparent" } else { "currentColor" }.into()
-                        })
-                    } else { value };
+                        parent
+                            .and_then(|parent| parent.get(&key))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                if key == "background-color" {
+                                    "transparent"
+                                } else {
+                                    "currentColor"
+                                }
+                                .into()
+                            })
+                    } else {
+                        value
+                    };
                     values.insert(key, value);
                 }
             }
             resolve_style(&mut values, parent);
             values.retain(|key, value| {
-                if !matches!(key.as_str(), "color" | "background-color" | "-webkit-text-fill-color") {
+                if !matches!(
+                    key.as_str(),
+                    "color" | "background-color" | "-webkit-text-fill-color"
+                ) {
                     return false;
                 }
                 if matches!(value.as_str(), "inherit" | "unset") {
-                    *value = parent.and_then(|parent| parent.get(key)).cloned().unwrap_or_else(|| {
-                        if key == "background-color" { "transparent" } else { "currentColor" }.into()
-                    });
+                    *value = parent
+                        .and_then(|parent| parent.get(key))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            if key == "background-color" {
+                                "transparent"
+                            } else {
+                                "currentColor"
+                            }
+                            .into()
+                        });
                 } else if value == "initial" {
-                    *value = if key == "background-color" { "transparent" } else { "currentColor" }.into();
+                    *value = if key == "background-color" {
+                        "transparent"
+                    } else {
+                        "currentColor"
+                    }
+                    .into();
                 }
-                value.eq_ignore_ascii_case("currentcolor") || color(value).is_some()
+                if value.eq_ignore_ascii_case("currentcolor") || color(value).is_some() {
+                    true
+                } else if let Some(inherited) = parent.and_then(|parent| parent.get(key)) {
+                    *value = inherited.clone();
+                    true
+                } else {
+                    false
+                }
             });
             if !values.is_empty() {
                 selections.insert(id, values);
@@ -1262,17 +1303,47 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
 }
 
 pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Option<u32>, u32) {
-    let normal = style.get("color").and_then(|value| color(value)).unwrap_or((0, 255));
-    let foreground = selection.and_then(|style| style.get("color")).and_then(|value| {
-        if value.eq_ignore_ascii_case("currentcolor") { Some(normal) } else { color(value) }
-    });
-    let background = selection.and_then(|style| style.get("background-color")).and_then(|value| {
-        if value.eq_ignore_ascii_case("currentcolor") { Some(foreground.unwrap_or(normal)) } else { color(value) }
-    }).unwrap_or(if foreground.is_some() { (0, 0) } else { (0x4488ff, 85) });
-    let fill = selection.and_then(|style| style.get("-webkit-text-fill-color")).and_then(|value| {
-        if value.eq_ignore_ascii_case("currentcolor") { Some(foreground.unwrap_or(normal)) } else { color(value) }
-    }).or(foreground);
-    (fill.map(|(color, alpha)| color << 8 | alpha as u32), background.0 << 8 | background.1 as u32)
+    let normal = style
+        .get("color")
+        .and_then(|value| color(value))
+        .unwrap_or((0, 255));
+    let foreground = selection
+        .and_then(|style| style.get("color"))
+        .and_then(|value| {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                Some(normal)
+            } else {
+                color(value)
+            }
+        });
+    let background = selection
+        .and_then(|style| style.get("background-color"))
+        .and_then(|value| {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                Some(foreground.unwrap_or(normal))
+            } else {
+                color(value)
+            }
+        })
+        .unwrap_or(if foreground.is_some() {
+            (0, 0)
+        } else {
+            (0x4488ff, 85)
+        });
+    let fill = selection
+        .and_then(|style| style.get("-webkit-text-fill-color"))
+        .and_then(|value| {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                Some(foreground.unwrap_or(normal))
+            } else {
+                color(value)
+            }
+        })
+        .or(foreground);
+    (
+        fill.map(|(color, alpha)| color << 8 | alpha as u32),
+        background.0 << 8 | background.1 as u32,
+    )
 }
 
 #[derive(Clone)]
@@ -1937,7 +2008,8 @@ mod tests {
 
     #[test]
     fn selection_colors_follow_highlight_inheritance() {
-        let doc = Document::parse(r#"<style>
+        let doc = Document::parse(
+            r#"<style>
             div { color: black; background: yellow; --ink: red }
             div::selection { color: white; background: blue; font-size: 80px }
             span { color: green; --ink: purple }
@@ -1945,9 +2017,17 @@ mod tests {
             #current::selection { color: currentColor; background-color: currentColor }
             #variable::selection { color: var(--ink); background: transparent }
             #initial::selection { color: initial; background-color: initial }
-            </style><div><span id=inherit>inherit</span><span id=current>current</span><span id=variable>variable</span><span id=initial>initial</span></div>"#);
-        let computed = compute_styles(&doc, 800., 600., None,
-            &mut HashMap::new(), &mut StyleCache::default(), None);
+            </style><div><span id=inherit>inherit</span><span id=current>current</span><span id=variable>variable</span><span id=initial>initial</span></div>"#,
+        );
+        let computed = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut StyleCache::default(),
+            None,
+        );
         for (selector, expected) in [
             ("#inherit", (Some(0xffffffff), 0x0000ffff)),
             ("#current", (Some(0x008000ff), 0x008000ff)),
@@ -1955,10 +2035,18 @@ mod tests {
             ("#initial", (Some(0x008000ff), 0x00000000)),
         ] {
             let id = element(&doc, selector);
-            assert_eq!(selection_colors(&computed.values[id], computed.selections.get(&id)), expected, "{selector}");
+            assert_eq!(
+                selection_colors(&computed.values[id], computed.selections.get(&id)),
+                expected,
+                "{selector}"
+            );
             assert!(!computed.selections[&id].contains_key("font-size"));
             for child in &doc.nodes[id].children {
-                assert_eq!(selection_colors(&computed.values[*child], computed.selections.get(child)), expected, "{selector} text");
+                assert_eq!(
+                    selection_colors(&computed.values[*child], computed.selections.get(child)),
+                    expected,
+                    "{selector} text"
+                );
             }
         }
     }
@@ -1969,14 +2057,33 @@ mod tests {
             ("color: red", (Some(0xff0000ff), 0)),
             ("background: blue", (None, 0x0000ffff)),
             ("color: transparent; background: transparent", (Some(0), 0)),
-            ("-webkit-text-fill-color: yellow; color: red", (Some(0xffff00ff), 0)),
-            ("font-size: 80px; background-image: linear-gradient(red, blue)", (None, 0x4488ff55)),
+            (
+                "-webkit-text-fill-color: yellow; color: red",
+                (Some(0xffff00ff), 0),
+            ),
+            (
+                "font-size: 80px; background-image: linear-gradient(red, blue)",
+                (None, 0x4488ff55),
+            ),
         ] {
-            let doc = Document::parse(&format!("<style>div{{color:green;background:yellow}}div::selection{{{rule}}}</style><div>text</div>"));
-            let computed = compute_styles(&doc, 800., 600., None,
-                &mut HashMap::new(), &mut StyleCache::default(), None);
+            let doc = Document::parse(&format!(
+                "<style>div{{color:green;background:yellow}}div::selection{{{rule}}}</style><div>text</div>"
+            ));
+            let computed = compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut HashMap::new(),
+                &mut StyleCache::default(),
+                None,
+            );
             let id = element(&doc, "div");
-            assert_eq!(selection_colors(&computed.values[id], computed.selections.get(&id)), expected, "{rule}");
+            assert_eq!(
+                selection_colors(&computed.values[id], computed.selections.get(&id)),
+                expected,
+                "{rule}"
+            );
         }
     }
 
