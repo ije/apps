@@ -23,7 +23,7 @@ globalThis.__appsWeb = call => {
     preventDefault() { const s = eventStates.get(this); if (s.cancelable && !s.passive) s.defaultPrevented = true; }
     stopPropagation() { eventStates.get(this).stopped = true; }
     stopImmediatePropagation() { const s = eventStates.get(this); s.stopped = s.immediate = true; }
-    composedPath() { const s = eventStates.get(this); return s.dispatching ? [s.target] : []; }
+    composedPath() { const s = eventStates.get(this); return s.dispatching ? [...(s.path ?? [s.target])] : []; }
     get cancelBubble() { return eventStates.get(this).stopped; }
     set cancelBubble(value) { if (value) this.stopPropagation(); }
     get returnValue() { return !this.defaultPrevented; }
@@ -40,6 +40,7 @@ globalThis.__appsWeb = call => {
   }
   class CustomEvent extends Event {
     constructor(type, options = {}) { super(type, options); this.detail = options.detail ?? null; }
+    initCustomEvent(type, bubbles, cancelable, detail = null) { this.initEvent(type, bubbles, cancelable); this.detail = detail; }
   }
   class EventTarget {
     constructor() { eventTargets.set(this, new Map()); }
@@ -636,6 +637,7 @@ globalThis.__appsWeb = call => {
     return poll.pending();
   };
   poll.pending = () => sockets.size > 0 || waiting();
+  poll.eventState = event => eventStates.get(event);
   Object.assign(globalThis, { DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
     TextDecoderStream, URL, URLSearchParams, crypto, Headers, Request, Response, Blob, File, FormData, fetch, WebSocket, MessageEvent, CloseEvent });
   return poll;

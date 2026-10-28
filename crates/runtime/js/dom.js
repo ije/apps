@@ -1,6 +1,6 @@
 (() => {
-  const call = globalThis.__appsDOM;
-  delete globalThis.__appsDOM;
+  const call = globalThis.__appsDOM, eventState = globalThis.__appsEventState;
+  delete globalThis.__appsDOM; delete globalThis.__appsEventState;
   const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
   const nodes = new Map(), events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
   let active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null;
@@ -10,13 +10,18 @@
     selectionPending.add(target);
     setTimeout(() => { selectionPending.delete(target); target.dispatchEvent(new Event('selectionchange', { bubbles: target !== document })); }, 0);
   };
-  const assignedSlot = node => node.parentNode?._shadow ? wrap(call('dom.assignedSlot', node._id)) : null;
-  const path = node => { const result = []; for (; node; node = assignedSlot(node) ?? node.parentNode ?? node.host) result.push(node); return result; };
+  const XHTML = 'http://www.w3.org/1999/xhtml';
+  const listOf = (Type, items) => Object.setPrototypeOf(items, Type.prototype);
+  const quote = value => '"' + String(value).replace(/["\\]/g, '\\$&') + '"';
+  const assignedSlot = (node, parent = node.parentNode) => parent?._shadow ? wrap(call('dom.assignedSlot', node._id)) : null;
+  const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
   const change = record => {
+    if (!observers.size) return;
     for (const observer of observers) for (const [target, options] of observer.targets) {
       if (target !== record.target && !(options.subtree && target.contains(record.target))) continue;
       if (!options[record.type] || (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName))) continue;
-      observer.records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, oldValue: null, ...record });
+      const old = record.type === 'attributes' ? options.attributeOldValue : record.type === 'characterData' && options.characterDataOldValue;
+      observer.records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, ...record, oldValue: old ? record.oldValue ?? null : null });
       break;
     }
     if (!mutationQueued) {
@@ -25,68 +30,109 @@
     }
   };
   const dispatch = (target, event, ancestors = path(target)) => {
-    if(!event.composed){const boundary=ancestors.findIndex(node=>node.host&&node===target.getRootNode());if(boundary>=0)ancestors.length=boundary+1;} const originalStop = event.stopPropagation.bind(event), originalImmediate = event.stopImmediatePropagation.bind(event);
-    let stopped = false, immediate = false, current = null, phase = 0;
-    Object.defineProperties(event, { target: { configurable: true, get: () => target }, currentTarget: { configurable: true, get: () => current }, eventPhase: { configurable: true, get: () => phase } });
-    event.stopPropagation = () => { stopped = true; originalStop(); };
-    event.stopImmediatePropagation = () => { immediate = stopped = true; originalImmediate(); };
-    event.composedPath = () => [...ancestors, window];
-    for (const capture of [true, false]) {
-      for (const node of capture ? [...ancestors].reverse() : ancestors) {
-        if (!capture && node !== target && !event.bubbles) continue;
-        current = node; phase = node === target ? 2 : capture ? 1 : 3;
-        const listeners = events.get(node), key = event.type;
-        for (const item of [...(listeners?.get(key) ?? [])]) {
-          if (immediate) break;
-          if (item.capture !== capture || !(listeners?.get(key) ?? []).includes(item)) continue;
-          if (item.once) node.removeEventListener(event.type, item.fn, item.capture);
-          try { if (typeof item.fn === 'function') item.fn.call(node, event); else item.fn.handleEvent(event); } catch (error) { console.error(error); }
-        }
-        if (!capture && !immediate && typeof node['on' + event.type] === 'function') try { node['on' + event.type](event); } catch (error) { console.error(error); }
-        if (stopped) break;
+    const state = eventState(event);
+    if (state.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
+    const shadow = ancestors.some(node => node instanceof ShadowRoot);
+    if (shadow && !event.composed) { const root = target.getRootNode(); if (root instanceof ShadowRoot) ancestors.length = ancestors.indexOf(root) + 1; }
+    if (ancestors.at(-1) === document) ancestors.push(window);
+    let seen = target;
+    const targets = shadow ? ancestors.map(node => { const value = seen; if (node instanceof ShadowRoot && seen.getRootNode() === node) seen = node.host; return value; }) : null;
+    Object.assign(state, { target, path: ancestors, dispatching: true });
+    const invoke = (index, capture) => {
+      const node = ancestors[index], listeners = events.get(node);
+      state.currentTarget = node; state.target = targets?.[index] ?? target; state.eventPhase = state.target === node ? 2 : capture ? 1 : 3;
+      for (const item of [...(listeners?.get(event.type) ?? [])]) {
+        if (state.immediate) break;
+        if (item.capture !== capture || !listeners.get(event.type).includes(item)) continue;
+        if (item.once) node.removeEventListener(event.type, item.fn, item.capture);
+        state.passive = item.passive;
+        try { if (typeof item.fn === 'function') item.fn.call(node, event); else item.fn.handleEvent(event); } catch (error) { console.error(error); }
+        state.passive = false;
       }
-      if (stopped) break;
-    }
-    current = null; phase = 0;
-    if (!stopped && event.bubbles) globalThis.dispatchEvent(event);
+      if (!capture && !state.immediate && typeof node['on' + event.type] === 'function') try { node['on' + event.type](event); } catch (error) { console.error(error); }
+    };
+    try {
+      for (let index = ancestors.length; index-- && !state.stopped;) invoke(index, true);
+      for (let index = 0; index < ancestors.length && !state.stopped; index++) if (event.bubbles || (targets?.[index] ?? target) === ancestors[index]) invoke(index, false);
+    } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
     return !event.defaultPrevented;
+  };
+  const activate = target => {
+    const label = path(target).find(node => node.localName === 'label');
+    const control = target.localName === 'input' ? target : label && (label.getAttribute('for') ? document.getElementById(label.getAttribute('for')) : label.querySelector('input'));
+    const kind = control?.localName === 'input' ? control.type : '';
+    if ((kind === 'checkbox' || kind === 'radio') && !control.disabled && !(kind === 'radio' && control.checked)) {
+      if (kind === 'radio' && control.getAttribute('name')) for (const other of control.getRootNode().querySelectorAll('input[type=radio]')) if (other.getAttribute('name') === control.getAttribute('name')) other.checked = false;
+      control.checked = kind === 'radio' || !control.checked;
+      dispatch(control, new Event('input', { bubbles: true, composed: true }));
+      dispatch(control, new Event('change', { bubbles: true }));
+    }
   };
   const serialize = node => {
     if (node.nodeType === 3) return node.data.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
     if (node.nodeType === 8) return '<!--' + node.data + '-->';
-    if (node.nodeType === 11) return node.childNodes.map(serialize).join('');
+    if (node.nodeType !== 1) return node.childNodes.map(serialize).join('');
     const attrs = node.attributes.map(a => ' ' + a.name + '="' + a.value.replaceAll('&', '&amp;').replaceAll('"', '&quot;') + '"').join('');
     return '<' + node.localName + attrs + '>' + node.innerHTML + (['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'].includes(node.localName) ? '' : '</' + node.localName + '>');
   };
+  const setHTML = (node, value, inert = false) => {
+    const observed = observers.size > 0, removedNodes = observed ? node.childNodes : [];
+    for (const child of node._children) child._parent = null; node._children.clear();
+    call('dom.html', node._id, String(value));
+    if (!inert) { __appsImages(node); if (definitions.size) customElements.upgrade(node); }
+    if (observed) change({ type: 'childList', target: node, removedNodes, addedNodes: node.childNodes });
+  };
+  class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
+  class NodeList extends List {}
+  class HTMLCollection extends List { namedItem(name) { return this.find(element => element.id === name || element.getAttribute('name') === name) ?? null; } }
+  class NamedNodeMap extends List { getNamedItem(name) { return this.find(attr => attr.name === name) ?? null; } }
+  class Attr {
+    constructor(ownerElement, name, value) { Object.assign(this, { ownerElement, name, localName: name, nodeName: name, nodeType: 2, namespaceURI: null, prefix: null, specified: true }); this._value = value; }
+    get value() { return this._value; } set value(value) { this._value = String(value); this.ownerElement?.setAttribute(this.name, this._value); }
+    get nodeValue() { return this.value; } set nodeValue(value) { this.value = value; }
+  }
+  const token = value => { value = String(value); if (!value) throw new DOMException('Token is empty', 'SyntaxError'); if (/[\t\n\f\r ]/.test(value)) throw new DOMException('Token contains whitespace', 'InvalidCharacterError'); return value; };
+  const tokens = list => [...new Set(list.value.split(/[\t\n\f\r ]+/).filter(Boolean))];
+  class DOMTokenList {
+    constructor(element, name) { this._element = element; this._name = name; }
+    get value() { return this._element.getAttribute(this._name) ?? ''; } set value(value) { this._element.setAttribute(this._name, value); }
+    get length() { return tokens(this).length; }
+    item(index) { return tokens(this)[index] ?? null; }
+    contains(value) { return tokens(this).includes(String(value)); }
+    add(...values) { const list = tokens(this); for (const value of values.map(token)) if (!list.includes(value)) list.push(value); this.value = list.join(' '); }
+    remove(...values) { values = values.map(token); this.value = tokens(this).filter(value => !values.includes(value)).join(' '); }
+    toggle(value, force) { value = token(value); const add = force === undefined ? !this.contains(value) : !!force; if (add) this.add(value); else this.remove(value); return add; }
+    replace(old, value) { old = token(old); value = token(value); const list = tokens(this), index = list.indexOf(old); if (index < 0) return false; list[index] = value; this.value = [...new Set(list)].join(' '); return true; }
+    supports() { return true; }
+    forEach(fn, thisArg) { tokens(this).forEach((value, index) => fn.call(thisArg, value, index, this)); }
+    keys() { return tokens(this).keys(); } values() { return tokens(this).values(); } entries() { return tokens(this).entries(); } [Symbol.iterator]() { return this.values(); }
+    toString() { return this.value; }
+  }
   class Node {
     constructor(id, tag) { this._id = id; this._children = new Set(); this._parent = null; nodes.set(id, new WeakRef(this)); registered.push(id); this.nodeType = ({ '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11 })[tag] ?? 1; this.nodeName = tag.startsWith('#') ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase(); }
     get ownerDocument() { if(this.nodeType===9)return null;const root=this.getRootNode();return root.nodeType===9?root:document; }
     get parentNode() { return wrap(call('dom.node', this._id).parent); }
     get parentElement() { const p = this.parentNode; return p?.nodeType === 1 ? p : null; }
     get assignedSlot() { const slot = assignedSlot(this); return slot?.getRootNode().mode === 'closed' ? null : slot; }
-    get childNodes() { const result = call('dom.node', this._id).children.map(wrap); result.item = i => result[i] ?? null; return result; }
+    get childNodes() { return listOf(NodeList, call('dom.node', this._id).children.map(wrap)); }
     get firstChild() { return wrap(call('dom.node', this._id).children[0]); }
     get lastChild() { return wrap(call('dom.node', this._id).children.at(-1)); }
     get nextSibling() { return wrap(call('dom.sibling', this._id, 1)); }
     get previousSibling() { return wrap(call('dom.sibling', this._id, -1)); }
     get isConnected() { return this.getRootNode({ composed: true }).nodeType === 9; }
     get textContent() { return call('dom.text', this._id); }
-    set textContent(value) { const observed = observers.size > 0, oldValue = observed ? this.textContent : null, removedNodes = observed ? this.childNodes : []; for (const child of this._children) child._parent = null; this._children.clear(); call('dom.setText', this._id, this.nodeType === 3 || this.nodeType === 8 ? String(value ?? '') : ''); if (this.nodeType === 1 && value != null && String(value)) this.appendChild(document.createTextNode(String(value))); change({ type: this.nodeType === 3 ? 'characterData' : 'childList', target: this, oldValue, removedNodes }); }
+    set textContent(value) {
+      const data = this.nodeType === 3 || this.nodeType === 8, observed = observers.size > 0, oldValue = observed ? this.textContent : null, removedNodes = observed && !data ? this.childNodes : [], addedNodes = [];
+      value = String(value ?? ''); for (const child of this._children) child._parent = null; this._children.clear(); call('dom.setText', this._id, data ? value : '');
+      if (!data && value) { const text = document.createTextNode(value); call('dom.insert', this._id, text._id, null); text._parent = this; this._children.add(text); addedNodes.push(text); }
+      change({ type: data ? 'characterData' : 'childList', target: this, oldValue, removedNodes, addedNodes });
+    }
     get nodeValue() { return this.nodeType === 3 || this.nodeType === 8 ? this.textContent : null; }
     set nodeValue(value) { if (this.nodeType === 3 || this.nodeType === 8) this.textContent = value; }
-    get data() { return this.nodeValue; }
-    set data(value) { this.nodeValue = value; }
-    get length() { return this.data?.length ?? 0; }
-    substringData(offset, count) { return this.data.slice(offset, offset + count); }
-    appendData(data) { this.data += data; }
-    deleteData(offset, count) { this.replaceData(offset, count, ''); }
-    insertData(offset, data) { this.replaceData(offset, 0, data); }
-    replaceData(offset, count, data) { if (offset < 0 || offset > this.length) throw new DOMException('Invalid offset', 'IndexSizeError'); this.data = this.data.slice(0, offset) + data + this.data.slice(offset + count); }
-    splitText(offset) { if (offset < 0 || offset > this.length) throw new DOMException('Invalid offset', 'IndexSizeError'); const other = document.createTextNode(this.data.slice(offset)); this.data = this.data.slice(0, offset); this.parentNode?.insertBefore(other, this.nextSibling); return other; }
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, before) {
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
-      if (child.nodeType === 11) { for (const node of [...child.childNodes]) this.insertBefore(node, before); return child; }
+      if (child.nodeType === 11) { for (const node of child.childNodes) this.insertBefore(node, before); return child; }
       const observed = observers.size > 0, oldParent = observed ? child.parentNode : null, previousSibling = observed ? before?.previousSibling ?? this.lastChild : null;
       call('dom.insert', this._id, child._id, before?._id ?? null); child._parent?._children.delete(child); child._parent = this; this._children.add(child);
       if (definitions.size && child.isConnected) { const stack=[child];while(stack.length){const node=stack.pop();node.connectedCallback?.();stack.push(...node.childNodes);if(node._shadow)stack.push(node._shadow);} }
@@ -94,71 +140,80 @@
       change({ type: 'childList', target: this, addedNodes: [child], previousSibling, nextSibling: before }); return child;
     }
     removeChild(child) { const observed = observers.size > 0, connected = definitions.size > 0 && child.isConnected, previousSibling = observed ? child.previousSibling : null, nextSibling = observed ? child.nextSibling : null; call('dom.remove', this._id, child._id); this._children.delete(child); child._parent = null; if(connected){const stack=[child];while(stack.length){const node=stack.pop();node.disconnectedCallback?.();stack.push(...node.childNodes);if(node._shadow)stack.push(node._shadow);}} change({ type: 'childList', target: this, removedNodes: [child], previousSibling, nextSibling }); return child; }
-    replaceChild(child, old) { this.insertBefore(child, old); return this.removeChild(old); }
-    replaceChildren(...children) { for (const child of [...this.childNodes]) this.removeChild(child); call('dom.setText', this._id, ''); this.append(...children); }
-    append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : document.createTextNode(String(child))); }
-    prepend(...children) { const before = this.firstChild; for (const child of children) this.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
+    replaceChild(child, old) { if (child !== old) { this.insertBefore(child, old); this.removeChild(old); } return old; }
     before(...children) { for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), this); }
     after(...children) { const before = this.nextSibling; for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
     replaceWith(...children) { this.before(...children); this.remove(); }
     remove() { this.parentNode?.removeChild(this); }
-    hasChildNodes() { return this.childNodes.length > 0; }
+    hasChildNodes() { return call('dom.node', this._id).children.length > 0; }
     contains(node) { for (; node; node = node.parentNode) if (node === this) return true; return false; }
-    getRootNode(options = {}) { let node = this; while (node.parentNode || (options.composed && node.host)) node = node.parentNode ?? node.host; return node; }
+    getRootNode(options = {}) { let node = this; for (let next; (next = node.parentNode ?? (options.composed && node instanceof ShadowRoot ? node.host : null));) node = next; return node; }
     cloneNode(deep = false) { const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : document.createElementNS(this.namespaceURI, this.localName); if (this.attributes) for (const attr of this.attributes) cloned.setAttribute(attr.name, attr.value); if (deep) for (const child of this.childNodes) cloned.appendChild(child.cloneNode(true)); return cloned; }
     isSameNode(other) { return this === other; }
     isEqualNode(other) { return other?.nodeType === this.nodeType && serialize(this) === serialize(other); }
     compareDocumentPosition(other) { if (this === other) return 0; const [a, b] = [this, other].map(node => { const chain = []; for (; node; node = node.parentNode) chain.push(node); return chain.reverse(); }); if (a[0] !== b[0]) return 1 | 32; let i = 0; while (a[i] && a[i] === b[i]) i++; if (i === a.length) return 4 | 16; if (i === b.length) return 2 | 8; const siblings = call('dom.node', a[i - 1]._id).children; return siblings.indexOf(a[i]._id) < siblings.indexOf(b[i]._id) ? 4 : 2; }
-    normalize() { for (const child of [...this.childNodes]) { if (child.nodeType === 3) { while (child.nextSibling?.nodeType === 3) { child.data += child.nextSibling.data; child.nextSibling.remove(); } if (!child.length) child.remove(); } else child.normalize(); } }
-    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (!list.some(item => item.fn === fn && item.capture === capture)) list.push({ fn, capture, once: !!options?.once }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
-    removeEventListener(name, fn, options = false) { const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this); listeners?.set(name, (listeners.get(name) ?? []).filter(item => item.fn !== fn || item.capture !== capture)); }
+    normalize() { for (const child of this.childNodes) { if (child.nodeType === 3) { while (child.nextSibling?.nodeType === 3) { child.data += child.nextSibling.data; child.nextSibling.remove(); } if (!child.length) child.remove(); } else child.normalize(); } }
+    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; list.push({ fn, capture, once: !!options?.once, passive: !!options?.passive }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
+    removeEventListener(name, fn, options = false) { const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this); listeners?.set(String(name), (listeners.get(String(name)) ?? []).filter(item => item.fn !== fn || item.capture !== capture)); }
     dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); return dispatch(this, event); }
   }
-  for (const [name, value] of Object.entries({ ELEMENT_NODE: 1, TEXT_NODE: 3, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16 })) { Node[name] = value; Node.prototype[name] = value; }
+  Object.setPrototypeOf(Node.prototype, EventTarget.prototype); Object.setPrototypeOf(Node, EventTarget);
+  for (const [name, value] of Object.entries({ ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32 })) { Node[name] = value; Node.prototype[name] = value; }
+  class CharacterData extends Node {
+    get data() { return this.textContent; } set data(value) { this.textContent = value; }
+    get length() { return this.data.length; }
+    substringData(offset, count) { return this.data.slice(offset, offset + count); }
+    appendData(data) { this.data += data; }
+    deleteData(offset, count) { this.replaceData(offset, count, ''); }
+    insertData(offset, data) { this.replaceData(offset, 0, data); }
+    replaceData(offset, count, data) { const value = this.data; if (offset < 0 || offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError'); this.data = value.slice(0, offset) + data + value.slice(offset + count); }
+  }
+  class Text extends CharacterData {
+    constructor(data = '', tag) { super(tag ? data : call('dom.create', '#text', String(data)), '#text'); }
+    splitText(offset) { const value = this.data; if (offset < 0 || offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError'); const other = document.createTextNode(value.slice(offset)); this.data = value.slice(0, offset); this.parentNode?.insertBefore(other, this.nextSibling); return other; }
+    get wholeText() { let node = this, text = ''; while (node.previousSibling?.nodeType === 3) node = node.previousSibling; for (; node?.nodeType === 3; node = node.nextSibling) text += node.data; return text; }
+  }
+  class Comment extends CharacterData { constructor(data = '', tag) { super(tag ? data : call('dom.createSpecial', '#comment', String(data)), '#comment'); } }
   const cssName = name => String(name).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+  const declarations = text => (text.match(/(?:[^;"'(]|"[^"]*"?|'[^']*'?|\([^)]*\)?)+/g) ?? []).flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim()]] : []; });
   const styleObject = (read, write) => new Proxy({
     get cssText() { return read(); }, set cssText(value) { write(String(value)); },
-    get length() { return this.cssText.split(';').filter(v => v.includes(':')).length; },
-    item(index) { return this.cssText.split(';').filter(v => v.includes(':'))[index]?.split(':')[0].trim() ?? ''; },
-    getPropertyValue(name) { return read().split(';').findLast(v => v.split(':')[0].trim() === name)?.split(':').slice(1).join(':').trim().replace(/\s*!important$/, '') ?? ''; },
-    getPropertyPriority(name) { return read().split(';').findLast(v => v.split(':')[0].trim() === name)?.trim().endsWith('!important') ? 'important' : ''; },
-    setProperty(name, value, priority = '') { const list = read().split(';').filter(v => v.split(':')[0].trim() !== name && v.trim()); if (value !== '' && value != null) list.push(name + ':' + value + (priority === 'important' ? ' !important' : '')); write(list.join(';')); },
+    get length() { return declarations(read()).length; },
+    item(index) { return declarations(read())[index]?.[0] ?? ''; },
+    getPropertyValue(name) { return declarations(read()).findLast(([key]) => key === name)?.[1].replace(/\s*!important$/i, '') ?? ''; },
+    getPropertyPriority(name) { return /!important$/i.test(declarations(read()).findLast(([key]) => key === name)?.[1]) ? 'important' : ''; },
+    setProperty(name, value, priority = '') { const list = declarations(read()).filter(([key]) => key !== name).map(([key, value]) => key + ':' + value); if (value !== '' && value != null) list.push(name + ':' + value + (priority === 'important' ? ' !important' : '')); write(list.join(';')); },
     removeProperty(name) { const old = this.getPropertyValue(name); this.setProperty(name, ''); return old; },
-  }, { get: (target, name) => name in target ? Reflect.get(target, name) : /^\d+$/.test(String(name)) ? target.item(Number(name)) : target.getPropertyValue(cssName(name)), set(target, name, value) { if (name === 'cssText') target.cssText = value; else target.setProperty(cssName(name), value); return true; } });
+  }, { get: (target, name) => name in target ? Reflect.get(target, name) : /^\d+$/.test(String(name)) ? target.item(Number(name)) : target.getPropertyValue(name === 'cssFloat' ? 'float' : cssName(name)), set(target, name, value) { if (name === 'cssText') target.cssText = value; else target.setProperty(name === 'cssFloat' ? 'float' : cssName(name), value); return true; } });
+  const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
   class Element extends Node {
-    constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??[...definitions].find(([,ctor])=>ctor===new.target)?.[0];if(!tag)throw new TypeError('Illegal element constructor');id=call('dom.create',tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = 'http://www.w3.org/1999/xhtml'; }
-    get attributes() { const attrs = Object.entries(call('dom.snapshot', this._id).attrs).map(([name, value]) => ({ name, value, nodeName: name, nodeValue: value, specified: true })); attrs.item = i => attrs[i] ?? null; attrs.getNamedItem = name => attrs.find(a => a.name === name) ?? null; return attrs; }
-    get children() { const list = this.childNodes.filter(n => n.nodeType === 1); list.item = i => list[i] ?? null; return list; }
-    get childElementCount() { return this.children.length; }
-    get firstElementChild() { return this.children[0] ?? null; }
-    get lastElementChild() { return this.children.at(-1) ?? null; }
+    constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??[...definitions].find(([,ctor])=>ctor===new.target)?.[0];if(!tag)throw new TypeError('Illegal element constructor');id=call('dom.create',tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; }
+    get attributes() { const attrs = listOf(NamedNodeMap, call('dom.snapshot', this._id).attrs.map(([name, value]) => new Attr(this, name, value))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
+    getAttributeNames() { return call('dom.snapshot', this._id).attrs.map(([name]) => name); }
+    hasAttributes() { return call('dom.snapshot', this._id).attrs.length > 0; }
     get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== 1) n = n.nextSibling; return n; }
     get previousElementSibling() { let n = this.previousSibling; while (n && n.nodeType !== 1) n = n.previousSibling; return n; }
     get id() { return this.getAttribute('id') ?? ''; } set id(value) { this.setAttribute('id', value); }
     get className() { return this.getAttribute('class') ?? ''; } set className(value) { this.setAttribute('class', value); }
-    get classList() { const element = this; return { contains: name => element.className.split(/\s+/).includes(name), add(...names) { element.className = [...new Set([...element.className.split(/\s+/).filter(Boolean), ...names])].join(' '); }, remove(...names) { element.className = element.className.split(/\s+/).filter(n => !names.includes(n)).join(' '); }, toggle(name, force) { const present = this.contains(name), add = force ?? !present; if (add) this.add(name); else this.remove(name); return add; }, replace(old, value) { if (!this.contains(old)) return false; this.remove(old); this.add(value); return true; }, get value() { return element.className; }, set value(value) { element.className = value; }, [Symbol.iterator]() { return element.className.split(/\s+/).filter(Boolean)[Symbol.iterator](); } }; }
-    get dataset() { return this._dataset ??= new Proxy({}, { get: (_, name) => this.getAttribute('data-' + cssName(name)) ?? undefined, set: (_, name, value) => { this.setAttribute('data-' + cssName(name), value); return true; }, deleteProperty: (_, name) => { this.removeAttribute('data-' + cssName(name)); return true; }, ownKeys: () => this.attributes.filter(a => a.name.startsWith('data-')).map(a => a.name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) }); }
-    getAttribute(name) { return call('dom.attr', this._id, String(name)); }
+    get classList() { return this._classList ??= new DOMTokenList(this, 'class'); } set classList(value) { this.classList.value = value; }
+    get dataset() { return this._dataset ??= new Proxy({}, { get: (_, name) => this.getAttribute('data-' + cssName(name)) ?? undefined, set: (_, name, value) => { this.setAttribute('data-' + cssName(name), value); return true; }, has: (_, name) => typeof name === 'string' && this.hasAttribute('data-' + cssName(name)), deleteProperty: (_, name) => { this.removeAttribute('data-' + cssName(name)); return true; }, ownKeys: () => this.getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) }); }
+    getAttribute(name) { return call('dom.attr', this._id, attrName(this, name)); }
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this.getAttribute(name) !== null; }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = String(name); const watched = this.constructor.observedAttributes?.includes(name), oldValue = watched || observers.size ? this.getAttribute(name) : null; call('dom.setAttr', this._id, name, String(value)); if(watched)this.attributeChangedCallback?.(name,oldValue,String(value)); change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const watched = this.constructor.observedAttributes?.includes(name), oldValue = watched || observers.size ? this.getAttribute(name) : null; call('dom.setAttr', this._id, name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { const watched = this.constructor.observedAttributes?.includes(name), oldValue = watched || observers.size ? this.getAttribute(name) : null; call('dom.removeAttr', this._id, name); if(oldValue!==null&&watched)this.attributeChangedCallback?.(name,oldValue,null); if (oldValue !== null) change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
+    removeAttribute(name) { name = attrName(this, name); const watched = this.constructor.observedAttributes?.includes(name), oldValue = watched || observers.size ? this.getAttribute(name) : null; call('dom.removeAttr', this._id, name); if(oldValue!==null&&watched)this.attributeChangedCallback?.(name,oldValue,null); if (oldValue !== null) change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
     get style() { return this._style ??= styleObject(() => this.getAttribute('style') ?? '', value => this.setAttribute('style', value)); }
     get innerHTML() { return this.childNodes.map(serialize).join('') || call('dom.snapshot', this._id).text; }
-    set innerHTML(value) { const removedNodes = this.childNodes; for (const child of this._children) child._parent = null; this._children.clear(); call('dom.html', this._id, String(value)); __appsImages(this); change({ type: 'childList', target: this, removedNodes, addedNodes: this.childNodes }); }
+    set innerHTML(value) { setHTML(this, value); }
     get outerHTML() { return serialize(this); }
     set outerHTML(value) { const container = document.createElement('div'); container.innerHTML = value; this.replaceWith(...container.childNodes); }
     get innerText() { return this.textContent; } set innerText(value) { this.textContent = value; }
-    querySelector(selector) { return wrap(call('dom.queryWithin', this._id, String(selector), true)); }
-    querySelectorAll(selector) { const list = call('dom.queryWithin', this._id, String(selector)).map(wrap); list.item = i => list[i] ?? null; return list; }
     matches(selector) { return call('dom.matches', this._id, String(selector)); }
     closest(selector) { for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node; return null; }
-    getElementsByTagName(tag) { return this.querySelectorAll(tag); }
-    getElementsByClassName(names) { return this.querySelectorAll('.' + String(names).trim().split(/\s+/).join('.')); }
     getBoundingClientRect() { const rect = call('dom.rect', this._id); return new DOMRect(rect.x, rect.y, rect.width, rect.height); }
     getClientRects() { return this.isConnected ? [this.getBoundingClientRect()] : []; }
     get clientWidth() { return this.getBoundingClientRect().width; } get clientHeight() { return this.getBoundingClientRect().height; }
@@ -197,7 +252,7 @@
     }
     focus() { if (active === this || this.disabled) return; const previous = active; active = this; call('dom.focus', path(this).map(node => node._id)); if (previous) { dispatch(previous, new FocusEvent('blur', { composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })); } dispatch(this, new FocusEvent('focus', { composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })); }
     blur() { if (active !== this) return; active = null; call('dom.focus', []); dispatch(this, new FocusEvent('blur', { composed: true })); dispatch(this, new FocusEvent('focusout', { bubbles: true, composed: true })); }
-    click() { if (!this.disabled) dispatch(this, new MouseEvent('click', { bubbles: true, cancelable: true })); }
+    click() { if (!this.disabled && dispatch(this, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true }))) activate(this); }
     get contentEditable() { return this.getAttribute('contenteditable') ?? 'inherit'; } set contentEditable(value) { this.setAttribute('contenteditable', value); }
     get isContentEditable() { const value = this.contentEditable.toLowerCase(); return ['true','plaintext-only',''].includes(value) || (value !== 'false' && !!this.parentElement?.isContentEditable); }
     get tabIndex() { return Number(this.getAttribute('tabindex') ?? (['input','textarea','button','select'].includes(this.localName) ? 0 : -1)); } set tabIndex(value) { this.setAttribute('tabindex', value); }
@@ -206,7 +261,9 @@
     setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
     hasPointerCapture(id) { return captures.get(id) === this; }
     releasePointerCapture(id) { if (captures.get(id) === this) { captures.delete(id); dispatch(this, new PointerEvent('lostpointercapture', { pointerId: id })); } }
-    insertAdjacentHTML(position, source) { const wrapper = document.createElement('div'); wrapper.innerHTML = source; const children = [...wrapper.childNodes]; if (position === 'beforebegin') this.before(...children); else if (position === 'afterend') this.after(...children); else if (position === 'afterbegin') this.prepend(...children); else if (position === 'beforeend') this.append(...children); else throw new DOMException('Invalid insertion position', 'SyntaxError'); }
+    insertAdjacentElement(position, node) { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!this.parentNode) return null; if (position === 'beforebegin') this.before(node); else this.after(node); } else if (position === 'afterbegin') this.prepend(node); else if (position === 'beforeend') this.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; }
+    insertAdjacentText(position, text) { this.insertAdjacentElement(position, document.createTextNode(String(text))); }
+    insertAdjacentHTML(position, source) { const wrapper = document.createElement('div'), fragment = new DocumentFragment(); wrapper.innerHTML = source; fragment.append(...wrapper.childNodes); this.insertAdjacentElement(position, fragment); }
   }
   class HTMLElement extends Element {}
   class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI='http://www.w3.org/2000/svg';this.nodeName=this.tagName=tag;}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
@@ -218,6 +275,7 @@
     assignedElements(options = {}) { return this.assignedNodes(options).filter(node => node.nodeType === 1); }
   }
   class HTMLInputElement extends HTMLElement {
+    get type() { return this.localName === 'textarea' ? 'textarea' : (this.getAttribute('type') ?? 'text').toLowerCase(); } set type(value) { this.setAttribute('type', value); }
     get value() { return this._value ?? this.getAttribute('value') ?? (this.localName === 'textarea' ? this.textContent : ''); }
     set value(value) { this._value = String(value); call('dom.setAttr', this._id, 'value', this._value); const length = this._value.length; this._start = Math.min(this._start ?? length, length); this._end = Math.min(this._end ?? length, length); }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
@@ -245,6 +303,11 @@
       this.setSelectionRange(mode === 'select' || mode === 'start' ? start : mode === 'end' ? after : oldStart > end ? oldStart + delta : oldStart > start ? start : oldStart,
         mode === 'select' || mode === 'end' ? after : mode === 'start' ? start : oldEnd > end ? oldEnd + delta : oldEnd > start ? after : oldEnd);
     }
+  }
+  class HTMLTemplateElement extends HTMLElement {
+    get content() { if (!this._content) { this._content = new DocumentFragment(); this._content.append(...this.childNodes); } return this._content; }
+    get innerHTML() { return this.content.childNodes.map(serialize).join(''); } set innerHTML(value) { setHTML(this.content, value, true); }
+    cloneNode(deep = false) { const clone = super.cloneNode(false); if (deep) clone.content.append(this.content.cloneNode(true)); return clone; }
   }
   class HTMLImageElement extends HTMLElement {
     get src() { return this.getAttribute('src') ?? ''; } set src(value) { this.setAttribute('src',value); }
@@ -285,7 +348,7 @@
   class ClipboardEvent extends Event {constructor(type,options={}){super(type,options);this.clipboardData=options.clipboardData??null;}}
   class DragEvent extends MouseEvent {constructor(type,options={}){super(type,options);this.dataTransfer=options.dataTransfer??null;}}
   class CompositionEvent extends UIEvent { constructor(type, options = {}) { super(type, options); this.data = options.data ?? ''; } }
-  class DocumentFragment extends Node { querySelector(selector) { return wrap(call('dom.queryWithin', this._id, String(selector), true)); } querySelectorAll(selector) { return call('dom.queryWithin', this._id, String(selector)).map(wrap); } get children() { return this.childNodes.filter(n => n.nodeType === 1); } get activeElement() { return active && this.contains(active) ? active : null; } }
+  class DocumentFragment extends Node { constructor(id, tag) { super(tag ? id : call('dom.createSpecial', '#fragment', ''), '#fragment'); } }
   class CSSStyleSheet {
     constructor(){this._text='';this._owners=new Map();}
     replaceSync(text){this._text=String(text);for(const node of this._owners.values())node.textContent=this._text;}
@@ -295,30 +358,108 @@
     deleteRule(index){const rules=this.cssRules.map(rule=>rule.cssText);if(index<0||index>=rules.length)throw new DOMException('Invalid rule index','IndexSizeError');rules.splice(index,1);this.replaceSync(rules.join(''));}
   }
   class ShadowRoot extends DocumentFragment {
-    get innerHTML(){return this.childNodes.map(serialize).join('');} set innerHTML(value){const removedNodes=this.childNodes;for(const child of this._children)child._parent=null;this._children.clear();call('dom.html',this._id,String(value));__appsImages(this);change({type:'childList',target:this,removedNodes,addedNodes:this.childNodes});}
+    get innerHTML(){return this.childNodes.map(serialize).join('');} set innerHTML(value){setHTML(this,value);}
+    get activeElement() { return active && this.contains(active) ? active : null; }
     get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;this.prepend(style);sheet._owners.set(this,style);}}
-    getElementById(id){return this.querySelectorAll('[id]').find(node=>node.id===String(id))??null;}
   }
-  const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root];while(stack.length){const node=stack.pop(),Type=definitions.get(node.localName);if(Type&&!(node instanceof Type)){constructing={node};try{new Type();}finally{constructing=null;}for(const attr of Type.observedAttributes??[])if(node.hasAttribute(attr))node.attributeChangedCallback?.(attr,null,node.getAttribute(attr));if(node.isConnected)node.connectedCallback?.();}stack.push(...node.childNodes);if(node._shadow)stack.push(node._shadow);}}};
+  const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root];while(stack.length){const node=stack.pop(),Type=definitions.get(node.localName);if(Type&&!(node instanceof Type)){constructing={node};try{new Type();}finally{constructing=null;}for(const attr of Type.observedAttributes??[])if(node.hasAttribute(attr))node.attributeChangedCallback?.(attr,null,node.getAttribute(attr));if(node.isConnected)node.connectedCallback?.();}if(node.localName!=='template')stack.push(...node.childNodes);if(node._shadow)stack.push(node._shadow);}}};
+  const filterNode = (walker, node) => !(walker.whatToShow & (1 << (node.nodeType - 1))) ? 3 : walker.filter == null ? 1 : typeof walker.filter === 'function' ? walker.filter(node) : walker.filter.acceptNode(node);
+  class TreeWalker {
+    constructor(root, whatToShow = 0xffffffff, filter = null) { Object.assign(this, { root, whatToShow: whatToShow >>> 0, filter, currentNode: root }); }
+    parentNode() { for (let node = this.currentNode; node && node !== this.root;) { node = node.parentNode; if (node && filterNode(this, node) === 1) return this.currentNode = node; } return null; }
+    firstChild() { return this._children(true); } lastChild() { return this._children(false); }
+    nextSibling() { return this._siblings(true); } previousSibling() { return this._siblings(false); }
+    _children(first) {
+      let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
+      while (node) {
+        const result = filterNode(this, node);
+        if (result === 1) return this.currentNode = node;
+        const child = result === 3 && (first ? node.firstChild : node.lastChild);
+        if (child) { node = child; continue; }
+        for (;;) { const sibling = first ? node.nextSibling : node.previousSibling; if (sibling) { node = sibling; break; } node = node.parentNode; if (!node || node === this.root || node === this.currentNode) return null; }
+      }
+      return null;
+    }
+    _siblings(next) {
+      let node = this.currentNode;
+      if (node === this.root) return null;
+      for (;;) {
+        let sibling = next ? node.nextSibling : node.previousSibling;
+        while (sibling) {
+          node = sibling; const result = filterNode(this, node);
+          if (result === 1) return this.currentNode = node;
+          sibling = next ? node.firstChild : node.lastChild;
+          if (result === 2 || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
+        }
+        node = node.parentNode;
+        if (!node || node === this.root || filterNode(this, node) === 1) return null;
+      }
+    }
+    previousNode() {
+      for (let node = this.currentNode; node !== this.root;) {
+        for (let sibling = node.previousSibling; sibling; sibling = node.previousSibling) {
+          node = sibling; let result = filterNode(this, node);
+          for (let child; result !== 2 && (child = node.lastChild);) { node = child; result = filterNode(this, node); }
+          if (result === 1) return this.currentNode = node;
+        }
+        if (node === this.root || !node.parentNode) return null;
+        node = node.parentNode;
+        if (filterNode(this, node) === 1) return this.currentNode = node;
+      }
+      return null;
+    }
+    nextNode() {
+      for (let node = this.currentNode, result = 1;;) {
+        for (let child; result !== 2 && (child = node.firstChild);) { node = child; result = filterNode(this, node); if (result === 1) return this.currentNode = node; }
+        let sibling = null;
+        for (let up = node; up && up !== this.root && !(sibling = up.nextSibling); up = up.parentNode);
+        if (!sibling) return null;
+        node = sibling; result = filterNode(this, node);
+        if (result === 1) return this.currentNode = node;
+      }
+    }
+  }
+  class NodeIterator {
+    constructor(root, whatToShow = 0xffffffff, filter = null) { Object.assign(this, { root, whatToShow: whatToShow >>> 0, filter, referenceNode: root, pointerBeforeReferenceNode: true }); }
+    nextNode() { return this._traverse(true); } previousNode() { return this._traverse(false); } detach() {}
+    _traverse(next) {
+      let node = this.referenceNode, before = this.pointerBeforeReferenceNode;
+      for (;;) {
+        if (next === before) before = !before;
+        else if (next) {
+          let following = node.firstChild;
+          for (let up = node; !following && up && up !== this.root; up = up.parentNode) following = up.nextSibling;
+          if (!following) return null; node = following;
+        } else {
+          if (node === this.root) return null;
+          let previous = node.previousSibling;
+          if (previous) { for (let child; (child = previous.lastChild);) previous = child; node = previous; } else node = node.parentNode;
+        }
+        if (filterNode(this, node) === 1) break;
+      }
+      this.referenceNode = node; this.pointerBeforeReferenceNode = before; return node;
+    }
+  }
   class Document extends Node {
+    constructor(id, tag) { super(tag ? id : call('dom.createSpecial', '#document', ''), '#document'); }
+    get textContent() { return null; } set textContent(_) {}
     createElement(tag) {tag=String(tag).toLowerCase();const Type=definitions.get(tag);if(Type){constructing={tag};try{return new Type();}finally{constructing=null;}}return wrap(call('dom.create',tag));}
     createElementNS(namespace, tag) {namespace=namespace==null?null:String(namespace);tag=String(tag);if(namespace==='http://www.w3.org/1999/xhtml')return this.createElement(tag);const id=call('dom.create',tag),Type=namespace==='http://www.w3.org/2000/svg'?(tag==='svg'?SVGSVGElement:SVGElement):Element;const node=new Type(id,tag);node.namespaceURI=namespace;return node;}
     createTextNode(text) { return wrap(call('dom.create', '#text', String(text))); }
     createComment(text) { return wrap(call('dom.createSpecial', '#comment', String(text))); }
     createDocumentFragment() { return wrap(call('dom.createSpecial', '#fragment', '')); }
     createRange() { return new Range(); }
-    get implementation(){return {createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<html><head></head><body></body></html>','text/html');if(title)doc.title=title;return doc;}};}
-    createEvent(type) { return new (type === 'MouseEvents' ? MouseEvent : type === 'KeyboardEvent' ? KeyboardEvent : Event)(''); }
+    get implementation(){return this._implementation??={createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<html><head></head><body></body></html>','text/html');if(title)doc.title=title;return doc;},hasFeature:()=>true};}
+    createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return node.cloneNode(deep); }
     adoptNode(node) { node.remove(); return node; }
-    querySelector(selector) { return wrap(call('dom.queryWithin', this._id, String(selector), true)); }
-    querySelectorAll(selector) { return call('dom.queryWithin',this._id,String(selector)).map(wrap); }
-    getElementById(id) { id = String(id); return !id ? null : /['\\()]|^"|"$/.test(id) ? this.querySelectorAll('[id]').find(node => node.id === id) ?? null : this.querySelector("[id='" + id + "']"); }
-    getElementsByTagName(tag) { return this.querySelectorAll(tag); }
-    getElementsByClassName(names) { return this.querySelectorAll('.' + names.trim().split(/\s+/).join('.')); }
+    getElementById(id) { id = String(id); return id ? this.querySelector('[id=' + quote(id) + ']') : null; }
+    getElementsByName(name) { return this.querySelectorAll('[name=' + quote(name) + ']'); }
     addEventListener(name, fn, options) { if (name === 'DOMContentLoaded') queueMicrotask(() => fn(new Event(name))); else super.addEventListener(name, fn, options); }
     get body() { return this.querySelector('body'); } get head() { return this.querySelector('head'); } get documentElement() { return this.querySelector('html'); }
     get activeElement() { return active ?? this.body; } get defaultView() { return globalThis; }
+    get URL() { return location.href; } get documentURI() { return location.href; } get location() { return this === document ? location : null; }
+    get characterSet() { return 'UTF-8'; } get contentType() { return 'text/html'; } get scrollingElement() { return this.documentElement; }
     get readyState() { return 'complete'; } get compatMode() { return 'CSS1Compat'; } get visibilityState() { return 'visible'; } get hidden() { return false; }
     get title() { return (this.querySelector('title')?.textContent ?? '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
     set title(value) {
@@ -331,8 +472,8 @@
       title.textContent = String(value);
     }
     getSelection() { return selection; } hasFocus() { return !!active; }
-    createTreeWalker(root, whatToShow = 0xffffffff, filter = null) { const accept = node => !(whatToShow & (1 << (node.nodeType - 1))) ? 3 : typeof filter === 'function' ? filter(node) : filter?.acceptNode(node) ?? 1; const walker = { root, currentNode: root, whatToShow, filter, nextNode() { let node = this.currentNode, result = 1, next; for (;;) { while (result !== 2 && (next = node.firstChild)) { node = next; result = accept(node); if (result === 1) return this.currentNode = node; } next = null; for (let up = node; up && up !== root && !(next = up.nextSibling); up = up.parentNode); if (!next) return null; node = next; result = accept(node); if (result === 1) return this.currentNode = node; } }, parentNode() { if (this.currentNode === root) return null; return this.currentNode = this.currentNode.parentNode; } }; return walker; }
-    createNodeIterator(root, whatToShow, filter) { const walker = this.createTreeWalker(root, whatToShow, filter); let first = true; const next = walker.nextNode; walker.nextNode = function () { if (first) { first = false; if (this.whatToShow & (1 << (root.nodeType - 1))) return root; } return next.call(this); }; return walker; }
+    createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
+    createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     caretRangeFromPoint(x,y) {
       const node = wrap(call('dom.hitTest',x,y,true,true)); if (!node) return null;
       const range = this.createRange(); range.setStart(node,node.nodeType === 3 ? call('dom.textIndex',node._id,x,y) : 0); range.collapse(true); return range;
@@ -341,6 +482,23 @@
     elementFromPoint(x, y) { return wrap(call('dom.hitTest', x, y, true)); }
     elementsFromPoint(x, y) { return call('dom.hitTest', x, y).map(wrap); }
   }
+  DocumentFragment.prototype.getElementById = Document.prototype.getElementById;
+  class ParentNode {
+    get children() { return listOf(HTMLCollection, this.childNodes.filter(node => node.nodeType === 1)); }
+    get childElementCount() { return this.children.length; }
+    get firstElementChild() { return this.children[0] ?? null; }
+    get lastElementChild() { return this.children.at(-1) ?? null; }
+    append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : document.createTextNode(String(child))); }
+    prepend(...children) { const before = this.firstChild; for (const child of children) this.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
+    replaceChildren(...children) { for (const child of this.childNodes) this.removeChild(child); call('dom.setText', this._id, ''); this.append(...children); }
+    querySelector(selector) { return wrap(call('dom.queryWithin', this._id, String(selector), true)); }
+    querySelectorAll(selector) { return listOf(NodeList, call('dom.queryWithin', this._id, String(selector)).map(wrap)); }
+    getElementsByTagName(name) { return listOf(HTMLCollection, this.querySelectorAll(name)); }
+    getElementsByClassName(names) { names = String(names).split(/[\t\n\f\r ]+/).filter(Boolean); return listOf(HTMLCollection, names.length ? this.querySelectorAll(names.map(name => '[class~=' + quote(name) + ']').join('')) : []); }
+  }
+  const { constructor: _, ...parentNode } = Object.getOwnPropertyDescriptors(ParentNode.prototype);
+  for (const Type of [Element, Document, DocumentFragment]) Object.defineProperties(Type.prototype, parentNode);
+  class XMLSerializer { serializeToString(node) { if (!(node instanceof Node)) throw new TypeError('Expected a Node'); const source = serialize(node); return node.nodeType === 1 && node.namespaceURI && !node.hasAttribute('xmlns') ? source.replace(/^<[^\s>]+/, tag => tag + ' xmlns=' + quote(node.namespaceURI)) : source; } }
   class DOMParser {
     parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(call('dom.createSpecial','#document',''));source=String(source);if(!/<html[\s>]/i.test(source))source=/<body[\s>]/i.test(source)?'<html><head></head>'+source+'</html>':'<html><head></head><body>'+source+'</body></html>';call('dom.html',doc._id,source);return doc;}
   }
@@ -487,7 +645,7 @@
     for (let next = id; next != null && !nodes.get(next)?.deref();) { const data = call('dom.node', next); chain.push([next, data.tag, data.parent]); next = data.parent; }
     for (const [id, tag, parent] of chain.reverse()) {
       const above = nodes.get(parent)?.deref(), svg = tag === 'svg' || above instanceof SVGElement && above.localName !== 'foreignObject';
-      const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag.startsWith('#') ? Node : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : tag === 'canvas' ? HTMLCanvasElement : tag === 'img' ? HTMLImageElement : tag === 'slot' ? HTMLSlotElement : ['input', 'textarea'].includes(tag) ? HTMLInputElement : HTMLElement;
+      const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag === '#text' ? Text : tag === '#comment' ? Comment : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : htmlTypes.get(tag) ?? HTMLElement;
       const node = new Type(id, tag); node._parent = above ?? null; above?._children.add(node);
     }
     return nodes.get(id)?.deref() ?? null;
@@ -541,10 +699,16 @@
     toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.from(atob(data),c=>c.charCodeAt(0))],{type:'image/png'}))); }
     getContext(type) { if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); if (this._contextType && this._contextType !== type) return null; if (!['webgpu','2d'].includes(type)) return null; this._contextType = type; return this._context ??= type === '2d' ? new CanvasRenderingContext2D(this) : new GPUCanvasContext(this, this._id); }
   }
+  const htmlTypes = new Map([['canvas', HTMLCanvasElement], ['img', HTMLImageElement], ['slot', HTMLSlotElement], ['input', HTMLInputElement], ['textarea', HTMLInputElement], ['template', HTMLTemplateElement]]);
+  for (const [name, tags] of Object.entries({ Anchor: 'a', Body: 'body', BR: 'br', Button: 'button', Details: 'details', Dialog: 'dialog', Div: 'div', DList: 'dl', FieldSet: 'fieldset', Form: 'form', Head: 'head', Heading: 'h1 h2 h3 h4 h5 h6', HR: 'hr', Html: 'html', IFrame: 'iframe', Label: 'label', Legend: 'legend', LI: 'li', Link: 'link', Meta: 'meta', Meter: 'meter', OList: 'ol', OptGroup: 'optgroup', Option: 'option', Output: 'output', Paragraph: 'p', Pre: 'pre', Progress: 'progress', Quote: 'blockquote q', Script: 'script', Select: 'select', Span: 'span', Style: 'style', Table: 'table', TableCaption: 'caption', TableCell: 'td th', TableCol: 'col colgroup', TableRow: 'tr', TableSection: 'tbody tfoot thead', Time: 'time', Title: 'title', UList: 'ul' })) {
+    const key = 'HTML' + name + 'Element', Type = globalThis[key] = { [key]: class extends HTMLElement {} }[key];
+    for (const tag of tags.split(' ')) htmlTypes.set(tag, Type);
+  }
   const document = globalThis.document = wrap(0);
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
-  Object.assign(globalThis, { Node, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, HTMLImageElement, HTMLCanvasElement, HTMLIFrameElement: class extends Element {}, Document, DocumentFragment, Text: Node, Comment: Node, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
+  for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
+  Object.assign(globalThis, { Node, CharacterData, Text, Comment, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, HTMLImageElement, HTMLCanvasElement, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
   Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
   globalThis.Image = function Image(width,height) { const image=document.createElement('img'); if(width!==undefined) image.width=width; if(height!==undefined) image.height=height; return image; };
   class FontFace {
@@ -558,7 +722,7 @@
     check(font,text=' ') {const families=String(font).replace(/^.*?\d+(?:\.\d+)?px\s+/,'').split(',').map(v=>v.trim().replace(/^['"]|['"]$/g,''));return families.some(family=>{const faces=[...this._faces].filter(face=>face.family===family);return faces.length?faces.every(face=>face.status==='loaded'):call('dom.fontCheck',0,family);});}
   }
   Object.assign(globalThis,{FontFace,FontFaceSet});document.fonts=new FontFaceSet();
-  globalThis.NodeFilter = { SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 };
+  globalThis.NodeFilter = { SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 };
   Object.defineProperties(globalThis, { innerWidth: { get: () => call('dom.viewport')[0] }, innerHeight: { get: () => call('dom.viewport')[1] }, devicePixelRatio: { get: () => call('dom.viewport')[2] } });
   globalThis.getSelection = () => selection;
   globalThis.getComputedStyle = node => { const values = call('dom.style', node._id); return styleObject(() => Object.entries(values).map(([k,v]) => k+':'+v).join(';'), () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); }); };
@@ -850,17 +1014,7 @@
       }
     }
     if (name === 'pointerup' || name === 'pointercancel') { if (selectionDrag?.id === data.pointerId) selectionDrag = null; pointers.delete(data.pointerId); captures.get(data.pointerId)?.releasePointerCapture(data.pointerId); }
-    if (name === 'click' && result) {
-      const label = path(target).find(node => node.localName === 'label');
-      const control = target.localName === 'input' ? target : label && (label.getAttribute('for') ? document.getElementById(label.getAttribute('for')) : label.querySelector('input'));
-      const kind = control?.localName === 'input' ? String(control.getAttribute('type')).toLowerCase() : '';
-      if ((kind === 'checkbox' || kind === 'radio') && !control.disabled && !(kind === 'radio' && control.checked)) {
-        if (kind === 'radio' && control.getAttribute('name')) for (const other of control.getRootNode().querySelectorAll('input[type=radio]')) if (other.getAttribute('name') === control.getAttribute('name')) other.checked = false;
-        control.checked = kind === 'radio' || !control.checked;
-        dispatch(control, new Event('input', { bubbles: true, composed: true }));
-        dispatch(control, new Event('change', { bubbles: true }));
-      }
-    }
+    if (name === 'click' && result) activate(target);
     if (name === 'click' && data.detail === 2) dispatch(target, new MouseEvent('dblclick', { bubbles: true, cancelable: true, composed: true, ...data }));
     return result;
   };

@@ -606,7 +606,7 @@ pub fn call(
             }
             "dom.snapshot" => {
                 let node = &doc.nodes[id];
-                let attrs: HashMap<_, _> = node.attrs.iter().collect();
+                let attrs: Vec<_> = node.attrs.iter().collect();
                 Ok(
                     json!({"tag":node.tag,"text":node.text,"attrs":attrs,"parent":node.parent,"children":node.children}),
                 )
@@ -633,7 +633,9 @@ pub fn call(
                         }
                         found.push(node);
                     }
-                    pending.extend(doc.nodes[node].children.iter().rev());
+                    if doc.nodes[node].tag != "template" {
+                        pending.extend(doc.nodes[node].children.iter().rev());
+                    }
                 }
                 Ok(if first { Value::Null } else { json!(found) })
             }

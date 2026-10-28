@@ -100,6 +100,7 @@
   };
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
+    globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsGPU = call;
     return;
   }

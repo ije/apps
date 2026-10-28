@@ -1,4 +1,3 @@
-use bbtree::unsync::BBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, rc::Rc};
 
@@ -1123,12 +1122,77 @@ impl Selector {
     }
 }
 
+/// Attributes in source order, like the DOM attribute list.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Attrs(Vec<(String, String)>);
+
+impl Attrs {
+    pub fn get(&self, name: &str) -> Option<&String> {
+        self.0.iter().find_map(|(key, value)| (key == name).then_some(value))
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut String> {
+        self.0.iter_mut().find_map(|(key, value)| (key == name).then_some(value))
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.0.iter().any(|(key, _)| key == name)
+    }
+
+    pub fn insert(&mut self, name: String, value: String) -> Option<String> {
+        match self.0.iter_mut().find(|(key, _)| *key == name) {
+            Some((_, old)) => Some(std::mem::replace(old, value)),
+            None => {
+                self.0.push((name, value));
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        let index = self.0.iter().position(|(key, _)| key == name)?;
+        Some(self.0.remove(index).1)
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(key, _)| key)
+    }
+}
+
+impl<'a> IntoIterator for &'a Attrs {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (String, String)>,
+        fn(&'a (String, String)) -> (&'a String, &'a String),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+}
+
+impl std::ops::Index<&str> for Attrs {
+    type Output = String;
+
+    fn index(&self, name: &str) -> &String {
+        self.get(name).expect("missing attribute")
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Node {
     pub tag: String,
     pub text: String,
-    #[serde(with = "crate::bundle::map")]
-    pub attrs: BBTreeMap<String, String>,
+    pub attrs: Attrs,
     pub children: Vec<usize>,
     pub parent: Option<usize>,
     pub(crate) stylesheet: Option<Rc<crate::render::Stylesheet>>,
@@ -1154,12 +1218,25 @@ impl Document {
         let mut pos = 0;
         while pos < source.len() {
             let rest = &source[pos..];
-            if rest.starts_with("<!--") {
-                pos += rest.find("-->").map_or(rest.len(), |n| n + 3);
-                continue;
-            }
             if rest.starts_with("<!") || rest.starts_with("<?") {
-                pos += rest.find('>').map_or(rest.len(), |n| n + 1);
+                let (text, length) = if let Some(body) = rest.strip_prefix("<!--") {
+                    body.find("-->")
+                        .map_or((body, rest.len()), |n| (&body[..n], n + 7))
+                } else {
+                    let end = rest.find('>').unwrap_or(rest.len());
+                    (&rest[if rest.starts_with("<?") { 1 } else { 2 }..end], end + 1)
+                };
+                pos += length.min(rest.len());
+                if !text.get(..7).is_some_and(|tag| tag.eq_ignore_ascii_case("doctype")) {
+                    let (parent, id) = (stack.last().unwrap().0, doc.nodes.len());
+                    doc.nodes[parent].children.push(id);
+                    doc.nodes.push(Node {
+                        tag: "#comment".into(),
+                        text: text.into(),
+                        parent: Some(parent),
+                        ..Node::default()
+                    });
+                }
                 continue;
             }
             if let Some(close) = rest.strip_prefix("</") {
@@ -1328,11 +1405,14 @@ impl Document {
         None
     }
 
-    pub fn text(&self, id: usize) -> String {
+    pub fn text(&self, root: usize) -> String {
         let mut text = String::new();
-        let mut pending = vec![id];
+        let mut pending = vec![root];
         while let Some(id) = pending.pop() {
             let node = &self.nodes[id];
+            if id != root && node.tag == "#comment" {
+                continue;
+            }
             match &node.stylesheet {
                 Some(sheet) => text.push_str(&sheet.source()),
                 None => text.push_str(&node.text),

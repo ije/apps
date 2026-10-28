@@ -186,7 +186,7 @@ fn editing_fragments_observers_and_layout() {
         if (input.style.width !== '200px' || input.style.color !== '') throw Error('Style mutation');
         let mutationCount = 0;
         const observer = new MutationObserver(records => mutationCount += records.length);
-        observer.observe(root, { subtree: true, attributes: true, childList: true, characterData: true });
+        observer.observe(root, { subtree: true, attributes: true, childList: true, characterDataOldValue: true });
         input.title = 'edit';
         root.lastChild.data = 'new';
         const records = observer.takeRecords();
@@ -598,5 +598,90 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
         check('pointerout:inner,pointerleave:inner,pointerleave:outer,mouseout:inner,mouseleave:inner,mouseleave:outer', 'exit');
         if (getComputedStyle(outer).color === 'red' || document.querySelector(':hover')) throw Error('Exit kept hover');
         if (document.querySelector('#outer:scope') || outer.querySelector(':scope > div') !== inner || !outer.matches(':scope')) throw Error('Scope');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn core_dom_interfaces_follow_the_standard() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+      const fails = [];
+      const check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (e) { fails.push(name + ': ' + e.message); } };
+      const a = document.getElementById('a');
+      check('text instanceof Text', () => a.firstChild instanceof Text && !(a instanceof Text));
+      check('comment instanceof Comment', () => a.childNodes[1] instanceof Comment && !(a.firstChild instanceof Comment));
+      check('CharacterData', () => a.firstChild instanceof CharacterData);
+      check('new Text', () => new Text('hi').data === 'hi');
+      check('new Comment', () => new Comment('hi').data === 'hi');
+      check('new DocumentFragment', () => new DocumentFragment().nodeType === 11);
+      check('EventTarget', () => a instanceof EventTarget);
+      check('element.length', () => a.length === undefined);
+      check('NodeList', () => a.childNodes instanceof NodeList && document.querySelectorAll('div') instanceof NodeList);
+      check('HTMLCollection', () => a.children instanceof HTMLCollection);
+      check('qsa item', () => document.querySelectorAll('div').item(0) === a);
+      check('document.children', () => document.children.length === 1 && document.firstElementChild === document.documentElement);
+      check('fragment.firstElementChild', () => { const f = document.createDocumentFragment(); f.append(document.createElement('i')); return f.firstElementChild?.localName === 'i' && f.childElementCount === 1; });
+      check('attr order', () => a.getAttributeNames?.().join() === 'id,z,b,class');
+      check('attributes order', () => [...a.attributes].map(x => x.name).join() === 'id,z,b,class');
+      check('hasAttributes', () => a.hasAttributes());
+      check('attributes named', () => a.attributes.id?.value === 'a' && a.attributes.getNamedItem('z').ownerElement === a);
+      check('classList.length', () => a.classList.length === 2 && a.classList.item(1) === 'y' && a.classList.value === 'x y' && String(a.classList) === 'x y');
+      check('classList.forEach', () => { let n = 0; a.classList.forEach(() => n++); return n === 2; });
+      check('classList identity', () => a.classList === a.classList);
+      check('DOMTokenList', () => a.classList instanceof DOMTokenList);
+      check('textContent skips comments', () => a.textContent === 'tu');
+      check('template content', () => { const t = document.getElementById('t'); return t.content instanceof DocumentFragment && t.content.firstChild?.localName === 'p' && t.childNodes.length === 0; });
+      check('template innerHTML', () => { const t = document.createElement('template'); t.innerHTML = '<b>x</b>'; return t.content.firstChild.localName === 'b' && t.innerHTML === '<b>x</b>' && t.cloneNode(true).content.firstChild?.localName === 'b'; });
+      check('HTMLTemplateElement', () => document.getElementById('t') instanceof HTMLTemplateElement);
+      check('HTMLDivElement', () => a instanceof HTMLDivElement && document.createElement('button') instanceof HTMLButtonElement);
+      check('setAttribute lowercase', () => { const d = document.createElement('div'); d.setAttribute('dataFoo', '1'); return d.getAttribute('datafoo') === '1' && d.hasAttribute('DATAFOO'); });
+      check('insertAdjacentElement', () => { const d = document.createElement('div'), s = document.createElement('span'); d.insertAdjacentElement('afterbegin', s); d.insertAdjacentText('beforeend', 'x'); return d.firstChild === s && d.lastChild.data === 'x'; });
+      check('fragment textContent', () => { const f = document.createDocumentFragment(); f.textContent = 'x'; return f.textContent === 'x'; });
+      check('document textContent', () => document.textContent === null);
+      check('replaceChild same', () => { const d = document.createElement('div'), s = document.createElement('span'); d.append(s); d.replaceChild(s, s); return s.parentNode === d; });
+      check('dataset in', () => 'foo' in Object.assign(document.createElement('div'), {}).dataset === false && (() => { const d = document.createElement('div'); d.dataset.fooBar = '1'; return 'fooBar' in d.dataset; })());
+      check('style.cssFloat', () => { const d = document.createElement('div'); d.style.cssFloat = 'left'; return d.style.getPropertyValue('float') === 'left'; });
+      check('style data url', () => { const d = document.createElement('div'); d.style.backgroundImage = 'url(data:image/png;base64,AA)'; d.style.color = 'red'; d.style.removeProperty('background-image'); return d.style.cssText.trim() === 'color:red' || d.style.cssText.trim() === 'color: red;'; });
+      check('Node consts', () => Node.ATTRIBUTE_NODE === 2 && Node.DOCUMENT_TYPE_NODE === 10 && Node.CDATA_SECTION_NODE === 4);
+      check('NodeFilter consts', () => NodeFilter.SHOW_DOCUMENT_FRAGMENT === 1024 && NodeFilter.SHOW_ATTRIBUTE === 2);
+      check('treewalker methods', () => { const w = document.createTreeWalker(a, NodeFilter.SHOW_ALL); return w.firstChild() === a.firstChild && w.nextSibling() === a.childNodes[1] && w.previousSibling() === a.firstChild && w.parentNode() === a && w.lastChild() === a.lastChild && w.previousNode() === a.childNodes[1] && w.previousNode() === a.firstChild && w.previousNode() === a && w.previousNode() === null; });
+      check('nodeiterator', () => { const it = document.createNodeIterator(a, NodeFilter.SHOW_TEXT); return it.nextNode() === a.firstChild && it.nextNode() === a.lastChild && it.nextNode() === null && it.previousNode() === a.lastChild; });
+      check('XMLSerializer', () => new XMLSerializer().serializeToString(a).startsWith('<div'));
+      check('document.URL', () => typeof document.URL === 'string' && document.location === location && document.characterSet === 'UTF-8' && document.contentType === 'text/html');
+      check('scrollingElement', () => document.scrollingElement === document.documentElement);
+      check('createEvent CustomEvent', () => document.createEvent('CustomEvent') instanceof CustomEvent);
+      check('input type default', () => document.createElement('input').type === 'text');
+      check('Attr', () => typeof Attr === 'function' && typeof NamedNodeMap === 'function');
+      check('window capture first', () => { const order = []; const d = document.createElement('div'); document.body.append(d); const w = () => order.push('window'), b = () => order.push('body'); addEventListener('x', w, true); document.body.addEventListener('x', b, true); d.dispatchEvent(new Event('x', { bubbles: true })); removeEventListener('x', w, true); d.remove(); return order.join() === 'window,body'; });
+      check('passive', () => { const d = document.createElement('div'); d.addEventListener('x', e => e.preventDefault(), { passive: true }); return d.dispatchEvent(new Event('x', { cancelable: true })) === true; });
+      check('click toggles checkbox', () => { const c = document.createElement('input'); c.type = 'checkbox'; document.body.append(c); let changed = 0; c.addEventListener('change', () => changed++); c.click(); const ok = c.checked && changed === 1; c.remove(); return ok; });
+      check('getElementsByName', () => typeof document.getElementsByName === 'function');
+      check('parsed comments', () => { const d = document.createElement('div'); d.innerHTML = '<p>a<!--x-->b<?lit$1$></p><!DOCTYPE html>'; return d.innerHTML === '<p>a<!--x-->b<!--?lit$1$--></p>' && d.firstChild.childNodes[1] instanceof Comment && d.firstChild.textContent === 'ab'; });
+      check('getElementById quotes', () => { const ids = ['a"b', "a'b", 'a(b)', 'a\\b', 'a b']; const d = document.createElement('div'); document.body.append(d); for (const id of ids) { const e = document.createElement('i'); e.id = id; d.append(e); } const ok = ids.every(id => document.getElementById(id)?.id === id); d.remove(); return ok; });
+      check('getElementsByClassName tailwind', () => { const d = document.createElement('div'); d.innerHTML = '<i class="md:flex w-1/2 x"></i><i class="x"></i>'; return d.getElementsByClassName('md:flex w-1/2').length === 1 && d.getElementsByClassName('x').length === 2 && d.getElementsByClassName(' ').length === 0; });
+      check('shadow retarget', () => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<b>x</b>'; const seen = []; const fn = e => seen.push(e.target === host, e.composedPath()[0] === root.firstChild); document.addEventListener('ping', fn); root.addEventListener('ping', e => seen.push(e.target === root.firstChild)); root.firstChild.dispatchEvent(new Event('ping', { bubbles: true, composed: true })); document.removeEventListener('ping', fn); host.remove(); return seen.join() === 'true,true,true'; });
+      check('window currentTarget', () => { let ok = false; const fn = e => { ok = e.currentTarget === window && e.eventPhase === 3; }; addEventListener('pong', fn); document.body.dispatchEvent(new Event('pong', { bubbles: true })); removeEventListener('pong', fn); return ok; });
+      check('redispatch throws', () => { const d = document.createElement('div'), e = new Event('x'); let threw = false; d.addEventListener('x', () => { try { d.dispatchEvent(e); } catch { threw = true; } }); d.dispatchEvent(e); return threw; });
+      check('lit-like template', () => { const t = document.createElement('template'); t.innerHTML = '<div a$lit$="x" class="c"><?lit$1$></div>'; const f = document.importNode(t.content, true), w = document.createTreeWalker(f, 133); w.currentNode = f; const seen = []; let n; while ((n = w.nextNode())) seen.push(n.nodeType === 1 ? n.getAttributeNames().join('+') : n.nodeType + ':' + n.data); return seen.join() === 'a$lit$+class,8:?lit$1$'; });
+      check('custom element via innerHTML', () => { class XProbe extends HTMLElement { connectedCallback() { this.dataset.on = '1'; } } customElements.define('x-probe', XProbe); const d = document.createElement('div'); document.body.append(d); d.innerHTML = '<x-probe></x-probe>'; const ok = d.firstChild instanceof XProbe && d.firstChild.dataset.on === '1'; d.remove(); return ok; });
+      check('template inert', () => document.querySelectorAll('p').length === 0 && document.getElementById('t').content.querySelectorAll('p').length === 1);
+      check('svg serialize', () => { const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('viewBox', '0 0 1 1'); return new XMLSerializer().serializeToString(svg) === '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>'; });
+      check('style quotes', () => { const d = document.createElement('div'); d.style.cssText = 'content: "a;b"; color: red'; return d.style.length === 2 && d.style.content === '"a;b"' && d.style.color === 'red'; });
+      check('isConnected', () => a.isConnected && !document.createElement('div').isConnected);
+      check('ownerDocument', () => document.createElement('div').ownerDocument === document);
+      check('getRootNode', () => a.getRootNode() === document);
+      check('normalize', () => { const d = document.createElement('div'); d.append('a', 'b'); d.normalize(); return d.childNodes.length === 1 && d.textContent === 'ab'; });
+      check('outerHTML', () => { const d = document.createElement('div'); d.innerHTML = '<span a="1" b="2">x</span>'; return d.innerHTML === '<span a="1" b="2">x</span>'; });
+      check('splitText', () => { const d = document.createElement('div'); d.append('hello'); const t = d.firstChild.splitText(2); return d.childNodes.length === 2 && t.data === 'llo'; });
+      check('wholeText', () => { const d = document.createElement('div'); d.append('a', 'b'); return d.firstChild.wholeText === 'ab'; });
+      check('closest', () => a.firstChild.parentElement.closest('body') === document.body);
+      check('compareDocumentPosition', () => (a.compareDocumentPosition(a.firstChild) & Node.DOCUMENT_POSITION_CONTAINED_BY) !== 0);
+      check('implementation', () => typeof document.implementation.createHTMLDocument === 'function' && document.implementation.hasFeature());
+      if (fails.length) throw Error(fails.join('\n'));
     "#, "test").unwrap();
 }

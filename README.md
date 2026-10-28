@@ -62,6 +62,20 @@ When a page uses one, `apps run` shows an error in the Developer Tools console (
 | Vertical `writing-mode`, `float`, multi-column layout | Not supported |
 | `text-shadow` blur, inset `box-shadow` | Approximated |
 
+## DOM
+
+Pages get the standard DOM API (nodes, elements, events, ranges, selection, observers, shadow DOM and custom elements). These parts differ from browsers:
+
+| Feature | Support |
+|---|---|
+| `NodeList`, `HTMLCollection` | Static arrays with `item()`. They don't update when the tree changes |
+| `DocumentType`, `CDATASection`, `ProcessingInstruction` | Not supported. `Attr` is not a `Node` |
+| `DOMParser`, XPath, XSLT | `DOMParser` parses `text/html` only. XPath and XSLT are not supported |
+| `*AttributeNS()` | The namespace is ignored |
+| `<template>` | Parsed children move into `content` when `content` is first read |
+| Inline event attributes (`onclick="..."`) | Not run, because `eval` is disabled. Use `addEventListener` or `el.onclick = fn` |
+| Forms | No `submit` event, `<select>` popup or `<button>` default action. Clicks on checkbox and radio inputs work |
+
 ## JSC
 
 The runtime uses [Bun's WebKit fork](https://github.com/oven-sh/WebKit).
