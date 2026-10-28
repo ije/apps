@@ -4,6 +4,11 @@ use std::{collections::HashMap, rc::Rc};
 
 pub(crate) type SelectorList = Rc<Vec<Selector>>;
 
+pub(crate) const FOCUS: u8 = 1;
+pub(crate) const FOCUS_WITHIN: u8 = 2;
+pub(crate) const HOVER: u8 = 4;
+pub(crate) const ACTIVE: u8 = 8;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Selector {
     simple: Vec<SimpleSelector>,
@@ -18,22 +23,88 @@ enum SimpleSelector {
     Class(String),
     Universal,
     Root,
-    Attribute(String, String, String),
-    Pseudo(String, String, #[serde(skip)] Vec<Selector>),
+    Attribute(String, String, String, bool),
+    Pseudo(String, String, #[serde(skip)] Vec<Selector>, [i32; 2]),
+    Element(String, String),
     Parent(#[serde(skip)] SelectorList, usize),
+}
+
+fn split(source: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = source;
+    loop {
+        let end = selector_boundary(rest, |c| c == ',');
+        parts.push(&rest[..end]);
+        if end == rest.len() {
+            return parts;
+        }
+        rest = &rest[end + 1..];
+    }
+}
+
+fn unescape(source: &str, stop: impl Fn(char) -> bool) -> (String, usize) {
+    let mut value = String::new();
+    let mut chars = source.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        if c != '\\' {
+            if stop(c) {
+                return (value, index);
+            }
+            value.push(c);
+            continue;
+        }
+        let (mut code, mut digits) = (0, 0);
+        while digits < 6
+            && let Some(digit) = chars.peek().and_then(|(_, c)| c.to_digit(16))
+        {
+            code = code * 16 + digit;
+            digits += 1;
+            chars.next();
+        }
+        if digits > 0 {
+            chars.next_if(|(_, c)| c.is_ascii_whitespace());
+            value.push(
+                char::from_u32(code)
+                    .filter(|&c| c != '\0')
+                    .unwrap_or('\u{fffd}'),
+            );
+        } else if let Some((_, c)) = chars.next()
+            && c != '\n'
+        {
+            value.push(c);
+        }
+    }
+    (value, source.len())
+}
+
+fn identifier(source: &str) -> Option<(String, usize)> {
+    let (name, length) = unescape(source, |c| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_') || !c.is_ascii())
+    });
+    let raw = source.as_bytes();
+    let invalid = length == 0
+        || raw[0].is_ascii_digit()
+        || raw[0] == b'-' && (length == 1 || raw[1].is_ascii_digit());
+    (!invalid).then_some((name, length))
 }
 
 fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
     let mut depth = 0;
     let mut quote = None;
-    let mut escaped = false;
+    let mut escape = None;
     for (index, c) in source.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+        if let Some(digits) = escape {
+            if c.is_ascii_hexdigit() && digits < 6 {
+                escape = Some(digits + 1);
+                continue;
+            }
+            escape = None;
+            if digits == 0 || c.is_ascii_whitespace() {
+                continue;
+            }
         }
         if c == '\\' {
-            escaped = true;
+            escape = Some(0);
             continue;
         }
         if let Some(q) = quote {
@@ -60,7 +131,7 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
-    nodes: Vec<(Node, [u64; 5])>,
+    nodes: Vec<(Node, [u64; 6])>,
     values: HashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[(usize, u64)]>)>,
     pub(crate) dependencies: Vec<(usize, u64)>,
     pub(crate) epoch: u64,
@@ -73,7 +144,7 @@ impl SelectorCache {
             self.values.clear();
         }
         self.nodes
-            .resize_with(doc.nodes.len(), || (Node::default(), [0; 5]));
+            .resize_with(doc.nodes.len(), || (Node::default(), [0; 6]));
         let mut changes = Vec::new();
         for &id in order {
             let node = &doc.nodes[id];
@@ -84,12 +155,13 @@ impl SelectorCache {
                 node.children != old.children,
                 node.text.is_empty() != old.text.is_empty(),
                 node.tag != old.tag,
+                node.state != old.state,
             ];
             if changed.iter().any(|&value| value) {
                 for (kind, (revision, changed)) in revisions.iter_mut().zip(changed).enumerate() {
                     if changed {
                         *revision += 1;
-                        changes.push(id * 5 + kind);
+                        changes.push(id * 6 + kind);
                     }
                 }
                 *old = Node {
@@ -98,6 +170,7 @@ impl SelectorCache {
                     inline: node.inline.clone(),
                     parent: node.parent,
                     children: node.children.clone(),
+                    state: node.state,
                     text: if node.text.is_empty() {
                         String::new()
                     } else {
@@ -118,15 +191,15 @@ impl SelectorCache {
 
     pub(crate) fn depend(&mut self, id: usize, kind: usize) {
         if let Some((_, revisions)) = self.nodes.get(id) {
-            self.dependencies.push((id * 5 + kind, revisions[kind]));
+            self.dependencies.push((id * 6 + kind, revisions[kind]));
         }
     }
 
     pub(crate) fn valid(&self, dependencies: &[(usize, u64)]) -> bool {
         dependencies.iter().all(|(id, revision)| {
             self.nodes
-                .get(*id / 5)
-                .map_or(0, |(_, current)| current[*id % 5])
+                .get(*id / 6)
+                .map_or(0, |(_, current)| current[*id % 6])
                 == *revision
         })
     }
@@ -171,18 +244,72 @@ impl SelectorCache {
 }
 
 impl Selector {
-    fn relative(argument: &str) -> Vec<Self> {
-        let mut parts = Vec::new();
-        let mut rest = argument;
-        loop {
-            let end = selector_boundary(rest, |c| c == ',');
-            parts.push(format!(":scope {}", rest[..end].trim()));
-            if end == rest.len() {
-                break;
+    fn argument(name: &str, argument: &str) -> Option<(Vec<Self>, [i32; 2])> {
+        let list = |source: &str| Some(Self::parse(source, None)).filter(|list| !list.is_empty());
+        match name {
+            "is" | "where" => Some((
+                split(argument)
+                    .into_iter()
+                    .flat_map(|part| Self::parse(part, None))
+                    .collect(),
+                [0, 0],
+            )),
+            "not" => Some((list(argument)?, [0, 0])),
+            "host" if !argument.is_empty() => Some((list(argument)?, [0, 0])),
+            "has" => {
+                let relative = split(argument)
+                    .into_iter()
+                    .map(|part| {
+                        (!part.trim().is_empty()).then(|| format!(":scope {}", part.trim()))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some((list(&relative.join(","))?, [0, 0]))
             }
-            rest = &rest[end + 1..];
+            "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
+                let of = argument.as_bytes().windows(4).position(|window| {
+                    window[0].is_ascii_whitespace()
+                        && window[1..3].eq_ignore_ascii_case(b"of")
+                        && window[3].is_ascii_whitespace()
+                });
+                let (formula, selectors) = match of {
+                    Some(_) if name.ends_with("of-type") => return None,
+                    Some(index) => (&argument[..index], list(&argument[index + 4..])?),
+                    None => (argument, Vec::new()),
+                };
+                let formula = formula.replace("/**/", " ").trim().to_ascii_lowercase();
+                let nth = match formula.as_str() {
+                    "odd" => [2, 1],
+                    "even" => [2, 0],
+                    _ => match formula.split_once('n') {
+                        None => [0, formula.parse().ok()?],
+                        Some((a, b)) => {
+                            let b = b.trim_start();
+                            let (negative, digits) = match b.as_bytes().first() {
+                                None => (false, "0"),
+                                Some(b'+') => (false, b[1..].trim_start()),
+                                Some(b'-') => (true, b[1..].trim_start()),
+                                _ => return None,
+                            };
+                            if !digits.starts_with(|c: char| c.is_ascii_digit()) {
+                                return None;
+                            }
+                            let b: i32 = digits.parse().ok()?;
+                            [
+                                match a {
+                                    "" | "+" => 1,
+                                    "-" => -1,
+                                    _ => a.parse().ok()?,
+                                },
+                                if negative { -b } else { b },
+                            ]
+                        }
+                    },
+                };
+                Some((selectors, nth))
+            }
+            "lang" | "dir" => (!argument.trim().is_empty()).then(|| (Vec::new(), [0, 0])),
+            _ => Some((Vec::new(), [0, 0])),
         }
-        Self::parse(&parts.join(","), None)
     }
 
     pub(crate) fn bind_parent(&mut self, parent: Option<&SelectorList>) -> anyhow::Result<()> {
@@ -193,14 +320,10 @@ impl Selector {
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Missing CSS parent selector"))?;
                 }
-                SimpleSelector::Pseudo(name, argument, parsed)
-                    if matches!(name.as_str(), "not" | "is" | "where" | "has") =>
-                {
-                    *parsed = if name == "has" {
-                        Self::relative(argument)
-                    } else {
-                        Self::parse(argument, None)
-                    };
+                SimpleSelector::Pseudo(name, argument, parsed, _) => {
+                    if let Some((selectors, _)) = Self::argument(name, argument) {
+                        *parsed = selectors;
+                    }
                 }
                 _ => {}
             }
@@ -212,19 +335,20 @@ impl Selector {
     }
 
     pub(crate) fn without_pseudo_element(&self) -> Option<(usize, Self)> {
-        let index = self.simple.iter().position(|part| matches!(part, SimpleSelector::Pseudo(name, _, _) if matches!(name.as_str(), "before" | "after" | "selection")))?;
+        let (index, kind) = self.simple.iter().enumerate().find_map(|(index, part)| {
+            let SimpleSelector::Element(name, _) = part else {
+                return None;
+            };
+            Some((
+                index,
+                ["before", "after", "selection"]
+                    .iter()
+                    .position(|n| n == name)?,
+            ))
+        })?;
         let mut selector = self.clone();
-        let SimpleSelector::Pseudo(name, _, _) = selector.simple.remove(index) else {
-            unreachable!()
-        };
-        Some((
-            match name.as_str() {
-                "before" => 0,
-                "after" => 1,
-                _ => 2,
-            },
-            selector,
-        ))
+        selector.simple.remove(index);
+        Some((kind, selector))
     }
 
     pub(crate) fn key(&self) -> Option<(u8, &str)> {
@@ -234,7 +358,7 @@ impl Selector {
                 SimpleSelector::Id(id) => Some((0, id.as_str())),
                 SimpleSelector::Class(class) => Some((1, class.as_str())),
                 SimpleSelector::Tag(tag) => Some((2, tag.as_str())),
-                SimpleSelector::Attribute(name, _, _) => Some((3, name.as_str())),
+                SimpleSelector::Attribute(name, ..) => Some((3, name.as_str())),
                 _ => None,
             })
             .min_by_key(|(kind, _)| *kind)
@@ -242,7 +366,7 @@ impl Selector {
                 self.simple.iter().find_map(|part| {
                     let alternatives = match part {
                         SimpleSelector::Parent(selectors, _) => selectors.as_slice(),
-                        SimpleSelector::Pseudo(name, _, selectors)
+                        SimpleSelector::Pseudo(name, _, selectors, _)
                             if matches!(name.as_str(), "is" | "where") =>
                         {
                             selectors.as_slice()
@@ -259,6 +383,21 @@ impl Selector {
     }
 
     pub(crate) fn source(&self) -> String {
+        let escape = |source: &mut String, value: &str| {
+            for (index, c) in value.char_indices() {
+                if c.is_ascii_control()
+                    || c == ' '
+                    || c.is_ascii_digit() && (index == 0 || index == 1 && value.starts_with('-'))
+                {
+                    source.push_str(&format!("\\{:x} ", c as u32));
+                } else {
+                    if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_') || !c.is_ascii()) {
+                        source.push('\\');
+                    }
+                    source.push(c);
+                }
+            }
+        };
         let mut source = String::new();
         if let Some((combinator, previous)) = &self.previous {
             source.push_str(&previous.source());
@@ -266,30 +405,42 @@ impl Selector {
         }
         for selector in &self.simple {
             match selector {
-                SimpleSelector::Tag(tag) => source.push_str(tag),
+                SimpleSelector::Tag(tag) => escape(&mut source, tag),
                 SimpleSelector::Id(id) => {
                     source.push('#');
-                    source.push_str(id);
+                    escape(&mut source, id);
                 }
                 SimpleSelector::Class(class) => {
                     source.push('.');
-                    source.push_str(class);
+                    escape(&mut source, class);
                 }
                 SimpleSelector::Universal => source.push('*'),
                 SimpleSelector::Root => source.push_str(":root"),
-                SimpleSelector::Attribute(name, op, value) => {
+                SimpleSelector::Attribute(name, op, value, insensitive) => {
                     source.push('[');
-                    source.push_str(name);
+                    escape(&mut source, name);
                     source.push_str(op);
                     if !op.is_empty() {
                         source.push('"');
-                        source.push_str(value);
+                        source.push_str(
+                            &value
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                                .replace('\n', "\\a "),
+                        );
                         source.push('"');
+                    }
+                    if *insensitive {
+                        source.push_str(" i");
                     }
                     source.push(']');
                 }
-                SimpleSelector::Pseudo(name, argument, _) => {
+                SimpleSelector::Pseudo(name, argument, ..)
+                | SimpleSelector::Element(name, argument) => {
                     source.push(':');
+                    if matches!(selector, SimpleSelector::Element(..)) {
+                        source.push(':');
+                    }
                     source.push_str(name);
                     if !argument.is_empty() {
                         source.push('(');
@@ -319,17 +470,7 @@ impl Selector {
         let parent_specificity = parent
             .and_then(|p| p.iter().map(|s| s.specificity).max())
             .unwrap_or_default();
-        let mut sources = Vec::new();
-        let mut remaining = source;
-        loop {
-            let end = selector_boundary(remaining, |c| c == ',');
-            sources.push(&remaining[..end]);
-            if end == remaining.len() {
-                break;
-            }
-            remaining = &remaining[end + 1..];
-        }
-        for source in sources {
+        for source in split(source) {
             let mut rest = source.trim();
             if rest.is_empty() {
                 return Vec::new();
@@ -341,7 +482,13 @@ impl Selector {
                     previous: None,
                     specificity: parent_specificity,
                 });
+            let mut compounds = 0;
             while !rest.is_empty() {
+                // WARNING: matching recurses per compound, so long chains can overflow the stack.
+                compounds += 1;
+                if compounds > 256 {
+                    return Vec::new();
+                }
                 let mut combinator = ' ';
                 if rest.starts_with(['>', '+', '~']) {
                     if previous.is_none() {
@@ -367,29 +514,62 @@ impl Selector {
                         if end == compound.len() {
                             return Vec::new();
                         }
-                        let attribute = &compound[1..end];
-                        let (name, operator, value) = if let Some(equal) = attribute.find('=') {
-                            let prefix = &attribute[..equal];
-                            let (name, operator) = if prefix.ends_with(['~', '|', '^', '$', '*']) {
-                                (&prefix[..prefix.len() - 1], &attribute[equal - 1..=equal])
+                        let attribute = compound[1..end].trim();
+                        let attribute = attribute
+                            .strip_prefix("*|")
+                            .or_else(|| {
+                                attribute
+                                    .strip_prefix('|')
+                                    .filter(|rest| !rest.starts_with('='))
+                            })
+                            .unwrap_or(attribute);
+                        let Some((name, length)) = identifier(attribute) else {
+                            return Vec::new();
+                        };
+                        let tail = attribute[length..].trim_start();
+                        let (operator, value, insensitive) = if tail.is_empty() {
+                            ("", String::new(), false)
+                        } else {
+                            let Some(operator) = ["=", "~=", "|=", "^=", "$=", "*="]
+                                .into_iter()
+                                .find(|operator| tail.starts_with(operator))
+                            else {
+                                return Vec::new();
+                            };
+                            let tail = tail[operator.len()..].trim_start();
+                            let (value, length) = if let Some(quote) =
+                                tail.chars().next().filter(|c| matches!(c, '"' | '\''))
+                            {
+                                let (value, length) = unescape(&tail[1..], |c| c == quote);
+                                if length + 1 == tail.len() {
+                                    return Vec::new();
+                                }
+                                (value, length + 2)
+                            } else if let Some(value) = identifier(tail) {
+                                value
                             } else {
-                                (prefix, "=")
+                                return Vec::new();
+                            };
+                            let insensitive = match tail[length..].trim_start() {
+                                "" | "s" | "S" => false,
+                                "i" | "I" => true,
+                                _ => return Vec::new(),
                             };
                             (
-                                name.trim(),
                                 operator,
-                                attribute[equal + 1..].trim().trim_matches(['\'', '"']),
+                                if insensitive {
+                                    value.to_ascii_lowercase()
+                                } else {
+                                    value
+                                },
+                                insensitive,
                             )
-                        } else {
-                            (attribute.trim(), "", "")
                         };
-                        if name.is_empty() {
-                            return Vec::new();
-                        }
                         simple.push(SimpleSelector::Attribute(
-                            name.into(),
+                            name,
                             operator.into(),
-                            value.into(),
+                            value,
+                            insensitive,
                         ));
                         specificity[1] = specificity[1].saturating_add(1);
                         compound = &compound[end + 1..];
@@ -423,64 +603,86 @@ impl Selector {
                         compound = &compound[1..];
                         continue;
                     }
-                    let named = matches!(marker, b'.' | b'#' | b':');
-                    if named {
-                        compound = &compound[1..];
-                        if marker == b':' && compound.starts_with(':') {
-                            compound = &compound[1..];
+                    if marker == b':' {
+                        let element = compound.starts_with("::");
+                        compound = &compound[if element { 2 } else { 1 }..];
+                        let Some((name, length)) = identifier(compound) else {
+                            return Vec::new();
+                        };
+                        let name = name.to_ascii_lowercase();
+                        compound = &compound[length..];
+                        let mut argument = "";
+                        if compound.starts_with('(') {
+                            let close = 1 + selector_boundary(&compound[1..], |c| c == ')');
+                            if close == compound.len() {
+                                return Vec::new();
+                            }
+                            argument = &compound[1..close];
+                            compound = &compound[close + 1..];
                         }
+                        if element
+                            || matches!(
+                                name.as_str(),
+                                "before" | "after" | "first-line" | "first-letter"
+                            )
+                        {
+                            specificity[2] = specificity[2].saturating_add(1);
+                            simple.push(SimpleSelector::Element(name, argument.into()));
+                            continue;
+                        }
+                        if name == "root" {
+                            specificity[1] = specificity[1].saturating_add(1);
+                            simple.push(SimpleSelector::Root);
+                            continue;
+                        }
+                        let Some((selectors, nth)) = Self::argument(&name, argument) else {
+                            return Vec::new();
+                        };
+                        let [ids, classes, tags] = selectors
+                            .iter()
+                            .map(|selector| selector.specificity)
+                            .max()
+                            .unwrap_or_default();
+                        let own = match name.as_str() {
+                            "where" => [0; 3],
+                            "is" | "not" => [ids, classes, tags],
+                            "has" => [ids, classes.saturating_sub(1), tags],
+                            _ => [ids, classes.saturating_add(1), tags],
+                        };
+                        for (value, own) in specificity.iter_mut().zip(own) {
+                            *value = value.saturating_add(own);
+                        }
+                        simple.push(SimpleSelector::Pseudo(
+                            name,
+                            argument.into(),
+                            selectors,
+                            nth,
+                        ));
+                        continue;
+                    }
+                    if matches!(marker, b'.' | b'#') {
+                        compound = &compound[1..];
                     } else if !simple.is_empty() {
                         return Vec::new();
                     }
-                    let end = compound
-                        .find(|c: char| !c.is_alphanumeric() && !matches!(c, '-' | '_'))
-                        .unwrap_or(compound.len());
-                    if end == 0 {
+                    let Some((name, length)) = identifier(compound) else {
                         return Vec::new();
-                    }
-                    let name = &compound[..end];
+                    };
+                    compound = &compound[length..];
                     simple.push(match marker {
                         b'#' => {
                             specificity[0] = specificity[0].saturating_add(1);
-                            SimpleSelector::Id(name.into())
+                            SimpleSelector::Id(name)
                         }
                         b'.' => {
                             specificity[1] = specificity[1].saturating_add(1);
-                            SimpleSelector::Class(name.into())
-                        }
-                        b':' if name == "root" => {
-                            specificity[1] = specificity[1].saturating_add(1);
-                            SimpleSelector::Root
-                        }
-                        b':' => {
-                            specificity[1] = specificity[1].saturating_add(1);
-                            SimpleSelector::Pseudo(name.into(), String::new(), Vec::new())
+                            SimpleSelector::Class(name)
                         }
                         _ => {
                             specificity[2] = specificity[2].saturating_add(1);
-                            SimpleSelector::Tag(name.into())
+                            SimpleSelector::Tag(name)
                         }
                     });
-                    compound = &compound[end..];
-                    if marker == b':' && compound.starts_with('(') {
-                        let close = 1 + selector_boundary(&compound[1..], |c| c == ')');
-                        if close == compound.len() {
-                            return Vec::new();
-                        }
-                        if let Some(SimpleSelector::Pseudo(name, argument, parsed)) =
-                            simple.last_mut()
-                        {
-                            *argument = compound[1..close].into();
-                            if matches!(name.as_str(), "not" | "is" | "where" | "has") {
-                                *parsed = if name == "has" {
-                                    Self::relative(argument)
-                                } else {
-                                    Self::parse(argument, None)
-                                };
-                            }
-                        }
-                        compound = &compound[close + 1..];
-                    }
                 }
                 previous = Some(Self {
                     simple,
@@ -511,7 +713,7 @@ impl Selector {
         self.matches_cached(doc, id, None, memo)
     }
 
-    fn matches_cached(
+    pub(crate) fn matches_cached(
         &self,
         doc: &Document,
         id: usize,
@@ -519,7 +721,14 @@ impl Selector {
         memo: &mut SelectorCache,
     ) -> bool {
         let key = (self as *const Self as usize, id, scope, false);
-        if let Some((result, dependencies)) = memo.values.get(&key)
+        let compound = self.previous.is_none()
+            && self.simple.iter().all(|simple| match simple {
+                SimpleSelector::Pseudo(_, _, parsed, _) => parsed.is_empty(),
+                SimpleSelector::Parent(..) => false,
+                _ => true,
+            });
+        if !compound
+            && let Some((result, dependencies)) = memo.values.get(&key)
             && memo.valid(dependencies)
         {
             memo.dependencies.extend(dependencies.iter().copied());
@@ -540,26 +749,50 @@ impl Selector {
                     }
                     SimpleSelector::Universal => true,
                     SimpleSelector::Root => node.tag == "html",
-                    SimpleSelector::Attribute(name, operator, value) => node
-                        .attrs
-                        .get(name)
-                        .is_some_and(|actual| match operator.as_str() {
-                            "" => true,
-                            "=" => actual == value,
-                            "~=" => actual.split_whitespace().any(|word| word == value),
-                            "|=" => actual
-                                .strip_prefix(value.as_str())
-                                .is_some_and(|rest| rest.is_empty() || rest.starts_with('-')),
-                            "^=" => actual.starts_with(value),
-                            "$=" => actual.ends_with(value),
-                            "*=" => actual.contains(value),
-                            _ => false,
-                        }),
-                    SimpleSelector::Pseudo(name, argument, parsed) => match name.as_str() {
-                        "scope" => scope == Some(id),
+                    SimpleSelector::Attribute(name, operator, value, insensitive) => {
+                        node.attrs.get(name).is_some_and(|actual| {
+                            let lower;
+                            let actual = if *insensitive {
+                                lower = actual.to_ascii_lowercase();
+                                &lower
+                            } else {
+                                actual
+                            };
+                            match operator.as_str() {
+                                "" => true,
+                                "=" => actual == value,
+                                "~=" => actual.split_ascii_whitespace().any(|word| word == value),
+                                "|=" => actual
+                                    .strip_prefix(value.as_str())
+                                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-')),
+                                _ if value.is_empty() => false,
+                                "^=" => actual.starts_with(value.as_str()),
+                                "$=" => actual.ends_with(value.as_str()),
+                                "*=" => actual.contains(value.as_str()),
+                                _ => false,
+                            }
+                        })
+                    }
+                    SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
+                        "scope" => scope.map_or(node.tag == "html", |scope| scope == id),
                         "has" => {
                             memo.depend(id, 2);
                             let mut pending = node.children.clone();
+                            if argument
+                                .split(',')
+                                .any(|part| part.trim_start().starts_with(['+', '~']))
+                                && let Some(parent) = node.parent
+                            {
+                                memo.depend(id, 1);
+                                memo.depend(parent, 2);
+                                pending.extend(
+                                    doc.nodes[parent]
+                                        .children
+                                        .iter()
+                                        .skip_while(|&&sibling| sibling != id)
+                                        .skip(1),
+                                );
+                            }
                             let mut found = false;
                             while let Some(child) = pending.pop() {
                                 if parsed.iter().any(|selector| {
@@ -573,7 +806,13 @@ impl Selector {
                             }
                             found
                         }
-                        "host" => node.tag == "apps-shadow-root",
+                        "host" => {
+                            node.tag == "apps-shadow-root"
+                                && (parsed.is_empty()
+                                    || parsed
+                                        .iter()
+                                        .any(|s| s.matches_cached(doc, id, scope, memo)))
+                        }
                         "empty" => {
                             memo.depend(id, 2);
                             memo.depend(id, 3);
@@ -588,44 +827,210 @@ impl Selector {
                                             && doc.nodes[id].text.is_empty()
                                 })
                         }
-                        "checked" | "disabled" | "required" => node.attrs.contains_key(name),
-                        "enabled" => !node.attrs.contains_key("disabled"),
-                        "focus" | "focus-visible" => node.attrs.contains_key("data-apps-focus"),
+                        "hover" | "active" | "focus" | "focus-visible" | "focus-within" => {
+                            memo.depend(id, 5);
+                            node.state
+                                & match name.as_str() {
+                                    "hover" => HOVER,
+                                    "active" => ACTIVE,
+                                    "focus-within" => FOCUS_WITHIN,
+                                    _ => FOCUS,
+                                }
+                                != 0
+                        }
+                        "link" | "any-link" | "-webkit-any-link" => {
+                            matches!(node.tag.as_str(), "a" | "area")
+                                && node.attrs.contains_key("href")
+                        }
+                        "defined" => true,
+                        "open" => {
+                            matches!(node.tag.as_str(), "details" | "dialog")
+                                && node.attrs.contains_key("open")
+                        }
+                        "indeterminate" => {
+                            node.tag == "progress" && !node.attrs.contains_key("value")
+                        }
+                        "checked" => match node.tag.as_str() {
+                            "input" => {
+                                node.attrs.contains_key("checked")
+                                    && node.attrs.get("type").is_some_and(|kind| {
+                                        kind.eq_ignore_ascii_case("checkbox")
+                                            || kind.eq_ignore_ascii_case("radio")
+                                    })
+                            }
+                            "option" => node.attrs.contains_key("selected"),
+                            _ => false,
+                        },
+                        "disabled" | "enabled" => {
+                            matches!(
+                                node.tag.as_str(),
+                                "button"
+                                    | "input"
+                                    | "select"
+                                    | "textarea"
+                                    | "optgroup"
+                                    | "option"
+                                    | "fieldset"
+                            ) && node.attrs.contains_key("disabled") == (name == "disabled")
+                        }
+                        "placeholder-shown" | "required" | "optional" | "valid" | "invalid" => {
+                            memo.depend(id, 2);
+                            memo.depend(id, 3);
+                            let required = node.attrs.contains_key("required");
+                            let empty = if node.attrs.get("type").is_some_and(|kind| {
+                                kind.eq_ignore_ascii_case("checkbox")
+                                    || kind.eq_ignore_ascii_case("radio")
+                            }) {
+                                !node.attrs.contains_key("checked")
+                            } else {
+                                node.attrs.get("value").map_or(
+                                    node.text.is_empty() && node.children.is_empty(),
+                                    String::is_empty,
+                                )
+                            };
+                            matches!(node.tag.as_str(), "input" | "select" | "textarea")
+                                && match name.as_str() {
+                                    "placeholder-shown" => {
+                                        node.tag != "select"
+                                            && node.attrs.contains_key("placeholder")
+                                            && empty
+                                    }
+                                    "required" => required,
+                                    "optional" => !required,
+                                    "invalid" => required && empty,
+                                    _ => !(required && empty),
+                                }
+                        }
+                        "read-write" | "read-only"
+                            if matches!(node.tag.as_str(), "input" | "textarea") =>
+                        {
+                            let writable = !node.attrs.contains_key("readonly")
+                                && !node.attrs.contains_key("disabled")
+                                && (node.tag == "textarea"
+                                    || node.attrs.get("type").is_none_or(|kind| {
+                                        ![
+                                            "hidden", "checkbox", "radio", "file", "submit",
+                                            "image", "reset", "button", "color", "range",
+                                        ]
+                                        .iter()
+                                        .any(|other| kind.eq_ignore_ascii_case(other))
+                                    }));
+                            writable == (name == "read-write")
+                        }
+                        "read-write" | "read-only" | "lang" | "dir" => {
+                            let attribute = match name.as_str() {
+                                "lang" | "dir" => name.as_str(),
+                                _ => "contenteditable",
+                            };
+                            let mut value = None;
+                            let mut current = Some(id);
+                            while value.is_none()
+                                && let Some(ancestor) = current
+                            {
+                                memo.depend(ancestor, 0);
+                                memo.depend(ancestor, 1);
+                                value = doc.nodes[ancestor].attrs.get(attribute).filter(|value| {
+                                    match attribute {
+                                        "lang" => true,
+                                        "dir" => ["ltr", "rtl", "auto"]
+                                            .iter()
+                                            .any(|v| value.eq_ignore_ascii_case(v)),
+                                        _ => ["", "true", "false", "plaintext-only"]
+                                            .iter()
+                                            .any(|v| value.eq_ignore_ascii_case(v)),
+                                    }
+                                });
+                                current = doc.nodes[ancestor].parent;
+                            }
+                            match name.as_str() {
+                                "lang" => value.is_some_and(|value| {
+                                    !value.is_empty()
+                                        && argument.split(',').any(|range| {
+                                            let range = range.trim().trim_matches(['"', '\'']);
+                                            range == "*"
+                                                || value.as_bytes().get(..range.len()).is_some_and(
+                                                    |prefix| {
+                                                        prefix
+                                                            .eq_ignore_ascii_case(range.as_bytes())
+                                                    },
+                                                ) && value
+                                                    .as_bytes()
+                                                    .get(range.len())
+                                                    .is_none_or(|&c| c == b'-')
+                                        })
+                                }),
+                                "dir" => {
+                                    let rtl = value
+                                        .is_some_and(|value| value.eq_ignore_ascii_case("rtl"));
+                                    let wanted = argument.trim();
+                                    wanted.eq_ignore_ascii_case("rtl") && rtl
+                                        || wanted.eq_ignore_ascii_case("ltr") && !rtl
+                                }
+                                _ => {
+                                    value.is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+                                        == (name == "read-write")
+                                }
+                            }
+                        }
                         "not" => !parsed
                             .iter()
                             .any(|s| s.matches_cached(doc, id, scope, memo)),
                         "is" | "where" => parsed
                             .iter()
                             .any(|s| s.matches_cached(doc, id, scope, memo)),
-                        "first-child" | "last-child" | "only-child" | "nth-child" => {
+                        "first-child" | "last-child" | "only-child" | "nth-child"
+                        | "nth-last-child" | "first-of-type" | "last-of-type" | "only-of-type"
+                        | "nth-of-type" | "nth-last-of-type" => {
                             memo.depend(id, 1);
                             node.parent.is_some_and(|parent| {
                                 memo.depend(parent, 2);
                                 for &child in &doc.nodes[parent].children {
                                     memo.depend(child, 4);
                                 }
-                                let mut elements = doc.nodes[parent]
-                                    .children
-                                    .iter()
-                                    .filter(|&&id| !doc.nodes[id].tag.starts_with('#'));
+                                if !parsed.is_empty()
+                                    && !parsed
+                                        .iter()
+                                        .any(|s| s.matches_cached(doc, id, scope, memo))
+                                {
+                                    return false;
+                                }
+                                let of_type = name.ends_with("of-type");
+                                let mut siblings =
+                                    doc.nodes[parent].children.iter().filter(|&&child| {
+                                        let tag = &doc.nodes[child].tag;
+                                        !tag.starts_with('#')
+                                            && (!of_type || *tag == node.tag)
+                                            && (parsed.is_empty()
+                                                || child == id
+                                                || parsed.iter().any(|s| {
+                                                    s.matches_cached(doc, child, scope, memo)
+                                                }))
+                                    });
                                 match name.as_str() {
-                                    "first-child" => elements.next() == Some(&id),
-                                    "last-child" => elements.next_back() == Some(&id),
-                                    "only-child" => elements.nth(1).is_none(),
-                                    _ => elements.position(|&child| child == id).is_some_and(
-                                        |index| match argument.as_str() {
-                                            "odd" => index % 2 == 0,
-                                            "even" => index % 2 == 1,
-                                            _ => argument
-                                                .parse::<usize>()
-                                                .is_ok_and(|n| n == index + 1),
-                                        },
-                                    ),
+                                    "first-child" | "first-of-type" => siblings.next() == Some(&id),
+                                    "last-child" | "last-of-type" => {
+                                        siblings.next_back() == Some(&id)
+                                    }
+                                    "only-child" | "only-of-type" => siblings.nth(1).is_none(),
+                                    _ => if name.starts_with("nth-last") {
+                                        siblings.rev().position(|&child| child == id)
+                                    } else {
+                                        siblings.position(|&child| child == id)
+                                    }
+                                    .is_some_and(|index| {
+                                        let (a, n) = (*a as i64, index as i64 + 1 - *b as i64);
+                                        if a == 0 {
+                                            n == 0
+                                        } else {
+                                            n % a == 0 && n / a >= 0
+                                        }
+                                    }),
                                 }
                             })
                         }
                         _ => false,
                     },
+                    SimpleSelector::Element(..) => false,
                     SimpleSelector::Parent(parent, _) => parent
                         .iter()
                         .any(|s| s.matches_cached(doc, id, scope, memo)),
@@ -697,6 +1102,10 @@ impl Selector {
                 }
             }
         })();
+        // A compound without combinators or nested lists is as cheap to match again as to look up.
+        if compound {
+            return result;
+        }
         let mut dependencies = memo.dependencies[start..].to_vec();
         dependencies.sort_unstable();
         dependencies.dedup();
@@ -717,6 +1126,8 @@ pub struct Node {
     pub parent: Option<usize>,
     pub(crate) stylesheet: Option<Rc<crate::render::Stylesheet>>,
     pub(crate) inline: Option<crate::render::Declarations>,
+    #[serde(skip)]
+    pub(crate) state: u8,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -823,7 +1234,9 @@ impl Document {
                             attrs = &attrs[length..];
                         }
                     }
-                    node.attrs.insert(name, decode(value));
+                    if !node.attrs.contains_key(&name) {
+                        node.attrs.insert(name, decode(value));
+                    }
                     attrs = attrs.trim_start();
                 }
                 pos += (end + 1).min(rest.len());
@@ -1096,6 +1509,8 @@ mod tests {
             .position(|n| n.attrs.get("id").is_some_and(|v| v == "empty"))
             .unwrap();
         assert!(!doc.matches(empty, ":has(.separator)"));
+        assert!(doc.matches(id, ":has(+ #empty)") && doc.matches(id, ":has(~ main:empty)"));
+        assert!(!doc.matches(empty, ":has(+ main)") && !doc.matches(id, ":has(+ code)"));
     }
 
     #[test]
@@ -1155,5 +1570,265 @@ mod tests {
         let source = doc.serialize(1);
         let tree = resvg::usvg::Tree::from_str(&source, &Default::default()).unwrap();
         assert_eq!(tree.root().children().len(), 2);
+    }
+
+    fn matched(doc: &Document, selector: &str) -> String {
+        (0..doc.nodes.len())
+            .filter(|&id| doc.matches(id, selector))
+            .filter_map(|id| doc.nodes[id].attrs.get("id").cloned())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    fn structural_pseudo_classes_follow_an_plus_b() {
+        let doc = Document::parse(
+            "<ul><li id=a class=k></li><li id=b></li><li id=c class=k></li><li id=d></li><li id=e class=k></li></ul><div><span id=s1></span><i id=i1></i><span id=s2></span><i id=i2></i><span id=s3></span></div><p><b id=only></b></p>",
+        );
+        for (selector, expected) in [
+            ("li:nth-child(odd)", "a,c,e"),
+            ("li:nth-child(EVEN)", "b,d"),
+            ("li:nth-child(2n+1)", "a,c,e"),
+            ("li:nth-child( 2n + 1 )", "a,c,e"),
+            ("li:nth-child(2n- 1)", "a,c,e"),
+            ("li:nth-child(-n+3)", "a,b,c"),
+            ("li:nth-child(-n/**/+3)", "a,b,c"),
+            ("li:nth-child(2n/**/+1)", "a,c,e"),
+            ("li:nth-child(n+4)", "d,e"),
+            ("li:nth-child(+3)", "c"),
+            ("li:nth-child(0n+2)", "b"),
+            ("li:nth-child(3n)", "c"),
+            ("li:nth-child(-2n+5)", "a,c,e"),
+            ("li:nth-child(n)", "a,b,c,d,e"),
+            ("li:nth-last-child(2)", "d"),
+            ("li:nth-last-child(-n+2)", "d,e"),
+            ("li:nth-child(odd of .k)", "a,e"),
+            ("li:nth-child(2 of .k)", "c"),
+            ("li:nth-last-child(1 of .k)", "e"),
+            ("li:nth-child(1 of :not(.k))", "b"),
+            ("span:nth-of-type(2)", "s2"),
+            ("div > :nth-of-type(odd)", "s1,i1,s3"),
+            ("div > :nth-last-of-type(1)", "i2,s3"),
+            ("div > :first-of-type", "s1,i1"),
+            ("div > :last-of-type", "i2,s3"),
+            ("div > :only-of-type", ""),
+            ("p > :only-of-type, b:only-child", "only"),
+            ("li:first-child, li:last-child", "a,e"),
+            ("li:nth-child(n+2):nth-child(-n+3)", "b,c"),
+        ] {
+            assert_eq!(matched(&doc, selector), expected, "{selector}");
+        }
+    }
+
+    #[test]
+    fn attribute_selectors_handle_flags_quotes_and_escapes() {
+        let doc = Document::parse(
+            "<div id=x data-k='ABC def' lang='en-US' title='a]b c' class='hover:bg md:w-1/2 123'></div>",
+        );
+        for selector in [
+            "[data-k='abc def' i]",
+            "[data-k=\"ABC def\" S]",
+            "[ data-k ~= \"def\" ]",
+            "[data-k~=DEF i]",
+            "[data-k^='ab' i]",
+            "[lang|=en]",
+            "[lang|='EN' i]",
+            "[title=\"a]b c\"]",
+            "[title='a\\]b c']",
+            "[title=\"a\\5d b c\"]",
+            "[|title]",
+            "[*|title]",
+            "div[id=x]",
+            ".hover\\:bg.md\\:w-1\\/2",
+            ".\\31 23",
+        ] {
+            assert!(doc.matches(1, selector), "{selector}");
+            let source = Selector::parse(selector, None)[0].source();
+            assert!(doc.matches(1, &source), "{selector} -> {source}");
+        }
+        for selector in [
+            "[data-k='abc def']",
+            "[data-k='abc def' s]",
+            "[data-k$='']",
+            "[data-k*='']",
+            "[data-k^='']",
+            "[data-k~='']",
+            "[data-k~='C d']",
+            "[lang|=e]",
+        ] {
+            assert!(!doc.matches(1, selector), "{selector}");
+        }
+    }
+
+    #[test]
+    fn invalid_selectors_reject_the_whole_list() {
+        for selector in [
+            "li:nth-child(2 n)",
+            "li:nth-child(n-)",
+            "li:nth-child(+ 2)",
+            "li:nth-child(2n+-1)",
+            "li:nth-child()",
+            "li:nth-child(foo)",
+            "li:nth-child(1.5)",
+            "li:nth-of-type(1 of .k)",
+            "[data-k=1]",
+            "[data-k='x' q]",
+            "[data-k='x]",
+            "[=x]",
+            "[a b]",
+            "[ns|a]",
+            ".1a",
+            "#-1",
+            ":not()",
+            ":has()",
+            "a::",
+            ":lang()",
+            ":dir()",
+            "a, :not(.b",
+        ] {
+            assert!(
+                Selector::parse(&format!("p, {selector}"), None).is_empty(),
+                "{selector}"
+            );
+        }
+        for selector in [
+            ":is()",
+            ":is(#1, .a)",
+            ":where(.a, 1x)",
+            ":unknown",
+            "::-webkit-scrollbar",
+            ":-webkit-any-link",
+        ] {
+            assert!(!Selector::parse(selector, None).is_empty(), "{selector}");
+        }
+        assert!(Selector::parse(&"a ".repeat(2000), None).is_empty());
+    }
+
+    #[test]
+    fn specificity_follows_selectors_level_4() {
+        for (selector, expected) in [
+            ("*", [0, 0, 0]),
+            ("li", [0, 0, 1]),
+            ("li::before", [0, 0, 2]),
+            ("li:before", [0, 0, 2]),
+            (".a:hover", [0, 2, 0]),
+            ("#a .b > c", [1, 1, 1]),
+            (":is(#a, .b)", [1, 0, 0]),
+            (":where(#a, .b) c", [0, 0, 1]),
+            (":not(.a, #b)", [1, 0, 0]),
+            (":has(> img, .x)", [0, 1, 0]),
+            (":nth-child(2n of #a, .b)", [1, 1, 0]),
+            (":nth-child(2n)", [0, 1, 0]),
+            ("[data-k='v' i]", [0, 1, 0]),
+            (":root", [0, 1, 0]),
+            (":host(.a)", [0, 2, 0]),
+        ] {
+            assert_eq!(
+                Selector::parse(selector, None)[0].specificity,
+                expected,
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn language_direction_link_and_form_pseudo_classes() {
+        let doc = Document::parse(
+            "<html lang=en-US><body><div lang=fr><p id=p1></p></div><p id=p2></p><div dir=rtl><span id=r></span><span id=l dir=ltr></span><span id=auto dir=auto></span></div><a id=link href='#x'></a><a id=plain></a><input id=t placeholder=x><input id=v placeholder=x value=1><input id=ro readonly><input id=cb type=checkbox checked required><input id=dis disabled><textarea id=ta required></textarea><div id=ce contenteditable><b id=inner></b></div><progress id=pr></progress><details id=det open></details></body></html>",
+        );
+        for (selector, expected) in [
+            ("p:lang(en)", "p2"),
+            ("p:lang(fr)", "p1"),
+            ("p:lang(\"EN\", de)", "p2"),
+            ("p:lang(en-US)", "p2"),
+            ("p:lang(en-u)", ""),
+            ("p:lang(*)", "p1,p2"),
+            ("span:dir(rtl)", "r"),
+            ("span:dir(ltr)", "l,auto"),
+            ("a:link", "link"),
+            ("a:any-link", "link"),
+            ("a:visited, :target", ""),
+            ("input:placeholder-shown", "t"),
+            ("input:read-only", "ro,cb,dis"),
+            ("input:read-write, textarea:read-write", "t,v,ta"),
+            ("div:read-write, b:read-write", "ce,inner"),
+            ("input:checked", "cb"),
+            ("input:required", "cb"),
+            ("input:optional", "t,v,ro,dis"),
+            (":invalid", "ta"),
+            ("input:valid", "t,v,ro,cb,dis"),
+            ("input:disabled", "dis"),
+            ("input:enabled", "t,v,ro,cb"),
+            ("div:enabled, div:disabled", ""),
+            ("progress:indeterminate", "pr"),
+            ("details:open", "det"),
+            ("p:defined", "p1,p2"),
+        ] {
+            assert_eq!(matched(&doc, selector), expected, "{selector}");
+        }
+        let html = doc.nodes.iter().position(|n| n.tag == "html").unwrap();
+        assert!(Selector::parse(":scope", None)[0].matches(&doc, html));
+    }
+
+    #[test]
+    fn interaction_states_invalidate_cached_styles() {
+        let mut doc = Document::parse(
+            "<style>.card:hover{color:red}.card:hover .title{font-weight:700}:focus-within>.title{background-color:blue}.title:focus{color:green}button:active{color:orange}:has(>.title:hover){padding-top:1px}</style><div class=card><span class=title>t</span><button>b</button></div>",
+        );
+        let card = doc.nodes.iter().position(|n| n.tag == "div").unwrap();
+        let title = doc.nodes.iter().position(|n| n.tag == "span").unwrap();
+        let button = doc.nodes.iter().position(|n| n.tag == "button").unwrap();
+        let checks = [
+            (card, "color", "red"),
+            (card, "padding-top", "1px"),
+            (title, "font-weight", "700"),
+            (title, "background-color", "blue"),
+            (title, "color", "green"),
+            (button, "color", "orange"),
+        ];
+        let mut sheets = HashMap::new();
+        let mut cache = crate::render::StyleCache::default();
+        for (step, (states, expected)) in [
+            ([0, 0, 0], &[][..]),
+            ([HOVER, 0, 0], &[0, 2][..]),
+            ([HOVER, HOVER, 0], &[0, 1, 2][..]),
+            ([0, 0, 0], &[][..]),
+            ([FOCUS_WITHIN, FOCUS | FOCUS_WITHIN, 0], &[3, 4][..]),
+            ([HOVER | ACTIVE, 0, HOVER | ACTIVE], &[0, 2, 5][..]),
+            ([0, 0, 0], &[][..]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (id, state) in [card, title, button].into_iter().zip(states) {
+                doc.nodes[id].state = state;
+            }
+            let cached = crate::render::compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut sheets,
+                &mut cache,
+                None,
+            );
+            let fresh = crate::render::compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut sheets,
+                &mut crate::render::StyleCache::default(),
+                None,
+            );
+            assert_eq!(cached.values, fresh.values, "step {step}");
+            for (index, (id, key, value)) in checks.into_iter().enumerate() {
+                assert_eq!(
+                    cached.values[id].get(key).is_some_and(|v| v == value),
+                    expected.contains(&index),
+                    "step {step}: {key}:{value}"
+                );
+            }
+        }
     }
 }

@@ -1,4 +1,4 @@
-use super::{Declaration, Declarations, MediaFeature, Rule, Selector, SelectorList, Stylesheet};
+use super::{Declaration, Declarations, MediaQuery, Rule, Selector, SelectorList, Stylesheet};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -181,86 +181,77 @@ impl<'i> AtRuleParser<'i> for Rules {
                     .collect(),
             )));
         }
-        if !self.declarations_only
-            && (name.eq_ignore_ascii_case("layer") || name.eq_ignore_ascii_case("supports"))
-        {
+        if name.eq_ignore_ascii_case("layer") && !self.declarations_only {
             let mut value = String::new();
             source(input, &mut value)?;
-            return Ok(Item::Rule(if name.eq_ignore_ascii_case("layer") {
-                Rule::Layer(
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                    Vec::new(),
-                )
-            } else {
-                Rule::Supports(value, Vec::new())
-            }));
+            return Ok(Item::Rule(Rule::Layer(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                Vec::new(),
+            )));
+        }
+        if name.eq_ignore_ascii_case("supports") && !self.declarations_only {
+            input.skip_whitespace();
+            let start = input.state();
+            let supported = condition(input, true, true)?.matches(0., 0., false, 0) == Some(true);
+            input.expect_exhausted()?;
+            input.reset(&start);
+            let mut value = String::new();
+            source(input, &mut value)?;
+            return Ok(Item::Rule(Rule::Supports(value, supported, Vec::new())));
         }
         if name.eq_ignore_ascii_case("media") && !self.declarations_only {
-            let queries = input.parse_comma_separated_ignoring_errors(|input| {
-                let mut features = Vec::new();
-                if let Ok(medium) = input.try_parse(Parser::expect_ident_cloned) {
-                    if !medium.eq_ignore_ascii_case("screen") && !medium.eq_ignore_ascii_case("all")
-                    {
-                        return Err(ParseError::<()>::unexpected_token());
-                    }
-                    if input.is_exhausted() {
-                        return Ok(features);
-                    }
-                    input.expect_ident_matching("and")?;
-                }
-                loop {
-                    input.expect_parenthesis_block()?;
-                    features.push(input.parse_nested_block(|input| {
-                        let feature = match input.expect_ident()?.to_ascii_lowercase().as_str() {
-                            "min-width" => MediaFeature::MinWidth,
-                            "max-width" => MediaFeature::MaxWidth,
-                            "min-height" => MediaFeature::MinHeight,
-                            "max-height" => MediaFeature::MaxHeight,
-                            "pointer" => MediaFeature::Pointer,
-                            "width" => MediaFeature::Width,
-                            "height" => MediaFeature::Height,
-                            "prefers-reduced-motion" => MediaFeature::ReducedMotion,
-                            "prefers-color-scheme" => MediaFeature::ColorScheme,
-                            "prefers-contrast" => MediaFeature::Contrast,
-                            "inverted-colors" => MediaFeature::InvertedColors,
-                            "prefers-reduced-transparency" => MediaFeature::ReducedTransparency,
-                            "forced-colors" => MediaFeature::ForcedColors,
-                            _ => return Err(ParseError::unexpected_token()),
-                        };
-                        let feature = if input.try_parse(Parser::expect_colon).is_ok() {
-                            feature
-                        } else {
-                            let Token::Delim(operator) = *input.next()? else {
-                                return Err(ParseError::unexpected_token());
-                            };
-                            let inclusive =
-                                input.try_parse(|input| input.expect_delim('=')).is_ok();
-                            match (feature, operator, inclusive) {
-                                (MediaFeature::Width, '>', true) => MediaFeature::MinWidth,
-                                (MediaFeature::Width, '<', true) => MediaFeature::MaxWidth,
-                                (MediaFeature::Height, '>', true) => MediaFeature::MinHeight,
-                                (MediaFeature::Height, '<', true) => MediaFeature::MaxHeight,
-                                (MediaFeature::Width | MediaFeature::Height, '=', false) => feature,
-                                _ => return Err(ParseError::unexpected_token()),
+            let queries = if input.is_exhausted() {
+                Vec::new()
+            } else {
+                input.parse_comma_separated_ignoring_errors(|input| {
+                    let query = input.try_parse(|input| {
+                        input.parse_entirely(|input| {
+                            if let Ok(query) = input.try_parse(|input| {
+                                input.parse_entirely(|input| condition(input, true, false))
+                            }) {
+                                return Ok(query);
                             }
-                        };
-                        input.skip_whitespace();
-                        let mut value = String::new();
-                        source(input, &mut value)?;
-                        value.truncate(value.trim_end().len());
-                        Ok((feature, value))
-                    })?);
-                    if input.is_exhausted() {
-                        return Ok(features);
-                    }
-                    input.expect_ident_matching("and")?;
-                }
-            });
+                            let not = input
+                                .try_parse(|input| input.expect_ident_matching("not"))
+                                .is_ok();
+                            if !not {
+                                let _ =
+                                    input.try_parse(|input| input.expect_ident_matching("only"));
+                            }
+                            let medium = input.expect_ident_cloned()?;
+                            if ["not", "only", "and", "or", "layer"]
+                                .iter()
+                                .any(|word| medium.eq_ignore_ascii_case(word))
+                            {
+                                return Err(ParseError::unexpected_token());
+                            }
+                            let query = if input.is_exhausted() {
+                                MediaQuery::All
+                            } else {
+                                input.expect_ident_matching("and")?;
+                                condition(input, false, false)?
+                            };
+                            let matched = medium.eq_ignore_ascii_case("all")
+                                || medium.eq_ignore_ascii_case("screen");
+                            Ok(match (matched, not) {
+                                (true, false) => query,
+                                (true, true) => MediaQuery::Not(Box::new(query)),
+                                (false, false) => MediaQuery::Not(Box::new(MediaQuery::All)),
+                                (false, true) => MediaQuery::All,
+                            })
+                        })
+                    });
+                    Ok::<_, ParseError<()>>(query.unwrap_or_else(|_| {
+                        while input.next().is_ok() {}
+                        MediaQuery::Not(Box::new(MediaQuery::All))
+                    }))
+                })
+            };
             return Ok(Item::Rule(Rule::Media(queries, Vec::new())));
         }
         Err(ParseError::unexpected_token())
@@ -290,8 +281,9 @@ impl<'i> AtRuleParser<'i> for Rules {
                 }
                 .body(input),
             ),
-            Item::Rule(Rule::Supports(condition, _)) => Rule::Supports(
+            Item::Rule(Rule::Supports(condition, supported, _)) => Rule::Supports(
                 condition,
+                supported,
                 Rules {
                     parent: self.parent.clone(),
                     ..Rules::default()
@@ -327,6 +319,172 @@ impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
     fn parse_qualified(&self) -> bool {
         !self.declarations_only
     }
+}
+
+/// Parses a media condition or, with `supports`, an `@supports` condition evaluated to `All` or `not all`.
+fn condition(
+    input: &mut Parser<'_>,
+    or: bool,
+    supports: bool,
+) -> Result<MediaQuery, ParseError<()>> {
+    let not = input
+        .try_parse(|input| input.expect_ident_matching("not"))
+        .is_ok();
+    let mut items = Vec::new();
+    let mut and = true;
+    loop {
+        let start = input.position();
+        let selector = match input.next()? {
+            Token::ParenthesisBlock => None,
+            Token::Function(name) => Some(name.eq_ignore_ascii_case("selector")),
+            _ => return Err(ParseError::unexpected_token()),
+        };
+        let item = input.parse_nested_block(|input| {
+            if selector.is_none()
+                && let Ok(query) = input.try_parse(|input| {
+                    input.parse_entirely(|input| condition(input, true, supports))
+                })
+            {
+                return Ok(Some(query));
+            }
+            let mut text = String::new();
+            source(input, &mut text)?;
+            let text = text.trim();
+            if supports {
+                let supported = match selector {
+                    Some(selector) => selector && !Selector::parse(text, None).is_empty(),
+                    None => text.split_once(':').is_some_and(|(name, value)| {
+                        let name = name.trim().to_ascii_lowercase();
+                        let value = value.trim();
+                        let value = value
+                            .strip_suffix("!important")
+                            .map_or(value, str::trim_end)
+                            .to_ascii_lowercase();
+                        let value = value.as_str();
+                        let wide = value.contains("var(")
+                            || matches!(
+                                value,
+                                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                            );
+                        !value.is_empty()
+                            && (name.starts_with("--")
+                                || super::SUPPORTED_PROPERTIES
+                                    .iter()
+                                    .any(|(property, values)| {
+                                        *property == name
+                                            && (wide
+                                                || if values.is_empty() {
+                                                    !name.ends_with("color")
+                                                        || value == "currentcolor"
+                                                        || super::color(value).is_some()
+                                                } else {
+                                                    values.contains(&value)
+                                                })
+                                    }))
+                    }),
+                };
+                return Ok(Some(if supported {
+                    MediaQuery::All
+                } else {
+                    MediaQuery::Not(Box::new(MediaQuery::All))
+                }));
+            }
+            if selector.is_some() {
+                return Ok(None);
+            }
+            let text = text.to_ascii_lowercase();
+            let ident = |name: &str| {
+                name.trim_start_matches('-')
+                    .starts_with(|c: char| c.is_ascii_alphabetic())
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            };
+            let feature = |name: &str, op: &str, value: &str| {
+                MediaQuery::Feature(name.into(), op.into(), value.into())
+            };
+            if let Some((name, value)) = text.split_once(':') {
+                let (name, value) = (name.trim(), value.trim());
+                return Ok((ident(name) && !value.is_empty()).then(|| {
+                    if let Some(name) = name.strip_prefix("min-") {
+                        feature(name, ">=", value)
+                    } else if let Some(name) = name.strip_prefix("max-") {
+                        feature(name, "<=", value)
+                    } else {
+                        feature(name, ":", value)
+                    }
+                }));
+            }
+            if ident(&text) {
+                return Ok(Some(feature(&text, "", "")));
+            }
+            let mut parts = [""; 3];
+            let mut ops = [""; 2];
+            let mut count = 0;
+            let mut rest = text.as_str();
+            while let Some(index) = rest.find(['<', '>', '=']) {
+                let length = 1 + usize::from(
+                    !rest[index..].starts_with('=') && rest[index + 1..].starts_with('='),
+                );
+                if count == 2 {
+                    return Ok(None);
+                }
+                parts[count] = rest[..index].trim();
+                ops[count] = &rest[index..index + length];
+                count += 1;
+                rest = &rest[index + length..];
+            }
+            parts[count] = rest.trim();
+            let flip = |op: &str| match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                _ => "=",
+            };
+            Ok(match count {
+                1 if ident(parts[0]) && !parts[1].is_empty() => {
+                    Some(feature(parts[0], ops[0], parts[1]))
+                }
+                1 if ident(parts[1]) && !parts[0].is_empty() => {
+                    Some(feature(parts[1], flip(ops[0]), parts[0]))
+                }
+                2 if ident(parts[1])
+                    && ops[0] != "="
+                    && ops[0].as_bytes().first() == ops[1].as_bytes().first()
+                    && !parts[0].is_empty()
+                    && !parts[2].is_empty() =>
+                {
+                    Some(MediaQuery::And(vec![
+                        feature(parts[1], flip(ops[0]), parts[0]),
+                        feature(parts[1], ops[1], parts[2]),
+                    ]))
+                }
+                _ => None,
+            })
+        })?;
+        let item = item.unwrap_or_else(|| MediaQuery::Unknown(input.slice_from(start).to_owned()));
+        if not {
+            return Ok(MediaQuery::Not(Box::new(item)));
+        }
+        items.push(item);
+        let Ok(word) = input.try_parse(Parser::expect_ident_cloned) else {
+            break;
+        };
+        let next = word.eq_ignore_ascii_case("and");
+        if !next && !(or && word.eq_ignore_ascii_case("or")) || items.len() > 1 && next != and {
+            return Err(ParseError::unexpected_token());
+        }
+        and = next;
+    }
+    if items.len() == 1
+        && let Some(item) = items.pop()
+    {
+        return Ok(item);
+    }
+    Ok(if and {
+        MediaQuery::And(items)
+    } else {
+        MediaQuery::Or(items)
+    })
 }
 
 fn source(input: &mut Parser<'_>, output: &mut String) -> Result<(), ParseError<()>> {
@@ -404,15 +562,21 @@ impl Lengths {
     }
 
     pub fn parse(&self, source: &str, base: f32) -> Option<(f32, bool)> {
+        let (value, kind) = self.math(source, base, &[])?;
+        let value = value as f32;
+        (kind != Kind::Angle && value.is_finite()).then_some((value, kind == Kind::Length))
+    }
+
+    pub fn math(&self, source: &str, base: f32, vars: &[(&str, f64)]) -> Option<(f64, Kind)> {
         let mut parser = Math {
             rest: source.trim(),
             units: self,
             base,
             depth: 0,
+            vars,
         };
-        let (value, dimension) = parser.atom()?;
-        let value = value as f32;
-        (parser.rest.trim().is_empty() && value.is_finite()).then_some((value, dimension))
+        let value = parser.atom()?;
+        (parser.rest.trim().is_empty() && value.0.is_finite()).then_some(value)
     }
 
     pub fn resolve(&self, source: &str, base: f32) -> Option<f32> {
@@ -421,15 +585,23 @@ impl Lengths {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Kind {
+    Number,
+    Length,
+    Angle,
+}
+
 struct Math<'a> {
     rest: &'a str,
     units: &'a Lengths,
     base: f32,
     depth: usize,
+    vars: &'a [(&'a str, f64)],
 }
 
 impl Math<'_> {
-    fn expression(&mut self, minimum: u8) -> Option<(f64, bool)> {
+    fn expression(&mut self, minimum: u8) -> Option<(f64, Kind)> {
         self.depth += 1;
         if self.depth > 64 {
             return None;
@@ -454,13 +626,12 @@ impl Math<'_> {
             }
             self.rest = &rest[1..];
             let right = self.expression(precedence + 1)?;
-            left = match operator {
-                b'+' if left.1 == right.1 => (left.0 + right.0, left.1),
-                b'-' if left.1 == right.1 => (left.0 - right.0, left.1),
-                b'*' if !left.1 || !right.1 => (left.0 * right.0, left.1 || right.1),
-                b'/' if right.0 != 0. && (!right.1 || left.1) => {
-                    (left.0 / right.0, left.1 && !right.1)
-                }
+            left = match (operator, left.1, right.1) {
+                (b'+', a, b) if a == b => (left.0 + right.0, a),
+                (b'-', a, b) if a == b => (left.0 - right.0, a),
+                (b'*', kind, Kind::Number) | (b'*', Kind::Number, kind) => (left.0 * right.0, kind),
+                (b'/', kind, Kind::Number) if right.0 != 0. => (left.0 / right.0, kind),
+                (b'/', a, b) if a == b && right.0 != 0. => (left.0 / right.0, Kind::Number),
                 _ => return None,
             };
             if !left.0.is_finite() {
@@ -471,25 +642,63 @@ impl Math<'_> {
         Some(left)
     }
 
-    fn atom(&mut self) -> Option<(f64, bool)> {
+    fn atom(&mut self) -> Option<(f64, Kind)> {
         self.rest = self.rest.trim_start();
-        let end = self
-            .rest
-            .find(|c: char| !c.is_ascii_alphabetic())
-            .unwrap_or(self.rest.len());
+        if let Some(rest) = self.rest.strip_prefix('-')
+            && rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '(')
+        {
+            self.rest = rest;
+            let (value, kind) = self.atom()?;
+            return Some((-value, kind));
+        }
+        let end = if self.rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            self.rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .unwrap_or(self.rest.len())
+        } else {
+            0
+        };
+        let name = &self.rest[..end];
+        let lower;
+        let name = if name.bytes().any(|c| c.is_ascii_uppercase()) {
+            lower = name.to_ascii_lowercase();
+            lower.as_str()
+        } else {
+            name
+        };
+        if end > 0 && !self.rest[end..].starts_with('(') {
+            self.rest = &self.rest[end..];
+            if let Some((_, value)) = self.vars.iter().find(|(var, _)| *var == name) {
+                return Some((*value, Kind::Number));
+            }
+            let value = match name {
+                "e" if self.depth > 0 => std::f64::consts::E,
+                "pi" if self.depth > 0 => std::f64::consts::PI,
+                "infinity" if self.depth > 0 => f64::INFINITY,
+                "nan" if self.depth > 0 => f64::NAN,
+                _ => return None,
+            };
+            return Some((value, Kind::Number));
+        }
         if end > 0 || self.rest.starts_with('(') {
-            let name = &self.rest[..end];
-            if name.is_empty() && self.depth == 0 {
+            if end == 0 && self.depth == 0 {
                 return None;
             }
-            if !["", "calc", "min", "max", "clamp", "round"]
-                .iter()
-                .any(|s| name.eq_ignore_ascii_case(s))
-            {
-                return None;
-            }
-            self.rest = self.rest[end..].strip_prefix('(')?;
-            let mut values = [self.expression(0)?; 3];
+            self.rest = &self.rest[end + 1..];
+            let strategy = ["nearest", "up", "down", "to-zero"]
+                .into_iter()
+                .filter(|_| name == "round")
+                .find_map(|keyword| {
+                    let rest = self.rest.trim_start();
+                    let rest = rest
+                        .get(..keyword.len())
+                        .filter(|word| word.eq_ignore_ascii_case(keyword))
+                        .and(rest.get(keyword.len()..))?;
+                    self.rest = rest.trim_start().strip_prefix(',')?;
+                    Some(keyword)
+                })
+                .unwrap_or("nearest");
+            let mut args = [self.expression(0)?; 3];
             let mut count = 1;
             loop {
                 self.rest = self.rest.trim_start();
@@ -499,30 +708,70 @@ impl Math<'_> {
                 }
                 self.rest = self.rest.strip_prefix(',')?;
                 let value = self.expression(0)?;
-                if value.1 != values[0].1 {
-                    return None;
+                match name {
+                    "min" | "max" | "hypot" if value.1 == args[0].1 => {
+                        args[0].0 = match name {
+                            "min" => args[0].0.min(value.0),
+                            "max" => args[0].0.max(value.0),
+                            _ => args[0].0.hypot(value.0),
+                        }
+                    }
+                    "clamp" | "round" | "mod" | "rem" | "atan2" | "pow" | "log" if count < 3 => {
+                        args[count] = value;
+                        count += 1;
+                    }
+                    _ => return None,
                 }
-                if name.eq_ignore_ascii_case("min") {
-                    values[0].0 = values[0].0.min(value.0);
-                } else if name.eq_ignore_ascii_case("max") {
-                    values[0].0 = values[0].0.max(value.0);
-                } else if name.eq_ignore_ascii_case("clamp") && count < 3 {
-                    values[count] = value;
-                } else {
-                    return None;
+            }
+            let [(a, kind), (b, other), (c, last)] = args;
+            let same = kind == other;
+            let number = kind == Kind::Number;
+            return Some(match (name, count) {
+                ("" | "calc" | "min" | "max", _) => args[0],
+                ("hypot", _) => (a.abs(), kind),
+                ("clamp", 3) if same && kind == last => (a.max(b.min(c)), kind),
+                ("round", 1 | 2) => {
+                    let step = if count == 2 && same {
+                        b.abs()
+                    } else if count == 1 {
+                        1.
+                    } else {
+                        return None;
+                    };
+                    let value = a / step;
+                    let value = match strategy {
+                        "up" => value.ceil(),
+                        "down" => value.floor(),
+                        "to-zero" => value.trunc(),
+                        _ => (value + 0.5).floor(),
+                    };
+                    (value * step, kind)
                 }
-                count += 1;
-            }
-            if name.eq_ignore_ascii_case("clamp") {
-                if count != 3 {
-                    return None;
+                ("mod", 2) if same => (a - b * (a / b).floor(), kind),
+                ("rem", 2) if same => (a % b, kind),
+                ("abs", 1) => (a.abs(), kind),
+                ("sign", 1) => (f64::from(i8::from(a > 0.) - i8::from(a < 0.)), Kind::Number),
+                ("sin" | "cos" | "tan", 1) if kind != Kind::Length => {
+                    let radians = if number { a } else { a.to_radians() };
+                    let value = match name {
+                        "sin" => radians.sin(),
+                        "cos" => radians.cos(),
+                        _ => radians.tan(),
+                    };
+                    (value, Kind::Number)
                 }
-                values[0].0 = values[0].0.max(values[1].0.min(values[2].0));
-            }
-            if name.eq_ignore_ascii_case("round") {
-                values[0].0 = values[0].0.round();
-            }
-            return Some(values[0]);
+                ("asin", 1) if number => (a.asin().to_degrees(), Kind::Angle),
+                ("acos", 1) if number => (a.acos().to_degrees(), Kind::Angle),
+                ("atan", 1) if number => (a.atan().to_degrees(), Kind::Angle),
+                ("atan2", 2) if same => (a.atan2(b).to_degrees(), Kind::Angle),
+                ("pow", 2) if number && same => (a.powf(b), Kind::Number),
+                ("sqrt", 1) if number => (a.sqrt(), Kind::Number),
+                ("exp", 1) if number => (a.exp(), Kind::Number),
+                ("log", 1) if number => (a.ln(), Kind::Number),
+                ("log", 2) if number && same => (a.ln() / b.ln(), Kind::Number),
+                _ => return None,
+            })
+            .filter(|value| value.0.is_finite());
         }
         let bytes = self.rest.as_bytes();
         let mut end = usize::from(bytes.first().is_some_and(|b| matches!(b, b'+' | b'-')));
@@ -581,37 +830,47 @@ impl Math<'_> {
         let font = self.units.font;
         let root = self.units.root;
         let [vw, vh] = self.units.viewport;
-        let scale = match unit {
-            "" | "px" => 1.,
-            "%" => self.base / 100.,
-            "em" => font.em,
-            "rem" => root.em,
-            "ch" => font.ch,
-            "rch" => root.ch,
-            "ex" => font.ex,
-            "rex" => root.ex,
-            "cap" => font.cap,
-            "rcap" => root.cap,
-            "ic" => font.ic,
-            "ric" => root.ic,
-            "lh" => font.lh,
-            "rlh" => root.lh,
-            "vw" | "svw" | "lvw" | "dvw" | "vi" | "svi" | "lvi" | "dvi" => vw / 100.,
-            "vh" | "svh" | "lvh" | "dvh" | "vb" | "svb" | "lvb" | "dvb" => vh / 100.,
-            "cqw" | "cqi" => self.units.container.unwrap_or(self.units.viewport)[0] / 100.,
-            "cqh" | "cqb" => self.units.container.unwrap_or(self.units.viewport)[1] / 100.,
-            "vmin" | "svmin" | "lvmin" | "dvmin" => vw.min(vh) / 100.,
-            "vmax" | "svmax" | "lvmax" | "dvmax" => vw.max(vh) / 100.,
-            "in" => 96.,
-            "cm" => 96. / 2.54,
-            "mm" => 96. / 25.4,
-            "q" => 96. / 101.6,
-            "pt" => 96. / 72.,
-            "pc" => 16.,
-            _ => return None,
+        let (scale, kind) = match unit {
+            "" => (1., Kind::Number),
+            "deg" => (1., Kind::Angle),
+            "grad" => (0.9, Kind::Angle),
+            "rad" => (180. / std::f64::consts::PI, Kind::Angle),
+            "turn" => (360., Kind::Angle),
+            "%" => (f64::from(self.base) / 100., Kind::Length),
+            _ => {
+                let scale = match unit {
+                    "px" => 1.,
+                    "em" => font.em,
+                    "rem" => root.em,
+                    "ch" => font.ch,
+                    "rch" => root.ch,
+                    "ex" => font.ex,
+                    "rex" => root.ex,
+                    "cap" => font.cap,
+                    "rcap" => root.cap,
+                    "ic" => font.ic,
+                    "ric" => root.ic,
+                    "lh" => font.lh,
+                    "rlh" => root.lh,
+                    "vw" | "svw" | "lvw" | "dvw" | "vi" | "svi" | "lvi" | "dvi" => vw / 100.,
+                    "vh" | "svh" | "lvh" | "dvh" | "vb" | "svb" | "lvb" | "dvb" => vh / 100.,
+                    "cqw" | "cqi" => self.units.container.unwrap_or(self.units.viewport)[0] / 100.,
+                    "cqh" | "cqb" => self.units.container.unwrap_or(self.units.viewport)[1] / 100.,
+                    "vmin" | "svmin" | "lvmin" | "dvmin" => vw.min(vh) / 100.,
+                    "vmax" | "svmax" | "lvmax" | "dvmax" => vw.max(vh) / 100.,
+                    "in" => 96.,
+                    "cm" => 96. / 2.54,
+                    "mm" => 96. / 25.4,
+                    "q" => 96. / 101.6,
+                    "pt" => 96. / 72.,
+                    "pc" => 16.,
+                    _ => return None,
+                };
+                (f64::from(scale), Kind::Length)
+            }
         };
-        let value = value * f64::from(scale);
-        value.is_finite().then_some((value, !unit.is_empty()))
+        let value = value * scale;
+        value.is_finite().then_some((value, kind))
     }
 }
 
@@ -715,9 +974,51 @@ mod tests {
             ("calc(max(2em, 10px) + min(1rem, 20px))", 56.),
             ("clamp(1rem, calc(100% / 4), 20vw)", 100.),
             ("CALC(1PX + 2PX)", 3.),
+            ("round(33px, 10px)", 30.),
+            ("round(up, 31px, 10px)", 40.),
+            ("round(DOWN, 39px, 10px)", 30.),
+            ("round(to-zero, -39px, 10px)", -30.),
+            ("round(nearest, 15px, 10px)", 20.),
+            ("round(-2.5px)", -2.),
+            ("round(33%, 10px)", 130.),
+            ("calc(2px * round(1.5))", 4.),
+            ("abs(-5px)", 5.),
+            ("calc(sign(-3px) * 10px)", -10.),
+            ("calc(sign(0px) * 10px)", 0.),
+            ("mod(-7px, 3px)", 2.),
+            ("rem(-7px, 3px)", -1.),
+            ("calc(sin(30deg) * 100px)", 50.),
+            ("calc(cos(0.5turn) * 10px)", -10.),
+            ("calc(cos(200grad) * 10px)", -10.),
+            ("calc(sin(pi / 2) * 1px)", 1.),
+            ("calc(cos(acos(0.5)) * 2px)", 1.),
+            ("calc(10px * tan(atan2(1px, 1px)))", 10.),
+            ("calc(sin(asin(1)) * 1px)", 1.),
+            ("calc(cos(atan(0)) * 1px)", 1.),
+            ("calc(pow(2, 10) * 1px)", 1024.),
+            ("calc(sqrt(16) * 1px)", 4.),
+            ("hypot(3px, 4px)", 5.),
+            ("hypot(-3px)", 3.),
+            ("calc(log(e) * 1px)", 1.),
+            ("calc(log(8, 2) * 1px)", 3.),
+            ("calc(exp(0) * 1px)", 1.),
+            ("calc(1px / infinity)", 0.),
+            ("calc(-min(1px, 2px))", -1.),
+            ("max(1px, -min(-5px, -6px))", 6.),
+            ("clamp(1px, calc(abs(-2) * (1px + 1px)), 50px)", 4.),
         ] {
-            assert_eq!(units.resolve(source, 400.), Some(expected), "{source}");
+            let actual = units.resolve(source, 400.).unwrap_or(f32::NAN);
+            assert!((actual - expected).abs() < 1e-4, "{source}: {actual}");
         }
+        assert_eq!(units.parse("sin(30deg)", 0.).map(|v| v.1), Some(false));
+        assert_eq!(
+            units.parse("calc(e)", 0.).map(|v| v.0),
+            Some(std::f32::consts::E)
+        );
+        assert_eq!(
+            units.parse("calc(PI)", 0.).map(|v| v.0),
+            Some(std::f32::consts::PI)
+        );
         assert_eq!(units.parse("calc(6px / 2px)", 0.), Some((3., false)));
         assert_eq!(units.parse("calc(1 + .5)", 0.), Some((1.5, false)));
     }
@@ -758,6 +1059,29 @@ mod tests {
             "1.px",
             "(1px)",
             "calc(1e300 * 1e300)",
+            "round(33px, 0px)",
+            "round(33px, 10)",
+            "round(sideways, 33px, 10px)",
+            "mod(5px, 0px)",
+            "mod(5px, 2)",
+            "rem(1px)",
+            "abs(1px, 2px)",
+            "calc(asin(2) * 1px)",
+            "calc(sqrt(-1) * 1px)",
+            "calc(log(0) * 1px)",
+            "calc(pow(1px, 2) * 1px)",
+            "sin(1px)",
+            "calc(30deg)",
+            "calc(1px + 30deg)",
+            "calc(infinity * 1px)",
+            "calc(-infinity * 1px)",
+            "calc(NaN * 1px)",
+            "calc(1px * e)px",
+            "pi",
+            "e",
+            "calc(pow(10, 400) * 1px)",
+            "calc(exp(1000) * 1px)",
+            "hypot(1px, 2)",
         ] {
             assert_eq!(units.resolve(source, 100.), None, "{source}");
         }
@@ -768,6 +1092,193 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn media_queries_follow_level_4_grammar_and_serialize() {
+        let evaluate = |query: &str| {
+            let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
+            let [Rule::Media(queries, _)] = sheet.0.as_slice() else {
+                return None;
+            };
+            let matched = queries.is_empty()
+                || queries
+                    .iter()
+                    .any(|query| query.matches(800., 600., false, 0) == Some(true));
+            Some((matched, sheet.source()))
+        };
+        for (query, expected) in [
+            ("", true),
+            ("all", true),
+            ("screen", true),
+            ("print", false),
+            ("speech", false),
+            ("not print", true),
+            ("not screen", false),
+            ("NOT PRINT", true),
+            ("only screen and (min-width: 600px)", true),
+            ("screen and (max-width: 600px)", false),
+            ("not screen and (max-width: 600px)", true),
+            ("print and (min-width: 1px)", false),
+            ("not print and (min-width: 1px)", true),
+            ("print, (min-width: 600px)", true),
+            ("(MIN-WIDTH: 600PX)", true),
+            ("(width > 799px)", true),
+            ("(width > 800px)", false),
+            ("(width >= 800px)", true),
+            ("(width = 800px)", true),
+            ("(width: 800px)", true),
+            ("(800px <= width)", true),
+            ("(800px < width)", false),
+            ("(400px < width < 900px)", true),
+            ("(900px > width > 400px)", true),
+            ("(400px <= width <= 700px)", false),
+            ("(400px < width > 900px)", false),
+            ("(height < 600px)", false),
+            ("(height <= 600px)", true),
+            ("(width >= calc(40em + 1px))", true),
+            ("(min-width: calc(50em + 1px))", false),
+            ("(min-width: 0)", true),
+            ("(min-width: 600)", false),
+            ("(min-width: 50%)", false),
+            ("(orientation: landscape)", true),
+            ("(orientation: portrait)", false),
+            ("(min-orientation: portrait)", false),
+            ("(aspect-ratio: 4/3)", true),
+            ("(aspect-ratio: 8 / 6)", true),
+            ("(min-aspect-ratio: 16/9)", false),
+            ("(aspect-ratio > 1)", true),
+            ("(min-resolution: 1dppx)", true),
+            ("(resolution >= 2x)", false),
+            ("(max-resolution: 96dpi)", true),
+            ("(hover: hover)", true),
+            ("(hover: none)", false),
+            ("(any-hover: hover)", true),
+            ("(pointer: fine)", true),
+            ("(any-pointer: coarse)", false),
+            ("(pointer)", true),
+            ("(prefers-color-scheme: light)", true),
+            ("(prefers-color-scheme: dark)", false),
+            ("(prefers-reduced-motion: no-preference)", true),
+            ("(prefers-reduced-motion)", false),
+            ("(prefers-contrast: no-preference)", true),
+            ("(prefers-contrast)", false),
+            ("(prefers-reduced-transparency: reduce)", false),
+            ("(forced-colors: none)", true),
+            ("(forced-colors)", false),
+            ("(inverted-colors: none)", true),
+            ("(display-mode: standalone)", true),
+            ("(display-mode: browser)", false),
+            ("(color)", true),
+            ("(min-color: 8)", true),
+            ("(color-index)", false),
+            ("(monochrome)", false),
+            ("(monochrome: 0)", true),
+            ("(update: fast)", true),
+            ("(scripting: enabled)", true),
+            ("(dynamic-range: standard)", true),
+            ("(dynamic-range: high)", false),
+            ("(color-gamut: srgb)", true),
+            ("(color-gamut: p3)", false),
+            ("(min-width: 600px) and (max-width: 900px)", true),
+            ("(max-width: 600px) or (orientation: landscape)", true),
+            ("not (max-width: 600px)", true),
+            ("not ((min-width: 600px) and (max-width: 900px))", false),
+            (
+                "((min-width: 600px) or (max-width: 100px)) and (hover)",
+                true,
+            ),
+            ("(min-width: 1px) and (not (hover: none))", true),
+            ("not (not (hover))", true),
+            ("(unknown-feature)", false),
+            ("not (unknown-feature)", false),
+            ("(unknown-feature) or (min-width: 1px)", true),
+            ("(unknown-feature) and (min-width: 1px)", false),
+            ("foo(bar) or (hover)", true),
+            ("(prefers-color-scheme: blue)", false),
+            ("not (prefers-color-scheme: blue)", false),
+            ("(max-width: invalid)", false),
+            ("not (max-width: invalid)", false),
+            ("screen and (min-width: 1px) or (hover)", false),
+            ("(min-width: 1px) and (hover) or (pointer)", false),
+            ("not (hover) and (pointer)", false),
+            ("garbage!!", false),
+            ("screen, garbage!!", true),
+            ("not", false),
+            ("only", false),
+            ("and", false),
+            ("only (hover)", false),
+        ] {
+            let (matched, source) = evaluate(query).unwrap();
+            assert_eq!(matched, expected, "{query}");
+            let reparsed = source
+                .strip_prefix("@media ")
+                .and_then(|source| source.strip_suffix("{}"))
+                .unwrap();
+            assert_eq!(
+                evaluate(reparsed).unwrap().0,
+                expected,
+                "{query} -> {source}"
+            );
+        }
+        let deep = format!("{}(hover){}", "(".repeat(200), ")".repeat(200));
+        assert!(evaluate(&deep).is_none_or(|(matched, _)| !matched));
+    }
+
+    #[test]
+    fn supports_conditions_check_properties_values_and_selectors() {
+        let supported = |condition: &str| match Stylesheet::parse(&format!(
+            "@supports {condition} {{ a {{ color: red }} }}"
+        ))
+        .0
+        .as_slice()
+        {
+            [Rule::Supports(_, supported, _)] => Some(*supported),
+            _ => None,
+        };
+        for (condition, expected) in [
+            ("(display: flex)", Some(true)),
+            ("(display: inline-grid)", Some(true)),
+            ("(display: contents)", Some(true)),
+            ("(DISPLAY: FLEX)", Some(true)),
+            ("(display: nonsense)", Some(false)),
+            ("not (display: nonsense)", Some(true)),
+            ("(display: flex !important)", Some(true)),
+            ("(position: sticky)", Some(true)),
+            ("(gap: 1rem)", Some(true)),
+            ("(aspect-ratio: 16 / 9)", Some(true)),
+            ("(width: 1cqi)", Some(true)),
+            ("(width:)", Some(false)),
+            ("(color: color-mix(in lab, red, red))", Some(true)),
+            ("(color: rgb(from red r g b))", Some(true)),
+            ("(background-color: oklch(0.5 0.1 120))", Some(true)),
+            ("(color: nonsense)", Some(false)),
+            ("(color: var(--ink))", Some(true)),
+            ("(color: inherit)", Some(true)),
+            ("(--custom: anything)", Some(true)),
+            ("(margin-trim: inline)", Some(false)),
+            ("(-webkit-hyphens: none)", Some(false)),
+            ("(display: flex) and (gap: 1px)", Some(true)),
+            ("(display: flex) and (display: nonsense)", Some(false)),
+            ("(display: nonsense) or (display: grid)", Some(true)),
+            ("not ((display: nonsense) or (display: block))", Some(false)),
+            (
+                "((display: flex) and (not (display: nonsense)))",
+                Some(true),
+            ),
+            ("selector(a > b)", Some(true)),
+            ("not selector(a > b)", Some(false)),
+            ("font-tech(color-colrv1)", Some(false)),
+            ("not font-format(woff2)", Some(true)),
+            ("(foo bar)", Some(false)),
+            ("not (foo bar)", Some(true)),
+            ("display: flex", None),
+            ("(display: flex) and", None),
+            ("(a: b) and (c: d) or (e: f)", None),
+            ("not (a: b) and (c: d)", None),
+        ] {
+            assert_eq!(supported(condition), expected, "{condition}");
+        }
     }
 }
 

@@ -13,6 +13,161 @@ pub use colors::color;
 pub(crate) use css::{FontUnits, Lengths};
 
 pub type Style = BTreeMap<String, String>;
+
+const UA: &str = "
+html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option,caption,td,th{display:block}
+li{display:list-item}
+img,svg,canvas,video,audio,iframe,embed,object,input,button,select,textarea,progress,meter{display:inline-block}
+head,script,style,title,meta,link,template,noscript,datalist,base,[hidden],input[type=hidden],dialog:not([open]){display:none}
+slot{display:contents}
+body{margin:8px}
+p,dl,ul,ol,menu,pre{margin:1em 0}
+blockquote,figure{margin:1em 40px}
+ul ul,ul ol,ol ul,ol ol{margin:0}
+ul,ol,menu{padding-left:40px}
+ul,menu{list-style-type:disc}
+ol{list-style-type:decimal}
+ul ul,ol ul{list-style-type:circle}
+ul ul ul,ol ul ul,ul ol ul,ol ol ul{list-style-type:square}
+dd{margin-left:40px}
+h1{font-size:2em;margin:.67em 0;font-weight:bold}
+h2{font-size:1.5em;margin:.83em 0;font-weight:bold}
+h3{font-size:1.17em;margin:1em 0;font-weight:bold}
+h4{margin:1.33em 0;font-weight:bold}
+h5{font-size:.83em;margin:1.67em 0;font-weight:bold}
+h6{font-size:.67em;margin:2.33em 0;font-weight:bold}
+b,strong,th{font-weight:bolder}
+i,em,cite,var,dfn,address{font-style:italic}
+pre,code,kbd,samp,tt{font-family:monospace}
+pre,textarea{white-space:pre-wrap}
+pre{white-space:pre}
+small,sub,sup{font-size:smaller}
+big{font-size:larger}
+u,ins{text-decoration:underline}
+s,strike,del{text-decoration:line-through}
+abbr[title]{text-decoration:underline dotted}
+mark{background-color:#ff0;color:#000}
+a[href]{color:#0000ee;text-decoration:underline;cursor:pointer}
+center,th,caption{text-align:center}
+hr{margin:.5em 0;border:1px inset #a0a0a0;color:#a0a0a0}
+table{display:grid;width:fit-content;border-spacing:2px;text-indent:0}
+thead,tbody,tfoot,tr{display:contents}
+table:has(tr>:nth-child(2)){grid-template-columns:repeat(2,auto)}
+table:has(tr>:nth-child(3)){grid-template-columns:repeat(3,auto)}
+table:has(tr>:nth-child(4)){grid-template-columns:repeat(4,auto)}
+table:has(tr>:nth-child(5)){grid-template-columns:repeat(5,auto)}
+table:has(tr>:nth-child(6)){grid-template-columns:repeat(6,auto)}
+table:has(tr>:nth-child(7)){grid-template-columns:repeat(7,auto)}
+table:has(tr>:nth-child(8)){grid-template-columns:repeat(8,auto)}
+table:has(tr>:nth-child(9)){grid-template-columns:repeat(9,auto)}
+table:has(tr>:nth-child(10)){grid-template-columns:repeat(10,auto)}
+table:has(tr>:nth-child(11)){grid-template-columns:repeat(11,auto)}
+table:has(tr>:nth-child(12)){grid-template-columns:repeat(12,auto)}
+td[colspan='2'],th[colspan='2']{grid-column:span 2}
+td[rowspan='2'],th[rowspan='2']{grid-row:span 2}
+td[colspan='3'],th[colspan='3']{grid-column:span 3}
+td[rowspan='3'],th[rowspan='3']{grid-row:span 3}
+td[colspan='4'],th[colspan='4']{grid-column:span 4}
+td[rowspan='4'],th[rowspan='4']{grid-row:span 4}
+td[colspan='5'],th[colspan='5']{grid-column:span 5}
+td[rowspan='5'],th[rowspan='5']{grid-row:span 5}
+td[colspan='6'],th[colspan='6']{grid-column:span 6}
+td[rowspan='6'],th[rowspan='6']{grid-row:span 6}
+caption{grid-column:1/-1}
+table[border]{border:1px outset #808080}
+table[border] td,table[border] th{border:1px inset #808080}
+td,th{padding:1px}
+fieldset{margin:0 2px;padding:.35em .75em .625em;border:2px groove #c0c0c0}
+legend{padding:0 2px}
+summary{display:list-item;list-style-type:disclosure-closed}
+details[open]>summary{list-style-type:disclosure-open}
+details:not([open])>:not(summary){display:none}
+button,input,select,textarea{font-family:system-ui;font-size:13px;color:#000}
+button,select,meter,progress{user-select:none}
+button,select{padding:2px 8px;border:1px solid #c4c4c4;border-radius:5px;background-color:#f6f6f6}
+input,textarea{padding:2px 4px;border:1px solid #c4c4c4;border-radius:4px;background-color:#fff}
+input[type=checkbox],input[type=radio]{width:13px;height:13px;margin:3px;padding:0}
+input[type=radio]{border-radius:50%}
+input[type=button],input[type=submit],input[type=reset]{padding:2px 8px;border-radius:5px;background-color:#f6f6f6}
+summary{list-style-position:inside}
+apps-shadow-root{display:block}
+button:disabled,input:disabled,select:disabled,textarea:disabled{color:#a0a0a0}
+input:focus-visible,textarea:focus-visible{outline:3px solid #8fb8f4}
+progress,meter{width:10em;height:1em}
+iframe{border:2px inset #c0c0c0}
+q::before{content:open-quote}
+q::after{content:close-quote}
+";
+
+const PREFLIGHT: &str = "
+*,::before,::after{box-sizing:border-box;margin:0;padding:0;border:0 solid}
+html{line-height:1.5;font-family:ui-sans-serif,system-ui,sans-serif}
+h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}
+a{color:inherit;text-decoration:inherit}
+code,kbd,samp,pre{font-family:ui-monospace,monospace;font-size:1em}
+small{font-size:80%}
+ol,ul,menu{list-style:none}
+img,svg,video,canvas,audio,iframe,embed,object{display:block}
+img,video{max-width:100%;height:auto}
+button,input,select,optgroup,textarea{font:inherit;color:inherit;border-radius:0;background-color:transparent}
+hr{height:0;color:inherit;border-top-width:1px}
+";
+
+// WARNING: keep sorted; it is searched with binary_search.
+const INHERITED: &[&str] = &[
+    "-webkit-text-fill-color",
+    "accent-color",
+    "border-collapse",
+    "border-spacing",
+    "caret-color",
+    "color",
+    "color-scheme",
+    "cursor",
+    "direction",
+    "fill",
+    "fill-opacity",
+    "font-family",
+    "font-feature-settings",
+    "font-size",
+    "font-stretch",
+    "font-style",
+    "font-variant",
+    "font-variant-numeric",
+    "font-weight",
+    "hyphens",
+    "letter-spacing",
+    "line-height",
+    "list-style-image",
+    "list-style-position",
+    "list-style-type",
+    "overflow-wrap",
+    "pointer-events",
+    "quotes",
+    "stroke",
+    "stroke-opacity",
+    "stroke-width",
+    "tab-size",
+    "text-align",
+    "text-decoration-color",
+    "text-decoration-line",
+    "text-decoration-style",
+    "text-decoration-thickness",
+    "text-indent",
+    "text-shadow",
+    "text-transform",
+    "text-underline-offset",
+    "text-wrap",
+    "visibility",
+    "white-space",
+    "word-break",
+    "word-spacing",
+];
+
+thread_local! {
+    static DEFAULT_SHEETS: [Rc<Stylesheet>; 2] = [UA, PREFLIGHT].map(|source| Rc::new(Stylesheet::parse(source)));
+    pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, HashMap<String, gpui::SharedString>)> = Default::default();
+}
+
 #[derive(Clone)]
 struct StyleRef(Rc<Style>);
 
@@ -85,6 +240,8 @@ struct StyleScope {
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     matches: SelectorCache,
     nodes: Vec<Option<MatchedRules>>,
+    // WARNING: the selector memo is keyed by selector address, so variant selectors must live as long as `matches`.
+    variants: HashMap<String, Option<Rc<Selector>>>,
 }
 
 struct MatchedRules {
@@ -93,6 +250,7 @@ struct MatchedRules {
     dependencies: Vec<(usize, u64)>,
     rules: Vec<(usize, [usize; 3])>,
     pseudos: Vec<usize>,
+    classes: Option<String>,
 }
 
 #[derive(Default)]
@@ -121,31 +279,233 @@ pub(crate) struct Stylesheet(Vec<Rule>);
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 enum Rule {
     Style(SelectorList, Vec<Rule>),
-    Media(Vec<Vec<(MediaFeature, String)>>, Vec<Rule>),
+    Media(Vec<MediaQuery>, Vec<Rule>),
     Layer(Vec<String>, Vec<Rule>),
-    Supports(String, Vec<Rule>),
+    Supports(String, bool, Vec<Rule>),
     Declarations(Declarations),
     Theme(Declarations),
     Tailwind,
     Keyframes(String, Vec<(f32, Declarations)>),
 }
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
-enum MediaFeature {
-    MinWidth,
-    MaxWidth,
-    MinHeight,
-    MaxHeight,
-    Pointer,
-    Width,
-    Height,
-    ReducedMotion,
-    ColorScheme,
-    Contrast,
-    InvertedColors,
-    ReducedTransparency,
-    ForcedColors,
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+enum MediaQuery {
+    All,
+    Feature(String, String, String),
+    Unknown(String),
+    Not(Box<MediaQuery>),
+    And(Vec<MediaQuery>),
+    Or(Vec<MediaQuery>),
 }
+
+/// Properties that `@supports (name: value)` reports as supported. Empty values accept anything.
+const SUPPORTED_PROPERTIES: &[(&str, &[&str])] = &[
+    ("align-content", &[]),
+    ("align-items", &[]),
+    ("align-self", &[]),
+    ("animation", &[]),
+    ("animation-delay", &[]),
+    ("animation-direction", &[]),
+    ("animation-duration", &[]),
+    ("animation-fill-mode", &[]),
+    ("animation-iteration-count", &[]),
+    ("animation-name", &[]),
+    ("animation-play-state", &[]),
+    ("animation-timing-function", &[]),
+    ("aspect-ratio", &[]),
+    ("background", &[]),
+    ("background-color", &[]),
+    ("background-image", &[]),
+    ("background-position", &[]),
+    ("background-size", &[]),
+    ("border", &[]),
+    ("border-block", &[]),
+    ("border-bottom", &[]),
+    ("border-bottom-left-radius", &[]),
+    ("border-bottom-right-radius", &[]),
+    ("border-bottom-width", &[]),
+    ("border-color", &[]),
+    ("border-inline", &[]),
+    ("border-left", &[]),
+    ("border-left-width", &[]),
+    ("border-radius", &[]),
+    ("border-right", &[]),
+    ("border-right-width", &[]),
+    ("border-style", &[]),
+    ("border-top", &[]),
+    ("border-top-left-radius", &[]),
+    ("border-top-right-radius", &[]),
+    ("border-top-width", &[]),
+    ("border-width", &[]),
+    ("bottom", &[]),
+    ("box-shadow", &[]),
+    ("box-sizing", &["content-box", "border-box"]),
+    ("caret-color", &[]),
+    ("color", &[]),
+    ("color-scheme", &[]),
+    ("column-gap", &[]),
+    ("container-type", &[]),
+    ("content", &[]),
+    ("cursor", &[]),
+    ("direction", &["ltr", "rtl"]),
+    (
+        "display",
+        &[
+            "none",
+            "block",
+            "inline",
+            "inline-block",
+            "flex",
+            "inline-flex",
+            "grid",
+            "inline-grid",
+            "contents",
+            "list-item",
+            "flow-root",
+        ],
+    ),
+    ("fill", &[]),
+    ("fill-opacity", &[]),
+    ("fill-rule", &[]),
+    ("flex", &[]),
+    ("flex-basis", &[]),
+    ("flex-direction", &[]),
+    ("flex-flow", &[]),
+    ("flex-grow", &[]),
+    ("flex-shrink", &[]),
+    ("flex-wrap", &[]),
+    ("font", &[]),
+    ("font-family", &[]),
+    ("font-size", &[]),
+    ("font-style", &[]),
+    ("font-weight", &[]),
+    ("gap", &[]),
+    ("grid", &[]),
+    ("grid-area", &[]),
+    ("grid-auto-columns", &[]),
+    ("grid-auto-flow", &[]),
+    ("grid-auto-rows", &[]),
+    ("grid-column", &[]),
+    ("grid-row", &[]),
+    ("grid-template", &[]),
+    ("grid-template-areas", &[]),
+    ("grid-template-columns", &[]),
+    ("grid-template-rows", &[]),
+    ("height", &[]),
+    ("inline-size", &[]),
+    ("inset", &[]),
+    ("inset-block", &[]),
+    ("inset-inline", &[]),
+    ("isolation", &["auto", "isolate"]),
+    ("justify-content", &[]),
+    ("left", &[]),
+    ("line-height", &[]),
+    ("margin", &[]),
+    ("margin-block", &[]),
+    ("margin-bottom", &[]),
+    ("margin-inline", &[]),
+    ("margin-left", &[]),
+    ("margin-right", &[]),
+    ("margin-top", &[]),
+    ("max-height", &[]),
+    ("max-width", &[]),
+    ("min-height", &[]),
+    ("min-width", &[]),
+    ("opacity", &[]),
+    ("overflow", &[]),
+    ("overflow-x", &[]),
+    ("overflow-y", &[]),
+    ("padding", &[]),
+    ("padding-block", &[]),
+    ("padding-bottom", &[]),
+    ("padding-inline", &[]),
+    ("padding-left", &[]),
+    ("padding-right", &[]),
+    ("padding-top", &[]),
+    ("pointer-events", &[]),
+    (
+        "position",
+        &["static", "relative", "absolute", "fixed", "sticky"],
+    ),
+    ("right", &[]),
+    ("row-gap", &[]),
+    ("stroke", &[]),
+    ("stroke-linecap", &[]),
+    ("stroke-linejoin", &[]),
+    ("stroke-opacity", &[]),
+    ("stroke-width", &[]),
+    ("text-align", &[]),
+    ("top", &[]),
+    ("transform", &[]),
+    ("translate", &[]),
+    ("user-select", &[]),
+    ("visibility", &["visible", "hidden", "collapse"]),
+    ("white-space", &[]),
+    ("width", &[]),
+    ("z-index", &[]),
+    ("accent-color", &[]),
+    ("all", &[]),
+    ("background-clip", &[]),
+    ("background-repeat", &[]),
+    ("block-size", &[]),
+    ("border-block-color", &[]),
+    ("border-block-style", &[]),
+    ("border-block-width", &[]),
+    ("border-bottom-color", &[]),
+    ("border-bottom-style", &[]),
+    ("border-collapse", &[]),
+    ("border-inline-color", &[]),
+    ("border-inline-style", &[]),
+    ("border-inline-width", &[]),
+    ("border-left-color", &[]),
+    ("border-left-style", &[]),
+    ("border-right-color", &[]),
+    ("border-right-style", &[]),
+    ("border-spacing", &[]),
+    ("border-top-color", &[]),
+    ("border-top-style", &[]),
+    ("font-variant", &[]),
+    ("inset-block-end", &[]),
+    ("inset-block-start", &[]),
+    ("inset-inline-end", &[]),
+    ("inset-inline-start", &[]),
+    ("justify-items", &[]),
+    ("justify-self", &[]),
+    ("line-clamp", &[]),
+    ("-webkit-line-clamp", &[]),
+    ("list-style", &[]),
+    ("list-style-position", &[]),
+    ("list-style-type", &[]),
+    ("margin-block-end", &[]),
+    ("margin-block-start", &[]),
+    ("margin-inline-end", &[]),
+    ("margin-inline-start", &[]),
+    ("max-block-size", &[]),
+    ("max-inline-size", &[]),
+    ("min-block-size", &[]),
+    ("min-inline-size", &[]),
+    ("object-fit", &[]),
+    ("order", &[]),
+    ("outline", &[]),
+    ("outline-color", &[]),
+    ("outline-offset", &[]),
+    ("outline-style", &[]),
+    ("outline-width", &[]),
+    ("padding-block-end", &[]),
+    ("padding-block-start", &[]),
+    ("padding-inline-end", &[]),
+    ("padding-inline-start", &[]),
+    ("place-content", &[]),
+    ("place-items", &[]),
+    ("place-self", &[]),
+    ("text-decoration", &[]),
+    ("text-decoration-color", &[]),
+    ("text-decoration-line", &[]),
+    ("text-decoration-style", &[]),
+    ("text-overflow", &[]),
+    ("text-transform", &[]),
+    ("-webkit-text-fill-color", &[]),
+];
 
 pub(crate) fn reduced_motion() -> bool {
     #[cfg(target_os = "macos")]
@@ -161,61 +521,172 @@ pub(crate) fn reduced_motion() -> bool {
     }
 }
 
-impl MediaFeature {
-    fn matches(
-        self,
-        value: &str,
-        width: f32,
-        height: f32,
-        reduced_motion: bool,
-        theme: u32,
-    ) -> bool {
-        match self {
-            Self::ColorScheme => return value == if theme & 1 != 0 { "dark" } else { "light" },
-            Self::Contrast => {
-                return value
-                    == if theme & 2 != 0 {
+impl MediaQuery {
+    /// Kleene logic: `None` is unknown and only `Some(true)` matches.
+    fn matches(&self, width: f32, height: f32, reduced_motion: bool, theme: u32) -> Option<bool> {
+        let (name, op, value) = match self {
+            Self::All => return Some(true),
+            Self::Unknown(_) => return None,
+            Self::Not(query) => {
+                return query
+                    .matches(width, height, reduced_motion, theme)
+                    .map(|v| !v);
+            }
+            Self::And(queries) | Self::Or(queries) => {
+                let and = matches!(self, Self::And(_));
+                let mut result = Some(and);
+                for query in queries {
+                    match query.matches(width, height, reduced_motion, theme) {
+                        Some(value) if value != and => return Some(value),
+                        None => result = None,
+                        _ => {}
+                    }
+                }
+                return result;
+            }
+            Self::Feature(name, op, value) => (name.as_str(), op.as_str(), value.as_str()),
+        };
+        let keyword = |values: &[&str], current: &str| match op {
+            "" => Some(!matches!(current, "none" | "no-preference")),
+            ":" if values.contains(&value) => Some(value == current),
+            _ => None,
+        };
+        let actual = match name {
+            "orientation" => {
+                return keyword(
+                    &["portrait", "landscape"],
+                    if height >= width {
+                        "portrait"
+                    } else {
+                        "landscape"
+                    },
+                );
+            }
+            "hover" | "any-hover" => return keyword(&["none", "hover"], "hover"),
+            "pointer" | "any-pointer" => return keyword(&["none", "coarse", "fine"], "fine"),
+            "prefers-color-scheme" => {
+                return keyword(
+                    &["light", "dark"],
+                    if theme & 1 != 0 { "dark" } else { "light" },
+                );
+            }
+            "prefers-contrast" => {
+                return keyword(
+                    &["no-preference", "more", "less", "custom"],
+                    if theme & 2 != 0 {
                         "more"
                     } else {
                         "no-preference"
-                    };
+                    },
+                );
             }
-            Self::InvertedColors => {
-                return value == if theme & 4 != 0 { "inverted" } else { "none" };
+            "inverted-colors" => {
+                return keyword(
+                    &["none", "inverted"],
+                    if theme & 4 != 0 { "inverted" } else { "none" },
+                );
             }
-            Self::ReducedTransparency => {
-                return value
-                    == if theme & 8 != 0 {
+            "prefers-reduced-transparency" => {
+                return keyword(
+                    &["no-preference", "reduce"],
+                    if theme & 8 != 0 {
                         "reduce"
                     } else {
                         "no-preference"
-                    };
+                    },
+                );
             }
-            Self::ForcedColors => return value == "none",
-            _ => {}
-        }
-        if matches!(self, Self::Pointer) {
-            return value == "fine";
-        }
-        if matches!(self, Self::ReducedMotion) {
-            return value
-                == if reduced_motion {
-                    "reduce"
-                } else {
-                    "no-preference"
-                };
-        }
-        let Some(boundary) = Lengths::new(16., width, height).resolve(value, width) else {
-            return false;
+            "prefers-reduced-motion" => {
+                return keyword(
+                    &["no-preference", "reduce"],
+                    if reduced_motion {
+                        "reduce"
+                    } else {
+                        "no-preference"
+                    },
+                );
+            }
+            "forced-colors" => return keyword(&["none", "active"], "none"),
+            "display-mode" => {
+                return keyword(
+                    &[
+                        "browser",
+                        "fullscreen",
+                        "minimal-ui",
+                        "picture-in-picture",
+                        "standalone",
+                        "window-controls-overlay",
+                    ],
+                    "standalone",
+                );
+            }
+            "update" => return keyword(&["none", "slow", "fast"], "fast"),
+            "scripting" => return keyword(&["none", "initial-only", "enabled"], "enabled"),
+            "dynamic-range" | "video-dynamic-range" => {
+                return keyword(&["standard", "high"], "standard");
+            }
+            "color-gamut" => return keyword(&["srgb", "p3", "rec2020"], "srgb"),
+            "width" => f64::from(width),
+            "height" => f64::from(height),
+            "aspect-ratio" => f64::from(width) / f64::from(height),
+            "resolution" => 1.,
+            "color" => 8.,
+            "color-index" | "monochrome" => 0.,
+            _ => return None,
+        };
+        let boundary = match name {
+            _ if op.is_empty() => return Some(actual != 0.),
+            // NaN base rejects percentages.
+            "width" | "height" => {
+                f64::from(Lengths::new(16., width, height).resolve(value, f32::NAN)?)
+            }
+            "aspect-ratio" => {
+                let (a, b) = value.split_once('/').unwrap_or((value, "1"));
+                let (a, b) = (a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?);
+                (a >= 0. && b > 0.).then_some(a / b)?
+            }
+            "resolution" => {
+                let number = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+                number.parse::<f64>().ok()?
+                    / match &value[number.len()..] {
+                        "dppx" | "x" => 1.,
+                        "dpi" => 96.,
+                        "dpcm" => 96. / 2.54,
+                        _ => return None,
+                    }
+            }
+            _ => value.parse().ok()?,
+        };
+        let ordering = actual.partial_cmp(&boundary)?;
+        Some(match op {
+            ":" | "=" => ordering.is_eq(),
+            "<" => ordering.is_lt(),
+            "<=" => ordering.is_le(),
+            ">" => ordering.is_gt(),
+            ">=" => ordering.is_ge(),
+            _ => return None,
+        })
+    }
+
+    fn source(&self) -> String {
+        let group = |query: &Self| match query {
+            Self::Not(_) | Self::And(_) | Self::Or(_) => format!("({})", query.source()),
+            _ => query.source(),
         };
         match self {
-            Self::MinWidth => width >= boundary,
-            Self::MaxWidth => width <= boundary,
-            Self::MinHeight => height >= boundary,
-            Self::MaxHeight => height <= boundary,
-            Self::Width => width == boundary,
-            Self::Height => height == boundary,
-            _ => unreachable!(),
+            Self::All => "all".into(),
+            Self::Unknown(text) => text.clone(),
+            Self::Feature(name, op, value) => format!("({name}{op}{value})"),
+            Self::Not(query) => format!("not {}", group(query)),
+            Self::And(queries) | Self::Or(queries) => {
+                queries.iter().map(group).collect::<Vec<_>>().join(
+                    if matches!(self, Self::And(_)) {
+                        " and "
+                    } else {
+                        " or "
+                    },
+                )
+            }
         }
     }
 }
@@ -226,7 +697,8 @@ struct Collect<'a> {
     reduced_motion: bool,
     native_theme: u32,
     rules: Vec<(&'a SelectorList, &'a Declarations, i32)>,
-    layers: Vec<String>,
+    /// Full layer names with their path rank: 10 bits per level, siblings in first-seen order.
+    layers: Vec<(String, i32)>,
     tailwind: bool,
     theme: Style,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
@@ -243,7 +715,9 @@ impl Rule {
                     child.bind_parent(Some(selectors))?;
                 }
             }
-            Self::Media(_, children) | Self::Layer(_, children) | Self::Supports(_, children) => {
+            Self::Media(_, children)
+            | Self::Layer(_, children)
+            | Self::Supports(_, _, children) => {
                 for child in children {
                     child.bind_parent(parent)?;
                 }
@@ -262,15 +736,15 @@ impl Rule {
         match self {
             Self::Declarations(values) => {
                 if let Some(parent) = parent {
-                    collected.rules.push((
-                        parent,
-                        values,
-                        collected
-                            .layers
-                            .iter()
-                            .position(|name| name == layer)
-                            .map_or(i32::MAX, |n| n as i32),
-                    ));
+                    let rank = collected
+                        .layers
+                        .iter()
+                        .find(|(name, _)| name == layer)
+                        .map_or(i32::MAX, |(name, rank)| match name.matches('.').count() {
+                            depth @ 0..2 => rank | 1023 << (10 * (1 - depth)),
+                            _ => *rank,
+                        });
+                    collected.rules.push((parent, values, rank));
                 }
             }
             Self::Theme(values) => {
@@ -301,47 +775,56 @@ impl Rule {
                     } else {
                         format!("{layer}.{name}")
                     };
-                    if !collected.layers.contains(&name) {
-                        collected.layers.push(name.clone());
+                    let mut rank = 0;
+                    for (depth, (end, _)) in name
+                        .match_indices('.')
+                        .chain([(name.len(), "")])
+                        .enumerate()
+                    {
+                        let path = &name[..end];
+                        let owner = path.rsplit_once('.').map_or("", |(owner, _)| owner);
+                        rank = match collected.layers.iter().find(|(name, _)| name == path) {
+                            Some((_, rank)) => *rank,
+                            None => {
+                                let siblings = collected
+                                    .layers
+                                    .iter()
+                                    .filter(|(name, _)| {
+                                        name.rsplit_once('.').map_or("", |(owner, _)| owner)
+                                            == owner
+                                    })
+                                    .count();
+                                if depth < 3 {
+                                    rank |= (siblings as i32 + 1).min(1022) << (10 * (2 - depth));
+                                }
+                                collected.layers.push((path.to_owned(), rank));
+                                rank
+                            }
+                        };
                     }
                     for rule in children {
                         rule.collect(parent, &name, collected);
                     }
                 }
             }
-            Self::Supports(condition, children) => {
-                let condition = condition.trim().trim_matches(['(', ')']);
-                let supported =
-                    condition
-                        .split_once(':')
-                        .is_some_and(|(name, value)| match name.trim() {
-                            "display" => matches!(value.trim(), "grid" | "flex" | "block"),
-                            "width" => {
-                                value.trim() == "1cqi"
-                                    || Lengths::new(16., collected.width, collected.height)
-                                        .resolve(value.trim(), collected.width)
-                                        .is_some()
-                            }
-                            _ => false,
-                        });
-                if supported {
+            Self::Supports(_, supported, children) => {
+                if *supported {
                     for rule in children {
                         rule.collect(parent, layer, collected);
                     }
                 }
             }
             Self::Media(queries, children) => {
-                if queries.iter().any(|query| {
-                    query.iter().all(|(feature, value)| {
-                        feature.matches(
-                            value,
+                if queries.is_empty()
+                    || queries.iter().any(|query| {
+                        query.matches(
                             collected.width,
                             collected.height,
                             collected.reduced_motion,
                             collected.native_theme,
-                        )
+                        ) == Some(true)
                     })
-                }) {
+                {
                     for rule in children {
                         rule.collect(parent, layer, collected);
                     }
@@ -364,7 +847,7 @@ impl Rule {
                     )
                 }
             }
-            Self::Supports(condition, children) => format!(
+            Self::Supports(condition, _, children) => format!(
                 "@supports {condition}{{{}}}",
                 children.iter().map(Self::source).collect::<String>()
             ),
@@ -390,35 +873,7 @@ impl Rule {
                 "@media {}{{{}}}",
                 queries
                     .iter()
-                    .map(|query| {
-                        if query.is_empty() {
-                            return "all".into();
-                        }
-                        query
-                            .iter()
-                            .map(|(feature, value)| {
-                                let key = match feature {
-                                    MediaFeature::MinWidth => "min-width",
-                                    MediaFeature::MaxWidth => "max-width",
-                                    MediaFeature::MinHeight => "min-height",
-                                    MediaFeature::MaxHeight => "max-height",
-                                    MediaFeature::Pointer => "pointer",
-                                    MediaFeature::Width => "width",
-                                    MediaFeature::Height => "height",
-                                    MediaFeature::ReducedMotion => "prefers-reduced-motion",
-                                    MediaFeature::ColorScheme => "prefers-color-scheme",
-                                    MediaFeature::Contrast => "prefers-contrast",
-                                    MediaFeature::InvertedColors => "inverted-colors",
-                                    MediaFeature::ReducedTransparency => {
-                                        "prefers-reduced-transparency"
-                                    }
-                                    MediaFeature::ForcedColors => "forced-colors",
-                                };
-                                format!("({key}:{value})")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" and ")
-                    })
+                    .map(MediaQuery::source)
                     .collect::<Vec<_>>()
                     .join(","),
                 children.iter().map(Self::source).collect::<String>(),
@@ -482,6 +937,20 @@ pub(crate) fn compute_styles(
 ) -> ComputedStyles {
     let reduced_motion = reduced_motion();
     let native_theme = crate::browser::theme_state();
+    let defaults = DEFAULT_SHEETS.with(Clone::clone);
+    if let Some(text) = text_system {
+        FONT_NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            if names.0.is_empty() {
+                names.1.clear();
+                names.0 = text
+                    .all_font_names()
+                    .into_iter()
+                    .map(|name| (name.to_ascii_lowercase(), name))
+                    .collect();
+            }
+        });
+    }
     let mut collected = Collect {
         width,
         height,
@@ -546,6 +1015,21 @@ pub(crate) fn compute_styles(
                     rule.collect(None, "", &mut collected);
                 }
             }
+            let author = std::mem::take(&mut collected.rules);
+            for (index, sheet) in defaults
+                .iter()
+                .take(1 + usize::from(collected.tailwind))
+                .enumerate()
+            {
+                let start = collected.rules.len();
+                for rule in &sheet.0 {
+                    rule.collect(None, "", &mut collected);
+                }
+                for rule in &mut collected.rules[start..] {
+                    rule.2 = i32::MIN + 1 + index as i32;
+                }
+            }
+            collected.rules.extend(author);
             let Collect {
                 rules,
                 tailwind,
@@ -593,6 +1077,7 @@ pub(crate) fn compute_styles(
                 keyframes,
                 matches: SelectorCache::default(),
                 nodes: Vec::new(),
+                variants: HashMap::new(),
             });
             style_cache.scopes.len() - 1
         });
@@ -615,13 +1100,18 @@ pub(crate) fn compute_styles(
         .elements
         .iter()
         .zip(rules)
-        .map(|(indices, (selectors, ..))| indices.iter().map(|&index| &selectors[index]).collect())
+        .map(|(indices, (selectors, ..))| {
+            indices
+                .iter()
+                .map(|&index| (&selectors[index], selectors[index].key()))
+                .collect()
+        })
         .collect();
     let mut buckets: HashMap<(u8, &str), Vec<usize>> = HashMap::new();
     let mut universal = Vec::new();
     for (index, selectors) in element_selectors.iter().enumerate() {
-        for selector in selectors {
-            match selector.key() {
+        for (_, key) in selectors {
+            match *key {
                 Some(key) => buckets.entry(key).or_default().push(index),
                 None => universal.push(index),
             }
@@ -633,9 +1123,63 @@ pub(crate) fn compute_styles(
         for &id in &order {
             if let Some(classes) = doc.nodes[id].attrs.get("class") {
                 for class in classes.split_ascii_whitespace() {
-                    utilities
-                        .entry(class)
-                        .or_insert_with(|| crate::tailwind::utility(class, width, &theme));
+                    utilities.entry(class).or_insert_with(|| {
+                        let (mut own, mut group, mut rest, mut dark) =
+                            (String::new(), String::new(), Vec::new(), false);
+                        let mut segments: Vec<&str> = class.split(':').collect();
+                        let utility = segments.pop().unwrap_or(class);
+                        for variant in segments {
+                            let (target, name) = match variant.strip_prefix("group-") {
+                                Some(name) => (&mut group, name),
+                                None => (&mut own, variant),
+                            };
+                            let pseudo = match name {
+                                "hover" | "focus" | "focus-visible" | "focus-within" | "active"
+                                | "visited" | "disabled" | "enabled" | "checked" | "required"
+                                | "optional" | "invalid" | "valid" | "placeholder-shown"
+                                | "read-only" | "empty" | "first-of-type" | "last-of-type"
+                                | "open" | "indeterminate" => format!(":{name}"),
+                                "first" | "last" | "only" => format!(":{name}-child"),
+                                "odd" | "even" => format!(":nth-child({name})"),
+                                "dark" if target.is_empty() && group.is_empty() => {
+                                    dark = true;
+                                    continue;
+                                }
+                                _ => {
+                                    rest.push(variant);
+                                    continue;
+                                }
+                            };
+                            target.push_str(&pseudo);
+                        }
+                        rest.push(utility);
+                        let selector = scoped
+                            .variants
+                            .entry(class.to_owned())
+                            .or_insert_with(|| {
+                                (!own.is_empty() || !group.is_empty())
+                                    .then(|| {
+                                        Selector::parse(
+                                            &if group.is_empty() {
+                                                format!("*{own}")
+                                            } else {
+                                                format!(".group{group} *{own}")
+                                            },
+                                            None,
+                                        )
+                                        .pop()
+                                    })
+                                    .flatten()
+                                    .map(Rc::new)
+                            })
+                            .clone();
+                        let values = if dark && native_theme & 1 == 0 {
+                            None
+                        } else {
+                            crate::tailwind::utility(&rest.join(":"), width, &theme)
+                        };
+                        (selector, values)
+                    });
                 }
             }
         }
@@ -692,10 +1236,14 @@ pub(crate) fn compute_styles(
             })
             .map(|cached| cached.value.clone())
             .or_else(|| {
-                let (matched, matched_pseudos) = if let Some(cached) = &scoped.nodes[id]
+                let (matched, matched_pseudos, classes) = if let Some(cached) = &scoped.nodes[id]
                     && matches.valid_since(&cached.dependencies, &cached.checked)
                 {
-                    (cached.rules.clone(), cached.pseudos.clone())
+                    (
+                        cached.rules.clone(),
+                        cached.pseudos.clone(),
+                        cached.classes.clone(),
+                    )
                 } else {
                     matches.dependencies.clear();
                     matches.depend(id, 0);
@@ -718,13 +1266,24 @@ pub(crate) fn compute_styles(
                         candidates.sort_unstable();
                         candidates.dedup();
                     }
+                    let has = |key: Option<(u8, &str)>| match key {
+                        Some((0, value)) => node.attrs.get("id").is_some_and(|id| id == value),
+                        Some((1, value)) => node.attrs.get("class").is_some_and(|classes| {
+                            classes.split_ascii_whitespace().any(|class| class == value)
+                        }),
+                        Some((2, value)) => node.tag == value,
+                        Some((3, name)) => node.attrs.contains_key(name),
+                        _ => true,
+                    };
                     let matched: Vec<_> = candidates
                         .iter()
                         .filter_map(|&order| {
                             element_selectors[order]
                                 .iter()
-                                .filter(|selector| selector.matches_reusing(doc, id, matches))
-                                .map(|selector| selector.specificity)
+                                .filter(|(selector, key)| {
+                                    has(*key) && selector.matches_reusing(doc, id, matches)
+                                })
+                                .map(|(selector, _)| selector.specificity)
                                 .max()
                                 .map(|specificity| (order, specificity))
                         })
@@ -736,26 +1295,27 @@ pub(crate) fn compute_styles(
                             .iter()
                             .enumerate()
                             .filter_map(|(index, (_, selector, ..))| {
-                                let candidate = match selector.key() {
-                                    Some((0, value)) => {
-                                        node.attrs.get("id").is_some_and(|id| id == value)
-                                    }
-                                    Some((1, value)) => {
-                                        node.attrs.get("class").is_some_and(|classes| {
-                                            classes
-                                                .split_ascii_whitespace()
-                                                .any(|class| class == value)
-                                        })
-                                    }
-                                    Some((2, value)) => node.tag == value,
-                                    Some((3, name)) => node.attrs.contains_key(name),
-                                    _ => true,
-                                };
-                                (candidate && selector.matches_reusing(doc, id, matches))
+                                (has(selector.key()) && selector.matches_reusing(doc, id, matches))
                                     .then_some(index)
                             })
                             .collect()
                     };
+                    let classes =
+                        tailwind
+                            .then(|| node.attrs.get("class"))
+                            .flatten()
+                            .map(|classes| {
+                                classes
+                                    .split_ascii_whitespace()
+                                    .filter(|class| match utilities.get(class) {
+                                        Some((Some(selector), _)) => {
+                                            selector.matches_reusing(doc, id, matches)
+                                        }
+                                        _ => true,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            });
                     matches.dependencies.sort_unstable();
                     matches.dependencies.dedup();
                     scoped.nodes[id] = Some(MatchedRules {
@@ -764,13 +1324,14 @@ pub(crate) fn compute_styles(
                         dependencies: std::mem::take(&mut matches.dependencies),
                         rules: matched.clone(),
                         pseudos: matched_pseudos.clone(),
+                        classes: classes.clone(),
                     });
-                    (matched, matched_pseudos)
+                    (matched, matched_pseudos, classes)
                 };
                 let resolved = StyleKey {
                     scope,
                     tag: node.tag.clone(),
-                    classes: tailwind.then(|| node.attrs.get("class").cloned()).flatten(),
+                    classes,
                     inline: node
                         .inline
                         .as_ref()
@@ -820,61 +1381,20 @@ pub(crate) fn compute_styles(
         if let Some(parent) = parent_style {
             let leaf = matches!(node.tag.as_str(), "#text" | "#comment");
             for (key, value) in parent.iter() {
-                if key.starts_with("--") && !leaf
-                    || matches!(
-                        key.as_str(),
-                        "color"
-                            | "font-size"
-                            | "font-family"
-                            | "font-weight"
-                            | "line-height"
-                            | "text-align"
-                            | "white-space"
-                            | "color-scheme"
-                            | "fill"
-                            | "pointer-events"
-                            | "caret-color"
-                            | "cursor"
-                            | "visibility"
-                    )
+                if key.starts_with("--") && !leaf || INHERITED.binary_search(&key.as_str()).is_ok()
                 {
                     style.insert(key.clone(), value.clone());
                 }
             }
         }
-        style.entry("font-size".into()).or_insert("16px".into());
-        style.entry("color".into()).or_insert("#171717".into());
-        if matches!(node.tag.as_str(), "button" | "meter" | "progress" | "select") {
-            style.insert("user-select".into(), "none".into());
-        }
-        if node.tag == "slot" {
-            style.insert("display".into(), "contents".into());
-        }
-        if !tailwind && node.tag == "body" {
-            style.insert("margin".into(), "8px".into());
-        }
-        if matches!(
-            node.tag.as_str(),
-            "head" | "script" | "style" | "title" | "meta" | "link"
-        ) {
-            style.insert("display".into(), "none".into());
-        }
-        if !tailwind && node.tag == "h1" {
-            style.insert("font-size".into(), "32px".into());
-            style.insert("margin".into(), "20px 0".into());
-        }
-        if !tailwind && node.tag == "h2" {
-            style.insert("font-size".into(), "24px".into());
-            style.insert("margin".into(), "16px 0".into());
-        }
-        if !tailwind && node.tag == "p" {
-            style.insert("margin".into(), "12px 0".into());
-        }
-        if tailwind && let Some(classes) = node.attrs.get("class") {
+        let mut cascade: BTreeMap<Cow<str>, (CascadeRank, Cow<str>)> = BTreeMap::new();
+        if let Some(classes) = &key.classes {
             let mut matched: Vec<_> = classes
                 .split_ascii_whitespace()
                 .filter_map(|class| {
-                    utilities[class]
+                    utilities
+                        .get(class)?
+                        .1
                         .as_ref()
                         .map(|(breakpoint, values)| (class, *breakpoint, values))
                 })
@@ -882,13 +1402,25 @@ pub(crate) fn compute_styles(
             matched.sort_unstable_by_key(|(class, breakpoint, values)| {
                 (*breakpoint, Reverse(values.len()), *class)
             });
-            for (_, _, values) in matched {
-                for (key, value) in values {
-                    style.insert(key.clone(), value.clone());
-                }
+            let mut values = Style::new();
+            for (_, _, utility) in matched {
+                values.extend(
+                    utility
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            }
+            for (key, value) in Declarations(
+                values
+                    .into_iter()
+                    .map(|(key, value)| Declaration::Property(key, value))
+                    .collect(),
+            )
+            .resolve(None, width)
+            {
+                cascade.insert(key.into(), ((false, i32::MIN + 3, [0; 4], 0), value.into()));
             }
         }
-        let mut cascade: BTreeMap<String, (CascadeRank, String)> = BTreeMap::new();
         for &(order, [ids, classes, tags]) in &key.rules {
             let (_, declarations, layer) = &rules[order];
             for (key, value) in declarations {
@@ -899,9 +1431,12 @@ pub(crate) fn compute_styles(
                     [0, ids, classes, tags],
                     order,
                 );
-                if cascade.get(key).is_none_or(|(old, _)| rank >= *old) {
+                if cascade
+                    .get(key.as_str())
+                    .is_none_or(|(old, _)| rank >= *old)
+                {
                     cascade.insert(
-                        key.clone(),
+                        key.as_str().into(),
                         (rank, value.trim_end_matches("!important").trim().into()),
                     );
                 }
@@ -920,10 +1455,20 @@ pub(crate) fn compute_styles(
                     [1, 0, 0, 0],
                     rules.len(),
                 );
-                if cascade.get(&key).is_none_or(|(old, _)| rank >= *old) {
+                if cascade
+                    .get(key.as_str())
+                    .is_none_or(|(old, _)| rank >= *old)
+                {
                     cascade.insert(
-                        key,
-                        (rank, value.trim_end_matches("!important").trim().into()),
+                        key.into(),
+                        (
+                            rank,
+                            value
+                                .trim_end_matches("!important")
+                                .trim()
+                                .to_owned()
+                                .into(),
+                        ),
                     );
                 }
             }
@@ -931,9 +1476,15 @@ pub(crate) fn compute_styles(
         if let Some(declarations) = context.and_then(|context| context.hosts.get(&id)) {
             for (key, value) in declarations {
                 let important = value.ends_with("!important");
-                if important || !cascade.contains_key(key) {
+                if important
+                    || cascade
+                        .get(key.as_str())
+                        .is_none_or(|((important, layer, ..), _)| {
+                            !important && *layer <= i32::MIN + 2
+                        })
+                {
                     cascade.insert(
-                        key.clone(),
+                        key.as_str().into(),
                         (
                             (important, 0, [0; 4], 0),
                             value.trim_end_matches("!important").trim().into(),
@@ -945,29 +1496,125 @@ pub(crate) fn compute_styles(
         if node.tag == "apps-shadow-root" {
             for (key, (rank, value)) in &cascade {
                 host_declarations.insert(
-                    key.clone(),
+                    key.to_string(),
                     if rank.0 {
                         format!("{value}!important")
                     } else {
-                        value.clone()
+                        value.to_string()
                     },
                 );
             }
         }
+        if let Some((rank, value)) = cascade.remove("all") {
+            for key in style.keys().filter(|key| !key.starts_with("--")) {
+                cascade
+                    .entry(key.clone().into())
+                    .or_insert((rank, value.clone()));
+            }
+            for (key, entry) in &mut cascade {
+                if entry.0 < rank && !key.starts_with("--") {
+                    *entry = (rank, value.clone());
+                }
+            }
+        }
+        let explicit_size = cascade.contains_key("font-size");
         for (key, (_, value)) in cascade {
-            style.insert(key, value);
+            style.insert(key.into_owned(), value.into_owned());
         }
         resolve_style(&mut style, parent_style.map(Rc::as_ref));
+        resolve_keywords(&mut style, parent_style.map(Rc::as_ref));
+        if style
+            .get("background-clip")
+            .is_some_and(|value| value.contains("text"))
+            && let Some(ink) = style.remove("background-image").and_then(|image| {
+                let body = image.split_once('(')?.1.to_owned();
+                components(&body, ',').into_iter().find_map(|part| {
+                    components(part, ' ')
+                        .into_iter()
+                        .find(|token| color(token).is_some())
+                        .map(str::to_owned)
+                })
+            })
+        {
+            style.insert("color".into(), ink.clone());
+            style.insert("-webkit-text-fill-color".into(), ink);
+        }
+        style.entry("color".into()).or_insert("#171717".into());
+        if node.tag == "table" && style.get("display").is_some_and(|value| value == "grid") {
+            let spacing = if style
+                .get("border-collapse")
+                .is_some_and(|value| value == "collapse")
+            {
+                "0".to_owned()
+            } else {
+                style
+                    .get("border-spacing")
+                    .cloned()
+                    .unwrap_or_else(|| "2px".into())
+            };
+            let parts = components(&spacing, ' ');
+            if let Some(&column) = parts.first() {
+                let row = parts.get(1).copied().unwrap_or(column);
+                style.insert("column-gap".into(), column.into());
+                style.insert("row-gap".into(), row.into());
+            }
+        }
+        let parent_weight = parent_style
+            .and_then(|parent| parent.get("font-weight"))
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(400.);
+        if let Some(weight) = style.get_mut("font-weight") {
+            let value = match weight.as_str() {
+                "normal" => 400.,
+                "bold" => 700.,
+                "bolder" if parent_weight < 350. => 400.,
+                "bolder" if parent_weight < 550. => 700.,
+                "bolder" => 900f32.max(parent_weight),
+                "lighter" if parent_weight < 550. => 100f32.min(parent_weight),
+                "lighter" if parent_weight < 750. => 400.,
+                "lighter" => 700.,
+                value => value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| (1. ..=1000.).contains(v))
+                    .unwrap_or(parent_weight),
+            };
+            *weight = value.to_string();
+        }
         let mut units = Lengths {
             font: parent,
             root,
             viewport: [width, height],
             container: None,
         };
-        let size = units
-            .resolve(&style["font-size"], parent.em)
-            .filter(|size| *size >= 0.)
-            .unwrap_or(parent.em);
+        let size = match style.get("font-size").map_or("medium", String::as_str) {
+            "xx-small" => Some(9.),
+            "x-small" => Some(10.),
+            "small" => Some(13.),
+            "medium" => Some(16.),
+            "large" => Some(18.),
+            "x-large" => Some(24.),
+            "xx-large" => Some(32.),
+            "xxx-large" => Some(48.),
+            "larger" => Some(parent.em * 1.2),
+            "smaller" => Some(parent.em / 1.2),
+            value => units.resolve(value, parent.em),
+        }
+        .filter(|size| *size >= 0.)
+        .unwrap_or(parent.em);
+        let monospace = |style: Option<&Style>| {
+            style
+                .and_then(|style| style.get("font-family"))
+                .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"))
+        };
+        let size = if !explicit_size
+            && monospace(Some(&style))
+            && !monospace(parent_style.map(Rc::as_ref))
+        {
+            size * 13. / 16.
+        } else {
+            size
+        };
         units.font = FontUnits::new(size);
         if let Some(text) = text_system {
             let font = font(&style);
@@ -1020,7 +1667,7 @@ pub(crate) fn compute_styles(
         }
         units.root = root;
         style.insert("font-size".into(), format!("{size}px"));
-        let mut pseudo_cascade: [BTreeMap<String, (CascadeRank, String)>; 3] = Default::default();
+        let mut pseudo_cascade: [BTreeMap<&str, (CascadeRank, &str)>; 3] = Default::default();
         for &index in &key.pseudos {
             let (pseudo, selector, declarations, layer, order) = &pseudo_rules[index];
             let [ids, classes, tags] = selector.specificity;
@@ -1033,12 +1680,12 @@ pub(crate) fn compute_styles(
                     *order,
                 );
                 if pseudo_cascade[*pseudo]
-                    .get(key)
+                    .get(key.as_str())
                     .is_none_or(|(old, _)| rank >= *old)
                 {
                     pseudo_cascade[*pseudo].insert(
-                        key.clone(),
-                        (rank, value.trim_end_matches("!important").trim().into()),
+                        key.as_str(),
+                        (rank, value.trim_end_matches("!important").trim()),
                     );
                 }
             }
@@ -1059,12 +1706,12 @@ pub(crate) fn compute_styles(
             );
             for (key, (_, value)) in selected {
                 if matches!(
-                    key.as_str(),
+                    key,
                     "color" | "background-color" | "-webkit-text-fill-color"
                 ) {
-                    let value = if matches!(value.as_str(), "inherit" | "unset") {
+                    let value = if matches!(value, "inherit" | "unset") {
                         parent
-                            .and_then(|parent| parent.get(&key))
+                            .and_then(|parent| parent.get(key))
                             .cloned()
                             .unwrap_or_else(|| {
                                 if key == "background-color" {
@@ -1075,9 +1722,9 @@ pub(crate) fn compute_styles(
                                 .into()
                             })
                     } else {
-                        value
+                        value.to_owned()
                     };
-                    values.insert(key, value);
+                    values.insert(key.to_owned(), value);
                 }
             }
             resolve_style(&mut values, parent);
@@ -1139,9 +1786,10 @@ pub(crate) fn compute_styles(
                     }
                 }
                 for (key, (_, value)) in cascade {
-                    values.insert(key, value);
+                    values.insert(key.to_owned(), value.to_owned());
                 }
                 resolve_style(&mut values, Some(&style));
+                resolve_keywords(&mut values, Some(&style));
                 values
             });
             pseudos.insert(id, Rc::new(values));
@@ -1183,21 +1831,21 @@ pub(crate) fn compute_styles(
 }
 
 fn resolve_style(style: &mut Style, parent: Option<&Style>) {
-    if let Some(parent) = parent {
-        for (key, value) in &mut *style {
-            if value == "inherit"
-                || value == "unset"
-                    && (key.starts_with("--")
-                        || matches!(
-                            key.as_str(),
-                            "color" | "font-size" | "font-family" | "line-height"
-                        ))
-            {
-                *value = parent.get(key).cloned().unwrap_or_default();
-            }
+    style.retain(|key, value| {
+        if !key.starts_with("--") || !matches!(value.as_str(), "inherit" | "unset" | "initial") {
+            return true;
         }
-    }
-    style.retain(|key, value| !(key.starts_with("--") && value == "initial"));
+        match parent
+            .and_then(|parent| parent.get(key))
+            .filter(|_| value != "initial")
+        {
+            Some(inherited) => {
+                *value = inherited.clone();
+                true
+            }
+            None => false,
+        }
+    });
     let resolved: Vec<_> = style
         .iter()
         .filter(|(_, value)| value.contains("var("))
@@ -1233,7 +1881,19 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
         })
         .collect();
     for (key, value) in resolved {
-        style.insert(key, value);
+        if let Some((shorthand, value)) = value
+            .strip_prefix('\u{1}')
+            .and_then(|value| value.split_once('\u{1}'))
+        {
+            let mut expanded = Vec::new();
+            expand(shorthand, value.trim(), &mut expanded);
+            match expanded.into_iter().find(|(name, _)| *name == key) {
+                Some((_, value)) => style.insert(key, value),
+                None => style.remove(&key),
+            };
+        } else {
+            style.insert(key, value);
+        }
     }
     let dark = style
         .get("color-scheme")
@@ -1261,43 +1921,83 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
             let selected = parts[usize::from(dark)].trim().to_owned();
             value.replace_range(start..=end, &selected);
         }
-        if value == "inherit" {
-            *value = parent.and_then(|p| p.get(key)).cloned().unwrap_or_default();
-        }
-        if (value.starts_with("color-mix(") || value.starts_with("rgb(from "))
-            && (key.ends_with("color") || matches!(key.as_str(), "background" | "fill" | "stroke"))
-            && let Some((rgb, alpha)) = color(value)
-        {
-            *value = format!("#{rgb:06x}{alpha:02x}");
-        }
     }
-    for (key, value) in &mut *style {
-        if key.starts_with("border-") && (key.ends_with("width") || key == "border-color") {
-            let parts = components(value, ' ');
-            if parts.len() > 1 {
-                if key.ends_with("width") {
-                    *value = parts[0].to_owned();
-                } else if let Some(color) = parts.iter().find(|v| color(v).is_some()) {
-                    *value = (*color).to_owned();
-                }
-            }
+    let convert = |value: &str, current: &str| {
+        if !value.starts_with("color-mix(") && !value.contains("(from ") {
+            return None;
         }
-        let side = match key.as_str() {
-            "padding-top" | "margin-top" | "row-gap" | "border-top-left-radius" => Some(0),
-            "padding-right" | "margin-right" | "column-gap" | "border-top-right-radius" => Some(1),
-            "padding-bottom" | "margin-bottom" | "border-bottom-right-radius" => Some(2),
-            "padding-left" | "margin-left" | "border-bottom-left-radius" => Some(3),
-            _ => None,
+        let (rgb, alpha) = color(&value.to_ascii_lowercase().replace("currentcolor", current))?;
+        Some(format!("#{rgb:06x}{alpha:02x}"))
+    };
+    let inherited = parent
+        .and_then(|parent| parent.get("color"))
+        .map_or("canvastext", String::as_str);
+    if let Some(value) = style
+        .get("color")
+        .and_then(|value| convert(value, inherited))
+    {
+        style.insert("color".into(), value);
+    }
+    let current = style
+        .get("color")
+        .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
+        .map_or(inherited, String::as_str);
+    let converted: Vec<_> = style
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != "color"
+                && !key.starts_with("--")
+                && (key.ends_with("color") || matches!(key.as_str(), "fill" | "stroke"))
+        })
+        .filter_map(|(key, value)| Some((key.clone(), convert(value, current)?)))
+        .collect();
+    style.extend(converted);
+}
+
+fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
+    style.retain(|key, value| {
+        let inherit = match value.as_str() {
+            _ if key.starts_with("--") => return true,
+            "inherit" => true,
+            "unset" | "revert" | "revert-layer" => INHERITED.binary_search(&key.as_str()).is_ok(),
+            "initial" => false,
+            _ => return true,
         };
-        if let Some(side) = side {
-            let parts = components(value, ' ');
-            if parts.len() > 1 {
-                *value = parts
-                    .get(side)
-                    .or_else(|| parts.get(side % 2))
-                    .unwrap_or(&parts[0])
-                    .to_string();
+        match parent
+            .and_then(|parent| parent.get(key))
+            .filter(|_| inherit)
+        {
+            Some(inherited) => {
+                *value = inherited.clone();
+                true
             }
+            None => false,
+        }
+    });
+    if style
+        .get("color")
+        .is_some_and(|value| value.eq_ignore_ascii_case("currentcolor"))
+    {
+        match parent.and_then(|parent| parent.get("color")) {
+            Some(inherited) => style.insert("color".into(), inherited.clone()),
+            None => style.remove("color"),
+        };
+    }
+    let Some(current) = style.get("color").cloned() else {
+        return;
+    };
+    for (key, value) in &mut *style {
+        if key.starts_with("--") || key == "color" || INHERITED.binary_search(&key.as_str()).is_ok()
+        {
+            continue;
+        }
+        let mut start = 0;
+        while let Some(index) = value.as_bytes()[start..]
+            .windows(12)
+            .position(|window| window.eq_ignore_ascii_case(b"currentcolor"))
+        {
+            value.replace_range(start + index..start + index + 12, &current);
+            start += index + current.len();
         }
     }
 }
@@ -1352,34 +2052,129 @@ pub(crate) struct InlineText {
     pub runs: Vec<gpui::TextRun>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub backgrounds: Vec<(usize, u32)>,
+    pub cursors: Vec<(usize, gpui::CursorStyle)>,
 }
 
+pub(crate) fn cursor(value: &str) -> Option<gpui::CursorStyle> {
+    use gpui::CursorStyle::*;
+    Some(match value {
+        "default" => Arrow,
+        "pointer" => PointingHand,
+        "text" => IBeam,
+        "vertical-text" => IBeamCursorForVerticalLayout,
+        "crosshair" => Crosshair,
+        "grab" | "move" | "all-scroll" => OpenHand,
+        "grabbing" => ClosedHand,
+        "not-allowed" | "no-drop" => OperationNotAllowed,
+        "col-resize" => ResizeColumn,
+        "row-resize" => ResizeRow,
+        "ew-resize" => ResizeLeftRight,
+        "ns-resize" => ResizeUpDown,
+        "e-resize" => ResizeRight,
+        "w-resize" => ResizeLeft,
+        "n-resize" => ResizeUp,
+        "s-resize" => ResizeDown,
+        "nwse-resize" | "nw-resize" | "se-resize" => ResizeUpLeftDownRight,
+        "nesw-resize" | "ne-resize" | "sw-resize" => ResizeUpRightDownLeft,
+        "alias" => DragLink,
+        "copy" => DragCopy,
+        "context-menu" => ContextualMenu,
+        "none" => None,
+        _ => return Option::None,
+    })
+}
+
+pub(crate) fn text_run(style: &Style, len: usize) -> gpui::TextRun {
+    let (ink, alpha) = style
+        .get("color")
+        .and_then(|value| color(value))
+        .unwrap_or((0, 255));
+    let ink: gpui::Hsla = gpui::rgba(ink << 8 | alpha as u32).into();
+    let lines = style.get("text-decoration-line").map_or("", String::as_str);
+    let decoration = style
+        .get("text-decoration-color")
+        .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
+        .and_then(|value| color(value))
+        .map_or(ink, |(ink, alpha)| {
+            gpui::rgba(ink << 8 | alpha as u32).into()
+        });
+    let thickness = gpui::px(1.);
+    gpui::TextRun {
+        len,
+        font: font(style),
+        color: ink,
+        background_color: None,
+        underline: lines.contains("underline").then(|| gpui::UnderlineStyle {
+            thickness,
+            color: Some(decoration),
+            wavy: style
+                .get("text-decoration-style")
+                .is_some_and(|value| value == "wavy"),
+        }),
+        strikethrough: lines
+            .contains("line-through")
+            .then(|| gpui::StrikethroughStyle {
+                thickness,
+                color: Some(decoration),
+            }),
+    }
+}
+
+/// Builds one text layout for an element whose content is only text and plain inline elements.
 pub(crate) fn inline_text(
     doc: &Document,
     styles: &ComputedStyles,
     id: usize,
 ) -> Option<InlineText> {
     let parent = &styles.values[id];
-    if doc.nodes[id].children.is_empty()
-        || !parent
-            .get("white-space")
-            .is_some_and(|value| value == "pre")
-        || parent
-            .get("display")
-            .is_some_and(|value| matches!(value.as_str(), "grid" | "flex" | "inline-flex"))
+    let own = doc.nodes[id].tag == "#text";
+    if !own && doc.nodes[id].children.is_empty()
+        || parent.get("display").is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                "grid" | "flex" | "inline-flex" | "inline-grid"
+            )
+        })
     {
         return None;
     }
+    let siblings = doc.nodes[id]
+        .parent
+        .map_or(&[][..], |parent| &doc.nodes[parent].children[..]);
+    let position = siblings
+        .iter()
+        .position(|&sibling| sibling == id)
+        .unwrap_or(0);
+    let inline_sibling = |sibling: Option<&usize>| {
+        own && sibling.is_some_and(|&sibling| {
+            !doc.nodes[sibling].tag.starts_with('#')
+                && doc.nodes[sibling].tag != "br"
+                && styles.values[sibling]
+                    .get("display")
+                    .is_none_or(|value| value.starts_with("inline"))
+        })
+    };
+    let trailing = inline_sibling(siblings.get(position + 1));
     let mut text = String::new();
-    let mut runs = Vec::new();
+    let mut runs: Vec<gpui::TextRun> = Vec::new();
     let mut ranges = Vec::new();
     let mut backgrounds = Vec::new();
-    let mut pending: Vec<_> = doc.nodes[id]
-        .children
-        .iter()
-        .rev()
-        .map(|&child| (child, None, None))
-        .collect();
+    let mut cursors = Vec::new();
+    let mut space = !inline_sibling(
+        position
+            .checked_sub(1)
+            .and_then(|index| siblings.get(index)),
+    );
+    let mut pending: Vec<_> = if own {
+        vec![(id, None, None)]
+    } else {
+        doc.nodes[id]
+            .children
+            .iter()
+            .rev()
+            .map(|&child| (child, None, None))
+            .collect()
+    };
     while let Some((child, end, background)) = pending.pop() {
         if let Some(index) = end {
             let (_, range): &mut (usize, std::ops::Range<usize>) = &mut ranges[index];
@@ -1388,46 +2183,92 @@ pub(crate) fn inline_text(
         }
         let node = &doc.nodes[child];
         let style = &styles.values[child];
-        if !matches!(
-            node.tag.as_str(),
-            "#text" | "span" | "b" | "strong" | "em" | "i" | "a" | "code" | "small"
-        ) || styles.pseudos.contains_key(&child)
+        if node.tag == "#comment" {
+            continue;
+        }
+        if node.tag == "br" {
+            text.push('\n');
+            runs.push(text_run(style, 1));
+            space = true;
+            continue;
+        }
+        if node.tag != "#text"
+            && (style.get("display").is_some_and(|value| value != "inline")
+                || matches!(
+                    node.tag.as_str(),
+                    "img"
+                        | "svg"
+                        | "canvas"
+                        | "input"
+                        | "button"
+                        | "select"
+                        | "textarea"
+                        | "iframe"
+                        | "video"
+                        | "audio"
+                        | "object"
+                        | "embed"
+                        | "progress"
+                        | "meter"
+                ))
+            || styles.pseudos.contains_key(&child)
             || styles.animations.contains_key(&child)
             || styles.lengths[child].font.em != styles.lengths[id].font.em
             || styles.lengths[child].font.lh != styles.lengths[id].font.lh
-            || ["white-space", "visibility", "pointer-events"]
-                .iter()
-                .any(|key| style.get(*key) != parent.get(*key))
-            || style
-                .get("cursor")
-                .is_some_and(|value| Some(value) != parent.get("cursor"))
+            || [
+                "white-space",
+                "visibility",
+                "pointer-events",
+                "letter-spacing",
+                "word-spacing",
+            ]
+            .iter()
+            .any(|key| style.get(*key) != parent.get(*key))
             || style.iter().any(|(key, value)| {
-                !value.is_empty()
-                    && !key.starts_with("--")
+                !key.starts_with("--")
+                    && parent.get(key) != Some(value)
+                    && !matches!(
+                        value.as_str(),
+                        "" | "0"
+                            | "0px"
+                            | "none"
+                            | "normal"
+                            | "auto"
+                            | "inline"
+                            | "baseline"
+                            | "static"
+                            | "visible"
+                            | "border-box"
+                            | "content-box"
+                            | "transparent"
+                            | "currentcolor"
+                            | "solid"
+                    )
                     && !matches!(
                         key.as_str(),
                         "color"
-                            | "font-size"
                             | "font-family"
                             | "font-weight"
-                            | "line-height"
-                            | "white-space"
+                            | "font-style"
+                            | "text-decoration-line"
+                            | "text-decoration-color"
+                            | "text-decoration-style"
+                            | "text-decoration-thickness"
+                            | "text-underline-offset"
+                            | "text-transform"
                             | "color-scheme"
                             | "caret-color"
-                            | "visibility"
-                            | "pointer-events"
                             | "cursor"
                             | "fill"
                             | "text-align"
                             | "background-color"
-                            | "border-radius"
                             | "border-top-left-radius"
                             | "border-top-right-radius"
                             | "border-bottom-right-radius"
                             | "border-bottom-left-radius"
                             | "box-decoration-break"
                             | "user-select"
-                            | "box-sizing"
+                            | "-webkit-user-select"
                     )
             })
         {
@@ -1435,6 +2276,14 @@ pub(crate) fn inline_text(
         }
         let index = ranges.len();
         ranges.push((child, text.len()..text.len()));
+        if node.tag != "#text"
+            && let Some(style) = style
+                .get("cursor")
+                .filter(|value| Some(*value) != parent.get("cursor"))
+                .and_then(|value| cursor(value))
+        {
+            cursors.push((index, style));
+        }
         let inherited_background = background;
         let background = style
             .get("background-color")
@@ -1454,28 +2303,55 @@ pub(crate) fn inline_text(
                 .map(|&child| (child, None, background)),
         );
         if !node.text.is_empty() {
-            let (color, alpha) = style
-                .get("color")
-                .and_then(|value| color(value))
-                .unwrap_or((0, 255));
-            runs.push(gpui::TextRun {
-                len: node.text.len(),
-                font: font(style),
-                color: gpui::rgba(color << 8 | alpha as u32).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-            text.push_str(&node.text);
+            let start = text.len();
+            let mode = style.get("white-space").map_or("normal", String::as_str);
+            let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
+            let transform = style.get("text-transform").map(String::as_str);
+            let mut word = true;
+            for c in node.text.chars() {
+                if c.is_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
+                    if !space {
+                        text.push(' ');
+                    }
+                    space = true;
+                    word = true;
+                    continue;
+                }
+                let mapped = match transform {
+                    Some("uppercase") => {
+                        let mut mapped = c.to_uppercase();
+                        mapped.next().filter(|_| mapped.next().is_none())
+                    }
+                    Some("capitalize") if word => {
+                        let mut mapped = c.to_uppercase();
+                        mapped.next().filter(|_| mapped.next().is_none())
+                    }
+                    Some("lowercase") => {
+                        let mut mapped = c.to_lowercase();
+                        mapped.next().filter(|_| mapped.next().is_none())
+                    }
+                    _ => None,
+                };
+                let c = mapped.filter(|m| m.len_utf8() == c.len_utf8()).unwrap_or(c);
+                text.push(c);
+                space = c == '\n';
+                word = !c.is_alphanumeric();
+            }
+            if text.len() > start {
+                runs.push(text_run(style, text.len() - start));
+            }
         }
     }
-    if text.contains(['\t', '\r'])
-        || text.trim_end_matches('\n').contains('\n')
-        || text.ends_with("\n\n")
-    {
+    if text.contains(['\t', '\r']) {
         return None;
     }
-    if text.ends_with('\n') {
+    if text.ends_with(' ')
+        && !trailing
+        && !parent
+            .get("white-space")
+            .is_some_and(|value| matches!(value.as_str(), "pre" | "pre-wrap" | "break-spaces"))
+        || text.ends_with('\n')
+    {
         text.pop();
         if let Some(run) = runs.last_mut() {
             run.len -= 1;
@@ -1496,21 +2372,65 @@ pub(crate) fn inline_text(
         runs,
         ranges,
         backgrounds,
+        cursors,
     })
 }
 
 pub(crate) fn font(style: &Style) -> gpui::Font {
-    let mut font = gpui::font(
-        style
-            .get("font-family")
-            .map_or(".SystemUIFont", String::as_str)
-            .split(',')
-            .next()
-            .unwrap()
-            .trim()
-            .trim_matches(['\'', '"'])
-            .to_owned(),
-    );
+    let families = style.get("font-family").map_or("system-ui", String::as_str);
+    let family = FONT_NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if let Some(family) = names.1.get(families) {
+            return family.clone();
+        }
+        let family: gpui::SharedString = components(families, ',')
+            .into_iter()
+            .find_map(|family| {
+                let family = family.trim().trim_matches(['\'', '"']);
+                let lower = family.to_ascii_lowercase();
+                let generic: &[&str] = match lower.as_str() {
+                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif"
+                    | "sans-serif" | "ui-rounded" => &[".SystemUIFont"],
+                    "monospace" | "ui-monospace" => &[
+                        "Menlo",
+                        "SF Mono",
+                        "Consolas",
+                        "DejaVu Sans Mono",
+                        "Liberation Mono",
+                        "Courier New",
+                    ],
+                    "serif" | "ui-serif" => &[
+                        "Times",
+                        "Times New Roman",
+                        "DejaVu Serif",
+                        "Liberation Serif",
+                    ],
+                    "cursive" => &["Apple Chancery", "Comic Sans MS"],
+                    "fantasy" => &["Papyrus", "Impact"],
+                    _ => {
+                        return if names.0.is_empty() {
+                            Some(family.to_owned())
+                        } else {
+                            names.0.get(&lower).cloned()
+                        };
+                    }
+                };
+                generic
+                    .iter()
+                    .find(|name| {
+                        name.starts_with('.') || names.0.contains_key(&name.to_ascii_lowercase())
+                    })
+                    .or(generic.first().filter(|_| names.0.is_empty()))
+                    .map(|name| name.to_string())
+            })
+            .unwrap_or_else(|| ".SystemUIFont".into())
+            .into();
+        if !names.0.is_empty() {
+            names.1.insert(families.to_owned(), family.clone());
+        }
+        family
+    });
+    let mut font = gpui::font(family);
     let weight = match style.get("font-weight").map(String::as_str) {
         Some("bold") => 700.,
         Some(value) => value
@@ -1521,6 +2441,11 @@ pub(crate) fn font(style: &Style) -> gpui::Font {
         None => 400.,
     };
     font.weight = gpui::FontWeight(weight.clamp(1., 1000.));
+    font.style = match style.get("font-style").map(String::as_str) {
+        Some("italic") => gpui::FontStyle::Italic,
+        Some(value) if value.starts_with("oblique") => gpui::FontStyle::Oblique,
+        _ => gpui::FontStyle::Normal,
+    };
     font
 }
 
@@ -1559,108 +2484,26 @@ impl Declarations {
                     }
                 }
                 Declaration::Property(key, value) => {
-                    let key = key.as_str();
                     let important = value.ends_with("!important");
                     let plain = value.trim_end_matches("!important").trim();
                     let mut expanded = Vec::new();
-                    match key {
-                        "padding-inline" | "padding-block" | "margin-inline" | "margin-block"
-                        | "inset-inline" | "inset-block" => {
-                            let (property, axis) = key.split_once('-').unwrap();
-                            let sides = if axis == "inline" {
-                                ["left", "right"]
-                            } else {
-                                ["top", "bottom"]
-                            };
-                            let parts = components(plain, ' ');
-                            for (index, side) in sides.into_iter().enumerate() {
-                                let name = if property == "inset" {
-                                    side.into()
-                                } else {
-                                    format!("{property}-{side}")
-                                };
-                                expanded
-                                    .push((name, parts.get(index).copied().unwrap_or(parts[0])));
-                            }
+                    if plain.contains("var(") && expand(key, "initial", &mut expanded) {
+                        for (_, value) in &mut expanded {
+                            *value = format!("\u{1}{key}\u{1}{plain}");
                         }
-                        "overflow" => {
-                            let parts = components(plain, ' ');
-                            expanded.push(("overflow-x".into(), parts[0]));
-                            expanded.push((
-                                "overflow-y".into(),
-                                parts.get(1).copied().unwrap_or(parts[0]),
-                            ));
-                        }
-                        "border" | "border-top" | "border-right" | "border-bottom"
-                        | "border-left" | "border-block" | "border-inline" => {
-                            let sides: &[&str] = match key {
-                                "border-top" => &["top"],
-                                "border-right" => &["right"],
-                                "border-bottom" => &["bottom"],
-                                "border-left" => &["left"],
-                                "border-block" => &["top", "bottom"],
-                                "border-inline" => &["left", "right"],
-                                _ => &["top", "right", "bottom", "left"],
-                            };
-                            let parts = components(plain, ' ');
-                            for &part in &parts {
-                                if matches!(part, "solid" | "dashed" | "dotted" | "none") {
-                                    expanded.push(("border-style".into(), part));
-                                } else if color(part).is_some() || part.starts_with("var(") {
-                                    expanded.push(("border-color".into(), part));
-                                    if part.starts_with("var(") && parts.len() == 1 {
-                                        for side in sides {
-                                            expanded.push((format!("border-{side}-width"), part));
-                                        }
-                                    }
-                                } else {
-                                    for side in sides {
-                                        expanded.push((format!("border-{side}-width"), part));
-                                    }
-                                }
-                            }
-                        }
-                        "inset" => {
-                            let parts = components(plain, ' ');
-                            for (index, side) in
-                                ["top", "right", "bottom", "left"].into_iter().enumerate()
-                            {
-                                expanded.push((
-                                    side.into(),
-                                    parts
-                                        .get(index)
-                                        .or(parts.get(index % 2))
-                                        .copied()
-                                        .unwrap_or(parts[0]),
-                                ));
-                            }
-                        }
-                        "padding" | "margin" => {
-                            for side in ["top", "right", "bottom", "left"] {
-                                expanded.push((format!("{key}-{side}"), plain));
-                            }
-                        }
-                        "gap" => {
-                            expanded.push(("row-gap".into(), plain));
-                            expanded.push(("column-gap".into(), plain));
-                        }
-                        "border-radius" => {
-                            for corner in ["top-left", "top-right", "bottom-right", "bottom-left"] {
-                                expanded.push((format!("border-{corner}-radius"), plain));
-                            }
-                        }
-                        "background" if color(plain).is_some() || plain.starts_with("var(") => {
-                            expanded.push(("background-color".into(), plain));
-                        }
-                        _ => {}
+                    } else if !expand(key, plain, &mut expanded) {
+                        expanded.push((key.clone(), plain.to_owned()));
                     }
-                    expanded.push((key.to_owned(), plain));
                     for (key, value) in expanded {
                         if important || result.get(&key).is_none_or(|v| !v.ends_with("!important"))
                         {
                             result.insert(
                                 key,
-                                format!("{value}{}", if important { " !important" } else { "" }),
+                                if important {
+                                    format!("{value} !important")
+                                } else {
+                                    value
+                                },
                             );
                         }
                     }
@@ -1681,12 +2524,480 @@ impl Declarations {
     }
 }
 
+/// Expands a shorthand or logical property into physical longhands. Returns false for other properties.
+fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
+    let alias = match key {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "max-inline-size" => "max-width",
+        "min-block-size" => "min-height",
+        "max-block-size" => "max-height",
+        "overflow-inline" => "overflow-x",
+        "overflow-block" => "overflow-y",
+        "word-wrap" => "overflow-wrap",
+        "grid-row-gap" => "row-gap",
+        "-webkit-background-clip" => "background-clip",
+        "grid-column-gap" => "column-gap",
+        "border-start-start-radius" => "border-top-left-radius",
+        "border-start-end-radius" => "border-top-right-radius",
+        "border-end-start-radius" => "border-bottom-left-radius",
+        "border-end-end-radius" => "border-bottom-right-radius",
+        _ => "",
+    };
+    if !alias.is_empty() {
+        out.push((alias.into(), value.into()));
+        return true;
+    }
+    if let Some((property, rest)) = key
+        .split_once("-inline-")
+        .or_else(|| key.split_once("-block-"))
+        && matches!(
+            property,
+            "margin" | "padding" | "inset" | "border" | "scroll-margin" | "scroll-padding"
+        )
+        && let Some((side, rest)) = rest
+            .split_once('-')
+            .map_or(Some((rest, "")), Some)
+            .filter(|(side, _)| matches!(*side, "start" | "end"))
+    {
+        let side = match (key.contains("-inline-"), side) {
+            (true, "start") => "left",
+            (true, _) => "right",
+            (false, "start") => "top",
+            _ => "bottom",
+        };
+        let physical = match (property, rest) {
+            ("inset", _) => side.to_owned(),
+            (_, "") => format!("{property}-{side}"),
+            _ => format!("{property}-{side}-{rest}"),
+        };
+        if !expand(&physical, value, out) {
+            out.push((physical, value.into()));
+        }
+        return true;
+    }
+    const BOX: [&str; 4] = ["top", "right", "bottom", "left"];
+    let (names, kind): (Vec<String>, u8) = match key {
+        "margin" | "padding" | "scroll-margin" | "scroll-padding" => {
+            (BOX.map(|side| format!("{key}-{side}")).into(), 0)
+        }
+        "inset" => (BOX.map(String::from).into(), 0),
+        "border-width" | "border-style" | "border-color" => {
+            let suffix = &key[7..];
+            (BOX.map(|side| format!("border-{side}-{suffix}")).into(), 0)
+        }
+        "border-radius" => (
+            ["top-left", "top-right", "bottom-right", "bottom-left"]
+                .map(|corner| format!("border-{corner}-radius"))
+                .into(),
+            1,
+        ),
+        "margin-inline"
+        | "padding-inline"
+        | "margin-block"
+        | "padding-block"
+        | "inset-inline"
+        | "inset-block"
+        | "border-inline-width"
+        | "border-inline-style"
+        | "border-inline-color"
+        | "border-block-width"
+        | "border-block-style"
+        | "border-block-color" => {
+            let (property, rest) = key
+                .split_once(if key.contains("-inline") {
+                    "-inline"
+                } else {
+                    "-block"
+                })
+                .unwrap_or((key, ""));
+            let sides = if key.contains("-inline") {
+                ["left", "right"]
+            } else {
+                ["top", "bottom"]
+            };
+            (
+                sides
+                    .map(|side| match property {
+                        "inset" => side.to_owned(),
+                        "border" => format!("border-{side}{rest}"),
+                        _ => format!("{property}-{side}"),
+                    })
+                    .into(),
+                2,
+            )
+        }
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
+        | "border-inline" | "border-block" | "outline" => {
+            let sides: &[&str] = match key {
+                "border-top" => &["top"],
+                "border-right" => &["right"],
+                "border-bottom" => &["bottom"],
+                "border-left" => &["left"],
+                "border-inline" => &["left", "right"],
+                "border-block" => &["top", "bottom"],
+                "outline" => &[""],
+                _ => &BOX,
+            };
+            let mut names = Vec::new();
+            for side in sides {
+                for part in ["width", "style", "color"] {
+                    names.push(if side.is_empty() {
+                        format!("outline-{part}")
+                    } else {
+                        format!("border-{side}-{part}")
+                    });
+                }
+            }
+            (names, 3)
+        }
+        "background" => (
+            ["color", "image", "position", "size", "repeat", "clip"]
+                .map(|part| format!("background-{part}"))
+                .into(),
+            4,
+        ),
+        "font" => (
+            [
+                "font-style",
+                "font-variant",
+                "font-weight",
+                "font-stretch",
+                "font-size",
+                "line-height",
+                "font-family",
+            ]
+            .map(String::from)
+            .into(),
+            5,
+        ),
+        "flex" => (
+            ["flex-grow", "flex-shrink", "flex-basis"]
+                .map(String::from)
+                .into(),
+            6,
+        ),
+        "flex-flow" => (["flex-direction", "flex-wrap"].map(String::from).into(), 7),
+        "place-items" | "place-content" | "place-self" => {
+            let suffix = &key[6..];
+            (
+                [format!("align-{suffix}"), format!("justify-{suffix}")].into(),
+                2,
+            )
+        }
+        "gap" | "grid-gap" => (["row-gap", "column-gap"].map(String::from).into(), 2),
+        "overflow" => (["overflow-x", "overflow-y"].map(String::from).into(), 2),
+        "text-decoration" => (
+            ["line", "style", "color", "thickness"]
+                .map(|part| format!("text-decoration-{part}"))
+                .into(),
+            8,
+        ),
+        "list-style" => (
+            ["list-style-type", "list-style-position", "list-style-image"]
+                .map(String::from)
+                .into(),
+            9,
+        ),
+        "container" => (
+            ["container-name", "container-type"]
+                .map(String::from)
+                .into(),
+            10,
+        ),
+        _ => return false,
+    };
+    if matches!(
+        value,
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        out.extend(names.into_iter().map(|name| (name, value.into())));
+        return true;
+    }
+    let parts = components(value, ' ');
+    let Some(&first) = parts.first() else {
+        return true;
+    };
+    let length = |part: &str| {
+        part.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+            || ["calc(", "min(", "max(", "clamp(", "var("]
+                .iter()
+                .any(|f| part.starts_with(f))
+    };
+    let mut values: Vec<String> = match kind {
+        0 | 1 => {
+            let parts = if kind == 1 {
+                let end = parts
+                    .iter()
+                    .position(|part| *part == "/")
+                    .unwrap_or(parts.len());
+                &parts[..end.max(1)]
+            } else {
+                &parts[..]
+            };
+            let side = |index: usize, fallback: usize| {
+                let part = parts.get(index).or(parts.get(fallback)).unwrap_or(&first);
+                part.split_once('/')
+                    .filter(|_| kind == 1 && !part.contains('('))
+                    .map_or(*part, |(part, _)| part)
+                    .to_owned()
+            };
+            vec![side(0, 0), side(1, 0), side(2, 0), side(3, 1)]
+        }
+        2 => vec![first.into(), parts.get(1).unwrap_or(&first).to_string()],
+        3 => {
+            let (mut width, mut style, mut color) = (
+                "medium".to_owned(),
+                "none".to_owned(),
+                "currentcolor".to_owned(),
+            );
+            for &part in &parts {
+                if matches!(
+                    part,
+                    "none"
+                        | "hidden"
+                        | "dotted"
+                        | "dashed"
+                        | "solid"
+                        | "double"
+                        | "groove"
+                        | "ridge"
+                        | "inset"
+                        | "outset"
+                        | "auto"
+                ) {
+                    style = part.into();
+                } else if matches!(part, "thin" | "medium" | "thick")
+                    || length(part) && !part.starts_with("var(")
+                {
+                    width = part.into();
+                } else {
+                    color = part.into();
+                }
+            }
+            width = match width.as_str() {
+                "thin" => "1px".into(),
+                "medium" => "3px".into(),
+                "thick" => "5px".into(),
+                _ => width,
+            };
+            names
+                .chunks(3)
+                .flat_map(|_| [width.clone(), style.clone(), color.clone()])
+                .collect()
+        }
+        4 => {
+            let layers = components(value, ',');
+            let mut result = vec![Vec::new(); 6];
+            let mut color = "transparent".to_owned();
+            for (index, layer) in layers.iter().enumerate() {
+                let (mut image, mut position, mut size, mut repeat, mut boxes) = (
+                    "none".to_owned(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let mut after_slash = false;
+                for part in components(layer, ' ') {
+                    if part == "/" {
+                        after_slash = true;
+                    } else if let Some((before, after)) =
+                        part.split_once('/').filter(|_| !part.contains('('))
+                    {
+                        position.push(before.to_owned());
+                        size.push(after.to_owned());
+                        after_slash = true;
+                    } else if part.starts_with("url(")
+                        || part.contains("gradient(")
+                        || part.starts_with("image-set(")
+                        || part == "none"
+                    {
+                        image = part.into();
+                    } else if matches!(
+                        part,
+                        "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round"
+                    ) {
+                        repeat.push(part);
+                    } else if matches!(part, "border-box" | "padding-box" | "content-box" | "text")
+                    {
+                        boxes.push(part);
+                    } else if matches!(part, "scroll" | "fixed" | "local") {
+                        continue;
+                    } else if after_slash
+                        && (length(part) || matches!(part, "auto" | "cover" | "contain"))
+                    {
+                        size.push(part.into());
+                    } else if length(part)
+                        || matches!(part, "left" | "right" | "top" | "bottom" | "center")
+                    {
+                        position.push(part.into());
+                    } else if index + 1 == layers.len() {
+                        color = part.into();
+                    }
+                }
+                let join = |values: Vec<String>, fallback: &str| {
+                    if values.is_empty() {
+                        fallback.to_owned()
+                    } else {
+                        values.join(" ")
+                    }
+                };
+                result[1].push(image);
+                result[2].push(join(position, "0% 0%"));
+                result[3].push(join(size, "auto"));
+                result[4].push(join(
+                    repeat.into_iter().map(String::from).collect(),
+                    "repeat",
+                ));
+                result[5].push(boxes.last().unwrap_or(&"border-box").to_string());
+            }
+            result[0].push(color);
+            result.into_iter().map(|values| values.join(", ")).collect()
+        }
+        5 => {
+            if matches!(
+                first,
+                "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
+            ) {
+                vec![
+                    "normal".into(),
+                    "normal".into(),
+                    "normal".into(),
+                    "normal".into(),
+                    "13px".into(),
+                    "normal".into(),
+                    "system-ui".into(),
+                ]
+            } else {
+                let mut values = vec!["normal".to_owned(); 6];
+                let mut index = 0;
+                while let Some(&part) = parts.get(index) {
+                    match part {
+                        "italic" => values[0] = part.into(),
+                        _ if part.starts_with("oblique") => values[0] = part.into(),
+                        "small-caps" => values[1] = part.into(),
+                        "bold" | "bolder" | "lighter" => values[2] = part.into(),
+                        _ if part.ends_with("condensed") || part.ends_with("expanded") => {
+                            values[3] = part.into()
+                        }
+                        "normal" => {}
+                        _ if part.parse::<f32>().is_ok() => values[2] = part.into(),
+                        _ => break,
+                    }
+                    index += 1;
+                }
+                let Some(size) = parts.get(index) else {
+                    return true;
+                };
+                let (size, mut line) = size
+                    .split_once('/')
+                    .map_or((*size, None), |(size, line)| (size, Some(line.to_owned())));
+                index += 1;
+                if line.as_deref() == Some("") || parts.get(index) == Some(&"/") {
+                    index += usize::from(parts.get(index) == Some(&"/"));
+                    line = parts.get(index).map(|part| part.to_string());
+                    index += 1;
+                } else if let Some(rest) = parts.get(index).and_then(|part| part.strip_prefix('/'))
+                {
+                    line = Some(rest.to_owned());
+                    index += 1;
+                }
+                let family = parts.get(index..).unwrap_or_default().join(" ");
+                if family.is_empty() {
+                    return true;
+                }
+                values[4] = size.into();
+                values[5] = line.unwrap_or_else(|| "normal".into());
+                values.push(family);
+                values
+            }
+        }
+        6 => match parts.as_slice() {
+            ["none"] => vec!["0".into(), "0".into(), "auto".into()],
+            ["auto"] => vec!["1".into(), "1".into(), "auto".into()],
+            [grow] if grow.parse::<f32>().is_ok() => {
+                vec![grow.to_string(), "1".into(), "0%".into()]
+            }
+            [basis] => vec!["1".into(), "1".into(), basis.to_string()],
+            [grow, shrink] if shrink.parse::<f32>().is_ok() => {
+                vec![grow.to_string(), shrink.to_string(), "0%".into()]
+            }
+            [grow, basis] => vec![grow.to_string(), "1".into(), basis.to_string()],
+            [grow, shrink, basis, ..] => {
+                vec![grow.to_string(), shrink.to_string(), basis.to_string()]
+            }
+            [] => return true,
+        },
+        7 => {
+            let mut values = vec!["row".to_owned(), "nowrap".to_owned()];
+            for &part in &parts {
+                values[usize::from(part.contains("wrap"))] = part.into();
+            }
+            values
+        }
+        8 => {
+            let (mut lines, mut values) = (
+                Vec::new(),
+                vec![
+                    String::new(),
+                    "solid".into(),
+                    "currentcolor".into(),
+                    "auto".into(),
+                ],
+            );
+            for &part in &parts {
+                if matches!(
+                    part,
+                    "none" | "underline" | "overline" | "line-through" | "blink"
+                ) {
+                    lines.push(part);
+                } else if matches!(part, "solid" | "double" | "dotted" | "dashed" | "wavy") {
+                    values[1] = part.into();
+                } else if length(part) || matches!(part, "auto" | "from-font") {
+                    values[3] = part.into();
+                } else {
+                    values[2] = part.into();
+                }
+            }
+            values[0] = if lines.is_empty() {
+                "none".into()
+            } else {
+                lines.join(" ")
+            };
+            values
+        }
+        9 => {
+            let mut values = vec!["disc".to_owned(), "outside".to_owned(), "none".to_owned()];
+            for &part in &parts {
+                match part {
+                    "inside" | "outside" => values[1] = part.into(),
+                    _ if part.starts_with("url(") => values[2] = part.into(),
+                    "none" => values[0] = part.into(),
+                    _ => values[0] = part.into(),
+                }
+            }
+            values
+        }
+        _ => {
+            let (name, kind) = value
+                .split_once('/')
+                .map_or((value, "normal"), |(name, kind)| (name.trim(), kind.trim()));
+            vec![name.into(), kind.into()]
+        }
+    };
+    values.truncate(names.len());
+    out.extend(names.into_iter().zip(values));
+    true
+}
+
 impl Stylesheet {
     pub(crate) fn matches_media(&self, width: f32, height: f32) -> bool {
         let reduced_motion = reduced_motion();
         let theme = crate::browser::theme_state();
-        matches!(self.0.as_slice(), [Rule::Media(queries, _)] if queries.iter().any(|query| {
-            query.iter().all(|(feature, value)| feature.matches(value, width, height, reduced_motion, theme))
+        matches!(self.0.as_slice(), [Rule::Media(queries, _)] if queries.is_empty() || queries.iter().any(|query| {
+            query.matches(width, height, reduced_motion, theme) == Some(true)
         }))
     }
 
@@ -1782,10 +3093,14 @@ impl Lengths {
         if value == "none" {
             return shadows;
         }
-        for shadow in components(value, ',') {
+        for shadow in components(value, ',').into_iter().rev() {
             let mut lengths = Vec::new();
             let mut ink = (0, 255);
-            for part in components(shadow, ' ') {
+            let parts = components(shadow, ' ');
+            if parts.contains(&"inset") {
+                continue;
+            }
+            for part in parts {
                 if let Some(color) = color(part) {
                     ink = color;
                 } else if let Some(value) = self.resolve(part, self.viewport[0]) {
@@ -1942,13 +3257,23 @@ mod tests {
             let doc = Document::parse(&format!("<pre style='white-space:pre'>{content}</pre>"));
             let id = element(&doc, "pre");
             let computed = compute_styles(
-                &doc, 800., 600., None,
-                &mut HashMap::new(), &mut StyleCache::default(), None,
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut HashMap::new(),
+                &mut StyleCache::default(),
+                None,
             );
             let inline = inline_text(&doc, &computed, id).unwrap();
-            let actual = (inline.text.clone(), inline.backgrounds.iter().map(|&(index, color)| {
-                (inline.ranges[index].1.clone(), color)
-            }).collect::<Vec<_>>());
+            let actual = (
+                inline.text.clone(),
+                inline
+                    .backgrounds
+                    .iter()
+                    .map(|&(index, color)| (inline.ranges[index].1.clone(), color))
+                    .collect::<Vec<_>>(),
+            );
             if let Some(expected) = &expected {
                 assert_eq!(&actual, expected);
             } else {
@@ -2126,8 +3451,12 @@ mod tests {
             wide.values[div].contains_key("animation"),
             !reduced_motion()
         );
-        assert!(MediaFeature::ReducedMotion.matches("reduce", 800., 600., true, 0));
-        assert!(!MediaFeature::ReducedMotion.matches("no-preference", 800., 600., true, 0));
+        let motion = |value: &str| {
+            MediaQuery::Feature("prefers-reduced-motion".into(), ":".into(), value.into())
+                .matches(800., 600., true, 0)
+        };
+        assert_eq!(motion("reduce"), Some(true));
+        assert_eq!(motion("no-preference"), Some(false));
     }
 
     #[test]
@@ -2163,6 +3492,38 @@ mod tests {
     }
 
     #[test]
+    fn nested_layers_media_and_supports_keep_cascade_order() {
+        let doc = Document::parse(
+            r#"<style>
+            @layer reset, base;
+            @layer base { .a { color: red; } @layer inner { .a { color: blue; background-color: blue !important; } } .a { background-color: red !important; } }
+            @layer reset { .a { width: 1px !important; caret-color: green; } }
+            .a { width: 2px !important; }
+            @layer base { @media (min-width: 1px) { .a { height: 3px; } } @supports (display: grid) { .a { padding-top: 4px; } } }
+            @layer one { .a { margin-top: 1px; } }
+            @layer two { .a { margin-top: 2px; } }
+            @layer one.sub { .a { margin-top: 3px; } }
+            .a { @media (width > 1px) { min-width: 5px; } @supports not (display: nonsense) { max-width: 6px; } @layer late { caret-color: red; } }
+        </style><div class="a"></div>"#,
+        );
+        let computed = styles(&doc, 800., 600.);
+        let id = element(&doc, ".a");
+        for (key, expected) in [
+            ("color", "red"),
+            ("background-color", "blue"),
+            ("width", "1px"),
+            ("height", "3px"),
+            ("padding-top", "4px"),
+            ("margin-top", "2px"),
+            ("min-width", "5px"),
+            ("max-width", "6px"),
+            ("caret-color", "red"),
+        ] {
+            assert_eq!(computed[id][key], expected, "{key}");
+        }
+    }
+
+    #[test]
     fn logical_borders_and_theme_colors_resolve_variables() {
         let doc = Document::parse(
             r#"<style>
@@ -2175,7 +3536,9 @@ mod tests {
         let item = element(&doc, ".item");
         assert_eq!(computed[item]["border-right-width"], "2px");
         assert_eq!(computed[item]["border-left-width"], "1px");
-        assert_eq!(computed[item]["border-color"], "#fff");
+        assert_eq!(computed[item]["border-right-color"], "#fff");
+        assert_eq!(computed[item]["border-left-color"], "#fff");
+        assert_eq!(computed[item]["border-left-style"], "solid");
         assert_eq!(computed[item]["padding-left"], "1ch");
         assert_eq!(computed[item]["padding-right"], "2ch");
         assert_eq!(computed[item]["margin-bottom"], "8px");
@@ -2192,6 +3555,28 @@ mod tests {
     }
 
     #[test]
+    fn relative_and_mixed_colors_resolve_with_current_color() {
+        let doc = Document::parse(
+            r#"<style>
+            .item { color: hsl(from red h s l); border-color: color-mix(in srgb, currentColor 50%, transparent); background-color: oklch(from CurrentColor l c h / 0.5); }
+            .item span { color: color-mix(in srgb, currentColor, white); fill: lab(from currentcolor l a b); --mix-color: color-mix(in srgb, red, blue); }
+        </style><div class="item"><span>text</span></div>"#,
+        );
+        let computed = styles(&doc, 800., 600.);
+        let item = element(&doc, ".item");
+        let span = element(&doc, "span");
+        assert_eq!(computed[item]["color"], "#ff0000ff");
+        assert_eq!(computed[item]["border-top-color"], "#ff000080");
+        assert_eq!(computed[item]["background-color"], "#ff000080");
+        assert_eq!(computed[span]["color"], "#ff8080ff");
+        assert_eq!(computed[span]["fill"], "#ff8080ff");
+        assert_eq!(
+            computed[span]["--mix-color"],
+            "color-mix(in srgb, red, blue)"
+        );
+    }
+
+    #[test]
     fn declaration_tokens_preserve_strings_blocks_and_priority() {
         let style = declarations(
             r#"/* leading ; } */ COLOR: red ! /* priority */ IMPORTANT;
@@ -2202,7 +3587,8 @@ mod tests {
             content: "!important"; width: calc(10px /* math */ + 2px);"#,
         );
         assert_eq!(style["color"], "red !important");
-        assert_eq!(style["padding"], "2px  4px");
+        assert_eq!(style["padding-top"], "2px");
+        assert_eq!(style["padding-right"], "4px");
         assert_eq!(style["--Case"], r#"{ key: [a;b]; nested: fn(";}"); }"#);
         assert_eq!(style["--case"], r#""/* text */;escaped\"}""#);
         assert_eq!(style["--tokens"], "one/**/two");
@@ -2220,9 +3606,9 @@ mod tests {
         );
         assert_eq!(style["color"], "red");
         assert_eq!(style["height"], "7px");
-        assert_eq!(style["padding"], "3px");
-        assert_eq!(style["margin"], "4px");
-        assert_eq!(style["border-width"], "2px");
+        assert_eq!(style["padding-left"], "3px");
+        assert_eq!(style["margin-bottom"], "4px");
+        assert_eq!(style["border-top-width"], "2px");
         assert_eq!(style["--empty"], "");
         for key in ["width", "content", "background", "opacity"] {
             assert!(!style.contains_key(key), "{key}");
@@ -2374,7 +3760,7 @@ mod tests {
         assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
         assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
         let shadows = units.shadows(&style["box-shadow"]);
-        assert_eq!(shadows[0].offset.y, gpui::px(24.));
+        assert_eq!(shadows[0].offset.y, gpui::px(30.));
         assert_eq!(shadows[0].blur_radius, gpui::px(8.));
     }
 
@@ -2411,7 +3797,7 @@ mod tests {
         </style><div class="select2-dropdown bg-mint-500 text-mint-500 border-mint-500"></div></html>"#,
         );
         let style = styles(&doc, 800., 600.).pop().unwrap();
-        for property in ["background-color", "color", "border-color"] {
+        for property in ["background-color", "color", "border-top-color"] {
             assert_eq!(style[property], "oklch(0.72 0.11 178)");
             assert!(color(&style[property]).is_some());
         }
@@ -2420,10 +3806,10 @@ mod tests {
         assert!(!style.contains_key("border-top-left-radius"));
         let paint = Lengths::new(16., 800., 600.).shadows(&style["box-shadow"]);
         assert_eq!(paint.len(), 2);
-        assert_eq!(paint[0].offset, gpui::point(gpui::px(0.), gpui::px(4.)));
-        assert_eq!(paint[0].blur_radius, gpui::px(6.));
-        assert_eq!(paint[0].spread_radius, gpui::px(-1.));
-        assert!((paint[0].color.a - 0.1).abs() < 0.003);
+        assert_eq!(paint[1].offset, gpui::point(gpui::px(0.), gpui::px(4.)));
+        assert_eq!(paint[1].blur_radius, gpui::px(6.));
+        assert_eq!(paint[1].spread_radius, gpui::px(-1.));
+        assert!((paint[1].color.a - 0.1).abs() < 0.003);
     }
 
     #[test]
@@ -2531,7 +3917,7 @@ mod tests {
         let computed = styles(&doc, 800., 600.);
         for (selector, key, value) in [
             (".card", "padding-left", "10px"),
-            (".card", "border-radius", "8px"),
+            (".card", "border-bottom-left-radius", "8px"),
             ("#direct", "margin-top", "0"),
             ("#direct", "background-color", "red"),
             ("#direct", "width", "100px"),
@@ -2548,12 +3934,12 @@ mod tests {
             ("#deep", "background-color"),
             ("#deep", "height"),
             ("#sibling", "width"),
-            ("#outside", "margin-top"),
             ("#outside", "background-color"),
         ] {
             let id = element(&doc, selector);
             assert!(!computed[id].contains_key(key), "{selector} {key}");
         }
+        assert_eq!(computed[element(&doc, "#outside")]["margin-top"], "1em");
     }
 
     #[test]
@@ -2583,7 +3969,7 @@ mod tests {
             ("#inside", "height", "20px"),
             ("#outside", "width", "10px"),
             ("#mixed", "margin-left", "3px"),
-            ("#mixed", "border-radius", "4px"),
+            ("#mixed", "border-top-right-radius", "4px"),
         ] {
             let id = element(&doc, selector);
             assert_eq!(computed[id][key], value, "{selector} {key}");
@@ -2627,7 +4013,7 @@ mod tests {
         assert_eq!(computed[card]["margin-left"], "4px");
         assert_eq!(computed[card]["width"], "60px");
         assert_eq!(computed[card]["max-width"], "11px");
-        assert_eq!(computed[card]["border-radius"], "5px");
+        assert_eq!(computed[card]["border-top-left-radius"], "5px");
         let child = element(&doc, ".child");
         assert_eq!(computed[child]["height"], "30px");
     }
@@ -2745,7 +4131,7 @@ mod tests {
             ));
             let style = styles(&doc, 800., 600.).pop().unwrap();
             assert!(!style.contains_key("height"));
-            assert!(!style.contains_key("display"));
+            assert_eq!(style["display"], "block");
             assert_eq!(style["color"], "blue");
         }
         for import in [
@@ -2839,13 +4225,54 @@ mod tests {
         assert_eq!(style["margin-top"], "-0.5rem");
         assert_eq!(style["margin-left"], "auto");
         assert_eq!(style["margin-right"], "auto");
-        assert_eq!(style["border-width"], "2px");
-        assert_eq!(style["border-color"], "#123456");
+        assert_eq!(style["border-left-width"], "2px");
+        assert_eq!(style["border-bottom-color"], "#123456");
         assert_eq!(style["border-bottom-left-radius"], "12px");
         assert_eq!(style["background-color"], "#abcdef");
         assert_eq!(style["font-size"], "18px");
         assert_eq!(style["font-weight"], "600");
-        assert!(!style.contains_key("padding-top"));
+        assert_eq!(style["padding-top"], "0");
+    }
+
+    #[test]
+    fn tailwind_state_variants_follow_interaction_states() {
+        let mut doc = Document::parse(
+            "<style>@import 'tailwindcss';</style><div class='group bg-[#111111] hover:bg-[#222222] md:hover:text-[#333333]'><span class='first:p-[3px] group-hover:font-bold hover:dark:font-thin'>x</span><b class='first:p-[3px]'>y</b></div>",
+        );
+        let card = element(&doc, "div");
+        let span = element(&doc, "span");
+        let bold = element(&doc, "b");
+        let mut sheets = HashMap::new();
+        let mut cache = StyleCache::default();
+        for hovered in [false, true, false] {
+            doc.nodes[card].state = if hovered { crate::html::HOVER } else { 0 };
+            let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+            let fresh = compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut sheets,
+                &mut StyleCache::default(),
+                None,
+            );
+            assert_eq!(cached.values, fresh.values, "hovered {hovered}");
+            let style = &cached.values[card];
+            assert_eq!(
+                style["background-color"],
+                if hovered { "#222222" } else { "#111111" }
+            );
+            assert_eq!(
+                style.get("color").map(String::as_str),
+                Some(if hovered { "#333333" } else { "#171717" })
+            );
+            assert_eq!(
+                cached.values[span].get("font-weight").map(String::as_str),
+                hovered.then_some("700")
+            );
+            assert_eq!(cached.values[span]["padding-top"], "3px");
+            assert_eq!(cached.values[bold]["padding-top"], "0");
+        }
     }
 
     #[test]

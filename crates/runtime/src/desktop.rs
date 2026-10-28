@@ -315,7 +315,12 @@ impl Desktop {
                             &format!("__appsSetLocation({})", serde_json::json!(location)),
                             "apps:location",
                         )?;
+                        self.host.borrow_mut().dom.entry(id).or_default().base =
+                            url::Url::parse(&location).ok();
                         renderer.eval("__appsSyncBridge()", "apps:bridge")?;
+                        if let Err(error) = renderer.eval("__appsImages(document)", "apps:images") {
+                            eprintln!("apps: {error}");
+                        }
                         for (kind, script) in &scripts {
                             if kind == "module" {
                                 if let Err(error) = renderer.eval(script, "apps:page") {
@@ -705,6 +710,12 @@ impl Render for WebView {
             let modifiers = &event.modifiers;
             Desktop::dispatch(modifier_runtime.clone(), id, "modifiers", &[], serde_json::json!({"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift}), cx);
         });
+        let exit_runtime = runtime.clone();
+        window.on_mouse_event(move |event: &gpui::MouseExitEvent, phase, _, cx| {
+            if phase.capture() {
+                Desktop::dispatch(exit_runtime.clone(), id, "pointerexit", &[], serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y)}), cx);
+            }
+        });
         let up_runtime = runtime.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
             if phase.capture() {
@@ -965,6 +976,8 @@ impl Render for WebView {
                 pixel_ratio: window.scale_factor(),
                 view: self,
                 layers: Rc::default(),
+                path: Rc::default(),
+                flex_parent: false,
                 measured: &measured,
                 inline_text: &inline_text,
             },
@@ -1051,59 +1064,353 @@ fn css_background(
     style: &render::Style,
     units: render::Lengths,
     id: usize,
-    layer: usize,
+    slot: usize,
+    radius: [f32; 4],
     view: gpui::Entity<WebView>,
-) -> AnyElement {
-    let source = style.get("background-image").cloned().unwrap_or_default();
-    let tile = style.get("background-size").cloned().unwrap_or_default();
-    let position = style
-        .get("background-position")
-        .cloned()
-        .unwrap_or_default();
-    gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
-        let (repeating, body) = if let Some(body) = source.strip_prefix("repeating-linear-gradient(") { (true, body) } else if let Some(body) = source.strip_prefix("linear-gradient(") { (false, body) } else { return };
-        let Some(body) = body.strip_suffix(')') else { return };
-        let parts = render::components(body, ',');
-        let Some(angle) = parts.first().and_then(|v| v.trim().strip_suffix("deg")).and_then(|v| v.parse::<f32>().ok()) else { return };
-        let width = f32::from(bounds.size.width);
-        let height = f32::from(bounds.size.height);
-        if width <= 0. || height <= 0. { return; }
-        let dimensions = render::components(&tile, ' ');
-        let tw = dimensions.first().and_then(|v| units.resolve(v, width)).unwrap_or(width).max(0.1);
-        let th = dimensions.get(1).or(dimensions.first()).and_then(|v| units.resolve(v, height)).unwrap_or(height).max(0.1);
-        let positions = render::components(&position, ' ');
-        let x = positions.first().and_then(|v| units.resolve(v, width - tw)).unwrap_or(0.);
-        let y = positions.get(1).and_then(|v| units.resolve(v, height - th)).unwrap_or(0.);
-        let dx = angle.to_radians().sin();
-        let dy = -angle.to_radians().cos();
-        let length = tw * dx.abs() + th * dy.abs();
-        let mut stops = Vec::new();
-        let stop_count = parts.len().saturating_sub(1);
-        for (index, stop) in parts.iter().skip(1).enumerate() {
-            let parts = render::components(stop.trim(), ' ');
-            let Some((color, alpha)) = render::color(parts[0]) else { return };
-            let offset = parts.get(1).and_then(|v| units.resolve(v, length)).unwrap_or(index as f32 * length / (stop_count.max(2) - 1) as f32);
-            stops.push((offset, color, alpha));
+    base: Option<&url::Url>,
+) -> Vec<AnyElement> {
+    let list = |name: &str| {
+        render::components(style.get(name).map_or("", String::as_str), ',')
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let (sizes, positions, repeats) = (
+        list("background-size"),
+        list("background-position"),
+        list("background-repeat"),
+    );
+    let pick = |values: &[String], index: usize| {
+        values
+            .get(index % values.len().max(1))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let corners = gpui::Corners {
+        top_left: px(radius[0]),
+        top_right: px(radius[1]),
+        bottom_right: px(radius[2]),
+        bottom_left: px(radius[3]),
+    };
+    let mut layers = Vec::new();
+    for (index, image) in list("background-image").into_iter().enumerate().rev() {
+        let (size, position, repeat) = (
+            pick(&sizes, index),
+            pick(&positions, index),
+            pick(&repeats, index),
+        );
+        if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
+            if let Some(path) = base
+                .and_then(|base| base.join(source.trim().trim_matches(['"', '\''])).ok())
+                .filter(|url| url.scheme() == "file")
+                .and_then(|url| url.to_file_path().ok())
+            {
+                layers.push(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .overflow_hidden()
+                        .child(img(path).size_full().object_fit(match size.as_str() {
+                            "cover" => gpui::ObjectFit::Cover,
+                            "contain" => gpui::ObjectFit::Contain,
+                            "" | "auto" | "auto auto" => gpui::ObjectFit::None,
+                            _ => gpui::ObjectFit::Fill,
+                        }))
+                        .into_any_element(),
+                );
+            }
+            continue;
         }
-        if stops.len() < 2 { return; }
-        let start = if repeating { stops[0].0 } else { 0. };
-        let period = if repeating { stops.last().unwrap().0 - start } else { length };
-        if period <= 0. { return; }
-        let x1 = tw / 2. - dx * length / 2. + dx * start;
-        let y1 = th / 2. - dy * length / 2. + dy * start;
-        let stops = stops.into_iter().map(|(offset, color, alpha)| format!("<stop offset=\"{}\" stop-color=\"#{color:06x}\" stop-opacity=\"{}\"/>", ((offset - start) / period).clamp(0., 1.), alpha as f32 / 255.)).collect::<String>();
-        let source = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><linearGradient id=\"g\" gradientUnits=\"userSpaceOnUse\" x1=\"{x1}\" y1=\"{y1}\" x2=\"{}\" y2=\"{}\" spreadMethod=\"{}\">{stops}</linearGradient><pattern id=\"p\" patternUnits=\"userSpaceOnUse\" width=\"{tw}\" height=\"{th}\" x=\"{x}\" y=\"{y}\"><rect width=\"{tw}\" height=\"{th}\" fill=\"url(#g)\"/></pattern></defs><rect width=\"100%\" height=\"100%\" fill=\"url(#p)\"/></svg>", x1 + dx * period, y1 + dy * period, if repeating { "repeat" } else { "pad" });
-        let view = view.read(cx);
-        let mut host = view.host.borrow_mut();
-        let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
-        let scale = window.scale_factor();
-        let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
-        let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
-        if backgrounds.get(&(id, layer)).is_none_or(|(old, image)| old != &source || u32::from(image.size(0).width) != rw || u32::from(image.size(0).height) != rh)
-            && let Ok(image) = crate::canvas::svg(&source, rw, rh)
-            && let Some((_, old)) = backgrounds.insert((id, layer), (source, image)) { let _ = window.drop_image(old); }
-        if let Some((_, image)) = backgrounds.get(&(id, layer)) { let _ = window.paint_image(bounds, gpui::Corners::default(), image.clone(), 0, false); }
-    }).absolute().left_0().top_0().size_full().into_any_element()
+        let Some((kind, body)) = image
+            .split_once('(')
+            .filter(|(kind, _)| kind.ends_with("-gradient"))
+            .and_then(|(kind, body)| Some((kind.to_owned(), body.strip_suffix(')')?.to_owned())))
+        else {
+            continue;
+        };
+        let view = view.clone();
+        layers.push(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
+            let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+            if width <= 0. || height <= 0. {
+                return;
+            }
+            let dims = render::components(&size, ' ');
+            let dim = |axis: usize| {
+                let extent = [width, height][axis];
+                match dims.get(axis) {
+                    None | Some(&"auto") => extent,
+                    Some(value) => units.resolve(value, extent).unwrap_or(extent),
+                }
+            };
+            let [tw, th] = if matches!(dims.as_slice(), ["cover"] | ["contain"]) {
+                [width, height]
+            } else {
+                [dim(0).max(0.1), dim(1).max(0.1)]
+            };
+            let tokens = render::components(&position, ' ');
+            let (x, y) = match tokens.as_slice() {
+                [only] if matches!(*only, "top" | "bottom") => ("center", *only),
+                [only] => (*only, "center"),
+                [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
+                [a, b, ..] => (*a, *b),
+                [] => ("0%", "0%"),
+            };
+            let [x, y] = [(x, width - tw), (y, height - th)].map(|(token, free)| match token {
+                "left" | "top" => 0.,
+                "center" => free / 2.,
+                "right" | "bottom" => free,
+                value => units.resolve(value, free).unwrap_or(0.),
+            });
+            let angle = |value: &str| -> Option<f32> {
+                let number = |unit: &str| value.strip_suffix(unit).and_then(|v| v.parse::<f32>().ok());
+                number("deg")
+                    .or_else(|| number("grad").map(|v| v * 0.9))
+                    .or_else(|| number("rad").map(f32::to_degrees))
+                    .or_else(|| number("turn").map(|v| v * 360.))
+                    .or((value == "0").then_some(0.))
+                    .filter(|v| v.is_finite())
+            };
+            let parts = render::components(&body, ',');
+            let first = parts.first().map_or("", |part| part.trim());
+            let repeating = kind.starts_with("repeating-");
+            let extent: f32;
+            let (mut prelude, mut direction, mut center, mut radii, mut from) = (false, (0f32, 0f32), (tw / 2., th / 2.), (0f32, 0f32), 0f32);
+            match kind.trim_start_matches("repeating-") {
+                "linear-gradient" => {
+                    let degrees = if let Some(side) = first.strip_prefix("to ") {
+                        prelude = true;
+                        let has = |name: &str| side.split_whitespace().any(|part| part == name);
+                        let corner = th.atan2(tw).to_degrees();
+                        match (has("top"), has("bottom"), has("left"), has("right")) {
+                            (true, _, false, true) => corner,
+                            (_, true, false, true) => 180. - corner,
+                            (_, true, true, _) => 180. + corner,
+                            (true, _, true, _) => 360. - corner,
+                            (true, ..) => 0.,
+                            (_, true, ..) => 180.,
+                            (_, _, true, _) => 270.,
+                            _ => 90.,
+                        }
+                    } else if let Some(degrees) = angle(first) {
+                        prelude = true;
+                        degrees
+                    } else {
+                        180.
+                    };
+                    direction = (degrees.to_radians().sin(), -degrees.to_radians().cos());
+                    extent = tw * direction.0.abs() + th * direction.1.abs();
+                }
+                "radial-gradient" => {
+                    prelude = ["circle", "ellipse", "at ", "side", "corner"].iter().any(|word| first.contains(word))
+                        || first.starts_with("at")
+                        || !first.is_empty() && render::color(first).is_none() && first.split_whitespace().all(|part| units.resolve(part, tw).is_some());
+                    let (shape, at) = if prelude {
+                        first.split_once("at ").map_or((first, ""), |(shape, at)| (shape.trim(), at.trim()))
+                    } else {
+                        ("", "")
+                    };
+                    let at = render::components(at, ' ');
+                    let (cx, cy) = match at.as_slice() {
+                        [only] if matches!(*only, "top" | "bottom") => ("center", *only),
+                        [only] => (*only, "center"),
+                        [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
+                        [a, b, ..] => (*a, *b),
+                        [] => ("center", "center"),
+                    };
+                    let [cx, cy] = [(cx, tw), (cy, th)].map(|(token, extent)| match token {
+                        "left" | "top" => 0.,
+                        "center" => extent / 2.,
+                        "right" | "bottom" => extent,
+                        value => units.resolve(value, extent).unwrap_or(extent / 2.),
+                    });
+                    center = (cx, cy);
+                    let lengths: Vec<f32> = shape.split_whitespace().filter_map(|part| units.resolve(part, tw)).collect();
+                    let circle = shape.contains("circle") || !shape.contains("ellipse") && lengths.len() == 1;
+                    let sides = [cx.abs(), (tw - cx).abs(), cy.abs(), (th - cy).abs()];
+                    let keyword = ["closest-side", "farthest-side", "closest-corner"].into_iter().find(|word| shape.contains(word));
+                    radii = match (lengths.as_slice(), keyword) {
+                        ([r], _) => (*r, *r),
+                        ([a, b, ..], _) => (*a, *b),
+                        (_, keyword) if circle => {
+                            let corners = [sides[0].hypot(sides[2]), sides[0].hypot(sides[3]), sides[1].hypot(sides[2]), sides[1].hypot(sides[3])];
+                            let r = match keyword {
+                                Some("closest-side") => sides.into_iter().fold(f32::MAX, f32::min),
+                                Some("farthest-side") => sides.into_iter().fold(0., f32::max),
+                                Some(_) => corners.into_iter().fold(f32::MAX, f32::min),
+                                None => corners.into_iter().fold(0., f32::max),
+                            };
+                            (r, r)
+                        }
+                        (_, keyword) => {
+                            let (x, y) = match keyword {
+                                Some("closest-side") | Some("closest-corner") => (sides[0].min(sides[1]), sides[2].min(sides[3])),
+                                _ => (sides[0].max(sides[1]), sides[2].max(sides[3])),
+                            };
+                            if keyword.is_some_and(|word| word.ends_with("side")) {
+                                (x, y)
+                            } else {
+                                (x * std::f32::consts::SQRT_2, y * std::f32::consts::SQRT_2)
+                            }
+                        }
+                    };
+                    extent = radii.0.max(0.01);
+                }
+                "conic-gradient" => {
+                    prelude = first.starts_with("from ") || first.starts_with("at ");
+                    if prelude {
+                        let (start, at) = first.split_once("at ").map_or((first, ""), |(start, at)| (start, at.trim()));
+                        from = start.trim().strip_prefix("from").and_then(|v| angle(v.trim())).unwrap_or(0.);
+                        let at = render::components(at, ' ');
+                        let token = |index: usize, extent: f32| match at.get(index).copied() {
+                            Some("left" | "top") => 0.,
+                            Some("right" | "bottom") => extent,
+                            Some(value) if value != "center" => units.resolve(value, extent).unwrap_or(extent / 2.),
+                            _ => extent / 2.,
+                        };
+                        center = (token(0, tw), token(1, th));
+                    }
+                    extent = 360.;
+                }
+                _ => return,
+            }
+            let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
+            for stop in parts.iter().skip(usize::from(prelude)) {
+                let tokens = render::components(stop.trim(), ' ');
+                let Some(ink) = tokens.iter().find_map(|token| render::color(token)) else {
+                    continue;
+                };
+                let offsets: Vec<f32> = tokens
+                    .iter()
+                    .filter(|token| render::color(token).is_none())
+                    .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token)))
+                    .take(2)
+                    .collect();
+                if offsets.is_empty() {
+                    stops.push((None, ink));
+                }
+                stops.extend(offsets.into_iter().map(|offset| (Some(offset), ink)));
+            }
+            if stops.len() < 2 {
+                return;
+            }
+            let last = stops.len() - 1;
+            stops[0].0.get_or_insert(0.);
+            stops[last].0.get_or_insert(extent);
+            let mut floor = f32::MIN;
+            for stop in &mut stops {
+                if let Some(offset) = &mut stop.0 {
+                    *offset = offset.max(floor);
+                    floor = *offset;
+                }
+            }
+            let mut index = 1;
+            while index < last {
+                if stops[index].0.is_none() {
+                    let end = (index..=last).find(|&end| stops[end].0.is_some()).unwrap_or(last);
+                    let (a, b) = (stops[index - 1].0.unwrap_or(0.), stops[end].0.unwrap_or(extent));
+                    for (step, stop) in stops[index..end].iter_mut().enumerate() {
+                        stop.0 = Some(a + (b - a) * (step + 1) as f32 / (end - index + 1) as f32);
+                    }
+                    index = end;
+                }
+                index += 1;
+            }
+            let offsets: Vec<(f32, (u32, u8))> = stops.into_iter().map(|(offset, ink)| (offset.unwrap_or(0.), ink)).collect();
+            let start = if repeating && !kind.contains("radial") { offsets[0].0 } else { 0. };
+            let period = if repeating { offsets[last].0 - start } else { extent };
+            if period <= 0. {
+                return;
+            }
+            let spread = if repeating { "repeat" } else { "pad" };
+            let svg_stops = offsets
+                .iter()
+                .map(|(offset, (ink, alpha))| {
+                    format!("<stop offset=\"{}\" stop-color=\"#{ink:06x}\" stop-opacity=\"{}\"/>", ((offset - start) / period).clamp(0., 1.), *alpha as f32 / 255.)
+                })
+                .collect::<String>();
+            let content = match kind.trim_start_matches("repeating-") {
+                "linear-gradient" => {
+                    let (dx, dy) = direction;
+                    let x1 = tw / 2. - dx * extent / 2. + dx * start;
+                    let y1 = th / 2. - dy * extent / 2. + dy * start;
+                    format!(
+                        "<defs><linearGradient id=\"g\" gradientUnits=\"userSpaceOnUse\" x1=\"{x1}\" y1=\"{y1}\" x2=\"{}\" y2=\"{}\" spreadMethod=\"{spread}\">{svg_stops}</linearGradient></defs><rect width=\"{tw}\" height=\"{th}\" fill=\"url(#g)\"/>",
+                        x1 + dx * period,
+                        y1 + dy * period
+                    )
+                }
+                "radial-gradient" => {
+                    let (cx, cy) = center;
+                    format!(
+                        "<defs><radialGradient id=\"g\" gradientUnits=\"userSpaceOnUse\" cx=\"{cx}\" cy=\"{cy}\" r=\"{period}\" spreadMethod=\"{spread}\" gradientTransform=\"translate({cx} {cy}) scale(1 {}) translate({} {})\">{svg_stops}</radialGradient></defs><rect width=\"{tw}\" height=\"{th}\" fill=\"url(#g)\"/>",
+                        radii.1 / radii.0.max(0.01),
+                        -cx,
+                        -cy
+                    )
+                }
+                _ => {
+                    let (cx, cy) = center;
+                    let reach = tw.hypot(th) * 2.;
+                    let mut paths = String::new();
+                    for step in 0..180 {
+                        let at = (step as f32 + 0.5) * 2.;
+                        let angle = if repeating { start + (at - start).rem_euclid(period) } else { at };
+                        let next = offsets.iter().position(|(offset, _)| *offset >= angle).unwrap_or(last);
+                        let (a, b) = (offsets[next.saturating_sub(1)], offsets[next]);
+                        let t = if b.0 > a.0 { ((angle - a.0) / (b.0 - a.0)).clamp(0., 1.) } else { 1. };
+                        let mix = |shift: u32| ((((a.1).0 >> shift) & 255) as f32 * (1. - t) + (((b.1).0 >> shift) & 255) as f32 * t).round() as u32;
+                        let ink = mix(16) << 16 | mix(8) << 8 | mix(0);
+                        let alpha = ((a.1).1 as f32 * (1. - t) + (b.1).1 as f32 * t) / 255.;
+                        let [start, end] = [from + step as f32 * 2. - 0.3, from + step as f32 * 2. + 2.3].map(f32::to_radians);
+                        paths.push_str(&format!(
+                            "<path d=\"M{cx} {cy}L{} {}L{} {}Z\" fill=\"#{ink:06x}\" fill-opacity=\"{alpha}\"/>",
+                            cx + reach * start.sin(),
+                            cy - reach * start.cos(),
+                            cx + reach * end.sin(),
+                            cy - reach * end.cos()
+                        ));
+                    }
+                    format!("<defs><clipPath id=\"c\"><rect width=\"{tw}\" height=\"{th}\"/></clipPath></defs><g clip-path=\"url(#c)\">{paths}</g>")
+                }
+            };
+            let body = match repeat.split_whitespace().next().unwrap_or("repeat") {
+                "no-repeat" => format!("<g transform=\"translate({x} {y})\">{content}</g>"),
+                kind => {
+                    let rect = match kind {
+                        "repeat-x" => format!("x=\"0\" y=\"{y}\" width=\"100%\" height=\"{th}\""),
+                        "repeat-y" => format!("x=\"{x}\" y=\"0\" width=\"{tw}\" height=\"100%\""),
+                        _ => "width=\"100%\" height=\"100%\"".into(),
+                    };
+                    format!("<defs><pattern id=\"p\" patternUnits=\"userSpaceOnUse\" width=\"{tw}\" height=\"{th}\" x=\"{x}\" y=\"{y}\">{content}</pattern></defs><rect {rect} fill=\"url(#p)\"/>")
+                }
+            };
+            let source = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>");
+            let view = view.read(cx);
+            let mut host = view.host.borrow_mut();
+            let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
+            let scale = window.scale_factor();
+            let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
+            let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
+            let key = (id, slot * 64 + index);
+            if backgrounds.get(&key).is_none_or(|(old, image)| old != &source || u32::from(image.size(0).width) != rw || u32::from(image.size(0).height) != rh)
+                && let Ok(image) = crate::canvas::svg(&source, rw, rh)
+                && let Some((_, old)) = backgrounds.insert(key, (source, image))
+            {
+                let _ = window.drop_image(old);
+            }
+            if let Some((_, image)) = backgrounds.get(&key) {
+                let _ = window.paint_image(bounds, corners, image.clone(), 0, false);
+            }
+        })
+        .absolute()
+        .left_0()
+        .top_0()
+        .size_full()
+        .into_any_element());
+    }
+    layers
 }
 
 struct DomBox {
@@ -1114,6 +1421,7 @@ struct DomBox {
     id: usize,
     view: gpui::Entity<WebView>,
     sticky: Option<(gpui::ScrollHandle, [f32; 4])>,
+    fixed: bool,
     inset: [Option<f32>; 4],
     translate: Vec<[String; 2]>,
     units: render::Lengths,
@@ -1216,6 +1524,20 @@ impl gpui::Element for DomBox {
             }
             bounds.origin += offset;
         }
+        if self.fixed {
+            let viewport = window.viewport_size();
+            if let Some(left) = self.inset[3] {
+                offset.x = px(left) - bounds.left();
+            } else if let Some(right) = self.inset[1] {
+                offset.x = viewport.width - px(right) - bounds.right();
+            }
+            if let Some(top) = self.inset[0] {
+                offset.y = px(top) - bounds.top();
+            } else if let Some(bottom) = self.inset[2] {
+                offset.y = viewport.height - px(bottom) - bounds.bottom();
+            }
+            bounds.origin += offset;
+        }
         for [x, y] in &self.translate {
             let translation = point(
                 px(self
@@ -1291,6 +1613,7 @@ fn paint_text(
     window.paint_layer(
         Bounds::new(origin, size(line.width, line_height * (wraps.len() + 1))),
         |window| {
+            let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
             let mut start = 0;
             let mut left = px(0.);
             for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
@@ -1320,10 +1643,47 @@ fn paint_text(
                         ));
                     }
                 }
+                let mut run_start = 0;
+                for run in runs {
+                    if run_start >= offset + end {
+                        break;
+                    }
+                    let (a, b) = (
+                        run_start.max(offset + start),
+                        (run_start + run.len).min(offset + end),
+                    );
+                    run_start += run.len;
+                    if a >= b || run.underline.is_none() && run.strikethrough.is_none() {
+                        continue;
+                    }
+                    let x = line.x_for_index(a - offset);
+                    let end_x = if b == offset + end {
+                        right
+                    } else {
+                        line.x_for_index(b - offset)
+                    };
+                    let top = origin.y + line_height * row;
+                    if let Some(underline) = &run.underline {
+                        window.paint_underline(
+                            point(origin.x + x - left, top + baseline + line.descent * 0.618),
+                            end_x - x,
+                            underline,
+                        );
+                    }
+                    if let Some(strikethrough) = &run.strikethrough {
+                        window.paint_strikethrough(
+                            point(
+                                origin.x + x - left,
+                                top + (line.ascent * 0.5 + baseline) * 0.5,
+                            ),
+                            end_x - x,
+                            strikethrough,
+                        );
+                    }
+                }
                 start = end;
                 left = right;
             }
-            let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
             let mut wrap = 0;
             let mut left = px(0.);
             let mut run_index = 0;
@@ -1392,7 +1752,7 @@ impl IntoElement for InlineText {
 
 impl gpui::Element for InlineText {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = Vec<(gpui::Hitbox, gpui::CursorStyle)>;
     fn id(&self) -> Option<gpui::ElementId> {
         None
     }
@@ -1416,9 +1776,33 @@ impl gpui::Element for InlineText {
         state: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Self::PrepaintState {
         self.inner
             .prepaint(id, inspector, bounds, state, window, cx);
+        let layout = self.inner.layout();
+        let hitboxes = self
+            .data
+            .cursors
+            .iter()
+            .filter_map(|&(index, cursor)| {
+                let range = &self.data.ranges.get(index)?.1;
+                let (a, b) = layout
+                    .position_for_index(range.start)
+                    .zip(layout.position_for_index(range.end))?;
+                let rect = if a.y == b.y {
+                    Bounds::new(a, size(b.x - a.x, layout.line_height()))
+                } else {
+                    Bounds::new(
+                        point(bounds.left(), a.y),
+                        size(bounds.size.width, b.y - a.y + layout.line_height()),
+                    )
+                };
+                Some((
+                    window.insert_hitbox(rect, gpui::HitboxBehavior::Normal),
+                    cursor,
+                ))
+            })
+            .collect();
         let view = self.view.read(cx);
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
@@ -1449,6 +1833,7 @@ impl gpui::Element for InlineText {
                     .insert(*id, (layout.clone(), self.data.text.clone(), range.clone()));
             }
         }
+        hitboxes
     }
     fn paint(
         &mut self,
@@ -1456,10 +1841,13 @@ impl gpui::Element for InlineText {
         _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut (),
-        _: &mut (),
+        hitboxes: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
+        for (hitbox, cursor) in hitboxes.iter() {
+            window.set_cursor_style(*cursor, hitbox);
+        }
         let mut highlights = Vec::new();
         {
             let view = self.view.read(cx);
@@ -1567,12 +1955,22 @@ impl gpui::Element for InlineText {
     }
 }
 
-type PaintLayers = Rc<RefCell<Vec<(i32, Rc<RefCell<AnyElement>>, gpui::ContentMask<Pixels>)>>>;
+type PaintLayers = Rc<
+    RefCell<
+        Vec<(
+            i32,
+            Rc<RefCell<AnyElement>>,
+            gpui::ContentMask<Pixels>,
+            Rc<[usize]>,
+        )>,
+    >,
+>;
 
 struct Stacked {
     inner: Option<AnyElement>,
     layers: PaintLayers,
     order: i32,
+    path: Rc<[usize]>,
 }
 
 impl IntoElement for Stacked {
@@ -1612,9 +2010,12 @@ impl gpui::Element for Stacked {
         cx: &mut App,
     ) {
         inner.borrow_mut().prepaint(window, cx);
-        self.layers
-            .borrow_mut()
-            .push((self.order, inner.clone(), window.content_mask()));
+        self.layers.borrow_mut().push((
+            self.order,
+            inner.clone(),
+            window.content_mask(),
+            self.path.clone(),
+        ));
     }
     fn paint(
         &mut self,
@@ -1629,18 +2030,30 @@ impl gpui::Element for Stacked {
     }
 }
 
+/// Re-enters the element id scopes between a stacking root and a stacked element, so paint sees the prepaint ids.
+fn with_path(path: &[usize], window: &mut Window, paint: &mut dyn FnMut(&mut Window)) {
+    match path.split_first() {
+        Some((&id, rest)) => window.with_element_namespace(
+            gpui::ElementId::Name(format!("dom-{id}").into()),
+            |window| window.with_element_namespace(id, |window| with_path(rest, window, paint)),
+        ),
+        None => paint(window),
+    }
+}
+
 fn paint_layers(layers: PaintLayers, negative: bool) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
         move |_, _, window, cx| {
             let mut layers = layers.borrow_mut();
-            layers.sort_by_key(|(order, _, _)| *order);
-            for (_, inner, mask) in layers
-                .iter()
-                .filter(|(order, _, _)| (*order < 0) == negative)
+            layers.sort_by_key(|(order, ..)| *order);
+            for (_, inner, mask, path) in
+                layers.iter().filter(|(order, ..)| (*order < 0) == negative)
             {
                 window.with_content_mask(Some(mask.clone()), |window| {
-                    inner.borrow_mut().paint(window, cx)
+                    with_path(path, window, &mut |window| {
+                        inner.borrow_mut().paint(window, cx)
+                    })
                 });
             }
         },
@@ -1657,6 +2070,8 @@ struct Build<'a> {
     pixel_ratio: f32,
     view: &'a WebView,
     layers: PaintLayers,
+    path: Rc<[usize]>,
+    flex_parent: bool,
     measured: &'a RefCell<crate::grid::Measurements>,
     inline_text: &'a RefCell<HashMap<usize, Option<Rc<render::InlineText>>>>,
 }
@@ -1676,11 +2091,21 @@ fn element(
         pixel_ratio,
         view,
         ref layers,
+        ref path,
+        flex_parent,
         measured,
         inline_text,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
+    let display = style.get("display").map_or(
+        if node.tag.starts_with('#') && node.tag != "#text" {
+            "block"
+        } else {
+            "inline"
+        },
+        String::as_str,
+    );
     let order = style
         .get("z-index")
         .and_then(|value| value.parse::<i32>().ok());
@@ -1689,6 +2114,9 @@ fn element(
         || style
             .get("isolation")
             .is_some_and(|value| value == "isolate")
+        || style
+            .get("position")
+            .is_some_and(|value| matches!(value.as_str(), "fixed" | "sticky"))
         || positioned && order.is_some()
         || style.get("transform").is_some_and(|value| value != "none")
         || style
@@ -1708,6 +2136,12 @@ fn element(
         } else {
             layers.clone()
         },
+        path: if stacking {
+            Rc::default()
+        } else {
+            path.iter().copied().chain([id]).collect()
+        },
+        flex_parent: matches!(display, "flex" | "inline-flex"),
     };
     let build = &child_build;
     let mut units = styles.lengths[id];
@@ -1728,33 +2162,53 @@ fn element(
         .id(id)
         .flex()
         .flex_col()
-        .flex_shrink_0()
         .text_size(px(units.font.em))
         .font_family(face.family)
         .font_weight(face.weight)
         .line_height(px(units.font.lh));
+    el.style().flex_shrink = Some(if flex_parent { 1. } else { 0. });
+    if face.style != gpui::FontStyle::Normal {
+        el.text_style()
+            .get_or_insert_with(Default::default)
+            .font_style = Some(face.style);
+    }
+    if node.tag == "br" {
+        return div().w_full().h(px(0.)).into_any_element();
+    }
     if stacking {
         el = el.child(paint_layers(build.layers.clone(), true));
     }
-    if !node.children.is_empty()
-        && node.children.iter().all(|child| {
-            matches!(
-                doc.nodes[*child].tag.as_str(),
-                "#text" | "span" | "strong" | "b" | "em" | "i" | "a" | "code" | "small" | "br"
-            )
-        })
-    {
-        el = el.flex_row().flex_wrap();
-        if !style
+    let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
+    let mut flat = Vec::new();
+    let mut pending: Vec<usize> = node.children.iter().rev().copied().collect();
+    while let Some(child) = pending.pop() {
+        if styles.values[child]
             .get("display")
-            .is_some_and(|value| matches!(value.as_str(), "flex" | "grid"))
+            .is_some_and(|value| value == "contents")
         {
-            el = match style.get("text-align").map(String::as_str) {
-                Some("right" | "end") => el.justify_end(),
-                Some("center") => el.justify_center(),
-                _ => el,
-            };
+            pending.extend(doc.nodes[child].children.iter().rev());
+        } else if doc.nodes[child].tag != "#comment" {
+            flat.push(child);
         }
+    }
+    let inline_level = |child: usize| {
+        doc.nodes[child].tag.starts_with('#')
+            || styles.values[child]
+                .get("display")
+                .is_none_or(|value| value.starts_with("inline"))
+            || styles.values[child]
+                .get("position")
+                .is_some_and(|value| matches!(value.as_str(), "absolute" | "fixed"))
+    };
+    let all_inline = flow && !flat.is_empty() && flat.iter().all(|&child| inline_level(child));
+    let line_justify = match style.get("text-align").map(String::as_str) {
+        Some("right" | "end") => Some(gpui::JustifyContent::End),
+        Some("center" | "-webkit-center") => Some(gpui::JustifyContent::Center),
+        _ => None,
+    };
+    if all_inline || display == "inline" {
+        el = el.flex_row().flex_wrap();
+        el.style().justify_content = line_justify;
     }
     if node.tag == "canvas" {
         el = el
@@ -1792,15 +2246,82 @@ fn element(
             .cloned()
         {
             let size = image.size(0);
-            if !style.contains_key("width") {
-                el = el.w(px(u32::from(size.width) as f32));
+            let natural = [u32::from(size.width) as f32, u32::from(size.height) as f32];
+            let attr = |name: &str| {
+                node.attrs
+                    .get(name)
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| value.is_finite() && *value >= 0.)
+            };
+            let auto = |name: &str| style.get(name).is_none_or(|value| value == "auto");
+            if natural[1] > 0. {
+                el.style().aspect_ratio = Some(natural[0] / natural[1]);
             }
-            if !style.contains_key("height") {
-                el = el.h(px(u32::from(size.height) as f32));
+            match (auto("width"), auto("height"), attr("width"), attr("height")) {
+                (true, _, Some(width), _) => el = el.w(px(width)),
+                (true, true, None, None) => el = el.w(px(natural[0])),
+                _ => {}
             }
-            el = el.child(img(image).size_full());
-        } else if let Some(source) = node.attrs.get("src") {
-            el = el.child(img(source.clone()).size_full());
+            if auto("height")
+                && let Some(height) = attr("height")
+            {
+                el = el.h(px(height));
+            }
+            el = el.child(img(image).size_full().object_fit(
+                match style.get("object-fit").map(String::as_str) {
+                    Some("contain") => gpui::ObjectFit::Contain,
+                    Some("cover") => gpui::ObjectFit::Cover,
+                    Some("none") => gpui::ObjectFit::None,
+                    Some("scale-down") => gpui::ObjectFit::ScaleDown,
+                    _ => gpui::ObjectFit::Fill,
+                },
+            ));
+        } else if let Some(path) = node.attrs.get("src").and_then(|source| {
+            let base = view
+                .host
+                .borrow()
+                .dom
+                .get(&view.id)
+                .and_then(|state| state.base.clone())?;
+            base.join(source)
+                .ok()
+                .filter(|url| url.scheme() == "file")?
+                .to_file_path()
+                .ok()
+        }) {
+            let auto = |name: &str| style.get(name).is_none_or(|value| value == "auto");
+            for (name, horizontal) in [("width", true), ("height", false)] {
+                if auto(name)
+                    && let Some(length) = node
+                        .attrs
+                        .get(name)
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.)
+                {
+                    el = if horizontal {
+                        el.w(px(length))
+                    } else {
+                        el.h(px(length))
+                    };
+                }
+            }
+            let sized = [
+                !auto("width") || node.attrs.contains_key("width"),
+                !auto("height") || node.attrs.contains_key("height"),
+            ];
+            let image = img(path).object_fit(match style.get("object-fit").map(String::as_str) {
+                Some("contain") => gpui::ObjectFit::Contain,
+                Some("cover") => gpui::ObjectFit::Cover,
+                Some("none") => gpui::ObjectFit::None,
+                Some("scale-down") => gpui::ObjectFit::ScaleDown,
+                _ => gpui::ObjectFit::Fill,
+            });
+            el = el.overflow_hidden().child(match sized {
+                [true, true] => image.size_full(),
+                [true, false] => image.w_full(),
+                [false, true] => image.h_full(),
+                _ => image,
+            });
         }
     }
     if node.tag == "svg" {
@@ -1949,18 +2470,42 @@ fn element(
     if node.tag == "iframe" {
         el = el.min_w(px(300.)).min_h(px(150.));
     }
-    let editable = matches!(node.tag.as_str(), "input" | "textarea");
+    let input =
+        (node.tag == "input").then(|| node.attrs.get("type").map_or("text", String::as_str));
+    let check = input.is_some_and(|kind| {
+        kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
+    });
+    let editable = node.tag == "textarea"
+        || input.is_some_and(|kind| {
+            ![
+                "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
+                "range", "hidden",
+            ]
+            .iter()
+            .any(|other| kind.eq_ignore_ascii_case(other))
+        });
+    if input.is_some_and(|kind| {
+        ["button", "submit", "reset"]
+            .iter()
+            .any(|other| kind.eq_ignore_ascii_case(other))
+    }) {
+        el = el.items_center().justify_center().child(SharedString::from(
+            node.attrs.get("value").cloned().unwrap_or_else(|| {
+                if input == Some("reset") {
+                    "Reset".into()
+                } else if input == Some("submit") {
+                    "Submit".into()
+                } else {
+                    String::new()
+                }
+            }),
+        ));
+    }
     if editable {
         if !style.contains_key("width") {
             el = el.w(px(180.));
         }
-        if !style.contains_key("height") {
-            el = el.min_h(px(if node.tag == "textarea" {
-                80.
-            } else {
-                units.font.lh
-            }));
-        }
+
         let text = node.attrs.get("value").cloned().unwrap_or_else(|| {
             if node.tag == "textarea" {
                 doc.text(id)
@@ -2080,14 +2625,16 @@ fn element(
     }
     if let Some(color) = style
         .get("background-color")
-        .or_else(|| style.get("background"))
         .and_then(|s| render::color(s))
+        .filter(|(_, alpha)| *alpha > 0)
     {
         let color = rgba((color.0 << 8) | color.1 as u32);
-        if matches!(
-            node.tag.as_str(),
-            "span" | "strong" | "b" | "em" | "i" | "a" | "code" | "small"
-        ) && style.get("display").is_none_or(|value| value == "inline")
+        if display == "inline"
+            && !node.tag.starts_with('#')
+            && !matches!(
+                node.tag.as_str(),
+                "img" | "svg" | "canvas" | "input" | "button" | "select" | "textarea" | "iframe"
+            )
             && !style
                 .get("position")
                 .is_some_and(|value| value == "absolute")
@@ -2128,89 +2675,6 @@ fn element(
             el = el.bg(color);
         }
     }
-    if style.contains_key("background-image") {
-        el = el.child(css_background(style, units, id, 0, cx.entity()));
-    }
-    if let Some(pseudos) = styles.pseudos.get(&id) {
-        for (index, pseudo) in pseudos.iter().enumerate() {
-            let Some(content) = pseudo
-                .get("content")
-                .filter(|v| !matches!(v.as_str(), "none" | "normal"))
-            else {
-                continue;
-            };
-            let mut decoration = div().relative();
-            if pseudo.get("position").is_some_and(|v| v == "absolute") {
-                decoration = decoration.absolute();
-            }
-            for (name, value) in pseudo {
-                let base = if matches!(name.as_str(), "height" | "top" | "bottom") {
-                    containing[1]
-                } else {
-                    containing[0]
-                };
-                match name.as_str() {
-                    "width" | "height" | "min-width" => {
-                        let length: gpui::Length = if let Some(percent) =
-                            value.strip_suffix('%').and_then(|v| v.parse::<f32>().ok())
-                        {
-                            relative(percent / 100.).into()
-                        } else if let Some(value) = units.resolve(value, base) {
-                            px(value).into()
-                        } else {
-                            continue;
-                        };
-                        decoration = match name.as_str() {
-                            "width" => decoration.w(length),
-                            "height" => decoration.h(length),
-                            _ => decoration.min_w(length),
-                        };
-                    }
-                    "left" | "top" | "right" | "bottom" => {
-                        if let Some(value) = units.resolve(value, base) {
-                            decoration = match name.as_str() {
-                                "left" => decoration.left(px(value)),
-                                "top" => decoration.top(px(value)),
-                                "right" => decoration.right(px(value)),
-                                _ => decoration.bottom(px(value)),
-                            };
-                        }
-                    }
-                    "background-color" => {
-                        if let Some((color, alpha)) = render::color(value) {
-                            decoration = decoration.bg(rgba(color << 8 | alpha as u32));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if pseudo.contains_key("background-image") {
-                decoration =
-                    decoration.child(css_background(pseudo, units, id, index + 1, cx.entity()));
-            }
-            let content = content.trim_matches(['\"', '\'']);
-            if !content.is_empty() {
-                decoration = decoration.child(SharedString::from(content.to_owned()));
-            }
-            let order = pseudo
-                .get("z-index")
-                .and_then(|value| value.parse::<i32>().ok())
-                .unwrap_or(0);
-            if order != 0
-                && pseudo
-                    .get("position")
-                    .is_some_and(|value| value != "static")
-            {
-                el = el.child(Stacked {
-                    inner: Some(decoration.into_any_element()),
-                    layers: build.layers.clone(),
-                    order,
-                });
-            } else {
-                el = el.child(decoration);
-            }
-        }
-    }
     let padding = units
         .edges(style, "padding", containing[0])
         .map(|value| value.max(0.));
@@ -2219,7 +2683,126 @@ fn element(
         .pr(px(padding[1]))
         .pb(px(padding[2]))
         .pl(px(padding[3]));
-    let margin = units.edges(style, "margin", containing[0]);
+    let mut margin = units.edges(style, "margin", containing[0]);
+    let edge = |id: usize, name: &str| {
+        styles.values[id]
+            .get(name)
+            .and_then(|value| styles.lengths[id].resolve(value, containing[0]))
+            .unwrap_or(0.)
+    };
+    let in_flow = |id: usize| {
+        let (node, style) = (&doc.nodes[id], &styles.values[id]);
+        node.tag != "#comment"
+            && !(node.tag == "#text" && node.text.trim().is_empty())
+            && style.get("display").is_none_or(|value| value != "none")
+            && style
+                .get("position")
+                .is_none_or(|value| !matches!(value.as_str(), "absolute" | "fixed"))
+    };
+    let block = |id: usize| {
+        !doc.nodes[id].tag.starts_with('#')
+            && styles.values[id]
+                .get("display")
+                .is_some_and(|value| !value.starts_with("inline") && value != "contents")
+    };
+    // WARNING: margins only collapse through plain block boxes; flex/grid items and scroll containers keep their own.
+    let collapses = |id: usize, side: usize| {
+        let style = &styles.values[id];
+        let [padding, border, kind] = if side == 0 {
+            ["padding-top", "border-top-width", "border-top-style"]
+        } else {
+            [
+                "padding-bottom",
+                "border-bottom-width",
+                "border-bottom-style",
+            ]
+        };
+        id != 0
+            && doc.nodes[id].tag != "html"
+            && doc.nodes[id].parent.is_none_or(|parent| {
+                !styles.values[parent].get("display").is_some_and(|value| {
+                    matches!(
+                        value.as_str(),
+                        "flex" | "inline-flex" | "grid" | "inline-grid"
+                    )
+                })
+            })
+            && style
+                .get("display")
+                .is_some_and(|value| matches!(value.as_str(), "block" | "list-item"))
+            && ["overflow-x", "overflow-y"]
+                .iter()
+                .all(|key| style.get(*key).is_none_or(|value| value == "visible"))
+            && style
+                .get("position")
+                .is_none_or(|value| !matches!(value.as_str(), "absolute" | "fixed"))
+            && edge(id, padding) == 0.
+            && (edge(id, border) == 0.
+                || style
+                    .get(kind)
+                    .is_none_or(|value| matches!(value.as_str(), "none" | "hidden")))
+            && (side == 0 || style.get("height").is_none_or(|value| value == "auto"))
+    };
+    if block(id)
+        && in_flow(id)
+        && slot.is_none()
+        && !flex_parent
+        && let Some(parent) = node.parent
+    {
+        let siblings: Vec<usize> = doc.nodes[parent]
+            .children
+            .iter()
+            .copied()
+            .filter(|&child| in_flow(child))
+            .collect();
+        let index = siblings.iter().position(|&child| child == id);
+        if let Some(previous) = index
+            .and_then(|index| index.checked_sub(1))
+            .map(|index| siblings[index])
+            .filter(|&previous| block(previous))
+        {
+            let (a, b) = (margin[0], edge(previous, "margin-bottom"));
+            margin[0] = if a >= 0. && b >= 0. {
+                a.max(b)
+            } else if a < 0. && b < 0. {
+                a.min(b)
+            } else {
+                a + b
+            } - b;
+        }
+        if index == Some(0)
+            && margin[0] >= 0.
+            && edge(parent, "margin-top") >= 0.
+            && collapses(parent, 0)
+        {
+            margin[0] = 0.;
+        }
+        if index.is_some_and(|index| index + 1 == siblings.len())
+            && margin[2] >= 0.
+            && edge(parent, "margin-bottom") >= 0.
+            && collapses(parent, 2)
+        {
+            margin[2] = 0.;
+        }
+    }
+    let children: Vec<usize> = node
+        .children
+        .iter()
+        .copied()
+        .filter(|&child| in_flow(child))
+        .collect();
+    if let Some(&first) = children
+        .first()
+        .filter(|&&first| block(first) && margin[0] >= 0. && collapses(id, 0))
+    {
+        margin[0] = margin[0].max(edge(first, "margin-top"));
+    }
+    if let Some(&last) = children
+        .last()
+        .filter(|&&last| block(last) && margin[2] >= 0. && collapses(id, 2))
+    {
+        margin[2] = margin[2].max(edge(last, "margin-bottom"));
+    }
     el = el
         .mt(px(margin[0]))
         .mr(px(margin[1]))
@@ -2238,151 +2821,300 @@ fn element(
             };
         }
     }
+    let ink = render::color(&style["color"]).map_or(rgba(0x000000ff), |(ink, alpha)| {
+        rgba(ink << 8 | alpha as u32)
+    });
+    let sides = [
+        ("border-top-width", "border-top-style", "border-top-color"),
+        (
+            "border-right-width",
+            "border-right-style",
+            "border-right-color",
+        ),
+        (
+            "border-bottom-width",
+            "border-bottom-style",
+            "border-bottom-color",
+        ),
+        (
+            "border-left-width",
+            "border-left-style",
+            "border-left-color",
+        ),
+    ];
+    let borders = sides.map(|(width, kind, _)| {
+        if style
+            .get(kind)
+            .is_none_or(|kind| matches!(kind.as_str(), "none" | "hidden"))
+        {
+            return 0.;
+        }
+        style
+            .get(width)
+            .map_or(Some(3.), |width| units.resolve(width, containing[0]))
+            .unwrap_or(0.)
+            .max(0.)
+    });
+    let border_colors = sides.map(|(_, _, name)| {
+        style
+            .get(name)
+            .and_then(|value| render::color(value))
+            .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
+    });
+    el = el
+        .border_t(px(borders[0]))
+        .border_r(px(borders[1]))
+        .border_b(px(borders[2]))
+        .border_l(px(borders[3]));
+    let visible = (0..4)
+        .filter(|&side| borders[side] > 0.)
+        .collect::<Vec<_>>();
+    if let Some(&first) = visible.first() {
+        if visible
+            .iter()
+            .all(|&side| border_colors[side] == border_colors[first])
+        {
+            el = el.border_color(border_colors[first]);
+        } else {
+            el = el.border_color(gpui::transparent_black());
+        }
+        if visible.iter().any(|&side| {
+            style
+                .get(sides[side].1)
+                .is_some_and(|kind| matches!(kind.as_str(), "dashed" | "dotted"))
+        }) {
+            el.style().border_style = Some(gpui::BorderStyle::Dashed);
+        }
+    }
+    let extra = if style
+        .get("box-sizing")
+        .is_some_and(|value| value == "border-box")
+    {
+        [0.; 2]
+    } else {
+        [
+            padding[1] + padding[3] + borders[1] + borders[3],
+            padding[0] + padding[2] + borders[0] + borders[2],
+        ]
+    };
+    if editable && style.get("height").is_none_or(|value| value == "auto") {
+        el = el.min_h(px(if node.tag == "textarea" {
+            2. * units.font.lh
+        } else {
+            units.font.lh
+        } + extra[1]));
+    }
+    let flexbox = matches!(display, "flex" | "inline-flex");
+    let position = style.get("position").map_or("static", String::as_str);
+    let mut radius = [0.; 4];
+    let mut intrinsic_width = None;
     for (name, value) in
         style.range::<str, _>((std::ops::Bound::Included("a"), std::ops::Bound::Unbounded))
     {
         let value = value.as_str();
-        let base = if name.ends_with("height") {
-            containing[1]
-        } else {
-            containing[0]
-        };
+        let vertical = name.ends_with("height") || matches!(name.as_str(), "top" | "bottom");
+        let base = containing[usize::from(vertical)];
         let length = || units.resolve(value, base);
         match name.as_str() {
-            "width" => {
-                el = if let Some(percent) = value
-                    .strip_suffix('%')
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                {
-                    el.w(relative(percent.max(0.) / 100.))
-                } else if value == "auto" {
-                    el.w_auto()
-                } else if let Some(length) = length() {
-                    el.w(px(length.max(0.)))
-                } else {
-                    el
-                }
-            }
-            "height" => {
-                el = if let Some(percent) = value
-                    .strip_suffix('%')
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                {
-                    el.h(relative(percent.max(0.) / 100.))
-                } else if value == "auto" {
-                    el.h_auto()
-                } else if let Some(length) = length() {
-                    el.h(px(length.max(0.)))
-                } else {
-                    el
-                }
-            }
-            "min-width" | "max-width" | "min-height" | "max-height" => {
+            "width" | "height" | "min-width" | "max-width" | "min-height" | "max-height" => {
+                let axis = usize::from(vertical);
                 let length: gpui::Length = if let Some(percent) = value
                     .strip_suffix('%')
                     .and_then(|s| s.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    relative(percent.max(0.) / 100.).into()
+                    if extra[axis] > 0. && base > 0. {
+                        px(percent.max(0.) / 100. * base + extra[axis]).into()
+                    } else {
+                        relative(percent.max(0.) / 100.).into()
+                    }
                 } else if let Some(length) = length() {
-                    px(length.max(0.)).into()
+                    px(length.max(0.) + extra[axis]).into()
+                } else if matches!(name.as_str(), "width" | "height") && value == "auto" {
+                    gpui::Length::Auto
+                } else if matches!(value, "stretch" | "-webkit-fill-available") {
+                    relative(1.).into()
+                } else if matches!(value, "fit-content" | "max-content" | "min-content")
+                    && axis == 0
+                {
+                    let [min, max, ..] = crate::grid::intrinsic(
+                        doc,
+                        id,
+                        styles,
+                        Some(containing[0]),
+                        None,
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    let size = match value {
+                        "min-content" => min,
+                        "max-content" => max,
+                        _ => max.min(min.max(containing[0])),
+                    };
+                    intrinsic_width = Some((size - margin[1] - margin[3]).max(0.));
+                    px((size - margin[1] - margin[3]).max(0.)).into()
                 } else {
                     continue;
                 };
                 el = match name.as_str() {
+                    "width" => el.w(length),
+                    "height" => el.h(length),
                     "min-width" => el.min_w(length),
                     "max-width" => el.max_w(length),
                     "min-height" => el.min_h(length),
                     _ => el.max_h(length),
                 };
             }
-            "gap"
-            | "row-gap"
-            | "column-gap"
-            | "border-top-left-radius"
+            "row-gap" | "column-gap" if flexbox => {
+                let Some(length) = length() else { continue };
+                el = if name == "row-gap" {
+                    el.gap_y(px(length.max(0.)))
+                } else {
+                    el.gap_x(px(length.max(0.)))
+                };
+            }
+            "border-top-left-radius"
             | "border-top-right-radius"
             | "border-bottom-right-radius"
-            | "border-bottom-left-radius"
-            | "border-width"
-            | "border-top-width"
-            | "border-right-width"
-            | "border-bottom-width"
-            | "border-left-width" => {
-                let Some(length) = length() else { continue };
-                let length = px(length.max(0.));
-                el = match name.as_str() {
-                    "gap" => el.gap(length),
-                    "row-gap" => el.gap_y(length),
-                    "column-gap" => el.gap_x(length),
-                    "border-top-left-radius" => el.rounded_tl(length),
-                    "border-top-right-radius" => el.rounded_tr(length),
-                    "border-bottom-right-radius" => el.rounded_br(length),
-                    "border-bottom-left-radius" => el.rounded_bl(length),
-                    "border-top-width" => el.border_t(length),
-                    "border-right-width" => el.border_r(length),
-                    "border-bottom-width" => el.border_b(length),
-                    "border-left-width" => el.border_l(length),
-                    _ => el.border(length),
+            | "border-bottom-left-radius" => {
+                let own = style
+                    .get("width")
+                    .and_then(|width| units.resolve(width, containing[0]))
+                    .unwrap_or(containing[0]);
+                let Some(length) = units.resolve(value, own) else {
+                    continue;
+                };
+                let length = length.max(0.);
+                let corner = match name.as_str() {
+                    "border-top-left-radius" => 0,
+                    "border-top-right-radius" => 1,
+                    "border-bottom-right-radius" => 2,
+                    _ => 3,
+                };
+                radius[corner] = length;
+                el = match corner {
+                    0 => el.rounded_tl(px(length)),
+                    1 => el.rounded_tr(px(length)),
+                    2 => el.rounded_br(px(length)),
+                    _ => el.rounded_bl(px(length)),
                 };
             }
             "box-shadow" => el.style().box_shadow = Some(units.shadows(value)),
-            "border-color" => {
-                if let Some((ink, a)) = render::color(value) {
-                    el = el.border_color(rgba((ink << 8) | a as u32));
+            "aspect-ratio" => {
+                let value = value.replace('/', " / ");
+                let parts = render::components(&value, ' ');
+                let numbers: Vec<f32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
+                let ratio = match numbers.as_slice() {
+                    [a, b, ..] if parts.contains(&"/") => a / b,
+                    [a, ..] => *a,
+                    _ => continue,
+                };
+                if ratio.is_finite() && ratio > 0. {
+                    el.style().aspect_ratio = Some(ratio);
                 }
             }
-            "display" if value == "grid" => el = el.grid(),
-            "display" if value == "flex" => el = el.flex().flex_row(),
-            "flex-direction" if value == "column" => el = el.flex_col(),
-            "flex-wrap" if value == "wrap" => el = el.flex_wrap(),
-            "flex-wrap" if value == "nowrap" => el = el.flex_nowrap(),
-            "flex-grow" => {
-                el.style().flex_grow = Some(value.parse().unwrap_or(0.));
+            "display" if matches!(value, "grid" | "inline-grid") => el = el.grid(),
+            "display" if matches!(value, "flex" | "inline-flex") => el = el.flex().flex_row(),
+            "flex-direction" if flexbox => {
+                el.style().flex_direction = Some(match value {
+                    "row-reverse" => gpui::FlexDirection::RowReverse,
+                    "column" => gpui::FlexDirection::Column,
+                    "column-reverse" => gpui::FlexDirection::ColumnReverse,
+                    _ => gpui::FlexDirection::Row,
+                })
             }
-            "flex-shrink" => {
-                el.style().flex_shrink = Some(value.parse().unwrap_or(1.));
+            "flex-wrap" if flexbox => {
+                el.style().flex_wrap = Some(match value {
+                    "wrap" => gpui::FlexWrap::Wrap,
+                    "wrap-reverse" => gpui::FlexWrap::WrapReverse,
+                    _ => gpui::FlexWrap::NoWrap,
+                })
             }
-            "flex" if value == "1" => el = el.flex_1(),
-            "align-items" => {
-                el = match value {
-                    "center" => el.items_center(),
-                    "flex-end" | "end" => el.items_end(),
-                    "flex-start" | "start" => el.items_start(),
-                    _ => {
-                        el.style().align_items = Some(gpui::AlignItems::Stretch);
-                        el
+            "flex-grow" | "flex-shrink" => {
+                if let Some(factor) = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.)
+                {
+                    if name == "flex-grow" {
+                        el.style().flex_grow = Some(factor);
+                    } else {
+                        el.style().flex_shrink = Some(factor);
                     }
                 }
             }
-            "justify-content" => {
-                el = match value {
-                    "center" => el.justify_center(),
-                    "space-between" => el.justify_between(),
-                    "space-around" => el.justify_around(),
-                    "flex-end" | "end" => el.justify_end(),
-                    _ => el.justify_start(),
+            "flex-basis" => {
+                el.style().flex_basis = Some(
+                    if let Some(percent) = value
+                        .strip_suffix('%')
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                    {
+                        relative(percent.max(0.) / 100.).into()
+                    } else if let Some(length) = length() {
+                        px(length.max(0.) + extra[0]).into()
+                    } else {
+                        gpui::Length::Auto
+                    },
+                )
+            }
+            "align-items" | "align-self" if flex_parent || flexbox => {
+                let align = match value {
+                    "center" => gpui::AlignItems::Center,
+                    "flex-start" | "start" | "self-start" => gpui::AlignItems::FlexStart,
+                    "flex-end" | "end" | "self-end" => gpui::AlignItems::FlexEnd,
+                    "baseline" | "first baseline" | "last baseline" => gpui::AlignItems::Baseline,
+                    "stretch" | "normal" => gpui::AlignItems::Stretch,
+                    _ => continue,
+                };
+                if name == "align-self" {
+                    el.style().align_self = Some(align);
+                } else if flexbox {
+                    el.style().align_items = Some(align);
+                }
+            }
+            "align-content" | "justify-content" if flexbox => {
+                let align = match value {
+                    "center" => gpui::AlignContent::Center,
+                    "flex-end" | "end" | "right" => gpui::AlignContent::FlexEnd,
+                    "space-between" => gpui::AlignContent::SpaceBetween,
+                    "space-around" => gpui::AlignContent::SpaceAround,
+                    "space-evenly" => gpui::AlignContent::SpaceEvenly,
+                    "stretch" => gpui::AlignContent::Stretch,
+                    _ => gpui::AlignContent::FlexStart,
+                };
+                if name == "justify-content" {
+                    el.style().justify_content = Some(align);
+                } else {
+                    el.style().align_content = Some(align);
                 }
             }
             "text-align" => {
                 el = match value {
                     "center" => el.text_center(),
-                    "right" => el.text_right(),
+                    "right" | "end" => el.text_right(),
                     _ => el.text_left(),
                 }
             }
             "position" if matches!(value, "absolute" | "fixed") => el = el.absolute(),
-            "left" | "right" | "top" | "bottom"
-                if style.get("position").is_some_and(|v| v != "sticky") => {
-                if let Some(length) = length() {
-                    el = match name.as_str() {
-                        "left" => el.left(px(length)),
-                        "right" => el.right(px(length)),
-                        "top" => el.top(px(length)),
-                        _ => el.bottom(px(length)),
-                    };
-                }
+            "left" | "right" | "top" | "bottom" if matches!(position, "relative" | "absolute") => {
+                let length: gpui::Length = if let Some(percent) = value
+                    .strip_suffix('%')
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite())
+                {
+                    relative(percent / 100.).into()
+                } else if let Some(length) = length() {
+                    px(length).into()
+                } else {
+                    continue;
+                };
+                el = match name.as_str() {
+                    "left" => el.left(length),
+                    "right" => el.right(length),
+                    "top" => el.top(length),
+                    _ => el.bottom(length),
+                };
             }
             "visibility" => {
                 el.style().visibility = Some(if value == "hidden" || value == "collapse" {
@@ -2391,38 +3123,222 @@ fn element(
                     gpui::Visibility::Visible
                 })
             }
-            "opacity" => el = el.opacity(value.parse::<f32>().unwrap_or(1.).clamp(0., 1.)),
+            "opacity" => {
+                let opacity = value
+                    .strip_suffix('%')
+                    .map_or(value.parse::<f32>().ok(), |v| {
+                        v.parse::<f32>().ok().map(|v| v / 100.)
+                    });
+                el = el.opacity(
+                    opacity
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(1.)
+                        .clamp(0., 1.),
+                );
+            }
             "white-space" if matches!(value, "nowrap" | "pre") => {
                 el = el.whitespace_nowrap().flex_nowrap()
             }
-            "overflow" | "overflow-x" | "overflow-y" => {
+            "overflow-x" | "overflow-y" => {
                 let overflow = match value {
                     "auto" | "scroll" => gpui::Overflow::Scroll,
                     "hidden" => gpui::Overflow::Hidden,
                     "clip" => gpui::Overflow::Clip,
                     _ => gpui::Overflow::Visible,
                 };
-                if name != "overflow-y" {
+                if name == "overflow-x" {
                     el.style().overflow.x = Some(overflow);
-                }
-                if name != "overflow-x" {
+                } else {
                     el.style().overflow.y = Some(overflow);
                 }
             }
-            "cursor" if value == "pointer" => el = el.cursor_pointer(),
-            "cursor" if value == "grab" => el = el.cursor(gpui::CursorStyle::OpenHand),
-            "cursor" if value == "grabbing" => el = el.cursor(gpui::CursorStyle::ClosedHand),
+            "cursor" => {
+                if let Some(cursor) = render::cursor(value) {
+                    el = el.cursor(cursor);
+                }
+            }
             _ => {}
         }
     }
-    let borders = ["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"].map(|name| {
-        style
-            .get(name)
-            .or_else(|| style.get("border-width"))
-            .and_then(|v| units.resolve(v, containing[0]))
-            .unwrap_or(0.)
-            .max(0.)
-    });
+    if style
+        .get("background-image")
+        .is_some_and(|value| value != "none")
+    {
+        let base = view
+            .host
+            .borrow()
+            .dom
+            .get(&view.id)
+            .and_then(|state| state.base.clone());
+        el = el.children(css_background(
+            style,
+            units,
+            id,
+            0,
+            radius,
+            cx.entity(),
+            base.as_ref(),
+        ));
+    }
+    if let Some(lines) = style
+        .get("-webkit-line-clamp")
+        .or_else(|| style.get("line-clamp"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| {
+            (style
+                .get("text-overflow")
+                .is_some_and(|value| value == "ellipsis")
+                && style
+                    .get("white-space")
+                    .is_some_and(|value| matches!(value.as_str(), "nowrap" | "pre"))
+                && el
+                    .style()
+                    .overflow
+                    .x
+                    .is_some_and(|overflow| overflow != gpui::Overflow::Visible))
+            .then_some(1)
+        })
+    {
+        let text = el.text_style().get_or_insert_with(Default::default);
+        text.white_space = Some(gpui::WhiteSpace::Normal);
+        text.line_clamp = Some(lines.max(1));
+        text.text_overflow = Some(gpui::TextOverflow::Truncate("…".into()));
+    }
+    if position == "fixed" {
+        let viewport = units.viewport;
+        let inset = ["left", "right", "top", "bottom"].map(|name| {
+            style.get(name).and_then(|v| {
+                units.resolve(v, viewport[usize::from(matches!(name, "top" | "bottom"))])
+            })
+        });
+        if style.get("width").is_none_or(|v| v == "auto")
+            && let [Some(left), Some(right), ..] = inset
+        {
+            el = el.w(px((viewport[0] - left - right).max(0.)));
+        }
+        if style.get("height").is_none_or(|v| v == "auto")
+            && let [_, _, Some(top), Some(bottom)] = inset
+        {
+            el = el.h(px((viewport[1] - top - bottom).max(0.)));
+        }
+    }
+    if let Some(width) = units
+        .resolve(
+            style.get("outline-width").map_or("3px", String::as_str),
+            containing[0],
+        )
+        .filter(|width| {
+            *width > 0.
+                && style
+                    .get("outline-style")
+                    .is_some_and(|kind| !matches!(kind.as_str(), "none" | "hidden"))
+        })
+    {
+        let grow = width
+            + style
+                .get("outline-offset")
+                .and_then(|v| units.resolve(v, containing[0]))
+                .unwrap_or(0.);
+        let color = style
+            .get("outline-color")
+            .and_then(|v| render::color(v))
+            .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32));
+        let mut outline = div()
+            .absolute()
+            .top(px(-grow - borders[0]))
+            .right(px(-grow - borders[1]))
+            .bottom(px(-grow - borders[2]))
+            .left(px(-grow - borders[3]))
+            .border(px(width))
+            .border_color(color)
+            .rounded_tl(px(radius[0] + grow))
+            .rounded_tr(px(radius[1] + grow))
+            .rounded_br(px(radius[2] + grow))
+            .rounded_bl(px(radius[3] + grow));
+        if style
+            .get("outline-style")
+            .is_some_and(|kind| matches!(kind.as_str(), "dashed" | "dotted"))
+        {
+            outline.style().border_style = Some(gpui::BorderStyle::Dashed);
+        }
+        el = el.child(outline);
+    }
+    if visible
+        .iter()
+        .any(|&side| border_colors[side] != border_colors[visible[0]])
+    {
+        let corners = gpui::Corners {
+            top_left: px(radius[0]),
+            top_right: px(radius[1]),
+            bottom_right: px(radius[2]),
+            bottom_left: px(radius[3]),
+        };
+        el = el.child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let bounds = Bounds::new(
+                        point(
+                            bounds.left() - px(borders[3]),
+                            bounds.top() - px(borders[0]),
+                        ),
+                        size(
+                            bounds.size.width + px(borders[1] + borders[3]),
+                            bounds.size.height + px(borders[0] + borders[2]),
+                        ),
+                    );
+                    for side in 0..4 {
+                        let mut widths = [px(0.); 4];
+                        widths[side] = px(borders[side]);
+                        window.paint_quad(gpui::quad(
+                            bounds,
+                            corners,
+                            gpui::transparent_black(),
+                            gpui::Edges {
+                                top: widths[0],
+                                right: widths[1],
+                                bottom: widths[2],
+                                left: widths[3],
+                            },
+                            border_colors[side],
+                            gpui::BorderStyle::Solid,
+                        ));
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        );
+    }
+    if check && node.attrs.contains_key("checked") {
+        let accent = style
+            .get("accent-color")
+            .and_then(|value| render::color(value))
+            .map_or(rgba(0x0a84ffff), |(ink, alpha)| {
+                rgba(ink << 8 | alpha as u32)
+            });
+        el = el
+            .bg(accent)
+            .border_color(accent)
+            .items_center()
+            .justify_center()
+            .child(
+                if input.is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) {
+                    div()
+                        .size(px(units.font.em * 0.35))
+                        .rounded_full()
+                        .bg(gpui::white())
+                } else {
+                    div()
+                        .text_color(gpui::white())
+                        .text_size(px(units.font.em * 0.75))
+                        .line_height(px(units.font.em * 0.75))
+                        .child("✓")
+                },
+            );
+    }
     if el.style().overflow.x == Some(gpui::Overflow::Scroll)
         || el.style().overflow.y == Some(gpui::Overflow::Scroll)
     {
@@ -2446,6 +3362,353 @@ fn element(
                 .size(px(0.)),
         );
     }
+    if display == "list-item"
+        && let Some(kind) = style
+            .get("list-style-type")
+            .filter(|kind| kind.as_str() != "none")
+    {
+        let list = node.parent.map(|parent| &doc.nodes[parent]);
+        let items: Vec<usize> = list.map_or(vec![id], |list| {
+            list.children
+                .iter()
+                .copied()
+                .filter(|&child| {
+                    styles.values[child]
+                        .get("display")
+                        .is_some_and(|value| value == "list-item")
+                })
+                .collect()
+        });
+        let position = items.iter().position(|&item| item == id).unwrap_or(0) as i64;
+        let start = list
+            .and_then(|list| list.attrs.get("start"))
+            .and_then(|value| value.parse::<i64>().ok());
+        let number = node
+            .attrs
+            .get("value")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(
+                if list.is_some_and(|list| list.attrs.contains_key("reversed")) {
+                    start.unwrap_or(items.len() as i64) - position
+                } else {
+                    start.unwrap_or(1) + position
+                },
+            );
+        let marker = match kind.as_str() {
+            "disc" => "•".to_owned(),
+            "circle" => "◦".to_owned(),
+            "square" => "▪".to_owned(),
+            "disclosure-closed" => "▸".to_owned(),
+            "disclosure-open" => "▾".to_owned(),
+            "decimal" => format!("{number}."),
+            "decimal-leading-zero" => format!("{number:02}."),
+            "lower-alpha" | "lower-latin" | "upper-alpha" | "upper-latin" if number > 0 => {
+                let mut letters = Vec::new();
+                let mut rest = number;
+                while rest > 0 {
+                    rest -= 1;
+                    letters.push((b'a' + (rest % 26) as u8) as char);
+                    rest /= 26;
+                }
+                let letters: String = letters.into_iter().rev().collect();
+                format!(
+                    "{}.",
+                    if kind.starts_with("upper") {
+                        letters.to_ascii_uppercase()
+                    } else {
+                        letters
+                    }
+                )
+            }
+            "lower-roman" | "upper-roman" if (1..4000).contains(&number) => {
+                let mut rest = number;
+                let mut roman = String::new();
+                for (value, digits) in [
+                    (1000, "m"),
+                    (900, "cm"),
+                    (500, "d"),
+                    (400, "cd"),
+                    (100, "c"),
+                    (90, "xc"),
+                    (50, "l"),
+                    (40, "xl"),
+                    (10, "x"),
+                    (9, "ix"),
+                    (5, "v"),
+                    (4, "iv"),
+                    (1, "i"),
+                ] {
+                    while rest >= value {
+                        roman.push_str(digits);
+                        rest -= value;
+                    }
+                }
+                format!(
+                    "{}.",
+                    if kind == "upper-roman" {
+                        roman.to_ascii_uppercase()
+                    } else {
+                        roman
+                    }
+                )
+            }
+            other if other.starts_with(['"', '\'']) => other.trim_matches(['"', '\'']).to_owned(),
+            _ => format!("{number}."),
+        };
+        el = el.child(
+            if style
+                .get("list-style-position")
+                .is_some_and(|value| value == "inside")
+            {
+                div()
+                    .flex_shrink_0()
+                    .mr(px(units.font.em * 0.3))
+                    .child(marker)
+            } else {
+                div()
+                    .absolute()
+                    .top(px(padding[0]))
+                    .right(relative(1.))
+                    .pr(px(units.font.em * 0.5))
+                    .whitespace_nowrap()
+                    .child(marker)
+            },
+        );
+    }
+    let mut after = None;
+    if let Some(pseudos) = styles.pseudos.get(&id) {
+        for (index, pseudo) in pseudos.iter().enumerate() {
+            let Some(content) = pseudo
+                .get("content")
+                .filter(|v| !matches!(v.as_str(), "none" | "normal"))
+            else {
+                continue;
+            };
+            if pseudo.get("display").is_some_and(|value| value == "none") {
+                continue;
+            }
+            let mut text = String::new();
+            for part in render::components(content, ' ') {
+                if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
+                    text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));
+                } else if part == "open-quote" {
+                    text.push('\u{201c}');
+                } else if part == "close-quote" {
+                    text.push('\u{201d}');
+                } else if let Some(string) = part
+                    .strip_prefix(['"', '\''])
+                    .and_then(|v| v.strip_suffix(['"', '\'']))
+                {
+                    let mut chars = string.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c != '\\' {
+                            text.push(c);
+                            continue;
+                        }
+                        let mut code = String::new();
+                        while code.len() < 6
+                            && let Some(digit) = chars.next_if(char::is_ascii_hexdigit)
+                        {
+                            code.push(digit);
+                        }
+                        if code.is_empty() {
+                            text.extend(chars.next());
+                            continue;
+                        }
+                        chars.next_if_eq(&' ');
+                        text.push(
+                            u32::from_str_radix(&code, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\u{fffd}'),
+                        );
+                    }
+                }
+            }
+            let mut pseudo_units = units;
+            if let Some(size) = pseudo
+                .get("font-size")
+                .and_then(|v| units.resolve(v, units.font.em))
+            {
+                pseudo_units.font = render::FontUnits::new(size);
+            }
+            let face = render::font(pseudo);
+            let mut decoration = div()
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .text_size(px(pseudo_units.font.em))
+                .font_family(face.family)
+                .font_weight(face.weight);
+            if let Some((ink, alpha)) = pseudo.get("color").and_then(|v| render::color(v)) {
+                decoration = decoration.text_color(rgba(ink << 8 | alpha as u32));
+            }
+            let absolute = pseudo
+                .get("position")
+                .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed"));
+            if absolute {
+                decoration = decoration.absolute();
+            } else if pseudo
+                .get("display")
+                .is_some_and(|value| !value.starts_with("inline"))
+                && (all_inline || display == "inline")
+            {
+                decoration = decoration.w_full();
+            }
+            let pseudo_padding = pseudo_units
+                .edges(pseudo, "padding", containing[0])
+                .map(|v| v.max(0.));
+            let pseudo_margin = pseudo_units.edges(pseudo, "margin", containing[0]);
+            let pseudo_borders = sides.map(|(width, kind, _)| {
+                if pseudo
+                    .get(kind)
+                    .is_none_or(|kind| matches!(kind.as_str(), "none" | "hidden"))
+                {
+                    return 0.;
+                }
+                pseudo
+                    .get(width)
+                    .map_or(Some(3.), |width| pseudo_units.resolve(width, containing[0]))
+                    .unwrap_or(0.)
+                    .max(0.)
+            });
+            decoration = decoration
+                .pt(px(pseudo_padding[0]))
+                .pr(px(pseudo_padding[1]))
+                .pb(px(pseudo_padding[2]))
+                .pl(px(pseudo_padding[3]))
+                .mt(px(pseudo_margin[0]))
+                .mr(px(pseudo_margin[1]))
+                .mb(px(pseudo_margin[2]))
+                .ml(px(pseudo_margin[3]))
+                .border_t(px(pseudo_borders[0]))
+                .border_r(px(pseudo_borders[1]))
+                .border_b(px(pseudo_borders[2]))
+                .border_l(px(pseudo_borders[3]));
+            if let Some(side) = (0..4).find(|&side| pseudo_borders[side] > 0.) {
+                decoration = decoration.border_color(
+                    pseudo
+                        .get(sides[side].2)
+                        .and_then(|v| render::color(v))
+                        .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32)),
+                );
+            }
+            for (name, value) in pseudo {
+                let vertical =
+                    name.ends_with("height") || matches!(name.as_str(), "top" | "bottom");
+                let base = containing[usize::from(vertical)];
+                let length = || -> Option<gpui::Length> {
+                    match value
+                        .strip_suffix('%')
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                    {
+                        Some(percent) => Some(relative(percent / 100.).into()),
+                        None => pseudo_units
+                            .resolve(value, base)
+                            .map(|value| px(value).into()),
+                    }
+                };
+                match name.as_str() {
+                    "width" | "height" | "min-width" | "max-width" | "min-height"
+                    | "max-height" | "left" | "top" | "right" | "bottom" => {
+                        let Some(length) = length() else { continue };
+                        decoration = match name.as_str() {
+                            "width" => decoration.w(length),
+                            "height" => decoration.h(length),
+                            "min-width" => decoration.min_w(length),
+                            "max-width" => decoration.max_w(length),
+                            "min-height" => decoration.min_h(length),
+                            "max-height" => decoration.max_h(length),
+                            "left" if absolute => decoration.left(length),
+                            "top" if absolute => decoration.top(length),
+                            "right" if absolute => decoration.right(length),
+                            "bottom" if absolute => decoration.bottom(length),
+                            _ => decoration,
+                        };
+                    }
+                    "border-top-left-radius"
+                    | "border-top-right-radius"
+                    | "border-bottom-right-radius"
+                    | "border-bottom-left-radius" => {
+                        let Some(length) = pseudo_units
+                            .resolve(value, containing[0])
+                            .map(|v| px(v.max(0.)))
+                        else {
+                            continue;
+                        };
+                        decoration = match name.as_str() {
+                            "border-top-left-radius" => decoration.rounded_tl(length),
+                            "border-top-right-radius" => decoration.rounded_tr(length),
+                            "border-bottom-right-radius" => decoration.rounded_br(length),
+                            _ => decoration.rounded_bl(length),
+                        };
+                    }
+                    "background-color" => {
+                        if let Some((color, alpha)) = render::color(value) {
+                            decoration = decoration.bg(rgba(color << 8 | alpha as u32));
+                        }
+                    }
+                    "opacity" => {
+                        if let Ok(opacity) = value.parse::<f32>() {
+                            decoration = decoration.opacity(opacity.clamp(0., 1.));
+                        }
+                    }
+                    "box-shadow" => {
+                        decoration.style().box_shadow = Some(pseudo_units.shadows(value))
+                    }
+                    _ => {}
+                }
+            }
+            if pseudo
+                .get("background-image")
+                .is_some_and(|value| value != "none")
+            {
+                let base = view
+                    .host
+                    .borrow()
+                    .dom
+                    .get(&view.id)
+                    .and_then(|state| state.base.clone());
+                decoration = decoration.children(css_background(
+                    pseudo,
+                    units,
+                    id,
+                    index + 1,
+                    [0.; 4],
+                    cx.entity(),
+                    base.as_ref(),
+                ));
+            }
+            if !text.is_empty() {
+                decoration = decoration.child(SharedString::from(text));
+            }
+            let order = pseudo
+                .get("z-index")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            let decoration = if order != 0
+                && pseudo
+                    .get("position")
+                    .is_some_and(|value| value != "static")
+            {
+                Stacked {
+                    inner: Some(decoration.into_any_element()),
+                    layers: build.layers.clone(),
+                    order,
+                    path: build.path.clone(),
+                }
+                .into_any_element()
+            } else {
+                decoration.into_any_element()
+            };
+            if index == 0 {
+                el = el.child(decoration);
+            } else {
+                after = Some(decoration);
+            }
+        }
+    }
     let preserve = style
         .get("white-space")
         .is_some_and(|v| matches!(v.as_str(), "pre" | "pre-wrap" | "break-spaces"))
@@ -2457,39 +3720,8 @@ fn element(
     {
         el = el.min_w(px(0.)).max_w(relative(1.)).flex_shrink();
     }
-    if !node.text.is_empty() && !editable {
-        let text = if preserve && node.text == "\n" {
-            el = el.min_h(px(units.font.lh));
-            String::new()
-        } else if preserve {
-            node.text.clone()
-        } else {
-            node.text.split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-        if !text.is_empty() {
-            let runs = vec![gpui::TextRun {
-                len: text.len(),
-                font: render::font(style),
-                color: style
-                    .get("color")
-                    .and_then(|value| render::color(value))
-                    .map(|(color, alpha)| rgba(color << 8 | alpha as u32).into())
-                    .unwrap_or_else(gpui::black),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }];
-            el = el.child(InlineText {
-                inner: gpui::StyledText::new(text.clone()).with_runs(runs.clone()),
-                data: Rc::new(render::InlineText {
-                    ranges: vec![(id, 0..text.len())],
-                    text: text.into(),
-                    runs,
-                    backgrounds: Vec::new(),
-                }),
-                view: cx.entity(),
-            });
-        }
+    if preserve && node.text == "\n" {
+        el = el.min_h(px(units.font.lh));
     }
     let inline = if editable {
         None
@@ -2509,11 +3741,17 @@ fn element(
     }
     if let Some(data) = inline {
         let inner = gpui::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
-        el = el.child(InlineText {
-            inner,
-            data,
-            view: cx.entity(),
-        });
+        el = el.child(
+            div()
+                .min_w(px(0.))
+                .max_w(relative(1.))
+                .flex_shrink()
+                .child(InlineText {
+                    inner,
+                    data,
+                    view: cx.entity(),
+                }),
+        );
     } else if !node.children.is_empty()
         && node.tag != "canvas"
         && node.tag != "iframe"
@@ -2531,6 +3769,7 @@ fn element(
             if let Some(value) = style
                 .get(name)
                 .and_then(|v| units.resolve(v, containing[axis]))
+                .or(intrinsic_width.filter(|_| axis == 0))
             {
                 content[axis] = value;
             } else if axis == 0 {
@@ -2581,16 +3820,38 @@ fn element(
         } else {
             container
         };
-        let grid = if style.get("display").is_some_and(|v| v == "grid") {
+        let grid = if let Some(display) = style
+            .get("display")
+            .filter(|v| matches!(v.as_str(), "grid" | "inline-grid"))
+        {
+            if display == "inline-grid"
+                && slot.is_none()
+                && style.get("width").is_none_or(|v| v == "auto")
+            {
+                let extent =
+                    padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
+                let [min, max, ..] = crate::grid::intrinsic(
+                    doc,
+                    id,
+                    styles,
+                    None,
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
+            }
+            let height = (slot.is_some() || style.get("height").is_some_and(|v| v != "auto"))
+                .then_some(content[1]);
             let cached = view
                 .host
                 .borrow()
                 .dom
                 .get(&view.id)
                 .and_then(|state| state.grids.get(&id))
-                .filter(|(width, height, inherited, _)| {
+                .filter(|(width, cached, inherited, _)| {
                     *width == content[0]
-                        && *height == style.contains_key("height").then_some(content[1])
+                        && *cached == height
                         && inherited.as_ref() == slot.as_ref().map(|(_, grid)| grid)
                 })
                 .map(|(_, _, _, grid)| grid.clone());
@@ -2599,8 +3860,8 @@ fn element(
                     doc,
                     id,
                     styles,
-                    content[0],
-                    style.contains_key("height").then_some(content[1]),
+                    Some(content[0]),
+                    height,
                     slot.as_ref().map(|(_, grid)| grid),
                     text,
                     &mut measured.borrow_mut(),
@@ -2615,7 +3876,7 @@ fn element(
                         id,
                         (
                             content[0],
-                            style.contains_key("height").then_some(content[1]),
+                            height,
                             slot.as_ref().map(|(_, grid)| grid.clone()),
                             grid.clone(),
                         ),
@@ -2631,7 +3892,7 @@ fn element(
                 + padding[3]
                 + borders[1]
                 + borders[3]));
-            if !style.contains_key("height") {
+            if style.get("height").is_none_or(|v| v == "auto") {
                 el = el.h(px(grid.rows.iter().sum::<f32>()
                     + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1]
                     + padding[0]
@@ -2640,7 +3901,11 @@ fn element(
                     + borders[2]));
             }
         }
-        let mut children = node.children.clone();
+        let mut children = if grid.is_some() {
+            node.children.clone()
+        } else {
+            flat.clone()
+        };
         if grid.is_some() {
             children.sort_by_key(|child| {
                 styles.values[*child]
@@ -2648,40 +3913,86 @@ fn element(
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(0)
             });
+        } else if flexbox {
+            children.sort_by_key(|child| {
+                styles.values[*child]
+                    .get("order")
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0)
+            });
         }
-        for child in children {
+        let inline_element = |child: Option<&usize>| {
+            child.is_some_and(|&child| {
+                !doc.nodes[child].tag.starts_with('#')
+                    && doc.nodes[child].tag != "br"
+                    && inline_level(child)
+            })
+        };
+        let mut line: Option<gpui::Div> = None;
+        let mut floating = Vec::new();
+        for (index, &child) in children.iter().enumerate() {
             if preserve
                 || !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty())
+                || flow
+                    && grid.is_none()
+                    && inline_element(index.checked_sub(1).and_then(|index| children.get(index)))
+                    && inline_element(children.get(index + 1))
             {
                 let placement = grid.as_ref().and_then(|grid| {
-                    grid.cells
-                        .iter()
-                        .find(|(id, _)| *id == child)
-                        .map(|(_, cell)| {
-                            let mut bounds = grid.bounds(*cell);
-                            bounds[0] += padding[3];
-                            bounds[1] += padding[0];
-                            let [column, row, columns, rows] = *cell;
-                            (
-                                bounds,
-                                crate::grid::Grid {
-                                    columns: grid.columns[column..column + columns].to_vec(),
-                                    rows: grid.rows[row..row + rows].to_vec(),
-                                    gap: grid.gap,
-                                    cells: Vec::new(),
-                                },
-                            )
-                        })
+                    let index = grid
+                        .cells
+                        .binary_search_by_key(&child, |(id, ..)| *id)
+                        .ok()?;
+                    let (_, [column, row, columns, rows], mut bounds) = *grid.cells.get(index)?;
+                    bounds[0] += padding[3];
+                    bounds[1] += padding[0];
+                    Some((
+                        bounds,
+                        crate::grid::Grid {
+                            columns: grid.columns.get(column..column + columns)?.to_vec(),
+                            rows: grid.rows.get(row..row + rows)?.to_vec(),
+                            gap: grid.gap,
+                            cells: Vec::new(),
+                        },
+                    ))
                 });
-                el = el.child(element(build, child, content, container, placement, cx));
+                let child_element = element(build, child, content, container, placement, cx);
+                let out_of_flow = styles.values[child]
+                    .get("position")
+                    .is_some_and(|value| matches!(value.as_str(), "absolute" | "fixed"));
+                if flow && !all_inline && grid.is_none() && inline_level(child) && !out_of_flow {
+                    let mut next = line
+                        .take()
+                        .unwrap_or_else(|| div().flex().flex_row().flex_wrap());
+                    next.style().justify_content = line_justify;
+                    line = Some(next.child(child_element));
+                } else if out_of_flow && line.is_some() {
+                    floating.push(child_element);
+                } else {
+                    if let Some(line) = line.take() {
+                        el = el.child(line).children(floating.drain(..));
+                    }
+                    el = el.child(child_element);
+                }
             }
         }
+        if let Some(line) = line {
+            el = el.child(line);
+        }
+        el = el.children(floating);
+    }
+    if let Some(after) = after {
+        el = el.child(after);
     }
     if let Some((bounds, _)) = &slot {
         el = el
             .absolute()
             .left(px(bounds[0]))
             .top(px(bounds[1]))
+            .mt(px(margin[0]))
+            .mr(px(margin[1]))
+            .mb(px(margin[2]))
+            .ml(px(margin[3]))
             .w(px((bounds[2] - margin[1] - margin[3]).max(0.)))
             .h(px((bounds[3] - margin[0] - margin[2]).max(0.)));
     }
@@ -2793,10 +4104,19 @@ fn element(
         id,
         view: cx.entity(),
         sticky,
+        fixed: position == "fixed",
         inset: ["top", "right", "bottom", "left"].map(|name| {
-            style
-                .get(name)
-                .and_then(|v| units.resolve(v, containing[0]))
+            let axis = usize::from(matches!(name, "top" | "bottom"));
+            style.get(name).and_then(|v| {
+                units.resolve(
+                    v,
+                    if position == "fixed" {
+                        units.viewport[axis]
+                    } else {
+                        containing[axis]
+                    },
+                )
+            })
         }),
     }
     .into_any_element();
@@ -2805,6 +4125,7 @@ fn element(
             inner: Some(element),
             layers: layers.clone(),
             order,
+            path: path.clone(),
         }
         .into_any_element()
     } else {

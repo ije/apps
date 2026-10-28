@@ -3,7 +3,7 @@
   delete globalThis.__appsDOM;
   const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
   const nodes = new Map(), events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
-  let active = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null;
+  let active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null;
   const selectionPending = new Set();
   const selectionChanged = (target = document) => {
     if (selectionPending.has(target)) return;
@@ -24,8 +24,8 @@
       queueMicrotask(() => { mutationQueued = false; for (const observer of observers) { const records = observer.takeRecords(); if (records.length) observer.callback(records, observer); } });
     }
   };
-  const dispatch = (target, event) => {
-    const ancestors = path(target);if(!event.composed){const boundary=ancestors.findIndex(node=>node.host&&node===target.getRootNode());if(boundary>=0)ancestors.length=boundary+1;} const originalStop = event.stopPropagation.bind(event), originalImmediate = event.stopImmediatePropagation.bind(event);
+  const dispatch = (target, event, ancestors = path(target)) => {
+    if(!event.composed){const boundary=ancestors.findIndex(node=>node.host&&node===target.getRootNode());if(boundary>=0)ancestors.length=boundary+1;} const originalStop = event.stopPropagation.bind(event), originalImmediate = event.stopImmediatePropagation.bind(event);
     let stopped = false, immediate = false, current = null, phase = 0;
     Object.defineProperties(event, { target: { configurable: true, get: () => target }, currentTarget: { configurable: true, get: () => current }, eventPhase: { configurable: true, get: () => phase } });
     event.stopPropagation = () => { stopped = true; originalStop(); };
@@ -149,7 +149,7 @@
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
     get style() { return this._style ??= styleObject(() => this.getAttribute('style') ?? '', value => this.setAttribute('style', value)); }
     get innerHTML() { return this.childNodes.map(serialize).join('') || call('dom.snapshot', this._id).text; }
-    set innerHTML(value) { const removedNodes = this.childNodes; for (const child of this._children) child._parent = null; this._children.clear(); call('dom.html', this._id, String(value)); change({ type: 'childList', target: this, removedNodes, addedNodes: this.childNodes }); }
+    set innerHTML(value) { const removedNodes = this.childNodes; for (const child of this._children) child._parent = null; this._children.clear(); call('dom.html', this._id, String(value)); __appsImages(this); change({ type: 'childList', target: this, removedNodes, addedNodes: this.childNodes }); }
     get outerHTML() { return serialize(this); }
     set outerHTML(value) { const container = document.createElement('div'); container.innerHTML = value; this.replaceWith(...container.childNodes); }
     get innerText() { return this.textContent; } set innerText(value) { this.textContent = value; }
@@ -195,8 +195,8 @@
         if (scrollable && options.container === 'nearest') break;
       }
     }
-    focus() { if (active === this || this.disabled) return; const previous = active; active = this; call('dom.focus', this._id, true); if (previous) { dispatch(previous, new FocusEvent('blur', { composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })); } dispatch(this, new FocusEvent('focus', { composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })); }
-    blur() { if (active !== this) return; active = null; call('dom.focus', this._id, false); dispatch(this, new FocusEvent('blur', { composed: true })); dispatch(this, new FocusEvent('focusout', { bubbles: true, composed: true })); }
+    focus() { if (active === this || this.disabled) return; const previous = active; active = this; call('dom.focus', path(this).map(node => node._id)); if (previous) { dispatch(previous, new FocusEvent('blur', { composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })); } dispatch(this, new FocusEvent('focus', { composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })); }
+    blur() { if (active !== this) return; active = null; call('dom.focus', []); dispatch(this, new FocusEvent('blur', { composed: true })); dispatch(this, new FocusEvent('focusout', { bubbles: true, composed: true })); }
     click() { if (!this.disabled) dispatch(this, new MouseEvent('click', { bubbles: true, cancelable: true })); }
     get contentEditable() { return this.getAttribute('contenteditable') ?? 'inherit'; } set contentEditable(value) { this.setAttribute('contenteditable', value); }
     get isContentEditable() { const value = this.contentEditable.toLowerCase(); return ['true','plaintext-only',''].includes(value) || (value !== 'false' && !!this.parentElement?.isContentEditable); }
@@ -266,6 +266,7 @@
     }
     decode() { if (!this._loading && this.src) this._loadImage(); return this._loading ?? Promise.resolve(); }
   }
+  globalThis.__appsImages = root => { for (const image of root.querySelectorAll('img[src]')) if (!image._loading) image._loadImage(); };
   class DOMRect { constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, { x, y, width, height }); } get left() { return Math.min(this.x, this.x + this.width); } get right() { return Math.max(this.x, this.x + this.width); } get top() { return Math.min(this.y, this.y + this.height); } get bottom() { return Math.max(this.y, this.y + this.height); } toJSON() { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; } static fromRect(r = {}) { return new this(r.x, r.y, r.width, r.height); } }
   class UIEvent extends Event { constructor(type, options = {}) { super(type, options); this.view = options.view ?? window; this.detail = options.detail ?? 0; } }
   class MouseEvent extends UIEvent { constructor(type, options = {}) { super(type, options); const { bubbles, cancelable, composed, ...fields } = options; Object.assign(this, { clientX: 0, clientY: 0, screenX: 0, screenY: 0, button: 0, buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, relatedTarget: null }, fields); } }
@@ -293,7 +294,7 @@
     deleteRule(index){const rules=this.cssRules.map(rule=>rule.cssText);if(index<0||index>=rules.length)throw new DOMException('Invalid rule index','IndexSizeError');rules.splice(index,1);this.replaceSync(rules.join(''));}
   }
   class ShadowRoot extends DocumentFragment {
-    get innerHTML(){return this.childNodes.map(serialize).join('');} set innerHTML(value){const removedNodes=this.childNodes;for(const child of this._children)child._parent=null;this._children.clear();call('dom.html',this._id,String(value));change({type:'childList',target:this,removedNodes,addedNodes:this.childNodes});}
+    get innerHTML(){return this.childNodes.map(serialize).join('');} set innerHTML(value){const removedNodes=this.childNodes;for(const child of this._children)child._parent=null;this._children.clear();call('dom.html',this._id,String(value));__appsImages(this);change({type:'childList',target:this,removedNodes,addedNodes:this.childNodes});}
     get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;this.prepend(style);sheet._owners.set(this,style);}}
     getElementById(id){return this.querySelectorAll('[id]').find(node=>node.id===String(id))??null;}
   }
@@ -697,7 +698,21 @@
     } else { range.setStart(node,offset); range.collapse(true); }
     return range;
   };
+  const hover = (target, data) => {
+    if (target === hovered) return;
+    const previous = hovered, from = previous ? path(previous) : [], to = target ? path(target) : [];
+    hovered = target;
+    call('dom.hover', to.map(node => node._id));
+    for (const [kind, Type] of [['pointer', PointerEvent], ['mouse', MouseEvent]]) {
+      const fire = (node, type, ancestors, relatedTarget, bubbles) => dispatch(node, new Type(kind + type, { ...data, bubbles, cancelable: bubbles, composed: bubbles, relatedTarget }), ancestors);
+      if (previous) fire(previous, 'out', from.slice(), target, true);
+      from.forEach((node, index) => { if (node.nodeType !== 11 && !to.includes(node)) fire(node, 'leave', from.slice(index), target, false); });
+      if (target) fire(target, 'over', to.slice(), previous, true);
+      for (let index = to.length; index--;) if (to[index].nodeType !== 11 && !from.includes(to[index])) fire(to[index], 'enter', to.slice(index), previous, false);
+    }
+  };
   globalThis.__appsDispatch = (name, ids, data = {}) => {
+    if (name === 'pointerexit') { hover(null, data); return true; }
     if (name.startsWith('window:')) return dispatchEvent(new Event(name.slice(7)));
     if (name === 'modifiers') {
       const previous = modifiers; modifiers = data;
@@ -775,7 +790,12 @@
       }
       return true;
     }
-    let target = captures.get(data.pointerId) ?? wrap(ids[0]) ?? (Number.isFinite(data.clientX) && Number.isFinite(data.clientY) ? document.elementFromPoint(data.clientX,data.clientY) : null) ?? (selectionDrag?.id === data.pointerId ? selectionDrag.host : null); if (!target) return false;
+    const hit = captures.get(data.pointerId) ?? wrap(ids[0]) ?? (Number.isFinite(data.clientX) && Number.isFinite(data.clientY) ? document.elementFromPoint(data.clientX,data.clientY) : null);
+    if (name === 'pointermove' || name === 'pointerdown' || name === 'pointerup') hover(hit?.nodeType === 3 ? hit.parentElement : hit, data);
+    const target = hit ?? (selectionDrag?.id === data.pointerId ? selectionDrag.host : null);
+    if (name === 'pointerdown' && target && (data.button ?? 0) === 0) call('dom.active', path(target).map(node => node._id));
+    if (name === 'pointerup' || name === 'pointercancel') call('dom.active', []);
+    if (!target) return false;
     if (name === 'pointerup' && selectionDrag?.id === data.pointerId && Number.isFinite(data.clientX) && Number.isFinite(data.clientY)) __appsDispatch('pointermove', ids, { ...data, buttons: 1 });
     if (name === 'pointerdown') pointers.add(data.pointerId);
     const event = new (name.startsWith('pointer') ? PointerEvent : MouseEvent)(name, { bubbles: true, cancelable: true, composed: true, ...data });
@@ -828,6 +848,17 @@
       }
     }
     if (name === 'pointerup' || name === 'pointercancel') { if (selectionDrag?.id === data.pointerId) selectionDrag = null; pointers.delete(data.pointerId); captures.get(data.pointerId)?.releasePointerCapture(data.pointerId); }
+    if (name === 'click' && result) {
+      const label = path(target).find(node => node.localName === 'label');
+      const control = target.localName === 'input' ? target : label && (label.getAttribute('for') ? document.getElementById(label.getAttribute('for')) : label.querySelector('input'));
+      const kind = control?.localName === 'input' ? String(control.getAttribute('type')).toLowerCase() : '';
+      if ((kind === 'checkbox' || kind === 'radio') && !control.disabled && !(kind === 'radio' && control.checked)) {
+        if (kind === 'radio' && control.getAttribute('name')) for (const other of control.getRootNode().querySelectorAll('input[type=radio]')) if (other.getAttribute('name') === control.getAttribute('name')) other.checked = false;
+        control.checked = kind === 'radio' || !control.checked;
+        dispatch(control, new Event('input', { bubbles: true, composed: true }));
+        dispatch(control, new Event('change', { bubbles: true }));
+      }
+    }
     if (name === 'click' && data.detail === 2) dispatch(target, new MouseEvent('dblclick', { bubbles: true, cancelable: true, composed: true, ...data }));
     return result;
   };

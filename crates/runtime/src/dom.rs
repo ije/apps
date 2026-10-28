@@ -1,5 +1,5 @@
 use crate::{
-    html::{Document, Node, Selector},
+    html::{self, Document, Node, Selector, SelectorCache},
     render,
 };
 use anyhow::{Context, Result, ensure};
@@ -15,6 +15,7 @@ pub(crate) struct LayoutNode {
 
 #[derive(Default)]
 pub struct State {
+    pub base: Option<url::Url>,
     pub(crate) free: Vec<usize>,
     live: std::collections::HashSet<usize>,
     pub bounds: HashMap<usize, [f32; 4]>,
@@ -42,6 +43,7 @@ pub struct State {
     style_reduced_motion: bool,
     style_theme: u32,
     pub focus: Option<usize>,
+    interaction: [Vec<usize>; 3],
     pub selection: HashMap<usize, [usize; 2]>,
     pub selection_caret: Option<usize>,
     pub dirty: bool,
@@ -136,6 +138,8 @@ pub fn call(
             | "dom.rect"
             | "dom.style"
             | "dom.focus"
+            | "dom.hover"
+            | "dom.active"
             | "dom.selection"
             | "dom.selectionText"
             | "dom.userSelect"
@@ -432,7 +436,54 @@ pub fn call(
                     .map(|(id, _)| id);
                 return Ok(json!(text.or(target)));
             }
+            if first && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
+                return Ok(json!(
+                    doc.nodes[0]
+                        .children
+                        .iter()
+                        .find(|&&id| !doc.nodes[id].tag.starts_with('#'))
+                ));
+            }
             return Ok(if first { Value::Null } else { json!(hits) });
+        }
+        if matches!(op, "dom.focus" | "dom.hover" | "dom.active") {
+            let ids = args[0]
+                .as_array()
+                .context("Expected nodes")?
+                .iter()
+                .map(|id| {
+                    id.as_u64()
+                        .map(|id| id as usize)
+                        .filter(|&id| id < doc.nodes.len())
+                        .context("Invalid node id")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (index, flag) = match op {
+                "dom.focus" => (0, html::FOCUS_WITHIN),
+                "dom.hover" => (1, html::HOVER),
+                _ => (2, html::ACTIVE),
+            };
+            if op == "dom.focus" {
+                if let Some(node) = state.focus.and_then(|id| doc.nodes.get_mut(id)) {
+                    node.state &= !html::FOCUS;
+                }
+                state.focus = ids.first().copied();
+                if let Some(id) = state.focus {
+                    doc.nodes[id].state |= html::FOCUS;
+                }
+            }
+            for &id in &state.interaction[index] {
+                if let Some(node) = doc.nodes.get_mut(id) {
+                    node.state &= !flag;
+                }
+            }
+            for &id in &ids {
+                doc.nodes[id].state |= flag;
+            }
+            state.interaction[index] = ids;
+            state.computed = None;
+            state.dirty = true;
+            return Ok(Value::Null);
         }
         if op == "dom.createSpecial" {
             let tag = args[0].as_str().context("Expected node kind")?;
@@ -495,7 +546,7 @@ pub fn call(
             "dom.matches" => Ok(json!(
                 Selector::parse(args[1].as_str().context("Expected selector")?, None)
                     .iter()
-                    .any(|s| s.matches(doc, id))
+                    .any(|s| s.matches_cached(doc, id, Some(id), &mut SelectorCache::default()))
             )),
             "dom.queryWithin" => {
                 let selectors =
@@ -503,8 +554,12 @@ pub fn call(
                 let first = args[2].as_bool().unwrap_or(false);
                 let mut pending: Vec<_> = doc.nodes[id].children.iter().rev().copied().collect();
                 let mut found = Vec::new();
+                let mut memo = SelectorCache::default();
                 while let Some(node) = pending.pop() {
-                    if selectors.iter().any(|s| s.matches(doc, node)) {
+                    if selectors
+                        .iter()
+                        .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                    {
                         if first {
                             return Ok(json!(node));
                         }
@@ -591,19 +646,6 @@ pub fn call(
                     "Shadow root already exists"
                 );
                 state.shadows.insert(id, root);
-                state.dirty = true;
-                Ok(Value::Null)
-            }
-            "dom.focus" => {
-                if let Some(previous) = state.focus {
-                    doc.nodes[previous].attrs.remove("data-apps-focus");
-                }
-                state.focus = args[1].as_bool().unwrap_or(true).then_some(id);
-                if state.focus.is_some() {
-                    doc.nodes[id]
-                        .attrs
-                        .insert("data-apps-focus".into(), String::new());
-                }
                 state.dirty = true;
                 Ok(Value::Null)
             }
@@ -844,6 +886,7 @@ pub fn call(
                     .0
                     .clone();
                 system.add_fonts(vec![std::borrow::Cow::Owned(bytes)])?;
+                render::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
                 state.style_cache = render::StyleCache::default();
                 state.computed = None;
                 state.font_aliases.insert(
@@ -1200,6 +1243,7 @@ pub(crate) fn styles(
                 scoped_root.attrs = doc.nodes[id].attrs.clone();
                 scoped_root.inline = None;
                 scoped_root.attrs.remove("style");
+                scoped_root.state = doc.nodes[id].state;
                 if pass == 1 {
                     context
                         .roots

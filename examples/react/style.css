@@ -5,6 +5,6 @@ h1 { margin: 16px 0; font-size: 42px; font-weight: 700; }
 .intro { margin: 0 0 24px; color: #5e7069; }
 .count { margin: 0 0 24px; font-size: 28px; font-weight: 700; }
 .actions { display: flex; gap: 12px; }
-button { padding: 12px 20px; background: #1c705c; color: white; border-radius: 8px; cursor: pointer; }
+button { padding: 12px 20px; border: 0; font: inherit; background: #1c705c; color: white; border-radius: 8px; cursor: pointer; }
 .secondary { background: #d7e3da; color: #172c29; }
 #message { margin: 20px 0 0; color: #5e7069; }

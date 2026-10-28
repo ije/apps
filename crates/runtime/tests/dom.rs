@@ -70,7 +70,7 @@ fn utility_classes_follow_dom_changes_without_css_generation() {
         assert_eq!(styles[id]["height"], "2rem");
         assert_eq!(styles[id]["width"], "2rem");
         assert_eq!(styles[id]["background-color"], "#123456");
-        assert!(!styles[id].contains_key("display"));
+        assert_eq!(styles[id]["display"], "block");
     }
     engine
         .eval("dot.removeAttribute('class');", "test")
@@ -141,6 +141,7 @@ fn mutations_preserve_tree_and_event_order() {
         if (root.lastChild !== button) throw Error('Cannot reattach node');
         const parent = document.createElement('section');
         parent.setAttribute('style', 'color: #123456; font-size: 24px');
+        button.setAttribute('style', 'color: inherit; font-size: inherit');
         parent.appendChild(button);
         root.appendChild(parent);
     "#, "test").unwrap();
@@ -529,5 +530,73 @@ fn hostile_selectors_canvas_data_and_traversal() {
         const canvas=document.createElement('canvas');canvas.width=canvas.height=4;const ctx=canvas.getContext('2d'),forged=new ImageData(1,1);
         Object.assign(forged,{width:2**31,height:2**31,data:new Uint8ClampedArray(0)});ctx.putImageData(forged,0,0);
         let rejected=false;try{ctx.getImageData(0,0,1,1);}catch{rejected=true;}if(!rejected)throw Error('Forged image data accepted');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn pointer_hover_tracks_boundary_events_and_interaction_states() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top-width:3px}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const [outer, inner, other, card] = ['#outer', '#inner', '#other', 'test-card'].map(s => document.querySelector(s));
+        card.attachShadow({mode:'open'}).innerHTML = '<style>:host(:hover){color:purple}</style><span id="part"></span>';
+        const log = [];
+        for (const kind of ['pointer', 'mouse']) for (const type of ['over', 'out', 'enter', 'leave']) document.addEventListener(kind + type, event => {
+            if (event.target.id) log.push(kind + type + ':' + event.target.id + (event.relatedTarget?.id ? '>' + event.relatedTarget.id : ''));
+        }, true);
+        globalThis.ids = [outer._id, inner._id, other._id, card._id, card.shadowRoot.querySelector('#part')._id];
+        globalThis.check = (expected, label) => { const actual = log.splice(0).join(); if (actual !== expected) throw Error(label + ': ' + actual); };
+    "#, "test").unwrap();
+    let ids: Vec<usize> =
+        serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
+    for (id, bounds) in ids.into_iter().zip([
+        [0., 0., 100., 100.],
+        [0., 0., 50., 50.],
+        [0., 100., 100., 100.],
+        [0., 200., 100., 100.],
+        [0., 200., 50., 50.],
+    ]) {
+        host.borrow_mut()
+            .dom
+            .entry(1)
+            .or_default()
+            .bounds
+            .insert(id, bounds);
+    }
+    engine.eval(r#"
+        const move = (x, y) => __appsDispatch('pointermove', [], {pointerId:1, pointerType:'mouse', clientX:x, clientY:y});
+        move(10, 10);
+        check('pointerover:inner,pointerenter:outer,pointerenter:inner,mouseover:inner,mouseenter:outer,mouseenter:inner', 'enter');
+        if (getComputedStyle(outer).color !== 'red' || getComputedStyle(inner).color !== 'blue') throw Error('Hover styles');
+        move(12, 12);
+        check('', 'same target');
+        move(80, 80);
+        check('pointerout:inner>outer,pointerleave:inner>outer,pointerover:outer>inner,mouseout:inner>outer,mouseleave:inner>outer,mouseover:outer>inner', 'leave child');
+        if (getComputedStyle(inner).color !== 'red') throw Error('Inner hover was not cleared');
+        move(10, 150);
+        check('pointerout:outer>other,pointerleave:outer>other,pointerover:other>outer,pointerenter:other>outer,mouseout:outer>other,mouseleave:outer>other,mouseover:other>outer,mouseenter:other>outer', 'sibling');
+        if (getComputedStyle(outer).color === 'red') throw Error('Outer hover was not cleared');
+        move(10, 210);
+        if (getComputedStyle(card).color !== 'purple') throw Error('Shadow host is not hovered');
+        move(400, 400);
+        if (getComputedStyle(card).color === 'purple') throw Error('Shadow host hover was not cleared');
+        log.length = 0;
+        __appsDispatch('pointerdown', [inner._id], {pointerId:1, pointerType:'mouse', clientX:10, clientY:10, button:0});
+        if (getComputedStyle(inner).fontWeight !== '700' || getComputedStyle(outer).backgroundColor !== 'green' || getComputedStyle(inner).borderTopWidth !== '3px') throw Error('Active or focus styles');
+        if (inner.attributes.length !== 2 || inner.outerHTML.includes('apps') || inner.hasAttribute('data-apps-focus')) throw Error('Interaction state leaked into attributes');
+        __appsDispatch('pointerup', [], {pointerId:1, pointerType:'mouse', clientX:600, clientY:10});
+        if (getComputedStyle(inner).fontWeight === '700') throw Error('Active was not cleared');
+        inner.blur();
+        if (getComputedStyle(outer).backgroundColor === 'green') throw Error('Focus within was not cleared');
+        move(10, 10);
+        log.length = 0;
+        __appsDispatch('pointerexit', [], {pointerId:1, pointerType:'mouse', clientX:10, clientY:10});
+        check('pointerout:inner,pointerleave:inner,pointerleave:outer,mouseout:inner,mouseleave:inner,mouseleave:outer', 'exit');
+        if (getComputedStyle(outer).color === 'red' || document.querySelector(':hover')) throw Error('Exit kept hover');
+        if (document.querySelector('#outer:scope') || outer.querySelector(':scope > div') !== inner || !outer.matches(':scope')) throw Error('Scope');
     "#, "test").unwrap();
 }
