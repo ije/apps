@@ -422,7 +422,10 @@ pub trait Platform: 'static {
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
-    fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback invoked when the app is reopened. It receives whether the app has visible windows.
+    fn on_reopen(&self, callback: Box<dyn FnMut(bool)>);
+    /// Registers the callback that decides whether the system may terminate the app (macOS Quit menu, Dock, logout).
+    fn on_should_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
     /// Registers the callback invoked when the system is about to sleep.
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system resumes from sleep.

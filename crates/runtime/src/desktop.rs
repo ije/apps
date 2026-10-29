@@ -47,7 +47,7 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn from_bundle(bundle: crate::bundle::Bundle) -> Result<Self> {
-        let mut desktop = Self::create(&bundle.files, bundle.packaged)?;
+        let mut desktop = Self::create(&bundle.files, bundle.packaged, bundle.root)?;
         desktop.pages = bundle.pages;
         Ok(desktop)
     }
@@ -86,16 +86,25 @@ impl Desktop {
     }
 
     pub fn new(files: &BBTreeMap<String, String>) -> Result<Self> {
-        Self::create(files, false)
+        Self::create(files, false, std::path::PathBuf::new())
     }
 
-    fn create(files: &BBTreeMap<String, String>, packaged: bool) -> Result<Self> {
+    fn create(
+        files: &BBTreeMap<String, String>,
+        packaged: bool,
+        root: std::path::PathBuf,
+    ) -> Result<Self> {
         let api = Api::load()?;
         let (_, name, version) =
             crate::bundle::package_metadata(files.get("package.json").map(String::as_str))?;
         let host = Rc::new(RefCell::new(Host {
             app_version: Some(version),
             app_name: Some(name.clone()),
+            app_path: if root.as_os_str().is_empty() {
+                std::env::current_dir().unwrap_or_default()
+            } else {
+                root
+            },
             packaged,
             assets: files
                 .get("assets.json")
@@ -171,6 +180,12 @@ impl Desktop {
                     }
                     return Ok(());
                 }
+                if command["op"] == "focus" {
+                    if let Some(cx) = cx.as_deref_mut() {
+                        cx.activate(args[0] == true);
+                    }
+                    continue;
+                }
                 let action = args[0].as_str().context("Missing window action")?;
                 let id = args[1].as_u64().context("Missing window id")?;
                 if action != "create" && !self.views.contains_key(&id) {
@@ -190,7 +205,7 @@ impl Desktop {
                             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
                             Some(cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),titlebar:Some(TitlebarOptions{title:Some(options["title"].as_str().unwrap_or("apps").to_owned().into()),..Default::default()}),show:options["show"]!=false,is_resizable:options["resizable"]!=false,..Default::default()},move|window,cx|{
                                 window.on_window_should_close(cx,move|_,cx|{let runtime=close_runtime.clone();cx.defer(move|cx|{runtime.borrow().host.borrow_mut().commands.push(serde_json::json!({"op":"window","args":["close",id]}));Desktop::drive(runtime,cx);});false});
-                                cx.new(|cx|{let focus = cx.focus_handle(); window.focus(&focus, cx); WebView{id,runtime,host,images:HashMap::new(),focus,browsers:HashMap::new()}})
+                                cx.new(|cx|{let focus = cx.focus_handle(); window.focus(&focus, cx); cx.observe_window_activation(window,|view: &mut WebView,window,cx|{let runtime=view.runtime.clone();let event=format!("__appsEvent('{}',{})",if window.is_window_active(){"focus"}else{"blur"},view.id);cx.defer(move|cx|{if let Ok(app)=runtime.try_borrow()&&let Err(error)=app.main.eval(&event,"apps:focus"){eprintln!("apps: {error}");}Desktop::drive(runtime,cx);});}).detach(); WebView{id,runtime,host,images:HashMap::new(),focus,browsers:HashMap::new()}})
                             })?)
                         } else {
                             None
@@ -549,7 +564,9 @@ impl Desktop {
             Ok(None) => runtime.borrow_mut().wake = None,
             Err(error) => {
                 eprintln!("apps: {error:#}");
-                runtime.borrow_mut().error = Some(error);
+                let mut app = runtime.borrow_mut();
+                app.error = Some(error);
+                app.quit = true;
                 cx.quit();
             }
         }
@@ -610,18 +627,95 @@ impl Desktop {
         let runtime = Rc::new(RefCell::new(self));
         let result = runtime.clone();
         let reopen = runtime.clone();
-        let application = gpui_platform::application();
-        application.on_reopen(move |cx| {
-            if let Err(error) = reopen
-                .borrow()
-                .main
-                .eval("__appsEvent('activate')", "apps:activate")
-            {
+        let terminate = runtime.clone();
+        let (urls, mut opened) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+        let application = gpui_platform::application().with_quit_mode(gpui::QuitMode::Explicit);
+        application.on_reopen(move |cx, visible| {
+            if let Err(error) = reopen.borrow().main.eval(
+                &format!("__appsEvent('activate',0,{visible})"),
+                "apps:activate",
+            ) {
                 eprintln!("apps: {error}");
             }
             Self::drive(reopen.clone(), cx);
         });
+        application.on_should_quit(move |cx| {
+            let Ok(app) = terminate.try_borrow() else {
+                return true;
+            };
+            if app.quit {
+                return true;
+            }
+            if let Err(error) = app.main.eval("__appsEvent('before-quit')", "apps:quit") {
+                eprintln!("apps: {error}");
+                return true;
+            }
+            drop(app);
+            Self::drive(terminate.clone(), cx);
+            terminate.try_borrow().is_ok_and(|app| app.quit)
+        });
+        application.on_open_urls(move |list| {
+            let _ = urls.send(list);
+        });
         application.run(move |cx| {
+            let host = runtime.borrow().host.clone();
+            cx.on_app_quit(move |_| {
+                if let Ok(host) = host.try_borrow() {
+                    if let Some(command) = &host.relaunch {
+                        #[cfg(unix)]
+                        let _ = std::os::unix::process::CommandExt::process_group(
+                            std::process::Command::new("/bin/sh")
+                                .args([
+                                    "-c",
+                                    r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; exec "$@""#,
+                                    &std::process::id().to_string(),
+                                ])
+                                .args(command),
+                            0,
+                        )
+                        .stdin(std::process::Stdio::null())
+                        .spawn();
+                        #[cfg(not(unix))]
+                        let _ = std::process::Command::new(&command[0])
+                            .args(&command[1..])
+                            .spawn();
+                    }
+                    // AppKit exits with 0 after this hook, so a failure code must exit here.
+                    if host.exit_code != 0 {
+                        std::process::exit(host.exit_code);
+                    }
+                }
+                async {}
+            })
+            .detach();
+            let weak = Rc::downgrade(&runtime);
+            cx.spawn(async move |cx| {
+                while let Some(list) = opened.recv().await {
+                    let Some(runtime) = weak.upgrade() else { break };
+                    cx.update(|cx| {
+                        for url in list {
+                            let event = match url::Url::parse(&url)
+                                .ok()
+                                .filter(|url| url.scheme() == "file")
+                                .and_then(|url| url.to_file_path().ok())
+                            {
+                                Some(path) => format!(
+                                    "__appsEvent('open-file',0,{})",
+                                    serde_json::json!(path)
+                                ),
+                                None => {
+                                    format!("__appsEvent('open-url',0,{})", serde_json::json!(url))
+                                }
+                            };
+                            if let Err(error) = runtime.borrow().main.eval(&event, "apps:open") {
+                                eprintln!("apps: {error}");
+                            }
+                        }
+                        Self::drive(runtime, cx);
+                    });
+                }
+            })
+            .detach();
             #[cfg(target_os = "macos")]
             {
                 let mut changes = crate::browser::observe_theme();
@@ -633,11 +727,7 @@ impl Desktop {
                     }
                 })
                 .detach();
-                let runtime = runtime.clone();
-                cx.on_action(move |_: &Quit, cx| {
-                    runtime.borrow_mut().quit = true;
-                    cx.quit();
-                });
+                cx.on_action(|_: &Quit, cx| cx.quit());
                 cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
             }
             let startup = if cfg!(target_os = "macos") {
@@ -647,6 +737,7 @@ impl Desktop {
             };
             if let Err(error) = runtime.borrow().main.eval(startup, "apps:ready") {
                 eprintln!("apps: {error}");
+                runtime.borrow_mut().quit = true;
                 cx.quit();
                 return;
             }
@@ -665,6 +756,7 @@ impl Desktop {
                     }
                     Err(error) => {
                         app.error = Some(error);
+                        app.quit = true;
                         cx.quit();
                         return;
                     }
@@ -6113,6 +6205,67 @@ mod tests {
             .commands
             .push(serde_json::json!({"op":"window","args":["title",2,"stale"]}));
         desktop.pump(None, None).unwrap();
+    }
+
+    #[test]
+    fn app_lifecycle_follows_electron() {
+        let code = r#"
+            const {app, BrowserWindow} = __apps;
+            globalThis.log = [];
+            for (const name of ['will-finish-launching', 'ready', 'web-contents-created', 'browser-window-created', 'browser-window-focus', 'activate', 'open-url', 'open-file', 'window-all-closed', 'will-quit', 'quit'])
+                app.on(name, (_event, value) => log.push(value === undefined || typeof value === 'object' ? name : name + ':' + value));
+            let blocked = true;
+            app.on('before-quit', event => { log.push('before-quit'); if (blocked) event.preventDefault(); blocked = false; });
+            app.commandLine.appendSwitch('flag', 'on');
+            app.setPath('userData', app.getPath('temp'));
+            globalThis.state = [app.getPath('sessionData') === app.getPath('temp'), !!app.getAppPath(), app.commandLine.getSwitchValue('flag'), app.name].join();
+            app.whenReady().then(() => new BrowserWindow());
+        "#;
+        let files = BBTreeMap::from([(
+            "app.js".into(),
+            format!(
+                "define({});",
+                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
+            ),
+        )]);
+        let mut desktop = Desktop::new(&files).unwrap();
+        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.main.eval("__appsEvent('focus',1);__appsEvent('activate',0,true);__appsEvent('open-url',0,'myapp://x');__appsEvent('open-file',0,'/tmp/a');__appsEvent('before-quit')", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        assert!(!desktop.quit);
+        desktop
+            .main
+            .eval("__appsEvent('before-quit')", "test")
+            .unwrap();
+        desktop.pump(None, None).unwrap();
+        assert!(desktop.quit);
+        assert_eq!(
+            desktop.main.eval("state", "test").unwrap(),
+            "true,true,on,App"
+        );
+        assert_eq!(
+            desktop.main.eval("log.join()", "test").unwrap(),
+            "will-finish-launching,ready,web-contents-created,browser-window-created,browser-window-focus,activate:true,open-url:myapp://x,open-file:/tmp/a,before-quit,before-quit,will-quit,quit:0"
+        );
+        for (listener, quits) in [
+            ("", true),
+            ("__apps.app.on('window-all-closed',()=>{});", false),
+        ] {
+            let code = format!(
+                "{listener}__apps.app.whenReady().then(()=>new __apps.BrowserWindow().close())"
+            );
+            let files = BBTreeMap::from([(
+                "app.js".into(),
+                format!(
+                    "define({});",
+                    serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
+                ),
+            )]);
+            let mut desktop = Desktop::new(&files).unwrap();
+            desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+            desktop.pump(None, None).unwrap();
+            assert_eq!(desktop.quit, quits);
+        }
     }
 
     #[test]

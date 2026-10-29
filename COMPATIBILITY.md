@@ -31,4 +31,17 @@ These parts differ from browsers. The ones that don't work show an error in the 
 
 ## Electron API
 
+These parts differ from Electron:
+
+| Feature | Support |
+|---|---|
+| Platforms | `activate`, `open-url`, `open-file`, `second-instance` and the native calls (about panel, login items, single instance lock) work on macOS only. On Windows and Linux the native calls throw an error |
+| `open-url` | The URL scheme must be in the app's `Info.plist`. `apps build` doesn't add it, and `setAsDefaultProtocolClient()` is not supported |
+| `relaunch()` | Works in built apps. `apps run` ignores it |
+| `setPath()`, `setName()` | Change only the values that `app` returns. Web storage keeps its own location |
+| `commandLine` | Switches can be added and read, but they don't change h2o. `disableHardwareAcceleration()` does nothing, because GPUI always draws on the GPU |
+| Login items | Need macOS 13 and a built app. Only `openAtLogin` and `status` are returned |
+| Images | `dock.setIcon()` and `iconPath` take a file path. There is no `nativeImage` |
+| Not supported | Recent documents, jump lists, user activities, `setAppLogsPath()`, `getFileIcon()`, `getAppMetrics()`, GPU info, proxy, certificates and accessibility APIs |
+
 ## Node Integration

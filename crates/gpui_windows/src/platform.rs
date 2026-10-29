@@ -106,7 +106,7 @@ pub(crate) struct WindowsPlatformState {
 struct PlatformCallbacks {
     open_urls: Cell<Option<Box<dyn FnMut(Vec<String>)>>>,
     quit: Cell<Option<Box<dyn FnMut() -> bool>>>,
-    reopen: Cell<Option<Box<dyn FnMut()>>>,
+    reopen: Cell<Option<Box<dyn FnMut(bool)>>>,
     app_menu_action: Cell<Option<Box<dyn FnMut(&dyn Action)>>>,
     will_open_app_menu: Cell<Option<Box<dyn FnMut()>>>,
     validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn Action) -> bool>>>,
@@ -855,7 +855,7 @@ impl Platform for WindowsPlatform {
         self.inner.state.callbacks.quit.set(Some(callback));
     }
 
-    fn on_reopen(&self, callback: Box<dyn FnMut()>) {
+    fn on_reopen(&self, callback: Box<dyn FnMut(bool)>) {
         self.inner.state.callbacks.reopen.set(Some(callback));
     }
 

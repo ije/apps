@@ -1,4 +1,4 @@
-globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true) => {
+globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}) => {
   const contents = new Map(), pending = new Map(), partitions = new Map(), layouts = new WeakMap(), owners = new WeakMap();
   let nextRequest = 0;
   class WebContents extends EventEmitter {
@@ -173,6 +173,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true) => {
       Object.defineProperty(this, 'webContents', { value: webContents, enumerable: true });
       owners.set(webContents, this);
       sync(this);
+      if (!options.webContents) created(webContents);
     }
   }
   const poll = () => {
@@ -211,19 +212,45 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
   let nextNativeID = 0, menuActive = false, menuReady = false, applicationMenu, observeTheme = false, observePower = false, observeApp = false, nativeApp;
   const bindApp = (app, identifier) => {
     nativeApp = app;
-    let ownsInstance = false;
-    const enable = () => { native('app.events'); observeApp = true; };
-    app.on = function (event, listener) {
-      if (this.isReady() && (event === 'open-url' || event === 'second-instance')) enable();
-      return EventEmitter.prototype.on.call(this, event, listener);
-    };
-    app.once('ready', () => { if (app.listenerCount('open-url') || app.listenerCount('second-instance')) enable(); });
+    let ownsInstance = false, badge = '', badgeCount = 0;
     app.requestSingleInstanceLock = (additionalData = null) => {
       ownsInstance = native('app.singleInstance', { id: String(identifier), argv: process.argv, cwd: process.cwd(), data: additionalData });
       observeApp = true; return ownsInstance;
     };
     app.hasSingleInstanceLock = () => ownsInstance;
     app.releaseSingleInstanceLock = () => { native('app.releaseInstance'); ownsInstance = false; };
+    app.showAboutPanel = () => native('app.about');
+    app.setAboutPanelOptions = options => native('app.about', { ...options });
+    app.getLoginItemSettings = () => native('app.loginItem');
+    app.setLoginItemSettings = settings => { native('app.loginItem', !!settings?.openAtLogin); };
+    Object.defineProperty(app, 'applicationMenu', { enumerable: true, get: () => Menu.getApplicationMenu(), set: menu => Menu.setApplicationMenu(menu) });
+    if (process.platform !== 'darwin') return;
+    const setBadge = text => { native('app.badge', badge = String(text)); };
+    Object.assign(app, {
+      hide: () => native('app.hidden', true),
+      show: () => native('app.hidden', false),
+      isHidden: () => native('app.state').hidden,
+      isActive: () => native('app.state').active,
+      setActivationPolicy: policy => native('app.activationPolicy', policy),
+      setBadgeCount(count) {
+        if (count !== undefined && (!Number.isInteger(count) || count < 0)) throw new TypeError('Expected a nonnegative badge count');
+        setBadge(count === undefined ? '•' : count || '');
+        badgeCount = count ?? 0;
+        return true;
+      },
+      getBadgeCount: () => badgeCount,
+      dock: Object.freeze({
+        bounce: (type = 'informational') => native('app.attention', type),
+        cancelBounce: id => native('app.cancelAttention', id),
+        downloadFinished: path => native('app.downloadFinished', String(path)),
+        setBadge, getBadge: () => badge,
+        hide: () => { native('app.activationPolicy', 'accessory'); },
+        show: async () => { native('app.activationPolicy', 'regular'); },
+        isVisible: () => native('app.activationPolicy') === 'regular',
+        setIcon: image => native('app.icon', image == null ? '' : String(image)),
+      }),
+    });
+    Object.defineProperty(app, 'badgeCount', { enumerable: true, get: app.getBadgeCount, set: app.setBadgeCount });
   };
   const clipboard = Object.freeze({
     readText: () => native('clipboard.readText'), writeText: text => native('clipboard.writeText', String(text)),

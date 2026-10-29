@@ -116,13 +116,14 @@ int main(int argc, const char *argv[]) {
         [task waitUntilExit];
         native("app.releaseInstance","null");
         if (!received || task.terminationStatus || [native("app.hasInstance","null") boolValue]) return 9;
-        NSAppleEventDescriptor *url=[NSAppleEventDescriptor appleEventWithEventClass:kInternetEventClass eventID:kAEGetURL targetDescriptor:nil returnID:kAutoGenerateReturnID transactionID:kAnyTransactionID];
-        [url setParamDescriptor:[NSAppleEventDescriptor descriptorWithString:@"apps-smoke://test"] forKeyword:keyDirectObject];
-        AppleEvent reply={typeNull,NULL};
-        if ([[NSAppleEventManager sharedAppleEventManager] dispatchRawAppleEvent:url.aeDesc withRawReply:&reply handlerRefCon:(SRefCon)&reply]!=noErr) return 10;
-        AEDisposeDesc(&reply);
-        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.05]];
-        for (NSDictionary *message in native("poll","null")) if ([message[@"event"] isEqual:@"open-url"] && [message[@"url"] isEqual:@"apps-smoke://test"]) return 0;
-        return 11;
+        native("app.badge","\"3\"");
+        if (![NSApp.dockTile.badgeLabel isEqual:@"3"]) return 10;
+        native("app.badge","\"\"");
+        if (NSApp.dockTile.badgeLabel || ![native("app.activationPolicy","null") isEqual:@"accessory"]) return 10;
+        NSDictionary *locale=native("app.locale","null");
+        if (![locale[@"system"] length] || ![locale[@"languages"] isKindOfClass:NSArray.class]) return 11;
+        native("app.about","{\"applicationName\":\"Smoke\",\"credits\":\"Thanks\"}");
+        if ([[menu itemAtIndex:0].submenu itemAtIndex:0].action != @selector(about:)) return 28;
+        return 0;
     }
 }

@@ -75,9 +75,48 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "power.idle"
         | "power.thermal"
         | "power.battery"
-        | "app.events"
         | "app.releaseInstance"
-        | "app.hasInstance" => {}
+        | "app.hasInstance"
+        | "app.locale"
+        | "app.state" => {}
+        "app.hidden" => ensure!(arguments.is_boolean(), "Expected boolean argument"),
+        "app.loginItem" => ensure!(
+            arguments.is_null() || arguments.is_boolean(),
+            "Expected login item state"
+        ),
+        "app.attention" => ensure!(
+            matches!(arguments.as_str(), Some("critical" | "informational")),
+            "Invalid attention type"
+        ),
+        "app.cancelAttention" => ensure!(arguments.is_u64(), "Expected attention request id"),
+        "app.activationPolicy" => ensure!(
+            arguments.is_null()
+                || matches!(
+                    arguments.as_str(),
+                    Some("regular" | "accessory" | "prohibited")
+                ),
+            "Invalid activation policy"
+        ),
+        "app.about" => {
+            if !arguments.is_null() {
+                let options = arguments
+                    .as_object()
+                    .context("Expected about panel options")?;
+                for name in [
+                    "applicationName",
+                    "applicationVersion",
+                    "version",
+                    "copyright",
+                    "credits",
+                    "iconPath",
+                ] {
+                    ensure!(
+                        options.get(name).is_none_or(Value::is_string),
+                        "Expected text option: {name}"
+                    );
+                }
+            }
+        }
         "app.singleInstance" => {
             ensure!(
                 arguments["id"].as_str().is_some_and(|v| !v.is_empty())
@@ -129,7 +168,10 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "shell.showItemInFolder"
         | "safeStorage.encrypt"
         | "safeStorage.decrypt"
-        | "notification.close" => {
+        | "notification.close"
+        | "app.badge"
+        | "app.icon"
+        | "app.downloadFinished" => {
             ensure!(arguments.is_string(), "Expected text argument");
         }
         "theme.set" => {
@@ -168,9 +210,6 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                     "Expected boolean option: {name}"
                 );
             }
-        }
-        "app.badge" => {
-            ensure!(arguments.is_u64(), "Expected nonnegative badge count");
         }
         _ => bail!("Unknown native operation: {operation}"),
     }

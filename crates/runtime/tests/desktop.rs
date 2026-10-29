@@ -41,6 +41,8 @@ fn native_desktop_dispatches_application_events() {
             "IOKit",
             "-framework",
             "CoreGraphics",
+            "-framework",
+            "ServiceManagement",
             "-o",
         ])
         .arg(&binary)

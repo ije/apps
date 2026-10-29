@@ -5,6 +5,7 @@
 #import <Carbon/Carbon.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
+#import <ServiceManagement/ServiceManagement.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -17,6 +18,7 @@
 bool apps_reduce_motion(void) { return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion; }
 
 static NSString *AppsThemeSource = @"system";
+static NSDictionary *AppsAboutOptions;
 static void (*AppsThemeWake)(void);
 static _Atomic(uint32_t) AppsThemeCache = UINT32_MAX;
 
@@ -94,7 +96,7 @@ static void AppsNativeEmit(NSDictionary *event) {
 - (void)themeChanged:(NSNotification *)notification;
 - (void)powerChanged:(NSNotification *)notification;
 - (void)secondInstance:(NSNotification *)notification;
-- (void)openURL:(NSAppleEventDescriptor *)event reply:(NSAppleEventDescriptor *)reply;
+- (void)about:(id)sender;
 @end
 @implementation AppsNative
 - (void)secondInstance:(NSNotification *)notification {
@@ -104,9 +106,8 @@ static void AppsNativeEmit(NSDictionary *event) {
     id value = AppsValue(message.UTF8String);
     if ([value isKindOfClass:[NSDictionary class]]) AppsNativeEmit(@{ @"type": @"app", @"event": @"second-instance", @"args": value[@"argv"] ?: @[], @"cwd": value[@"cwd"] ?: @"", @"data": value[@"data"] ?: [NSNull null] });
 }
-- (void)openURL:(NSAppleEventDescriptor *)event reply:(NSAppleEventDescriptor *)reply {
-    NSString *url = [event paramDescriptorForKeyword:keyDirectObject].stringValue;
-    if (url) AppsNativeEmit(@{ @"type": @"app", @"event": @"open-url", @"url": url });
+- (void)about:(id)sender {
+    [NSApp orderFrontStandardAboutPanelWithOptions:AppsAboutOptions ?: @{}];
 }
 - (void)menuAction:(NSMenuItem *)item {
     if ([item.representedObject isEqual:@"checkbox"]) item.state = item.state == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn;
@@ -163,7 +164,6 @@ static AppsNative *AppsNativeOwner(void) {
         owner.lockFD = -1;
         owner.hotkeys = [NSMutableDictionary new];
         owner.themeState = apps_theme_state();
-        [[NSAppleEventManager sharedAppleEventManager] setEventHandler:owner andSelector:@selector(openURL:reply:) forEventClass:kInternetEventClass andEventID:kAEGetURL];
         [[NSDistributedNotificationCenter defaultCenter] addObserver:owner selector:@selector(themeChanged:) name:@"AppleInterfaceThemeChangedNotification" object:nil];
         [NSWorkspace.sharedWorkspace.notificationCenter addObserver:owner selector:@selector(themeChanged:) name:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification object:nil];
         for (NSString *name in @[NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification, NSWorkspaceWillPowerOffNotification]) [[NSWorkspace sharedWorkspace].notificationCenter addObserver:owner selector:@selector(powerChanged:) name:name object:nil];
@@ -219,6 +219,7 @@ static NSMenu *AppsMenu(NSArray *template) {
         if (role && !roles[role]) role = nil;
         NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:description[@"label"] ?: description[@"role"] ?: @"" action:role ? NSSelectorFromString(roles[role]) : @selector(menuAction:) keyEquivalent:@""];
         if (!role) { item.target = AppsNativeOwner(); item.tag = [description[@"click"] integerValue]; }
+        if ([role isEqual:@"about"]) { item.target = AppsNativeOwner(); item.action = @selector(about:); }
         if (description[@"accelerator"]) {
             NSArray *accelerator = AppsAccelerator(description[@"accelerator"]);
             if (!accelerator) return nil;
@@ -261,7 +262,6 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     if (![NSThread isMainThread]) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
     if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
     if ([op isEqualToString:@"poll"]) { result = [AppsNativeEvents() copy]; [AppsNativeEvents() removeAllObjects]; }
-    else if ([op isEqualToString:@"app.events"]) AppsNativeOwner();
     else if ([op isEqualToString:@"app.singleInstance"]) {
         AppsNative *owner = AppsNativeOwner();
         if (owner.lockFD >= 0) result = @YES;
@@ -410,7 +410,44 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         }];
         result = identifier;
     } else if ([op isEqualToString:@"notification.close"]) [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[args]];
-    else if ([op isEqualToString:@"app.badge"]) NSApp.dockTile.badgeLabel = [args integerValue] > 0 ? [args stringValue] : nil;
+    else if ([op isEqualToString:@"app.badge"]) NSApp.dockTile.badgeLabel = [args length] ? args : nil;
+    else if ([op isEqualToString:@"app.locale"]) result = @{ @"system": [[NSLocale.currentLocale.localeIdentifier componentsSeparatedByString:@"@"][0] stringByReplacingOccurrencesOfString:@"_" withString:@"-"], @"languages": NSLocale.preferredLanguages };
+    else if ([op isEqualToString:@"app.hidden"]) { if ([args boolValue]) [NSApp hide:nil]; else [NSApp unhide:nil]; }
+    else if ([op isEqualToString:@"app.state"]) result = @{ @"hidden": @(NSApp.isHidden), @"active": @(NSApp.isActive) };
+    else if ([op isEqualToString:@"app.attention"]) result = @([NSApp requestUserAttention:[args isEqual:@"critical"] ? NSCriticalRequest : NSInformationalRequest]);
+    else if ([op isEqualToString:@"app.cancelAttention"]) [NSApp cancelUserAttentionRequest:[args integerValue]];
+    else if ([op isEqualToString:@"app.downloadFinished"]) [[NSDistributedNotificationCenter defaultCenter] postNotificationName:@"com.apple.DownloadFileFinished" object:[args stringByResolvingSymlinksInPath]];
+    else if ([op isEqualToString:@"app.activationPolicy"]) {
+        NSArray *policies = @[@"regular", @"accessory", @"prohibited"];
+        if (args != [NSNull null]) [NSApp setActivationPolicy:[policies indexOfObject:args]];
+        result = policies[MIN(2, NSApp.activationPolicy)];
+    } else if ([op isEqualToString:@"app.icon"]) {
+        NSImage *image = [args length] ? [[NSImage alloc] initWithContentsOfFile:args] : nil;
+        if ([args length] && !image) return strdup("{\"error\":\"Cannot load the icon image\"}");
+        NSApp.applicationIconImage = image;
+    } else if ([op isEqualToString:@"app.about"]) {
+        if (args == [NSNull null]) [NSApp orderFrontStandardAboutPanelWithOptions:AppsAboutOptions ?: @{}];
+        else {
+            NSMutableDictionary *options = [NSMutableDictionary new];
+            NSDictionary *keys = @{ @"applicationName": NSAboutPanelOptionApplicationName, @"applicationVersion": NSAboutPanelOptionApplicationVersion, @"version": NSAboutPanelOptionVersion, @"copyright": @"Copyright" };
+            for (NSString *key in keys) if (args[key]) options[keys[key]] = args[key];
+            if (args[@"credits"]) options[NSAboutPanelOptionCredits] = [[NSAttributedString alloc] initWithString:args[@"credits"]];
+            if (args[@"iconPath"]) {
+                NSImage *image = [[NSImage alloc] initWithContentsOfFile:args[@"iconPath"]];
+                if (!image) return strdup("{\"error\":\"Cannot load the icon image\"}");
+                options[NSAboutPanelOptionApplicationIcon] = image;
+            }
+            AppsAboutOptions = options;
+        }
+    } else if ([op isEqualToString:@"app.loginItem"]) {
+        if (@available(macOS 13, *)) {
+            SMAppService *service = SMAppService.mainAppService;
+            if (args != [NSNull null] && [args boolValue] != (service.status == SMAppServiceStatusEnabled)) {
+                if ([args boolValue]) [service registerAndReturnError:nil]; else [service unregisterAndReturnError:nil];
+            }
+            result = @{ @"openAtLogin": @((BOOL)(service.status == SMAppServiceStatusEnabled)), @"status": @[@"not-registered", @"enabled", @"requires-approval", @"not-found"][MIN(3, service.status)] };
+        } else result = @{ @"openAtLogin": @NO, @"status": @"not-found" };
+    }
     else if ([op isEqualToString:@"dialog.open"]) {
         NSOpenPanel *panel = [NSOpenPanel openPanel];
         NSArray *properties = args[@"properties"] ?: @[@"openFile"];

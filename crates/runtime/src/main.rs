@@ -6,7 +6,17 @@ fn main() {
         let mut devtools = false;
         let mut directory = None;
         let mut bundle_stdin = false;
-        for arg in std::env::args().skip(1) {
+        let mut home = std::env::current_exe()?
+            .canonicalize()?
+            .parent()
+            .unwrap()
+            .to_owned();
+        if home.ends_with("Contents/MacOS") {
+            home = home.parent().unwrap().join("Resources");
+        }
+        // A built app passes all of its arguments to process.argv.
+        let packaged = home.join("app.h2o").is_file() || home.join("app.js").is_file();
+        for arg in std::env::args().skip(1).filter(|_| !packaged) {
             if arg == "--check" {
                 check = true;
             } else if arg == "--devtools" {
@@ -32,18 +42,7 @@ fn main() {
             anyhow::ensure!(bundle.files.contains_key("app.js"), "Missing app.js");
             bundle
         } else {
-            let directory = directory.unwrap_or(
-                std::env::current_exe()?
-                    .canonicalize()?
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-            );
-            let directory = if directory.ends_with("Contents/MacOS") {
-                directory.parent().unwrap().join("Resources")
-            } else {
-                directory
-            };
+            let directory = directory.unwrap_or(home);
             apps_runtime::bundle::read(&directory)?
         };
         let app = apps_runtime::desktop::Desktop::from_bundle(bundle)?;

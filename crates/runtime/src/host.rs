@@ -22,6 +22,9 @@ pub struct Page {
 pub struct Host {
     pub app_name: Option<String>,
     pub app_version: Option<String>,
+    pub app_path: PathBuf,
+    pub paths: HashMap<String, PathBuf>,
+    pub relaunch: Option<Vec<String>>,
     pub packaged: bool,
     pub native_modules: HashMap<String, PathBuf>,
     pub assets: HashMap<String, PathBuf>,
@@ -39,6 +42,41 @@ pub struct Host {
 }
 
 impl Host {
+    fn app_dir(&self, name: &str) -> Result<PathBuf> {
+        if let Some(path) = self.paths.get(name) {
+            return Ok(path.clone());
+        }
+        let home = PathBuf::from(
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .unwrap_or_default(),
+        );
+        Ok(match name {
+            "home" => home,
+            "temp" => std::env::temp_dir(),
+            "exe" => std::env::current_exe()?,
+            "desktop" => home.join("Desktop"),
+            "documents" => home.join("Documents"),
+            "downloads" => home.join("Downloads"),
+            "music" => home.join("Music"),
+            "pictures" => home.join("Pictures"),
+            "videos" if cfg!(target_os = "macos") => home.join("Movies"),
+            "videos" => home.join("Videos"),
+            "appData" if cfg!(target_os = "macos") => home.join("Library/Application Support"),
+            "appData" if cfg!(windows) => std::env::var_os("APPDATA").map_or(home, PathBuf::from),
+            "appData" => std::env::var_os("XDG_CONFIG_HOME")
+                .map_or_else(|| home.join(".config"), PathBuf::from),
+            "userData" => self
+                .app_dir("appData")?
+                .join(self.app_name.as_deref().unwrap_or("apps")),
+            "sessionData" => self.app_dir("userData")?,
+            "logs" if cfg!(target_os = "macos") => home
+                .join("Library/Logs")
+                .join(self.app_name.as_deref().unwrap_or("apps")),
+            "logs" => self.app_dir("userData")?.join("logs"),
+            _ => bail!("Unsupported app path: {name}"),
+        })
+    }
+
     pub(crate) fn sync_theme(&mut self) {
         let theme = crate::browser::theme_state();
         if self.theme == theme {
@@ -349,46 +387,65 @@ impl Host {
                 #[cfg(not(unix))]
                 bail!("process.kill is unavailable on this platform")
             }
-            "app.path" => {
-                let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                    .unwrap_or_default();
+            "app.path" => Ok(json!(
+                self.app_dir(args[0].as_str().context("Expected path name")?)?
+            )),
+            "app.setPath" => {
                 let name = args[0].as_str().context("Expected path name")?;
-                Ok(json!(match name {
-                    "home" => PathBuf::from(&home),
-                    "temp" => std::env::temp_dir(),
-                    "exe" => std::env::current_exe()?,
-                    "desktop" => PathBuf::from(&home).join("Desktop"),
-                    "documents" => PathBuf::from(&home).join("Documents"),
-                    "downloads" => PathBuf::from(&home).join("Downloads"),
-                    "appData" | "userData" => {
-                        let base = if cfg!(target_os = "macos") {
-                            PathBuf::from(&home).join("Library/Application Support")
-                        } else if cfg!(windows) {
-                            PathBuf::from(std::env::var("APPDATA").unwrap_or(home))
-                        } else {
-                            PathBuf::from(
-                                std::env::var("XDG_CONFIG_HOME")
-                                    .unwrap_or_else(|_| format!("{home}/.config")),
-                            )
-                        };
-                        if name == "userData" {
-                            base.join(self.app_name.as_deref().unwrap_or("apps"))
-                        } else {
-                            base
-                        }
-                    }
-                    _ => bail!("Unsupported app path: {name}"),
-                }))
+                let path = PathBuf::from(args[1].as_str().context("Expected path")?);
+                self.app_dir(name)?;
+                ensure!(path.is_absolute(), "Path must be absolute");
+                self.paths.insert(name.to_owned(), path);
+                Ok(Value::Null)
             }
-            "info" => Ok(
-                json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":std::env::var("LANG").unwrap_or_else(|_|"en-US".into()).split('.').next().unwrap_or("en-US").replace('_',"-"),"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":std::env::args().collect::<Vec<_>>(),"env":std::env::vars().collect::<HashMap<_,_>>(),"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
-            ),
+            "app.relaunch" => {
+                ensure!(
+                    matches!(role, Role::Main),
+                    "Only the main context can relaunch the app"
+                );
+                let command: Vec<String> = serde_json::from_value(args[0].clone())
+                    .ok()
+                    .filter(|command: &Vec<String>| !command.is_empty())
+                    .context("Expected relaunch command")?;
+                if self.packaged {
+                    self.relaunch = Some(command);
+                } else {
+                    eprintln!("apps: app.relaunch() only works in built apps");
+                }
+                Ok(Value::Null)
+            }
+            "info" => {
+                let system = ["LC_ALL", "LC_MESSAGES", "LANG"]
+                    .iter()
+                    .find_map(|name| {
+                        std::env::var(name)
+                            .ok()
+                            .filter(|value| !matches!(value.as_str(), "" | "C" | "POSIX"))
+                    })
+                    .map_or("en-US".into(), |value| {
+                        value
+                            .split(['.', '@'])
+                            .next()
+                            .unwrap_or("")
+                            .replace('_', "-")
+                    });
+                let languages: Vec<_> = std::env::var("LANGUAGE")
+                    .unwrap_or_default()
+                    .split(':')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.replace('_', "-"))
+                    .collect();
+                let locale = json!({"system":system,"languages":if languages.is_empty() {vec![system.clone()]} else {languages}});
+                Ok(
+                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":std::env::args().collect::<Vec<_>>(),"env":std::env::vars().collect::<HashMap<_,_>>(),"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                )
+            }
             "cwd" => Ok(json!(std::env::current_dir()?)),
             "chdir" => {
                 std::env::set_current_dir(args[0].as_str().context("Expected path")?)?;
                 Ok(Value::Null)
             }
-            "window" | "quit" => {
+            "window" | "quit" | "focus" => {
                 ensure!(
                     matches!(role, Role::Main),
                     "Only the main context can control windows"

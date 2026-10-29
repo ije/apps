@@ -13,6 +13,8 @@ const HEADER: &[u8; 8] = b"H2O\0\x01\0\0\0";
 pub struct Bundle {
     #[serde(skip)]
     pub packaged: bool,
+    #[serde(skip)]
+    pub root: std::path::PathBuf,
     #[serde(with = "map")]
     pub files: BBTreeMap<String, String>,
     #[serde(with = "map")]
@@ -230,6 +232,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
         *source = serde_json::to_string(&paths)?;
     }
     bundle.packaged = path.is_file();
+    bundle.root = directory;
     ensure!(bundle.files.contains_key("app.js"), "Missing app.js");
     Ok(bundle)
 }

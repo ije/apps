@@ -32,6 +32,7 @@ fn main() {
             "Carbon",
             "IOKit",
             "CoreGraphics",
+            "ServiceManagement",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

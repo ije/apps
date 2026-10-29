@@ -126,7 +126,7 @@
   delete globalThis.__appsHTTP;
   pty = globalThis.__appsPty(call);
   delete globalThis.__appsPty;
-  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready);
+  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents));
   delete globalThis.__appsBrowser;
   nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter);
   delete globalThis.__appsNativeShell;
@@ -259,6 +259,8 @@
       call('window', 'create', this.id, options);
       windows.set(this.id, this);
       Object.defineProperty(this, 'contentView', { value: browsers.contentView(this, options), enumerable: true });
+      app.emit('web-contents-created', event(), this.webContents);
+      app.emit('browser-window-created', event(), this);
     }
     load(html) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'load', this.id, String(html)); }
     loadFile(file) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'loadFile', this.id, String(file)); }
@@ -272,7 +274,53 @@
     static fromId(id) { return windows.get(id) ?? null; }
   }
   const app = new events.EventEmitter();
-  Object.assign(app, { whenReady: () => readyPromise, isReady: () => ready, quit: () => call('quit', 0), getVersion: () => info.appVersion, getPath: name => call('app.path', name), getName: () => info.appName, getLocale: () => info.locale, isPackaged: info.isPackaged, platform: info.platform });
+  const event = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  const switches = new Map(info.argv.slice(1).flatMap(arg => { const match = /^--([^=]+)(?:=(.*))?$/s.exec(arg); return match ? [[match[1], match[2] ?? '']] : []; }));
+  let quitting = false, name = info.appName, locale;
+  const locales = () => locale ??= info.platform === 'darwin' ? call('native.app.locale', null) : info.locale;
+  const willQuit = () => {
+    const will = event();
+    app.emit('will-quit', will);
+    if (will.defaultPrevented) { quitting = false; return; }
+    app.emit('quit', event(), 0);
+    call('quit', 0);
+  };
+  const quit = () => {
+    if (quitting) return;
+    const before = event();
+    app.emit('before-quit', before);
+    if (before.defaultPrevented) return;
+    quitting = true;
+    for (const win of windows.values()) win.close();
+    if (!windows.size) willQuit();
+  };
+  Object.assign(app, {
+    whenReady: () => readyPromise, isReady: () => ready, quit,
+    exit: (code = 0) => call('quit', code),
+    relaunch: ({ args = info.argv.slice(1), execPath = info.execPath } = {}) => call('app.relaunch', [String(execPath), ...args.map(String)]),
+    focus: ({ steal = false } = {}) => call('focus', !!steal),
+    getAppPath: () => info.appPath,
+    getPath: name => call('app.path', name),
+    setPath: (name, path) => call('app.setPath', name, path),
+    getVersion: () => info.appVersion,
+    getName: () => name,
+    setName: value => { name = String(value); },
+    getLocale: () => locales().languages[0] ?? locales().system,
+    getSystemLocale: () => locales().system,
+    getPreferredSystemLanguages: () => [...locales().languages],
+    getLocaleCountryCode: () => locales().system.split('-').slice(1).find(part => /^[A-Z]{2}$/.test(part)) ?? '',
+    commandLine: Object.freeze({
+      appendSwitch: (key, value = '') => { switches.set(String(key), String(value)); },
+      appendArgument: () => {},
+      hasSwitch: key => switches.has(key),
+      getSwitchValue: key => switches.get(key) ?? '',
+      removeSwitch: key => { switches.delete(key); },
+    }),
+    disableHardwareAcceleration: () => {},
+    isHardwareAccelerationEnabled: () => true,
+    isPackaged: info.isPackaged, platform: info.platform,
+  });
+  Object.defineProperty(app, 'name', { get: () => name, set: app.setName, enumerable: true });
   Object.defineProperty(app, 'hasWindows', { get: () => windows.size > 0, enumerable: true });
   nativeShell.bindApp(app,info.appName);
   if (role === 'main' && workers.api.isMainThread) globalThis.__appsStart = options => {
@@ -297,12 +345,28 @@
     }
     onReady?.();
   };
-  globalThis.__appsEvent = (name, id, bounds) => {
-    if (name === 'ready') { ready = true; app.emit('ready'); resolveReady(); }
-    else if (name === 'closed') { const win = windows.get(id); if (!win) return; windows.delete(id); for (const child of win.contentView.children) win.contentView.removeChildView(child); win.emit('closed'); app.emit('window-close'); if (!windows.size) app.emit('window-all-closed'); }
-    else if (name === 'resize') { const win = windows.get(id); if (win) { win.contentView.setBounds({ x: 0, y: 0, ...bounds }); win.emit('resize'); } }
-    else if (name === 'loaded') windows.get(id)?.emit('ready-to-show');
-    else app.emit(name);
+  globalThis.__appsEvent = (name, id, data) => {
+    const win = windows.get(id);
+    if (name === 'ready') { app.emit('will-finish-launching'); ready = true; app.emit('ready'); resolveReady(); }
+    else if (name === 'closed') {
+      if (!win) return;
+      const closing = quitting;
+      windows.delete(id);
+      for (const child of win.contentView.children) win.contentView.removeChildView(child);
+      win.emit('closed');
+      app.emit('window-close');
+      if (windows.size) return;
+      if (closing) willQuit();
+      else if (quitting) return;
+      else if (app.listenerCount('window-all-closed') || app.listenerCount('window-close')) app.emit('window-all-closed');
+      else quit();
+    }
+    else if (name === 'resize') { if (win) { win.contentView.setBounds({ x: 0, y: 0, ...data }); win.emit('resize'); } }
+    else if (name === 'loaded') win?.emit('ready-to-show');
+    else if (name === 'focus' || name === 'blur') { if (win) { win.emit(name); app.emit('browser-window-' + name, event(), win); } }
+    else if (name === 'activate') app.emit('activate', event(), !!data);
+    else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
+    else if (name === 'before-quit') quit();
   };
   globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, ...nativeShell, ...bridge, serve: servers.serve, fs, path, os, process, sqlite, events, child_process: children.api, pty: pty.api, ffi, buffer: { Buffer: node.Buffer }, stream, net: net.api, http: http.http, https: http.https, ws: http.ws, util: node.util, url: node.url, string_decoder: node.string_decoder, crypto: globalThis.__appsNodeCrypto, worker_threads: workers.api, timers: { setTimeout: (delay, value, options) => scheduler.wait(delay, options).then(() => value), setImmediate: value => scheduler.wait(0).then(() => value), scheduler }, module: { createRequire: () => name => { const key=name.replace(/^node:/, ""); const value = key==='electron'?globalThis.__apps:key==='node-pty'?globalThis.__apps.pty:key==='fs/promises'?globalThis.__apps.fs.promises:key==='stream/promises'?globalThis.__apps.stream.promises:key==='stream/web'?{ReadableStream,WritableStream,TransformStream}:globalThis.__apps[key]; if (value === undefined) throw new Error("Unsupported required module: " + name); return value; }, isBuiltin: name => Object.hasOwn(globalThis.__apps, name.replace(/^node:/, "")), get builtinModules() { return Object.keys(globalThis.__apps); } } });
 })();

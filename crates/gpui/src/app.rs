@@ -275,16 +275,39 @@ impl Application {
 
     /// Invokes a handler when an already-running application is launched.
     /// On macOS, this can occur when the application icon is double-clicked or the app is launched via the dock.
+    /// The handler receives whether the app has visible windows.
     pub fn on_reopen<F>(&self, mut callback: F) -> &Self
     where
-        F: 'static + FnMut(&mut App),
+        F: 'static + FnMut(&mut App, bool),
     {
         let this = Rc::downgrade(&self.0);
-        self.0.borrow_mut().platform.on_reopen(Box::new(move || {
-            if let Some(app) = this.upgrade() {
-                callback(&mut app.borrow_mut());
-            }
-        }));
+        self.0
+            .borrow_mut()
+            .platform
+            .on_reopen(Box::new(move |has_visible_windows| {
+                if let Some(app) = this.upgrade() {
+                    callback(&mut app.borrow_mut(), has_visible_windows);
+                }
+            }));
+        self
+    }
+
+    /// Invokes a handler when the system asks to terminate the app (macOS Quit menu, Dock, logout).
+    /// Return `false` to cancel. The app quits when the handler can't run because the app is busy.
+    pub fn on_should_quit<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App) -> bool,
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_should_quit(Box::new(move || {
+                this.upgrade().is_none_or(|app| {
+                    app.try_borrow_mut()
+                        .map_or(true, |mut cx| callback(&mut cx))
+                })
+            }));
         self
     }
 
