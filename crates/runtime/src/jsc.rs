@@ -806,6 +806,7 @@ impl Engine {
             engine.eval(include_str!("../js/serve.js"), "apps:serve")?;
             engine.eval(include_str!("../js/node.js"), "apps:node")?;
             engine.eval(include_str!("../js/node_streams.js"), "apps:node-streams")?;
+            engine.eval(include_str!("../js/node_io.js"), "apps:node-io")?;
             engine.eval(include_str!("../js/node_http.js"), "apps:node-http")?;
             engine.eval(include_str!("../js/net.js"), "apps:net")?;
             engine.eval(include_str!("../js/pty.js"), "apps:pty")?;
@@ -821,6 +822,7 @@ impl Engine {
             include_str!("../js/browser_environment.js"),
             "apps:browser-environment",
         )?;
+        engine.eval(include_str!("../js/inspect.js"), "apps:inspect")?;
         engine.eval(include_str!("../js/bootstrap.js"), "apps:bootstrap")?;
         engine.eval(include_str!("../js/wasm.js"), "apps:wasm")?;
         engine.eval(include_str!("../js/file_system.js"), "apps:file-system")?;

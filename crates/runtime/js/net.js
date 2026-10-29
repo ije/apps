@@ -10,7 +10,7 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
         this._written = callback;
         try { call('web.tcp.write', this._socket, encode(chunk)); } catch (error) { this._written = null; callback(error); }
       };
-      this._writer._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
+      this._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
     }
     connect(options, host, listener) {
       if (this._socket !== undefined) throw new Error('Socket is already connected');

@@ -262,6 +262,79 @@ fn synchronous_child_processes_and_errors() {
 }
 
 #[test]
+fn node_core_modules() {
+    run(r#"
+        const {assert,util,path,os,url,querystring,events,crypto,zlib,string_decoder:{StringDecoder}}=__apps;
+        assert.deepStrictEqual(Buffer.concat([Buffer.alloc(0),Buffer.from('ab')]),Buffer.from('ab'));
+        assert.strictEqual(Buffer.alloc(5).fill('ab').toString(),'ababa');
+        assert.strictEqual(Buffer.from('abcabc').lastIndexOf('b'),4);
+        const word=Buffer.alloc(6);word.writeUIntBE(0x123456789a,0,5);assert.strictEqual(word.readUIntBE(0,5),0x123456789a);
+        assert.strictEqual(util.format('%s=%d %j','a',5,{x:1}),'a=5 {"x":1}');
+        assert.strictEqual(util.inspect({a:[1,{b:new Map([[1,2]])}],c:'x'}),"{ a: [ 1, { b: [Map] } ], c: 'x' }");
+        assert.strictEqual(util.inspect(Buffer.from('hi')),'<Buffer 68 69>');
+        assert.throws(()=>assert.deepStrictEqual({a:1},{a:'1'}),{code:'ERR_ASSERTION'});
+        await assert.rejects(Promise.reject(new TypeError('x')),TypeError);
+        assert.deepStrictEqual(util.parseArgs({args:['-v','--name=x','pos'],options:{verbose:{type:'boolean',short:'v'},name:{type:'string'}},allowPositionals:true}).positionals,['pos']);
+        assert.deepStrictEqual(path.parse('/home/u/f.txt'),{root:'/',dir:'/home/u',base:'f.txt',ext:'.txt',name:'f'});
+        assert.strictEqual(path.win32.format({dir:'C:\\a',name:'b',ext:'.c'}),'C:\\a\\b.c');
+        assert.strictEqual(url.fileURLToPath(url.pathToFileURL('/tmp/a b#c')),'/tmp/a b#c');
+        assert.ok(os.totalmem()>0&&os.cpus().length>0&&!os.tmpdir().endsWith('/')&&typeof os.userInfo().username==='string');
+        assert.deepStrictEqual(querystring.parse('a=1&a=2&b=x+y'),Object.assign(Object.create(null),{a:['1','2'],b:'x y'}));
+        const decoder=new StringDecoder('utf8'),euro=Buffer.from('€');assert.strictEqual(decoder.write(euro.subarray(0,1))+decoder.end(euro.subarray(1)),'€');
+        const emitter=new events.EventEmitter();let added;emitter.on('newListener',name=>added=name);emitter.on('x',()=>{});assert.strictEqual(added,'x');
+        setTimeout(()=>{emitter.emit('tick',1);emitter.emit('tick',2);},1);const ticks=[];for await(const [value] of events.on(emitter,'tick')){ticks.push(value);if(ticks.length===2)break;}assert.deepStrictEqual(ticks,[1,2]);
+        assert.strictEqual(crypto.createHash('md5').update('a').digest('hex'),'0cc175b9c0f1b6a831c399e269772661');
+        const big=crypto.createHash('sha256');for(let i=0;i<40;i++)big.update(Buffer.alloc(4096,i));const copy=big.copy();assert.strictEqual(big.digest('hex'),copy.digest('hex'));
+        const key=crypto.randomBytes(32),iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key,iv);
+        const sealed=Buffer.concat([cipher.update('secret','utf8'),cipher.final()]),decipher=crypto.createDecipheriv('aes-256-gcm',key,iv);decipher.setAuthTag(cipher.getAuthTag());
+        assert.strictEqual(Buffer.concat([decipher.update(sealed),decipher.final()]).toString(),'secret');
+        assert.strictEqual((await util.promisify(crypto.pbkdf2)('pw','salt',1000,16,'sha256')).toString('hex'),crypto.pbkdf2Sync('pw','salt',1000,16,'sha256').toString('hex'));
+        assert.strictEqual(zlib.gunzipSync(zlib.gzipSync('hello')).toString(),'hello');
+        assert.strictEqual((await util.promisify(zlib.inflate)(zlib.deflateSync('async'))).toString(),'async');
+        assert.throws(()=>zlib.gunzipSync(Buffer.from('nope')),{code:'Z_DATA_ERROR'});
+        assert.strictEqual(typeof setTimeout(()=>{},0).unref().hasRef,'function');
+        assert.strictEqual(await util.promisify(setTimeout)(1,'done'),'done');
+        assert.ok(process.memoryUsage().rss>0&&process.cpuUsage().user>=0&&process.versions.node);
+        assert.ok(__apps.module.isBuiltin('node:readline/promises'));
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
+fn node_files_streams_and_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = serde_json::to_string(dir.path()).unwrap();
+    run(&format!(
+        r#"
+        const {{assert,fs,path,stream,readline,zlib,crypto,util,child_process}}=__apps,root={root};
+        const file=path.join(root,'a','lines.txt');
+        fs.mkdirSync(path.dirname(file),{{recursive:true}});fs.writeFileSync(file,'one\r\ntwo\nthree');
+        try{{fs.readFileSync(path.join(root,'missing'))}}catch(error){{assert.strictEqual(error.message,`ENOENT: no such file or directory, open '${{path.join(root,'missing')}}'`);assert.strictEqual(error.syscall,'open');}}
+        assert.strictEqual(fs.statSync(path.join(root,'missing'),{{throwIfNoEntry:false}}),undefined);
+        const stats=fs.statSync(file);assert.ok(stats.isFile()&&stats.atime instanceof Date&&stats.ctimeMs>0&&stats.nlink===1);
+        assert.deepStrictEqual(fs.readdirSync(root,{{recursive:true}}).sort(),['a',path.join('a','lines.txt')]);
+        const entry=fs.readdirSync(root,{{recursive:true,withFileTypes:true}}).find(item=>item.isFile());assert.strictEqual(entry.name,'lines.txt');assert.strictEqual(entry.parentPath,path.join(root,'a'));
+        fs.utimesSync(file,1000,2000);assert.strictEqual(fs.statSync(file).mtimeMs,2000000);
+        fs.cpSync(path.join(root,'a'),path.join(root,'b'),{{recursive:true}});assert.strictEqual(fs.readFileSync(path.join(root,'b','lines.txt'),'utf8'),'one\r\ntwo\nthree');
+        fs.copyFileSync(file,path.join(root,'b','copy.txt'));assert.throws(()=>fs.copyFileSync(file,path.join(root,'b','copy.txt'),fs.constants.COPYFILE_EXCL),{{code:'EEXIST'}});
+        fs.truncateSync(path.join(root,'b','copy.txt'),3);assert.strictEqual(fs.readFileSync(path.join(root,'b','copy.txt'),'utf8'),'one');
+        const lines=[];for await(const line of readline.createInterface({{input:fs.createReadStream(file,{{highWaterMark:2}})}}))lines.push(line);assert.deepStrictEqual(lines,['one','two','three']);
+        class Upper extends stream.Transform{{_transform(chunk,encoding,callback){{callback(null,chunk.toString().toUpperCase());}}}}
+        const output=path.join(root,'out.gz');
+        await stream.promises.pipeline(fs.createReadStream(file),new Upper(),async function*(source){{for await(const chunk of source)yield chunk;}},zlib.createGzip(),fs.createWriteStream(output));
+        assert.strictEqual(zlib.gunzipSync(fs.readFileSync(output)).toString(),'ONE\r\nTWO\nTHREE');
+        const hash=await new Promise((resolve,reject)=>fs.createReadStream(file).pipe(crypto.createHash('sha1')).setEncoding('hex').on('data',resolve).on('error',reject));
+        assert.strictEqual(hash,crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex'));
+        assert.strictEqual(await stream.consumers.text(stream.Readable.from(['a','b'])),'ab');
+        const exec=util.promisify(child_process.exec);
+        const {{stdout}}=await exec('echo "$0"',{{shell:'/bin/sh'}});assert.strictEqual(stdout.trim(),'/bin/sh');
+        await assert.rejects(exec('echo bad >&2; exit 3'),error=>error.code===3&&error.stderr==='bad\n');
+        process.env.APPS_ENV_TEST='inherited';assert.strictEqual((await exec('printf "$APPS_ENV_TEST"')).stdout,'inherited');assert.strictEqual(child_process.execSync('printf "$APPS_ENV_TEST"',{{encoding:'utf8'}}),'inherited');
+    "#
+    ));
+}
+
+#[test]
 fn data_urls_load_binary_wasm_without_a_server() {
     run(r#"
         const raw=await fetch('data:application/octet-stream,%00%FF%23#ignored');

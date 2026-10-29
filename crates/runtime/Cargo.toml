@@ -24,6 +24,7 @@ libc.workspace = true
 libffi = "5.2.0"
 libloading = "0.8"
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
+md-5 = "0.10"
 naga = { version = "30", features = ["termcolor"] }
 notify = "8.2"
 pollster.workspace = true

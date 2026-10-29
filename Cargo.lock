@@ -115,6 +115,7 @@ dependencies = [
  "libffi",
  "libloading",
  "libsqlite3-sys",
+ "md-5",
  "naga",
  "notify",
  "pollster",

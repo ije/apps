@@ -45,3 +45,23 @@ These parts differ from Electron:
 | Not supported | Recent documents, jump lists, user activities, `setAppLogsPath()`, `getFileIcon()`, `getAppMetrics()`, GPU info, proxy, certificates and accessibility APIs |
 
 ## Node Integration
+
+The main process, preload scripts and workers can import these built-in modules, with or without the `node:` prefix: `assert`, `buffer`, `child_process`, `crypto`, `dns`, `events`, `fs`, `http`, `https`, `module`, `net`, `os`, `path`, `perf_hooks`, `process`, `querystring`, `readline`, `stream`, `string_decoder`, `timers`, `tty`, `url`, `util`, `worker_threads` and `zlib`. Their `/promises`, `/strict`, `/posix`, `/win32`, `/types`, `/consumers` and `/web` subpaths also work. `node:sqlite` and `node:ffi` are available too.
+
+h2o follows the Node.js 24 API, so `process.version` is `v24.0.0`. Deprecated and experimental APIs are not included. These parts differ from Node.js:
+
+| Feature | Support |
+|---|---|
+| Other modules | `async_hooks`, `cluster`, `dgram`, `diagnostics_channel`, `http2`, `inspector`, `repl`, `test`, `tls`, `v8`, `vm` and `wasi` are not supported. Importing them fails at build time |
+| `require()` | App code is ESM. CommonJS works in `node_modules`. `module.createRequire()` loads built-in modules only |
+| `process` | No `stdin`. `memoryUsage()` returns `rss` only, the heap values are 0. An unhandled promise rejection is logged and does not stop the app. `process.kill()` doesn't work on Windows |
+| Timers | The app runs until it quits, so `ref()` and `unref()` have no effect |
+| `fs` | File descriptors are h2o handles, not OS descriptors. There are no `bigint` stats, `readv()`, `writev()`, `statfs()` or `glob()` |
+| `child_process` | No `fork()` and no IPC channel. The `uid` and `gid` options are not supported |
+| `crypto` | Hashes are `md5`, `sha1`, `sha224`, `sha256`, `sha384` and `sha512`. HMAC supports the SHA-1 and SHA-2 hashes. Ciphers are `aes-128-gcm` and `aes-256-gcm` with a 12-byte IV. `pbkdf2()` works. There is no `KeyObject`, `sign()`, `verify()`, key pair generation, `scrypt()`, `hkdf()` or Diffie-Hellman. Use `crypto.subtle` for ECDSA P-256 |
+| `zlib` | Gzip, deflate and raw deflate only, there is no Brotli. Streams from `createGzip()` and the other `create*()` functions ignore `level` |
+| `os` | `cpus()` times are 0. On Windows, `networkInterfaces()` returns `{}`, `loadavg()` returns zeros and `version()` returns `Windows` |
+| `dns` | Only `lookup()` is supported |
+| `http`, `https` | `request()` uses `fetch`. It sends the body when `end()` is called, and there is no `Agent` |
+| `readline` | Reads lines from streams. There is no terminal line editing, history or completion |
+| `util.inspect()` | No colors and no Proxy details. The state of a Promise is not shown |

@@ -271,16 +271,14 @@ impl State {
                         #[cfg(unix)]
                         {
                             use std::os::unix::process::ExitStatusExt;
-                            process.signal = status.signal().map(|signal| match signal {
-                                libc::SIGHUP => "SIGHUP".into(),
-                                libc::SIGINT => "SIGINT".into(),
-                                libc::SIGQUIT => "SIGQUIT".into(),
-                                libc::SIGABRT => "SIGABRT".into(),
-                                libc::SIGKILL => "SIGKILL".into(),
-                                libc::SIGSEGV => "SIGSEGV".into(),
-                                libc::SIGPIPE => "SIGPIPE".into(),
-                                libc::SIGTERM => "SIGTERM".into(),
-                                _ => format!("SIG{signal}"),
+                            process.signal = status.signal().map(|signal| {
+                                crate::node::SIGNALS
+                                    .iter()
+                                    .find(|(_, number)| *number == signal)
+                                    .map_or_else(
+                                        || format!("SIG{signal}"),
+                                        |(name, _)| (*name).into(),
+                                    )
                             });
                         }
                         process.status = Some(status);
@@ -339,14 +337,11 @@ impl State {
                 let signal = args[1].as_str().context("Expected signal")?;
                 #[cfg(unix)]
                 {
-                    let number = match signal {
-                        "SIGTERM" => libc::SIGTERM,
-                        "SIGKILL" => libc::SIGKILL,
-                        "SIGINT" => libc::SIGINT,
-                        "SIGHUP" => libc::SIGHUP,
-                        "SIGQUIT" => libc::SIGQUIT,
-                        _ => bail!("Unsupported signal: {signal}"),
-                    };
+                    let number = crate::node::SIGNALS
+                        .iter()
+                        .find(|(name, _)| *name == signal)
+                        .with_context(|| format!("Unknown signal: {signal}"))?
+                        .1;
                     // WARNING: Only signal a child that this context owns and has not reaped.
                     if unsafe {
                         libc::kill(

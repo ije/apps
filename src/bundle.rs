@@ -291,6 +291,8 @@ impl Builder {
             specifier,
             "fs" | "fs/promises"
                 | "path"
+                | "path/posix"
+                | "path/win32"
                 | "os"
                 | "events"
                 | "child_process"
@@ -298,9 +300,11 @@ impl Builder {
                 | "stream"
                 | "stream/promises"
                 | "stream/web"
+                | "stream/consumers"
                 | "crypto"
                 | "url"
                 | "util"
+                | "util/types"
                 | "string_decoder"
                 | "worker_threads"
                 | "module"
@@ -310,6 +314,16 @@ impl Builder {
                 | "timers"
                 | "timers/promises"
                 | "process"
+                | "assert"
+                | "assert/strict"
+                | "zlib"
+                | "readline"
+                | "readline/promises"
+                | "tty"
+                | "dns"
+                | "dns/promises"
+                | "querystring"
+                | "perf_hooks"
         ) && (self.realm != Realm::Renderer
             || !base.ancestors().any(|directory| {
                 directory
@@ -401,7 +415,22 @@ impl Builder {
                     ],
                 ),
                 "node-pty" => ("globalThis.__apps.pty", vec!["spawn"]),
-                "node:buffer" => ("globalThis.__apps.buffer", vec!["Buffer"]),
+                "node:buffer" => (
+                    "globalThis.__apps.buffer",
+                    vec![
+                        "Buffer",
+                        "Blob",
+                        "File",
+                        "atob",
+                        "btoa",
+                        "constants",
+                        "kMaxLength",
+                        "kStringMaxLength",
+                        "isUtf8",
+                        "isAscii",
+                        "INSPECT_MAX_BYTES",
+                    ],
+                ),
                 "node:stream" => (
                     "globalThis.__apps.stream",
                     vec![
@@ -413,11 +442,17 @@ impl Builder {
                         "Stream",
                         "pipeline",
                         "finished",
+                        "addAbortSignal",
+                        "promises",
                     ],
                 ),
                 "node:stream/promises" => (
                     "globalThis.__apps.stream.promises",
                     vec!["pipeline", "finished"],
+                ),
+                "node:stream/consumers" => (
+                    "globalThis.__apps.stream.consumers",
+                    vec!["arrayBuffer", "blob", "buffer", "json", "text"],
                 ),
                 "node:stream/web" => (
                     "globalThis",
@@ -427,6 +462,10 @@ impl Builder {
                         "TransformStream",
                         "ByteLengthQueuingStrategy",
                         "CountQueuingStrategy",
+                        "TextEncoderStream",
+                        "TextDecoderStream",
+                        "CompressionStream",
+                        "DecompressionStream",
                     ],
                 ),
                 "node:util" => (
@@ -436,14 +475,56 @@ impl Builder {
                         "callbackify",
                         "inspect",
                         "format",
+                        "formatWithOptions",
+                        "inherits",
+                        "isDeepStrictEqual",
+                        "deprecate",
+                        "debuglog",
+                        "debug",
+                        "parseArgs",
+                        "stripVTControlCharacters",
+                        "styleText",
+                        "aborted",
+                        "getSystemErrorName",
                         "types",
                         "TextEncoder",
                         "TextDecoder",
                     ],
                 ),
+                "node:util/types" => (
+                    "globalThis.__apps.util.types",
+                    vec![
+                        "isAnyArrayBuffer",
+                        "isArrayBuffer",
+                        "isArrayBufferView",
+                        "isAsyncFunction",
+                        "isBoxedPrimitive",
+                        "isDataView",
+                        "isDate",
+                        "isGeneratorFunction",
+                        "isGeneratorObject",
+                        "isMap",
+                        "isNativeError",
+                        "isPromise",
+                        "isRegExp",
+                        "isSet",
+                        "isSharedArrayBuffer",
+                        "isTypedArray",
+                        "isUint8Array",
+                        "isWeakMap",
+                        "isWeakSet",
+                    ],
+                ),
                 "node:url" => (
                     "globalThis.__apps.url",
-                    vec!["URL", "URLSearchParams", "fileURLToPath", "pathToFileURL"],
+                    vec![
+                        "URL",
+                        "URLSearchParams",
+                        "fileURLToPath",
+                        "pathToFileURL",
+                        "format",
+                        "urlToHttpOptions",
+                    ],
                 ),
                 "node:string_decoder" => {
                     ("globalThis.__apps.string_decoder", vec!["StringDecoder"])
@@ -453,10 +534,22 @@ impl Builder {
                     vec![
                         "createHash",
                         "createHmac",
+                        "hash",
+                        "getHashes",
+                        "getCiphers",
+                        "createCipheriv",
+                        "createDecipheriv",
+                        "pbkdf2",
+                        "pbkdf2Sync",
                         "randomBytes",
+                        "randomFill",
+                        "randomFillSync",
+                        "randomInt",
                         "randomUUID",
+                        "getRandomValues",
                         "timingSafeEqual",
                         "webcrypto",
+                        "subtle",
                     ],
                 ),
                 "node:worker_threads" => (
@@ -476,7 +569,7 @@ impl Builder {
                     vec!["createRequire", "builtinModules", "isBuiltin"],
                 ),
                 "node:timers" => (
-                    "globalThis",
+                    "globalThis.__apps.timers",
                     vec![
                         "setTimeout",
                         "clearTimeout",
@@ -484,18 +577,46 @@ impl Builder {
                         "clearInterval",
                         "setImmediate",
                         "clearImmediate",
+                        "promises",
                     ],
                 ),
                 "node:timers/promises" => (
-                    "globalThis.__apps.timers",
-                    vec!["setTimeout", "setImmediate", "scheduler"],
+                    "globalThis.__apps.timers.promises",
+                    vec!["setTimeout", "setImmediate", "setInterval", "scheduler"],
                 ),
                 "node:process" => (
                     "globalThis.__apps.process",
                     vec![
-                        "platform", "arch", "pid", "argv", "env", "versions", "cwd", "chdir",
-                        "nextTick", "exit", "on", "once", "off", "kill", "hrtime", "execPath",
-                        "stdout", "stderr",
+                        "platform",
+                        "arch",
+                        "pid",
+                        "ppid",
+                        "title",
+                        "version",
+                        "versions",
+                        "release",
+                        "argv",
+                        "argv0",
+                        "execArgv",
+                        "execPath",
+                        "env",
+                        "cwd",
+                        "chdir",
+                        "nextTick",
+                        "exit",
+                        "on",
+                        "once",
+                        "off",
+                        "emit",
+                        "kill",
+                        "hrtime",
+                        "uptime",
+                        "memoryUsage",
+                        "cpuUsage",
+                        "umask",
+                        "emitWarning",
+                        "stdout",
+                        "stderr",
                     ],
                 ),
                 "node:sqlite" => (
@@ -509,7 +630,18 @@ impl Builder {
                         "constants",
                     ],
                 ),
-                "node:events" => ("globalThis.__apps.events", vec!["EventEmitter", "once"]),
+                "node:events" => (
+                    "globalThis.__apps.events",
+                    vec![
+                        "EventEmitter",
+                        "once",
+                        "on",
+                        "errorMonitor",
+                        "getEventListeners",
+                        "setMaxListeners",
+                        "defaultMaxListeners",
+                    ],
+                ),
                 "node:ffi" => (
                     "globalThis.__apps.ffi",
                     vec![
@@ -567,6 +699,8 @@ impl Builder {
                     vec![
                         "constants",
                         "promises",
+                        "Stats",
+                        "Dirent",
                         "readFile",
                         "writeFile",
                         "appendFile",
@@ -574,45 +708,69 @@ impl Builder {
                         "readdir",
                         "stat",
                         "lstat",
+                        "fstat",
                         "rename",
                         "copyFile",
+                        "cp",
                         "realpath",
                         "readlink",
                         "symlink",
+                        "link",
                         "chmod",
+                        "chown",
+                        "lchown",
+                        "utimes",
+                        "lutimes",
+                        "truncate",
                         "access",
                         "unlink",
                         "rm",
                         "rmdir",
                         "mkdtemp",
                         "open",
+                        "opendir",
                         "close",
+                        "fsync",
+                        "ftruncate",
                         "readFileSync",
                         "writeFileSync",
                         "appendFileSync",
-                        "existsSync",
                         "mkdirSync",
                         "readdirSync",
                         "statSync",
                         "lstatSync",
+                        "fstatSync",
                         "renameSync",
                         "copyFileSync",
+                        "cpSync",
                         "realpathSync",
                         "readlinkSync",
                         "symlinkSync",
+                        "linkSync",
                         "chmodSync",
+                        "chownSync",
+                        "lchownSync",
+                        "utimesSync",
+                        "lutimesSync",
+                        "truncateSync",
                         "accessSync",
                         "unlinkSync",
                         "rmSync",
                         "rmdirSync",
                         "mkdtempSync",
                         "openSync",
+                        "opendirSync",
                         "closeSync",
-                        "readSync",
-                        "writeSync",
                         "fsyncSync",
                         "ftruncateSync",
+                        "existsSync",
+                        "read",
+                        "readSync",
+                        "write",
+                        "writeSync",
                         "watch",
+                        "watchFile",
+                        "unwatchFile",
                         "createReadStream",
                         "createWriteStream",
                     ],
@@ -620,6 +778,7 @@ impl Builder {
                 "node:fs/promises" => (
                     "globalThis.__apps.fs.promises",
                     vec![
+                        "constants",
                         "readFile",
                         "writeFile",
                         "appendFile",
@@ -629,29 +788,51 @@ impl Builder {
                         "lstat",
                         "rename",
                         "copyFile",
+                        "cp",
                         "realpath",
                         "readlink",
                         "symlink",
+                        "link",
                         "chmod",
+                        "chown",
+                        "lchown",
+                        "utimes",
+                        "lutimes",
+                        "truncate",
                         "access",
                         "unlink",
                         "rm",
                         "rmdir",
                         "mkdtemp",
                         "open",
+                        "opendir",
+                        "watch",
                     ],
                 ),
                 "node:os" => (
                     "globalThis.__apps.os",
                     vec![
+                        "EOL",
+                        "devNull",
                         "platform",
                         "arch",
+                        "machine",
+                        "release",
+                        "version",
+                        "type",
                         "homedir",
                         "tmpdir",
                         "hostname",
+                        "endianness",
                         "availableParallelism",
-                        "type",
-                        "EOL",
+                        "cpus",
+                        "totalmem",
+                        "freemem",
+                        "uptime",
+                        "loadavg",
+                        "networkInterfaces",
+                        "userInfo",
+                        "constants",
                     ],
                 ),
                 "node:path" => (
@@ -667,10 +848,167 @@ impl Builder {
                         "dirname",
                         "extname",
                         "relative",
+                        "parse",
+                        "format",
+                        "toNamespacedPath",
                         "posix",
                         "win32",
                     ],
                 ),
+                "node:path/posix" => (
+                    "globalThis.__apps.path.posix",
+                    vec![
+                        "sep",
+                        "delimiter",
+                        "normalize",
+                        "isAbsolute",
+                        "join",
+                        "resolve",
+                        "basename",
+                        "dirname",
+                        "extname",
+                        "relative",
+                        "parse",
+                        "format",
+                        "toNamespacedPath",
+                        "posix",
+                        "win32",
+                    ],
+                ),
+                "node:path/win32" => (
+                    "globalThis.__apps.path.win32",
+                    vec![
+                        "sep",
+                        "delimiter",
+                        "normalize",
+                        "isAbsolute",
+                        "join",
+                        "resolve",
+                        "basename",
+                        "dirname",
+                        "extname",
+                        "relative",
+                        "parse",
+                        "format",
+                        "toNamespacedPath",
+                        "posix",
+                        "win32",
+                    ],
+                ),
+                "node:assert" => (
+                    "globalThis.__apps.assert",
+                    vec![
+                        "AssertionError",
+                        "ok",
+                        "equal",
+                        "notEqual",
+                        "strictEqual",
+                        "notStrictEqual",
+                        "deepEqual",
+                        "notDeepEqual",
+                        "deepStrictEqual",
+                        "notDeepStrictEqual",
+                        "throws",
+                        "doesNotThrow",
+                        "rejects",
+                        "doesNotReject",
+                        "match",
+                        "doesNotMatch",
+                        "fail",
+                        "ifError",
+                        "strict",
+                    ],
+                ),
+                "node:assert/strict" => (
+                    "globalThis.__apps.assert.strict",
+                    vec![
+                        "AssertionError",
+                        "ok",
+                        "equal",
+                        "notEqual",
+                        "strictEqual",
+                        "notStrictEqual",
+                        "deepEqual",
+                        "notDeepEqual",
+                        "deepStrictEqual",
+                        "notDeepStrictEqual",
+                        "throws",
+                        "doesNotThrow",
+                        "rejects",
+                        "doesNotReject",
+                        "match",
+                        "doesNotMatch",
+                        "fail",
+                        "ifError",
+                        "strict",
+                    ],
+                ),
+                "node:zlib" => (
+                    "globalThis.__apps.zlib",
+                    vec![
+                        "constants",
+                        "gzip",
+                        "gzipSync",
+                        "createGzip",
+                        "Gzip",
+                        "gunzip",
+                        "gunzipSync",
+                        "createGunzip",
+                        "Gunzip",
+                        "deflate",
+                        "deflateSync",
+                        "createDeflate",
+                        "Deflate",
+                        "inflate",
+                        "inflateSync",
+                        "createInflate",
+                        "Inflate",
+                        "deflateRaw",
+                        "deflateRawSync",
+                        "createDeflateRaw",
+                        "DeflateRaw",
+                        "inflateRaw",
+                        "inflateRawSync",
+                        "createInflateRaw",
+                        "InflateRaw",
+                        "unzip",
+                        "unzipSync",
+                        "createUnzip",
+                        "Unzip",
+                    ],
+                ),
+                "node:readline" => (
+                    "globalThis.__apps.readline",
+                    vec![
+                        "Interface",
+                        "createInterface",
+                        "clearLine",
+                        "clearScreenDown",
+                        "cursorTo",
+                        "moveCursor",
+                        "emitKeypressEvents",
+                        "promises",
+                    ],
+                ),
+                "node:readline/promises" => (
+                    "globalThis.__apps.readline.promises",
+                    vec!["Interface", "createInterface"],
+                ),
+                "node:tty" => ("globalThis.__apps.tty", vec!["isatty"]),
+                "node:dns" => ("globalThis.__apps.dns", vec!["lookup", "promises"]),
+                "node:dns/promises" => ("globalThis.__apps.dns.promises", vec!["lookup"]),
+                "node:querystring" => (
+                    "globalThis.__apps.querystring",
+                    vec![
+                        "parse",
+                        "stringify",
+                        "escape",
+                        "unescape",
+                        "decode",
+                        "encode",
+                    ],
+                ),
+                "node:perf_hooks" => ("globalThis.__apps.perf_hooks", vec!["performance"]),
                 _ => bail!("Unsupported built-in module: {specifier}"),
             };
             let source = format!(
@@ -3189,6 +3527,71 @@ mod tests {
         .unwrap();
         engine.bundle(&files, "app.js").unwrap();
         assert!(!dir.path().join("data.txt").exists());
+    }
+
+    #[test]
+    fn node_builtin_exports_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("app.ts");
+        let modules = [
+            "assert",
+            "assert/strict",
+            "buffer",
+            "child_process",
+            "crypto",
+            "dns",
+            "dns/promises",
+            "events",
+            "fs",
+            "fs/promises",
+            "http",
+            "https",
+            "module",
+            "net",
+            "os",
+            "path",
+            "path/posix",
+            "path/win32",
+            "perf_hooks",
+            "process",
+            "querystring",
+            "readline",
+            "readline/promises",
+            "stream",
+            "stream/consumers",
+            "stream/promises",
+            "stream/web",
+            "string_decoder",
+            "timers",
+            "timers/promises",
+            "tty",
+            "url",
+            "util",
+            "util/types",
+            "worker_threads",
+            "zlib",
+        ];
+        let mut source = String::new();
+        for (index, name) in modules.iter().enumerate() {
+            source += &format!("import * as m{index} from 'node:{name}';");
+        }
+        source += "const missing=[";
+        for (index, name) in modules.iter().enumerate() {
+            source += &format!(
+                "...Object.keys(m{index}).filter(key=>m{index}[key]===undefined).map(key=>'{name}.'+key),"
+            );
+        }
+        source += "];globalThis.result=missing.join(', ')||'ok';";
+        fs::write(&entry, source).unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), false).unwrap();
+        let engine = apps_runtime::jsc::Engine::new(
+            apps_runtime::jsc::Api::load().unwrap(),
+            std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default())),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.bundle(&files, "app.js").unwrap();
+        assert_eq!(engine.eval("result", "test").unwrap(), "ok");
     }
 
     #[cfg(unix)]

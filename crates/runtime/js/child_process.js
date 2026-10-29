@@ -8,6 +8,7 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
     #ended = false;
     #buffered = 0;
     constructor(id) { super(); this.#id = id; }
+    get writable() { return !this.#ended; }
     write(data) {
       if (this.#ended) throw new Error('Child stdin is closed');
       if (typeof data !== 'string') {
@@ -42,8 +43,8 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
       this.signalCode = null;
       this.killed = false;
       this.stdin = options.stdio[0] === 'pipe' ? new Input(result.id) : null;
-      this.stdout = options.stdio[1] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)() : null;
-      this.stderr = options.stdio[2] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)() : null;
+      this.stdout = options.stdio[1] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)({ read() {} }) : null;
+      this.stderr = options.stdio[2] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)({ read() {} }) : null;
       this.stdio = [this.stdin, this.stdout, this.stderr];
     }
     ref() { call('child.unref',this.#id,false);this._unreferenced=false;return this; }
@@ -60,24 +61,25 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
     if (typeof command !== 'string' || !command || command.includes('\0')) throw new TypeError('Expected a nonempty command without null bytes');
     if (!Array.isArray(args)) { options = args; args = []; }
     if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Expected spawn options');
-    for (const name of Object.keys(options)) if (!['cwd', 'env', 'stdio', 'detached', 'windowsHide', 'shell', 'signal', 'timeout', 'killSignal'].includes(name)) throw new Error('Unsupported spawn option: ' + name);
+    for (const name of Object.keys(options)) if (!['cwd', 'env', 'stdio', 'detached', 'windowsHide', 'shell', 'signal', 'timeout', 'killSignal', 'argv0', 'encoding', 'serialization', 'windowsVerbatimArguments'].includes(name)) throw new Error('Unsupported spawn option: ' + name);
     args = args.map(value => String(value));
     if (args.some(value => value.includes('\0'))) throw new TypeError('Arguments cannot contain null bytes');
     if (options.shell) {
       const text=[command,...args].join(' ');
-      command=typeof options.shell==='string'?options.shell:shell();args=shellArgs(text);
+      command=typeof options.shell==='string'?options.shell:shell();args=shellArgs(command,text);
     }
     const config = { detached: !!options.detached, windowsHide: !!options.windowsHide };
     if (options.cwd !== undefined) {
       if (typeof options.cwd !== 'string' || options.cwd.includes('\0')) throw new TypeError('cwd must be a path string');
       config.cwd = options.cwd;
     }
-    if (options.env !== undefined) {
-      if (!options.env || typeof options.env !== 'object') throw new TypeError('env must be an object');
+    const env = options.env ?? globalThis.process?.env;
+    if (env !== undefined) {
+      if (!env || typeof env !== 'object') throw new TypeError('env must be an object');
       config.env = Object.create(null);
-      for (const name of Object.keys(options.env)) {
-        if (options.env[name] === undefined) continue;
-        const value = String(options.env[name]);
+      for (const name of Object.keys(env)) {
+        if (env[name] === undefined) continue;
+        const value = String(env[name]);
         if (name.includes('=') || name.includes('\0') || value.includes('\0')) throw new TypeError('Invalid environment entry');
         config.env[name] = value;
       }
@@ -125,13 +127,19 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
   };
   const spawnSync=(command,args=[],options={})=>{
     if(!Array.isArray(args)){options=args;args=[];}
-    if(options.shell){const text=[command,...args].join(' ');command=typeof options.shell==='string'?options.shell:shell();args=shellArgs(text);}
-    const result=call('child.sync',command,args,{...options,input:ArrayBuffer.isView(options.input)?latin1(options.input):options.input});
+    if(options.shell){const text=[command,...args].join(' ');command=typeof options.shell==='string'?options.shell:shell();args=shellArgs(command,text);}
+    const result=call('child.sync',command,args,{...options,env:options.env??globalThis.process?.env,input:ArrayBuffer.isView(options.input)?latin1(options.input):options.input});
     for(const name of ['stdout','stderr']){if(result[name]==null)continue;result[name]=Buffer.from(result[name],'latin1');if(options.encoding&&options.encoding!=='buffer')result[name]=result[name].toString(options.encoding);}
     result.output=[null,result.stdout,result.stderr];if(result.error)result.error=Object.assign(new Error(result.error.message),result.error);return result;
   };
-  const execFileSync=(command,args,options)=>{if(!Array.isArray(args)){options=args;args=[];}const result=spawnSync(command,args,options);if(result.error||result.status!==0)throw Object.assign(result.error??new Error('Command failed: '+command),result);return result.stdout;};
-  const execFile=(command,args=[],options={},callback)=>{
+  const execFileSync=(command,args,options={},cmd=[command,...(Array.isArray(args)?args:[])].join(' '))=>{
+    if(!Array.isArray(args)){options=args??{};args=[];}
+    const result=spawnSync(command,args,options);
+    if(!options.stdio&&result.stderr?.length)process.stderr.write(result.stderr);
+    if(result.error||result.status!==0)throw Object.assign(result.error??new Error(`Command failed: ${cmd}${result.stderr?.length?'\n'+result.stderr:''}`),result);
+    return result.stdout;
+  };
+  const execFile=(command,args=[],options={},callback,cmd)=>{
     if(typeof args==='function'){callback=args;args=[];options={};}else if(!Array.isArray(args)){callback=typeof options==='function'?options:callback;options=args;args=[];}
     if(typeof options==='function'){callback=options;options={};}
     const {encoding='utf8',maxBuffer=1024*1024,...spawnOptions}=options;
@@ -139,9 +147,19 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
     child.stdout?.on('data',data=>{out.push(data);size+=data.length;if(size>maxBuffer){failure=Object.assign(new Error('maxBuffer exceeded'),{code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'});child.kill();}});
     child.stderr?.on('data',data=>{err.push(data);size+=data.length;if(size>maxBuffer){failure=Object.assign(new Error('maxBuffer exceeded'),{code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'});child.kill();}});
     child.on('error',error=>{failure=error;});
-    child.once('close',(code,signal)=>{const stdout=Buffer.concat(out),stderr=Buffer.concat(err);if(code!==0&&!failure)failure=Object.assign(new Error('Command failed: '+command),{code,signal});callback?.(failure??null,encoding==='buffer'?stdout:stdout.toString(encoding),encoding==='buffer'?stderr:stderr.toString(encoding));});return child;
+    child.once('close',(code,signal)=>{
+      const stdout=Buffer.concat(out),stderr=Buffer.concat(err),text=value=>encoding==='buffer'?value:value.toString(encoding);
+      cmd??=[command,...args].join(' ');
+      if(code!==0&&!failure)failure=Object.assign(new Error(`Command failed: ${cmd}${stderr.length?'\n'+stderr:''}`),{code,killed:child.killed,signal,cmd});
+      callback?.(failure??null,text(stdout),text(stderr));
+    });
+    return child;
   };
-  const shellArgs=command=>process.platform==='win32'?['/d','/s','/c',command]:['-c',command];
-  const shell=()=>process.platform==='win32'?'cmd.exe':'/bin/sh';
-  return { api: { spawn, ChildProcess, spawnSync, execFileSync, execFile, exec:(command,options,callback)=>execFile(shell(),shellArgs(command),options??{},callback),execSync:(command,options)=>execFileSync(shell(),shellArgs(command),options) }, poll, pending: () => [...children.values()].some(({child})=>!child._unreferenced) };
+  const shellArgs=(shell,command)=>/(?:^|[\\/])cmd(?:\.exe)?$/i.test(shell)?['/d','/s','/c',command]:['-c',command];
+  const shell=()=>process.platform==='win32'?process.env.ComSpec??'cmd.exe':'/bin/sh';
+  const exec=(command,options,callback)=>{if(typeof options==='function'){callback=options;options={};}const{shell:custom,...rest}=options??{},program=typeof custom==='string'?custom:shell();return execFile(program,shellArgs(program,command),rest,callback,command);};
+  const execSync=(command,options={})=>{const{shell:custom,...rest}=options,program=typeof custom==='string'?custom:shell();return execFileSync(program,shellArgs(program,command),rest,command);};
+  const custom=Symbol.for('nodejs.util.promisify.custom');
+  for(const run of [exec,execFile])run[custom]=(...args)=>{let child;const promise=new Promise((resolve,reject)=>{child=run(...args,(error,stdout,stderr)=>error?reject(Object.assign(error,{stdout,stderr})):resolve({stdout,stderr}));});promise.child=child;return promise;};
+  return { api: { spawn, ChildProcess, spawnSync, execFileSync, execFile, exec, execSync }, poll, pending: () => [...children.values()].some(({child})=>!child._unreferenced) };
 };

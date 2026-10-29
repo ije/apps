@@ -89,29 +89,8 @@ globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
     try { return decodeBytes(call('web.crypto.' + operation, data.private, encodeBytes(bytes(algorithm.iv)), algorithm.additionalData ? encodeBytes(bytes(algorithm.additionalData)) : [], encodeBytes(bytes(input)))).buffer; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
-  const hash = (algorithm, secret) => {
-    const chunks = []; let size = 0, finished = false;
-    return {
-      update(value, encoding = 'utf8') {
-        if (finished) throw new Error('Digest already called');
-        const chunk = typeof value === 'string' ? globalThis.Buffer ? Buffer.from(value, encoding) : new TextEncoder().encode(value) : bytes(value);
-        chunks.push(new Uint8Array(chunk)); size += chunk.length; return this;
-      },
-      digest(encoding) {
-        if (finished) throw new Error('Digest already called'); finished = true;
-        const input = new Uint8Array(size); let offset = 0;
-        for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.length; }
-        const normalized = String(algorithm).toUpperCase().replace(/^SHA-?/, 'SHA-');
-        const value = secret ? call('web.crypto.sign', 'HMAC', encodeBytes(secret), [], encodeBytes(input), [], normalized) : call('web.digest', normalized, encodeBytes(input));
-        const result = globalThis.Buffer ? Buffer.from(value) : new Uint8Array(value);
-        return encoding ? result.toString(encoding) : result;
-      },
-    };
-  };
   globalThis.__appsNodeCrypto = {
     webcrypto: null,
-    createHash: algorithm => hash(algorithm),
-    createHmac: (algorithm, key) => hash(algorithm, typeof key === 'string' ? new TextEncoder().encode(key) : bytes(key)),
     randomUUID: base.randomUUID,
     randomBytes(size, callback) {
       const result = globalThis.Buffer ? Buffer.alloc(size) : new Uint8Array(size);

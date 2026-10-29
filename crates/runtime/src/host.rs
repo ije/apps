@@ -96,7 +96,12 @@ impl Host {
         let op = request["op"].as_str().context("Missing operation")?;
         let args = &request["args"];
         if op == "log" {
-            let _ = writeln!(std::io::stdout(), "{}", args[0].as_str().unwrap_or(""));
+            let text = args[0].as_str().unwrap_or("");
+            let _ = if matches!(args[1].as_str(), Some("error" | "warn")) {
+                writeln!(std::io::stderr(), "{text}")
+            } else {
+                writeln!(std::io::stdout(), "{text}")
+            };
             if self.logs.len() == 500 {
                 self.logs.pop_front();
             }
@@ -354,11 +359,11 @@ impl Host {
         }
         match op {
             "process.write" => {
-                let bytes = args[1].as_str().context("Expected text")?.as_bytes();
+                let bytes = crate::node::bytes(&args[1])?;
                 if args[0] == 2 {
-                    std::io::stderr().write_all(bytes)?;
+                    std::io::stderr().write_all(&bytes)?;
                 } else {
-                    std::io::stdout().write_all(bytes)?;
+                    std::io::stdout().write_all(&bytes)?;
                 }
                 Ok(Value::Null)
             }
@@ -370,14 +375,16 @@ impl Host {
                         pid != 0 && pid >= i32::MIN as i64 && pid <= i32::MAX as i64,
                         "Invalid PID"
                     );
-                    let signal = match args[1].as_str().unwrap_or("") {
-                        "SIGTERM" => libc::SIGTERM,
-                        "SIGKILL" => libc::SIGKILL,
-                        "SIGINT" => libc::SIGINT,
-                        "SIGHUP" => libc::SIGHUP,
-                        "SIGQUIT" => libc::SIGQUIT,
-                        "" if args[1] == 0 => 0,
-                        _ => bail!("Unsupported signal"),
+                    let signal = match (args[1].as_i64(), args[1].as_str()) {
+                        (Some(signal), _) => i32::try_from(signal)?,
+                        (_, Some(name)) => {
+                            crate::node::SIGNALS
+                                .iter()
+                                .find(|(signal, _)| *signal == name)
+                                .context("Unknown signal")?
+                                .1
+                        }
+                        _ => bail!("Unknown signal"),
                     };
                     if unsafe { libc::kill(pid as i32, signal) } != 0 {
                         return Err(std::io::Error::last_os_error().into());
@@ -437,7 +444,7 @@ impl Host {
                     .collect();
                 let locale = json!({"system":system,"languages":if languages.is_empty() {vec![system.clone()]} else {languages}});
                 Ok(
-                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":std::env::args().collect::<Vec<_>>(),"env":std::env::vars().collect::<HashMap<_,_>>(),"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":std::env::args().collect::<Vec<_>>(),"env":std::env::vars().collect::<HashMap<_,_>>(),"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             "cwd" => Ok(json!(std::env::current_dir()?)),
