@@ -1,4 +1,4 @@
-use apps_runtime::{dom, html::Document};
+use apps_runtime::dom::{self, Document};
 use image::{ImageFormat, Limits};
 use serde_json::json;
 
@@ -29,7 +29,7 @@ fn web_images_decode_in_the_dom() {
         assert!(state.images.contains_key(&1));
     }
     let image =
-        apps_runtime::images::decode(include_bytes!("images/alpha.avif"), Limits::default())
+        apps_runtime::render::image::decode(include_bytes!("images/alpha.avif"), Limits::default())
             .unwrap()
             .into_rgba8();
     for pixel in image.pixels() {
@@ -57,11 +57,11 @@ fn web_image_formats_are_enabled() {
 #[test]
 fn avif_rejects_corrupt_data_and_respects_limits() {
     let mut bytes = include_bytes!("images/corrupt-base.avif").to_vec();
-    assert!(apps_runtime::images::decode(&bytes, Limits::default()).is_ok());
+    assert!(apps_runtime::render::image::decode(&bytes, Limits::default()).is_ok());
     bytes[280] ^= 1;
-    assert!(apps_runtime::images::decode(&bytes, Limits::default()).is_err());
+    assert!(apps_runtime::render::image::decode(&bytes, Limits::default()).is_err());
     for length in [0, 8, 64, 128] {
-        assert!(apps_runtime::images::decode(&bytes[..length], Limits::default()).is_err());
+        assert!(apps_runtime::render::image::decode(&bytes[..length], Limits::default()).is_err());
     }
     for allocation in [false, true] {
         let mut limits = Limits::default();
@@ -71,7 +71,7 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
             limits.max_image_width = Some(2);
         }
         assert!(matches!(
-            apps_runtime::images::decode(include_bytes!("images/sample.avif"), limits),
+            apps_runtime::render::image::decode(include_bytes!("images/sample.avif"), limits),
             Err(image::ImageError::Limits(_))
         ));
     }

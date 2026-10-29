@@ -1,6 +1,6 @@
 use apps_runtime::{
+    dom::Document,
     host::{Host, Page, Role},
-    html::Document,
     jsc::{Api, Engine},
 };
 use std::{cell::RefCell, rc::Rc};

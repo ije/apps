@@ -1,34 +1,13 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-mod binary;
-pub mod browser;
 pub mod bundle;
-pub mod canvas;
-mod child_process;
-mod crypto;
 pub mod desktop;
-pub mod devtools;
 pub mod dom;
-mod effects;
-mod ffi;
-pub mod gpu;
-mod grid;
 pub mod host;
-pub mod html;
-pub mod images;
 pub mod jsc;
-mod napi;
 mod node;
-mod pty;
 pub mod render;
-mod serve;
-mod socket;
-mod sqlite;
-mod storage;
-mod tailwind;
-mod tcp;
+pub mod style;
 mod web;
-mod web_platform;
-mod worker;
 
 pub fn bundle_source(
     files: &bbtree::unsync::BBTreeMap<String, String>,

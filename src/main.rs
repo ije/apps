@@ -1,5 +1,5 @@
 mod build;
-mod bundle;
+mod bundler;
 mod run;
 mod target;
 

@@ -3,9 +3,9 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source = if root.ends_with("runtime") {
-        root.join("src/napi.rs")
+        root.join("src/node/napi.rs")
     } else {
-        root.join("crates/runtime/src/napi.rs")
+        root.join("crates/runtime/src/node/napi.rs")
     };
     println!("cargo:rerun-if-changed={}", source.display());
     let target = env::var("CARGO_CFG_TARGET_OS").unwrap();

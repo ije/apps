@@ -1,6 +1,6 @@
 use apps_runtime::{
+    dom::Document,
     host::{Host, Page, Role},
-    html::Document,
     jsc::{Api, Engine},
 };
 use std::{cell::RefCell, rc::Rc};
@@ -66,7 +66,7 @@ fn utility_classes_follow_dom_changes_without_css_generation() {
             .iter()
             .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
             .unwrap();
-        let styles = apps_runtime::render::styles(doc, 800., 600.);
+        let styles = apps_runtime::style::styles(doc, 800., 600.);
         assert_eq!(styles[id]["height"], "2rem");
         assert_eq!(styles[id]["width"], "2rem");
         assert_eq!(styles[id]["background-color"], "#123456");
@@ -82,7 +82,7 @@ fn utility_classes_follow_dom_changes_without_css_generation() {
         .iter()
         .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
         .unwrap();
-    assert!(!apps_runtime::render::styles(doc, 800., 600.)[id].contains_key("height"));
+    assert!(!apps_runtime::style::styles(doc, 800., 600.)[id].contains_key("height"));
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn mutations_preserve_tree_and_event_order() {
     assert!(host.borrow().pages[&1].dirty);
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
-    let styles = apps_runtime::render::styles(doc, 800., 600.);
+    let styles = apps_runtime::style::styles(doc, 800., 600.);
     let button = doc
         .nodes
         .iter()

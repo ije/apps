@@ -81,7 +81,7 @@ fn native_addons_values_callbacks_and_contexts() {
     host.pages.insert(
         1,
         apps_runtime::host::Page {
-            doc: apps_runtime::html::Document::parse("<body></body>"),
+            doc: apps_runtime::dom::Document::parse("<body></body>"),
             dirty: false,
         },
     );

@@ -1,4 +1,4 @@
-use crate::bundle;
+use crate::bundler;
 use anyhow::{Context, Result};
 use apps_runtime::{
     host::Role,
@@ -28,7 +28,7 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
     let library = apps_runtime::jsc::library_path(&runtime, std::env::consts::OS)?;
     let mut files = Rc::new(RefCell::new(BTreeSet::new()));
     let started = Instant::now();
-    let bundle = bundle::compile(entry, bundle::Realm::Main, None, files.clone(), false)?;
+    let bundle = bundler::compile(entry, bundler::Realm::Main, None, files.clone(), false)?;
     let validator = Engine::new(Api::load()?, Rc::default(), Role::Main)?;
     validator.validate(&bundle)?;
     let validator = watch.then_some(validator);
@@ -178,9 +178,9 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
                 changed = None;
                 fresh = true;
                 let next_files = Rc::default();
-                let rebuilt = bundle::compile(
+                let rebuilt = bundler::compile(
                     entry,
-                    bundle::Realm::Main,
+                    bundler::Realm::Main,
                     None,
                     Rc::clone(&next_files),
                     false,

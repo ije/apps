@@ -16,7 +16,7 @@ fn web_apis_in_every_context() {
         host.borrow_mut().pages.insert(
             1,
             Page {
-                doc: apps_runtime::html::Document::parse("<html><body></body></html>"),
+                doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
                 dirty: false,
             },
         );

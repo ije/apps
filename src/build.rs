@@ -1,4 +1,4 @@
-use crate::{bundle, target::Target};
+use crate::{bundler, target::Target};
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
 use std::{
@@ -13,7 +13,7 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: Target) -> Result<(
     target.validate(runtime).context(
         "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
     )?;
-    let files = bundle::compile(entry, bundle::Realm::Main, None, Rc::default(), true)?;
+    let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true)?;
     if let Some(source) = files.get("native.json") {
         let addons: std::collections::BTreeMap<String, PathBuf> = serde_json::from_str(source)?;
         for path in addons.values() {
@@ -143,9 +143,9 @@ pub fn write_bundle(
     fs::create_dir_all(executable.parent().unwrap())?;
     if target.platform == "macos" {
         let identifier = name.replace('_', "-");
-        let name = apps_runtime::html::escape(&name);
-        let product_name = apps_runtime::html::escape(&product_name);
-        let version = apps_runtime::html::escape(&version);
+        let name = apps_runtime::dom::escape(&name);
+        let product_name = apps_runtime::dom::escape(&product_name);
+        let version = apps_runtime::dom::escape(&version);
         fs::write(
             app_directory.join("Contents/Info.plist"),
             format!(
@@ -385,7 +385,7 @@ mod tests {
                 {
                     let app = out.join(format!("{product_name}.app"));
                     let plist = fs::read_to_string(app.join("Contents/Info.plist")).unwrap();
-                    let escaped = apps_runtime::html::escape(name);
+                    let escaped = apps_runtime::dom::escape(name);
                     assert!(plist.contains(&format!(
                         "<key>CFBundleExecutable</key><string>{escaped}</string>"
                     )));
@@ -393,7 +393,7 @@ mod tests {
                         "<key>CFBundleIdentifier</key><string>dev.pierre.apps.{}</string>",
                         name.replace('_', "-")
                     )));
-                    let escaped = apps_runtime::html::escape(product_name);
+                    let escaped = apps_runtime::dom::escape(product_name);
                     for key in ["CFBundleName", "CFBundleDisplayName"] {
                         assert!(
                             plist.contains(&format!("<key>{key}</key><string>{escaped}</string>"))
@@ -483,9 +483,9 @@ mod tests {
             fs::write(&runtime, b"runtime").unwrap();
             let out = dir.path().join("dist");
             for production in [false, true] {
-                let files = bundle::compile(
+                let files = bundler::compile(
                     &entry,
-                    bundle::Realm::Main,
+                    bundler::Realm::Main,
                     None,
                     Default::default(),
                     production,

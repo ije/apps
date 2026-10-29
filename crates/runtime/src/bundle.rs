@@ -1,6 +1,6 @@
 use crate::{
-    html::Document,
-    render::{Declarations, Stylesheet},
+    dom::Document,
+    style::{Declarations, Stylesheet},
 };
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
@@ -334,7 +334,7 @@ mod tests {
     use super::*;
     use crate::{
         host::{Host, Page, Role},
-        render,
+        style,
     };
     use serde_json::json;
 
@@ -531,13 +531,13 @@ mod tests {
         assert!(doc.nodes[card].inline.is_some());
         assert!(doc.text(card).contains("你好 & hello"));
         for (width, height) in [(400., 600.), (800., 600.), (800., 100.)] {
-            let actual = render::styles(&doc, width, height);
-            let expected = render::styles(&raw, width, height);
+            let actual = style::styles(&doc, width, height);
+            let expected = style::styles(&raw, width, height);
             for (actual, expected) in actual.iter().zip(&expected) {
                 assert!(actual.iter().eq(expected.iter()));
             }
             let serialized = Document::parse(&doc.serialize(0));
-            let roundtrip = render::styles(&serialized, width, height);
+            let roundtrip = style::styles(&serialized, width, height);
             for (actual, expected) in roundtrip.iter().zip(&expected) {
                 assert!(actual.iter().eq(expected.iter()));
             }
@@ -557,7 +557,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            render::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
+            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
             "42px"
         );
         host.call(
@@ -566,7 +566,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            render::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
+            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
             "20px"
         );
         host.call(
@@ -575,7 +575,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            render::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
+            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
             "55px"
         );
     }
@@ -599,7 +599,7 @@ mod tests {
         );
         let bundle = read(dir.path()).unwrap();
         assert_eq!(
-            render::styles(&bundle.pages["page-0.html"], 800., 600.)
+            style::styles(&bundle.pages["page-0.html"], 800., 600.)
                 .last()
                 .unwrap()["width"],
             "1px"

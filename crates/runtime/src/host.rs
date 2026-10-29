@@ -1,4 +1,4 @@
-use crate::html::{Document, Node};
+use crate::dom::{Document, Node};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -31,10 +31,10 @@ pub struct Host {
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
     pub dom: HashMap<u64, crate::dom::State>,
-    pub bridge: HashMap<u64, HashMap<String, crate::binary::Payload>>,
-    pub browsers: crate::browser::State,
+    pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
+    pub browsers: crate::desktop::browser::State,
     pub logs: std::collections::VecDeque<Value>,
-    pub graphics: HashMap<u64, crate::gpu::Gpu>,
+    pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
     pub viewports: HashMap<u64, [f32; 2]>,
     pub exit_code: i32,
     pub theme: u32,
@@ -78,7 +78,7 @@ impl Host {
     }
 
     pub(crate) fn sync_theme(&mut self) {
-        let theme = crate::browser::theme_state();
+        let theme = crate::desktop::native::theme_state();
         if self.theme == theme {
             return;
         }
@@ -142,7 +142,7 @@ impl Host {
                     self.dom
                         .get(&id)
                         .map_or(1., |state| state.pixel_ratio.max(1.)),
-                    crate::browser::theme_state()
+                    crate::desktop::native::theme_state()
                 ]));
             }
             if matches!(op, "dom.setAttr" | "dom.removeAttr")
