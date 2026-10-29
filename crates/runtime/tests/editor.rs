@@ -156,16 +156,37 @@ fn empty_selection_fragments_are_not_carets() {
     });
     let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
     engine.eval("const editor=document.querySelector('div');editor.children[1].append(document.createTextNode(''));editor.focus();getSelection().selectAllChildren(editor)", "test").unwrap();
-    let empty: usize = engine.eval("editor.children[1].firstChild._id", "test").unwrap().parse().unwrap();
+    let empty: usize = engine
+        .eval("editor.children[1].firstChild._id", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert_eq!(host.borrow().dom[&1].selection[&empty], [0, 0]);
     assert_eq!(host.borrow().dom[&1].selection_caret, None);
-    engine.eval("getSelection().collapse(editor.children[1].firstChild,0)", "test").unwrap();
+    engine
+        .eval(
+            "getSelection().collapse(editor.children[1].firstChild,0)",
+            "test",
+        )
+        .unwrap();
     assert_eq!(host.borrow().dom[&1].selection_caret, Some(empty));
-    engine.eval("getSelection().collapse(document.querySelector('pre').firstChild,4)", "test").unwrap();
+    engine
+        .eval(
+            "getSelection().collapse(document.querySelector('pre').firstChild,4)",
+            "test",
+        )
+        .unwrap();
     assert_eq!(host.borrow().dom[&1].selection_caret, None);
-    engine.eval("getSelection().removeAllRanges()", "test").unwrap();
+    engine
+        .eval("getSelection().removeAllRanges()", "test")
+        .unwrap();
     assert_eq!(host.borrow().dom[&1].selection_caret, None);
-    engine.eval("const input=document.querySelector('textarea');input.focus();input.select()", "test").unwrap();
+    engine
+        .eval(
+            "const input=document.querySelector('textarea');input.focus();input.select()",
+            "test",
+        )
+        .unwrap();
     assert_eq!(host.borrow().dom[&1].selection_caret, None);
     engine.eval("input.setSelectionRange(2,2)", "test").unwrap();
     let input: usize = engine.eval("input._id", "test").unwrap().parse().unwrap();

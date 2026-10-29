@@ -7,7 +7,7 @@ mod animation;
 #[path = "color.rs"]
 mod colors;
 #[path = "css.rs"]
-mod css;
+pub(crate) mod css;
 pub(crate) use animation::{Animation, Motion};
 pub use colors::color;
 pub(crate) use css::{FontUnits, Lengths};
@@ -1272,7 +1272,7 @@ pub(crate) fn compute_styles(
                         let values = if dark && native_theme & 1 == 0 {
                             None
                         } else {
-                            crate::tailwind::utility(&rest.join(":"), width, &theme)
+                            crate::tailwind::utility(&rest.join(":"), width, theme)
                         };
                         (selector, values)
                     });
@@ -1280,7 +1280,8 @@ pub(crate) fn compute_styles(
             }
         }
     }
-    let mut styles = vec![Rc::new(Style::new()); doc.nodes.len()];
+    let empty = Rc::new(Style::new());
+    let mut styles = vec![empty; doc.nodes.len()];
     let mut lengths = vec![Lengths::new(16., width, height); doc.nodes.len()];
     let mut root = FontUnits::new(16.);
     let mut pseudos = HashMap::new();
@@ -1592,7 +1593,7 @@ pub(crate) fn compute_styles(
                 .map(|source| Cow::Owned(Declarations::parse(source)))
         });
         if let Some(inline) = inline {
-            for (key, value) in inline.resolve(tailwind.then_some(&theme), width) {
+            for (key, value) in inline.resolve(tailwind.then_some(theme), width) {
                 let rank = (
                     value.trim_end().ends_with("!important"),
                     i32::MAX,
@@ -2262,6 +2263,15 @@ pub(crate) fn restyle(
                 if piece.strikethrough == base.strikethrough {
                     piece.strikethrough = pseudo.strikethrough;
                 }
+                if piece.font_size == base.font_size {
+                    piece.font_size = pseudo.font_size;
+                }
+                if piece.letter_spacing == base.letter_spacing {
+                    piece.letter_spacing = pseudo.letter_spacing;
+                }
+                if piece.word_spacing == base.word_spacing {
+                    piece.word_spacing = pseudo.word_spacing;
+                }
                 piece.background_color = piece.background_color.or(pseudo.background_color);
             }
             restyled.push(piece);
@@ -2317,12 +2327,11 @@ pub(crate) fn cursor(value: &str) -> Option<gpui::CursorStyle> {
         "alias" => DragLink,
         "copy" => DragCopy,
         "context-menu" => ContextualMenu,
-        "none" => None,
         _ => return Option::None,
     })
 }
 
-pub(crate) fn text_run(style: &Style, len: usize) -> gpui::TextRun {
+pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> gpui::TextRun {
     let (ink, alpha) = style
         .get("color")
         .and_then(|value| color(value))
@@ -2351,11 +2360,26 @@ pub(crate) fn text_run(style: &Style, len: usize) -> gpui::TextRun {
         }),
         strikethrough: lines
             .contains("line-through")
-            .then(|| gpui::StrikethroughStyle {
+            .then_some(gpui::StrikethroughStyle {
                 thickness,
                 color: Some(decoration),
             }),
+        letter_spacing: spacing(style, units, "letter-spacing"),
+        word_spacing: spacing(style, units, "word-spacing"),
+        font_size: None,
     }
+}
+
+/// A CSS `letter-spacing` or `word-spacing` value.
+pub(crate) fn spacing(style: &Style, units: &Lengths, name: &str) -> gpui::Pixels {
+    gpui::px(
+        style
+            .get(name)
+            .filter(|value| *value != "normal")
+            .and_then(|value| units.resolve(value, units.font.em))
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.),
+    )
 }
 
 /// Builds one text layout for an element whose content is only text and plain inline elements.
@@ -2426,7 +2450,7 @@ pub(crate) fn inline_text(
         }
         if node.tag == "br" {
             text.push('\n');
-            runs.push(text_run(style, 1));
+            runs.push(text_run(style, &styles.lengths[child], 1));
             space = true;
             continue;
         }
@@ -2453,16 +2477,9 @@ pub(crate) fn inline_text(
             || styles.animations.contains_key(&child)
             || styles.lengths[child].font.em != styles.lengths[id].font.em
             || styles.lengths[child].font.lh != styles.lengths[id].font.lh
-            || [
-                "white-space",
-                "visibility",
-                "pointer-events",
-                "letter-spacing",
-                "word-spacing",
-                "text-shadow",
-            ]
-            .iter()
-            .any(|key| style.get(*key) != parent.get(*key))
+            || ["white-space", "visibility", "pointer-events", "text-shadow"]
+                .iter()
+                .any(|key| style.get(*key) != parent.get(*key))
             || style.iter().any(|(key, value)| {
                 !key.starts_with("--")
                     && parent.get(key) != Some(value)
@@ -2577,7 +2594,7 @@ pub(crate) fn inline_text(
                 word = !c.is_alphanumeric();
             }
             if text.len() > start {
-                runs.push(text_run(style, text.len() - start));
+                runs.push(text_run(style, &styles.lengths[child], text.len() - start));
             }
         }
     }
@@ -2607,7 +2624,14 @@ pub(crate) fn inline_text(
         return None;
     }
     let pseudo_run = |style: &Style| {
-        let mut run = text_run(style, 0);
+        let units = &styles.lengths[id];
+        let mut run = text_run(style, units, 0);
+        // `::first-letter` and `::first-line` may change the size inside the line.
+        run.font_size = style
+            .get("font-size")
+            .and_then(|value| units.resolve(value, units.font.em))
+            .filter(|size| (size - units.font.em).abs() > 0.01)
+            .map(gpui::px);
         run.background_color = style
             .get("background-color")
             .and_then(|value| color(value))
@@ -2636,7 +2660,12 @@ pub(crate) fn inline_text(
             {
                 text_transform(&mut text, start..end, mode);
             }
-            runs = restyle(&runs, start..end, &text_run(parent, 0), &pseudo_run(letter));
+            runs = restyle(
+                &runs,
+                start..end,
+                &text_run(parent, &styles.lengths[id], 0),
+                &pseudo_run(letter),
+            );
         }
     }
     let ink = parent
@@ -2676,7 +2705,7 @@ pub(crate) fn inline_text(
         shadows,
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
             (
-                text_run(parent, 0),
+                text_run(parent, &styles.lengths[id], 0),
                 pseudo_run(line),
                 line.get("text-transform")
                     .filter(|mode| Some(*mode) != parent.get("text-transform"))
@@ -3428,6 +3457,7 @@ impl Lengths {
                 // WARNING: gpui uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
                 blur_radius: gpui::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
                 spread_radius: gpui::px(lengths.get(3).copied().unwrap_or(0.)),
+                inset,
             });
         }
         shadows
@@ -3561,6 +3591,7 @@ impl Filter {
             .map(|row| (row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + row[3]).clamp(0., 1.))
     }
 
+    #[cfg(test)]
     pub fn color(&self, (ink, alpha): (u32, u8)) -> (u32, u8) {
         let [r, g, b] = self
             .rgb([16, 8, 0].map(|shift| ((ink >> shift) & 255) as f32 / 255.))
@@ -3579,140 +3610,6 @@ impl Filter {
         }
         .into()
     }
-
-    pub fn grayscale(&self) -> bool {
-        (0..4).all(|j| {
-            (self.0[0][j] - self.0[1][j]).abs() < 0.3 && (self.0[0][j] - self.0[2][j]).abs() < 0.3
-        })
-    }
-}
-
-pub(crate) fn transform(
-    style: &Style,
-    units: &Lengths,
-    size: [f32; 2],
-    step: f32,
-) -> Option<[f32; 6]> {
-    let number = |value: &str| {
-        if let Some(percent) = value.strip_suffix('%') {
-            return percent.parse::<f32>().ok().map(|value| value / 100.);
-        }
-        units
-            .math(value, 0., &[])
-            .filter(|(_, kind)| *kind == css::Kind::Number)
-            .map(|(value, _)| value as f32)
-    };
-    let angle = |value: &str| {
-        units
-            .math(value, 0., &[])
-            .filter(|(value, kind)| *kind == css::Kind::Angle || *value == 0.)
-            .map(|(value, _)| (value as f32).to_radians())
-    };
-    let multiply = |m: [f32; 6], n: [f32; 6]| {
-        [
-            m[0] * n[0] + m[2] * n[1],
-            m[1] * n[0] + m[3] * n[1],
-            m[0] * n[2] + m[2] * n[3],
-            m[1] * n[2] + m[3] * n[3],
-            m[0] * n[4] + m[2] * n[5] + m[4],
-            m[1] * n[4] + m[3] * n[5] + m[5],
-        ]
-    };
-    let rotation = |angle: f32| [angle.cos(), angle.sin(), -angle.sin(), angle.cos(), 0., 0.];
-    let mut matrix = [1., 0., 0., 1., 0., 0.];
-    if let Some(value) = style.get("rotate").filter(|value| *value != "none") {
-        let parts = components(value, ' ');
-        if let Some((last, rest)) = parts.split_last()
-            && (rest.is_empty() || rest == ["z"] || rest == ["0", "0", "1"])
-        {
-            matrix = multiply(matrix, rotation(angle(last)?));
-        }
-    }
-    if let Some(value) = style.get("scale").filter(|value| *value != "none") {
-        let parts = components(value, ' ');
-        let x = number(parts.first()?)?;
-        matrix = multiply(
-            matrix,
-            [
-                x,
-                0.,
-                0.,
-                parts.get(1).map_or(Some(x), |y| number(y))?,
-                0.,
-                0.,
-            ],
-        );
-    }
-    for part in components(style.get("transform").map_or("", String::as_str), ' ') {
-        let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
-        else {
-            continue;
-        };
-        let args = components(args, ',');
-        let next = match (name, args.as_slice()) {
-            ("rotate" | "rotateZ", [a]) => rotation(angle(a)?),
-            ("scale", [x]) => [number(x)?, 0., 0., number(x)?, 0., 0.],
-            ("scale", [x, y]) => [number(x)?, 0., 0., number(y)?, 0., 0.],
-            ("scaleX", [x]) => [number(x)?, 0., 0., 1., 0., 0.],
-            ("scaleY", [y]) => [1., 0., 0., number(y)?, 0., 0.],
-            ("skew" | "skewX", [x]) => [1., 0., angle(x)?.tan(), 1., 0., 0.],
-            ("skew", [x, y]) => [1., angle(y)?.tan(), angle(x)?.tan(), 1., 0., 0.],
-            ("skewY", [y]) => [1., angle(y)?.tan(), 0., 1., 0., 0.],
-            ("matrix", [a, b, c, d, e, f]) => [
-                number(a)?,
-                number(b)?,
-                number(c)?,
-                number(d)?,
-                number(e)?,
-                number(f)?,
-            ],
-            _ => continue,
-        };
-        matrix = multiply(matrix, next);
-    }
-    if matrix == [1., 0., 0., 1., 0., 0.] || matrix.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    if step > 0. {
-        let [a, b, c, d, e, f] = matrix;
-        let sx = a.hypot(b);
-        if sx > 1e-3 {
-            let snap = |value: f32, unit: f32| (value / unit).round() * unit;
-            let theta = snap(b.atan2(a), step.to_radians());
-            let [sx, k, sy] =
-                [sx, (a * c + b * d) / sx, (a * d - b * c) / sx].map(|v| snap(v, 1. / 64.));
-            let (sin, cos) = theta.sin_cos();
-            matrix = [
-                cos * sx,
-                sin * sx,
-                cos * k - sin * sy,
-                sin * k + cos * sy,
-                snap(e, 0.25),
-                snap(f, 0.25),
-            ];
-        }
-    }
-    let origin = components(
-        style
-            .get("transform-origin")
-            .map_or("50% 50%", String::as_str),
-        ' ',
-    );
-    let (x, y) = match origin.as_slice() {
-        [only] if matches!(*only, "top" | "bottom") => ("center", *only),
-        [only] => (*only, "center"),
-        [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
-        [a, b, ..] => (*a, *b),
-        [] => ("center", "center"),
-    };
-    let [x, y] = [(x, size[0]), (y, size[1])].map(|(token, extent)| match token {
-        "left" | "top" => 0.,
-        "center" => extent / 2.,
-        "right" | "bottom" => extent,
-        value => units.resolve(value, extent).unwrap_or(extent / 2.),
-    });
-    let [a, b, c, d, e, f] = matrix;
-    Some([a, b, c, d, x + e - a * x - c * y, y + f - b * x - d * y])
 }
 
 pub(crate) fn clip_path(
@@ -4753,7 +4650,7 @@ mod tests {
         let parse = |value: &str| Filter::parse(value, &units);
         let (gray, opacity, shadows) = parse("grayscale(100%) opacity(50%) blur(2px)");
         let gray = gray.unwrap();
-        assert!(gray.grayscale());
+        assert!(gray.0.iter().all(|row| row[..3] == gray.0[0][..3]));
         assert_eq!(opacity, 0.5);
         assert!(shadows.is_empty());
         let (ink, alpha) = gray.color((0xff0000, 128));
@@ -4780,61 +4677,13 @@ mod tests {
         assert_eq!(shadows[0].offset, gpui::point(gpui::px(2.), gpui::px(3.)));
         assert_eq!(gpui::Rgba::from(shadows[0].color), gpui::rgba(0x00ffffff));
         let twice = matrix.unwrap().then(matrix.unwrap());
-        assert_eq!(twice.color((0x336699, 255)), (0x336699, 255));
-    }
-
-    #[test]
-    fn transforms_bake_origin_and_skip_translation() {
-        let units = Lengths::new(16., 800., 600.);
-        let close = |a: [f32; 6], b: [f32; 6]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-4);
-        let style = |pairs: &[(&str, &str)]| -> Style {
-            pairs
+        assert!(
+            twice
+                .0
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect()
-        };
-        assert_eq!(
-            transform(
-                &style(&[("transform", "translate(5px, 6px)")]),
-                &units,
-                [10., 10.],
-                0.
-            ),
-            None
+                .zip([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]])
+                .all(|(a, b)| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-4))
         );
-        let quarter = transform(
-            &style(&[("transform", "translateX(9px) rotate(90deg)")]),
-            &units,
-            [10., 20.],
-            0.,
-        )
-        .unwrap();
-        assert!(close(quarter, [0., 1., -1., 0., 15., 5.]));
-        let corner = transform(
-            &style(&[("rotate", "90deg"), ("transform-origin", "left top")]),
-            &units,
-            [10., 20.],
-            0.,
-        )
-        .unwrap();
-        assert!(close(corner, [0., 1., -1., 0., 0., 0.]));
-        let scaled = transform(
-            &style(&[("scale", "2 50%"), ("transform", "skewX(0)")]),
-            &units,
-            [10., 10.],
-            0.,
-        )
-        .unwrap();
-        assert!(close(scaled, [2., 0., 0., 0.5, -5., 2.5]));
-        let snapped = transform(
-            &style(&[("transform", "rotate(4deg)")]),
-            &units,
-            [10., 10.],
-            3.,
-        )
-        .unwrap();
-        assert!((snapped[1].atan2(snapped[0]).to_degrees() - 3.).abs() < 1e-3);
-        assert!(transform(&style(&[("rotate", "x 45deg")]), &units, [10., 10.], 0.).is_none());
     }
 
     #[test]

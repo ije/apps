@@ -96,7 +96,7 @@ fn map(device: &Device, slice: BufferSlice<'_>, mode: MapMode) -> Result<()> {
         let _ = tx.send(result);
     });
     let result = device
-        .poll(PollType::Wait)
+        .poll(PollType::wait_indefinitely())
         .map_err(anyhow::Error::from)
         .and_then(|_| Ok(rx.recv()??));
     if result.is_err() {
@@ -224,15 +224,15 @@ impl Gpu {
     pub fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         if op == "adapter" {
             let instance = self.instance.get_or_insert_with(|| {
-                Instance::new(&InstanceDescriptor {
-                    backends: Backends::METAL | Backends::VULKAN | Backends::DX12,
-                    ..Default::default()
-                })
+                let mut descriptor = InstanceDescriptor::new_without_display_handle();
+                descriptor.backends = Backends::METAL | Backends::VULKAN | Backends::DX12;
+                Instance::new(descriptor)
             });
             let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
                 power_preference: decode(&args[0]["powerPreference"], json!("none"))?,
                 force_fallback_adapter: args[0]["forceFallbackAdapter"] == true,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             }));
             let Ok(adapter) = adapter else {
                 return Ok(Value::Null);
@@ -273,8 +273,11 @@ impl Gpu {
                 required_limits: limits,
                 memory_hints: MemoryHints::MemoryUsage,
                 trace: Trace::Off,
+                experimental_features: ExperimentalFeatures::disabled(),
             }))?;
-            device.on_uncaptured_error(Box::new(|error| eprintln!("apps: WebGPU error: {error}")));
+            device.on_uncaptured_error(std::sync::Arc::new(|error| {
+                eprintln!("apps: WebGPU error: {error}")
+            }));
             self.next += 1;
             let mut names: Vec<_> = FEATURES
                 .iter()
@@ -302,11 +305,11 @@ impl Gpu {
             .get(&id)
             .context("GPU device is destroyed or invalid")?
             .clone();
-        device.push_error_scope(ErrorFilter::Validation);
-        device.push_error_scope(ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(ErrorFilter::Validation);
+        let oom = device.push_error_scope(ErrorFilter::OutOfMemory);
         let result = self.execute(op, id, &device, &queue, &args[1]);
-        let oom = pollster::block_on(device.pop_error_scope());
-        let validation = pollster::block_on(device.pop_error_scope());
+        let oom = pollster::block_on(oom.pop());
+        let validation = pollster::block_on(validation.pop());
         if let Some(error) = oom.or(validation) {
             if op == "canvasTexture"
                 && let Some(node) = args[1]["canvas"].as_u64()
@@ -317,9 +320,9 @@ impl Gpu {
                 && self.mapped.remove(&key).is_some()
                 && let Some((_, Resource::Buffer(buffer))) = self.resources.get(&key)
             {
-                device.push_error_scope(ErrorFilter::Validation);
+                let scope = device.push_error_scope(ErrorFilter::Validation);
                 buffer.unmap();
-                let _ = pollster::block_on(device.pop_error_scope());
+                let _ = pollster::block_on(scope.pop());
             }
             let kind = if matches!(error, Error::OutOfMemory { .. }) {
                 "out-of-memory"
@@ -495,12 +498,18 @@ impl Gpu {
             "createPipelineLayout" => {
                 let layouts = list(&p["bindGroupLayouts"])
                     .iter()
-                    .map(|v| -> Result<_> { Ok(resource!(self, id, v, BindLayout)) })
+                    .map(|v| -> Result<_> {
+                        Ok(if v.is_null() {
+                            None
+                        } else {
+                            Some(resource!(self, id, v, BindLayout))
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Resource::PipelineLayout(device.create_pipeline_layout(&PipelineLayoutDescriptor {
                     label,
                     bind_group_layouts: &layouts,
-                    push_constant_ranges: &[],
+                    immediate_size: 0,
                 }))
             }
             "createBindGroup" => {
@@ -548,11 +557,14 @@ impl Gpu {
                     .iter()
                     .zip(&attributes)
                     .map(|(b, attrs)| -> Result<_> {
-                        Ok(VertexBufferLayout {
+                        if b.is_null() {
+                            return Ok(None);
+                        }
+                        Ok(Some(VertexBufferLayout {
                             array_stride: number(&b["arrayStride"])?,
                             step_mode: decode(&b["stepMode"], json!("vertex"))?,
                             attributes: attrs,
-                        })
+                        }))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let targets = list(&fragment["targets"])
@@ -654,7 +666,7 @@ impl Gpu {
                     } else {
                         Some(DepthStencilState {
                             format: decode(&depth["format"], Value::Null)?,
-                            depth_write_enabled: depth["depthWriteEnabled"] == true,
+                            depth_write_enabled: Some(depth["depthWriteEnabled"] == true),
                             depth_compare: decode(&depth["depthCompare"], json!("always"))?,
                             stencil: StencilState {
                                 front: stencil(&depth["stencilFront"])?,
@@ -675,7 +687,7 @@ impl Gpu {
                         alpha_to_coverage_enabled: p["multisample"]["alphaToCoverageEnabled"]
                             == true,
                     },
-                    multiview: None,
+                    multiview_mask: None,
                     cache: None,
                 }))
             }
@@ -763,7 +775,7 @@ impl Gpu {
                     },
                 )?;
                 self.mapped.insert(key, offset..end);
-                return Ok(crate::web::base64(&slice.get_mapped_range()));
+                return Ok(crate::web::base64(&slice.get_mapped_range()?));
             }
             "unmapBuffer" => {
                 let key = number(&p[0])?;
@@ -787,7 +799,7 @@ impl Gpu {
                         );
                         buffer
                             .slice(offset..end)
-                            .get_mapped_range_mut()
+                            .get_mapped_range_mut()?
                             .copy_from_slice(&bytes);
                     }
                 }
@@ -831,7 +843,7 @@ impl Gpu {
                 return Ok(Value::Null);
             }
             "wait" => {
-                device.poll(PollType::Wait)?;
+                device.poll(PollType::wait_indefinitely())?;
                 return Ok(Value::Null);
             }
             "canvasTexture" => {
@@ -1036,6 +1048,7 @@ impl Gpu {
                                     depth_stencil_attachment,
                                     timestamp_writes: None,
                                     occlusion_query_set: None,
+                                    multiview_mask: None,
                                 });
                                 for command in list(&c[2]) {
                                     self.render_command(id, &mut pass, command)?;
@@ -1287,7 +1300,7 @@ impl Gpu {
         );
         queue.submit([encoder.finish()]);
         map(device, buffer.slice(..), MapMode::Read)?;
-        let mapped = buffer.slice(..).get_mapped_range();
+        let mapped = buffer.slice(..).get_mapped_range()?;
         let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
         for row in mapped.chunks(stride as usize) {
             pixels.extend_from_slice(&row[..width as usize * 4]);

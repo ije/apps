@@ -8,6 +8,7 @@ mod crypto;
 pub mod desktop;
 pub mod devtools;
 pub mod dom;
+mod effects;
 mod ffi;
 pub mod gpu;
 mod grid;

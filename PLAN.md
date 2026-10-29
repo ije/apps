@@ -1,0 +1,3 @@
+# PLAN
+
+- [] precompile metal shader?

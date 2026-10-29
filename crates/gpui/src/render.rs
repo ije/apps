@@ -1,0 +1,606 @@
+//! Turns a scene into draw commands for the platform renderers, including the offscreen
+//! layers that effects are painted into.
+#![allow(missing_docs)]
+
+use crate::{
+    AtlasTextureId, Background, BlendMode, Bounds, EffectPrimitive, MonochromeSprite, Point,
+    PolychromeSprite, PrimitiveBatch, Quad, Rgba, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline,
+};
+use std::{mem, ops::Range};
+
+const IDENTITY: [f32; 16] = [
+    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+];
+const COMPOSITE_MATRIX: u32 = 1;
+const COMPOSITE_CLIP: u32 = 2;
+const COMPOSITE_MASK: u32 = 4;
+const COMPOSITE_SHADOW: u32 = 8;
+const COMPOSITE_BACKDROP: u32 = 16;
+const COMPOSITE_BLEND: u32 = 32;
+
+/// The shader globals of one render target, which covers `viewport_size` device pixels from
+/// `viewport_origin` of the window.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Globals {
+    pub gamma_ratios: [f32; 4],
+    pub viewport_size: [f32; 2],
+    pub viewport_origin: [f32; 2],
+    pub window_size: [f32; 2],
+    pub grayscale_enhanced_contrast: f32,
+    pub subpixel_enhanced_contrast: f32,
+    pub premultiplied_alpha: u32,
+    pub is_bgr: u32,
+    pub pad: [u32; 2],
+}
+
+/// Text rendering settings of a renderer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextParams {
+    pub gamma_ratios: [f32; 4],
+    pub grayscale_enhanced_contrast: f32,
+    pub subpixel_enhanced_contrast: f32,
+    pub is_bgr: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PathSprite {
+    pub bounds: Bounds<ScaledPixels>,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct PathRasterizationVertex {
+    pub xy_position: Point<ScaledPixels>,
+    pub st_position: Point<f32>,
+    pub color: Background,
+    pub bounds: Bounds<ScaledPixels>,
+    pub rounded: Bounds<ScaledPixels>,
+    pub radii: crate::Corners<ScaledPixels>,
+}
+
+/// Draws an offscreen layer onto a target. `mask_tile` is in mask texture pixels.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Composite {
+    pub transform: [f32; 16],
+    pub color_matrix: [f32; 16],
+    pub color_offset: [f32; 4],
+    pub shadow_color: [f32; 4],
+    pub bounds: [f32; 4],
+    pub clip: [f32; 4],
+    pub clip_radii: [f32; 4],
+    pub mask_rect: [f32; 4],
+    pub mask_tile: [f32; 4],
+    pub content_mask: [f32; 4],
+    pub rounded_mask: [f32; 4],
+    pub rounded_radii: [f32; 4],
+    pub shadow: [f32; 4],
+    pub source_rect: [f32; 4],
+    pub backdrop_rect: [f32; 4],
+    pub opacity: f32,
+    pub blur: f32,
+    pub flags: u32,
+    pub blend: u32,
+}
+
+/// The horizontal half of a separable blur; the composite does the vertical half.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Blur {
+    pub region: [f32; 4],
+    pub source_rect: [f32; 4],
+    pub sigma: f32,
+    pub pad: [f32; 3],
+}
+
+/// The window, or an offscreen layer covering part of the window.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Target {
+    Frame,
+    Layer(usize),
+}
+
+/// An offscreen layer: a pooled texture placed at `origin` in window device pixels.
+pub struct Layer {
+    pub texture: usize,
+    pub origin: [i32; 2],
+}
+
+pub enum Cmd {
+    /// Draw the next commands into the target, cleared first if `true`.
+    Pass(Target, bool),
+    Quads(Range<u32>),
+    Shadows(Range<u32>),
+    Underlines(Range<u32>),
+    Mono(AtlasTextureId, Range<u32>),
+    Subpixel(AtlasTextureId, Range<u32>),
+    Poly(AtlasTextureId, Range<u32>),
+    /// Rasterize the vertices into the window sized path texture, then draw the sprites from it.
+    Paths {
+        vertices: Range<u32>,
+        sprites: Range<u32>,
+    },
+    /// Draw a blur into the cleared `dst`, then continue with the previous target.
+    Blur {
+        src: Target,
+        dst: Target,
+        index: u32,
+    },
+    /// Copy the `[x, y, width, height]` window region.
+    Copy {
+        src: Target,
+        dst: Target,
+        region: [i32; 4],
+    },
+    Composite {
+        src: Target,
+        mask: Option<AtlasTextureId>,
+        backdrop: Option<Target>,
+        index: u32,
+    },
+}
+
+/// The instance data and commands of one frame, kept to reuse the allocations.
+#[derive(Default)]
+pub struct RenderFrame {
+    pub quads: Vec<Quad>,
+    pub shadows: Vec<Shadow>,
+    pub vertices: Vec<PathRasterizationVertex>,
+    pub sprites: Vec<PathSprite>,
+    pub underlines: Vec<Underline>,
+    pub mono: Vec<MonochromeSprite>,
+    pub subpixel: Vec<SubpixelSprite>,
+    pub poly: Vec<PolychromeSprite>,
+    pub composites: Vec<Composite>,
+    pub blurs: Vec<Blur>,
+    pub cmds: Vec<Cmd>,
+    pub layers: Vec<Layer>,
+    /// The size of each pooled texture the layers use.
+    pub textures: Vec<[u32; 2]>,
+    free: Vec<usize>,
+    window: [u32; 2],
+    max_texture: f32,
+    copy: bool,
+}
+
+fn extend<T: Clone>(items: &mut Vec<T>, new: &[T]) -> Range<u32> {
+    let start = items.len() as u32;
+    items.extend_from_slice(new);
+    start..items.len() as u32
+}
+
+fn rect(bounds: Bounds<ScaledPixels>) -> [f32; 4] {
+    [
+        bounds.origin.x.0,
+        bounds.origin.y.0,
+        bounds.size.width.0,
+        bounds.size.height.0,
+    ]
+}
+
+fn radii(radii: &crate::Corners<ScaledPixels>) -> [f32; 4] {
+    [
+        radii.top_left.0,
+        radii.top_right.0,
+        radii.bottom_right.0,
+        radii.bottom_left.0,
+    ]
+}
+
+/// The instance data as raw bytes.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub fn bytes<T>(items: &[T]) -> &[u8] {
+    // SAFETY: the instance types are `repr(C)` plain data that the shaders read as raw bytes.
+    unsafe { std::slice::from_raw_parts(items.as_ptr() as *const u8, mem::size_of_val(items)) }
+}
+
+impl RenderFrame {
+    /// Records the scene for a `window` sized frame. Backdrops and blend modes need `copy`,
+    /// the support for copying from the window texture.
+    pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
+        self.quads.clear();
+        self.shadows.clear();
+        self.vertices.clear();
+        self.sprites.clear();
+        self.underlines.clear();
+        self.mono.clear();
+        self.subpixel.clear();
+        self.poly.clear();
+        self.composites.clear();
+        self.blurs.clear();
+        self.cmds.clear();
+        self.layers.clear();
+        self.textures.clear();
+        self.free.clear();
+        self.window = window;
+        self.max_texture = max_texture as f32;
+        self.copy = copy;
+        self.record_layer(scene, 0, Target::Frame, true);
+    }
+
+    /// The `[x, y, width, height]` window region the target covers.
+    pub fn rect(&self, target: Target) -> [f32; 4] {
+        match target {
+            Target::Frame => [0., 0., self.window[0] as f32, self.window[1] as f32],
+            Target::Layer(index) => {
+                let layer = &self.layers[index];
+                let size = self.textures[layer.texture];
+                [
+                    layer.origin[0] as f32,
+                    layer.origin[1] as f32,
+                    size[0] as f32,
+                    size[1] as f32,
+                ]
+            }
+        }
+    }
+
+    pub fn origin(&self, target: Target) -> [i32; 2] {
+        match target {
+            Target::Frame => [0, 0],
+            Target::Layer(index) => self.layers[index].origin,
+        }
+    }
+
+    pub fn globals(&self, target: Target, text: &TextParams) -> Globals {
+        let rect = self.rect(target);
+        Globals {
+            gamma_ratios: text.gamma_ratios,
+            viewport_size: [rect[2], rect[3]],
+            viewport_origin: [rect[0], rect[1]],
+            window_size: [self.window[0] as f32, self.window[1] as f32],
+            grayscale_enhanced_contrast: text.grayscale_enhanced_contrast,
+            subpixel_enhanced_contrast: text.subpixel_enhanced_contrast,
+            premultiplied_alpha: 0,
+            is_bgr: text.is_bgr as u32,
+            pad: [0; 2],
+        }
+    }
+
+    /// Returns a target covering the `[x, y, width, height]` region of the window.
+    fn acquire(&mut self, region: [i32; 4]) -> Target {
+        let size = [region[2].max(1) as u32, region[3].max(1) as u32];
+        let fit = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                let texture = self.textures[**slot];
+                texture[0] >= size[0] && texture[1] >= size[1]
+            })
+            .min_by_key(|(_, slot)| {
+                let texture = self.textures[**slot];
+                texture[0] * texture[1]
+            })
+            .map(|(index, _)| index);
+        let texture = match fit {
+            Some(index) => self.free.swap_remove(index),
+            None => {
+                // Round up so textures can be reused by later frames.
+                self.textures
+                    .push(size.map(|value| value.div_ceil(256) * 256));
+                self.textures.len() - 1
+            }
+        };
+        self.layers.push(Layer {
+            texture,
+            origin: [region[0], region[1]],
+        });
+        Target::Layer(self.layers.len() - 1)
+    }
+
+    // WARNING: commands run in order, so a texture can be reused once the commands reading it are recorded.
+    fn release(&mut self, target: Target) {
+        if let Target::Layer(index) = target {
+            self.free.push(self.layers[index].texture);
+        }
+    }
+
+    fn record_layer(&mut self, scene: &Scene, layer: usize, target: Target, clear: bool) {
+        self.cmds.push(Cmd::Pass(target, clear));
+        let primitives = &scene.layers[layer];
+        for batch in scene.batches(layer) {
+            let cmd = match batch {
+                PrimitiveBatch::Quads(range) => {
+                    Cmd::Quads(extend(&mut self.quads, &primitives.quads[range]))
+                }
+                PrimitiveBatch::Shadows(range) => {
+                    Cmd::Shadows(extend(&mut self.shadows, &primitives.shadows[range]))
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    Cmd::Underlines(extend(&mut self.underlines, &primitives.underlines[range]))
+                }
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => Cmd::Mono(
+                    texture_id,
+                    extend(&mut self.mono, &primitives.monochrome_sprites[range]),
+                ),
+                PrimitiveBatch::SubpixelSprites { texture_id, range } => Cmd::Subpixel(
+                    texture_id,
+                    extend(&mut self.subpixel, &primitives.subpixel_sprites[range]),
+                ),
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => Cmd::Poly(
+                    texture_id,
+                    extend(&mut self.poly, &primitives.polychrome_sprites[range]),
+                ),
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &primitives.paths[range];
+                    let start = self.vertices.len() as u32;
+                    for path in paths {
+                        let bounds = path.clipped_bounds();
+                        self.vertices.extend(path.vertices.iter().map(|vertex| {
+                            PathRasterizationVertex {
+                                xy_position: vertex.xy_position,
+                                st_position: vertex.st_position,
+                                color: path.color,
+                                bounds,
+                                rounded: path.content_mask.rounded,
+                                radii: path.content_mask.corner_radii,
+                            }
+                        }));
+                    }
+                    let vertices = start..self.vertices.len() as u32;
+                    // Each pixel must be copied once, so paths of different draw orders share one sprite.
+                    let first = &paths[0];
+                    let sprites = if paths.iter().all(|path| path.order == first.order) {
+                        let start = self.sprites.len() as u32;
+                        self.sprites.extend(paths.iter().map(|path| PathSprite {
+                            bounds: path.clipped_bounds(),
+                        }));
+                        start..self.sprites.len() as u32
+                    } else {
+                        let bounds = paths
+                            .iter()
+                            .skip(1)
+                            .fold(first.clipped_bounds(), |bounds, path| {
+                                bounds.union(&path.clipped_bounds())
+                            });
+                        extend(&mut self.sprites, &[PathSprite { bounds }])
+                    };
+                    Cmd::Paths { vertices, sprites }
+                }
+                PrimitiveBatch::Effects(range) => {
+                    for effect in &primitives.effects[range] {
+                        self.record_effect(scene, effect, target);
+                    }
+                    continue;
+                }
+            };
+            self.cmds.push(cmd);
+        }
+    }
+
+    /// The integer `[x, y, width, height]` region covering `bounds`, limited to what can be seen
+    /// and to the maximum texture size.
+    fn region(&self, bounds: Bounds<ScaledPixels>, limit: [f32; 4]) -> Option<[i32; 4]> {
+        let x0 = bounds.origin.x.0.floor().max(limit[0]);
+        let y0 = bounds.origin.y.0.floor().max(limit[1]);
+        let x1 = (bounds.origin.x.0 + bounds.size.width.0)
+            .ceil()
+            .min(limit[0] + limit[2])
+            .min(x0 + self.max_texture);
+        let y1 = (bounds.origin.y.0 + bounds.size.height.0)
+            .ceil()
+            .min(limit[1] + limit[3])
+            .min(y0 + self.max_texture);
+        (x1 > x0 && y1 > y0).then(|| [x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
+    }
+
+    fn blur(&mut self, src: Target, region: [i32; 4], sigma: f32, release: bool) -> Target {
+        let source_rect = self.rect(src);
+        let dst = match src {
+            Target::Layer(index) => {
+                let layer = &self.layers[index];
+                let size = self.textures[layer.texture];
+                let origin = layer.origin;
+                self.acquire([origin[0], origin[1], size[0] as i32, size[1] as i32])
+            }
+            Target::Frame => self.acquire(region),
+        };
+        let index = self.blurs.len() as u32;
+        self.blurs.push(Blur {
+            region: region.map(|value| value as f32),
+            source_rect,
+            sigma,
+            pad: [0.; 3],
+        });
+        self.cmds.push(Cmd::Blur { src, dst, index });
+        if release {
+            self.release(src);
+        }
+        dst
+    }
+
+    fn composite(
+        &mut self,
+        target: Target,
+        src: Target,
+        mask: Option<AtlasTextureId>,
+        backdrop: Option<Target>,
+        composite: Composite,
+    ) {
+        self.cmds.push(Cmd::Pass(target, false));
+        self.cmds.push(Cmd::Composite {
+            src,
+            mask,
+            backdrop,
+            index: self.composites.len() as u32,
+        });
+        self.composites.push(composite);
+    }
+
+    fn record_effect(&mut self, scene: &Scene, primitive: &EffectPrimitive, target: Target) {
+        let layer = &scene.layers[primitive.layer];
+        let Some(effect) = layer.effect.as_ref() else {
+            return;
+        };
+        let mask = primitive.content_mask.bounds;
+        let matrix = |matrix: &Option<[f32; 20]>, composite: &mut Composite| {
+            if let Some(m) = matrix {
+                composite.flags |= COMPOSITE_MATRIX;
+                composite.color_matrix = [
+                    m[0], m[5], m[10], m[15], m[1], m[6], m[11], m[16], m[2], m[7], m[12], m[17],
+                    m[3], m[8], m[13], m[18],
+                ];
+                composite.color_offset = [m[4], m[9], m[14], m[19]];
+            }
+        };
+        let base = Composite {
+            transform: IDENTITY,
+            color_matrix: IDENTITY,
+            color_offset: [0.; 4],
+            shadow_color: [0.; 4],
+            bounds: [0.; 4],
+            clip: [0.; 4],
+            clip_radii: [0.; 4],
+            mask_rect: [0.; 4],
+            mask_tile: [0.; 4],
+            content_mask: rect(mask),
+            rounded_mask: rect(primitive.content_mask.rounded),
+            rounded_radii: radii(&primitive.content_mask.corner_radii),
+            shadow: [0.; 4],
+            source_rect: [0.; 4],
+            backdrop_rect: [0.; 4],
+            opacity: 1.,
+            blur: 0.,
+            flags: 0,
+            blend: 0,
+        };
+        let target_rect = self.rect(target);
+        let visible = rect(mask.intersect(&Bounds::new(
+            Point::new(ScaledPixels(target_rect[0]), ScaledPixels(target_rect[1])),
+            Size::new(ScaledPixels(target_rect[2]), ScaledPixels(target_rect[3])),
+        )));
+
+        if let Some(backdrop) = &effect.backdrop
+            && self.copy
+            && let Some(region) = self.region(
+                backdrop.bounds.dilate(ScaledPixels(backdrop.blur * 3.)),
+                visible,
+            )
+        {
+            let copy = self.acquire(region);
+            self.cmds.push(Cmd::Copy {
+                src: target,
+                dst: copy,
+                region,
+            });
+            let src = if backdrop.blur > 0.25 {
+                self.blur(copy, region, backdrop.blur, true)
+            } else {
+                copy
+            };
+            let mut composite = base;
+            composite.flags = COMPOSITE_BACKDROP | COMPOSITE_CLIP;
+            composite.bounds = rect(backdrop.bounds);
+            composite.clip = composite.bounds;
+            composite.clip_radii = radii(&backdrop.corner_radii);
+            composite.blur = backdrop.blur;
+            composite.source_rect = self.rect(src);
+            matrix(&backdrop.color_matrix, &mut composite);
+            self.composite(target, src, None, None, composite);
+            self.release(src);
+        }
+
+        let Some(content) = layer.bounds else {
+            return;
+        };
+        // WARNING: transformed content can be visible beyond the window, so allow a window of margin.
+        let (w, h) = (self.window[0] as f32, self.window[1] as f32);
+        let reach = if effect.transform.is_some() {
+            [-w, -h, 3. * w, 3. * h]
+        } else {
+            visible
+        };
+        let spread = effect
+            .blur
+            .max(effect.shadow.map_or(0., |(_, sigma, _)| sigma))
+            * 3.;
+        let Some(region) = self.region(content.dilate(ScaledPixels(spread)), reach) else {
+            return;
+        };
+        let texture = self.acquire(region);
+        self.record_layer(scene, primitive.layer, texture, true);
+
+        let mut base = base;
+        base.transform = effect.transform.unwrap_or(IDENTITY);
+        base.opacity = effect.opacity;
+        if let Some((bounds, corners)) = &effect.clip {
+            base.flags |= COMPOSITE_CLIP;
+            base.clip = rect(*bounds);
+            base.clip_radii = radii(corners);
+        }
+        let mask_texture = effect.mask.as_ref().map(|(tile, bounds)| {
+            base.flags |= COMPOSITE_MASK;
+            base.mask_rect = rect(*bounds);
+            base.mask_tile = [
+                tile.bounds.origin.x.0 as f32,
+                tile.bounds.origin.y.0 as f32,
+                tile.bounds.size.width.0 as f32,
+                tile.bounds.size.height.0 as f32,
+            ];
+            tile.texture_id
+        });
+        let region_rect = region.map(|value| value as f32);
+
+        if let Some((offset, sigma, color)) = effect.shadow {
+            let src = if sigma > 0.25 {
+                self.blur(texture, region, sigma, false)
+            } else {
+                texture
+            };
+            let rgba = Rgba::from(color);
+            let mut composite = base;
+            composite.flags |= COMPOSITE_SHADOW;
+            composite.blur = sigma;
+            composite.shadow = [offset.x, offset.y, sigma, 0.];
+            composite.shadow_color = [rgba.r * rgba.a, rgba.g * rgba.a, rgba.b * rgba.a, rgba.a];
+            composite.bounds = [
+                region_rect[0] + offset.x,
+                region_rect[1] + offset.y,
+                region_rect[2],
+                region_rect[3],
+            ];
+            composite.source_rect = self.rect(src);
+            self.composite(target, src, mask_texture, None, composite);
+            if src != texture {
+                self.release(src);
+            }
+        }
+
+        let src = if effect.blur > 0.25 {
+            self.blur(texture, region, effect.blur, true)
+        } else {
+            texture
+        };
+        let backdrop = (effect.blend_mode != BlendMode::Normal && self.copy)
+            .then(|| self.region(primitive.bounds, visible))
+            .flatten()
+            .map(|region| {
+                let copy = self.acquire(region);
+                self.cmds.push(Cmd::Copy {
+                    src: target,
+                    dst: copy,
+                    region,
+                });
+                copy
+            });
+        let mut composite = base;
+        matrix(&effect.color_matrix, &mut composite);
+        composite.blur = effect.blur;
+        composite.bounds = region_rect;
+        composite.blend = effect.blend_mode as u32;
+        composite.source_rect = self.rect(src);
+        if let Some(backdrop) = backdrop {
+            composite.flags |= COMPOSITE_BLEND;
+            composite.backdrop_rect = self.rect(backdrop);
+        }
+        self.composite(target, src, mask_texture, backdrop, composite);
+        self.release(src);
+        if let Some(backdrop) = backdrop {
+            self.release(backdrop);
+        }
+    }
+}

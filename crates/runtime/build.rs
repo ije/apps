@@ -5,7 +5,7 @@ fn main() {
     let source = if root.ends_with("runtime") {
         root.join("src/napi.rs")
     } else {
-        root.join("../runtime/src/napi.rs")
+        root.join("crates/runtime/src/napi.rs")
     };
     println!("cargo:rerun-if-changed={}", source.display());
     let target = env::var("CARGO_CFG_TARGET_OS").unwrap();

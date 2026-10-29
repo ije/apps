@@ -39,49 +39,6 @@ export default {
 
 All handlers are optional. Lifecycle handlers receive `app` and can be async.
 The `ready` handler runs once after the main module and the app are ready.
-The `windowClose` handler runs after each window closes. The `app.hasWindows` getter reports whether any windows remain.
-The `app.platform` value matches `process.platform` (`darwin`, `linux`, or `win32`).
-The `fetch` handler starts a server with the same options as `serve()`.
-The default port is `3000`. Calls to `app.on()` and `app.whenReady()` also work.
-
-## CSS
-
-Pages use standard CSS, drawn with GPUI. GPUI can't draw some CSS features, and its layout engine has no floats or columns.
-When a page uses one, `apps run` shows an error in the Developer Tools console (`apps run -D`).
-
-| Feature | Support |
-|---|---|
-| `transform` rotate, scale, skew, matrix, 3D | Only on `<svg>` and SVG `<img>`. Other elements support `translate` only |
-| `filter` | Color functions work. `blur()` and `url()` don't. Images support only `grayscale()` and `opacity()` |
-| `backdrop-filter`, `mix-blend-mode`, `background-blend-mode`, `mask` | Not supported |
-| `clip-path` | `inset()`, `circle()`, `ellipse()`, `rect()` and `xywh()` clip children to the shape's bounding box. `polygon()`, `path()` and `url()` don't work |
-| `overflow` with `border-radius` | Children are clipped to a rectangle. An only-child `<img>` gets the rounded corners |
-| `letter-spacing`, `word-spacing`, `text-indent`, `text-align: justify` | Not supported |
-| `font-size`, `line-height`, `vertical-align` in `::first-letter` and `::first-line` | Not supported. Colors and font styles work |
-| `border-style` dotted, double, groove, ridge, inset, outset | Dotted draws as dashed, the others as solid |
-| Vertical `writing-mode`, `float`, multi-column layout | Not supported |
-| `text-shadow` blur, inset `box-shadow` | Approximated |
-
-## DOM
-
-Pages get the standard DOM API (nodes, elements, events, ranges, selection, observers, shadow DOM and custom elements). These parts differ from browsers:
-
-| Feature | Support |
-|---|---|
-| `NodeList`, `HTMLCollection` | Static arrays with `item()`. They don't update when the tree changes |
-| `DocumentType`, `CDATASection`, `ProcessingInstruction` | Not supported. `Attr` is not a `Node` |
-| `DOMParser`, XPath, XSLT | `DOMParser` parses `text/html` only. XPath and XSLT are not supported |
-| `*AttributeNS()` | The namespace is ignored |
-| `<template>` | Parsed children move into `content` when `content` is first read |
-| Inline event attributes (`onclick="..."`) | Not run, because `eval` is disabled. Use `addEventListener` or `el.onclick = fn` |
-| Forms | No `submit` event, `<select>` popup or `<button>` default action. Clicks on checkbox and radio inputs work |
-
-## JSC
-
-The runtime uses [Bun's WebKit fork](https://github.com/oven-sh/WebKit).
-The build enables Bun's JSC additions with the generic event loop.
-`scripts/jsc.patch` restores C API locks and adds support for shared libraries.
-
-```sh
-bash scripts/build-jsc.sh
-```
+The `windowClose` handler runs after each window closes. Calls to `app.on()` and `app.whenReady()` also work.
+The `fetch` handler starts a http server with the same options as `serve()`.
+The default port is `3000`.

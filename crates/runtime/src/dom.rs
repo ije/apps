@@ -6,7 +6,19 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::HashMap, rc::Rc};
 
-pub(crate) type Rows = Rc<[(gpui::Pixels, gpui::Pixels)]>;
+/// One visual row of wrapped text: its shift for alignment and indent, its right edge, the extra
+/// space after each space when justified, its first byte, and how far it moves down.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Row {
+    pub shift: gpui::Pixels,
+    pub right: gpui::Pixels,
+    pub gap: gpui::Pixels,
+    pub start: usize,
+    /// How far the row moves down, when the first row is taller.
+    pub drop: gpui::Pixels,
+}
+
+pub(crate) type Rows = Rc<[Row]>;
 
 pub(crate) struct LayoutNode {
     pub node: Node,
@@ -56,13 +68,13 @@ pub struct State {
     pub shadows: HashMap<usize, usize>,
     pub(crate) svg_sources: HashMap<usize, ([f32; 2], String, String)>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
-    pub(crate) svg_rasters: HashMap<u64, (std::sync::Arc<gpui::RenderImage>, u64)>,
-    pub(crate) svg_clock: u64,
+    /// Rasterized `clip-path` and `mask-image` shapes, by node.
+    pub(crate) masks: HashMap<usize, (String, std::sync::Arc<gpui::RenderImage>)>,
     pub(crate) image_crops: HashMap<usize, (u64, std::sync::Arc<gpui::RenderImage>)>,
     pub svgs: HashMap<usize, (String, std::sync::Arc<gpui::RenderImage>)>,
     pub backgrounds: HashMap<(usize, usize), (String, std::sync::Arc<gpui::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
-    pub text_system: Option<std::sync::Arc<gpui::WindowTextSystem>>,
+    pub text_system: Option<std::rc::Rc<gpui::WindowTextSystem>>,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: std::collections::HashSet<String>,
@@ -128,7 +140,9 @@ impl State {
                 computed
                     .lengths
                     .resize(doc.nodes.len(), computed.lengths[0]);
-                computed.user_select.resize(doc.nodes.len(), (render::UserSelect::None, 0));
+                computed
+                    .user_select
+                    .resize(doc.nodes.len(), (render::UserSelect::None, 0));
                 computed.user_select[id] = (render::UserSelect::None, 0);
             } else {
                 self.computed = None;
@@ -679,7 +693,7 @@ pub fn call(
                 let offset = scroll.map(scroll_offset).unwrap_or_default();
                 let max = scroll.map(|s| s.max_offset()).unwrap_or_default();
                 Ok(
-                    json!({"x":bounds[0],"y":bounds[1],"left":bounds[0],"top":bounds[1],"width":bounds[2],"height":bounds[3],"right":bounds[0]+bounds[2],"bottom":bounds[1]+bounds[3],"scrollLeft":-f32::from(offset.x),"scrollTop":-f32::from(offset.y),"scrollWidth":bounds[2]+f32::from(max.width),"scrollHeight":bounds[3]+f32::from(max.height)}),
+                    json!({"x":bounds[0],"y":bounds[1],"left":bounds[0],"top":bounds[1],"width":bounds[2],"height":bounds[3],"right":bounds[0]+bounds[2],"bottom":bounds[1]+bounds[3],"scrollLeft":-f32::from(offset.x),"scrollTop":-f32::from(offset.y),"scrollWidth":bounds[2]+f32::from(max.x),"scrollHeight":bounds[3]+f32::from(max.y)}),
                 )
             }
             "dom.style" => {
@@ -754,7 +768,12 @@ pub fn call(
             }
             "dom.userSelect" | "dom.selectionText" => {
                 let system = state.text_system.clone();
-                let computed = styles(doc, state, viewport, system.as_deref().map(|system| &***system));
+                let computed = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| &***system),
+                );
                 if op == "dom.userSelect" {
                     return Ok(json!(computed.user_select[id]));
                 }
@@ -1018,7 +1037,7 @@ pub fn call(
                             gpui::px(args[1].as_f64().unwrap_or(0.) as f32),
                             gpui::px(args[2].as_f64().unwrap_or(0.) as f32),
                         );
-                        let index = crate::desktop::text_index(layout, rows, position)
+                        let index = crate::desktop::text_index(layout, text, rows, position)
                             .unwrap_or_else(|index| index)
                             .clamp(range.start, range.end);
                         return Ok(json!(text[range.start..index].encode_utf16().count()));
@@ -1027,11 +1046,13 @@ pub fn call(
                     let end = args[2].as_u64().unwrap_or(start as u64) as usize;
                     let a = crate::desktop::text_position(
                         layout,
+                        text,
                         rows,
                         range.start + utf16_index(content, start),
                     );
                     let b = crate::desktop::text_position(
                         layout,
+                        text,
                         rows,
                         range.start + utf16_index(content, end),
                     );
@@ -1095,6 +1116,9 @@ pub fn call(
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: gpui::px(0.),
+                    word_spacing: gpui::px(0.),
+                    font_size: None,
                 };
                 let wrap = (!style
                     .get("white-space")
@@ -1200,6 +1224,9 @@ pub fn call(
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    letter_spacing: gpui::px(0.),
+                    word_spacing: gpui::px(0.),
+                    font_size: None,
                 };
                 let line =
                     system.shape_line(text.to_owned().into(), gpui::px(font_size), &[run], None);
@@ -1217,8 +1244,8 @@ fn scroll_offset(handle: &gpui::ScrollHandle) -> gpui::Point<gpui::Pixels> {
     let bounds = handle.bounds();
     if bounds.size.width > gpui::px(0.) || bounds.size.height > gpui::px(0.) {
         let max = handle.max_offset();
-        offset.x = offset.x.clamp(-max.width, gpui::px(0.));
-        offset.y = offset.y.clamp(-max.height, gpui::px(0.));
+        offset.x = offset.x.clamp(-max.x, gpui::px(0.));
+        offset.y = offset.y.clamp(-max.y, gpui::px(0.));
     }
     offset
 }
@@ -1331,9 +1358,11 @@ pub(crate) fn styles(
                     .map(|(key, value)| format!("{key}:{value}"))
                     .collect::<Vec<_>>()
                     .join(";");
-                let mut scoped_doc = Node::default();
-                scoped_doc.tag = "#document".into();
-                scoped_doc.children = vec![*root];
+                let mut scoped_doc = Node {
+                    tag: "#document".into(),
+                    children: vec![*root],
+                    ..Default::default()
+                };
                 scoped_doc.attrs.insert("style".into(), inherit);
                 let document = std::mem::replace(&mut doc.nodes[0], scoped_doc);
                 let shadow = std::mem::replace(&mut doc.nodes[*root], scoped_root);
@@ -1410,10 +1439,19 @@ pub(crate) fn styles(
         let node = &doc.nodes[id];
         let style = &result.values[id];
         let hidden = hidden || style.get("display").is_some_and(|value| value == "none");
-        let mode = if hidden || style.get("visibility").is_some_and(|v| matches!(v.as_str(), "hidden" | "collapse")) {
+        let mode = if hidden
+            || style
+                .get("visibility")
+                .is_some_and(|v| matches!(v.as_str(), "hidden" | "collapse"))
+        {
             render::UserSelect::None
         } else if matches!(node.tag.as_str(), "input" | "textarea")
-            || node.attrs.get("contenteditable").is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "" | "true" | "plaintext-only"))
+            || node.attrs.get("contenteditable").is_some_and(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "" | "true" | "plaintext-only"
+                )
+            })
         {
             render::UserSelect::Text
         } else {
@@ -1427,7 +1465,14 @@ pub(crate) fn styles(
         let selection = (mode, if mode == inherited.0 { inherited.1 } else { id });
         result.user_select[id] = selection;
         order.push(id);
-        pending.extend(result.children.get(&id).unwrap_or(&node.children).iter().map(|&child| (child, selection, hidden)));
+        pending.extend(
+            result
+                .children
+                .get(&id)
+                .unwrap_or(&node.children)
+                .iter()
+                .map(|&child| (child, selection, hidden)),
+        );
     }
     for id in order.into_iter().rev() {
         let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);

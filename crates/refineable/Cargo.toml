@@ -1,0 +1,17 @@
+[package]
+name = "refineable"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/refineable.rs"
+doctest = false
+test = false
+
+[dependencies]
+derive_refineable.workspace = true

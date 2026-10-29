@@ -729,6 +729,7 @@ pub(crate) fn intrinsic(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn layout(
     doc: &Document,
     id: usize,

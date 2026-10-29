@@ -946,6 +946,40 @@ impl Math<'_> {
     }
 }
 
+struct Keyframes;
+impl<'i> AtRuleParser<'i> for Keyframes {
+    type Prelude = ();
+    type AtRule = Vec<(f32, Declarations)>;
+    type Error = ();
+}
+impl<'i> QualifiedRuleParser<'i> for Keyframes {
+    type Prelude = Vec<f32>;
+    type QualifiedRule = Vec<(f32, Declarations)>;
+    type Error = ();
+    fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<Vec<f32>, ParseError<()>> {
+        input.parse_comma_separated(|input| match input.next()? {
+            Token::Ident(name) if name.eq_ignore_ascii_case("from") => Ok(0.),
+            Token::Ident(name) if name.eq_ignore_ascii_case("to") => Ok(1.),
+            Token::Percentage { unit_value, .. } if (0. ..=1.).contains(unit_value) => {
+                Ok(*unit_value)
+            }
+            _ => Err(ParseError::unexpected_token()),
+        })
+    }
+    fn parse_block(
+        &mut self,
+        offsets: Vec<f32>,
+        _: &ParserState,
+        input: &mut Parser<'i>,
+    ) -> Result<Vec<(f32, Declarations)>, ParseError<()>> {
+        let values = Declarations::parse_input(input);
+        Ok(offsets
+            .into_iter()
+            .map(|offset| (offset, values.clone()))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,39 +1385,5 @@ mod tests {
         ] {
             assert_eq!(supported(condition), expected, "{condition}");
         }
-    }
-}
-
-struct Keyframes;
-impl<'i> AtRuleParser<'i> for Keyframes {
-    type Prelude = ();
-    type AtRule = Vec<(f32, Declarations)>;
-    type Error = ();
-}
-impl<'i> QualifiedRuleParser<'i> for Keyframes {
-    type Prelude = Vec<f32>;
-    type QualifiedRule = Vec<(f32, Declarations)>;
-    type Error = ();
-    fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<Vec<f32>, ParseError<()>> {
-        input.parse_comma_separated(|input| match input.next()? {
-            Token::Ident(name) if name.eq_ignore_ascii_case("from") => Ok(0.),
-            Token::Ident(name) if name.eq_ignore_ascii_case("to") => Ok(1.),
-            Token::Percentage { unit_value, .. } if (0. ..=1.).contains(unit_value) => {
-                Ok(*unit_value)
-            }
-            _ => Err(ParseError::unexpected_token()),
-        })
-    }
-    fn parse_block(
-        &mut self,
-        offsets: Vec<f32>,
-        _: &ParserState,
-        input: &mut Parser<'i>,
-    ) -> Result<Vec<(f32, Declarations)>, ParseError<()>> {
-        let values = Declarations::parse_input(input);
-        Ok(offsets
-            .into_iter()
-            .map(|offset| (offset, values.clone()))
-            .collect())
     }
 }

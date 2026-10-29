@@ -128,10 +128,13 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
     source.len()
 }
 
+/// Match results and their dependencies, by selector address, node, scope and combinator flag.
+type Matches = HashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[(usize, u64)]>)>;
+
 #[derive(Default)]
 pub(crate) struct SelectorCache {
     nodes: Vec<(Node, [u64; 6])>,
-    values: HashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[(usize, u64)]>)>,
+    values: Matches,
     pub(crate) dependencies: Vec<(usize, u64)>,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<usize>)>,
@@ -1129,11 +1132,15 @@ pub struct Attrs(Vec<(String, String)>);
 
 impl Attrs {
     pub fn get(&self, name: &str) -> Option<&String> {
-        self.0.iter().find_map(|(key, value)| (key == name).then_some(value))
+        self.0
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut String> {
-        self.0.iter_mut().find_map(|(key, value)| (key == name).then_some(value))
+        self.0
+            .iter_mut()
+            .find_map(|(key, value)| (key == name).then_some(value))
     }
 
     pub fn contains_key(&self, name: &str) -> bool {
@@ -1224,10 +1231,16 @@ impl Document {
                         .map_or((body, rest.len()), |n| (&body[..n], n + 7))
                 } else {
                     let end = rest.find('>').unwrap_or(rest.len());
-                    (&rest[if rest.starts_with("<?") { 1 } else { 2 }..end], end + 1)
+                    (
+                        &rest[if rest.starts_with("<?") { 1 } else { 2 }..end],
+                        end + 1,
+                    )
                 };
                 pos += length.min(rest.len());
-                if !text.get(..7).is_some_and(|tag| tag.eq_ignore_ascii_case("doctype")) {
+                if !text
+                    .get(..7)
+                    .is_some_and(|tag| tag.eq_ignore_ascii_case("doctype"))
+                {
                     let (parent, id) = (stack.last().unwrap().0, doc.nodes.len());
                     doc.nodes[parent].children.push(id);
                     doc.nodes.push(Node {
