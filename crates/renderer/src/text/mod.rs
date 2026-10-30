@@ -334,6 +334,11 @@ impl TextSystem {
     }
 
     /// Adds font files. Cached layouts and font choices are dropped.
+    /// Advances whenever fonts are added.
+    pub(crate) fn generation(&self) -> usize {
+        self.shared.generation.get()
+    }
+
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform.add_fonts(fonts)?;
         self.fonts.borrow_mut().clear();

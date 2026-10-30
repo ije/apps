@@ -35,7 +35,9 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 
 ## Renderer
 
-`crates/render` (`apps-render`) is h2o's window system and GPU renderer. It started from [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), but keeps only what h2o needs: an element tree built each frame, taffy layout, text shaping, an atlas, and one renderer per platform.
+`crates/renderer` (`apps-renderer`) is h2o's window system and GPU renderer. It started from [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), but keeps only what h2o needs: an element tree built each frame over a retained taffy layout tree, text shaping, an atlas, and one renderer per platform.
+
+Layout nodes are kept across frames. A node keeps its identity (element id, or position in the nearest element with an id) and is reused while its style, children and measure inputs stay equal, so taffy's caches skip unchanged subtrees. Measured leaves (text) pass their inputs as a `PartialEq` state to `request_measured_layout` and paint from the state it returns.
 
 | Platform | Window | Renderer | Text |
 |---|---|---|---|

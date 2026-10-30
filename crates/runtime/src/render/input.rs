@@ -2,7 +2,7 @@ use super::{ViewData, WebView};
 use crate::style::Prop;
 use crate::{desktop::Desktop, style};
 use anyhow::{Context as _, Result, ensure};
-use render::{
+use renderer::{
     App, Bounds, FileDropEvent, Pixels, PlatformInput, Point, Utf16Selection, Window, point, px,
     size,
 };
@@ -95,8 +95,8 @@ impl ViewData {
     }
 }
 
-impl render::View for WebView {
-    fn render(&mut self, window: &mut Window, cx: &mut App) -> render::AnyElement {
+impl renderer::View for WebView {
+    fn render(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
         self.render_page(window, cx)
     }
 
@@ -357,10 +357,10 @@ impl render::View for WebView {
             }
             offset += line.encode_utf16().count() + 1;
         }
-        let run = render::TextRun {
+        let run = renderer::TextRun {
             len: selected.len(),
             font: face,
-            color: render::black(),
+            color: renderer::black(),
             ..Default::default()
         };
         let line = window

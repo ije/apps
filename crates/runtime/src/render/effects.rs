@@ -3,7 +3,7 @@ use crate::{
     dom::Document,
     style::{self, Lengths, Style, components, parser},
 };
-use render::{BlendMode, Bounds, Corners, PaintEffect, Pixels, Rgba, point, px};
+use renderer::{BlendMode, Bounds, Corners, PaintEffect, Pixels, Rgba, point, px};
 
 /// A 4x4 column-major matrix.
 pub(crate) type Matrix = [f32; 16];
@@ -444,7 +444,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                     .and_then(|value| style::color(value))
                     .unwrap_or((0, 255));
                 let opacity = numbers("flood-opacity").first().copied().unwrap_or(1.);
-                let mut ink: Rgba = render::rgba(color.0 << 8 | color.1 as u32);
+                let mut ink: Rgba = renderer::rgba(color.0 << 8 | color.1 as u32);
                 ink.a *= opacity;
                 effects.push(PaintEffect {
                     shadow: Some((
@@ -494,7 +494,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
         // `feOffset` after a blur of the alpha is the usual drop shadow recipe.
         let sigma = effects.remove(blur).blur;
         effects.push(PaintEffect {
-            shadow: Some((offset, sigma, render::black().opacity(0.5))),
+            shadow: Some((offset, sigma, renderer::black().opacity(0.5))),
             ..Default::default()
         });
     }
@@ -991,7 +991,7 @@ pub(crate) fn gradient_svg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use render::size;
+    use renderer::size;
 
     fn style(pairs: &[(&str, &str)]) -> Style {
         pairs

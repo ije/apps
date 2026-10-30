@@ -134,6 +134,12 @@ impl Nodes {
         self.list.iter_mut()
     }
 
+    /// Swaps in the children a frame lays out, like slotted shadow trees, and returns the old ones.
+    // WARNING: the revision stays, so the frame must put the old children back before it ends.
+    pub fn compose_children(&mut self, id: usize, children: Vec<usize>) -> Vec<usize> {
+        std::mem::replace(&mut self.list[id].children, children)
+    }
+
     /// The newest revision of any node, so it changes whenever a node does.
     pub fn latest(&self) -> u64 {
         self.latest

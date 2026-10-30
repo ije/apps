@@ -161,7 +161,7 @@ fn load() -> Result<Library> {
 #[derive(Default)]
 pub struct Gpu {
     raw: Option<(NonNull<c_void>, &'static Library)>,
-    images: HashMap<usize, Arc<render::RenderImage>>,
+    images: HashMap<usize, Arc<renderer::RenderImage>>,
 }
 
 impl Gpu {
@@ -204,7 +204,7 @@ impl Gpu {
             .is_some_and(|(raw, library)| unsafe { (library.presented)(raw.as_ptr()) })
     }
 
-    pub fn image(&mut self, node: usize) -> Result<Option<Arc<render::RenderImage>>> {
+    pub fn image(&mut self, node: usize) -> Result<Option<Arc<renderer::RenderImage>>> {
         let Some((raw, library)) = self.raw else {
             return Ok(None);
         };
@@ -227,7 +227,7 @@ impl Gpu {
             2 => {
                 let pixels = image::RgbaImage::from_raw(size[0], size[1], output.finish())
                     .context("Invalid canvas pixels")?;
-                let image = Arc::new(render::RenderImage::new(
+                let image = Arc::new(renderer::RenderImage::new(
                     pixels.width(),
                     pixels.height(),
                     pixels.into_raw(),

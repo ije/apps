@@ -131,7 +131,7 @@ q::after{content:close-quote}
 
 thread_local! {
     static UA_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(UA));
-    pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, HashMap<String, render::SharedString>)> = Default::default();
+    pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, HashMap<String, renderer::SharedString>)> = Default::default();
 }
 
 #[derive(Clone)]
@@ -1090,7 +1090,7 @@ pub(crate) fn compute_styles(
     doc: &Document,
     width: f32,
     height: f32,
-    text_system: Option<&render::TextSystem>,
+    text_system: Option<&renderer::TextSystem>,
     cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
     style_cache: &mut StyleCache,
     context: Option<&StyleContext>,
@@ -1119,7 +1119,7 @@ pub(crate) fn compute_styles(
 pub(crate) fn cascade(
     doc: &Document,
     [width, height]: [f32; 2],
-    text_system: Option<&render::TextSystem>,
+    text_system: Option<&renderer::TextSystem>,
     cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
     style_cache: &mut StyleCache,
     context: Option<&StyleContext>,
@@ -1856,7 +1856,7 @@ pub(crate) fn cascade(
             let font = font(&style);
             let metrics = font_metrics.entry(font.clone()).or_insert_with(|| {
                 let id = text.resolve_font(&font);
-                let size = render::px(1.);
+                let size = renderer::px(1.);
                 [
                     text.ch_advance(id, size).map(f32::from).unwrap_or(0.5),
                     f32::from(text.x_height(id, size)),

@@ -80,7 +80,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "apps-render"
+name = "apps-renderer"
 version = "0.0.0"
 dependencies = [
  "anyhow",
@@ -131,7 +131,7 @@ name = "apps-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "apps-render",
+ "apps-renderer",
  "apps-webgpu",
  "apps-webview",
  "avif-parse",

@@ -481,7 +481,7 @@ pub(crate) fn intrinsic(
     styles: &ComputedStyles,
     width: Option<f32>,
     height: Option<f32>,
-    text: &render::TextSystem,
+    text: &renderer::TextSystem,
     measured: &mut Measurements,
 ) -> [f32; 4] {
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
@@ -571,9 +571,9 @@ pub(crate) fn intrinsic(
         let lines = text
             .shape_text(
                 inline.text.to_string().into(),
-                render::px(units.font.em),
+                renderer::px(units.font.em),
                 &inline.runs,
-                available.filter(|_| wrap).map(render::px),
+                available.filter(|_| wrap).map(renderer::px),
                 None,
             )
             .unwrap_or_default();
@@ -740,7 +740,7 @@ pub(crate) fn layout(
     width: Option<f32>,
     height: Option<f32>,
     inherited: Option<&Grid>,
-    text: &render::TextSystem,
+    text: &renderer::TextSystem,
     measured: &mut Measurements,
 ) -> Grid {
     use Sizing::*;
@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn dense_packing_fills_holes_and_stays_bounded() {
-        let text = render::TextSystem::new();
+        let text = renderer::TextSystem::new();
         let place = |html: &str| {
             let mut doc = Document::parse(html);
             let mut state = crate::dom::State::default();

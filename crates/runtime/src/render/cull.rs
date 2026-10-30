@@ -1,6 +1,6 @@
 use crate::style::Prop;
 use crate::{dom::Document, style};
-use render::{AnyElement, prelude::*, px};
+use renderer::{AnyElement, prelude::*, px};
 use std::{collections::HashMap, rc::Rc};
 
 /// The subtree paints outside its box or keeps native state, so it is never replaced by a spacer.
@@ -45,7 +45,9 @@ pub(crate) struct Cull {
     /// The viewport size, scale and font loads of the last frame.
     pub(crate) frame: [f32; 4],
     /// The scroll offsets of the last frame, by scroll container, `0` for the page.
-    pub(crate) offsets: HashMap<usize, render::Point<render::Pixels>>,
+    pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
+    /// The nodes that are not hidden, built with `info`.
+    pub(crate) visible: Vec<bool>,
     /// The newest node revision, focus and styles that `info` was built from, without animated paint.
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
 }
@@ -59,7 +61,7 @@ pub(super) struct Zone {
 
 impl Zone {
     /// The visible vertical range in the window, from this frame's bounds of the clipping ancestors.
-    fn visible(&self, bounds: &crate::dom::LayoutMirror, window: &render::Window) -> [f32; 2] {
+    fn visible(&self, bounds: &crate::dom::LayoutMirror, window: &renderer::Window) -> [f32; 2] {
         self.clips.iter().filter_map(|clip| bounds.get(clip)).fold(
             [0., f32::from(window.viewport_size().height)],
             |[low, high], rect| [low.max(rect[1]), high.min(rect[1] + rect[3])],
@@ -416,7 +418,7 @@ pub(super) fn spacer(
         margins,
         watch,
     } = run;
-    render::canvas(
+    renderer::canvas(
         move |bounds, window| {
             let view = &*view;
             let mut host = view.host.borrow_mut();
@@ -470,7 +472,7 @@ pub(super) fn anchor(
     zone: Rc<Zone>,
     view: Rc<super::ViewData>,
 ) -> AnyElement {
-    render::canvas(
+    renderer::canvas(
         move |bounds, window| {
             let view = &*view;
             let mut host = view.host.borrow_mut();

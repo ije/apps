@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use render::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
+use renderer::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 
 pub(crate) struct View {
     pub(crate) handle: Option<WindowId>,
@@ -38,9 +38,9 @@ pub struct Desktop {
     pages: BBTreeMap<String, Document>,
     error: Option<anyhow::Error>,
     quit: bool,
-    wake: Option<(Instant, render::Timer)>,
+    wake: Option<(Instant, renderer::Timer)>,
     /// The waker of the running app, which async ops started before it ran use too.
-    waker: Arc<OnceLock<render::Waker>>,
+    waker: Arc<OnceLock<renderer::Waker>>,
     scheduled: bool,
 }
 
@@ -103,7 +103,7 @@ impl Desktop {
         root: std::path::PathBuf,
     ) -> Result<Self> {
         let api = Api::load()?;
-        let waker = Arc::new(OnceLock::<render::Waker>::new());
+        let waker = Arc::new(OnceLock::<renderer::Waker>::new());
         crate::host::Waker::install({
             let waker = waker.clone();
             move || {
@@ -277,7 +277,7 @@ impl Desktop {
                                     (options["alwaysOnTop"] == true, WindowChange::AlwaysOnTop(true)),
                                     (options["maximizable"] == false, WindowChange::Maximizable(false)),
                                     (options["closable"] == false, WindowChange::Closable(false)),
-                                    (true, WindowChange::Background(render::rgba((background.0 << 8) | background.1 as u32))),
+                                    (true, WindowChange::Background(renderer::rgba((background.0 << 8) | background.1 as u32))),
                                 ] {
                                     if apply {
                                         window.change_window(change);
@@ -566,7 +566,7 @@ impl Desktop {
                             (self.views[&id].handle, cx.as_deref_mut())
                         {
                             cx.update_window(handle, |window, _| {
-                                window.change_window(WindowChange::Background(render::rgba(
+                                window.change_window(WindowChange::Background(renderer::rgba(
                                     (color.0 << 8) | color.1 as u32,
                                 )));
                                 window.refresh();
@@ -591,7 +591,7 @@ impl Desktop {
                                     }
                                     "bounds" if cfg!(target_os = "macos") => {
                                         WindowChange::Frame(Bounds::new(
-                                            render::point(number(2), number(3)),
+                                            renderer::point(number(2), number(3)),
                                             size(number(4), number(5)),
                                         ))
                                     }
@@ -965,7 +965,7 @@ impl Desktop {
         }
         let runtime = Rc::new(RefCell::new(self));
         let result = runtime.clone();
-        render::run(move |cx| {
+        renderer::run(move |cx| {
             let reopen = runtime.clone();
             cx.on_reopen(move |cx, visible| {
                 if let Err(error) = reopen
@@ -1171,9 +1171,9 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
 }
 
 /// The window state that `BrowserWindow` caches, in screen points.
-fn window_state(window: &render::Window) -> serde_json::Value {
+fn window_state(window: &renderer::Window) -> serde_json::Value {
     let state = window.window_state();
-    let rect = |bounds: Bounds<render::Pixels>| {
+    let rect = |bounds: Bounds<renderer::Pixels>| {
         [
             bounds.origin.x,
             bounds.origin.y,

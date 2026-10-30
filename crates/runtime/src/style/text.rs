@@ -47,20 +47,20 @@ pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Opt
 #[derive(Clone)]
 pub(crate) struct InlineText {
     pub text: Rc<str>,
-    pub runs: Vec<render::TextRun>,
+    pub runs: Vec<renderer::TextRun>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub backgrounds: Vec<(usize, u32)>,
-    pub cursors: Vec<(usize, render::CursorStyle)>,
+    pub cursors: Vec<(usize, renderer::CursorStyle)>,
     pub shadows: Vec<(f32, f32, f32, u32)>,
-    pub first_line: Option<(render::TextRun, render::TextRun, Option<String>)>,
+    pub first_line: Option<(renderer::TextRun, renderer::TextRun, Option<String>)>,
 }
 
 pub(crate) fn restyle(
-    runs: &[render::TextRun],
+    runs: &[renderer::TextRun],
     range: std::ops::Range<usize>,
-    base: &render::TextRun,
-    pseudo: &render::TextRun,
-) -> Vec<render::TextRun> {
+    base: &renderer::TextRun,
+    pseudo: &renderer::TextRun,
+) -> Vec<renderer::TextRun> {
     let mut restyled = Vec::with_capacity(runs.len() + 2);
     let mut start = 0;
     for run in runs {
@@ -131,8 +131,8 @@ pub(crate) fn text_transform(text: &mut String, range: std::ops::Range<usize>, m
     text.replace_range(range, &mapped);
 }
 
-pub(crate) fn cursor(value: &str) -> Option<render::CursorStyle> {
-    use render::CursorStyle::*;
+pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
+    use renderer::CursorStyle::*;
     Some(match value {
         "default" => Arrow,
         "pointer" => PointingHand,
@@ -159,35 +159,35 @@ pub(crate) fn cursor(value: &str) -> Option<render::CursorStyle> {
     })
 }
 
-pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> render::TextRun {
+pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
     let (ink, alpha) = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
-    let ink: render::Rgba = render::rgba(ink << 8 | alpha as u32);
+    let ink: renderer::Rgba = renderer::rgba(ink << 8 | alpha as u32);
     let lines = style.get(Prop::TEXT_DECORATION_LINE).unwrap_or("");
     let decoration = style
         .get(Prop::TEXT_DECORATION_COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
         .and_then(color)
-        .map_or(ink, |(ink, alpha)| render::rgba(ink << 8 | alpha as u32));
+        .map_or(ink, |(ink, alpha)| renderer::rgba(ink << 8 | alpha as u32));
     let length = |prop: Prop| {
         style
             .get(prop)
             .and_then(|value| units.resolve(value, units.font.em))
-            .map(render::px)
+            .map(renderer::px)
     };
-    let thickness = length(Prop::TEXT_DECORATION_THICKNESS).unwrap_or(render::px(1.));
+    let thickness = length(Prop::TEXT_DECORATION_THICKNESS).unwrap_or(renderer::px(1.));
     let decoration_style = match style.get(Prop::TEXT_DECORATION_STYLE) {
-        Some("double") => render::DecorationStyle::Double,
-        Some("dotted") => render::DecorationStyle::Dotted,
-        Some("dashed") => render::DecorationStyle::Dashed,
-        Some("wavy") => render::DecorationStyle::Wavy,
-        _ => render::DecorationStyle::Solid,
+        Some("double") => renderer::DecorationStyle::Double,
+        Some("dotted") => renderer::DecorationStyle::Dotted,
+        Some("dashed") => renderer::DecorationStyle::Dashed,
+        Some("wavy") => renderer::DecorationStyle::Wavy,
+        _ => renderer::DecorationStyle::Solid,
     };
-    render::TextRun {
+    renderer::TextRun {
         len,
         font: font(style),
         color: ink,
         background_color: None,
-        underline: lines.contains("underline").then(|| render::UnderlineStyle {
+        underline: lines.contains("underline").then(|| renderer::UnderlineStyle {
             thickness,
             color: Some(decoration),
             style: decoration_style,
@@ -195,7 +195,7 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> render::Te
         }),
         strikethrough: lines
             .contains("line-through")
-            .then_some(render::StrikethroughStyle {
+            .then_some(renderer::StrikethroughStyle {
                 thickness,
                 color: Some(decoration),
                 style: decoration_style,
@@ -207,8 +207,8 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> render::Te
 }
 
 /// A CSS `letter-spacing` or `word-spacing` value.
-pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> render::Pixels {
-    render::px(
+pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::Pixels {
+    renderer::px(
         style
             .get(prop)
             .filter(|value| *value != "normal")
@@ -258,7 +258,7 @@ pub(crate) fn inline_text(
     };
     let trailing = inline_sibling(siblings.get(position + 1));
     let mut text = String::new();
-    let mut runs: Vec<render::TextRun> = Vec::new();
+    let mut runs: Vec<renderer::TextRun> = Vec::new();
     let mut ranges = Vec::new();
     let mut backgrounds = Vec::new();
     let mut cursors = Vec::new();
@@ -455,7 +455,7 @@ pub(crate) fn inline_text(
                 let mut run = text_run(style, &styles.lengths[child], text.len() - start);
                 let size = styles.lengths[child].font.em;
                 if (size - styles.lengths[id].font.em).abs() > 0.01 {
-                    run.font_size = Some(render::px(size));
+                    run.font_size = Some(renderer::px(size));
                 }
                 runs.push(run);
             }
@@ -494,12 +494,12 @@ pub(crate) fn inline_text(
             .get(Prop::FONT_SIZE)
             .and_then(|value| units.resolve(value, units.font.em))
             .filter(|size| (size - units.font.em).abs() > 0.01)
-            .map(render::px);
+            .map(renderer::px);
         run.background_color = style
             .get(Prop::BACKGROUND_COLOR)
             .and_then(color)
             .filter(|(_, alpha)| *alpha != 0)
-            .map(|(ink, alpha)| render::rgba(ink << 8 | alpha as u32));
+            .map(|(ink, alpha)| renderer::rgba(ink << 8 | alpha as u32));
         run
     };
     let pseudos = styles.text_pseudos.get(&id).filter(|_| {
@@ -579,14 +579,14 @@ pub(crate) fn inline_text(
     })
 }
 
-pub(crate) fn font(style: &Style) -> render::Font {
+pub(crate) fn font(style: &Style) -> renderer::Font {
     let families = style.get(Prop::FONT_FAMILY).unwrap_or("system-ui");
     let family = FONT_NAMES.with(|names| {
         let mut names = names.borrow_mut();
         if let Some(family) = names.1.get(families) {
             return family.clone();
         }
-        let family: render::SharedString = components(families, ',')
+        let family: renderer::SharedString = components(families, ',')
             .into_iter()
             .find_map(|family| {
                 let family = family.trim().trim_matches(['\'', '"']);
@@ -639,7 +639,7 @@ pub(crate) fn font(style: &Style) -> render::Font {
         }
         family
     });
-    let mut font = render::font(family);
+    let mut font = renderer::font(family);
     let weight = match style.get(Prop::FONT_WEIGHT) {
         Some("bold") => 700.,
         Some(value) => value
@@ -649,11 +649,11 @@ pub(crate) fn font(style: &Style) -> render::Font {
             .unwrap_or(400.),
         None => 400.,
     };
-    font.weight = render::FontWeight(weight.clamp(1., 1000.));
+    font.weight = renderer::FontWeight(weight.clamp(1., 1000.));
     font.style = match style.get(Prop::FONT_STYLE) {
-        Some("italic") => render::FontStyle::Italic,
-        Some(value) if value.starts_with("oblique") => render::FontStyle::Oblique,
-        _ => render::FontStyle::Normal,
+        Some("italic") => renderer::FontStyle::Italic,
+        Some(value) if value.starts_with("oblique") => renderer::FontStyle::Oblique,
+        _ => renderer::FontStyle::Normal,
     };
     font
 }

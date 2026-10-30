@@ -12,7 +12,7 @@ use crate::{
     dom::Document,
     style::{self, ComputedStyles},
 };
-use render::{
+use renderer::{
     AnyElement, Bounds, MouseButton, SharedString, div, img, point, prelude::*, px, relative, rgba,
     size,
 };
@@ -21,7 +21,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 pub(super) struct Build<'a> {
     pub(super) doc: &'a Document,
     pub(super) styles: &'a ComputedStyles,
-    pub(super) text: &'a render::TextSystem,
+    pub(super) text: &'a renderer::TextSystem,
     pub(super) pixel_ratio: f32,
     pub(super) view: &'a Rc<ViewData>,
     pub(super) layers: PaintLayers,
@@ -221,7 +221,7 @@ pub(super) fn element(
             .and_then(|value| units.resolve(value, containing[0]))
             .unwrap_or(0.)));
     }
-    if face.style != render::FontStyle::Normal {
+    if face.style != renderer::FontStyle::Normal {
         el.text_style().font_style = Some(face.style);
     }
     if node.tag == "br" {
@@ -261,8 +261,8 @@ pub(super) fn element(
     };
     let all_inline = flow && !flat.is_empty() && flat.iter().all(|&child| inline_level(child));
     let line_justify = match style.get(Prop::TEXT_ALIGN) {
-        Some("right" | "end") => Some(render::JustifyContent::End),
-        Some("center" | "-webkit-center") => Some(render::JustifyContent::Center),
+        Some("right" | "end") => Some(renderer::JustifyContent::End),
+        Some("center" | "-webkit-center") => Some(renderer::JustifyContent::Center),
         _ => None,
     };
     let line_align = Some(
@@ -271,9 +271,9 @@ pub(super) fn element(
                 .get(Prop::VERTICAL_ALIGN)
                 .is_some_and(|value| value == "middle")
         }) {
-            render::AlignItems::Center
+            renderer::AlignItems::Center
         } else {
-            render::AlignItems::Baseline
+            renderer::AlignItems::Baseline
         },
     );
     if all_inline || display == "inline" {
@@ -355,14 +355,14 @@ pub(super) fn element(
                 el = el.h(px(height));
             }
             let fit = match style.get(Prop::OBJECT_FIT) {
-                Some("contain") => render::ObjectFit::Contain,
-                Some("cover") => render::ObjectFit::Cover,
-                Some("none") => render::ObjectFit::None,
-                Some("scale-down") => render::ObjectFit::ScaleDown,
-                _ => render::ObjectFit::Fill,
+                Some("contain") => renderer::ObjectFit::Contain,
+                Some("cover") => renderer::ObjectFit::Cover,
+                Some("none") => renderer::ObjectFit::None,
+                Some("scale-down") => renderer::ObjectFit::ScaleDown,
+                _ => renderer::ObjectFit::Fill,
             };
             if let Some(image) = image {
-                if matches!(fit, render::ObjectFit::Cover | render::ObjectFit::None) {
+                if matches!(fit, renderer::ObjectFit::Cover | renderer::ObjectFit::None) {
                     cropped = Some((image, fit));
                 } else {
                     image_child = Some(img(image).size_full().object_fit(fit));
@@ -575,7 +575,7 @@ pub(super) fn element(
             .get(Prop::COLOR)
             .and_then(style::color)
             .map(|(c, a)| rgba((c << 8) | a as u32))
-            .unwrap_or(render::black());
+            .unwrap_or(renderer::black());
         let caret_color = style
             .get(Prop::CARET_COLOR)
             .filter(|value| !matches!(*value, "auto" | "currentColor"))
@@ -593,8 +593,8 @@ pub(super) fn element(
         // The text is drawn in the content box.
         let padding = units.edges(style, style::PADDING, containing[0]);
         let entity = view.clone();
-        el = el.cursor(render::CursorStyle::IBeam).child(
-            render::canvas(
+        el = el.cursor(renderer::CursorStyle::IBeam).child(
+            renderer::canvas(
                 |_, _| (),
                 move |bounds, _, window| {
                     let view = &*entity;
@@ -615,15 +615,15 @@ pub(super) fn element(
                     };
                     let mut offset = 0;
                     for (row, text) in shown.split('\n').enumerate() {
-                        let run = render::TextRun {
+                        let run = renderer::TextRun {
                             len: text.len(),
                             font: face.clone(),
                             color,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
-                            letter_spacing: render::px(0.),
-                            word_spacing: render::px(0.),
+                            letter_spacing: renderer::px(0.),
+                            word_spacing: renderer::px(0.),
                             font_size: None,
                         };
                         let line = window.text_system().shape_line(
@@ -657,7 +657,7 @@ pub(super) fn element(
                             let x = line.x_for_index(left);
                             let end_x = line.x_for_index(right);
                             if start == end {
-                                window.paint_quad(render::fill(
+                                window.paint_quad(renderer::fill(
                                     Bounds::new(
                                         point(bounds.left() + x, top),
                                         size(px(1.), px(line_height)),
@@ -676,7 +676,7 @@ pub(super) fn element(
                             line.paint(
                                 point(bounds.left(), top),
                                 px(line_height),
-                                render::TextAlign::Left,
+                                renderer::TextAlign::Left,
                                 None,
                                 window,
                             );
@@ -742,7 +742,7 @@ pub(super) fn element(
                 .and_then(|value| units.resolve(value, containing[0]))
                 .unwrap_or(0.));
             el = el.child(
-                render::canvas(
+                renderer::canvas(
                     |_, _| (),
                     move |bounds, _, window| {
                         let step = line_height.max(px(1.));
@@ -751,7 +751,7 @@ pub(super) fn element(
                         top += step * ((mask.top() - top - height) / step).floor().max(0.);
                         while top < bounds.bottom().min(mask.bottom()) {
                             window.paint_quad(
-                                render::fill(
+                                renderer::fill(
                                     Bounds::new(
                                         point(bounds.left(), top),
                                         size(bounds.size.width, height),
@@ -781,18 +781,18 @@ pub(super) fn element(
             .iter()
             .any(|value| !matches!(*value, "visible" | "clip"));
     let overflow = overflow.map(|value| match value {
-        "auto" | "scroll" => render::Overflow::Scroll,
-        "hidden" => render::Overflow::Hidden,
-        "clip" if boxed => render::Overflow::Hidden,
-        "clip" => render::Overflow::Clip,
-        _ if boxed => render::Overflow::Scroll,
-        _ => render::Overflow::Visible,
+        "auto" | "scroll" => renderer::Overflow::Scroll,
+        "hidden" => renderer::Overflow::Hidden,
+        "clip" if boxed => renderer::Overflow::Hidden,
+        "clip" => renderer::Overflow::Clip,
+        _ if boxed => renderer::Overflow::Scroll,
+        _ => renderer::Overflow::Visible,
     });
-    if overflow != [render::Overflow::Visible; 2] {
+    if overflow != [renderer::Overflow::Visible; 2] {
         el.style().overflow.x = overflow[0];
         el.style().overflow.y = overflow[1];
     }
-    let scrolls = overflow.map(|axis| axis == render::Overflow::Scroll);
+    let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
     let look = if scrolls.contains(&true) {
         scrollbar::Look::new(
             style,
@@ -820,7 +820,7 @@ pub(super) fn element(
             .dom
             .get(&view.id)
             .and_then(|dom| dom.scroll.get(&id))
-            .map(render::ScrollHandle::max_offset)
+            .map(renderer::ScrollHandle::max_offset)
             .unwrap_or_default();
         look.space(look.shown(scrolls, max))
     });
@@ -903,7 +903,7 @@ pub(super) fn element(
         {
             el = el.border_color(border_colors[first]);
         } else {
-            el = el.border_color(render::transparent_black());
+            el = el.border_color(renderer::transparent_black());
         }
         if visible
             .iter()
@@ -914,7 +914,7 @@ pub(super) fn element(
             .iter()
             .any(|&side| matches!(border_kinds[side], "dashed" | "dotted"))
         {
-            el.style().border_style = render::BorderStyle::Dashed;
+            el.style().border_style = renderer::BorderStyle::Dashed;
         }
     }
     let extra = if style
@@ -960,10 +960,10 @@ pub(super) fn element(
                 shown
                     .split('\n')
                     .map(|line| {
-                        let run = render::TextRun {
+                        let run = renderer::TextRun {
                             len: line.len(),
                             font: face.clone(),
-                            color: render::black(),
+                            color: renderer::black(),
                             background_color: None,
                             underline: None,
                             strikethrough: None,
@@ -1041,7 +1041,7 @@ pub(super) fn element(
             | Prop::MIN_HEIGHT
             | Prop::MAX_HEIGHT => {
                 let axis = usize::from(vertical);
-                let length: render::Length = if let Some(percent) = value
+                let length: renderer::Length = if let Some(percent) = value
                     .strip_suffix('%')
                     .and_then(|s| s.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
@@ -1054,7 +1054,7 @@ pub(super) fn element(
                 } else if let Some(length) = length() {
                     px(length.max(0.) + extra[axis]).into()
                 } else if matches!(prop, Prop::WIDTH | Prop::HEIGHT) && value == "auto" {
-                    render::Length::Auto
+                    renderer::Length::Auto
                 } else if matches!(value, "stretch" | "-webkit-fill-available") {
                     relative(1.)
                 } else if matches!(value, "fit-content" | "max-content" | "min-content")
@@ -1143,17 +1143,17 @@ pub(super) fn element(
             Prop::DISPLAY if matches!(value, "flex" | "inline-flex") => el = el.flex().flex_row(),
             Prop::FLEX_DIRECTION if flexbox => {
                 el.style().flex_direction = match value {
-                    "row-reverse" => render::FlexDirection::RowReverse,
-                    "column" => render::FlexDirection::Column,
-                    "column-reverse" => render::FlexDirection::ColumnReverse,
-                    _ => render::FlexDirection::Row,
+                    "row-reverse" => renderer::FlexDirection::RowReverse,
+                    "column" => renderer::FlexDirection::Column,
+                    "column-reverse" => renderer::FlexDirection::ColumnReverse,
+                    _ => renderer::FlexDirection::Row,
                 }
             }
             Prop::FLEX_WRAP if flexbox => {
                 el.style().flex_wrap = match value {
-                    "wrap" => render::FlexWrap::Wrap,
-                    "wrap-reverse" => render::FlexWrap::WrapReverse,
-                    _ => render::FlexWrap::NoWrap,
+                    "wrap" => renderer::FlexWrap::Wrap,
+                    "wrap-reverse" => renderer::FlexWrap::WrapReverse,
+                    _ => renderer::FlexWrap::NoWrap,
                 }
             }
             Prop::FLEX_GROW | Prop::FLEX_SHRINK => {
@@ -1185,16 +1185,18 @@ pub(super) fn element(
                     });
                     px(length.max(0.) + extra[usize::from(column)]).into()
                 } else {
-                    render::Length::Auto
+                    renderer::Length::Auto
                 };
             }
             Prop::ALIGN_ITEMS | Prop::ALIGN_SELF if flex_parent || flexbox => {
                 let align = match value {
-                    "center" => render::AlignItems::Center,
-                    "flex-start" | "start" | "self-start" => render::AlignItems::FlexStart,
-                    "flex-end" | "end" | "self-end" => render::AlignItems::FlexEnd,
-                    "baseline" | "first baseline" | "last baseline" => render::AlignItems::Baseline,
-                    "stretch" | "normal" => render::AlignItems::Stretch,
+                    "center" => renderer::AlignItems::Center,
+                    "flex-start" | "start" | "self-start" => renderer::AlignItems::FlexStart,
+                    "flex-end" | "end" | "self-end" => renderer::AlignItems::FlexEnd,
+                    "baseline" | "first baseline" | "last baseline" => {
+                        renderer::AlignItems::Baseline
+                    }
+                    "stretch" | "normal" => renderer::AlignItems::Stretch,
                     _ => continue,
                 };
                 if prop == Prop::ALIGN_SELF {
@@ -1205,13 +1207,13 @@ pub(super) fn element(
             }
             Prop::ALIGN_CONTENT | Prop::JUSTIFY_CONTENT if flexbox => {
                 let align = match value {
-                    "center" => render::AlignContent::Center,
-                    "flex-end" | "end" | "right" => render::AlignContent::FlexEnd,
-                    "space-between" => render::AlignContent::SpaceBetween,
-                    "space-around" => render::AlignContent::SpaceAround,
-                    "space-evenly" => render::AlignContent::SpaceEvenly,
-                    "stretch" => render::AlignContent::Stretch,
-                    _ => render::AlignContent::FlexStart,
+                    "center" => renderer::AlignContent::Center,
+                    "flex-end" | "end" | "right" => renderer::AlignContent::FlexEnd,
+                    "space-between" => renderer::AlignContent::SpaceBetween,
+                    "space-around" => renderer::AlignContent::SpaceAround,
+                    "space-evenly" => renderer::AlignContent::SpaceEvenly,
+                    "stretch" => renderer::AlignContent::Stretch,
+                    _ => renderer::AlignContent::FlexStart,
                 };
                 if prop == Prop::JUSTIFY_CONTENT {
                     el.style().justify_content = Some(align);
@@ -1230,7 +1232,7 @@ pub(super) fn element(
             Prop::LEFT | Prop::RIGHT | Prop::TOP | Prop::BOTTOM
                 if matches!(position, "relative" | "absolute") =>
             {
-                let length: render::Length = if let Some(percent) = value
+                let length: renderer::Length = if let Some(percent) = value
                     .strip_suffix('%')
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
@@ -1250,9 +1252,9 @@ pub(super) fn element(
             }
             Prop::VISIBILITY => {
                 el.style().visibility = if value == "hidden" || value == "collapse" {
-                    render::Visibility::Hidden
+                    renderer::Visibility::Hidden
                 } else {
-                    render::Visibility::Visible
+                    renderer::Visibility::Visible
                 }
             }
             Prop::OPACITY if effect_layer.is_none() => el = el.opacity(opacity),
@@ -1264,11 +1266,11 @@ pub(super) fn element(
             }
             Prop::TEXT_WRAP => {
                 el.text_style().text_wrap = Some(if value.contains("balance") {
-                    render::TextWrap::Balance
+                    renderer::TextWrap::Balance
                 } else if value.contains("pretty") {
-                    render::TextWrap::Pretty
+                    renderer::TextWrap::Pretty
                 } else {
-                    render::TextWrap::Wrap
+                    renderer::TextWrap::Wrap
                 })
             }
             Prop::CURSOR => {
@@ -1287,9 +1289,9 @@ pub(super) fn element(
     {
         let align = style.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
         el.style().align_self = match align {
-            "middle" => Some(render::AlignItems::Center),
-            "top" | "text-top" => Some(render::AlignItems::FlexStart),
-            "bottom" => Some(render::AlignItems::FlexEnd),
+            "middle" => Some(renderer::AlignItems::Center),
+            "top" | "text-top" => Some(renderer::AlignItems::FlexStart),
+            "bottom" => Some(renderer::AlignItems::FlexEnd),
             _ => None,
         };
         let below = |style: &style::Style, font: style::FontUnits| {
@@ -1406,7 +1408,7 @@ pub(super) fn element(
             let view = view.clone();
             // WARNING: the renderer rounds the fitted image bounds, so overflowing fits paint a cached crop of the visible part.
             el = el.child(
-                render::canvas(
+                renderer::canvas(
                     |_, _| (),
                     move |bounds, _, window| {
                         let natural = image.size();
@@ -1468,7 +1470,7 @@ pub(super) fn element(
                                             ])
                                         },
                                     );
-                                    let shown = Arc::new(render::RenderImage::new(
+                                    let shown = Arc::new(renderer::RenderImage::new(
                                         pixels.width(),
                                         pixels.height(),
                                         pixels.into_raw(),
@@ -1483,7 +1485,7 @@ pub(super) fn element(
                             }
                         };
                         if let Some(shown) = shown {
-                            let corners = render::Corners {
+                            let corners = renderer::Corners {
                                 top_left: px(corners[0]),
                                 top_right: px(corners[1]),
                                 bottom_right: px(corners[2]),
@@ -1509,12 +1511,12 @@ pub(super) fn element(
                 && style
                     .get(Prop::WHITE_SPACE)
                     .is_some_and(|value| matches!(value, "nowrap" | "pre"))
-                && el.style().overflow.x != render::Overflow::Visible)
+                && el.style().overflow.x != renderer::Overflow::Visible)
                 .then_some(1)
         })
     {
         let text = el.text_style();
-        text.white_space = Some(render::WhiteSpace::Normal);
+        text.white_space = Some(renderer::WhiteSpace::Normal);
         text.line_clamp = Some(lines.max(1));
         text.text_overflow = Some("…".into());
     }
@@ -1582,10 +1584,10 @@ pub(super) fn element(
             .any(|&side| border_colors[side] != border_colors[visible[0]])
     {
         // Each side is painted alone; 3D styles shade it, and groove and ridge split it in two halves.
-        let mut bands = vec![([0.; 4], borders, [render::transparent_black(); 4])];
+        let mut bands = vec![([0.; 4], borders, [renderer::transparent_black(); 4])];
         let split = (0..4).any(|side| matches!(border_kinds[side], "groove" | "ridge"));
         if split {
-            bands.push(([0.; 4], [0.; 4], [render::transparent_black(); 4]));
+            bands.push(([0.; 4], [0.; 4], [renderer::transparent_black(); 4]));
         }
         for side in 0..4 {
             let color = border_colors[side];
@@ -1623,7 +1625,7 @@ pub(super) fn element(
         }
         let kinds = border_kinds.map(border_style);
         el = el.child(
-            render::canvas(
+            renderer::canvas(
                 |_, _| (),
                 move |bounds, _, window| {
                     let outer = Bounds::new(
@@ -1644,7 +1646,7 @@ pub(super) fn element(
                         let shrink = |corner: usize, a: usize, b: usize| {
                             px((radius[corner] - inset[a].max(inset[b])).max(0.))
                         };
-                        let corners = render::Corners {
+                        let corners = renderer::Corners {
                             top_left: shrink(0, 0, 3),
                             top_right: shrink(1, 0, 1),
                             bottom_right: shrink(2, 2, 1),
@@ -1657,11 +1659,11 @@ pub(super) fn element(
                             }
                             let mut edges = [px(0.); 4];
                             edges[side] = px(widths[side]);
-                            window.paint_quad(render::quad(
+                            window.paint_quad(renderer::quad(
                                 bounds,
                                 corners,
-                                render::transparent_black(),
-                                render::Edges {
+                                renderer::transparent_black(),
+                                renderer::Edges {
                                     top: edges[0],
                                     right: edges[1],
                                     bottom: edges[2],
@@ -1711,7 +1713,7 @@ pub(super) fn element(
         let scroll = &mut host.dom.entry(view.id).or_default().scroll;
         if scrolls.contains(&true) {
             Some(scroll.entry(id).or_default().clone())
-        } else if overflow.contains(&render::Overflow::Hidden) {
+        } else if overflow.contains(&renderer::Overflow::Hidden) {
             scroll.get(&id).cloned()
         } else {
             None
@@ -2026,7 +2028,7 @@ pub(super) fn element(
                     Prop::HEIGHT | Prop::MIN_HEIGHT | Prop::MAX_HEIGHT | Prop::TOP | Prop::BOTTOM
                 );
                 let base = containing[usize::from(vertical)];
-                let length = || -> Option<render::Length> {
+                let length = || -> Option<renderer::Length> {
                     match value
                         .strip_suffix('%')
                         .and_then(|v| v.parse::<f32>().ok())
@@ -2191,7 +2193,7 @@ pub(super) fn element(
         && styles.user_select[id].0 != style::UserSelect::None
         && style.get(Prop::CURSOR).is_none_or(|value| value == "auto")
     {
-        el = el.cursor(render::CursorStyle::IBeam);
+        el = el.cursor(renderer::CursorStyle::IBeam);
     }
     if let Some(data) = inline {
         if style
@@ -2220,7 +2222,7 @@ pub(super) fn element(
                 .containers
                 .insert(id, size);
         }
-        let inner = render::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
+        let inner = renderer::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
         el = el.child(
             div()
                 .min_w(px(0.))
@@ -2532,7 +2534,7 @@ pub(super) fn element(
             })
         };
         let multicol = columns(style, &units, content[0]);
-        let mut line: Option<render::Div> = None;
+        let mut line: Option<renderer::Div> = None;
         let mut floating = Vec::new();
         // Floats and the content after them, until a `clear`, share a row: left floats, the
         // content, then right floats. Text does not flow under a float that ends early.
@@ -2863,7 +2865,7 @@ pub(super) fn element(
                         .get(Prop::DISPLAY)
                         .is_some_and(|value| !value.starts_with("inline"));
                     let entity = view.clone();
-                    let mut placeholder = render::canvas(
+                    let mut placeholder = renderer::canvas(
                         move |bounds, _| {
                             let view = &*entity;
                             view.host
@@ -2891,7 +2893,7 @@ pub(super) fn element(
                             0.
                         },
                     ));
-                    placeholder.style().align_self = Some(render::AlignSelf::FlexStart);
+                    placeholder.style().align_self = Some(renderer::AlignSelf::FlexStart);
                     match line.take() {
                         Some(open) => line = Some(open.child(placeholder)),
                         None if all_inline || block => place!(placeholder, None),
@@ -2978,8 +2980,8 @@ pub(super) fn element(
     }
     if slot.is_some() && flow && matches!(node.tag.as_str(), "td" | "th") {
         let align = match style.get(Prop::VERTICAL_ALIGN) {
-            Some("middle") => Some(render::AlignContent::Center),
-            Some("bottom") => Some(render::AlignContent::FlexEnd),
+            Some("middle") => Some(renderer::AlignContent::Center),
+            Some("bottom") => Some(renderer::AlignContent::FlexEnd),
             _ => None,
         };
         if all_inline {
@@ -3003,10 +3005,10 @@ pub(super) fn element(
     // WARNING: Windows moves the window in the native hit test (`window_control_area`), macOS and Linux on the first drag.
     if drag {
         el = el
-            .window_control_area(render::WindowControlArea::Drag)
+            .window_control_area(renderer::WindowControlArea::Drag)
             .on_mouse_down(MouseButton::Left, {
                 let view = view.clone();
-                move |event: &render::MouseDownEvent, window, cx| {
+                move |event: &renderer::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     if event.click_count != 2 {
                         view.moving.set(true);
@@ -3022,7 +3024,7 @@ pub(super) fn element(
         .is_none_or(|value| value != "none")
     {
         let view = view.clone();
-        el = el.on_mouse_down(MouseButton::Left, move |event: &render::MouseDownEvent, _, cx| {
+        el = el.on_mouse_down(MouseButton::Left, move |event: &renderer::MouseDownEvent, _, cx| {
             cx.stop_propagation();
             Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", if hit_test { &[] } else { std::slice::from_ref(&id) }, serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":0,"buttons":1,"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), cx);
         });
@@ -3079,7 +3081,7 @@ pub(super) fn element(
         el
     } else {
         let view = view.clone();
-        el.on_click(move |event: &render::ClickEvent, window, cx| {
+        el.on_click(move |event: &renderer::ClickEvent, window, cx| {
             cx.stop_propagation();
             let runtime = view.runtime.clone();
             let result = {
@@ -3391,7 +3393,7 @@ fn float_side(style: &style::Style) -> Option<bool> {
 }
 
 /// The width, color and style of a column rule.
-type ColumnRule = (f32, render::Rgba, render::BorderStyle);
+type ColumnRule = (f32, renderer::Rgba, renderer::BorderStyle);
 
 /// The column count, gap and rule of a multi-column box with the given content width.
 fn columns(
@@ -3465,7 +3467,7 @@ fn columns(
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))
                 .and_then(style::color)
-                .map_or(render::black(), |(ink, alpha)| {
+                .map_or(renderer::black(), |(ink, alpha)| {
                     rgba(ink << 8 | alpha as u32)
                 });
             (width, color, border_style(kind))
@@ -3479,20 +3481,20 @@ fn column_rules(
     count: usize,
     gap: f32,
     width: f32,
-    color: render::Rgba,
-    kind: render::BorderStyle,
+    color: renderer::Rgba,
+    kind: renderer::BorderStyle,
 ) -> AnyElement {
-    render::canvas(
+    renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
             let column = (f32::from(bounds.size.width) - gap * (count - 1) as f32) / count as f32;
             for index in 1..count {
                 let x = bounds.left() + px(index as f32 * (column + gap) - gap / 2. - width / 2.);
-                window.paint_quad(render::quad(
+                window.paint_quad(renderer::quad(
                     Bounds::new(point(x, bounds.top()), size(px(width), bounds.size.height)),
-                    render::Corners::default(),
-                    render::transparent_black(),
-                    render::Edges {
+                    renderer::Corners::default(),
+                    renderer::transparent_black(),
+                    renderer::Edges {
                         left: px(width),
                         ..Default::default()
                     },
@@ -3509,24 +3511,24 @@ fn column_rules(
     .into_any_element()
 }
 
-fn border_style(kind: &str) -> render::BorderStyle {
+fn border_style(kind: &str) -> renderer::BorderStyle {
     match kind {
-        "dashed" => render::BorderStyle::Dashed,
-        "dotted" => render::BorderStyle::Dotted,
-        "double" => render::BorderStyle::Double,
-        _ => render::BorderStyle::Solid,
+        "dashed" => renderer::BorderStyle::Dashed,
+        "dotted" => renderer::BorderStyle::Dotted,
+        "double" => renderer::BorderStyle::Double,
+        _ => renderer::BorderStyle::Solid,
     }
 }
 
 /// The darker or lighter shade of a 3D border, like WebKit.
-fn shade_border(color: render::Rgba, dark: bool) -> render::Rgba {
+fn shade_border(color: renderer::Rgba, dark: bool) -> renderer::Rgba {
     let rgba = color;
     let value = rgba.r.max(rgba.g).max(rgba.b);
     let factor = if value <= 0. {
         return if dark {
             color
         } else {
-            render::Rgba {
+            renderer::Rgba {
                 r: 0.33,
                 g: 0.33,
                 b: 0.33,
@@ -3538,7 +3540,7 @@ fn shade_border(color: render::Rgba, dark: bool) -> render::Rgba {
     } else {
         (value + 0.33).min(1.) / value
     };
-    render::Rgba {
+    renderer::Rgba {
         r: (rgba.r * factor).min(1.),
         g: (rgba.g * factor).min(1.),
         b: (rgba.b * factor).min(1.),
@@ -3547,7 +3549,7 @@ fn shade_border(color: render::Rgba, dark: bool) -> render::Rgba {
 }
 
 fn inset_shadows(
-    shadows: Vec<render::BoxShadow>,
+    shadows: Vec<renderer::BoxShadow>,
     radius: [f32; 4],
     borders: [f32; 4],
 ) -> AnyElement {
@@ -3559,7 +3561,7 @@ fn inset_shadows(
         inner(2, 2, 1),
         inner(3, 2, 3),
     ]);
-    render::canvas(
+    renderer::canvas(
         |_, _| (),
         move |bounds, _, window| window.paint_inset_shadows(bounds, radii, &shadows),
     )
@@ -3572,7 +3574,7 @@ fn inset_shadows(
 
 /// Paints the inline `<svg>` or the SVG `<img>` source of a node, rasterized at the box size.
 fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
-    render::canvas(
+    renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
             let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
@@ -3611,7 +3613,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
             let image = state.svgs.get(&id).map(|(_, image)| image.clone());
             drop(host);
             if let Some(image) = image {
-                window.paint_image(bounds, bounds, render::Corners::default(), image, false);
+                window.paint_image(bounds, bounds, renderer::Corners::default(), image, false);
             }
         },
     )

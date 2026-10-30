@@ -318,7 +318,7 @@ pub(crate) struct Motion {
     /// The last animated style of each node, with its base style and animated values.
     styled: HashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
     /// The timer that wakes the view for the next animation change.
-    pub wake: Option<(Instant, render::Timer)>,
+    pub wake: Option<(Instant, renderer::Timer)>,
 }
 
 impl Motion {

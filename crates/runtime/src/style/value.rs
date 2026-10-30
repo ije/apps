@@ -134,7 +134,7 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
 }
 
 impl Lengths {
-    pub fn shadows(&self, value: &str, inset: bool) -> Vec<render::BoxShadow> {
+    pub fn shadows(&self, value: &str, inset: bool) -> Vec<renderer::BoxShadow> {
         let mut shadows = Vec::new();
         if value == "none" {
             return shadows;
@@ -158,12 +158,12 @@ impl Lengths {
             if !(2..=4).contains(&lengths.len()) {
                 return Vec::new();
             }
-            shadows.push(render::BoxShadow {
-                color: render::rgba((ink.0 << 8) | u32::from(ink.1)),
-                offset: render::point(render::px(lengths[0]), render::px(lengths[1])),
+            shadows.push(renderer::BoxShadow {
+                color: renderer::rgba((ink.0 << 8) | u32::from(ink.1)),
+                offset: renderer::point(renderer::px(lengths[0]), renderer::px(lengths[1])),
                 // WARNING: the renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
-                blur_radius: render::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
-                spread_radius: render::px(lengths.get(3).copied().unwrap_or(0.)),
+                blur_radius: renderer::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
+                spread_radius: renderer::px(lengths.get(3).copied().unwrap_or(0.)),
                 inset,
             });
         }
@@ -175,10 +175,10 @@ impl Lengths {
 pub(crate) struct Filter(pub [[f32; 4]; 3]);
 
 impl Filter {
-    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32, Vec<render::BoxShadow>) {
+    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32, Vec<renderer::BoxShadow>) {
         let identity = Self([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
         let (mut matrix, mut opacity, mut shadows) =
-            (identity, 1f32, Vec::<render::BoxShadow>::new());
+            (identity, 1f32, Vec::<renderer::BoxShadow>::new());
         for part in components(value, ' ') {
             let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
             else {
@@ -307,9 +307,9 @@ impl Filter {
         (r << 16 | g << 8 | b, alpha)
     }
 
-    pub fn hsla(&self, color: render::Rgba) -> render::Rgba {
+    pub fn hsla(&self, color: renderer::Rgba) -> renderer::Rgba {
         let [r, g, b] = self.rgb([color.r, color.g, color.b]);
-        render::Rgba {
+        renderer::Rgba {
             r,
             g,
             b,

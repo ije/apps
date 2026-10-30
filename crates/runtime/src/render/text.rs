@@ -1,27 +1,27 @@
 use crate::style;
 use crate::style::Prop;
 use anyhow::Result;
-use render::{Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
+use renderer::{Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
 use std::{ops::Range, rc::Rc};
 
 pub(super) struct TextHighlight {
     pub(super) range: Range<usize>,
-    pub(super) color: Option<render::Rgba>,
-    pub(super) background: render::Rgba,
+    pub(super) color: Option<renderer::Rgba>,
+    pub(super) background: renderer::Rgba,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_text(
-    line: &render::LineLayout,
-    wraps: &[render::WrapBoundary],
+    line: &renderer::LineLayout,
+    wraps: &[renderer::WrapBoundary],
     origin: Point<Pixels>,
     line_height: Pixels,
-    runs: &[render::TextRun],
+    runs: &[renderer::TextRun],
     offset: usize,
     highlights: &[TextHighlight],
     rows: &[crate::dom::Row],
     text: &str,
-    ink: Option<render::Rgba>,
+    ink: Option<renderer::Rgba>,
     window: &mut Window,
 ) {
     let smoothing = window.text_style().font_smoothing;
@@ -117,7 +117,7 @@ pub(super) fn paint_text(
                         line.x_for_index(b - offset) + justify(row, b)
                     };
                     if let Some(background) = run.background_color.filter(|_| ink.is_none()) {
-                        window.paint_quad(render::fill(
+                        window.paint_quad(renderer::fill(
                             Bounds::new(
                                 point(row_left + x, top + baseline - line.ascent),
                                 size(end_x - x, line.ascent + line.descent),
@@ -132,7 +132,7 @@ pub(super) fn paint_text(
                                 top + baseline + underline.offset.unwrap_or(line.descent * 0.618),
                             ),
                             end_x - x,
-                            &render::UnderlineStyle {
+                            &renderer::UnderlineStyle {
                                 color: ink.or(underline.color),
                                 ..*underline
                             },
@@ -142,7 +142,7 @@ pub(super) fn paint_text(
                         window.paint_strikethrough(
                             point(row_left + x, top + (line.ascent * 0.5 + baseline) * 0.5),
                             end_x - x,
-                            &render::StrikethroughStyle {
+                            &renderer::StrikethroughStyle {
                                 color: ink.or(strikethrough.color),
                                 ..*strikethrough
                             },
@@ -162,7 +162,7 @@ pub(super) fn paint_text(
                         line.x_for_index(b - offset) + justify(row, b)
                     };
                     if end_x > x && highlight.background.a > 0. {
-                        window.paint_quad(render::fill(
+                        window.paint_quad(renderer::fill(
                             Bounds::new(point(row_left + x, top), size(end_x - x, line_height)),
                             highlight.background,
                         ));
@@ -192,7 +192,7 @@ pub(super) fn paint_text(
                     .size;
                 let skip = if run_ix == from.0 { from.1 } else { 0 };
                 for (glyph_ix, glyph) in run.glyphs.iter().enumerate().skip(skip) {
-                    if wraps.get(wrap) == Some(&render::WrapBoundary { run_ix, glyph_ix }) {
+                    if wraps.get(wrap) == Some(&renderer::WrapBoundary { run_ix, glyph_ix }) {
                         wrap += 1;
                         left = glyph.position.x;
                     }
@@ -259,7 +259,7 @@ pub(super) fn spaces(text: &str) -> f32 {
 /// How much taller the first row is than the line height, when larger first-letter or
 /// first-line runs rise above the normal baseline.
 fn first_row_drop(
-    line: Option<&render::WrappedLineLayout>,
+    line: Option<&renderer::WrappedLineLayout>,
     line_height: Pixels,
     window: &Window,
 ) -> Pixels {
@@ -296,7 +296,7 @@ fn first_row_drop(
 }
 
 pub(crate) fn text_position(
-    layout: &render::TextLayout,
+    layout: &renderer::TextLayout,
     text: &str,
     rows: &[crate::dom::Row],
     index: usize,
@@ -312,7 +312,7 @@ pub(crate) fn text_position(
 }
 
 pub(crate) fn text_index(
-    layout: &render::TextLayout,
+    layout: &renderer::TextLayout,
     text: &str,
     rows: &[crate::dom::Row],
     mut position: Point<Pixels>,
@@ -344,8 +344,8 @@ fn first_line(
     data: &style::InlineText,
     width: Option<Pixels>,
     font_size: Pixels,
-    text_system: &render::TextSystem,
-) -> (SharedString, Vec<render::TextRun>) {
+    text_system: &renderer::TextSystem,
+) -> (SharedString, Vec<renderer::TextRun>) {
     let mut text = data.text.to_string();
     let Some((base, pseudo, mode)) = &data.first_line else {
         return (text.into(), data.runs.clone());
@@ -380,15 +380,30 @@ fn first_line(
 }
 
 pub(super) struct InlineText {
-    pub(super) inner: render::StyledText,
+    pub(super) inner: renderer::StyledText,
     pub(super) data: Rc<style::InlineText>,
     pub(super) view: Rc<super::ViewData>,
-    pub(super) runs: Option<Vec<render::TextRun>>,
+    pub(super) runs: Option<Vec<renderer::TextRun>>,
     /// For justified text, whether the last row is justified too.
     pub(super) justify: Option<bool>,
     /// Set when the text is measured here instead of by `inner`: the last measured wrap
     /// width and text width.
     pub(super) measured: Option<Rc<std::cell::Cell<[Pixels; 2]>>>,
+}
+
+/// What a measured paragraph depends on, with its last measurement. Equal inputs keep it.
+struct Measured {
+    data: Rc<style::InlineText>,
+    style: renderer::TextStyle,
+    /// The last measured wrap width and text width.
+    measured: Rc<std::cell::Cell<[Pixels; 2]>>,
+    cached: std::cell::Cell<Option<(Option<Pixels>, renderer::Size<Pixels>)>>,
+}
+
+impl PartialEq for Measured {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.data, &other.data) && self.style == other.style
+    }
 }
 
 impl IntoElement for InlineText {
@@ -398,45 +413,56 @@ impl IntoElement for InlineText {
     }
 }
 
-impl render::Element for InlineText {
+impl renderer::Element for InlineText {
     type RequestLayoutState = ();
-    type PrepaintState = (Vec<(render::Hitbox, render::CursorStyle)>, crate::dom::Rows);
-    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
+    type PrepaintState = (
+        Vec<(renderer::Hitbox, renderer::CursorStyle)>,
+        crate::dom::Rows,
+    );
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
         let sized = self.data.runs.iter().any(|run| run.font_size.is_some())
             || self
                 .data
                 .first_line
                 .as_ref()
                 .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
-        self.measured = (self.data.first_line.is_some() || sized).then(Default::default);
-        let Some(measured) = self.measured.clone() else {
+        if self.data.first_line.is_none() && !sized {
+            self.measured = None;
             return self.inner.request_layout(window);
-        };
-        let style = window.text_style();
-        let font_size = style.font_size;
-        let line_height = style.line_height;
-        let data = self.data.clone();
-        let cached = std::cell::Cell::new(None);
-        let layout = window.request_measured_layout(
-            &render::Style::default(),
-            move |known, available, window| {
+        }
+        let (layout, kept) = window.request_measured_layout(
+            &renderer::Style::default(),
+            Measured {
+                data: self.data.clone(),
+                style: window.text_style(),
+                measured: Rc::default(),
+                cached: std::cell::Cell::new(None),
+            },
+            |kept, known, available, window| {
+                let Measured {
+                    data,
+                    style,
+                    measured,
+                    cached,
+                } = kept;
+                let (font_size, line_height) = (style.font_size, style.line_height);
                 let width = known
                     .width
                     .or(match available.width {
-                        render::AvailableSpace::Definite(width) => Some(width),
+                        renderer::AvailableSpace::Definite(width) => Some(width),
                         _ => None,
                     })
-                    .filter(|_| style.white_space == render::WhiteSpace::Normal);
+                    .filter(|_| style.white_space == renderer::WhiteSpace::Normal);
                 if let Some((_, size)) = cached
                     .get()
-                    .filter(|(cached, _): &(_, render::Size<Pixels>)| *cached == width)
+                    .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == width)
                 {
                     measured.set([width.unwrap_or_default(), size.width]);
                     return size;
                 }
                 let system = window.text_system().clone();
-                let (text, runs) = first_line(&data, width, font_size, &system);
-                let mut size = render::Size::<Pixels>::default();
+                let (text, runs) = first_line(data, width, font_size, &system);
+                let mut size = renderer::Size::<Pixels>::default();
                 let lines = system
                     .shape_text_indented(
                         text,
@@ -460,6 +486,7 @@ impl render::Element for InlineText {
                 size
             },
         );
+        self.measured = Some(kept.measured.clone());
         (layout, ())
     }
     fn prepaint(
@@ -477,17 +504,17 @@ impl render::Element for InlineText {
                 .into_iter()
                 .filter(|width| *width >= bounds.size.width && *width - bounds.size.width < px(1.))
                 .fold(bounds.size.width, Pixels::max);
-            let width = (style.white_space == render::WhiteSpace::Normal).then_some(wrap);
+            let width = (style.white_space == renderer::WhiteSpace::Normal).then_some(wrap);
             let font_size = style.font_size;
             let system = window.text_system().clone();
             let (text, runs) = first_line(&self.data, width, font_size, &system);
-            self.inner = render::StyledText::new(text).with_runs(runs.clone());
+            self.inner = renderer::StyledText::new(text).with_runs(runs.clone());
             let (layout, _) = self.inner.request_layout(window);
             window.compute_layout(
                 layout,
                 size(
-                    render::AvailableSpace::Definite(wrap),
-                    render::AvailableSpace::MinContent,
+                    renderer::AvailableSpace::Definite(wrap),
+                    renderer::AvailableSpace::MinContent,
                 ),
             );
             self.runs = Some(runs);
@@ -499,7 +526,7 @@ impl render::Element for InlineText {
         let drop = layout.line_layout_for_index(0).map_or(px(0.), |line| {
             first_row_drop(Some(&line), layout.line_height(), window)
         });
-        if style.text_align != render::TextAlign::Left
+        if style.text_align != renderer::TextAlign::Left
             || !self.data.backgrounds.is_empty()
             || indent != px(0.)
             || self.justify.is_some()
@@ -544,9 +571,9 @@ impl render::Element for InlineText {
                         (indent, free / gaps)
                     } else {
                         let shift = match style.text_align {
-                            render::TextAlign::Left => px(0.),
-                            render::TextAlign::Center => free / 2.,
-                            render::TextAlign::Right => free,
+                            renderer::TextAlign::Left => px(0.),
+                            renderer::TextAlign::Center => free / 2.,
+                            renderer::TextAlign::Right => free,
                         };
                         (indent + shift, px(0.))
                     };
@@ -584,7 +611,7 @@ impl render::Element for InlineText {
                     )
                 };
                 Some((
-                    window.insert_hitbox(rect, render::HitboxBehavior::Normal),
+                    window.insert_hitbox(rect, renderer::HitboxBehavior::Normal),
                     cursor,
                 ))
             })
@@ -694,7 +721,7 @@ impl render::Element for InlineText {
                             };
                             let [left_side, right_side] = [start || clone, end || clone];
                             window.paint_quad(
-                                render::fill(
+                                renderer::fill(
                                     Bounds::new(
                                         point(
                                             x,
@@ -704,7 +731,7 @@ impl render::Element for InlineText {
                                     ),
                                     rgba(ink),
                                 )
-                                .corner_radii(render::Corners {
+                                .corner_radii(renderer::Corners {
                                     top_left: if left_side { radii[0] } else { px(0.) },
                                     top_right: if right_side { radii[1] } else { px(0.) },
                                     bottom_right: if right_side { radii[2] } else { px(0.) },
@@ -738,7 +765,7 @@ impl render::Element for InlineText {
                         .map(|(color, alpha)| color << 8 | alpha as u32)
                         .unwrap_or(0x000000ff);
                     if let Some(position) = text_position(layout, &self.data.text, rows, start) {
-                        window.paint_quad(render::fill(
+                        window.paint_quad(renderer::fill(
                             Bounds::new(position, size(px(1.), layout.line_height())),
                             rgba(ink),
                         ));
@@ -799,7 +826,7 @@ impl render::Element for InlineText {
             };
             if blur > 0. {
                 // The CSS blur radius is twice the gaussian deviation.
-                let effect = render::PaintEffect {
+                let effect = renderer::PaintEffect {
                     blur: px(blur / 2.),
                     ..Default::default()
                 };

@@ -1,10 +1,10 @@
 use super::paint::Effected;
 use crate::style;
 use crate::style::Prop;
-use render::{AnyElement, div, prelude::*, px, rgba};
+use renderer::{AnyElement, div, prelude::*, px, rgba};
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
-type Backgrounds = HashMap<(usize, usize), (String, Arc<render::RenderImage>)>;
+type Backgrounds = HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn css_background(
@@ -34,7 +34,7 @@ pub(super) fn css_background(
             .cloned()
             .unwrap_or_default()
     };
-    let corners = render::Corners {
+    let corners = renderer::Corners {
         top_left: px(radius[0]),
         top_right: px(radius[1]),
         bottom_right: px(radius[2]),
@@ -63,10 +63,10 @@ pub(super) fn css_background(
                 })
             {
                 let fit = match size.as_str() {
-                    "cover" => render::ObjectFit::Cover,
-                    "contain" => render::ObjectFit::Contain,
-                    "" | "auto" | "auto auto" => render::ObjectFit::None,
-                    _ => render::ObjectFit::Fill,
+                    "cover" => renderer::ObjectFit::Cover,
+                    "contain" => renderer::ObjectFit::Contain,
+                    "" | "auto" | "auto auto" => renderer::ObjectFit::None,
+                    _ => renderer::ObjectFit::Fill,
                 };
                 let file = path.to_string_lossy().into_owned();
                 let source = format!("{size} {file}");
@@ -78,7 +78,7 @@ pub(super) fn css_background(
                 });
                 let view = view.clone();
                 layers.push(
-                    render::canvas(
+                    renderer::canvas(
                         |_, _| (),
                         move |bounds, _, window| {
                             let [width, height] =
@@ -100,7 +100,7 @@ pub(super) fn css_background(
                                     .map(|(_, image)| image.clone())
                             };
                             let fixed =
-                                |backgrounds: &Backgrounds, image: &Arc<render::RenderImage>| {
+                                |backgrounds: &Backgrounds, image: &Arc<renderer::RenderImage>| {
                                     decoded(backgrounds)
                                         .is_some_and(|bitmap| Arc::ptr_eq(&bitmap, image))
                                 };
@@ -130,7 +130,7 @@ pub(super) fn css_background(
                                         Ok(pixels)
                                     })()
                                     .unwrap_or_default();
-                                    let image = Arc::new(render::RenderImage::new(
+                                    let image = Arc::new(renderer::RenderImage::new(
                                         pixels.width(),
                                         pixels.height(),
                                         pixels.into_raw(),
@@ -150,11 +150,11 @@ pub(super) fn css_background(
                                             )?
                                             .size();
                                             let fitted = fit.get_bounds(
-                                                render::Bounds::new(
-                                                    render::point(px(0.), px(0.)),
-                                                    render::size(px(width), px(height)),
+                                                renderer::Bounds::new(
+                                                    renderer::point(px(0.), px(0.)),
+                                                    renderer::size(px(width), px(height)),
                                                 ),
-                                                render::size(
+                                                renderer::size(
                                                     (natural.width().round().max(1.) as u32).into(),
                                                     (natural.height().round().max(1.) as u32)
                                                         .into(),
@@ -207,7 +207,7 @@ pub(super) fn css_background(
                             window.paint_image(
                                 bounds,
                                 target,
-                                render::Corners::default(),
+                                renderer::Corners::default(),
                                 image.clone(),
                                 false,
                             );
@@ -232,7 +232,7 @@ pub(super) fn css_background(
         };
         let view = view.clone();
         layers.push(
-            render::canvas(
+            renderer::canvas(
                 |_, _| (),
                 move |bounds, _, window| {
                     let [width, height] =
@@ -299,7 +299,7 @@ pub(super) fn css_background(
     for (layer, index) in layers.into_iter().zip(indexes) {
         let blend_mode = super::effects::blend_mode(&pick(&modes, index));
         group = group.child(Effected {
-            effect: render::PaintEffect {
+            effect: renderer::PaintEffect {
                 blend_mode,
                 ..Default::default()
             },
@@ -308,7 +308,7 @@ pub(super) fn css_background(
     }
     vec![
         Effected {
-            effect: render::PaintEffect::default(),
+            effect: renderer::PaintEffect::default(),
             child: group.into_any_element(),
         }
         .into_any_element(),

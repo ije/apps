@@ -9,7 +9,7 @@ use crate::{
     jsc,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use render::{
+use renderer::{
     App, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, point, px,
 };

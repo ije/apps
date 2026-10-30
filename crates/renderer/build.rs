@@ -5,7 +5,7 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(render_shaders)");
+    println!("cargo::rustc-check-cfg=cfg(renderer_shaders)");
     match env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("macos") => metal(),
         Ok("windows") if env::var("PROFILE").as_deref() == Ok("release") => hlsl(),
@@ -16,7 +16,7 @@ fn main() {
 fn hlsl() {
     let source = "src/platform/windows/shaders.hlsl";
     println!("cargo::rerun-if-changed={source}");
-    println!("cargo::rerun-if-env-changed=RENDER_FXC");
+    println!("cargo::rerun-if-env-changed=RENDERER_FXC");
     // `fxc` ships with the Windows SDK.
     let sdk = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
     let mut versions: Vec<_> = std::fs::read_dir(&sdk)
@@ -32,7 +32,7 @@ fn hlsl() {
             .filter_map(|part| part.parse().ok())
             .collect::<Vec<u32>>()
     });
-    let fxc = env::var_os("RENDER_FXC")
+    let fxc = env::var_os("RENDERER_FXC")
         .map(PathBuf::from)
         .or_else(|| {
             versions
@@ -63,7 +63,7 @@ fn hlsl() {
             ]));
         }
     }
-    println!("cargo::rustc-cfg=render_shaders");
+    println!("cargo::rustc-cfg=renderer_shaders");
 }
 
 fn metal() {
@@ -97,7 +97,7 @@ fn metal() {
         "-o",
         &format!("{out}/shaders.metallib"),
     ]));
-    println!("cargo::rustc-cfg=render_shaders");
+    println!("cargo::rustc-cfg=renderer_shaders");
 }
 
 fn run(command: &mut Command) {

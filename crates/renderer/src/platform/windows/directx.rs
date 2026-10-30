@@ -48,14 +48,14 @@ fn gpu() -> Result<Rc<Gpu>> {
     })
 }
 
-#[cfg(render_shaders)]
+#[cfg(renderer_shaders)]
 macro_rules! shader {
     ($name:literal) => {
         Cow::Borrowed(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".cso")).as_slice())
     };
 }
 
-#[cfg(not(render_shaders))]
+#[cfg(not(renderer_shaders))]
 macro_rules! shader {
     ($name:literal) => {
         compile($name)?
@@ -63,7 +63,7 @@ macro_rules! shader {
 }
 
 /// Compiles a shader at launch, when the build had no `fxc`.
-#[cfg(not(render_shaders))]
+#[cfg(not(renderer_shaders))]
 fn compile(entry: &str) -> Result<Cow<'static, [u8]>> {
     use windows::{Win32::Graphics::Direct3D::Fxc::D3DCompile, core::PCSTR};
     const SOURCE: &str = include_str!("shaders.hlsl");

@@ -102,74 +102,109 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
+/// What a text layout depends on, with the layout it holds. Equal inputs keep the layout.
+struct Measured {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    style: TextStyle,
+    scale: f32,
+    layout: TextLayout,
+}
+
+impl PartialEq for Measured {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.runs == other.runs
+            && self.style == other.style
+            && self.scale == other.scale
+    }
+}
+
 impl TextLayout {
     fn layout(
-        &self,
+        &mut self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         window: &mut Window,
     ) -> LayoutId {
         let style = window.text_style();
-        let font_size = style.font_size;
-        let scale = window.scale_factor();
-        let line_height = px((style.line_height.0 * scale).round() / scale);
         let runs = runs.unwrap_or_else(|| vec![style.to_run(text.len())]);
-        let state = self.clone();
-        window.request_measured_layout(&Style::default(), move |known, available, window| {
-            let definite = |space: AvailableSpace| match space {
-                AvailableSpace::Definite(width) => Some(width),
-                _ => None,
-            };
-            let width = known.width.or(definite(available.width));
-            let wrap_width = width.filter(|_| style.white_space == WhiteSpace::Normal);
-            let truncate = style.text_overflow.clone().zip(width);
-            // A truncated layout answers an unconstrained probe with the truncated size, so it is
-            // never reused.
-            if let Some(inner) = state.0.borrow().as_ref()
-                && (wrap_width.is_none() || wrap_width == inner.wrap_width)
-                && truncate.is_none()
-                && !inner.truncated
-            {
-                return inner.size;
-            }
-            let system = window.text_system().clone();
-            let (text, runs, truncated) = match truncate {
-                Some((affix, width)) => {
-                    let (text, runs, truncated) =
-                        truncate_text(&system, &style, &text, &runs, &affix, width, wrap_width);
-                    (text, Cow::Owned(runs), truncated)
-                }
-                None => (text.clone(), Cow::Borrowed(&runs), false),
-            };
-            let len = text.len();
-            let lines = system
-                .shape_text_indented(
+        let measured = Measured {
+            text,
+            runs,
+            style,
+            scale: window.scale_factor(),
+            layout: self.clone(),
+        };
+        let (id, measured) = window.request_measured_layout(
+            &Style::default(),
+            measured,
+            |measured, known, available, window| {
+                let Measured {
                     text,
-                    font_size,
-                    &runs,
+                    runs,
+                    style,
+                    scale,
+                    layout,
+                } = measured;
+                let line_height = px((style.line_height.0 * scale).round() / scale);
+                let definite = |space: AvailableSpace| match space {
+                    AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                };
+                let width = known.width.or(definite(available.width));
+                let wrap_width = width.filter(|_| style.white_space == WhiteSpace::Normal);
+                let truncate = style.text_overflow.clone().zip(width);
+                // A truncated layout answers an unconstrained probe with the truncated size, so it is
+                // never reused.
+                if let Some(inner) = layout.0.borrow().as_ref()
+                    && (wrap_width.is_none() || wrap_width == inner.wrap_width)
+                    && truncate.is_none()
+                    && !inner.truncated
+                {
+                    return inner.size;
+                }
+                let system = window.text_system().clone();
+                let (text, runs, truncated) = match truncate {
+                    Some((affix, width)) => {
+                        let (text, runs, truncated) =
+                            truncate_text(&system, style, text, runs, &affix, width, wrap_width);
+                        (text, Cow::Owned(runs), truncated)
+                    }
+                    None => (text.clone(), Cow::Borrowed(runs), false),
+                };
+                let len = text.len();
+                let lines = system
+                    .shape_text_indented(
+                        text,
+                        style.font_size,
+                        &runs,
+                        wrap_width,
+                        style.line_clamp,
+                        style.text_indent,
+                        style.text_wrap,
+                    )
+                    .unwrap_or_default();
+                let mut size = Size::<Pixels>::default();
+                for line in &lines {
+                    let line = line.size(line_height);
+                    size.height += line.height;
+                    size.width = size.width.max(line.width);
+                }
+                *layout.0.borrow_mut() = Some(TextLayoutInner {
+                    len,
+                    lines,
+                    line_height,
                     wrap_width,
-                    style.line_clamp,
-                    style.text_indent,
-                    style.text_wrap,
-                )
-                .unwrap_or_default();
-            let mut size = Size::<Pixels>::default();
-            for line in &lines {
-                let line = line.size(line_height);
-                size.height += line.height;
-                size.width = size.width.max(line.width);
-            }
-            *state.0.borrow_mut() = Some(TextLayoutInner {
-                len,
-                lines,
-                line_height,
-                wrap_width,
-                truncated,
-                size,
-                bounds: None,
-            });
-            size
-        })
+                    truncated,
+                    size,
+                    bounds: None,
+                });
+                size
+            },
+        );
+        *self = measured.layout.clone();
+        id
     }
 
     pub fn paint(&self, window: &mut Window) {

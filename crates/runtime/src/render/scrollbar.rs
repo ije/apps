@@ -3,7 +3,7 @@
 
 use crate::style::Prop;
 use crate::style::{self, Style};
-use render::{
+use renderer::{
     Bounds, Corners, DispatchPhase, Edges, Hitbox, HitboxBehavior, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, Timer, Window,
     point, prelude::*, px, quad, rgba, size, transparent_black,
@@ -253,12 +253,12 @@ impl IntoElement for Scrollbar {
     }
 }
 
-impl render::Element for Scrollbar {
+impl renderer::Element for Scrollbar {
     type RequestLayoutState = ();
     type PrepaintState = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
-    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
-        let mut style = render::Style {
-            position: render::Position::Absolute,
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
+        let mut style = renderer::Style {
+            position: renderer::Position::Absolute,
             ..Default::default()
         };
         style.inset.left = px(self.origin[0]).into();

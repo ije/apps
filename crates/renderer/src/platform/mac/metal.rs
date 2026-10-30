@@ -112,14 +112,14 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
-        #[cfg(not(render_shaders))]
+        #[cfg(not(renderer_shaders))]
         let library = device
             .newLibraryWithSource_options_error(
                 &NSString::from_str(include_str!("shaders.metal")),
                 Some(&objc2_metal::MTLCompileOptions::new()),
             )
             .context("building Metal library")?;
-        #[cfg(render_shaders)]
+        #[cfg(renderer_shaders)]
         let library = device
             .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(include_bytes!(
                 concat!(env!("OUT_DIR"), "/shaders.metallib")
@@ -241,6 +241,11 @@ impl Renderer {
     }
 
     /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
+    /// Frees the layer textures the last frame did not use, for a window that stops drawing.
+    pub fn trim(&mut self) {
+        self.pool.retain(|(_, _, idle)| *idle == 0);
+    }
+
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         let size = self.layer.drawableSize();
         let window = [size.width.ceil() as u32, size.height.ceil() as u32];

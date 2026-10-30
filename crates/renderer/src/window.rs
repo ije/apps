@@ -6,7 +6,7 @@ use crate::{
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
     input::{DEFAULT_LINE_HEIGHT, DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
-    layout::{LayoutEngine, MeasureFn},
+    layout::LayoutEngine,
     platform, point, px,
     scene::{
         BackdropState, EffectState, MonochromeSprite, PolychromeSprite, Primitive, Quad, Scene,
@@ -630,7 +630,7 @@ impl Window {
             self.next_hitbox = 0;
             self.next_states.clear();
             if let Some(layout) = &mut self.layout {
-                layout.clear();
+                layout.begin_frame(self.scale_factor, self.text_system.generation());
             }
             if let Some(mut view) = self.view.take() {
                 let mut root = view.render(self, cx);
@@ -808,25 +808,59 @@ impl Window {
         style: &Style,
         children: impl IntoIterator<Item = LayoutId>,
     ) -> LayoutId {
+        self.request_element_layout(None, style, children)
+    }
+
+    /// Requests the node of the element with `id`, which keeps it from frame to frame.
+    pub fn request_element_layout(
+        &mut self,
+        id: Option<ElementId>,
+        style: &Style,
+        children: impl IntoIterator<Item = LayoutId>,
+    ) -> LayoutId {
         let scale = self.scale_factor;
         match &mut self.layout {
-            Some(layout) => layout.request_layout(style, scale, children),
-            None => LayoutEngine::default().request_layout(style, scale, children),
+            Some(layout) => layout.request_layout(id, style, scale, children),
+            None => LayoutEngine::default().request_layout(id, style, scale, children),
         }
     }
 
-    pub fn request_measured_layout(
+    /// A leaf sized by `measure`. While `state` compares equal to last frame's, the node keeps
+    /// its layout and the returned state is last frame's, with what `measure` stored in it.
+    pub fn request_measured_layout<S: PartialEq + 'static>(
         &mut self,
         style: &Style,
-        measure: impl FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window) -> Size<Pixels>
+        state: S,
+        measure: impl FnMut(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window) -> Size<Pixels>
         + 'static,
-    ) -> LayoutId {
+    ) -> (LayoutId, Rc<S>) {
         let scale = self.scale_factor;
-        let measure: Box<MeasureFn> = Box::new(measure);
         match &mut self.layout {
-            Some(layout) => layout.request_measured_layout(style, scale, measure),
-            None => LayoutEngine::default().request_measured_layout(style, scale, measure),
+            Some(layout) => layout.request_measured_layout(style, scale, state, measure),
+            None => LayoutEngine::default().request_measured_layout(style, scale, state, measure),
         }
+    }
+
+    /// Requests the layout of an element's children in its scope, so nodes without an id keep
+    /// their identity when other elements change.
+    pub fn with_layout_scope<R>(
+        &mut self,
+        id: Option<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(scope) = id.zip(self.layout.as_ref()).map(|(id, layout)| {
+            crate::layout::identity(Some(id), layout.scopes.last().copied().unwrap_or_default())
+        }) else {
+            return f(self);
+        };
+        if let Some(layout) = &mut self.layout {
+            layout.scopes.push(scope);
+        }
+        let result = f(self);
+        if let Some(layout) = &mut self.layout {
+            layout.scopes.pop();
+        }
+        result
     }
 
     pub fn compute_layout(&mut self, id: LayoutId, space: Size<AvailableSpace>) {

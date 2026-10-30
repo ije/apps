@@ -23,18 +23,18 @@ use std::{
 /// space after each space when justified, its first byte, and how far it moves down.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Row {
-    pub shift: render::Pixels,
-    pub right: render::Pixels,
-    pub gap: render::Pixels,
+    pub shift: renderer::Pixels,
+    pub right: renderer::Pixels,
+    pub gap: renderer::Pixels,
     pub start: usize,
     /// How far the row moves down, when the first row is taller.
-    pub drop: render::Pixels,
+    pub drop: renderer::Pixels,
 }
 
 pub(crate) type Rows = Rc<[Row]>;
 
 /// A decoded raster, or SVG text and its size.
-type Decoded = Result<Result<render::RenderImage, (String, [f32; 2])>>;
+type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
 
 pub(crate) struct LayoutNode {
     pub node: Node,
@@ -200,9 +200,9 @@ pub struct State {
     live: HashSet<usize>,
     pub bounds: LayoutMirror,
     pub(crate) text_layouts:
-        HashMap<usize, (render::TextLayout, Rc<str>, std::ops::Range<usize>, Rows)>,
-    pub scroll: HashMap<usize, render::ScrollHandle>,
-    scroll_offsets: HashMap<usize, render::Point<render::Pixels>>,
+        HashMap<usize, (renderer::TextLayout, Rc<str>, std::ops::Range<usize>, Rows)>,
+    pub scroll: HashMap<usize, renderer::ScrollHandle>,
+    scroll_offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     pub(crate) grids: HashMap<
         usize,
@@ -237,12 +237,12 @@ pub struct State {
     pub dirty: bool,
     pub frame_requested: bool,
     pub canvases: HashMap<usize, crate::render::canvas::Canvas>,
-    pub images: HashMap<usize, Arc<render::RenderImage>>,
+    pub images: HashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
     /// Shadow hosts by shadow root.
     pub(crate) hosts: HashMap<usize, usize>,
     /// Replaced or removed images whose GPU atlas tiles the renderer must drop.
-    pub retired: Vec<Arc<render::RenderImage>>,
+    pub retired: Vec<Arc<renderer::RenderImage>>,
     /// Canvases with a redrawn image in `retired`.
     retired_canvases: HashSet<usize>,
     /// Images that workers decoded, by node and request.
@@ -254,23 +254,23 @@ pub struct State {
     pub(crate) svg_sources: HashMap<usize, ([f32; 2], String, String)>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
-    pub(crate) masks: HashMap<usize, (String, Arc<render::RenderImage>)>,
-    pub(crate) image_crops: HashMap<usize, (u64, Arc<render::RenderImage>)>,
-    pub svgs: HashMap<usize, (String, Arc<render::RenderImage>)>,
-    pub backgrounds: HashMap<(usize, usize), (String, Arc<render::RenderImage>)>,
+    pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    pub(crate) image_crops: HashMap<usize, (u64, Arc<renderer::RenderImage>)>,
+    pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
     /// The `@font-face` sources already loaded.
     pub(crate) fonts: std::collections::HashSet<String>,
     /// How many fonts were added, from `@font-face` or `FontFace`.
     pub(crate) font_loads: u32,
-    pub text_system: Option<std::rc::Rc<render::TextSystem>>,
+    pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
     pub(crate) motion: style::Motion,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
     pub(crate) container_pass: bool,
-    pub(crate) anchors: HashMap<usize, render::Bounds<render::Pixels>>,
+    pub(crate) anchors: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
 }
 
@@ -390,7 +390,7 @@ pub(crate) fn load_image(
                     for pixel in pixels.pixels_mut() {
                         pixel.0.swap(0, 2);
                     }
-                    Ok(render::RenderImage::new(
+                    Ok(renderer::RenderImage::new(
                         pixels.width(),
                         pixels.height(),
                         pixels.into_raw(),
@@ -1085,14 +1085,14 @@ pub fn call(
             "dom.scroll" => {
                 let handle = state.scroll.entry(if page { 0 } else { id }).or_default();
                 let previous = handle.offset();
-                handle.set_offset(render::point(
-                    render::px(
+                handle.set_offset(renderer::point(
+                    renderer::px(
                         -args[1]
                             .as_f64()
                             .map(|v| v as f32)
                             .unwrap_or(-f32::from(previous.x)),
                     ),
-                    render::px(
+                    renderer::px(
                         -args[2]
                             .as_f64()
                             .map(|v| v as f32)
@@ -1303,9 +1303,9 @@ pub fn call(
                 if let Some((layout, text, range, rows)) = state.text_layouts.get(&id) {
                     let content = &text[range.clone()];
                     if op == "dom.textIndex" {
-                        let position = render::point(
-                            render::px(args[1].as_f64().unwrap_or(0.) as f32),
-                            render::px(args[2].as_f64().unwrap_or(0.) as f32),
+                        let position = renderer::point(
+                            renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
+                            renderer::px(args[2].as_f64().unwrap_or(0.) as f32),
                         );
                         let index = crate::render::text::text_index(layout, text, rows, position)
                             .unwrap_or_else(|index| index)
@@ -1376,24 +1376,24 @@ pub fn call(
                     viewport[1],
                 )
                 .max(1.);
-                let run = render::TextRun {
+                let run = renderer::TextRun {
                     len: text.len(),
                     font: style::font(style),
-                    color: render::black(),
+                    color: renderer::black(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
-                    letter_spacing: render::px(0.),
-                    word_spacing: render::px(0.),
+                    letter_spacing: renderer::px(0.),
+                    word_spacing: renderer::px(0.),
                     font_size: None,
                 };
                 let wrap = (!style
                     .get(Prop::WHITE_SPACE)
                     .is_some_and(|s| matches!(s, "pre" | "nowrap")))
-                .then_some(render::px(bounds[2]));
+                .then_some(renderer::px(bounds[2]));
                 let lines = system.shape_text(
                     text.clone().into(),
-                    render::px(font_size),
+                    renderer::px(font_size),
                     &[run],
                     wrap,
                     None,
@@ -1409,11 +1409,11 @@ pub fn call(
                         let y = args[2].as_f64().unwrap_or(0.) as f32 - bounds[1];
                         if y < top + rows as f32 * height {
                             let index = line.closest_index_for_position(
-                                render::point(
-                                    render::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
-                                    render::px(y - top),
+                                renderer::point(
+                                    renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
+                                    renderer::px(y - top),
                                 ),
-                                render::px(height),
+                                renderer::px(height),
                             );
                             let index = index.unwrap_or_else(|index| index);
                             return Ok(json!(offset + line.text[..index].encode_utf16().count()));
@@ -1431,7 +1431,7 @@ pub fn call(
                                 .filter(|i| *i >= a && *i <= b)
                             {
                                 if let Some(point) =
-                                    line.position_for_index(byte, render::px(height))
+                                    line.position_for_index(byte, renderer::px(height))
                                 {
                                     let x = bounds[0] + f32::from(point.x);
                                     let y = bounds[1] + top + f32::from(point.y);
@@ -1485,19 +1485,19 @@ pub fn call(
                 if let Some(family) = state.font_aliases.get(face.family.as_ref()) {
                     face.family = family.clone().into();
                 }
-                let run = render::TextRun {
+                let run = renderer::TextRun {
                     len: text.len(),
                     font: face,
-                    color: render::black(),
+                    color: renderer::black(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
-                    letter_spacing: render::px(0.),
-                    word_spacing: render::px(0.),
+                    letter_spacing: renderer::px(0.),
+                    word_spacing: renderer::px(0.),
                     font_size: None,
                 };
                 let line =
-                    system.shape_line(text.to_owned().into(), render::px(font_size), &[run], None);
+                    system.shape_line(text.to_owned().into(), renderer::px(font_size), &[run], None);
                 Ok(
                     json!({"width":f32::from(line.width),"actualBoundingBoxLeft":0,"actualBoundingBoxRight":f32::from(line.width),"actualBoundingBoxAscent":f32::from(line.ascent),"actualBoundingBoxDescent":f32::from(line.descent),"fontBoundingBoxAscent":f32::from(line.ascent),"fontBoundingBoxDescent":f32::from(line.descent)}),
                 )
@@ -1539,13 +1539,13 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     Value::Array(list)
 }
 
-fn scroll_offset(handle: &render::ScrollHandle) -> render::Point<render::Pixels> {
+fn scroll_offset(handle: &renderer::ScrollHandle) -> renderer::Point<renderer::Pixels> {
     let mut offset = handle.offset();
     let bounds = handle.bounds();
-    if bounds.size.width > render::px(0.) || bounds.size.height > render::px(0.) {
+    if bounds.size.width > renderer::px(0.) || bounds.size.height > renderer::px(0.) {
         let max = handle.max_offset();
-        offset.x = offset.x.clamp(-max.x, render::px(0.));
-        offset.y = offset.y.clamp(-max.y, render::px(0.));
+        offset.x = offset.x.clamp(-max.x, renderer::px(0.));
+        offset.y = offset.y.clamp(-max.y, renderer::px(0.));
     }
     offset
 }
@@ -1622,7 +1622,7 @@ pub(crate) fn styles(
     doc: &mut Document,
     state: &mut State,
     viewport: [f32; 2],
-    system: Option<&render::TextSystem>,
+    system: Option<&renderer::TextSystem>,
 ) -> Rc<style::ComputedStyles> {
     let reduced_motion = style::reduced_motion();
     let theme = crate::desktop::native::theme_state();

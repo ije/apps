@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct Canvas {
     pub pixels: skia::Pixmap,
-    pub image: Arc<render::RenderImage>,
+    pub image: Arc<renderer::RenderImage>,
 }
 
 pub fn escape(value: &str) -> String {
@@ -25,7 +25,7 @@ pub fn fonts() -> &'static Mutex<Arc<usvg::fontdb::Database>> {
     })
 }
 
-fn render_image(pixels: &skia::Pixmap) -> Arc<render::RenderImage> {
+fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> {
     let mut bytes = vec![0; pixels.data().len()];
     for (out, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(pixels.pixels()) {
         if pixel.alpha() != 0 {
@@ -33,7 +33,7 @@ fn render_image(pixels: &skia::Pixmap) -> Arc<render::RenderImage> {
             *out = [pixel.blue(), pixel.green(), pixel.red(), pixel.alpha()];
         }
     }
-    Arc::new(render::RenderImage::new(
+    Arc::new(renderer::RenderImage::new(
         pixels.width(),
         pixels.height(),
         bytes,
@@ -51,7 +51,7 @@ impl Canvas {
             "Canvas dimensions exceed the pixel limit"
         );
         let pixels = skia::Pixmap::new(width, height).context("Cannot allocate canvas")?;
-        let image = Arc::new(render::RenderImage::new(
+        let image = Arc::new(renderer::RenderImage::new(
             width,
             height,
             vec![0; (width * height * 4) as usize],
@@ -329,7 +329,7 @@ pub fn svg(
     width: u32,
     height: u32,
     transform: Option<([f32; 2], [f32; 6])>,
-) -> Result<Arc<render::RenderImage>> {
+) -> Result<Arc<renderer::RenderImage>> {
     let tree = usvg::Tree::from_str(
         source,
         &usvg::Options {

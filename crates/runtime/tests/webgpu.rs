@@ -77,7 +77,7 @@ fn wait(engine: &Engine, ready: &str) -> String {
     panic!("GPU work did not finish: {ready}");
 }
 
-fn present(host: &RefCell<Host>, node: usize) -> Arc<render::RenderImage> {
+fn present(host: &RefCell<Host>, node: usize) -> Arc<renderer::RenderImage> {
     for _ in 0..5000 {
         if let Some(image) = host
             .borrow_mut()

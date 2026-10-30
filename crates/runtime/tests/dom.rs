@@ -35,7 +35,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
     let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().dom[&1].scroll[&id].set_offset(render::point(render::px(-60.), render::px(-25.)));
+    host.borrow().dom[&1].scroll[&id].set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
     engine.eval(r#"
         __appsLayout(); __appsLayout();
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
@@ -70,7 +70,7 @@ fn window_scroll_moves_the_page() {
         if (JSON.stringify(received) !== '[[true,true,0,50]]') throw Error(JSON.stringify(received));
         if (document.documentElement.clientHeight !== innerHeight) throw Error('Root client height is not the viewport');
     "#, "test").unwrap();
-    host.borrow().dom[&1].scroll[&0].set_offset(render::point(render::px(0.), render::px(-120.)));
+    host.borrow().dom[&1].scroll[&0].set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
     engine
         .eval(
             "__appsLayout(); if (scrollY !== 120) throw Error(String(scrollY));",

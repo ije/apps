@@ -271,7 +271,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
     );
-    let ink = |color: u32| render::rgba(color);
+    let ink = |color: u32| renderer::rgba(color);
     assert_eq!(
         (inline.runs[0].len, inline.runs[0].color),
         (2, ink(0xff0000ff))
@@ -291,7 +291,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     );
     assert!(
         runs.iter()
-            .all(|run| run.font.weight == render::FontWeight(700.))
+            .all(|run| run.font.weight == renderer::FontWeight(700.))
     );
     let doc = Document::parse(
         "<p style='text-shadow:1px 1px red'>a <span style='text-shadow:none'>b</span></p><table><tr><td>a</td><td style='vertical-align:top'>b</td></tr></table>",
@@ -835,8 +835,8 @@ fn math_values_work_in_variables_shorthands_shadows_and_utilities() {
     assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
     assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
     let shadows = units.shadows(&style["box-shadow"], false);
-    assert_eq!(shadows[0].offset.y, render::px(30.));
-    assert_eq!(shadows[0].blur_radius, render::px(4.));
+    assert_eq!(shadows[0].offset.y, renderer::px(30.));
+    assert_eq!(shadows[0].blur_radius, renderer::px(4.));
 }
 
 #[test]
@@ -890,10 +890,10 @@ fn theme_colors_and_apply_reach_native_paint() {
     assert_eq!(paint.len(), 2);
     assert_eq!(
         paint[1].offset,
-        render::point(render::px(0.), render::px(4.))
+        renderer::point(renderer::px(0.), renderer::px(4.))
     );
-    assert_eq!(paint[1].blur_radius, render::px(3.));
-    assert_eq!(paint[1].spread_radius, render::px(-1.));
+    assert_eq!(paint[1].blur_radius, renderer::px(3.));
+    assert_eq!(paint[1].spread_radius, renderer::px(-1.));
     assert!((paint[1].color.a - 0.1).abs() < 0.003);
 }
 
@@ -979,13 +979,13 @@ fn shadows_split_inset_and_outer_lists() {
     let outer = units.shadows(value, false);
     let inset = units.shadows(value, true);
     assert_eq!(outer.len(), 1);
-    assert_eq!(outer[0].blur_radius, render::px(4.));
+    assert_eq!(outer[0].blur_radius, renderer::px(4.));
     assert_eq!(inset.len(), 2);
     assert_eq!(
         inset[0].offset,
-        render::point(render::px(1.), render::px(2.))
+        renderer::point(renderer::px(1.), renderer::px(2.))
     );
-    assert_eq!(inset[1].spread_radius, render::px(2.));
+    assert_eq!(inset[1].spread_radius, renderer::px(2.));
 }
 
 #[test]
@@ -1020,9 +1020,9 @@ fn filters_fold_into_one_color_matrix() {
     assert_eq!(shadows.len(), 1);
     assert_eq!(
         shadows[0].offset,
-        render::point(render::px(2.), render::px(3.))
+        renderer::point(renderer::px(2.), renderer::px(3.))
     );
-    assert_eq!(shadows[0].color, render::rgba(0x00ffffff));
+    assert_eq!(shadows[0].color, renderer::rgba(0x00ffffff));
     let twice = matrix.unwrap().then(matrix.unwrap());
     assert!(
         twice

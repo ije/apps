@@ -14,7 +14,7 @@ pub(crate) mod text;
 use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 use element::{Build, element};
-use render::{
+use renderer::{
     App, MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Window, div, prelude::*, rgba,
 };
 use std::{
@@ -30,7 +30,7 @@ pub(crate) struct ViewData {
     pub(crate) id: u64,
     pub(crate) runtime: Rc<RefCell<Desktop>>,
     pub(crate) host: Rc<RefCell<Host>>,
-    pub(crate) images: RefCell<HashMap<usize, Arc<render::RenderImage>>>,
+    pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
     /// A drag area was pressed, so the next drag moves the window.
     pub(crate) moving: Cell<bool>,
@@ -61,7 +61,7 @@ impl WebView {
         }))
     }
 
-    fn render_page(&mut self, window: &mut Window, cx: &mut App) -> render::AnyElement {
+    fn render_page(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
         let started = std::time::Instant::now();
         let runtime = self.runtime.clone();
         let id = self.id;
@@ -88,7 +88,7 @@ impl WebView {
         {
             window.on_next_frame(|window, _| window.refresh());
         }
-        let pointer_events = render::canvas(|_, _| (), move |_, _, window| {
+        let pointer_events = renderer::canvas(|_, _| (), move |_, _, window| {
         let exit_runtime = runtime.clone();
         window.on_mouse_event(move |event: &MouseExitEvent, phase, _, cx| {
             if phase.capture() {
@@ -177,25 +177,26 @@ impl WebView {
         let children: Vec<_> = styles
             .children
             .iter()
-            .map(|(&node, children)| {
-                (
-                    node,
-                    std::mem::replace(&mut doc.nodes[node].children, children.clone()),
-                )
-            })
+            .map(|(&node, children)| (node, doc.nodes.compose_children(node, children.clone())))
             .collect();
-        let mut visible = vec![false; doc.nodes.len()];
-        let mut pending = vec![0];
-        while let Some(node) = pending.pop() {
-            let style = &styles.values[node];
-            if !match dom.layout_nodes.get(node).and_then(Option::as_ref) {
-                Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
-                _ => style
-                    .get(Prop::DISPLAY)
-                    .is_some_and(|value| value == "none"),
-            } {
-                visible[node] = true;
-                pending.extend(&doc.nodes[node].children);
+        let mut visible = std::mem::take(&mut dom.cull.visible);
+        if dom.cull.seen.as_ref().is_none_or(|(latest, _, computed)| {
+            *latest != doc.nodes.latest() || !Rc::ptr_eq(computed, &styles)
+        }) {
+            visible.clear();
+            visible.resize(doc.nodes.len(), false);
+            let mut pending = vec![0];
+            while let Some(node) = pending.pop() {
+                let style = &styles.values[node];
+                if !match dom.layout_nodes.get(node).and_then(Option::as_ref) {
+                    Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
+                    _ => style
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|value| value == "none"),
+                } {
+                    visible[node] = true;
+                    pending.extend(&doc.nodes[node].children);
+                }
             }
         }
         let mut events = Vec::new();
@@ -721,7 +722,7 @@ impl WebView {
             None,
         );
         for (node, children) in children.into_iter().rev() {
-            doc.nodes[node].children = children;
+            doc.nodes.compose_children(node, children);
         }
         {
             let mut host = self.host.borrow_mut();
@@ -730,6 +731,7 @@ impl WebView {
             }
             let dom = host.dom.entry(self.id).or_default();
             dom.cull.info = info;
+            dom.cull.visible = visible;
             dom.measurements = measured.into_inner();
             dom.inline_text = inline_text.into_inner();
             if !restore.is_empty() {
@@ -770,7 +772,7 @@ impl WebView {
             .size_full()
             .when(page_scrolls, |page| page.overflow_y_scroll())
             .when(!page_scrolls, |page| page.overflow_y_hidden())
-            .pr(render::px(page_space[1]))
+            .pr(renderer::px(page_space[1]))
             .restrict_scroll_to_axis()
             .track_scroll(&page_scroll)
             .bg(rgba((background.0 << 8) | background.1 as u32))
@@ -794,7 +796,7 @@ impl WebView {
                 origin: [0.; 2],
             }))
             .children(crate::desktop::mcp::profiling().then(|| {
-                render::canvas(
+                renderer::canvas(
                     |_, _| (),
                     move |_, _, _| crate::desktop::mcp::frame(id, started),
                 )
@@ -809,7 +811,7 @@ fn retire(
     dom: &mut crate::dom::State,
     visible: &[bool],
     styles: &style::ComputedStyles,
-    mut release: impl FnMut(Arc<render::RenderImage>),
+    mut release: impl FnMut(Arc<renderer::RenderImage>),
 ) {
     dom.svgs.retain(|id, (_, image)| {
         visible.get(*id) == Some(&true) || {
@@ -883,7 +885,7 @@ mod tests {
             .unwrap();
         dom.canvases.insert(canvas, drawn);
         let image = |size: u32| {
-            Arc::new(render::RenderImage::new(
+            Arc::new(renderer::RenderImage::new(
                 size,
                 size,
                 vec![0; (size * size * 4) as usize],

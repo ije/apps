@@ -1,6 +1,6 @@
 use crate::style;
 use crate::style::Prop;
-use render::{AnyElement, Bounds, Pixels, Point, Window, point, prelude::*, px};
+use renderer::{AnyElement, Bounds, Pixels, Point, Window, point, prelude::*, px};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 /// A box turned a quarter turn for vertical writing modes.
@@ -34,13 +34,13 @@ impl IntoElement for Turned {
     }
 }
 
-impl render::Element for Turned {
+impl renderer::Element for Turned {
     type RequestLayoutState = ();
     type PrepaintState = super::effects::Matrix;
-    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
         let child = self.child.request_layout(window);
-        let mut style = render::Style {
-            position: render::Position::Absolute,
+        let mut style = renderer::Style {
+            position: renderer::Position::Absolute,
             ..Default::default()
         };
         style.size.width = px(self.block).into();
@@ -64,7 +64,7 @@ impl render::Element for Turned {
         matrix: &mut super::effects::Matrix,
         window: &mut Window,
     ) {
-        let effect = render::PaintEffect {
+        let effect = renderer::PaintEffect {
             transform: Some(*matrix),
             ..Default::default()
         };
@@ -74,7 +74,7 @@ impl render::Element for Turned {
 
 /// Paints a child through an effect layer.
 pub(super) struct Effected {
-    pub(super) effect: render::PaintEffect,
+    pub(super) effect: renderer::PaintEffect,
     pub(super) child: AnyElement,
 }
 
@@ -85,10 +85,10 @@ impl IntoElement for Effected {
     }
 }
 
-impl render::Element for Effected {
+impl renderer::Element for Effected {
     type RequestLayoutState = ();
     type PrepaintState = ();
-    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
         (self.child.request_layout(window), ())
     }
     fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), window: &mut Window) {
@@ -100,13 +100,13 @@ impl render::Element for Effected {
 }
 
 pub(super) struct DomBox {
-    pub(super) inner: Option<render::Div>,
+    pub(super) inner: Option<renderer::Div>,
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
     pub(super) ids: Rc<super::effects::Ids>,
     pub(super) view: Rc<super::ViewData>,
     /// The scroll container, its borders, and the containing block of a sticky box.
-    pub(super) sticky: Option<(render::ScrollHandle, [f32; 4], Option<usize>)>,
+    pub(super) sticky: Option<(renderer::ScrollHandle, [f32; 4], Option<usize>)>,
     pub(super) fixed: bool,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
@@ -132,10 +132,10 @@ impl IntoElement for DomBox {
     }
 }
 
-impl render::Element for DomBox {
+impl renderer::Element for DomBox {
     type RequestLayoutState = AnyElement;
     type PrepaintState = (Bounds<Pixels>, Option<super::effects::Matrix>);
-    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, AnyElement) {
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, AnyElement) {
         let mut inner = self.inner.take().unwrap().into_any_element();
         (inner.request_layout(window), inner)
     }
@@ -330,8 +330,8 @@ impl DomBox {
         transform: Option<super::effects::Matrix>,
         window: &mut Window,
     ) -> (
-        Option<render::ContentMask<Pixels>>,
-        Vec<render::PaintEffect>,
+        Option<renderer::ContentMask<Pixels>>,
+        Vec<renderer::PaintEffect>,
     ) {
         use super::effects::{self, Clip};
         let style = &self.style;
@@ -357,10 +357,10 @@ impl DomBox {
             .and_then(|value| effects::clip(value, &units, size, doc, &self.ids))
         {
             Some(Clip::Rounded(rect, radii)) => {
-                clip = Some(render::ContentMask::rounded(
+                clip = Some(renderer::ContentMask::rounded(
                     Bounds::new(
                         bounds.origin + point(px(rect[0]), px(rect[1])),
-                        render::size(px(rect[2]), px(rect[3])),
+                        renderer::size(px(rect[2]), px(rect[3])),
                     ),
                     effects::corners(radii),
                 ))
@@ -422,18 +422,19 @@ impl DomBox {
         };
         let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
             .and_then(|value| effects::backdrop(value, &units))
-            .map(|(blur, color_matrix)| render::Backdrop {
+            .map(|(blur, color_matrix)| renderer::Backdrop {
                 bounds,
                 corner_radii: radii(),
                 blur,
                 color_matrix,
             });
-        let outer = render::PaintEffect {
+        let outer = renderer::PaintEffect {
             transform,
             opacity: self.effects.unwrap_or(1.),
-            blend_mode: value(&[Prop::MIX_BLEND_MODE]).map_or(render::BlendMode::Normal, |value| {
-                effects::blend_mode(value)
-            }),
+            blend_mode: value(&[Prop::MIX_BLEND_MODE])
+                .map_or(renderer::BlendMode::Normal, |value| {
+                    effects::blend_mode(value)
+                }),
             mask: mask.flatten(),
             backdrop,
             ..Default::default()
@@ -443,7 +444,7 @@ impl DomBox {
             .is_some_and(|value| value == "isolate");
         let needed = outer.transform.is_some()
             || outer.opacity < 1.
-            || outer.blend_mode != render::BlendMode::Normal
+            || outer.blend_mode != renderer::BlendMode::Normal
             || outer.mask.is_some()
             || outer.backdrop.is_some()
             || isolate;
@@ -451,7 +452,7 @@ impl DomBox {
             // One filter function and no clip can share the outer layer.
             if layers.len() == 1 && clip.is_none() {
                 let filter = layers.pop().unwrap();
-                layers.push(render::PaintEffect {
+                layers.push(renderer::PaintEffect {
                     color_matrix: filter.color_matrix,
                     blur: filter.blur,
                     shadow: filter.shadow,
@@ -467,7 +468,7 @@ impl DomBox {
 
 /// Paints through the effect layers, the last one outermost.
 fn nest_effects(
-    layers: &mut Vec<render::PaintEffect>,
+    layers: &mut Vec<renderer::PaintEffect>,
     window: &mut Window,
     paint: &mut dyn FnMut(&mut Window),
 ) {
@@ -575,7 +576,7 @@ pub(super) type PaintLayers = Rc<
         Vec<(
             i32,
             Rc<RefCell<AnyElement>>,
-            render::ContentMask<Pixels>,
+            renderer::ContentMask<Pixels>,
             Rc<[usize]>,
         )>,
     >,
@@ -595,13 +596,13 @@ impl IntoElement for Stacked {
     }
 }
 
-impl render::Element for Stacked {
+impl renderer::Element for Stacked {
     type RequestLayoutState = Rc<RefCell<AnyElement>>;
     type PrepaintState = ();
     fn request_layout(
         &mut self,
         window: &mut Window,
-    ) -> (render::LayoutId, Self::RequestLayoutState) {
+    ) -> (renderer::LayoutId, Self::RequestLayoutState) {
         let mut inner = self.inner.take().unwrap();
         let id = inner.request_layout(window);
         (id, Rc::new(RefCell::new(inner)))
@@ -631,7 +632,7 @@ impl render::Element for Stacked {
 }
 
 pub(super) fn paint_layers(layers: PaintLayers, negative: bool) -> impl IntoElement {
-    render::canvas(
+    renderer::canvas(
         |_, _| (),
         move |_, _, window| {
             let mut layers = layers.borrow_mut();

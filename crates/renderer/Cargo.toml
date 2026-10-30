@@ -1,5 +1,5 @@
 [package]
-name = "apps-render"
+name = "apps-renderer"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

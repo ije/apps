@@ -208,13 +208,19 @@ impl Element for Div {
     fn request_layout(&mut self, window: &mut Window) -> (LayoutId, Vec<LayoutId>) {
         let style = &self.style;
         let children = &mut self.children;
-        let ids = window.with_text_style(Some(&style.text), |window| {
-            children
-                .iter_mut()
-                .map(|child| child.request_layout(window))
-                .collect::<Vec<_>>()
+        let id = self.events.id;
+        let ids = window.with_layout_scope(id, |window| {
+            window.with_text_style(Some(&style.text), |window| {
+                children
+                    .iter_mut()
+                    .map(|child| child.request_layout(window))
+                    .collect::<Vec<_>>()
+            })
         });
-        (window.request_layout(&self.style, ids.iter().copied()), ids)
+        (
+            window.request_element_layout(id, &self.style, ids.iter().copied()),
+            ids,
+        )
     }
 
     fn prepaint(

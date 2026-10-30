@@ -392,6 +392,7 @@ impl State {
         if let Some(source) = &mut self.frame_source {
             source.stop();
         }
+        self.renderer.trim();
     }
 
     fn traffic_light_buttons(&self) -> Option<TrafficLightButtons> {
