@@ -6,7 +6,7 @@ pub use element::*;
 pub use layout::*;
 pub use line::*;
 
-use crate::{Bounds, DevicePixels, Pixels, Point, Rgba, Size, platform, px};
+use crate::{Bounds, Pixels, Point, Rgba, Size, platform, px};
 use anyhow::{Context as _, Result};
 use rustc_hash::FxHashMap;
 use std::{
@@ -101,9 +101,13 @@ pub struct Font {
     pub style: FontStyle,
 }
 
+thread_local! {
+    pub(crate) static SYSTEM_UI_FONT: SharedString = ".SystemUIFont".into();
+}
+
 impl Default for Font {
     fn default() -> Self {
-        font(".SystemUIFont")
+        font(SYSTEM_UI_FONT.with(Rc::clone))
     }
 }
 
@@ -223,7 +227,7 @@ pub struct FontRun {
 }
 
 /// A glyph raster: the cache key of its atlas tile.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RenderGlyphParams {
     pub font_id: FontId,
     pub glyph_id: GlyphId,
@@ -253,7 +257,6 @@ pub struct Fonts {
     pub(crate) platform: platform::TextSystem,
     fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
     metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
-    raster_bounds: RefCell<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     /// Advances when fonts are added, so cached layouts made with the old fonts go away.
     generation: Cell<usize>,
 }
@@ -296,7 +299,6 @@ impl TextSystem {
                 platform: platform::TextSystem::new(),
                 fonts: RefCell::default(),
                 metrics: RefCell::default(),
-                raster_bounds: RefCell::default(),
                 generation: Cell::new(0),
             }),
             font_runs: Cell::default(),
@@ -443,26 +445,20 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.descent, font_size))
     }
 
-    pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        if let Some(bounds) = self.raster_bounds.borrow().get(params) {
-            return Ok(*bounds);
-        }
-        let bounds = self.platform.glyph_raster_bounds(params)?;
-        self.raster_bounds
-            .borrow_mut()
-            .insert(params.clone(), bounds);
-        Ok(bounds)
-    }
-
+    /// The glyph's pixels, `None` when it has none.
     pub(crate) fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
-    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let bounds = self.raster_bounds(params)?;
-        self.platform.rasterize_glyph(params, bounds)
+    ) -> Result<Option<crate::atlas::Raster<Vec<u8>>>> {
+        let bounds = self.platform.glyph_raster_bounds(params)?;
+        if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
+            return Ok(None);
+        }
+        let (size, bytes) = self.platform.rasterize_glyph(params, bounds)?;
+        Ok(Some((bounds.origin, size, bytes)))
     }
 
-    /// Drops the layouts that were not used since the last frame.
+    /// Drops the layouts that were not used for a while.
     pub(crate) fn finish_frame(&self) {
         self.lines.finish_frame();
     }
@@ -475,17 +471,20 @@ impl TextSystem {
     ) -> Vec<FontRun> {
         let mut font_runs = self.font_runs.take();
         font_runs.clear();
-        let mut last: Option<&TextRun> = None;
+        let mut last: Option<(&TextRun, FontId)> = None;
         for (len, run) in runs {
             // Background colors do not change glyphs, so they never split a font run.
-            let decoration_changed = !last.is_some_and(|last| {
+            let decoration_changed = !last.is_some_and(|(last, _)| {
                 last.color == run.color
                     && last.underline == run.underline
                     && last.strikethrough == run.strikethrough
                     && (glyphs_only || last.background_color == run.background_color)
             });
-            last = Some(run);
-            let font_id = self.resolve_font(&run.font);
+            let font_id = match last {
+                Some((last, id)) if last.font == run.font => id,
+                _ => self.resolve_font(&run.font),
+            };
+            last = Some((run, font_id));
             let size = run.font_size.unwrap_or(font_size);
             match font_runs.last_mut() {
                 Some(font_run)
@@ -585,45 +584,35 @@ impl TextSystem {
         indent: Pixels,
         wrap: TextWrap,
     ) -> Result<Vec<WrappedLine>> {
-        let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
+        let mut runs = runs.iter().filter(|run| run.len > 0).peekable();
+        let mut used = 0;
+        let mut pieces = Vec::new();
         let mut lines = Vec::new();
         let mut wrapped = 0;
-        let mut start = 0;
-        let count = text.split('\n').count();
         for (index, line_text) in text.split('\n').enumerate() {
-            let end = start + line_text.len();
-            let mut pieces = Vec::new();
+            pieces.clear();
             let mut decoration_runs = Vec::<DecorationRun>::new();
-            let mut run_start = start;
-            while run_start < end {
-                let Some(run) = runs.peek_mut() else {
-                    break;
-                };
-                let len = (end - run_start).min(run.len);
+            let mut left = line_text.len();
+            while left > 0
+                && let Some(&run) = runs.peek()
+            {
+                let len = left.min(run.len - used);
                 match decoration_runs.last_mut() {
                     Some(last) if last.same(run) => last.len += len as u32,
                     _ => decoration_runs.push(DecorationRun::new(run, len)),
                 }
-                pieces.push((len, run.clone()));
-                run.len -= len;
-                if run.len == 0 {
+                pieces.push((len, run));
+                used += len;
+                left -= len;
+                if used == run.len {
                     runs.next();
+                    used = 0;
                 }
-                run_start += len;
             }
-            let font_runs = self.font_runs(
-                pieces.iter().map(|(len, run)| (*len, run)),
-                font_size,
-                false,
-            );
-            let line_text: SharedString = if count == 1 {
-                text.clone()
-            } else {
-                line_text.into()
-            };
-            let layout = self.lines().layout_wrapped_line(
+            let font_runs = self.font_runs(pieces.iter().copied(), font_size, false);
+            let (text, layout) = self.lines().layout_wrapped_line(
                 &self.platform,
-                &line_text,
+                line_text,
                 font_size,
                 &font_runs,
                 wrap_width,
@@ -636,16 +625,16 @@ impl TextSystem {
             lines.push(WrappedLine {
                 layout,
                 decoration_runs,
-                text: line_text,
+                text,
             });
             // Skips the newline.
-            if let Some(run) = runs.peek_mut() {
-                run.len -= 1;
-                if run.len == 0 {
+            if let Some(&run) = runs.peek() {
+                used += 1;
+                if used == run.len {
                     runs.next();
+                    used = 0;
                 }
             }
-            start = end + 1;
         }
         Ok(lines)
     }

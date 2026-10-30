@@ -334,12 +334,8 @@ impl State {
                     .header("connection", "Upgrade")
                     .header(
                         "sec-websocket-accept",
-                        base64::engine::general_purpose::STANDARD.encode(
-                            sha1_smol::Sha1::from(format!(
-                                "{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-                            ))
-                            .digest()
-                            .bytes(),
+                        tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                            key.as_bytes(),
                         ),
                     );
                 if !protocol.is_empty() {

@@ -1,7 +1,7 @@
 use crate::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{Api, Engine, payload::Payload},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -18,24 +18,27 @@ use std::{
 };
 
 struct Parent {
-    events: mpsc::SyncSender<Value>,
+    events: mpsc::SyncSender<Payload>,
     wake: crate::host::Waker,
     data: Value,
     id: u64,
     stop: Arc<AtomicBool>,
+    /// The bytes of the message that `__appsWorkerReceive` is reading.
+    received: Vec<bytes::Bytes>,
 }
 thread_local! { static PARENT: RefCell<Option<Parent>> = const { RefCell::new(None) }; }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+// WARNING: messages are `[json, ...bytes]` from `worker.js`, so their JSON is parsed once, by the receiving engine.
 struct Worker {
-    input: mpsc::Sender<Value>,
-    events: mpsc::Receiver<Value>,
+    input: mpsc::Sender<Payload>,
+    events: mpsc::Receiver<Payload>,
     stop: Arc<AtomicBool>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.input.send(Value::Null);
+        let _ = self.input.send(Value::Null.into());
     }
 }
 
@@ -61,7 +64,7 @@ impl State {
         self.disabled = disabled;
         self.scripts = scripts;
     }
-    pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
+    pub(crate) fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
             "info" => Ok(PARENT.with(|parent| {
                 parent.borrow().as_ref().map_or(
@@ -74,11 +77,22 @@ impl State {
                 let parent = parent.as_ref().context("Worker has no parent")?;
                 parent
                     .events
-                    .send(json!({"kind":"message","data":args[0]}))
+                    .send(Payload::snapshot(json!({"kind":"message","data":args.take()})))
                     .context("Worker parent is closed")?;
                 parent.wake.wake();
                 Ok(Value::Null)
             }),
+            "buffers" => Ok(json!(
+                PARENT
+                    .with(|parent| parent
+                        .borrow_mut()
+                        .as_mut()
+                        .map(|parent| std::mem::take(&mut parent.received)))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::jsc::payload::write)
+                    .collect::<Vec<_>>()
+            )),
             "close" => {
                 PARENT.with(|p| {
                     if let Some(p) = p.borrow().as_ref() {
@@ -102,21 +116,21 @@ impl State {
                     source.into()
                 };
                 let native = args[1] == true;
-                let data = args[2].clone();
+                let data = args[2].take();
                 let namespace = self.namespace.clone();
                 let packaged = self.packaged;
                 let disabled = self.disabled;
                 let scripts = self.scripts.clone();
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-                let (input, inbox) = mpsc::channel::<Value>();
-                let (output, events) = mpsc::sync_channel::<Value>(64);
+                let (input, inbox) = mpsc::channel::<Payload>();
+                let (output, events) = mpsc::sync_channel::<Payload>(64);
                 let stop = Arc::new(AtomicBool::new(false));
                 let cancelled = stop.clone();
                 let wake = crate::host::Waker::current();
                 let own = input.clone();
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
-                    crate::host::Waker::install(move || { let _ = own.send(Value::Null); });
-                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone() }));
+                    crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
+                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received: Vec::new() }));
                     let result = (|| -> Result<()> {
                         let host = Rc::new(RefCell::new(Host::default()));
                         host.borrow_mut().app_name=Some(namespace);
@@ -131,7 +145,7 @@ impl State {
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = name => { const key = name.replace(/^node:/, ''); const value = globalThis.__apps[key]; if (!value) throw new Error('Unsupported worker module: ' + name); return value; };", "apps:worker-modules")?; }
                         engine.eval_page(&source, "apps:worker")?;
-                        let _ = output.send(json!({"kind":"online"}));
+                        let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
@@ -139,7 +153,10 @@ impl State {
                             let message = if delay < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(delay as u64)) };
                             match message {
                                 Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {
-                                    if !message.is_null() { engine.call("__appsWorkerReceive", &[&message.to_string()])?; }
+                                    if let Some(text) = message.value[0].as_str() {
+                                        PARENT.with(|parent| if let Some(parent) = parent.borrow_mut().as_mut() { parent.received = message.buffers; });
+                                        engine.call("__appsWorkerReceive", &[text])?;
+                                    }
                                 },
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -148,8 +165,8 @@ impl State {
                         Ok(())
                     })();
                     let terminated=cancelled.load(Ordering::Acquire);
-                    if !terminated && let Err(error) = &result { let _ = output.send(json!({"kind":"error","message":format!("{error:#}")})); }
-                    let _ = output.send(json!({"kind":"exit","code":if result.is_ok() && !terminated {0} else {1}}));
+                    if !terminated && let Err(error) = &result { let _ = output.send(json!({"kind":"error","message":format!("{error:#}")}).into()); }
+                    let _ = output.send(json!({"kind":"exit","code":if result.is_ok() && !terminated {0} else {1}}).into());
                     wake.wake();
                     PARENT.with(|parent| *parent.borrow_mut() = None);
                 })?;
@@ -168,9 +185,13 @@ impl State {
                     .workers
                     .get(&args[0].as_u64().context("Expected worker ID")?)
                     .context("Worker is closed")?;
+                let message = args
+                    .as_array_mut()
+                    .context("Expected worker message")?
+                    .split_off(1);
                 worker
                     .input
-                    .send(args[1].clone())
+                    .send(Payload::snapshot(Value::Array(message)))
                     .context("Worker is closed")?;
                 Ok(Value::Null)
             }
@@ -180,7 +201,7 @@ impl State {
                     .get(&args[0].as_u64().context("Expected worker ID")?)
                 {
                     worker.stop.store(true, Ordering::Release);
-                    let _ = worker.input.send(Value::Null);
+                    let _ = worker.input.send(Value::Null.into());
                 }
                 Ok(Value::Null)
             }
@@ -189,7 +210,8 @@ impl State {
                 self.workers.retain(|id, worker| {
                     for _ in 0..64 {
                         match worker.events.try_recv() {
-                            Ok(mut event) => {
+                            Ok(event) => {
+                                let mut event = event.into_value();
                                 let done = event["kind"] == "exit";
                                 event["id"] = json!(id);
                                 events.push(event);

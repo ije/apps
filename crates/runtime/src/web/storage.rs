@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use libsqlite3_sys as sql;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     ffi::{CStr, CString},
     path::PathBuf,
@@ -10,10 +10,14 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-struct Database(*mut sql::sqlite3);
+/// A connection with its prepared statements, kept by SQL text.
+struct Database(*mut sql::sqlite3, RefCell<HashMap<String, *mut sql::sqlite3_stmt>>);
 impl Drop for Database {
     fn drop(&mut self) {
         unsafe {
+            for &statement in self.1.get_mut().values() {
+                sql::sqlite3_finalize(statement);
+            }
             sql::sqlite3_close(self.0);
         }
     }
@@ -104,30 +108,46 @@ impl Database {
             )
         };
         ensure!(!raw.is_null(), "Cannot allocate browser storage");
-        let db = Self(raw);
+        let db = Self(raw, RefCell::default());
         ensure!(code == sql::SQLITE_OK, "Cannot open browser storage");
         Ok(db)
     }
     fn query(&self, source: &str, parameters: &[&str]) -> Result<Vec<Vec<Option<String>>>> {
+        // WARNING: a cached statement holds its read lock and bound values until it is reset.
         struct Statement(*mut sql::sqlite3_stmt);
         impl Drop for Statement {
             fn drop(&mut self) {
                 unsafe {
-                    sql::sqlite3_finalize(self.0);
+                    sql::sqlite3_reset(self.0);
+                    sql::sqlite3_clear_bindings(self.0);
                 }
             }
         }
-        let source = CString::new(source)?;
-        let mut raw = ptr::null_mut();
-        let code = unsafe {
-            sql::sqlite3_prepare_v2(self.0, source.as_ptr(), -1, &mut raw, ptr::null_mut())
-        };
-        ensure!(
-            code == sql::SQLITE_OK,
-            "{}",
-            unsafe { CStr::from_ptr(sql::sqlite3_errmsg(self.0)) }.to_string_lossy()
-        );
-        let statement = Statement(raw);
+        let cached = self.1.borrow().get(source).copied();
+        let statement = Statement(match cached {
+            Some(statement) => statement,
+            None => {
+                let text = CString::new(source)?;
+                let mut raw = ptr::null_mut();
+                let code = unsafe {
+                    sql::sqlite3_prepare_v3(
+                        self.0,
+                        text.as_ptr(),
+                        -1,
+                        sql::SQLITE_PREPARE_PERSISTENT,
+                        &mut raw,
+                        ptr::null_mut(),
+                    )
+                };
+                ensure!(
+                    code == sql::SQLITE_OK && !raw.is_null(),
+                    "{}",
+                    unsafe { CStr::from_ptr(sql::sqlite3_errmsg(self.0)) }.to_string_lossy()
+                );
+                self.1.borrow_mut().insert(source.to_owned(), raw);
+                raw
+            }
+        });
         let mut rows = Vec::new();
         for (index, value) in parameters.iter().enumerate() {
             ensure!(
@@ -174,7 +194,9 @@ impl Database {
 }
 
 type SessionKey = (String, u64);
-static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, BTreeMap<String, String>>>> = OnceLock::new();
+/// The values of a window's session storage, with their total size in bytes.
+type Session = (usize, BTreeMap<String, String>);
+static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
 struct Transaction {
     database: Database,
     name: String,
@@ -190,6 +212,8 @@ pub(crate) struct State {
     transactions: HashMap<u64, Transaction>,
     next_id: u64,
     idle: Vec<Database>,
+    /// localStorage keys in order, valid while the database's `data_version` matches.
+    keys: Option<(Option<String>, Vec<String>)>,
 }
 
 /// Drops the session storage of a closed window.
@@ -202,7 +226,11 @@ pub(crate) fn forget(window: u64) {
 }
 impl State {
     pub(crate) fn configure(&mut self, namespace: &str, window: Option<u64>) {
-        self.namespace = format!("{:x}", Sha256::digest(namespace.as_bytes()));
+        self.namespace = ring::digest::digest(&ring::digest::SHA256, namespace.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         self.window = window.unwrap_or(0);
         let root = std::env::var_os("APPS_DATA_DIR")
             .map(PathBuf::from)
@@ -229,32 +257,38 @@ impl State {
                 .get_or_init(Mutex::default)
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Session storage lock failed"))?;
-            let values = sessions
+            let (size, values) = sessions
                 .entry((self.namespace.clone(), self.window))
                 .or_default();
             let key = args[0].as_str().unwrap_or("");
             return match op {
                 "get" => Ok(json!(values.get(key))),
                 "keys" => Ok(json!(values.keys().collect::<Vec<_>>())),
+                "length" => Ok(json!(values.len())),
+                "key" => Ok(json!(
+                    args[0]
+                        .as_u64()
+                        .and_then(|index| values.keys().nth(index as usize))
+                )),
                 "set" => {
                     let value = args[1].as_str().context("Expected storage value")?;
-                    let size = values
-                        .iter()
-                        .filter(|(name, _)| *name != key)
-                        .map(|(name, value)| name.len() + value.len())
-                        .sum::<usize>();
+                    let old = values.get(key).map_or(0, |old| key.len() + old.len());
                     ensure!(
-                        size + key.len() + value.len() <= 5 << 20,
+                        *size - old + key.len() + value.len() <= 5 << 20,
                         "QuotaExceededError: sessionStorage is full"
                     );
+                    *size = *size - old + key.len() + value.len();
                     values.insert(key.to_owned(), value.to_owned());
                     Ok(Value::Null)
                 }
                 "remove" => {
-                    values.remove(key);
+                    if let Some(old) = values.remove(key) {
+                        *size -= key.len() + old.len();
+                    }
                     Ok(Value::Null)
                 }
                 "clear" => {
+                    *size = 0;
                     values.clear();
                     Ok(Value::Null)
                 }
@@ -319,17 +353,37 @@ impl State {
             }
             let db = self.local_database.as_ref().unwrap();
             let key = args[0].as_str().unwrap_or("");
+            if matches!(op, "keys" | "length" | "key") {
+                // WARNING: other connections can change the keys, and `data_version` only moves for their commits.
+                let version = db
+                    .query("PRAGMA data_version", &[])?
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .flatten();
+                if self.keys.as_ref().is_none_or(|(cached, _)| *cached != version) {
+                    let keys = db
+                        .query("SELECT key FROM local ORDER BY rowid", &[])?
+                        .into_iter()
+                        .map(|row| row.into_iter().flatten().next().unwrap_or_default())
+                        .collect();
+                    self.keys = Some((version, keys));
+                }
+                let keys = &self.keys.as_ref().unwrap().1;
+                return Ok(match op {
+                    "length" => json!(keys.len()),
+                    "key" => json!(args[0].as_u64().and_then(|index| keys.get(index as usize))),
+                    _ => json!(keys),
+                });
+            }
+            if matches!(op, "set" | "remove" | "clear") {
+                self.keys = None;
+            }
             return match op {
                 "get" => Ok(json!(
                     db.query("SELECT value FROM local WHERE key=?", &[key])?
                         .first()
                         .and_then(|r| r[0].as_ref())
-                )),
-                "keys" => Ok(json!(
-                    db.query("SELECT key FROM local ORDER BY rowid", &[])?
-                        .into_iter()
-                        .map(|r| r[0].clone())
-                        .collect::<Vec<_>>()
                 )),
                 "set" => {
                     let value = args[1].as_str().context("Expected storage value")?;

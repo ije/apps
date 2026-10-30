@@ -323,15 +323,8 @@ impl App {
     fn flush(&mut self) {
         for _ in 0..1024 {
             let deferred = std::mem::take(&mut self.deferred);
-            let removed: Vec<_> = self
-                .windows
-                .iter()
-                .filter(|(_, window)| window.as_ref().is_some_and(|window| window.removed))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in removed {
-                self.windows.remove(&id);
-            }
+            self.windows
+                .retain(|_, window| !window.as_ref().is_some_and(|window| window.removed));
             if deferred.is_empty() {
                 return;
             }

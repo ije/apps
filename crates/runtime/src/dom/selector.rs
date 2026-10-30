@@ -1592,7 +1592,9 @@ mod tests {
             assert_eq!(cached.values, fresh.values, "step {step}");
             for (index, (id, key, value)) in checks.into_iter().enumerate() {
                 assert_eq!(
-                    cached.values[id].get(key).is_some_and(|v| v == value),
+                    cached.values[id]
+                        .get(crate::style::Prop::new(key))
+                        .is_some_and(|v| v == value),
                     expected.contains(&index),
                     "step {step}: {key}:{value}"
                 );

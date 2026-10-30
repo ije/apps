@@ -1,5 +1,5 @@
 use super::{
-    ComputedStyles, Declarations, INHERITED, Style, color, components, expand, resolve_keywords,
+    ComputedStyles, Declarations, Prop, Style, color, components, expand, resolve_keywords,
     resolve_style,
 };
 use crate::dom::Document;
@@ -9,27 +9,27 @@ use std::{
     time::Instant,
 };
 
-const PAINT: &[&str] = &[
-    "opacity",
-    "transform",
-    "translate",
-    "rotate",
-    "scale",
-    "box-shadow",
-    "background-color",
-    "background-position",
-    "border-top-color",
-    "border-right-color",
-    "border-bottom-color",
-    "border-left-color",
-    "outline-color",
-    "border-top-left-radius",
-    "border-top-right-radius",
-    "border-bottom-right-radius",
-    "border-bottom-left-radius",
-    "visibility",
-    "z-index",
-    "filter",
+const PAINT: &[Prop] = &[
+    Prop::OPACITY,
+    Prop::TRANSFORM,
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::BOX_SHADOW,
+    Prop::BACKGROUND_COLOR,
+    Prop::BACKGROUND_POSITION,
+    Prop::BORDER_TOP_COLOR,
+    Prop::BORDER_RIGHT_COLOR,
+    Prop::BORDER_BOTTOM_COLOR,
+    Prop::BORDER_LEFT_COLOR,
+    Prop::OUTLINE_COLOR,
+    Prop::BORDER_TOP_LEFT_RADIUS,
+    Prop::BORDER_TOP_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    Prop::BORDER_BOTTOM_LEFT_RADIUS,
+    Prop::VISIBILITY,
+    Prop::Z_INDEX,
+    Prop::FILTER,
 ];
 
 #[derive(Clone, Debug)]
@@ -42,7 +42,7 @@ pub(crate) struct Animation {
     direction: String,
     fill: String,
     timing: String,
-    tracks: Vec<(String, Keyframes)>,
+    tracks: Vec<(Prop, Keyframes)>,
 }
 
 type Keyframes = Vec<(f64, String, String)>;
@@ -55,12 +55,12 @@ impl Animation {
         style: &Style,
         keyframes: &HashMap<String, Vec<(f32, Declarations)>>,
     ) -> Vec<Self> {
-        let shorthand = components(style.get("animation").map_or("none", String::as_str), ',');
+        let shorthand = components(style.get(Prop::ANIMATION).unwrap_or("none"), ',');
         if shorthand.is_empty() {
             return Vec::new();
         }
         let names = style
-            .get("animation-name")
+            .get(Prop::ANIMATION_NAME)
             .map(|value| components(value, ','));
         (0..names.as_ref().map_or(shorthand.len(), Vec::len))
             .filter_map(|index| {
@@ -97,17 +97,17 @@ impl Animation {
                     };
                     values.insert(key, part);
                 }
-                for key in [
-                    "name",
-                    "duration",
-                    "delay",
-                    "iteration-count",
-                    "direction",
-                    "fill-mode",
-                    "timing-function",
-                    "play-state",
+                for (key, prop) in [
+                    ("name", Prop::ANIMATION_NAME),
+                    ("duration", Prop::ANIMATION_DURATION),
+                    ("delay", Prop::ANIMATION_DELAY),
+                    ("iteration-count", Prop::ANIMATION_ITERATION_COUNT),
+                    ("direction", Prop::ANIMATION_DIRECTION),
+                    ("fill-mode", Prop::ANIMATION_FILL_MODE),
+                    ("timing-function", Prop::ANIMATION_TIMING_FUNCTION),
+                    ("play-state", Prop::ANIMATION_PLAY_STATE),
                 ] {
-                    if let Some(value) = style.get(&format!("animation-{key}")) {
+                    if let Some(value) = style.get(prop) {
                         let parts = components(value, ',');
                         if !parts.is_empty() {
                             values.insert(key, parts[index % parts.len()]);
@@ -116,23 +116,23 @@ impl Animation {
                 }
                 let name = values["name"].trim_matches(['\'', '"']);
                 let rules = keyframes.get(name)?;
-                let mut tracks: Vec<(String, Keyframes)> = Vec::new();
+                let mut tracks: Vec<(Prop, Keyframes)> = Vec::new();
                 for (offset, declarations) in rules {
                     let declarations = declarations.resolve();
                     let timing = declarations
-                        .get("animation-timing-function")
-                        .cloned()
+                        .get(Prop::ANIMATION_TIMING_FUNCTION)
+                        .map(str::to_owned)
                         .unwrap_or_default();
                     let mut frame = style.clone();
                     frame.extend(
                         declarations
                             .iter()
                             .filter(|(_, value)| !value.ends_with("!important"))
-                            .map(|(key, value)| (key.clone(), value.clone())),
+                            .map(|(key, value)| (key, value.clone())),
                     );
                     resolve_style(&mut frame, Some(style));
                     resolve_keywords(&mut frame, Some(style));
-                    for (key, value) in &declarations {
+                    for (key, value) in declarations.iter() {
                         if value.ends_with("!important") || !animatable(key) {
                             continue;
                         }
@@ -140,12 +140,12 @@ impl Animation {
                             continue;
                         };
                         let frame = (f64::from(*offset), value.to_owned(), timing.clone());
-                        match tracks.iter_mut().find(|(name, _)| name == key) {
+                        match tracks.iter_mut().find(|(name, _)| *name == key) {
                             Some((_, frames)) => {
                                 frames.retain(|(at, ..)| *at != frame.0);
                                 frames.push(frame);
                             }
-                            None => tracks.push((key.clone(), vec![frame])),
+                            None => tracks.push((key, vec![frame])),
                         }
                     }
                 }
@@ -224,7 +224,7 @@ impl Animation {
                 .iter()
                 .map(|(at, value, timing)| (*at, value.as_str(), timing.as_str()))
                 .collect();
-            if let Some(value) = computed(base, property) {
+            if let Some(value) = computed(base, *property) {
                 if keys[0].0 > 0. {
                     keys.insert(0, (0., value, ""));
                 }
@@ -275,9 +275,9 @@ impl Animation {
                 });
             }
             let local = easing(timing, local);
-            let value = interpolate(property, from.1, to.1, local)
+            let value = interpolate(property.name(), from.1, to.1, local)
                 .unwrap_or_else(|| if local < 0.5 { from.1 } else { to.1 }.to_owned());
-            out.insert(property.clone(), value);
+            out.insert(*property, value);
         }
         (wake, ended)
     }
@@ -292,7 +292,7 @@ struct Clock {
 
 #[derive(Clone)]
 struct Transition {
-    property: String,
+    property: Prop,
     from: String,
     to: String,
     start: Instant,
@@ -353,28 +353,31 @@ impl Motion {
             let running = self.transitions.remove(&id).unwrap_or_default();
             if old.is_empty()
                 || !visible.get(id).copied().unwrap_or(false)
-                || old.get("display").is_some_and(|value| value == "none")
-                || !new.contains_key("transition") && !new.contains_key("transition-property")
+                || old.get(Prop::DISPLAY).is_some_and(|value| value == "none")
+                || !new.contains(Prop::TRANSITION) && !new.contains(Prop::TRANSITION_PROPERTY)
             {
                 continue;
             }
-            let mut properties: Vec<(String, f64, f64, String)> = Vec::new();
+            let mut properties: Vec<(Prop, f64, f64, String)> = Vec::new();
             for (name, duration, delay, timing) in transitions(new) {
-                let names: Vec<String> = match name.as_str() {
+                let names: Vec<Prop> = match name.as_str() {
                     "none" => continue,
                     "all" => old
-                        .keys()
-                        .chain(new.keys())
-                        .filter(|key| animatable(key) && old.get(*key) != new.get(*key))
-                        .chain(running.iter().map(|transition| &transition.property))
-                        .cloned()
+                        .iter()
+                        .chain(new.iter())
+                        .map(|(key, _)| key)
+                        .filter(|&key| animatable(key) && old.get(key) != new.get(key))
+                        .chain(running.iter().map(|transition| transition.property))
                         .collect(),
                     _ => {
                         let mut longhands = Vec::new();
                         if !expand(&name, "0", &mut longhands) {
                             longhands.push((name, String::new()));
                         }
-                        longhands.into_iter().map(|(name, _)| name).collect()
+                        longhands
+                            .into_iter()
+                            .map(|(name, _)| Prop::new(&name))
+                            .collect()
                     }
                 };
                 for name in names {
@@ -384,7 +387,7 @@ impl Motion {
             }
             let mut next = Vec::new();
             for (property, duration, delay, timing) in properties {
-                let Some(after) = computed(new, &property) else {
+                let Some(after) = computed(new, property) else {
                     continue;
                 };
                 if duration.max(0.) + delay <= 0. {
@@ -400,7 +403,7 @@ impl Motion {
                         let progress = old.progress(now);
                         let current = progress
                             .and_then(|progress| {
-                                interpolate(&property, &old.from, &old.to, progress)
+                                interpolate(property.name(), &old.from, &old.to, progress)
                             })
                             .unwrap_or_else(|| old.to.clone());
                         if old.reverse == after {
@@ -413,12 +416,12 @@ impl Motion {
                             (current.clone(), current, 1.)
                         }
                     }
-                    None => match computed(&old, &property) {
+                    None => match computed(&old, property) {
                         Some(before) => (before.to_owned(), before.to_owned(), 1.),
                         None => continue,
                     },
                 };
-                if from == after || interpolate(&property, &from, after, 0.5).is_none() {
+                if from == after || interpolate(property.name(), &from, after, 0.5).is_none() {
                     continue;
                 }
                 next.push(Transition {
@@ -496,10 +499,7 @@ impl Motion {
                 };
                 wakes.push((
                     id,
-                    effect
-                        .tracks
-                        .iter()
-                        .all(|(key, _)| PAINT.contains(&key.as_str())),
+                    effect.tracks.iter().all(|(key, _)| PAINT.contains(key)),
                     if effect.tracks.is_empty() {
                         end
                     } else {
@@ -514,12 +514,12 @@ impl Motion {
             list.retain(|transition| match transition.progress(now) {
                 Some(progress) => {
                     if let Some(value) = interpolate(
-                        &transition.property,
+                        transition.property.name(),
                         &transition.from,
                         &transition.to,
                         progress,
                     ) {
-                        out.insert(transition.property.clone(), value);
+                        out.insert(transition.property, value);
                     }
                     let time = now
                         .saturating_duration_since(transition.start)
@@ -527,7 +527,7 @@ impl Motion {
                         - transition.delay;
                     wakes.push((
                         id,
-                        PAINT.contains(&transition.property.as_str()),
+                        PAINT.contains(&transition.property),
                         (-time).max(0.),
                         transition.duration - time,
                     ));
@@ -537,7 +537,7 @@ impl Motion {
                     events.push((
                         id,
                         "transitionend",
-                        transition.property.clone(),
+                        transition.property.name().to_owned(),
                         transition.duration,
                     ));
                     false
@@ -548,8 +548,8 @@ impl Motion {
         animated.retain(|_, values| !values.is_empty());
         let mut inherited = Vec::new();
         for (&id, values) in &animated {
-            for (key, value) in values {
-                if INHERITED.binary_search(&key.as_str()).is_err() {
+            for (key, value) in values.iter() {
+                if !key.inherited() {
                     continue;
                 }
                 let base = styles.values[id].get(key);
@@ -563,9 +563,9 @@ impl Motion {
                         if styles.values[child].get(key) == base
                             && animated
                                 .get(&child)
-                                .is_none_or(|values| !values.contains_key(key))
+                                .is_none_or(|values| !values.contains(key))
                         {
-                            inherited.push((child, key.clone(), value.clone()));
+                            inherited.push((child, key, value.clone()));
                             pending.push(child);
                         }
                     }
@@ -578,28 +578,25 @@ impl Motion {
         }
         for (&id, values) in &animated {
             if styles.values[id]
-                .get("display")
-                .is_none_or(|value| matches!(value.as_str(), "inline" | "contents"))
-                || values.keys().any(|key| !PAINT.contains(&key.as_str()))
+                .get(Prop::DISPLAY)
+                .is_none_or(|value| matches!(value, "inline" | "contents"))
+                || values.iter().any(|(key, _)| !PAINT.contains(&key))
             {
                 layout.insert(id);
             }
         }
         // WARNING: paint-only changes under a non-animated `opacity: 0` or inside a fully hidden
         // subtree can't be seen, so they only wake the view for their end events.
-        let fixed = |id: usize, key: &str| {
-            animated
-                .get(&id)
-                .is_none_or(|values| !values.contains_key(key))
-        };
+        let fixed =
+            |id: usize, key: Prop| animated.get(&id).is_none_or(|values| !values.contains(key));
         let mut next = f64::INFINITY;
         for (id, paint, change, end) in wakes {
             let unseen = paint && {
                 let mut faded = false;
                 let mut chain = Some(id);
                 while let Some(node) = chain {
-                    faded |= fixed(node, "opacity")
-                        && styles.values[node].get("opacity").is_some_and(|value| {
+                    faded |= fixed(node, Prop::OPACITY)
+                        && styles.values[node].get(Prop::OPACITY).is_some_and(|value| {
                             value.trim_end_matches('%').parse::<f32>() == Ok(0.)
                         });
                     chain = doc.nodes[node].parent.filter(|_| !faded);
@@ -611,10 +608,10 @@ impl Motion {
                     if tag.starts_with('#') && tag != "#text" {
                         continue;
                     }
-                    hidden = fixed(node, "visibility")
+                    hidden = fixed(node, Prop::VISIBILITY)
                         && styles.values[node]
-                            .get("visibility")
-                            .is_some_and(|value| matches!(value.as_str(), "hidden" | "collapse"));
+                            .get(Prop::VISIBILITY)
+                            .is_some_and(|value| matches!(value, "hidden" | "collapse"));
                     pending.extend(
                         styles
                             .children
@@ -637,11 +634,7 @@ impl Motion {
                     }
                     _ => {
                         let mut style = (**base).clone();
-                        style.extend(
-                            values
-                                .iter()
-                                .map(|(key, value)| (key.clone(), value.clone())),
-                        );
+                        style.extend(values.iter().map(|(key, value)| (key, value.clone())));
                         let style = Rc::new(style);
                         self.styled
                             .insert(id, (base.clone(), values, style.clone()));
@@ -658,8 +651,9 @@ impl Motion {
     }
 }
 
-fn animatable(key: &str) -> bool {
-    !key.starts_with("--")
+fn animatable(prop: Prop) -> bool {
+    let key = prop.name();
+    !prop.is_custom()
         && !key.starts_with("animation")
         && !key.starts_with("transition")
         && !key.starts_with("container")
@@ -669,8 +663,9 @@ fn animatable(key: &str) -> bool {
         )
 }
 
-fn computed<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
-    style.get(key).map(String::as_str).or(match key {
+fn computed(style: &Style, prop: Prop) -> Option<&str> {
+    let key = prop.name();
+    style.get(prop).or(match key {
         "opacity" | "flex-shrink" => Some("1"),
         "flex-grow" => Some("0"),
         "transform" | "translate" | "rotate" | "scale" | "box-shadow" | "text-shadow"
@@ -691,7 +686,7 @@ fn computed<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
         _ if key.starts_with("border-") && key.ends_with("-width") || key == "outline-width" => {
             Some("3px")
         }
-        _ if key.ends_with("-color") => style.get("color").map(String::as_str),
+        _ if key.ends_with("-color") => style.get(Prop::COLOR),
         _ => None,
     })
 }
@@ -699,7 +694,7 @@ fn computed<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
 fn transitions(style: &Style) -> Vec<(String, f64, f64, String)> {
     const DEFAULT: [&str; 4] = ["all", "0s", "0s", "ease"];
     let shorthand: Vec<[&str; 4]> = style
-        .get("transition")
+        .get(Prop::TRANSITION)
         .map(|value| components(value, ','))
         .unwrap_or_default()
         .into_iter()
@@ -720,12 +715,12 @@ fn transitions(style: &Style) -> Vec<(String, f64, f64, String)> {
         })
         .collect();
     let longhands = [
-        "transition-property",
-        "transition-duration",
-        "transition-delay",
-        "transition-timing-function",
+        Prop::TRANSITION_PROPERTY,
+        Prop::TRANSITION_DURATION,
+        Prop::TRANSITION_DELAY,
+        Prop::TRANSITION_TIMING_FUNCTION,
     ]
-    .map(|key| style.get(key).map(|value| components(value, ',')));
+    .map(|prop| style.get(prop).map(|value| components(value, ',')));
     (0..longhands[0].as_ref().map_or(shorthand.len(), Vec::len))
         .filter_map(|index| {
             let mut parts = shorthand
@@ -1075,7 +1070,7 @@ mod tests {
             let mut out = Style::new();
             let (wake, _) = effect.sample(elapsed, &base, &mut out);
             (
-                out.get("opacity")
+                out.get(Prop::OPACITY)
                     .map(|value| value.parse::<f64>().unwrap()),
                 wake.is_some(),
             )
@@ -1112,15 +1107,15 @@ mod tests {
         let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let mut out = Style::new();
         styles.animations[&div][0].sample(1., &styles.values[div], &mut out);
-        assert_eq!(out["transform"], "translateX(50px) rotate(45deg)");
-        assert_eq!(out["background-color"], "#800080ff");
-        assert_eq!(out["width"], "50%");
-        out.clear();
+        assert_eq!(&out["transform"], "translateX(50px) rotate(45deg)");
+        assert_eq!(&out["background-color"], "#800080ff");
+        assert_eq!(&out["width"], "50%");
+        out = Style::new();
         styles.animations[&div][0].sample(0.5, &styles.values[div], &mut out);
-        assert_eq!(out["width"], "calc(10px * 0.5 + 50% * 0.5)");
-        out.clear();
+        assert_eq!(&out["width"], "calc(10px * 0.5 + 50% * 0.5)");
+        out = Style::new();
         styles.animations[&p][0].sample(0.25, &styles.values[p], &mut out);
-        assert_eq!(out["transform"], "rotate(90deg)");
+        assert_eq!(&out["transform"], "rotate(90deg)");
     }
 
     #[test]
@@ -1196,17 +1191,17 @@ mod tests {
         let on = computed_styles(&doc);
         let (values, running, _) = update(&mut motion, &doc, &on, 0.);
         assert!(running);
-        assert_eq!(values[&id]["color"], "blue");
-        assert_eq!(values[&text]["color"], "blue");
-        assert_eq!(values[&id]["width"], "20px");
+        assert_eq!(&values[&id]["color"], "blue");
+        assert_eq!(&values[&text]["color"], "blue");
+        assert_eq!(&values[&id]["width"], "20px");
         let (values, ..) = update(&mut motion, &doc, &on, 0.5);
-        assert_eq!(values[&id]["color"], "#800080ff");
+        assert_eq!(&values[&id]["color"], "#800080ff");
         doc.nodes[id].attrs.remove("class");
         let off = computed_styles(&doc);
         let (values, ..) = update(&mut motion, &doc, &off, 0.5);
-        assert_eq!(values[&id]["color"], "#800080ff");
+        assert_eq!(&values[&id]["color"], "#800080ff");
         let (values, ..) = update(&mut motion, &doc, &off, 0.75);
-        assert_eq!(values[&id]["color"], "#4000c0ff");
+        assert_eq!(&values[&id]["color"], "#4000c0ff");
         let (values, running, event) = update(&mut motion, &doc, &off, 1.);
         assert!(values.is_empty() && !running);
         assert_eq!(event, Some("transitionend"));
@@ -1294,7 +1289,7 @@ mod tests {
         };
         let (half, end, later) = (style(0.5), style(2.), style(3.));
         assert!(!Rc::ptr_eq(&half, &end) && Rc::ptr_eq(&end, &later));
-        assert_eq!(later["width"], "10px");
+        assert_eq!(&later["width"], "10px");
     }
 
     #[test]
@@ -1317,9 +1312,9 @@ mod tests {
         let frames = HashMap::from([("pulse".into(), Vec::new())]);
         assert!(
             Animation::parse(
-                &Style::from([
-                    ("animation".into(), "".into()),
-                    ("animation-name".into(), "pulse".into())
+                &Style::from_iter([
+                    (Prop::new("animation"), "".into()),
+                    (Prop::new("animation-name"), "pulse".into())
                 ]),
                 &frames
             )
@@ -1327,21 +1322,18 @@ mod tests {
         );
         assert!(
             Animation::parse(
-                &Style::from([
-                    ("animation".into(), "1s pulse".into()),
-                    ("animation-iteration-count".into(), "NaN".into())
+                &Style::from_iter([
+                    (Prop::new("animation"), "1s pulse".into()),
+                    (Prop::new("animation-iteration-count"), "NaN".into())
                 ]),
                 &frames
             )
             .is_empty()
         );
         assert_eq!(
-            transitions(&Style::from([
-                (
-                    "transition".into(),
-                    "opacity .2s ease-in 1s, all .3s".into()
-                ),
-                ("transition-timing-function".into(), "linear".into())
+            transitions(&Style::from_iter([
+                (Prop::TRANSITION, "opacity .2s ease-in 1s, all .3s".into()),
+                (Prop::new("transition-timing-function"), "linear".into())
             ])),
             vec![
                 ("opacity".into(), 0.2, 1., "linear".into()),

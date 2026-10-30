@@ -271,8 +271,11 @@ impl Host {
                         if before == Some(child) {
                             return Ok(false);
                         }
-                        if let Some(old) = doc.nodes[child].parent {
-                            doc.nodes[old].children.retain(|&id| id != child);
+                        if let Some(old) = doc.nodes[child].parent
+                            && let Some(index) =
+                                doc.nodes[old].children.iter().position(|&id| id == child)
+                        {
+                            doc.nodes[old].children.remove(index);
                         }
                         let children = &mut doc.nodes[parent].children;
                         let index = before
@@ -284,14 +287,18 @@ impl Host {
                     }
                     3 => {
                         let parent = node(doc, a)?;
-                        let child = usize::try_from(b)
+                        let child = usize::try_from(b).context("Node is not a child")?;
+                        // WARNING: `c` is the child's index in the page mirror, so check it before the scan.
+                        let children = &doc.nodes[parent].children;
+                        let index = usize::try_from(c)
                             .ok()
-                            .filter(|id| doc.nodes[parent].children.contains(id))
+                            .filter(|&index| children.get(index) == Some(&child))
+                            .or_else(|| children.iter().position(|&id| id == child))
                             .context("Node is not a child")?;
                         if state.computed.is_some() && connected(doc, &state.hosts, parent) {
                             state.computed = None;
                         }
-                        doc.nodes[parent].children.retain(|&id| id != child);
+                        doc.nodes[parent].children.remove(index);
                         doc.nodes[child].parent = None;
                         state.detached.push(child);
                         true
@@ -474,9 +481,9 @@ impl Host {
             "process.write" => {
                 let bytes = crate::node::bytes(&args[1])?;
                 if args[0] == 2 {
-                    std::io::stderr().write_all(&bytes)?;
+                    std::io::stderr().write_all(bytes)?;
                 } else {
-                    std::io::stdout().write_all(&bytes)?;
+                    std::io::stdout().write_all(bytes)?;
                 }
                 Ok(Value::Null)
             }

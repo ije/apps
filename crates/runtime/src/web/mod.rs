@@ -9,13 +9,23 @@ pub(crate) mod worker;
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::{
+    Client,
+    connect::{HttpConnector, dns::Name},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::{collections::HashMap, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 
 static NETWORK: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 use url::{Url, quirks};
 
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
@@ -29,9 +39,77 @@ pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
     Ok(NETWORK.get().unwrap())
 }
 
+#[derive(Debug)]
+struct NativeRoots(
+    OnceLock<Option<Arc<rustls::client::WebPkiServerVerifier>>>,
+    rustls::crypto::WebPkiSupportedAlgorithms,
+);
+
+impl rustls::client::danger::ServerCertVerifier for NativeRoots {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // WARNING: loading the OS root certificates takes about 100 ms, so wait for the first TLS handshake.
+        self.0
+            .get_or_init(|| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+                rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+            .ok_or_else(|| rustls::Error::General("No root certificates".into()))?
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.1)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.1)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.1.supported_schemes()
+    }
+}
+
+pub(crate) fn tls() -> Arc<rustls::ClientConfig> {
+    TLS.get_or_init(|| {
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NativeRoots(
+                    OnceLock::new(),
+                    algorithms,
+                )))
+                .with_no_client_auth(),
+        )
+    })
+    .clone()
+}
+
 pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
     if let Some(bytes) = crate::jsc::payload::read(value) {
-        return bytes;
+        return bytes.map(Vec::from);
     }
     Ok(match value.as_str() {
         Some(text) => STANDARD.decode(text)?,
@@ -40,7 +118,7 @@ pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn base64(bytes: &[u8]) -> Value {
-    crate::jsc::payload::write(bytes).unwrap_or_else(|| Value::String(STANDARD.encode(bytes)))
+    crate::jsc::payload::write(bytes::Bytes::copy_from_slice(bytes))
 }
 
 pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
@@ -80,24 +158,42 @@ pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
     }
 }
 
-struct PublicDns;
+type Agent = Client<
+    hyper_rustls::HttpsConnector<HttpConnector<Dns>>,
+    http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, std::io::Error>,
+>;
 
-impl reqwest::dns::Resolve for PublicDns {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+#[derive(Clone)]
+struct Dns(bool);
+
+impl tower_service::Service<Name> for Dns {
+    type Response = std::vec::IntoIter<std::net::SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let public = self.0;
         Box::pin(async move {
             let addresses: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            if addresses.is_empty()
-                || addresses
-                    .iter()
-                    .any(|address| private_address(address.ip()))
+            if public
+                && (addresses.is_empty()
+                    || addresses
+                        .iter()
+                        .any(|address| private_address(address.ip())))
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "Pages cannot access private networks",
-                )
-                .into());
+                ));
             }
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+            Ok(addresses.into_iter())
         })
     }
 }
@@ -126,17 +222,21 @@ pub struct State {
     storage: crate::web::storage::State,
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
-    agent: Option<reqwest::Client>,
+    agent: Option<Agent>,
 }
 
 impl State {
     pub fn configure_storage(&mut self, host: &crate::host::Host, window: Option<u64>) {
         let namespace = host.app_name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
-        self.workers
-            .configure(namespace, host.packaged, host.disabled, host.scripts.clone());
+        self.workers.configure(
+            namespace,
+            host.packaged,
+            host.disabled,
+            host.scripts.clone(),
+        );
     }
-    pub fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
+    pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
             "url" => {
                 let input = args[0].as_str().context("Expected URL")?;
@@ -196,21 +296,23 @@ impl State {
                 let mut bytes = vec![0; length as usize];
                 getrandom::fill(&mut bytes)
                     .map_err(|e| anyhow::anyhow!("Random source failed: {e}"))?;
-                Ok(base64(&bytes))
+                Ok(crate::jsc::payload::write(bytes))
             }
             "digest" => {
-                let bytes = bytes(&args[1])?;
-                let digest = match args[0].as_str().context("Expected algorithm")? {
-                    "SHA-1" => sha1_smol::Sha1::from(&bytes).digest().bytes().to_vec(),
-                    "SHA-256" => Sha256::digest(&bytes).to_vec(),
-                    "SHA-384" => Sha384::digest(&bytes).to_vec(),
-                    "SHA-512" => Sha512::digest(&bytes).to_vec(),
+                let bytes = crate::node::bytes(&args[1])?;
+                let algorithm = match args[0].as_str().context("Expected algorithm")? {
+                    "SHA-1" => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                    "SHA-256" => &ring::digest::SHA256,
+                    "SHA-384" => &ring::digest::SHA384,
+                    "SHA-512" => &ring::digest::SHA512,
                     _ => bail!("Unsupported digest algorithm"),
                 };
-                Ok(base64(&digest))
+                Ok(crate::jsc::payload::write(
+                    ring::digest::digest(algorithm, bytes).as_ref().to_vec(),
+                ))
             }
             "decode" => {
-                let bytes = bytes(&args[0])?;
+                let bytes = crate::node::bytes(&args[0])?;
                 let mut offset = 0;
                 let mut end = bytes.len();
                 while let Err(error) = std::str::from_utf8(&bytes[offset..]) {
@@ -222,9 +324,10 @@ impl State {
                     ensure!(args[2] != true, "Invalid UTF-8 data");
                     offset += error.error_len().unwrap_or(bytes.len() - offset);
                 }
-                Ok(
-                    json!({"text": String::from_utf8_lossy(&bytes[..end]), "pending": base64(&bytes[end..])}),
-                )
+                Ok(json!([
+                    String::from_utf8_lossy(&bytes[..end]),
+                    bytes.len() - end
+                ]))
             }
             "fetch.start" => {
                 ensure!(self.fetches.len() < 256, "Too many active fetch requests");
@@ -262,19 +365,24 @@ impl State {
                 let mut body = bytes::Bytes::from(bytes(&args[0]["body"])?);
                 let redirect = args[0]["redirect"].as_str().unwrap_or("follow").to_owned();
                 let network = network()?;
-                if self.agent.is_none() {
-                    let mut builder = reqwest::Client::builder()
-                        .redirect_policy(reqwest::redirect::Policy::none())
-                        .connect_timeout(Duration::from_secs(30));
-                    if self.renderer {
-                        builder = builder
-                            .no_proxy()
-                            .dns_resolver(std::sync::Arc::new(PublicDns));
-                    }
-                    self.agent = Some(builder.build()?);
-                }
-                let agent = self.agent.as_ref().unwrap().clone();
                 let renderer = self.renderer;
+                let agent = self
+                    .agent
+                    .get_or_insert_with(|| {
+                        let mut http = HttpConnector::new_with_resolver(Dns(renderer));
+                        http.enforce_http(false);
+                        http.set_nodelay(true);
+                        http.set_connect_timeout(Some(Duration::from_secs(30)));
+                        Client::builder(hyper_util::rt::TokioExecutor::new())
+                            .pool_timer(hyper_util::rt::TokioTimer::new())
+                            .build(hyper_rustls::HttpsConnector::new(
+                                http,
+                                tls(),
+                                false,
+                                Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
+                            ))
+                    })
+                    .clone();
                 let (events_tx, events) = mpsc::channel(64);
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
@@ -284,7 +392,7 @@ impl State {
                     let result: Result<()> = async {
                         if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }
                         let mut redirects = 0;
-                        let mut response = loop {
+                        let response = loop {
                             if renderer {
                                 let ip = match url.host() {
                                     Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
@@ -293,19 +401,22 @@ impl State {
                                 };
                                 ensure!(!ip.is_some_and(private_address), "Pages cannot access private networks");
                             }
-                            let mut request = agent.request(reqwest::Method::from_bytes(method.as_bytes())?, url.clone());
+                            let mut request = hyper::Request::builder().method(method.as_bytes()).uri(url.as_str());
                             for (name, value) in &headers { request = request.header(name, value); }
+                            let has = |name: &str| headers.iter().any(|(key, _)| key.eq_ignore_ascii_case(name));
+                            if !has("accept") { request = request.header("accept", "*/*"); }
+                            if !has("accept-encoding") && !has("range") { request = request.header("accept-encoding", "gzip"); }
                             let streaming = upload_rx.is_some();
                             let request_body = if let Some(receiver) = upload_rx.take() {
                                 let sender = (events_tx.clone(), wake.clone());
-                                reqwest::Body::wrap_stream(futures_util::stream::unfold((receiver, sender), |(mut receiver, sender)| async move {
+                                http_body_util::StreamBody::new(futures_util::stream::unfold((receiver, sender), |(mut receiver, sender)| async move {
                                     let chunk = receiver.recv().await.flatten()?;
                                     sender.0.send(json!({"kind": "upload"}).into()).await.ok()?;
                                     sender.1.wake();
-                                    Some((Ok::<_, std::io::Error>(chunk), (receiver, sender)))
-                                }))
-                            } else { reqwest::Body::from(body.clone()) };
-                            let response = request.body(request_body).send().await?;
+                                    Some((Ok::<_, std::io::Error>(hyper::body::Frame::data(chunk)), (receiver, sender)))
+                                })).boxed_unsync()
+                            } else { http_body_util::Full::new(body.clone()).map_err(|never| match never {}).boxed_unsync() };
+                            let response = agent.request(request.body(request_body)?).await?;
                             let status = response.status().as_u16();
                             if !matches!(status, 301 | 302 | 303 | 307 | 308) { break response; }
                             ensure!(redirect != "error", "Redirect is not allowed");
@@ -328,20 +439,26 @@ impl State {
                             url = next;
                             redirects += 1;
                         };
-                        let headers: Vec<_> = response.headers().iter().map(|(name, value)| {
+                        let (parts, mut response) = response.into_parts();
+                        let mut gzip = parts.headers.get_all("content-encoding").iter().any(|value| value == "gzip").then(|| flate2::write::GzDecoder::new(Vec::new()));
+                        let headers: Vec<_> = parts.headers.iter().filter(|(name, _)| gzip.is_none() || !matches!(name.as_str(), "content-encoding" | "content-length")).map(|(name, value)| {
                             (name.as_str(), value.as_bytes().iter().map(|&b| char::from(b)).collect::<String>())
                         }).collect();
-                        let metadata = json!({"kind": "headers", "status": response.status().as_u16(),
-                            "statusText": response.status().canonical_reason().unwrap_or(""), "headers": headers,
-                            "url": response.url().to_string(), "redirected": redirects > 0});
+                        let metadata = json!({"kind": "headers", "status": parts.status.as_u16(),
+                            "statusText": parts.status.canonical_reason().unwrap_or(""), "headers": headers,
+                            "url": url.as_str(), "redirected": redirects > 0});
                         if events_tx.send(metadata.into()).await.is_err() { return Ok(()); }
                         wake.wake();
-                        let (mut buffer, mut wanted, mut ended, mut pulled) = (Vec::new(), false, false, false);
+                        let (mut buffer, mut input, mut wanted, mut ended, mut pulled) = (Vec::new(), bytes::Bytes::new(), false, false, false);
                         loop {
                             // WARNING: an unread body holds its buffer until GC, so read ahead little before the first pull.
-                            tokio::select! {
-                                demand = demand_rx.recv() => { if demand.is_none() { break; } wanted = true; pulled = true; }
-                                chunk = response.chunk(), if !ended && buffer.len() < if pulled { 1 << 20 } else { 64 << 10 } => match chunk? { Some(bytes) => buffer.extend_from_slice(&bytes), None => ended = true },
+                            let limit = if pulled { 1 << 20 } else { 64 << 10 };
+                            // WARNING: gzip data can inflate 1000 times, so inflate it in small steps.
+                            while !input.is_empty() && buffer.len() < limit {
+                                match &mut gzip {
+                                    Some(decoder) => { decoder.write_all(&input.split_to(input.len().min(4096)))?; buffer.append(decoder.get_mut()); }
+                                    None => buffer.extend_from_slice(&std::mem::take(&mut input)),
+                                }
                             }
                             if wanted && (ended || !buffer.is_empty()) {
                                 wanted = false;
@@ -350,6 +467,17 @@ impl State {
                                 if events_tx.send(event).await.is_err() { break; }
                                 wake.wake();
                                 if done { break; }
+                                continue;
+                            }
+                            tokio::select! {
+                                demand = demand_rx.recv() => { if demand.is_none() { break; } wanted = true; pulled = true; }
+                                frame = response.frame(), if !ended && input.is_empty() && buffer.len() < limit => match frame.transpose()? {
+                                    Some(frame) => input = frame.into_data().unwrap_or_default(),
+                                    None => {
+                                        if let Some(decoder) = gzip.as_mut().filter(|decoder| decoder.header().is_some()) { decoder.try_finish()?; buffer.append(decoder.get_mut()); }
+                                        ended = true;
+                                    }
+                                },
                             }
                         }
                         Ok(())

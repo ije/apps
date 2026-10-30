@@ -1,11 +1,18 @@
 use crate::{
-    DevicePixels, Size,
+    DevicePixels, Point, Size,
     scene::{AtlasTextureKind, AtlasTile},
     text::RenderGlyphParams,
 };
 use anyhow::Result;
 use rustc_hash::FxHashMap;
-use std::{borrow::Cow, cell::RefCell};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+};
+
+/// Past this many glyph pixels, glyphs unused for `MAX_AGE` frames are dropped.
+const MAX_GLYPH_PIXELS: usize = 4 << 20;
+const MAX_AGE: u32 = 60;
 
 /// What an atlas tile holds.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -35,48 +42,110 @@ pub(crate) trait AtlasBackend {
     fn remove(&mut self, tile: AtlasTile);
 }
 
+/// A tile, `None` for a glyph without pixels, with the offset of its pixels from the glyph
+/// origin and the frame it was last used in.
+struct Entry {
+    tile: Option<AtlasTile>,
+    origin: Point<DevicePixels>,
+    used: Cell<u32>,
+}
+
 /// Glyphs and images packed into GPU textures, by key.
 pub(crate) struct Atlas<B> {
-    tiles: RefCell<FxHashMap<AtlasKey, AtlasTile>>,
+    tiles: RefCell<FxHashMap<AtlasKey, Entry>>,
+    frame: Cell<u32>,
+    glyph_pixels: Cell<usize>,
     pub(crate) backend: RefCell<B>,
 }
 
-pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>> + 'a;
+/// The offset of a tile's pixels from the glyph origin, their size and bytes.
+pub(crate) type Raster<B> = (Point<DevicePixels>, Size<DevicePixels>, B);
+
+pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
+
+fn pixels(tile: &AtlasTile) -> usize {
+    tile.bounds.size.width.0 as usize * tile.bounds.size.height.0 as usize
+}
 
 impl<B: AtlasBackend> Atlas<B> {
     pub fn new(backend: B) -> Self {
         Self {
             tiles: RefCell::default(),
+            frame: Cell::new(0),
+            glyph_pixels: Cell::new(0),
             backend: RefCell::new(backend),
         }
     }
 
+    /// The tile and the offset of its pixels. `build` returns `None` for a glyph without pixels.
     pub fn get_or_insert_with(
         &self,
         key: &AtlasKey,
         build: &mut Build<'_>,
-    ) -> Result<Option<AtlasTile>> {
-        if let Some(tile) = self.tiles.borrow().get(key) {
-            return Ok(Some(*tile));
+    ) -> Result<Option<(AtlasTile, Point<DevicePixels>)>> {
+        if let Some(entry) = self.tiles.borrow().get(key) {
+            entry.used.set(self.frame.get());
+            return Ok(entry.tile.map(|tile| (tile, entry.origin)));
         }
-        let Some((size, bytes)) = build()? else {
-            return Ok(None);
+        let (tile, origin) = match build()? {
+            Some((origin, size, bytes)) => {
+                let tile = self.backend.borrow_mut().insert(key.kind(), size, &bytes)?;
+                if let AtlasKey::Glyph(_) = key {
+                    self.glyph_pixels
+                        .set(self.glyph_pixels.get() + pixels(&tile));
+                }
+                (Some(tile), origin)
+            }
+            None => (None, Point::default()),
         };
-        let tile = self.backend.borrow_mut().insert(key.kind(), size, &bytes)?;
-        self.tiles.borrow_mut().insert(key.clone(), tile);
-        Ok(Some(tile))
+        self.tiles.borrow_mut().insert(
+            key.clone(),
+            Entry {
+                tile,
+                origin,
+                used: Cell::new(self.frame.get()),
+            },
+        );
+        Ok(tile.map(|tile| (tile, origin)))
     }
 
     pub fn remove(&self, key: &AtlasKey) {
-        if let Some(tile) = self.tiles.borrow_mut().remove(key) {
+        if let Some(Entry {
+            tile: Some(tile), ..
+        }) = self.tiles.borrow_mut().remove(key)
+        {
             self.backend.borrow_mut().remove(tile);
         }
+    }
+
+    /// Ends a frame, and drops the glyphs unused for a while once there are too many.
+    pub fn finish_frame(&self) {
+        let frame = self.frame.replace(self.frame.get().wrapping_add(1));
+        let mut glyph_pixels = self.glyph_pixels.get();
+        if glyph_pixels <= MAX_GLYPH_PIXELS {
+            return;
+        }
+        // WARNING: frames in flight may still read a tile, so only long unused tiles are freed.
+        let mut backend = self.backend.borrow_mut();
+        self.tiles.borrow_mut().retain(|key, entry| {
+            if !matches!(key, AtlasKey::Glyph(_)) || frame.wrapping_sub(entry.used.get()) < MAX_AGE
+            {
+                return true;
+            }
+            if let Some(tile) = entry.tile {
+                glyph_pixels -= pixels(&tile);
+                backend.remove(tile);
+            }
+            false
+        });
+        self.glyph_pixels.set(glyph_pixels);
     }
 
     /// Drops every tile, for a lost device.
     #[allow(dead_code)]
     pub fn clear(&self, reset: impl FnOnce(&mut B)) {
         self.tiles.borrow_mut().clear();
+        self.glyph_pixels.set(0);
         reset(&mut self.backend.borrow_mut());
     }
 }

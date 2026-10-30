@@ -1,3 +1,4 @@
+use crate::style::Prop;
 use crate::{
     dom::Document,
     style::{self, Lengths, Style, components, parser},
@@ -141,7 +142,7 @@ pub(crate) fn transform(
         matrix = multiply(&matrix, &next);
         changed = true;
     };
-    if let Some(value) = style.get("translate").filter(|value| *value != "none") {
+    if let Some(value) = style.get(Prop::TRANSLATE).filter(|value| *value != "none") {
         let parts = components(value, ' ');
         then(translate(
             length(parts.first()?, size[0])?,
@@ -149,7 +150,7 @@ pub(crate) fn transform(
             parts.get(2).map_or(Some(0.), |z| length(z, 0.))?,
         ));
     }
-    if let Some(value) = style.get("rotate").filter(|value| *value != "none") {
+    if let Some(value) = style.get(Prop::ROTATE).filter(|value| *value != "none") {
         let parts = components(value, ' ');
         let (last, rest) = parts.split_last()?;
         let axis = match rest {
@@ -161,7 +162,7 @@ pub(crate) fn transform(
         };
         then(rotate(axis, angle(last)?)?);
     }
-    if let Some(value) = style.get("scale").filter(|value| *value != "none") {
+    if let Some(value) = style.get(Prop::SCALE).filter(|value| *value != "none") {
         let parts = components(value, ' ');
         let x = number(parts.first()?)?;
         then(scale(
@@ -170,7 +171,7 @@ pub(crate) fn transform(
             parts.get(2).map_or(Some(1.), |z| number(z))?,
         ));
     }
-    for part in components(style.get("transform").map_or("", String::as_str), ' ') {
+    for part in components(style.get(Prop::TRANSFORM).unwrap_or(""), ' ') {
         let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
         else {
             continue;
@@ -242,9 +243,7 @@ pub(crate) fn transform(
         return None;
     }
     let [ox, oy, oz] = origin(
-        style
-            .get("transform-origin")
-            .map_or("50% 50%", String::as_str),
+        style.get(Prop::TRANSFORM_ORIGIN).unwrap_or("50% 50%"),
         units,
         size,
     );
@@ -997,7 +996,7 @@ mod tests {
     fn style(pairs: &[(&str, &str)]) -> Style {
         pairs
             .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .map(|(key, value)| (crate::style::Prop::new(key), (*value).into()))
             .collect()
     }
 

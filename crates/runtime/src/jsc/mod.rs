@@ -641,8 +641,10 @@ unsafe extern "C" fn call(
                 4 => Value::String(api.text(ctx, value)),
                 5 if unsafe { (api.is_function)(ctx, value) } => Value::Null,
                 5 => {
-                    let bytes = crate::jsc::payload::view(&api, ctx, value)?;
-                    buffers.push(bytes::Bytes::copy_from_slice(bytes));
+                    // WARNING: the arguments live until the call returns, so their bytes are borrowed, see `payload::input`.
+                    buffers.push(bytes::Bytes::from_static(crate::jsc::payload::view(
+                        &api, ctx, value,
+                    )?));
                     serde_json::json!({"$appsBytes": buffers.len() - 1})
                 }
                 7 => bail!("Do not know how to serialize a BigInt"),
@@ -726,7 +728,7 @@ fn dispatch(
         return node
             .try_borrow_mut()
             .context("Node is busy")?
-            .call(op, values);
+            .call(op, &mut args);
     }
     if let Some(op) = op.strip_prefix("pty.") {
         anyhow::ensure!(
@@ -860,7 +862,10 @@ fn dispatch(
             unsafe {
                 (target_api.string_release)(name);
             }
-            let buffers = crate::jsc::payload::input(&target_api, context, buffers)?;
+            let buffers = crate::jsc::payload::input(&target_api, context, buffers)?
+                .iter()
+                .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
+                .collect();
             Ok(crate::jsc::payload::Payload { value, buffers }.into_value())
         })();
         unsafe {
@@ -886,7 +891,9 @@ fn dispatch(
             !matches!(role, Role::Renderer(_)) || op != "worker.start" || values[1] == false,
             "Page workers cannot request native APIs"
         );
-        web.try_borrow_mut().context("Web is busy")?.call(op, &args)
+        web.try_borrow_mut()
+            .context("Web is busy")?
+            .call(op, &mut args)
     } else if op.starts_with("sqlite.") {
         sqlite
             .try_borrow_mut()
@@ -1102,7 +1109,13 @@ unsafe extern "C" fn ffi_call(
     }
 }
 
-fn call_json(api: &Api, ctx: Ptr, name: &str, arguments: &[&str]) -> Result<String> {
+fn call_json<T>(
+    api: &Api,
+    ctx: Ptr,
+    name: &str,
+    arguments: &[&str],
+    read: impl FnOnce(Ptr) -> T,
+) -> Result<T> {
     let key = api.string(name);
     let mut exception = ptr::null_mut();
     let function = unsafe { (api.get)(ctx, (api.global)(ctx), key, &mut exception) };
@@ -1142,7 +1155,7 @@ fn call_json(api: &Api, ctx: Ptr, name: &str, arguments: &[&str]) -> Result<Stri
         };
         api.busy.set(api.busy.get() + start.elapsed());
         if exception.is_null() {
-            Ok(api.text(ctx, result))
+            Ok(read(result))
         } else {
             Err(anyhow::anyhow!("{}", api.text(ctx, exception)))
         }
@@ -1279,6 +1292,7 @@ impl Engine {
                             &action.to_string(),
                             &serde_json::to_string(&args)?,
                         ],
+                        |value| callback_api.text(ctx, value),
                     )?
                     .parse::<i32>()
                     .context("Authorizer must return a SQLite authorization code")
@@ -1458,7 +1472,9 @@ impl Engine {
 
     /// Calls a global function with JSON arguments, without compiling a new script.
     pub fn call(&self, name: &str, arguments: &[&str]) -> Result<String> {
-        call_json(&self.api, self.ctx, name, arguments)
+        call_json(&self.api, self.ctx, name, arguments, |value| {
+            self.api.text(self.ctx, value)
+        })
     }
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
@@ -1480,23 +1496,27 @@ impl Engine {
         }
         if !exception.is_null() {
             let message = self.api.text(self.ctx, exception);
-            HOSTS.with(|hosts| {
-                if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
-                    && let Ok(mut host) = binding.1.try_borrow_mut()
-                    && !host.packaged
-                {
-                    if host.logs.len() == 500 {
-                        host.logs.pop_front();
-                    }
-                    host.logs.push_back(
-                        serde_json::json!({"type":"error","message":format!("{url}: {message}")}),
-                    );
-                }
-            });
+            self.log(url, &message);
             bail!("{message}");
         }
         anyhow::ensure!(!result.is_null(), "JSC returned no value");
         Ok(self.api.text(self.ctx, result))
+    }
+
+    fn log(&self, url: &str, message: &str) {
+        HOSTS.with(|hosts| {
+            if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
+                && let Ok(mut host) = binding.1.try_borrow_mut()
+                && !host.packaged
+            {
+                if host.logs.len() == 500 {
+                    host.logs.pop_front();
+                }
+                host.logs.push_back(
+                    serde_json::json!({"type":"error","message":format!("{url}: {message}")}),
+                );
+            }
+        });
     }
 
     pub fn sources(&self) -> HashMap<String, String> {
@@ -1571,10 +1591,11 @@ impl Engine {
         if let Some(napi) = &self.napi {
             napi.sweep();
         }
-        Ok(self
-            .eval("__appsTick()", "apps:tick")?
-            .parse()
-            .unwrap_or(-1))
+        let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
+            (self.api.to_number)(self.ctx, value, ptr::null_mut())
+        })
+        .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
+        Ok(if delay.is_finite() { delay as i64 } else { -1 })
     }
 
     pub fn validate(&self, files: &BBTreeMap<String, String>) -> Result<()> {

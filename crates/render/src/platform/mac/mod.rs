@@ -13,7 +13,9 @@ mod window;
 use crate::{Bounds, CursorStyle, Pixels, WindowOptions, app::Callbacks, point, px, size};
 use anyhow::Result;
 use core_foundation::string::CFStringRef;
-use dispatch2::{DispatchQueue, DispatchTime};
+use dispatch2::{
+    DispatchObject as _, DispatchQueue, DispatchRetained, DispatchSource, DispatchTime,
+};
 use objc2::{
     Encode, Encoding, MainThreadMarker, RefEncode, class, msg_send,
     rc::{Retained, autoreleasepool},
@@ -174,11 +176,34 @@ pub(crate) fn post(f: Box<dyn FnOnce() + Send>) {
 
 /// Runs `f` on the main thread after `delay`.
 pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
-    let f: Box<dyn FnOnce()> = Box::new(f);
-    let context = Box::into_raw(Box::new(f)) as *mut c_void;
+    // WARNING: `dispatch_after` lets a timer fire a tenth of its delay late (300 ms for a 3 s
+    // `setTimeout`), so a timer source with a 1 ms leeway runs it.
+    // SAFETY: a timer source, which needs no handle or mask, on the main queue of this thread.
+    let source = unsafe {
+        DispatchSource::new(
+            &raw const dispatch2::_dispatch_source_type_timer as _,
+            0,
+            0,
+            Some(DispatchQueue::main()),
+        )
+    };
     let when = DispatchTime::NOW.time(delay.as_nanos().min(i64::MAX as u128) as i64);
-    // SAFETY: `local` takes back the box on the main queue, which runs on this thread.
-    unsafe { DispatchQueue::exec_after_f(when, DispatchQueue::main(), context, local) };
+    source.set_timer(when, DispatchTime::FOREVER.0, 1_000_000);
+    let f: Box<dyn FnOnce()> = Box::new(f);
+    let context = Box::into_raw(Box::new((f, source.clone()))) as *mut c_void;
+    // SAFETY: `fire` takes back the box on its one event, on the main queue of this thread.
+    unsafe { source.set_context(context) };
+    source.set_event_handler_f(fire);
+    source.resume();
+}
+
+extern "C" fn fire(context: *mut c_void) {
+    // SAFETY: the context is the box made by `run_after`, and the source fires once.
+    let (f, source) = *unsafe {
+        Box::from_raw(context as *mut (Box<dyn FnOnce()>, DispatchRetained<DispatchSource>))
+    };
+    source.cancel();
+    f();
 }
 
 /// Runs `f` on the main thread after the current event.

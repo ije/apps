@@ -28,7 +28,13 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     static allocUnsafeSlow(size) { return new Buffer(size); }
     static isBuffer(value) { return value instanceof Buffer; }
     static isEncoding(value) { return typeof value === 'string' && /^(utf-?8|hex|base64(?:url)?|ascii|latin1|binary|utf-?16le|ucs-?2)$/i.test(value); }
-    static byteLength(value, encoding) { return typeof value === 'string' ? encode(value, encoding).length : value.byteLength; }
+    static byteLength(value, encoding) {
+      if (typeof value !== 'string') return value.byteLength;
+      if (encoding !== undefined && !utf8.test(encoding)) return encode(value, encoding).length;
+      let length = value.length;
+      for (let i = 0; i < value.length; i++) { const c = value.charCodeAt(i); if (c < 128) continue; length += c < 2048 ? 1 : 2; if (c >= 0xD800 && c < 0xDC00 && (value.charCodeAt(i + 1) & 0xFC00) === 0xDC00) i++; }
+      return length;
+    }
     static concat(values, length = values.reduce((n, v) => n + v.length, 0)) { const out = new Buffer(length); let offset = 0; for (const value of values) { if (offset >= length) break; const n = Math.min(value.length, length - offset); out.set(value.subarray(0, n), offset); offset += n; } return out; }
     static compare(a, b) { for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; return Math.sign(a.length - b.length); }
     toString(encoding = 'utf8', start = 0, end = this.length) {

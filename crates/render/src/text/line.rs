@@ -162,7 +162,10 @@ fn paint_line(
         |_: Range<usize>, origin, width, style: &UnderlineStyle, window: &mut Window| {
             window.paint_underline(origin, width, style)
         };
-    let smoothing = window.text_style().font_smoothing;
+    let smoothing = window
+        .text_styles
+        .last()
+        .is_none_or(|style| style.font_smoothing);
     let line_bounds = line_paint_bounds(
         origin,
         layout,

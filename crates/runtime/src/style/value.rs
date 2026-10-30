@@ -1,25 +1,64 @@
-use super::{Lengths, Style, color, parser};
+use super::{Lengths, Prop, Style, color, parser};
 
-pub fn edges(style: &Style, name: &str, base: f32, font: f32, vw: f32, vh: f32) -> [f32; 4] {
-    Lengths::new(font, vw, vh).edges(style, name, base)
-}
+/// The shorthand and its top, right, bottom and left longhands.
+pub(crate) const PADDING: [Prop; 5] = [
+    Prop::PADDING,
+    Prop::PADDING_TOP,
+    Prop::PADDING_RIGHT,
+    Prop::PADDING_BOTTOM,
+    Prop::PADDING_LEFT,
+];
+pub(crate) const MARGIN: [Prop; 5] = [
+    Prop::MARGIN,
+    Prop::MARGIN_TOP,
+    Prop::MARGIN_RIGHT,
+    Prop::MARGIN_BOTTOM,
+    Prop::MARGIN_LEFT,
+];
+
+/// The width, style and color of the top, right, bottom and left borders.
+pub(crate) const BORDERS: [[Prop; 3]; 4] = [
+    [
+        Prop::BORDER_TOP_WIDTH,
+        Prop::BORDER_TOP_STYLE,
+        Prop::BORDER_TOP_COLOR,
+    ],
+    [
+        Prop::BORDER_RIGHT_WIDTH,
+        Prop::BORDER_RIGHT_STYLE,
+        Prop::BORDER_RIGHT_COLOR,
+    ],
+    [
+        Prop::BORDER_BOTTOM_WIDTH,
+        Prop::BORDER_BOTTOM_STYLE,
+        Prop::BORDER_BOTTOM_COLOR,
+    ],
+    [
+        Prop::BORDER_LEFT_WIDTH,
+        Prop::BORDER_LEFT_STYLE,
+        Prop::BORDER_LEFT_COLOR,
+    ],
+];
 
 impl Lengths {
-    pub fn edges(&self, style: &Style, name: &str, base: f32) -> [f32; 4] {
-        let values: Vec<_> = components(style.get(name).map_or("0", String::as_str), ' ')
-            .into_iter()
-            .map(|v| self.resolve(v, base).unwrap_or(0.))
-            .collect();
-        let first = values.first().copied().unwrap_or(0.);
-        let mut result = [
-            first,
-            values.get(1).copied().unwrap_or(first),
-            values.get(2).copied().unwrap_or(first),
-            values.get(3).or(values.get(1)).copied().unwrap_or(first),
-        ];
-        for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
-            if let Some(value) = style.get(&format!("{name}-{side}")) {
-                result[i] = self.resolve(value, base).unwrap_or(0.);
+    pub fn edges(&self, style: &Style, [shorthand, sides @ ..]: [Prop; 5], base: f32) -> [f32; 4] {
+        let mut result = [0.; 4];
+        if let Some(value) = style.get(shorthand) {
+            let values: Vec<_> = components(value, ' ')
+                .into_iter()
+                .map(|v| self.resolve(v, base).unwrap_or(0.))
+                .collect();
+            let first = values.first().copied().unwrap_or(0.);
+            result = [
+                first,
+                values.get(1).copied().unwrap_or(first),
+                values.get(2).copied().unwrap_or(first),
+                values.get(3).or(values.get(1)).copied().unwrap_or(first),
+            ];
+        }
+        for (edge, side) in result.iter_mut().zip(sides) {
+            if let Some(value) = style.get(side) {
+                *edge = self.resolve(value, base).unwrap_or(0.);
             }
         }
         result

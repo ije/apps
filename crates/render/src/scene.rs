@@ -2,9 +2,12 @@ use crate::{
     Bounds, ContentMask, Corners, DevicePixels, Edges, Pixels, Point, Rgba, ScaledPixels, Size,
     bounds_tree::BoundsTree, point,
 };
-use std::{iter::Peekable, ops::Range, slice};
 
 pub type DrawOrder = u32;
+
+/// The draw order, the atlas texture of a sprite and the index of a primitive. Sorted, they
+/// give the paint order.
+pub(crate) type SortKey = [u32; 3];
 
 /// The primitives of one frame. Layer 0 is the window; every effect paints into its own layer.
 pub struct Scene {
@@ -28,6 +31,8 @@ pub(crate) struct SceneLayer {
     pub(crate) mono: Vec<MonochromeSprite>,
     pub(crate) poly: Vec<PolychromeSprite>,
     pub(crate) effects: Vec<EffectPrimitive>,
+    /// The keys of the shadows, quads, underlines, mono and poly sprites and effects.
+    keys: [Vec<SortKey>; 6],
 }
 
 impl Default for Scene {
@@ -61,6 +66,9 @@ impl SceneLayer {
         self.mono.clear();
         self.poly.clear();
         self.effects.clear();
+        for keys in &mut self.keys {
+            keys.clear();
+        }
     }
 
     fn insert(
@@ -78,43 +86,46 @@ impl SceneLayer {
             Some(order) => *order,
             None => self.tree.insert(clipped),
         };
-        match primitive {
+        let (kind, texture, index) = match primitive {
             Primitive::Shadow(mut shadow) => {
                 shadow.order = order;
                 self.shadows.push(shadow);
+                (0, 0, self.shadows.len())
             }
             Primitive::Quad(mut quad) => {
                 quad.order = order;
                 self.quads.push(quad);
+                (1, 0, self.quads.len())
             }
             Primitive::Underline(mut underline) => {
                 underline.order = order;
                 self.underlines.push(underline);
+                (2, 0, self.underlines.len())
             }
             Primitive::Mono(mut sprite) => {
                 sprite.order = order;
                 self.mono.push(sprite);
+                (3, sprite.tile.texture_id.index, self.mono.len())
             }
             Primitive::Poly(mut sprite) => {
                 sprite.order = order;
                 self.poly.push(sprite);
+                (4, sprite.tile.texture_id.index, self.poly.len())
             }
             Primitive::Effect(mut effect) => {
                 effect.order = order;
                 self.effects.push(effect);
+                (5, 0, self.effects.len())
             }
-        }
+        };
+        self.keys[kind].push([order, texture, index as u32 - 1]);
     }
 
+    /// Sorts the keys into paint order. The index keeps ties in insertion order.
     fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.mono
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.poly
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.effects.sort_by_key(|effect| effect.order);
+        for keys in &mut self.keys {
+            keys.sort_unstable();
+        }
     }
 }
 
@@ -209,18 +220,9 @@ impl Scene {
         }
     }
 
-    /// The batches of a layer, in paint order. Ranges index into the layer's primitives.
+    /// The batches of a layer, in paint order, as keys of the layer's primitives.
     pub(crate) fn batches(&self, layer: usize) -> Batches<'_> {
-        let layer = &self.layers[layer];
-        Batches {
-            starts: [0; 6],
-            shadows: layer.shadows.iter().peekable(),
-            quads: layer.quads.iter().peekable(),
-            underlines: layer.underlines.iter().peekable(),
-            mono: layer.mono.iter().peekable(),
-            poly: layer.poly.iter().peekable(),
-            effects: layer.effects.iter().peekable(),
-        }
+        Batches(self.layers[layer].keys.each_ref().map(Vec::as_slice))
     }
 }
 
@@ -257,125 +259,45 @@ pub(crate) fn transform_bounds(
 }
 
 #[derive(Debug)]
-pub(crate) enum Batch {
-    Shadows(Range<usize>),
-    Quads(Range<usize>),
-    Underlines(Range<usize>),
-    Mono(AtlasTextureId, Range<usize>),
-    Poly(AtlasTextureId, Range<usize>),
-    Effects(Range<usize>),
+pub(crate) enum Batch<'a> {
+    Shadows(&'a [SortKey]),
+    Quads(&'a [SortKey]),
+    Underlines(&'a [SortKey]),
+    Mono(AtlasTextureId, &'a [SortKey]),
+    Poly(AtlasTextureId, &'a [SortKey]),
+    Effects(&'a [SortKey]),
 }
 
-pub(crate) struct Batches<'a> {
-    starts: [usize; 6],
-    shadows: Peekable<slice::Iter<'a, Shadow>>,
-    quads: Peekable<slice::Iter<'a, Quad>>,
-    underlines: Peekable<slice::Iter<'a, Underline>>,
-    mono: Peekable<slice::Iter<'a, MonochromeSprite>>,
-    poly: Peekable<slice::Iter<'a, PolychromeSprite>>,
-    effects: Peekable<slice::Iter<'a, EffectPrimitive>>,
-}
+/// The keys of each primitive kind that are not batched yet. A batch is the run of keys of one
+/// kind and texture that come before the first key of the other kinds.
+pub(crate) struct Batches<'a>([&'a [SortKey]; 6]);
 
-/// Takes the run of primitives that come before `limit` in paint order.
-fn take<'a, T: 'a>(
-    iter: &mut Peekable<slice::Iter<'a, T>>,
-    start: &mut usize,
-    kind: usize,
-    limit: (u32, usize),
-    order: impl Fn(&T) -> u32,
-    same: impl Fn(&T) -> bool,
-) -> Range<usize> {
-    let first = *start;
-    iter.next();
-    *start += 1;
-    while iter
-        .next_if(|item| (order(item), kind) < limit && same(item))
-        .is_some()
-    {
-        *start += 1;
-    }
-    first..*start
-}
+impl<'a> Iterator for Batches<'a> {
+    type Item = Batch<'a>;
 
-impl Iterator for Batches<'_> {
-    type Item = Batch;
-
-    fn next(&mut self) -> Option<Batch> {
-        let mut heads = [
-            (self.shadows.peek().map(|item| item.order), 0),
-            (self.quads.peek().map(|item| item.order), 1),
-            (self.underlines.peek().map(|item| item.order), 2),
-            (self.mono.peek().map(|item| item.order), 3),
-            (self.poly.peek().map(|item| item.order), 4),
-            (self.effects.peek().map(|item| item.order), 5),
-        ];
-        heads.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
-        let (Some(_), kind) = heads[0] else {
-            return None;
+    fn next(&mut self) -> Option<Batch<'a>> {
+        let mut heads: [_; 6] =
+            std::array::from_fn(|kind| (self.0[kind].first().map_or(u32::MAX, |key| key[0]), kind));
+        heads.sort_unstable();
+        let kind = heads[0].1;
+        let &[_, texture, _] = self.0[kind].first()?;
+        let len = 1 + self.0[kind][1..]
+            .iter()
+            .take_while(|key| (key[0], kind) < heads[1] && key[1] == texture)
+            .count();
+        let (batch, rest) = self.0[kind].split_at(len);
+        self.0[kind] = rest;
+        let texture = |kind| AtlasTextureId {
+            index: texture,
+            kind,
         };
-        let limit = (heads[1].0.unwrap_or(u32::MAX), heads[1].1);
-        let start = &mut self.starts[kind];
         Some(match kind {
-            0 => Batch::Shadows(take(
-                &mut self.shadows,
-                start,
-                kind,
-                limit,
-                |item| item.order,
-                |_| true,
-            )),
-            1 => Batch::Quads(take(
-                &mut self.quads,
-                start,
-                kind,
-                limit,
-                |item| item.order,
-                |_| true,
-            )),
-            2 => Batch::Underlines(take(
-                &mut self.underlines,
-                start,
-                kind,
-                limit,
-                |item| item.order,
-                |_| true,
-            )),
-            3 => {
-                let texture = self.mono.peek().unwrap().tile.texture_id;
-                Batch::Mono(
-                    texture,
-                    take(
-                        &mut self.mono,
-                        start,
-                        kind,
-                        limit,
-                        |item| item.order,
-                        |item| item.tile.texture_id == texture,
-                    ),
-                )
-            }
-            4 => {
-                let texture = self.poly.peek().unwrap().tile.texture_id;
-                Batch::Poly(
-                    texture,
-                    take(
-                        &mut self.poly,
-                        start,
-                        kind,
-                        limit,
-                        |item| item.order,
-                        |item| item.tile.texture_id == texture,
-                    ),
-                )
-            }
-            _ => Batch::Effects(take(
-                &mut self.effects,
-                start,
-                kind,
-                limit,
-                |item| item.order,
-                |_| true,
-            )),
+            0 => Batch::Shadows(batch),
+            1 => Batch::Quads(batch),
+            2 => Batch::Underlines(batch),
+            3 => Batch::Mono(texture(AtlasTextureKind::Monochrome), batch),
+            4 => Batch::Poly(texture(AtlasTextureKind::Polychrome), batch),
+            _ => Batch::Effects(batch),
         })
     }
 }

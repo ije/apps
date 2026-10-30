@@ -199,7 +199,7 @@ impl TextSystem {
             size: size(image.placement.width.into(), image.placement.height.into()),
         };
         if bounds.size.width.0 > 0 && bounds.size.height.0 > 0 {
-            state.pending.insert(params.clone(), image);
+            state.pending.insert(*params, image);
         }
         Ok(bounds)
     }

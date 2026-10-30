@@ -94,11 +94,8 @@ fn meminfo(key: &str) -> u64 {
 #[derive(Clone)]
 pub(super) enum Hasher {
     Md5(md5::Md5),
-    Sha1(sha1_smol::Sha1),
     Sha224(sha2::Sha224),
-    Sha256(sha2::Sha256),
-    Sha384(sha2::Sha384),
-    Sha512(sha2::Sha512),
+    Digest(ring::digest::Context),
     Hmac(ring::hmac::Context),
 }
 
@@ -115,28 +112,26 @@ impl Hasher {
                 name => bail!("Digest method not supported: {name}"),
             };
             return Ok(Self::Hmac(ring::hmac::Context::with_key(
-                &ring::hmac::Key::new(algorithm, &bytes(key)?),
+                &ring::hmac::Key::new(algorithm, bytes(key)?),
             )));
         }
-        Ok(match name {
-            "md5" => Self::Md5(md5::Md5::new()),
-            "sha1" => Self::Sha1(sha1_smol::Sha1::new()),
-            "sha224" => Self::Sha224(sha2::Sha224::new()),
-            "sha256" => Self::Sha256(sha2::Sha256::new()),
-            "sha384" => Self::Sha384(sha2::Sha384::new()),
-            "sha512" => Self::Sha512(sha2::Sha512::new()),
+        let algorithm = match name {
+            "md5" => return Ok(Self::Md5(md5::Md5::new())),
+            "sha224" => return Ok(Self::Sha224(sha2::Sha224::new())),
+            "sha1" => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            "sha256" => &ring::digest::SHA256,
+            "sha384" => &ring::digest::SHA384,
+            "sha512" => &ring::digest::SHA512,
             name => bail!("Digest method not supported: {name}"),
-        })
+        };
+        Ok(Self::Digest(ring::digest::Context::new(algorithm)))
     }
     pub(super) fn update(&mut self, data: &[u8]) {
         use sha2::Digest;
         match self {
             Self::Md5(hasher) => hasher.update(data),
-            Self::Sha1(hasher) => hasher.update(data),
             Self::Sha224(hasher) => hasher.update(data),
-            Self::Sha256(hasher) => hasher.update(data),
-            Self::Sha384(hasher) => hasher.update(data),
-            Self::Sha512(hasher) => hasher.update(data),
+            Self::Digest(context) => context.update(data),
             Self::Hmac(context) => context.update(data),
         }
     }
@@ -144,11 +139,8 @@ impl Hasher {
         use sha2::Digest;
         crate::web::base64(&match self {
             Self::Md5(hasher) => hasher.finalize().to_vec(),
-            Self::Sha1(hasher) => hasher.digest().bytes().to_vec(),
             Self::Sha224(hasher) => hasher.finalize().to_vec(),
-            Self::Sha256(hasher) => hasher.finalize().to_vec(),
-            Self::Sha384(hasher) => hasher.finalize().to_vec(),
-            Self::Sha512(hasher) => hasher.finalize().to_vec(),
+            Self::Digest(context) => context.finish().as_ref().to_vec(),
             Self::Hmac(context) => context.sign().as_ref().to_vec(),
         })
     }
@@ -158,7 +150,7 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
     match op {
         "hash" => {
             let mut hasher = Hasher::new(&args[0], &args[2])?;
-            hasher.update(&bytes(&args[1])?);
+            hasher.update(bytes(&args[1])?);
             Ok(hasher.finish())
         }
         "pbkdf2" => {
@@ -180,8 +172,8 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 ring::pbkdf2::derive(
                     algorithm,
                     iterations,
-                    &bytes(&args[1])?,
-                    &bytes(&args[0])?,
+                    bytes(&args[1])?,
+                    bytes(&args[0])?,
                     &mut key,
                 );
             }
@@ -189,12 +181,11 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
         }
         "zlib" => {
             use flate2::{Compression, read};
-            let data = bytes(&args[2])?;
+            let input = bytes(&args[2])?;
             let level = match args[3].as_u64() {
                 Some(level @ 0..=9) => Compression::new(level as u32),
                 _ => Compression::default(),
             };
-            let input = &data[..];
             let gzip = input.starts_with(&[0x1f, 0x8b]);
             let reader: Box<dyn Read> = match (args[0].as_str().unwrap_or(""), args[1] == true) {
                 ("gzip", false) => Box::new(read::GzEncoder::new(input, level)),

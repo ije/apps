@@ -10,8 +10,8 @@ globalThis.__appsBrowserEnvironment = call => {
   const storageKinds = new WeakMap();
   class Storage {
     constructor(kind) { storageKinds.set(this, kind); }
-    get length() { return native(storageKinds.get(this) + '.keys').length; }
-    key(index) { return native(storageKinds.get(this) + '.keys')[Number(index) >>> 0] ?? null; }
+    get length() { return native(storageKinds.get(this) + '.length'); }
+    key(index) { return native(storageKinds.get(this) + '.key', Number(index) >>> 0); }
     getItem(key) { return native(storageKinds.get(this) + '.get', String(key)); }
     setItem(key, value) { native(storageKinds.get(this) + '.set', String(key), String(value)); }
     removeItem(key) { native(storageKinds.get(this) + '.remove', String(key)); }

@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     rc::{Rc, Weak},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use render::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 
@@ -38,7 +38,7 @@ pub struct Desktop {
     pages: BBTreeMap<String, Document>,
     error: Option<anyhow::Error>,
     quit: bool,
-    wake: Option<render::Timer>,
+    wake: Option<(Instant, render::Timer)>,
     /// The waker of the running app, which async ops started before it ran use too.
     waker: Arc<OnceLock<render::Waker>>,
     scheduled: bool,
@@ -751,20 +751,6 @@ impl Desktop {
                     delay = delay.min(next);
                 }
             }
-            // WARNING: a later engine's tick can add timers to an earlier one through IPC, so read all delays again.
-            for engine in std::iter::once(&app.main).chain(
-                app.views
-                    .values()
-                    .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref)),
-            ) {
-                if let Ok(next) = engine
-                    .call("__appsDelay", &[])
-                    .map(|next| next.parse().unwrap_or(-1))
-                    && next >= 0
-                {
-                    delay = delay.min(next);
-                }
-            }
             app.pump(Some(cx), Some(&runtime))?;
             if app.quit {
                 return Ok(None);
@@ -847,6 +833,20 @@ impl Desktop {
             }
             drop(host);
             app.titles(Some(cx))?;
+            // WARNING: IPC, microtasks and the scripts above can add timers after an engine's tick, so read all delays again.
+            for engine in std::iter::once(&app.main).chain(
+                app.views
+                    .values()
+                    .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref)),
+            ) {
+                if let Ok(next) = engine
+                    .call("__appsDelay", &[])
+                    .map(|next| next.parse().unwrap_or(-1))
+                    && next >= 0
+                {
+                    delay = delay.min(next);
+                }
+            }
             for (&id, view) in &app.views {
                 let dirty = {
                     let host = app.host.borrow();
@@ -871,10 +871,31 @@ impl Desktop {
         }
         match result {
             Ok(Some(delay)) => {
-                let wake = runtime.clone();
-                // WARNING: native dialogs and popup menus run a nested loop while the app is busy, so the timer runs after it.
-                let task = cx.timer(Duration::from_millis(delay), move |cx| Self::drive(wake, cx));
-                runtime.borrow_mut().wake = Some(task);
+                // WARNING: JS timers are due when `Date.now()` reaches a whole millisecond, so wake at that boundary, not up to 1 ms after it.
+                let wait = Duration::from_millis(delay).saturating_sub(Duration::from_nanos(
+                    u64::from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos(),
+                    ) % 1_000_000,
+                ));
+                let at = Instant::now() + wait;
+                let mut app = runtime.borrow_mut();
+                // WARNING: a replaced timer stays registered until it fires, so keep the armed one unless the new deadline is earlier.
+                if app.wake.as_ref().is_none_or(|(armed, _)| {
+                    *armed <= Instant::now() || at + Duration::from_micros(500) < *armed
+                }) {
+                    let wake = runtime.clone();
+                    // WARNING: native dialogs and popup menus run a nested loop while the app is busy, so the timer runs after it.
+                    let task = cx.timer(wait, move |cx| {
+                        if let Ok(mut app) = wake.try_borrow_mut() {
+                            app.wake = None;
+                        }
+                        Self::drive(wake, cx)
+                    });
+                    app.wake = Some((at, task));
+                }
             }
             Ok(None) => runtime.borrow_mut().wake = None,
             Err(error) => {

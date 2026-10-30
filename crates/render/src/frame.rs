@@ -5,7 +5,7 @@ use crate::{
     BlendMode, Bounds, Point, ScaledPixels, Size,
     scene::{
         AtlasTextureId, Batch, EffectPrimitive, MonochromeSprite, PolychromeSprite, Quad, Scene,
-        Shadow, Underline,
+        Shadow, SortKey, Underline,
     },
 };
 use std::{mem, ops::Range};
@@ -156,9 +156,10 @@ pub struct RenderFrame {
     copy: bool,
 }
 
-fn extend<T: Clone>(items: &mut Vec<T>, new: &[T]) -> Range<u32> {
+/// Copies the primitives of `keys` in their order.
+fn extend<T: Copy>(items: &mut Vec<T>, primitives: &[T], keys: &[SortKey]) -> Range<u32> {
     let start = items.len() as u32;
-    items.extend_from_slice(new);
+    items.extend(keys.iter().map(|key| primitives[key[2] as usize]));
     start..items.len() as u32
 }
 
@@ -384,24 +385,27 @@ impl RenderFrame {
         let primitives = &scene.layers[layer];
         for batch in scene.batches(layer) {
             let cmd = match batch {
-                Batch::Quads(range) => {
-                    Cmd::Quads(extend(&mut self.quads, &primitives.quads[range]))
+                Batch::Quads(keys) => Cmd::Quads(extend(&mut self.quads, &primitives.quads, keys)),
+                Batch::Shadows(keys) => {
+                    Cmd::Shadows(extend(&mut self.shadows, &primitives.shadows, keys))
                 }
-                Batch::Shadows(range) => {
-                    Cmd::Shadows(extend(&mut self.shadows, &primitives.shadows[range]))
+                Batch::Underlines(keys) => {
+                    Cmd::Underlines(extend(&mut self.underlines, &primitives.underlines, keys))
                 }
-                Batch::Underlines(range) => {
-                    Cmd::Underlines(extend(&mut self.underlines, &primitives.underlines[range]))
+                Batch::Mono(texture, keys) => {
+                    Cmd::Mono(texture, extend(&mut self.mono, &primitives.mono, keys))
                 }
-                Batch::Mono(texture, range) => {
-                    Cmd::Mono(texture, extend(&mut self.mono, &primitives.mono[range]))
+                Batch::Poly(texture, keys) => {
+                    Cmd::Poly(texture, extend(&mut self.poly, &primitives.poly, keys))
                 }
-                Batch::Poly(texture, range) => {
-                    Cmd::Poly(texture, extend(&mut self.poly, &primitives.poly[range]))
-                }
-                Batch::Effects(range) => {
-                    for effect in &primitives.effects[range] {
-                        self.record_effect(scene, effect, target, depth);
+                Batch::Effects(keys) => {
+                    for key in keys {
+                        self.record_effect(
+                            scene,
+                            &primitives.effects[key[2] as usize],
+                            target,
+                            depth,
+                        );
                     }
                     self.flush(target, depth);
                     continue;

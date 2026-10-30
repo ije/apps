@@ -17,15 +17,11 @@ use std::{
 };
 use system::Hasher;
 
-pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
-    if let Some(bytes) = crate::jsc::payload::read(value) {
+pub(crate) fn bytes(value: &Value) -> Result<&[u8]> {
+    if let Some(bytes) = crate::jsc::payload::slice(value) {
         return bytes;
     }
-    Ok(value
-        .as_str()
-        .context("Expected bytes")?
-        .as_bytes()
-        .to_vec())
+    Ok(value.as_str().context("Expected bytes")?.as_bytes())
 }
 
 #[cfg(unix)]
@@ -241,7 +237,7 @@ impl Default for State {
     }
 }
 impl State {
-    pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
+    pub(crate) fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
             "poll" => {
                 let mut events = Vec::new();
@@ -271,8 +267,8 @@ impl State {
                 self.next += 1;
                 let id = self.next;
                 let op = args[0].as_str().context("Expected operation")?.to_owned();
-                let payload = crate::jsc::payload::Payload::snapshot(args[1].clone());
-                // Slow work uses a small pool so it cannot stall queued file operations.
+                let payload = crate::jsc::payload::Payload::snapshot(args[1].take());
+                // Slow work uses its own pool so it cannot stall queued file operations.
                 let slow = matches!(op.as_str(), "lookup" | "zlib" | "pbkdf2");
                 let queue = if slow {
                     &mut self.pool
@@ -284,11 +280,8 @@ impl State {
                     None => {
                         let (jobs, receiver) = mpsc::channel::<Job>();
                         let receiver = Arc::new(Mutex::new(receiver));
-                        let workers = if slow {
-                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
-                        } else {
-                            1
-                        };
+                        let workers =
+                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
                         for _ in 0..workers {
                             let (files, sender, receiver) =
                                 (self.files.clone(), self.sender.clone(), receiver.clone());
@@ -359,7 +352,7 @@ impl State {
                 self.hashers
                     .get_mut(&args[0].as_u64().context("Expected hash ID")?)
                     .context("Hash is finalized")?
-                    .update(&bytes(&args[1])?);
+                    .update(bytes(&args[1])?);
                 Ok(Value::Null)
             }
             "hash.digest" => Ok(self

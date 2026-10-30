@@ -1,3 +1,4 @@
+use crate::style::Prop;
 use crate::{
     dom::Document,
     style::{self, ComputedStyles, Lengths},
@@ -490,7 +491,7 @@ pub(crate) fn intrinsic(
     let node = &doc.nodes[id];
     let style = &styles.values[id];
     let units = &styles.lengths[id];
-    let display = style.get("display").map_or("", String::as_str);
+    let display = style.get(Prop::DISPLAY).unwrap_or("");
     // WARNING: measuring recurses per DOM level, so deep pages must not overflow the stack.
     if display == "none"
         || std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
@@ -500,17 +501,17 @@ pub(crate) fn intrinsic(
         return [0.; 4];
     }
     let base = width.unwrap_or(0.);
-    let padding = units.edges(style, "padding", base);
-    let margin = units.edges(style, "margin", base);
-    let border = ["top", "right", "bottom", "left"].map(|side| {
+    let padding = units.edges(style, style::PADDING, base);
+    let margin = units.edges(style, style::MARGIN, base);
+    let border = style::BORDERS.map(|[width, kind, _]| {
         if style
-            .get(&format!("border-{side}-style"))
-            .is_none_or(|kind| matches!(kind.as_str(), "none" | "hidden"))
+            .get(kind)
+            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
         {
             return 0.;
         }
         style
-            .get(&format!("border-{side}-width"))
+            .get(width)
             .map_or(Some(3.), |v| units.resolve(v, base))
             .unwrap_or(0.)
             .max(0.)
@@ -523,12 +524,14 @@ pub(crate) fn intrinsic(
         inner[0] + margin[1] + margin[3],
         inner[1] + margin[0] + margin[2],
     ];
-    let border_box = style.get("box-sizing").is_some_and(|v| v == "border-box");
-    let sizes = |names: [&str; 3], base: Option<f32>| {
-        let axis = usize::from(names[0] == "height");
-        names.map(|name| {
+    let border_box = style
+        .get(Prop::BOX_SIZING)
+        .is_some_and(|v| v == "border-box");
+    let sizes = |props: [Prop; 3], base: Option<f32>| {
+        let axis = usize::from(props[0] == Prop::HEIGHT);
+        props.map(|prop| {
             style
-                .get(name)
+                .get(prop)
                 .filter(|v| base.is_some() || !v.contains('%'))
                 .and_then(|v| units.resolve(v, base.unwrap_or(0.)))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
@@ -539,14 +542,14 @@ pub(crate) fn intrinsic(
             .min(max.unwrap_or(f32::INFINITY))
             .max(min.unwrap_or(0.))
     };
-    let horizontal = ["width", "min-width", "max-width"];
+    let horizontal = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH];
     let fixed = sizes(horizontal, None);
     let used = sizes(horizontal, width);
     let available = used[0]
         .or(width.map(|width| width - outer[0]))
         .or(fixed[0])
         .map(|width| clamp(width, used).max(0.));
-    let vertical = sizes(["height", "min-height", "max-height"], height);
+    let vertical = sizes([Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], height);
     let mut content = [0f32; 3];
     if matches!(node.tag.as_str(), "svg" | "img" | "canvas" | "video") {
         let default = match node.tag.as_str() {
@@ -563,8 +566,8 @@ pub(crate) fn intrinsic(
         content = [width, width, height];
     } else if let Some(inline) = style::inline_text(doc, styles, id) {
         let wrap = !style
-            .get("white-space")
-            .is_some_and(|space| matches!(space.as_str(), "pre" | "nowrap"));
+            .get(Prop::WHITE_SPACE)
+            .is_some_and(|space| matches!(space, "pre" | "nowrap"));
         let lines = text
             .shape_text(
                 inline.text.to_string().into(),
@@ -604,9 +607,9 @@ pub(crate) fn intrinsic(
             content[0] = content[1];
         }
     } else if matches!(display, "grid" | "inline-grid")
-        && !["grid-template-columns", "grid-template-rows"]
-            .iter()
-            .any(|name| style.get(*name).is_some_and(|v| v.starts_with("subgrid")))
+        && ![Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS]
+            .into_iter()
+            .any(|name| style.get(name).is_some_and(|v| v.starts_with("subgrid")))
     {
         let extent = |grid: &Grid| {
             [(&grid.columns, grid.gap[0]), (&grid.rows, grid.gap[1])].map(|(sizes, gap)| {
@@ -650,10 +653,10 @@ pub(crate) fn intrinsic(
         let row = inline
             || flex
                 && style
-                    .get("flex-direction")
+                    .get(Prop::FLEX_DIRECTION)
                     .is_none_or(|v| !v.starts_with("column"));
-        let wrap = inline || flex && style.get("flex-wrap").is_some_and(|v| v != "nowrap");
-        let gaps = ["column-gap", "row-gap"].map(|name| {
+        let wrap = inline || flex && style.get(Prop::FLEX_WRAP).is_some_and(|v| v != "nowrap");
+        let gaps = [Prop::COLUMN_GAP, Prop::ROW_GAP].map(|name| {
             style
                 .get(name)
                 .filter(|_| flex)
@@ -662,14 +665,14 @@ pub(crate) fn intrinsic(
                 .max(0.)
         });
         let preserve = style
-            .get("white-space")
-            .is_some_and(|v| matches!(v.as_str(), "pre" | "pre-wrap" | "break-spaces"));
+            .get(Prop::WHITE_SPACE)
+            .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"));
         let mut line = [0f32; 2];
         let mut first = true;
         for &child in &node.children {
             if styles.values[child]
-                .get("position")
-                .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed"))
+                .get(Prop::POSITION)
+                .is_some_and(|v| matches!(v, "absolute" | "fixed"))
                 || !preserve
                     && doc.nodes[child].tag == "#text"
                     && doc.nodes[child].text.trim().is_empty()
@@ -744,17 +747,20 @@ pub(crate) fn layout(
     let style = &styles.values[id];
     let units = &styles.lengths[id];
     let available = [width, height];
-    let get = |name: &str| style.get(name).map(String::as_str);
-    let mut template =
-        [get("grid-template-columns"), get("grid-template-rows")].map(|v| v.map(str::to_owned));
-    let mut areas = get("grid-template-areas").map(str::to_owned);
-    let mut flow = get("grid-auto-flow").unwrap_or("row").to_owned();
-    let mut implicit =
-        [get("grid-auto-columns"), get("grid-auto-rows")].map(|v| v.unwrap_or("auto").to_owned());
+    let get = |prop| style.get(prop);
+    let mut template = [
+        get(Prop::GRID_TEMPLATE_COLUMNS),
+        get(Prop::GRID_TEMPLATE_ROWS),
+    ]
+    .map(|v| v.map(str::to_owned));
+    let mut areas = get(Prop::GRID_TEMPLATE_AREAS).map(str::to_owned);
+    let mut flow = get(Prop::GRID_AUTO_FLOW).unwrap_or("row").to_owned();
+    let mut implicit = [get(Prop::GRID_AUTO_COLUMNS), get(Prop::GRID_AUTO_ROWS)]
+        .map(|v| v.unwrap_or("auto").to_owned());
     if template.iter().all(Option::is_none)
         && areas.is_none()
-        && let Some(value) = get("grid-template")
-            .or_else(|| get("grid"))
+        && let Some(value) = get(Prop::GRID_TEMPLATE)
+            .or_else(|| get(Prop::GRID))
             .filter(|v| *v != "none")
     {
         let (mut depth, mut quote, mut split) = (0, None, value.len());
@@ -835,16 +841,16 @@ pub(crate) fn layout(
                         .is_some_and(|v| v.starts_with("subgrid"))
             })
     });
-    let pair = |name: &str, axis: usize| {
-        let parts = style::components(get(name)?, ' ');
+    let pair = |prop, axis: usize| {
+        let parts = style::components(get(prop)?, ' ');
         parts.get(axis ^ 1).or(parts.first()).copied()
     };
     let gap = [0, 1].map(|axis| {
         match (
-            get(["column-gap", "row-gap"][axis])
+            get([Prop::COLUMN_GAP, Prop::ROW_GAP][axis])
                 .filter(|v| *v != "normal")
-                .or_else(|| get(["grid-column-gap", "grid-row-gap"][axis]))
-                .or_else(|| pair("grid-gap", axis)),
+                .or_else(|| get([Prop::GRID_COLUMN_GAP, Prop::GRID_ROW_GAP][axis]))
+                .or_else(|| pair(Prop::GRID_GAP, axis)),
             shared[axis],
         ) {
             (None, Some(_)) => inherited.map_or(0., |grid| grid.gap[axis]),
@@ -924,21 +930,28 @@ pub(crate) fn layout(
     let alignment = |child: usize, axis: usize| {
         let own = &styles.values[child];
         let margins = [
-            ["margin-left", "margin-right"],
-            ["margin-top", "margin-bottom"],
+            [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
+            [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
         ][axis]
             .map(|name| own.get(name).is_some_and(|v| v == "auto"));
         let mut value = "normal";
         for (style, name, shorthand) in [
-            (own, ["justify-self", "align-self"][axis], "place-self"),
-            (style, ["justify-items", "align-items"][axis], "place-items"),
+            (
+                own,
+                [Prop::JUSTIFY_SELF, Prop::ALIGN_SELF][axis],
+                Prop::PLACE_SELF,
+            ),
+            (
+                style,
+                [Prop::JUSTIFY_ITEMS, Prop::ALIGN_ITEMS][axis],
+                Prop::PLACE_ITEMS,
+            ),
         ] {
             let parts: Vec<&str> = style
                 .get(shorthand)
                 .map_or(Vec::new(), |v| v.split_whitespace().collect());
             if let Some(found) = style
                 .get(name)
-                .map(String::as_str)
                 .or(parts.get(axis ^ 1).or(parts.first()).copied())
                 .filter(|v| *v != "auto")
             {
@@ -988,26 +1001,30 @@ pub(crate) fn layout(
         *memo
             .entry((std::rc::Rc::as_ptr(style), replaced))
             .or_insert_with(|| {
-                let flowed = !style.get("display").is_some_and(|v| v == "none")
+                let flowed = !style.get(Prop::DISPLAY).is_some_and(|v| v == "none")
                     && !style
-                        .get("position")
-                        .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed"));
+                        .get(Prop::POSITION)
+                        .is_some_and(|v| matches!(v, "absolute" | "fixed"));
                 let order = style
-                    .get("order")
+                    .get(Prop::ORDER)
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(0);
                 let placed = {
-                    let split = |name: &str| {
-                        style.get(name).map_or(Vec::new(), |v| {
+                    let split = |prop| {
+                        style.get(prop).map_or(Vec::new(), |v| {
                             v.split('/').map(str::trim).collect::<Vec<_>>()
                         })
                     };
-                    let area = split("grid-area");
+                    let area = split(Prop::GRID_AREA);
                     let (mut position, mut span) = ([None; 2], [1; 2]);
                     for axis in 0..2 {
                         let [name, start, end] = [
-                            ["grid-column", "grid-column-start", "grid-column-end"],
-                            ["grid-row", "grid-row-start", "grid-row-end"],
+                            [
+                                Prop::GRID_COLUMN,
+                                Prop::GRID_COLUMN_START,
+                                Prop::GRID_COLUMN_END,
+                            ],
+                            [Prop::GRID_ROW, Prop::GRID_ROW_START, Prop::GRID_ROW_END],
                         ][axis];
                         let pair = split(name);
                         let shorthand = if let Some(&first) = pair.first() {
@@ -1022,7 +1039,7 @@ pub(crate) fn layout(
                                 .or(area.first().copied().filter(ident));
                             (start, area.get(3 - axis).copied().or(start.filter(ident)))
                         };
-                        let longhand = |name: &str| style.get(name).map(String::as_str);
+                        let longhand = |prop| style.get(prop);
                         (position[axis], span[axis]) = placement(
                             longhand(start).or(shorthand.0).unwrap_or("auto"),
                             longhand(end).or(shorthand.1).unwrap_or("auto"),
@@ -1039,16 +1056,16 @@ pub(crate) fn layout(
                 };
                 let shrink = [0, 1].map(|axis| {
                     style
-                        .get(["overflow-x", "overflow-y"][axis])
-                        .or_else(|| style.get("overflow"))
-                        .is_some_and(|v| !matches!(v.as_str(), "visible" | "clip"))
+                        .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
+                        .or_else(|| style.get(Prop::OVERFLOW))
+                        .is_some_and(|v| !matches!(v, "visible" | "clip"))
                         || style
-                            .get(["min-width", "min-height"][axis])
+                            .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
                             .is_some_and(|v| v == "0" || v == "0px")
                 });
                 let subgrid = [0, 1].map(|axis| {
                     style
-                        .get(["grid-template-columns", "grid-template-rows"][axis])
+                        .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
                         .is_some_and(|v| v.starts_with("subgrid"))
                 });
                 Item {
@@ -1057,8 +1074,8 @@ pub(crate) fn layout(
                     placed,
                     alignment: [alignment(child, 0), alignment(child, 1)],
                     shrink,
-                    auto_width: style.get("width").is_none_or(|v| v == "auto"),
-                    height: style.get("height").map(String::as_str),
+                    auto_width: style.get(Prop::WIDTH).is_none_or(|v| v == "auto"),
+                    height: style.get(Prop::HEIGHT),
                     subgrid,
                 }
             })
@@ -1250,11 +1267,11 @@ pub(crate) fn layout(
     let minimum = |child: usize, axis: usize, value: f32| {
         let style = &styles.values[child];
         if style
-            .get(["overflow-x", "overflow-y"][axis])
-            .or_else(|| style.get("overflow"))
-            .is_some_and(|v| !matches!(v.as_str(), "visible" | "clip"))
+            .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
+            .or_else(|| style.get(Prop::OVERFLOW))
+            .is_some_and(|v| !matches!(v, "visible" | "clip"))
             || style
-                .get(["min-width", "min-height"][axis])
+                .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
                 .is_some_and(|v| v == "0" || v == "0px")
         {
             0.
@@ -1334,7 +1351,7 @@ pub(crate) fn layout(
             let mut offset = 0;
             for &grandchild in &doc.nodes[child].children {
                 let style = &styles.values[grandchild];
-                if style.get("display").is_some_and(|v| v == "none")
+                if style.get(Prop::DISPLAY).is_some_and(|v| v == "none")
                     || doc.nodes[grandchild].tag == "#text"
                         && doc.nodes[grandchild].text.trim().is_empty()
                 {
@@ -1342,7 +1359,7 @@ pub(crate) fn layout(
                 }
                 let start = cell[axis] + offset % cell[axis + 2];
                 let span = style
-                    .get(["grid-column", "grid-row"][axis])
+                    .get([Prop::GRID_COLUMN, Prop::GRID_ROW][axis])
                     .and_then(|v| v.trim().strip_prefix("span"))
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(1)
@@ -1365,8 +1382,8 @@ pub(crate) fn layout(
                 offset += span;
             }
         }
-        let content = get(["justify-content", "align-content"][axis])
-            .or_else(|| pair("place-content", axis))
+        let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis])
+            .or_else(|| pair(Prop::PLACE_CONTENT, axis))
             .unwrap_or("normal");
         let sizes = size(
             &definitions[axis],

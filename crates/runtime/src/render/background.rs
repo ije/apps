@@ -1,5 +1,6 @@
 use super::paint::Effected;
 use crate::style;
+use crate::style::Prop;
 use render::{AnyElement, div, prelude::*, px, rgba};
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -16,16 +17,16 @@ pub(super) fn css_background(
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
 ) -> Vec<AnyElement> {
-    let list = |name: &str| {
-        style::components(style.get(name).map_or("", String::as_str), ',')
+    let list = |prop| {
+        style::components(style.get(prop).unwrap_or(""), ',')
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
     let (sizes, positions, repeats) = (
-        list("background-size"),
-        list("background-position"),
-        list("background-repeat"),
+        list(Prop::BACKGROUND_SIZE),
+        list(Prop::BACKGROUND_POSITION),
+        list(Prop::BACKGROUND_REPEAT),
     );
     let pick = |values: &[String], index: usize| {
         values
@@ -41,7 +42,7 @@ pub(super) fn css_background(
     };
     let mut layers = Vec::new();
     let mut indexes = Vec::new();
-    for (index, image) in list("background-image").into_iter().enumerate().rev() {
+    for (index, image) in list(Prop::BACKGROUND_IMAGE).into_iter().enumerate().rev() {
         let (size, position, repeat) = (
             pick(&sizes, index),
             pick(&positions, index),
@@ -274,7 +275,7 @@ pub(super) fn css_background(
         );
         indexes.push(index);
     }
-    let modes = list("background-blend-mode");
+    let modes = list(Prop::BACKGROUND_BLEND_MODE);
     if modes
         .iter()
         .all(|mode| matches!(mode.trim(), "" | "normal"))
@@ -283,10 +284,7 @@ pub(super) fn css_background(
     }
     // Blended layers mix with the layers and color below them, inside an isolated group.
     let mut group = div().absolute().top_0().left_0().size_full();
-    if let Some((ink, alpha)) = style
-        .get("background-color")
-        .and_then(|value| style::color(value))
-    {
+    if let Some((ink, alpha)) = style.get(Prop::BACKGROUND_COLOR).and_then(style::color) {
         group = group.child(
             div()
                 .absolute()

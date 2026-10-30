@@ -89,9 +89,11 @@ impl Files {
                         encoding.eq_ignore_ascii_case("utf8")
                             || encoding.eq_ignore_ascii_case("utf-8")
                     }) {
-                        json!(String::from_utf8_lossy(&data))
+                        Value::String(String::from_utf8(data).unwrap_or_else(|error| {
+                            String::from_utf8_lossy(error.as_bytes()).into_owned()
+                        }))
                     } else {
-                        crate::web::base64(&data)
+                        crate::jsc::payload::write(data)
                     },
                 )
             }
@@ -115,7 +117,7 @@ impl Files {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(args[2]["mode"].as_u64().unwrap_or(0o666) as u32);
                 }
-                options.open(path()?)?.write_all(&bytes(&args[1])?)?;
+                options.open(path()?)?.write_all(bytes(&args[1])?)?;
                 Ok(Value::Null)
             }
             "mkdir" => {
@@ -432,7 +434,8 @@ impl Files {
                         } else {
                             (&*file).read(&mut data)?
                         };
-                        Ok(crate::web::base64(&data[..count]))
+                        data.truncate(count);
+                        Ok(crate::jsc::payload::write(data))
                     }
                     "write" => {
                         let data = bytes(&args[1])?;
@@ -440,15 +443,15 @@ impl Files {
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::FileExt;
-                                file.write_at(&data, position)?
+                                file.write_at(data, position)?
                             }
                             #[cfg(windows)]
                             {
                                 use std::os::windows::fs::FileExt;
-                                file.seek_write(&data, position)?
+                                file.seek_write(data, position)?
                             }
                         } else {
-                            (&*file).write(&data)?
+                            (&*file).write(data)?
                         }))
                     }
                     "fsync" => {

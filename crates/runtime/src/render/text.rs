@@ -1,4 +1,5 @@
 use crate::style;
+use crate::style::Prop;
 use anyhow::Result;
 use render::{Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
 use std::{ops::Range, rc::Rc};
@@ -654,15 +655,15 @@ impl render::Element for InlineText {
                         let height = window.text_system().ascent(font, px(units.font.em))
                             - window.text_system().descent(font, px(units.font.em));
                         let radii = [
-                            "border-top-left-radius",
-                            "border-top-right-radius",
-                            "border-bottom-right-radius",
-                            "border-bottom-left-radius",
+                            Prop::BORDER_TOP_LEFT_RADIUS,
+                            Prop::BORDER_TOP_RIGHT_RADIUS,
+                            Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+                            Prop::BORDER_BOTTOM_LEFT_RADIUS,
                         ]
                         .map(|corner| {
                             px(style
                                 .get(corner)
-                                .or_else(|| style.get("border-radius"))
+                                .or_else(|| style.get(Prop::BORDER_RADIUS))
                                 .and_then(|v| units.resolve(v, (b.x - a.x).into()))
                                 .unwrap_or(0.))
                         });
@@ -672,7 +673,7 @@ impl render::Element for InlineText {
                                 .min(rows.len().saturating_sub(1))
                         });
                         let clone = style
-                            .get("box-decoration-break")
+                            .get(Prop::BOX_DECORATION_BREAK)
                             .is_some_and(|value| value == "clone");
                         for row in first..=last {
                             let (start, end) = (row == first, row == last);
@@ -730,10 +731,10 @@ impl render::Element for InlineText {
                 let end = range.start + crate::dom::utf16_index(text, *end);
                 if caret {
                     let ink = styles.values[*id]
-                        .get("caret-color")
-                        .filter(|value| !matches!(value.as_str(), "auto" | "currentColor"))
-                        .or_else(|| styles.values[*id].get("color"))
-                        .and_then(|value| style::color(value))
+                        .get(Prop::CARET_COLOR)
+                        .filter(|value| !matches!(*value, "auto" | "currentColor"))
+                        .or_else(|| styles.values[*id].get(Prop::COLOR))
+                        .and_then(style::color)
                         .map(|(color, alpha)| color << 8 | alpha as u32)
                         .unwrap_or(0x000000ff);
                     if let Some(position) = text_position(layout, &self.data.text, rows, start) {

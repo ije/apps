@@ -90,16 +90,18 @@
       write('log', [line('┌', '┬', '┐'), cells(header), line('├', '┼', '┤'), ...rows.map(row => cells(header.map(name => row[name] ?? ''))), line('└', '┴', '┘')].join('\n'));
     },
   });
+  // WARNING: `next` is never later than the earliest timer, and it is exact unless `stale`, so ticks skip the timer scan until one is due.
   const timers = new Map();
-  let timerID = 0;
+  let timerID = 0, next = Infinity, stale = false;
+  const earliest = () => { if (stale) { stale = false; next = Infinity; for (const timer of timers.values()) if (timer.at < next) next = timer.at; } return next; };
   class Timeout {
     #id;
     constructor(id) { this.#id = id; }
     ref() { const timer = timers.get(this.#id); if (timer) timer.ref = true; return this; }
     unref() { const timer = timers.get(this.#id); if (timer) timer.ref = false; return this; }
     hasRef() { return timers.get(this.#id)?.ref ?? false; }
-    refresh() { const timer = timers.get(this.#id); if (timer) timer.at = Date.now() + timer.delay; return this; }
-    close() { timers.delete(this.#id); return this; }
+    refresh() { const timer = timers.get(this.#id); if (timer) { timer.at = Date.now() + timer.delay; stale = true; } return this; }
+    close() { clearTimeout(this.#id); return this; }
     [Symbol.toPrimitive]() { return this.#id; }
   }
   globalThis.setTimeout = (fn, delay = 0, ...args) => {
@@ -107,10 +109,12 @@
     const id = ++timerID;
     delay = Number(delay);
     delay = delay >= 0 && delay <= 2147483647 ? delay : delay > 0 ? 1 : 0;
-    timers.set(id, { fn, args, delay, at: Date.now() + delay, ref: true });
+    const at = Date.now() + delay;
+    timers.set(id, { fn, args, delay, at, ref: true });
+    if (at < next) next = at;
     return nodeRole ? new Timeout(id) : id;
   };
-  globalThis.clearTimeout = id => { timers.delete(+id); };
+  globalThis.clearTimeout = id => { if (timers.get(+id)?.at === next) stale = true; timers.delete(+id); };
   globalThis.setInterval = (fn, delay = 0, ...args) => {
     const id = setTimeout(fn, delay, ...args);
     timers.get(+id).interval = Math.max(1, timers.get(+id).delay);
@@ -156,20 +160,21 @@
       nativeShell?.poll?.();
     } catch (error) { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } }
     const now = Date.now();
-    for (const [id, timer] of [...timers]) {
-      if (timer.at > now || !timers.has(id)) continue;
-      if (timer.interval) timer.at = now + timer.interval;
-      else timers.delete(id);
-      try { timer.fn(...timer.args); } catch (error) { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } }
+    if (now >= earliest()) {
+      stale = true;
+      for (const [id, timer] of [...timers]) {
+        if (timer.at > now || !timers.has(id)) continue;
+        if (timer.interval) timer.at = now + timer.interval;
+        else timers.delete(id);
+        try { timer.fn(...timer.args); } catch (error) { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } }
+      }
     }
     return __appsDelay();
   };
   globalThis.__appsDelay = () => {
-    let at = Infinity;
-    for (const timer of timers.values()) if (timer.at < at) at = timer.at;
-    const delay = at === Infinity ? -1 : Math.max(0, at - Date.now());
-    // WARNING: native producers wake the loop when they queue events, so only bridge replies and module errors poll here.
-    return moduleErrors.length || bridge.poll.pending() ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
+    const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - Date.now());
+    // WARNING: native producers wake the loop when they queue events and bridge replies arrive in a call, so only module errors poll here.
+    return moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
   globalThis.__appsAlive = () => timers.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   if (typeof role === 'object' && 'renderer' in role) {

@@ -1,9 +1,11 @@
 globalThis.__appsWorkers = (call, nativeAccess) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
+  const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   const encodeBytes = value => { if(value.toBase64)return value.toBase64();let text='';for(let i=0;i<value.length;i+=8192)text+=String.fromCharCode(...value.subarray(i,i+8192));return btoa(text); };
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
-  const encode = value => {
+  // With `buffers`, ArrayBuffers go there instead of into base64 text.
+  const encode = (value, buffers) => {
     const seen = new Map(), nodes = [];
     const visit = value => {
       if (value === undefined) return { u: true };
@@ -15,7 +17,7 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       const id = nodes.length; seen.set(value, id); nodes.push(null);
       let node;
       if (globalThis.CryptoKey && value instanceof CryptoKey) node = ['crypto', cryptoCodec.encode(value)];
-      else if (value instanceof ArrayBuffer) node = ['buffer', encodeBytes(new Uint8Array(value))];
+      else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : encodeBytes(new Uint8Array(value))];
       else if (ArrayBuffer.isView(value)) node = ['view', value.constructor.name, visit(value.buffer), value.byteOffset, value.byteLength];
       else if (value instanceof Date) node = ['date', value.getTime()];
       else if (value instanceof RegExp) node = ['regexp', value.source, value.flags];
@@ -29,9 +31,10 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
     };
     return { value: visit(value), nodes };
   };
-  const decode = wire => {
+  const decode = (wire, buffers) => {
     if (!wire) return undefined;
     const created = new Map();
+    let received;
     const visit = value => {
       if (value === null || typeof value !== 'object') return value;
       if (value.u) return undefined;
@@ -42,7 +45,7 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       const node = wire.nodes[id]; let result;
       switch (node[0]) {
         case 'crypto': result = cryptoCodec.decode(node[1]); break;
-        case 'buffer': result = (typeof node[1] === 'string' ? decodeBytes(node[1]) : new Uint8Array(node[1])).buffer; break;
+        case 'buffer': result = typeof node[1] === 'number' ? (received ??= buffers())[node[1]].buffer : (typeof node[1] === 'string' ? decodeBytes(node[1]) : new Uint8Array(node[1])).buffer; break;
         case 'view': { const buffer = visit(node[2]), Type = globalThis[node[1]]; result = node[1] === 'DataView' ? new DataView(buffer, node[3], node[4]) : new Type(buffer, node[3], node[4] / Type.BYTES_PER_ELEMENT); break; }
         case 'date': result = new Date(node[1]); break;
         case 'regexp': result = new RegExp(node[1], node[2]); break;
@@ -68,6 +71,11 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
     if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer) || typeof v.transfer !== 'function')) throw new DOMException('Only transferable ArrayBuffers are supported', 'DataCloneError');
     return values;
   };
+  // WARNING: native calls pin the bytes they read, so messages send moved or copied buffers and never the caller's own.
+  const message = (value, options) => {
+    const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers));
+    return [text, ...buffers.map(buffer => new Uint8Array(transfer.includes(buffer) ? buffer.transfer() : buffer.slice(0)))];
+  };
   if (!globalThis.structuredClone) globalThis.structuredClone = (value, options) => {
     const transfer = transfers(options), result = decode(encode(value));
     for (const buffer of transfer) buffer.transfer(0);
@@ -91,14 +99,11 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
   }
   const info = call('web.worker.info'), parentPort = info.main ? null : new Endpoint();
   if (parentPort) {
-    parentPort.postMessage = (value, options) => {
-      const transfer = transfers(options), message = encode(value);
-      call('web.worker.post', message); for (const buffer of transfer) buffer.transfer(0);
-    };
+    parentPort.postMessage = (value, options) => { call('web.worker.post', ...message(value, options)); };
     parentPort.close = () => call('web.worker.close');
     globalThis.postMessage = parentPort.postMessage;
     globalThis.close = parentPort.close;
-    globalThis.__appsWorkerReceive = wire => { const data = decode(wire); parentPort._emit('message', data); dispatchEvent(new MessageEvent('message', { data })); };
+    globalThis.__appsWorkerReceive = wire => { const data = decode(wire, () => call('web.worker.buffers')); parentPort._emit('message', data); dispatchEvent(new MessageEvent('message', { data })); };
   }
   const workers = new Map(), nativeToken = Symbol();
   class Worker extends Endpoint {
@@ -112,7 +117,7 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
         if (this._closed) return;
         this.threadId = call('web.worker.start', text, native, encode(options.workerData), bundled);
         workers.set(this.threadId, this);
-        for (const message of this._queue) call('web.worker.send', this.threadId, message);
+        for (const message of this._queue) call('web.worker.send', this.threadId, ...message);
         this._queue.length = 0;
       };
       const url = String(source);
@@ -128,9 +133,8 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
     }
     postMessage(value, options) {
       if (this._closed) return;
-      const transfer = transfers(options), message = encode(value);
-      if (this.threadId === undefined) this._queue.push(message); else call('web.worker.send', this.threadId, message);
-      for (const buffer of transfer) buffer.transfer(0);
+      const wire = message(value, options);
+      if (this.threadId === undefined) this._queue.push(wire); else call('web.worker.send', this.threadId, ...wire);
     }
     terminate() {
       this._closed = true;
@@ -163,7 +167,7 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       if (!workers.size) return;
       for (const event of call('web.worker.poll')) {
         const worker = workers.get(event.id); if (!worker) continue;
-        if (event.kind === 'message') worker._emit('message', decode(event.data));
+        if (event.kind === 'message') { const [text, ...buffers] = event.data; worker._emit('message', decode(parse(text), () => buffers)); }
         else if (event.kind === 'error') worker._emit('error', new Error(event.message));
         else if (event.kind === 'online') worker._emit('online');
         else if (event.kind === 'exit') { workers.delete(event.id); worker._closed = true; worker._exitCode = event.code; worker._emit('exit', event.code); }

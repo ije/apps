@@ -4,7 +4,8 @@
   // WARNING: records mirror the Rust tree for reads. Writes queue as `code, a, b, c` integers, with strings in `texts` and their lengths in place, and reach Rust in one `dom.batch` before any other host call and at the microtask checkpoint that ends the turn, so Rust never reads a stale page.
   class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : new Map(); this.up = null; this.kids = []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
   const records = [], texts = [], orphans = [];
-  let scheduled = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
+  // WARNING: `changed` marks writes that can detach or create nodes since the last `dom.release`, so idle sweeps skip it.
+  let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
   const flush = () => {
     if (!size) return;
     let errors;
@@ -14,10 +15,10 @@
   const drain = () => { scheduled = false; flush(); };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
-    codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(b), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(c), c.length) : c; size += 4;
+    changed = true; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(b), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(c), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  const call = (name, ...args) => { flush(); return host(name, ...args); };
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') changed = true; return host(name, ...args); };
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0; geometry[0] = 1;
@@ -202,7 +203,7 @@
     removeChild(child) {
       if (!(child instanceof Node) || child._m.up !== this._m) throw new DOMException('Node is not a child', 'NotFoundError');
       const observed = observers.size > 0, connected = definitions.size > 0 && child.isConnected, previousSibling = observed ? child.previousSibling : null, nextSibling = observed ? child.nextSibling : null, kid = child._m;
-      op(3, this._id, child._id); this._m.kids.splice(index(kid), 1); kid.up = null; this._held?.delete(child); child._parent = null;
+      const i = index(kid); op(3, this._id, child._id, i); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
       if(connected){const stack=[kid];while(stack.length){const rec=stack.pop();rec.ref?.deref()?.disconnectedCallback?.();stack.push(...rec.kids);if(rec.shadow)stack.push(rec.shadow);}}
       if (observed) change({ type: 'childList', target: this, removedNodes: [child], previousSibling, nextSibling }); return child;
     }
@@ -730,7 +731,7 @@
     sweepAt = Date.now() + 250;
     const dead = [];
     for (let i = 0; i < wrapped.length;) { const rec = wrapped[i]; if (rec.ref?.deref()) { i++; continue; } dead.push(rec.id); orphans.push(rec); rec.ref = null; wrapped[i] = wrapped[wrapped.length - 1]; wrapped.pop(); }
-    call('dom.release', dead, registered.splice(0));
+    if (dead.length || registered.length || changed) { changed = false; call('dom.release', dead, registered.splice(0)); }
     // WARNING: Rust frees detached trees without live wrappers in the release above, so their records go too.
     for (let root of orphans.splice(0)) {
       while (root.up ?? root.host) root = root.up ?? root.host;

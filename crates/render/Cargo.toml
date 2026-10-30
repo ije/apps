@@ -11,7 +11,7 @@ anyhow.workspace = true
 etagere.workspace = true
 raw-window-handle.workspace = true
 rustc-hash.workspace = true
-taffy = { workspace = true, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "float_layout", "content_size"] }
+taffy = { workspace = true, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true

@@ -47,20 +47,20 @@ fn container_queries_parse_and_follow_container_sizes() {
     let compute = |cache: &mut StyleCache| {
         compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None).values
     };
-    assert!(compute(&mut cache)[outer].get("color") != Some(&"red".to_owned()));
+    assert!(compute(&mut cache)[outer].get(Prop::COLOR) != Some("red"));
     assert!(cache.set_containers(HashMap::from([(a, [500., 50.]), (b, [200., 100.])])));
     let values = compute(&mut cache);
-    assert_eq!(values[outer]["color"], "red");
-    assert_eq!(values[outer]["order"], "5");
-    assert!(!values[outer].contains_key("width") && !values[outer].contains_key("z-index"));
-    assert_eq!(values[inner]["color"], "red");
-    assert_eq!(values[inner]["width"], "1px");
-    assert!(!values[inner].contains_key("order") && !values[inner].contains_key("height"));
+    assert_eq!(&values[outer]["color"], "red");
+    assert_eq!(&values[outer]["order"], "5");
+    assert!(!values[outer].contains(Prop::WIDTH) && !values[outer].contains(Prop::Z_INDEX));
+    assert_eq!(&values[inner]["color"], "red");
+    assert_eq!(&values[inner]["width"], "1px");
+    assert!(!values[inner].contains(Prop::ORDER) && !values[inner].contains(Prop::HEIGHT));
     assert!(!cache.set_containers(HashMap::from([(a, [450., 50.]), (b, [200., 100.])])));
     assert!(cache.set_containers(HashMap::from([(a, [90., 50.]), (b, [200., 100.])])));
     let values = compute(&mut cache);
-    assert!(values[outer].get("color") != Some(&"red".to_owned()));
-    assert_eq!(values[outer]["z-index"], "3");
+    assert!(values[outer].get(Prop::COLOR) != Some("red"));
+    assert_eq!(&values[outer]["z-index"], "3");
 }
 
 #[test]
@@ -235,14 +235,14 @@ fn scrollbar_parts_reach_scroll_containers_only() {
         None,
     );
     let parts = &computed.scrollbars[&element(&doc, "div")];
-    assert_eq!(parts[0].as_ref().unwrap()["width"], "8px");
-    assert_eq!(parts[1].as_ref().unwrap()["background-color"], "#eee");
+    assert_eq!(&parts[0].as_ref().unwrap()["width"], "8px");
+    assert_eq!(&parts[1].as_ref().unwrap()["background-color"], "#eee");
     let [thumb, hovered] = [&parts[2], &parts[4]].map(|part| part.as_ref().unwrap());
     assert_eq!(
-        (&*thumb["background-color"], &*hovered["background-color"]),
+        (&thumb["background-color"], &hovered["background-color"]),
         ("red", "blue")
     );
-    assert_eq!(hovered["border-top-left-radius"], "4px");
+    assert_eq!(&hovered["border-top-left-radius"], "4px");
     assert!(!computed.scrollbars.contains_key(&element(&doc, "p")));
 }
 
@@ -262,8 +262,8 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         None,
     );
     let marker = computed.text_pseudos[&li][0].as_ref().unwrap();
-    assert_eq!(marker["color"], "blue");
-    assert!(marker.contains_key("content") && marker.contains_key("font-size"));
+    assert_eq!(&marker["color"], "blue");
+    assert!(marker.contains(Prop::CONTENT) && marker.contains(Prop::FONT_SIZE));
     assert!(computed.text_pseudos[&p][0].is_none());
     let inline = inline_text(&doc, &computed, p).unwrap();
     assert_eq!(&*inline.text, "\"Hi there x");
@@ -271,7 +271,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
     );
-    let ink = |color: u32| render::Rgba::from(render::rgba(color));
+    let ink = |color: u32| render::rgba(color);
     assert_eq!(
         (inline.runs[0].len, inline.runs[0].color),
         (2, ink(0xff0000ff))
@@ -307,11 +307,11 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     );
     assert!(inline_text(&doc, &computed, element(&doc, "p")).is_none());
     assert_eq!(
-        computed.values[element(&doc, "td")]["vertical-align"],
+        &computed.values[element(&doc, "td")]["vertical-align"],
         "middle"
     );
     assert_eq!(
-        computed.values[element(&doc, "td+td")]["vertical-align"],
+        &computed.values[element(&doc, "td+td")]["vertical-align"],
         "top"
     );
     let mut text = "hello wörld ß".to_owned();
@@ -349,14 +349,14 @@ fn cached_styles_follow_selectors_inheritance_and_stylesheets() {
         .attrs
         .insert("style".into(), "--ink:green".into());
     let inherited = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(inherited.values[children[0]]["color"], "green");
+    assert_eq!(&inherited.values[children[0]]["color"], "green");
     assert_eq!(
-        inherited.selections[&children[0]]["background-color"],
+        &inherited.selections[&children[0]]["background-color"],
         "green"
     );
     doc.nodes[children[1]].tag = "b".into();
     let matched = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(matched.values[children[0]]["color"], "blue");
+    assert_eq!(&matched.values[children[0]]["color"], "blue");
     let sheet = doc
         .nodes
         .iter()
@@ -365,7 +365,7 @@ fn cached_styles_follow_selectors_inheritance_and_stylesheets() {
     doc.nodes[sheet].text = "span{color:purple}".into();
     doc.nodes[sheet].stylesheet = None;
     let changed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(changed.values[children[0]]["color"], "purple");
+    assert_eq!(&changed.values[children[0]]["color"], "purple");
 }
 
 #[test]
@@ -402,7 +402,7 @@ fn selection_colors_follow_highlight_inheritance() {
             expected,
             "{selector}"
         );
-        assert!(!computed.selections[&id].contains_key("font-size"));
+        assert!(!computed.selections[&id].contains(Prop::FONT_SIZE));
         for child in &doc.nodes[id].children {
             assert_eq!(
                 selection_colors(&computed.values[*child], computed.selections.get(child)),
@@ -477,15 +477,15 @@ fn editor_media_caret_and_selection_styles() {
         &mut StyleCache::default(),
         None,
     );
-    assert_eq!(narrow.values[id]["caret-color"], "red");
-    assert_eq!(wide.values[id]["caret-color"], "#0000");
-    assert_eq!(wide.selections[&id]["background-color"], "#0000");
+    assert_eq!(&narrow.values[id]["caret-color"], "red");
+    assert_eq!(&wide.values[id]["caret-color"], "#0000");
+    assert_eq!(&wide.selections[&id]["background-color"], "#0000");
     let div = doc.nodes[id]
         .parent
         .and_then(|parent| doc.nodes[parent].parent)
         .unwrap();
     assert_eq!(
-        wide.values[div].contains_key("animation"),
+        wide.values[div].contains(Prop::ANIMATION),
         !reduced_motion()
     );
     let motion = |value: &str| {
@@ -520,8 +520,8 @@ fn app_region_is_inherited_and_accepts_the_webkit_name() {
     );
     let region = |selector| {
         computed.values[element(&doc, selector)]
-            .get("app-region")
-            .cloned()
+            .get(Prop::APP_REGION)
+            .map(str::to_owned)
     };
     assert_eq!(region("header").as_deref(), Some("drag"));
     assert_eq!(region("#title").as_deref(), Some("drag"));
@@ -551,14 +551,14 @@ fn layers_supports_and_generated_content_keep_the_cascade() {
         &mut StyleCache::default(),
         None,
     );
-    assert_eq!(computed.values[id]["color"], "blue");
-    assert_eq!(computed.values[id]["background-color"], "red");
-    assert_eq!(computed.values[id]["display"], "grid");
-    assert_eq!(computed.values[id]["width"], "100cqi");
-    assert_eq!(computed.values[id]["cursor"], "pointer");
-    assert!(!computed.values[id].contains_key("content"));
-    assert_eq!(computed.pseudos[&id][0]["background-color"], "red");
-    assert_eq!(computed.pseudos[&id][0]["width"], "4px");
+    assert_eq!(&computed.values[id]["color"], "blue");
+    assert_eq!(&computed.values[id]["background-color"], "red");
+    assert_eq!(&computed.values[id]["display"], "grid");
+    assert_eq!(&computed.values[id]["width"], "100cqi");
+    assert_eq!(&computed.values[id]["cursor"], "pointer");
+    assert!(!computed.values[id].contains(Prop::CONTENT));
+    assert_eq!(&computed.pseudos[&id][0]["background-color"], "red");
+    assert_eq!(&computed.pseudos[&id][0]["width"], "4px");
 }
 
 #[test]
@@ -656,13 +656,13 @@ fn declaration_tokens_preserve_strings_blocks_and_priority() {
             --tokens: one/**/two;
             content: "!important"; width: calc(10px /* math */ + 2px);"#,
     );
-    assert_eq!(style["color"], "red !important");
-    assert_eq!(style["padding-top"], "2px");
-    assert_eq!(style["padding-right"], "4px");
-    assert_eq!(style["--Case"], r#"{ key: [a;b]; nested: fn(";}"); }"#);
-    assert_eq!(style["--case"], r#""/* text */;escaped\"}""#);
-    assert_eq!(style["--tokens"], "one/**/two");
-    assert_eq!(style["content"], r#""!important""#);
+    assert_eq!(&style["color"], "red !important");
+    assert_eq!(&style["padding-top"], "2px");
+    assert_eq!(&style["padding-right"], "4px");
+    assert_eq!(&style["--Case"], r#"{ key: [a;b]; nested: fn(";}"); }"#);
+    assert_eq!(&style["--case"], r#""/* text */;escaped\"}""#);
+    assert_eq!(&style["--tokens"], "one/**/two");
+    assert_eq!(&style["content"], r#""!important""#);
     assert_eq!(length(&style["width"], 0., 16., 800., 600.), 12.);
 }
 
@@ -674,14 +674,17 @@ fn invalid_declarations_recover_at_the_next_property() {
              @unknown { color: blue; } border-width: 2px; \
              color: green !important extra; opacity:; --empty:;",
     );
-    assert_eq!(style["color"], "red");
-    assert_eq!(style["height"], "7px");
-    assert_eq!(style["padding-left"], "3px");
-    assert_eq!(style["margin-bottom"], "4px");
-    assert_eq!(style["border-top-width"], "2px");
-    assert_eq!(style["--empty"], "");
+    assert_eq!(&style["color"], "red");
+    assert_eq!(&style["height"], "7px");
+    assert_eq!(&style["padding-left"], "3px");
+    assert_eq!(&style["margin-bottom"], "4px");
+    assert_eq!(&style["border-top-width"], "2px");
+    assert_eq!(&style["--empty"], "");
     for key in ["width", "content", "background", "opacity"] {
-        assert!(!style.contains_key(key), "{key}");
+        assert!(
+            Prop::find(key).is_none_or(|prop| !style.contains(prop)),
+            "{key}"
+        );
     }
 }
 
@@ -711,7 +714,10 @@ fn tokenized_at_rules_keep_scope_and_accept_css_escapes() {
         assert_eq!(style["color"], "red");
         assert_eq!(style["width"], expected);
         assert_eq!(style["background-color"], "#123456");
-        assert_eq!(edges(style, "padding", width, 16., width, 600.), [3.; 4]);
+        assert_eq!(
+            Lengths::new(16., width, 600.).edges(&typed(style), PADDING, width),
+            [3.; 4]
+        );
         assert_eq!(
             computed[element(&doc, "span")].contains_key("height"),
             width >= 500.
@@ -752,19 +758,19 @@ fn relative_units_follow_root_font_and_inherited_line_height() {
         Some(200.)
     );
     assert_eq!(
-        computed.lengths[section].edges(&computed.values[section], "padding", 800.),
+        computed.lengths[section].edges(&computed.values[section], PADDING, 800.),
         [30., 40., 30., 40.]
     );
     assert_eq!(computed.lengths[absolute].font.em, 20.);
     assert_eq!(computed.lengths[absolute].font.lh, 60.);
-    assert_eq!(computed.values[absolute]["line-height"], "60px");
+    assert_eq!(&computed.values[absolute]["line-height"], "60px");
     assert_eq!(computed.lengths[number].font.lh, 40.);
     assert_eq!(computed.lengths[child].font.em, 10.);
     assert_eq!(computed.lengths[child].font.lh, 20.);
-    assert_eq!(computed.values[child]["line-height"], "2");
+    assert_eq!(&computed.values[child]["line-height"], "2");
     assert_eq!(computed.lengths[relative].font.lh, 120.);
     assert_eq!(
-        computed.lengths[relative].edges(&computed.values[relative], "margin", 800.),
+        computed.lengths[relative].edges(&computed.values[relative], MARGIN, 800.),
         [30.; 4]
     );
 }
@@ -825,7 +831,7 @@ fn math_values_work_in_variables_shorthands_shadows_and_utilities() {
     let id = element(&doc, ".box");
     let style = &computed.values[id];
     let units = computed.lengths[id];
-    assert_eq!(units.edges(style, "padding", 800.), [22., 30., 22., 30.]);
+    assert_eq!(units.edges(style, PADDING, 800.), [22., 30., 22., 30.]);
     assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
     assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
     let shadows = units.shadows(&style["box-shadow"], false);
@@ -926,11 +932,11 @@ fn theme_tokens_apply_order_and_scoped_overrides() {
     assert_eq!(style["font-family"], "Helvetica");
     assert_eq!(style["font-weight"], "850");
     assert_eq!(
-        edges(&style, "padding", 799., 32., 799., 600.),
+        Lengths::new(32., 799., 600.).edges(&typed(&style), PADDING, 799.),
         [20., 20., 20., 10.]
     );
     assert_eq!(
-        edges(&style, "margin", 799., 32., 799., 600.),
+        Lengths::new(32., 799., 600.).edges(&typed(&style), MARGIN, 799.),
         [-23., 0., -10., 0.]
     );
     assert_eq!(length(&style["width"], 799., 32., 799., 600.), 23.);
@@ -1016,10 +1022,7 @@ fn filters_fold_into_one_color_matrix() {
         shadows[0].offset,
         render::point(render::px(2.), render::px(3.))
     );
-    assert_eq!(
-        render::Rgba::from(shadows[0].color),
-        render::rgba(0x00ffffff)
-    );
+    assert_eq!(shadows[0].color, render::rgba(0x00ffffff));
     let twice = matrix.unwrap().then(matrix.unwrap());
     assert!(
         twice
@@ -1341,7 +1344,7 @@ fn tailwind_classes_have_stable_order_and_respond_to_width() {
             assert_eq!(px("width"), expected);
             assert_eq!(px("height"), 32.);
             assert_eq!(
-                edges(&style, "padding", width, 16., width, 600.),
+                Lengths::new(16., width, 600.).edges(&typed(&style), PADDING, width),
                 [32., 16., 32., 8.]
             );
             assert_eq!(px("row-gap"), 16.);
@@ -1356,7 +1359,10 @@ fn css_and_inline_shorthands_override_utilities() {
         "<style>@import 'tailwindcss'; div { padding: 2px 3px; gap: 4px; background: blue; width: 20px !important; } .box { padding-left: 5px; }</style><div class='box p-8 bg-white gap-8 w-4' style='padding: 6px; gap: 7px 8px; background: black; width: 30px'></div>",
     );
     let style = styles(&doc, 800., 600.).pop().unwrap();
-    assert_eq!(edges(&style, "padding", 800., 16., 800., 600.), [6.; 4]);
+    assert_eq!(
+        Lengths::new(16., 800., 600.).edges(&typed(&style), PADDING, 800.),
+        [6.; 4]
+    );
     assert_eq!(style["background-color"], "black");
     assert_eq!(style["row-gap"], "7px");
     assert_eq!(style["column-gap"], "8px");
@@ -1364,18 +1370,18 @@ fn css_and_inline_shorthands_override_utilities() {
     let style = declarations(
         "padding: 1px !important; padding: 2px; padding-left: 3px; padding-right: 4px !important",
     );
-    assert_eq!(style["padding-left"], "1px !important");
-    assert_eq!(style["padding-right"], "4px !important");
+    assert_eq!(&style["padding-left"], "1px !important");
+    assert_eq!(&style["padding-right"], "4px !important");
     let doc = Document::parse(
         "<html><style>@import 'tailwindcss'; :root { --space: 2px 4px; } div { padding: var(--space); gap: var(--missing, 5px 6px); margin: var(--space); margin-left: 9px; }</style><div class='p-8 gap-8 m-8'></div></html>",
     );
     let style = styles(&doc, 800., 600.).pop().unwrap();
     assert_eq!(
-        edges(&style, "padding", 800., 16., 800., 600.),
+        Lengths::new(16., 800., 600.).edges(&typed(&style), PADDING, 800.),
         [2., 4., 2., 4.]
     );
     assert_eq!(
-        edges(&style, "margin", 800., 16., 800., 600.),
+        Lengths::new(16., 800., 600.).edges(&typed(&style), MARGIN, 800.),
         [2., 4., 2., 9.]
     );
     assert_eq!(style["row-gap"], "5px");
@@ -1432,19 +1438,19 @@ fn tailwind_state_variants_follow_interaction_states() {
         assert_eq!(cached.values, fresh.values, "hovered {hovered}");
         let style = &cached.values[card];
         assert_eq!(
-            style["background-color"],
+            &style["background-color"],
             if hovered { "#222222" } else { "#111111" }
         );
         assert_eq!(
-            style.get("color").map(String::as_str),
+            style.get(Prop::COLOR),
             Some(if hovered { "#333333" } else { "#171717" })
         );
         assert_eq!(
-            cached.values[span].get("font-weight").map(String::as_str),
+            cached.values[span].get(Prop::FONT_WEIGHT),
             hovered.then_some("700")
         );
-        assert_eq!(cached.values[span]["padding-top"], "3px");
-        assert_eq!(cached.values[bold]["padding-top"], "0");
+        assert_eq!(&cached.values[span]["padding-top"], "3px");
+        assert_eq!(&cached.values[bold]["padding-top"], "0");
     }
 }
 
@@ -1475,15 +1481,15 @@ fn table_columns_follow_rows_and_stay_cached() {
     let mut cache = StyleCache::default();
     let first = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(
-        first.values[table]["grid-template-columns"],
+        &first.values[table]["grid-template-columns"],
         "repeat(3,auto)"
     );
     assert_eq!(
-        first.values[inner]["grid-template-columns"],
+        &first.values[inner]["grid-template-columns"],
         "repeat(5,auto)"
     );
-    assert!(!first.values[one].contains_key("grid-template-columns"));
-    assert_eq!(first.values[own]["grid-template-columns"], "1fr 2fr");
+    assert!(!first.values[one].contains(Prop::GRID_TEMPLATE_COLUMNS));
+    assert_eq!(&first.values[own]["grid-template-columns"], "1fr 2fr");
     let second = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert!(Rc::ptr_eq(&first.values[table], &second.values[table]));
     let row = doc.nodes[doc.nodes[table].children[1]].children[0];
@@ -1498,7 +1504,7 @@ fn table_columns_follow_rows_and_stay_cached() {
     }
     let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(
-        cached.values[table]["grid-template-columns"],
+        &cached.values[table]["grid-template-columns"],
         "repeat(5,auto)"
     );
     let last = *doc.nodes[row].children.last().unwrap();
@@ -1515,7 +1521,7 @@ fn table_columns_follow_rows_and_stay_cached() {
     );
     assert_eq!(cached.values, fresh.values);
     assert_eq!(
-        cached.values[table]["grid-template-columns"],
+        &cached.values[table]["grid-template-columns"],
         "repeat(4,auto)"
     );
 }
@@ -1594,6 +1600,40 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
 }
 
 #[test]
+fn resizes_keep_scopes_until_a_media_query_changes() {
+    let doc = Document::parse(
+        "<style>.a{font-size:2vw} @media (max-width: 500px){.a{color:red}}</style><div class=a></div>",
+    );
+    let div = element(&doc, "div");
+    let mut cache = StyleCache::default();
+    let mut scopes = Vec::new();
+    for width in [800., 700., 400., 300.] {
+        let computed = compute_styles(
+            &doc,
+            width,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut cache,
+            None,
+        );
+        cache.finish();
+        scopes.push(cache.scopes[0].id);
+        let fresh = styles(&doc, width, 600.);
+        assert_eq!(
+            computed.values[div].get(Prop::COLOR),
+            fresh[div].get("color").map(String::as_str)
+        );
+        assert_eq!(
+            &computed.values[div]["font-size"],
+            format!("{}px", width / 50.)
+        );
+    }
+    assert_eq!(scopes, [scopes[0], scopes[0], scopes[2], scopes[2]]);
+    assert_ne!(scopes[0], scopes[2]);
+}
+
+#[test]
 fn collapsed_table_borders_straddle_grid_lines() {
     let doc = Document::parse(
         "<style>table { border-collapse: collapse } td { border: 2px solid } .own { border: 6px solid }</style>
@@ -1602,20 +1642,20 @@ fn collapsed_table_borders_straddle_grid_lines() {
         <table id=separate style='border-collapse: separate; border-spacing: 3px'><tr><td>a</td></tr></table>",
     );
     let computed = styles(&doc, 800., 600.);
-    let edges = |selector, name| {
-        edges(
-            &computed[element(&doc, selector)],
-            name,
-            0.,
-            16.,
-            800.,
-            600.,
-        )
+    let edges = |selector, props| {
+        Lengths::new(16., 800., 600.).edges(&typed(&computed[element(&doc, selector)]), props, 0.)
     };
-    assert_eq!(edges("#cells td", "margin"), [-1.; 4]);
-    assert_eq!(edges("#cells", "padding"), [1.; 4]);
+    assert_eq!(edges("#cells td", MARGIN), [-1.; 4]);
+    assert_eq!(edges("#cells", PADDING), [1.; 4]);
     assert_eq!(computed[element(&doc, "#cells")]["border-top-width"], "0");
-    assert_eq!(edges("#own", "margin"), [7.; 4]);
-    assert_eq!(edges("#own", "padding"), [0.; 4]);
-    assert_eq!(edges("#separate", "padding"), [3.; 4]);
+    assert_eq!(edges("#own", MARGIN), [7.; 4]);
+    assert_eq!(edges("#own", PADDING), [0.; 4]);
+    assert_eq!(edges("#separate", PADDING), [3.; 4]);
+}
+
+fn typed(values: &BTreeMap<String, String>) -> Style {
+    values
+        .iter()
+        .map(|(name, value)| (Prop::new(name), value.as_str().into()))
+        .collect()
 }

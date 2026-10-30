@@ -1,11 +1,12 @@
 //! Scrollbars. By default they are macOS overlay bars that show while the box scrolls or the pointer is
 //! over them, then fade out. `::-webkit-scrollbar` styles give bars that always show and take layout space.
 
+use crate::style::Prop;
 use crate::style::{self, Style};
 use render::{
-    Bounds, Corners, DispatchPhase, Edges, Hitbox, HitboxBehavior, Rgba, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle,
-    Timer, Window, point, prelude::*, px, quad, rgba, size, transparent_black,
+    Bounds, Corners, DispatchPhase, Edges, Hitbox, HitboxBehavior, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, Timer, Window,
+    point, prelude::*, px, quad, rgba, size, transparent_black,
 };
 use std::{
     cell::RefCell,
@@ -35,37 +36,37 @@ struct Part {
 
 impl Part {
     fn new(style: &Style, units: &style::Lengths, thickness: f32) -> Self {
-        let length = |name: &str| {
+        let length = |prop| {
             style
-                .get(name)
+                .get(prop)
                 .and_then(|value| units.resolve(style::components(value, ' ').first()?, thickness))
                 .unwrap_or(0.)
                 .max(0.)
         };
-        let color = |name: &str| {
+        let color = |prop| {
             style
-                .get(name)
-                .and_then(|value| style::color(value))
+                .get(prop)
+                .and_then(style::color)
                 .map_or(transparent_black(), |(ink, alpha)| {
                     rgba(ink << 8 | alpha as u32)
                 })
         };
         let border = if style
-            .get("border-top-style")
-            .is_some_and(|kind| !matches!(kind.as_str(), "none" | "hidden"))
+            .get(Prop::BORDER_TOP_STYLE)
+            .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
         {
-            length("border-top-width")
+            length(Prop::BORDER_TOP_WIDTH)
         } else {
             0.
         };
         Part {
-            fill: color("background-color"),
-            radius: length("border-top-left-radius"),
+            fill: color(Prop::BACKGROUND_COLOR),
+            radius: length(Prop::BORDER_TOP_LEFT_RADIUS),
             border,
-            edge: color("border-top-color"),
-            clip: match style.get("background-clip").map(String::as_str) {
+            edge: color(Prop::BORDER_TOP_COLOR),
+            clip: match style.get(Prop::BACKGROUND_CLIP) {
                 Some("padding-box") => border,
-                Some("content-box") => border + length("padding-top"),
+                Some("content-box") => border + length(Prop::PADDING_TOP),
                 _ => 0.,
             },
         }
@@ -118,13 +119,13 @@ impl Look {
         units: &style::Lengths,
         backdrop: Option<u32>,
     ) -> Option<Self> {
-        let width = style.get("scrollbar-width").map_or("auto", String::as_str);
+        let width = style.get(Prop::SCROLLBAR_WIDTH).unwrap_or("auto");
         if width == "none" {
             return None;
         }
         // A `color-scheme` picks the knobs; without one, a dark backdrop does, by HSL lightness like Chromium.
         // Transparent windows follow the system appearance.
-        let scheme = style.get("color-scheme").map_or("", String::as_str);
+        let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
         let system = || crate::desktop::native::theme_state() & 1 != 0;
         let mut look = Look {
             dark: match (scheme.contains("dark"), scheme.contains("light")) {
@@ -137,7 +138,7 @@ impl Look {
                 }),
             },
             thin: width == "thin",
-            colors: style.get("scrollbar-color").and_then(|value| {
+            colors: style.get(Prop::SCROLLBAR_COLOR).and_then(|value| {
                 let parts = style::components(value, ' ');
                 let [thumb, track] =
                     [parts.first()?, parts.get(1)?].map(|value| style::color(value));
@@ -146,13 +147,13 @@ impl Look {
             custom: None,
             forced: [
                 style
-                    .get("overflow-x")
+                    .get(Prop::OVERFLOW_X)
                     .is_some_and(|value| value == "scroll"),
                 style
-                    .get("overflow-y")
+                    .get(Prop::OVERFLOW_Y)
                     .is_some_and(|value| value == "scroll")
                     || style
-                        .get("scrollbar-gutter")
+                        .get(Prop::SCROLLBAR_GUTTER)
                         .is_some_and(|value| value.starts_with("stable")),
             ],
         };
@@ -162,10 +163,10 @@ impl Look {
             && width == "auto"
             && look.colors.is_none()
         {
-            if bar.get("display").is_some_and(|value| value == "none") {
+            if bar.get(Prop::DISPLAY).is_some_and(|value| value == "none") {
                 return None;
             }
-            let size = ["height", "width"].map(|name| {
+            let size = [Prop::HEIGHT, Prop::WIDTH].map(|name| {
                 bar.get(name)
                     .and_then(|value| units.resolve(value, 0.))
                     .map_or(15., |value| value.max(0.))
@@ -255,10 +256,7 @@ impl IntoElement for Scrollbar {
 impl render::Element for Scrollbar {
     type RequestLayoutState = ();
     type PrepaintState = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
-    fn request_layout(
-        &mut self,
-        window: &mut Window,
-    ) -> (render::LayoutId, ()) {
+    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
         let mut style = render::Style {
             position: render::Position::Absolute,
             ..Default::default()
@@ -276,10 +274,13 @@ impl render::Element for Scrollbar {
         window: &mut Window,
     ) -> Self::PrepaintState {
         let look = self.look.as_ref()?;
-        let state = window.with_element_state(("scrollbar", self.id).into(), |state: Option<Rc<RefCell<State>>>, _| {
-            let state = state.unwrap_or_default();
-            (state.clone(), state)
-        });
+        let state = window.with_element_state(
+            ("scrollbar", self.id).into(),
+            |state: Option<Rc<RefCell<State>>>, _| {
+                let state = state.unwrap_or_default();
+                (state.clone(), state)
+            },
+        );
         let (bounds, max, offset) = (
             self.handle.bounds(),
             self.handle.max_offset(),
@@ -438,9 +439,7 @@ impl render::Element for Scrollbar {
             let cross = [bar_width - INSET - width, width];
             let (thumb_color, track_color) = look
                 .colors
-                .map_or((rgba(knob), rgba(track)), |[thumb, track]| {
-                    (thumb, track)
-                });
+                .map_or((rgba(knob), rgba(track)), |[thumb, track]| (thumb, track));
             let edge = |color: u32| {
                 if look.colors.is_some() {
                     transparent_black()

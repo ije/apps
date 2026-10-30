@@ -1,4 +1,5 @@
 use super::{ViewData, WebView};
+use crate::style::Prop;
 use crate::{desktop::Desktop, style};
 use anyhow::{Context as _, Result, ensure};
 use render::{
@@ -332,17 +333,14 @@ impl render::View for WebView {
         let face = style::font(style);
         let text = state["text"].as_str()?;
         let font_size = style::length(
-            style.get("font-size").map(String::as_str).unwrap_or("16px"),
+            style.get(Prop::FONT_SIZE).unwrap_or("16px"),
             16.,
             16.,
             bounds[2],
             bounds[3],
         );
         let line_height = style::length(
-            style
-                .get("line-height")
-                .map(String::as_str)
-                .unwrap_or("20px"),
+            style.get(Prop::LINE_HEIGHT).unwrap_or("20px"),
             font_size,
             font_size,
             bounds[2],

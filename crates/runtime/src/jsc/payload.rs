@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 
+// WARNING: binary arguments of a call can borrow JavaScript memory, so bytes leave a frame only through `read` and `snapshot`, which copy borrowed bytes. A `slice` must not outlive its call or a `read` of the same argument.
 thread_local! { static FRAMES: RefCell<Vec<Vec<Bytes>>> = const { RefCell::new(Vec::new()) }; }
 
 #[derive(Clone, Default)]
@@ -39,10 +41,17 @@ impl Payload {
         Self { value, buffers }
     }
 
+    /// Takes the binary arguments of the current call, so `value` can outlive it.
     pub fn snapshot(value: Value) -> Self {
         Self {
             value,
-            buffers: FRAMES.with(|frames| frames.borrow().last().cloned().unwrap_or_default()),
+            buffers: FRAMES.with(|frames| {
+                frames
+                    .borrow_mut()
+                    .last_mut()
+                    .map(|frame| frame.iter_mut().map(own).collect())
+                    .unwrap_or_default()
+            }),
         }
     }
 
@@ -69,12 +78,12 @@ impl Payload {
                 *value = if let Some(offset) = offset {
                     json!({"$appsBytes": index + offset as u64})
                 } else {
-                    crate::web::base64(
+                    Value::String(STANDARD.encode(
                         self.buffers
                             .get(index as usize)
                             .map(Bytes::as_ref)
                             .unwrap_or_default(),
-                    )
+                    ))
                 };
             } else {
                 match value {
@@ -88,16 +97,37 @@ impl Payload {
     }
 }
 
-pub(crate) fn read(value: &Value) -> Option<Result<Vec<u8>>> {
+/// Moves out bytes that the frame owns alone, and copies borrowed or shared ones.
+fn own(bytes: &mut Bytes) -> Bytes {
+    if bytes.is_unique() {
+        std::mem::take(bytes)
+    } else {
+        Bytes::copy_from_slice(bytes)
+    }
+}
+
+/// Takes binary argument `value` of the current call, for an op that keeps it.
+pub(crate) fn read(value: &Value) -> Option<Result<Bytes>> {
     let index = value.get("$appsBytes")?.as_u64()?;
     Some(FRAMES.with(|frames| {
-        let frames = frames.borrow();
-        let bytes = frames
-            .last()
-            .and_then(|frame| frame.get(index as usize))
-            .context("Invalid binary argument")?;
-        Ok(bytes.to_vec())
+        Ok(own(
+            frames
+                .borrow_mut()
+                .last_mut()
+                .and_then(|frame| frame.get_mut(index as usize))
+                .context("Invalid binary argument")?,
+        ))
     }))
+}
+
+/// Borrows binary argument `value` of the current call without a copy.
+pub(crate) fn slice(value: &Value) -> Option<Result<&[u8]>> {
+    let index = value.get("$appsBytes")?.as_u64()?;
+    Some(
+        get(index as usize)
+            .map(|(pointer, length)| unsafe { std::slice::from_raw_parts(pointer, length) })
+            .context("Invalid binary argument"),
+    )
 }
 
 /// The bytes of binary argument `index` of the current call. They stay valid until the call returns.
@@ -109,17 +139,19 @@ pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
     })
 }
 
-pub(crate) fn write(bytes: &[u8]) -> Option<Value> {
-    FRAMES.with(|frames| {
-        let mut frames = frames.borrow_mut();
-        let frame = frames.last_mut()?;
-        let index = frame.len();
-        frame.push(Bytes::copy_from_slice(bytes));
-        Some(json!({"$appsBytes":index}))
+/// Returns `bytes` as a binary result of the current call, or as base64 outside a call.
+pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
+    let bytes = bytes.into();
+    FRAMES.with(|frames| match frames.borrow_mut().last_mut() {
+        Some(frame) => {
+            frame.push(bytes);
+            json!({"$appsBytes": frame.len() - 1})
+        }
+        None => Value::String(STANDARD.encode(bytes)),
     })
 }
 
-/// The bytes of an `ArrayBuffer` or typed array, valid until the next JavaScript allocation.
+/// The bytes of an `ArrayBuffer` or typed array. JavaScriptCore pins them, so they stay valid while the value lives.
 pub(crate) fn view<'a>(
     api: &crate::jsc::Api,
     ctx: crate::jsc::Ptr,
@@ -188,7 +220,8 @@ pub(crate) fn input(
         let bytes = view(api, ctx, value)?;
         total += bytes.len();
         ensure!(total <= 1 << 31, "Binary arguments are too large");
-        buffers.push(Bytes::copy_from_slice(bytes));
+        // WARNING: these borrow the arguments of the running call, so callers that keep them must copy them first.
+        buffers.push(Bytes::from_static(bytes));
     }
     Ok(buffers)
 }

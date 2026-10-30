@@ -40,8 +40,8 @@ extern "C" fn read(index: usize, length: *mut usize) -> *const u8 {
 }
 
 extern "C" fn write(bytes: *const u8, length: usize) -> usize {
-    crate::jsc::payload::write(unsafe { std::slice::from_raw_parts(bytes, length) })
-        .and_then(|value| value["$appsBytes"].as_u64())
+    crate::jsc::payload::write(unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec())["$appsBytes"]
+        .as_u64()
         .map_or(usize::MAX, |index| index as usize)
 }
 

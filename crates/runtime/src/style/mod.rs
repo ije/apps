@@ -1,10 +1,12 @@
 use crate::dom::{Document, Selector, SelectorCache, SelectorList};
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 mod animation;
 mod color;
 pub(crate) mod parser;
+mod props;
 mod shorthand;
 mod tailwind;
 #[cfg(test)]
@@ -19,10 +21,11 @@ use shorthand::expand;
 pub(crate) use text::{
     InlineText, cursor, font, inline_text, restyle, selection_colors, spacing, text_transform,
 };
-pub(crate) use value::{Filter, clip_path, components};
-pub use value::{edges, length};
+pub use value::length;
+pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, clip_path, components};
 
-pub type Style = BTreeMap<String, String>;
+pub(crate) use props::Prop;
+pub use props::Style;
 
 pub(crate) const DISPLAY_NONE: u8 = 1;
 pub(crate) const DISPLAY_CONTENTS: u8 = 2;
@@ -32,15 +35,15 @@ pub(crate) const SELECT_ALL: u8 = 16;
 pub(crate) const SELECT_TEXT: u8 = 32;
 
 fn flags(style: &Style) -> u8 {
-    let get = |name| style.get(name).map_or("", String::as_str);
+    let get = |prop| style.get(prop).unwrap_or("");
     let flag = |set, value| if set { value } else { 0 };
-    flag(get("display") == "none", DISPLAY_NONE)
-        | flag(get("display") == "contents", DISPLAY_CONTENTS)
+    flag(get(Prop::DISPLAY) == "none", DISPLAY_NONE)
+        | flag(get(Prop::DISPLAY) == "contents", DISPLAY_CONTENTS)
         | flag(
-            matches!(get("visibility"), "hidden" | "collapse"),
+            matches!(get(Prop::VISIBILITY), "hidden" | "collapse"),
             INVISIBLE,
         )
-        | match get("user-select") {
+        | match get(Prop::USER_SELECT) {
             "none" => SELECT_NONE,
             "all" => SELECT_ALL,
             "text" => SELECT_TEXT,
@@ -126,59 +129,6 @@ q::before{content:open-quote}
 q::after{content:close-quote}
 ";
 
-// WARNING: keep sorted; it is searched with binary_search.
-const INHERITED: &[&str] = &[
-    "-moz-osx-font-smoothing",
-    "-webkit-font-smoothing",
-    "-webkit-text-fill-color",
-    "accent-color",
-    "app-region",
-    "border-collapse",
-    "border-spacing",
-    "caret-color",
-    "color",
-    "color-scheme",
-    "cursor",
-    "direction",
-    "fill",
-    "fill-opacity",
-    "font-family",
-    "font-feature-settings",
-    "font-size",
-    "font-stretch",
-    "font-style",
-    "font-variant",
-    "font-variant-numeric",
-    "font-weight",
-    "hyphens",
-    "letter-spacing",
-    "line-height",
-    "list-style-image",
-    "list-style-position",
-    "list-style-type",
-    "overflow-wrap",
-    "pointer-events",
-    "quotes",
-    "stroke",
-    "stroke-opacity",
-    "stroke-width",
-    "tab-size",
-    "text-align",
-    "text-decoration-color",
-    "text-decoration-line",
-    "text-decoration-style",
-    "text-decoration-thickness",
-    "text-indent",
-    "text-shadow",
-    "text-transform",
-    "text-underline-offset",
-    "text-wrap",
-    "visibility",
-    "white-space",
-    "word-break",
-    "word-spacing",
-];
-
 thread_local! {
     static UA_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(UA));
     pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, HashMap<String, render::SharedString>)> = Default::default();
@@ -256,15 +206,18 @@ struct StyleScope {
     used: u64,
     restricted: bool,
     sheets: Vec<Rc<Stylesheet>>,
-    rules: Vec<(SelectorList, Style, i32)>,
+    /// Selectors, declarations with their `!important` flag, and layer.
+    rules: Vec<(SelectorList, Vec<Declared>, i32)>,
     /// Pseudo-element kind, selector without it, rule and key.
     pseudos: Vec<(usize, Selector, usize, Key)>,
     /// Element selectors of each rule, by index in the rule's list.
     elements: Vec<Vec<(usize, Key)>>,
     /// Rules by the key one of their selectors requires, per key kind.
-    buckets: [HashMap<String, Vec<usize>>; 4],
+    buckets: [FxHashMap<String, Vec<usize>>; 4],
     universal: Vec<usize>,
     containers: Vec<Option<ContainerQuery>>,
+    /// Whether each `@media` rule of the sheets matched when the rules were collected.
+    media: Vec<bool>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     /// Interaction states the selectors use.
     states: u8,
@@ -365,6 +318,7 @@ impl StyleCache {
     }
 }
 type CascadeRank = (bool, i32, [usize; 4], usize);
+type Declared = (Prop, Rc<str>, bool);
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Declarations(Vec<Declaration>);
@@ -821,6 +775,21 @@ impl MediaQuery {
     }
 }
 
+impl Collect<'_> {
+    fn media(&self, queries: &[MediaQuery]) -> bool {
+        queries.is_empty()
+            || queries.iter().any(|query| {
+                query.matches(
+                    self.width,
+                    self.height,
+                    self.reduced_motion,
+                    self.native_theme,
+                    FontUnits::new(16.),
+                ) == Some(true)
+            })
+    }
+}
+
 struct Collect<'a> {
     width: f32,
     height: f32,
@@ -966,22 +935,31 @@ impl Rule {
                 collected.container = outer;
             }
             Self::Media(queries, children) => {
-                if queries.is_empty()
-                    || queries.iter().any(|query| {
-                        query.matches(
-                            collected.width,
-                            collected.height,
-                            collected.reduced_motion,
-                            collected.native_theme,
-                            FontUnits::new(16.),
-                        ) == Some(true)
-                    })
-                {
+                if collected.media(queries) {
                     for rule in children {
                         rule.collect(parent, layer, collected);
                     }
                 }
             }
+        }
+    }
+
+    /// Appends whether each `@media` rule matches, in tree order.
+    fn media(&self, collected: &Collect, out: &mut Vec<bool>) {
+        let children = match self {
+            Self::Media(queries, children) => {
+                out.push(collected.media(queries));
+                children
+            }
+            Self::Style(_, children)
+            | Self::Layer(_, children)
+            | Self::Supports(_, _, children)
+            | Self::Theme(_, children)
+            | Self::Container(.., children) => children,
+            _ => return,
+        };
+        for child in children {
+            child.media(collected, out);
         }
     }
 
@@ -1051,9 +1029,9 @@ impl Rule {
 
 #[derive(Default)]
 pub(crate) struct StyleContext {
-    pub hosts: HashMap<usize, Style>,
-    pub inherited: HashMap<usize, (Rc<Style>, Lengths)>,
-    pub roots: HashMap<usize, (Rc<Style>, Lengths)>,
+    pub hosts: FxHashMap<usize, Style>,
+    pub inherited: FxHashMap<usize, (Rc<Style>, Lengths)>,
+    pub roots: FxHashMap<usize, (Rc<Style>, Lengths)>,
     pub required: Option<std::collections::HashSet<usize>>,
     pub reduced_motion: bool,
     pub theme: u32,
@@ -1066,14 +1044,14 @@ pub(crate) struct ComputedStyles {
     pub values: Vec<Rc<Style>>,
     pub flags: Vec<u8>,
     pub lengths: Vec<Lengths>,
-    pub pseudos: HashMap<usize, Rc<[Style; 2]>>,
-    pub text_pseudos: HashMap<usize, Rc<[Option<Style>; 4]>>,
+    pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
+    pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
     /// `::-webkit-scrollbar`, `-track`, `-thumb`, `-corner` and `-thumb:hover`.
-    pub scrollbars: HashMap<usize, Rc<[Option<Style>; 5]>>,
-    pub selections: HashMap<usize, Style>,
+    pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
+    pub selections: FxHashMap<usize, Style>,
     pub user_select: Vec<(UserSelect, usize)>,
-    pub animations: HashMap<usize, Vec<Animation>>,
-    pub children: HashMap<usize, Vec<usize>>,
+    pub animations: FxHashMap<usize, Vec<Animation>>,
+    pub children: FxHashMap<usize, Vec<usize>>,
     pub host_declarations: Style,
 }
 
@@ -1086,7 +1064,8 @@ pub(crate) enum UserSelect {
     All,
 }
 
-pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<Style> {
+/// The computed styles of all nodes by property name.
+pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BTreeMap<String, String>> {
     compute_styles(
         doc,
         width,
@@ -1097,8 +1076,13 @@ pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<Style> {
         None,
     )
     .values
-    .into_iter()
-    .map(|style| (*style).clone())
+    .iter()
+    .map(|style| {
+        style
+            .iter()
+            .map(|(prop, value)| (prop.name().to_owned(), value.to_string()))
+            .collect()
+    })
     .collect()
 }
 
@@ -1223,18 +1207,26 @@ pub(crate) fn cascade(
         || style_cache.reduced_motion != reduced_motion
         || style_cache.native_theme != native_theme
     {
-        *style_cache = StyleCache {
-            viewport: [width, height],
-            metrics: text_system.is_some(),
-            reduced_motion,
-            native_theme,
-            next: style_cache.next,
-            pass: style_cache.pass,
-            sheets: std::mem::take(&mut style_cache.sheets),
-            containers: std::mem::take(&mut style_cache.containers),
-            tailwind: std::mem::take(&mut style_cache.tailwind),
-            ..Default::default()
-        };
+        style_cache.viewport = [width, height];
+        style_cache.metrics = text_system.is_some();
+        style_cache.reduced_motion = reduced_motion;
+        style_cache.native_theme = native_theme;
+        style_cache.values.clear();
+        style_cache.queries.clear();
+        style_cache.queried = false;
+        // Selector matches stay valid while every `@media` rule keeps its result; computed values don't.
+        style_cache.scopes.retain_mut(|scope| {
+            let mut media = Vec::new();
+            for sheet in &scope.sheets {
+                for rule in &sheet.0 {
+                    rule.media(&collected, &mut media);
+                }
+            }
+            for node in scope.nodes.iter_mut().flatten() {
+                node.cached = None;
+            }
+            media == scope.media
+        });
     }
     let classes = order
         .iter()
@@ -1265,8 +1257,10 @@ pub(crate) fn cascade(
                     .all(|(a, b)| Rc::ptr_eq(a, b))
         })
         .unwrap_or_else(|| {
+            let mut media = Vec::new();
             for sheet in &sheets {
                 for rule in &sheet.0 {
+                    rule.media(&collected, &mut media);
                     rule.collect(None, "", &mut collected);
                 }
             }
@@ -1284,10 +1278,20 @@ pub(crate) fn cascade(
             let containers = rules.iter().map(|rule| rule.3.clone()).collect();
             let rules: Vec<_> = rules
                 .into_iter()
-                .map(|(selector, body, layer, _)| (selector.clone(), body.resolve(), layer))
+                .map(|(selector, body, layer, _)| {
+                    let body = body
+                        .resolve()
+                        .iter()
+                        .map(|(prop, value)| match value.strip_suffix("!important") {
+                            Some(plain) => (prop, plain.trim().into(), true),
+                            None => (prop, value.clone(), false),
+                        })
+                        .collect();
+                    (selector.clone(), body, layer)
+                })
                 .collect();
             let mut pseudos = Vec::new();
-            let mut buckets: [HashMap<String, Vec<usize>>; 4] = Default::default();
+            let mut buckets: [FxHashMap<String, Vec<usize>>; 4] = Default::default();
             let mut universal = Vec::new();
             let elements = rules
                 .iter()
@@ -1340,6 +1344,7 @@ pub(crate) fn cascade(
                 buckets,
                 universal,
                 containers,
+                media,
                 keyframes,
                 states,
                 matches: SelectorCache::default(),
@@ -1527,11 +1532,11 @@ pub(crate) fn cascade(
                             let mut parent = node.parent;
                             while let Some(ancestor) = parent {
                                 let style = &styles[ancestor];
-                                let kind = style.get("container-type").map_or("", String::as_str);
+                                let kind = style.get(Prop::CONTAINER_TYPE).unwrap_or("");
                                 if matches!(kind, "size" | "inline-size")
                                     && (!block || kind == "size")
                                     && name.as_ref().is_none_or(|name| {
-                                        style.get("container-name").is_some_and(|names| {
+                                        style.get(Prop::CONTAINER_NAME).is_some_and(|names| {
                                             names.split_ascii_whitespace().any(|item| item == name)
                                         })
                                     })
@@ -1622,32 +1627,25 @@ pub(crate) fn cascade(
         };
         if let Some(parent) = parent_style {
             let leaf = matches!(node.tag.as_str(), "#text" | "#comment");
-            for (key, value) in parent.iter() {
-                if key.starts_with("--") && !leaf || INHERITED.binary_search(&key.as_str()).is_ok()
-                {
-                    style.insert(key.clone(), value.clone());
-                }
-            }
+            style.extend(
+                parent
+                    .iter()
+                    .filter(|(prop, _)| prop.is_custom() && !leaf || prop.inherited())
+                    .map(|(prop, value)| (prop, value.clone())),
+            );
         }
-        let mut cascade: BTreeMap<Cow<str>, (CascadeRank, Cow<str>)> = BTreeMap::new();
+        let mut cascade: BTreeMap<Prop, (CascadeRank, Rc<str>)> = BTreeMap::new();
         for &(order, [ids, classes, tags]) in &key.rules {
             let (_, declarations, layer) = &rules[order];
-            for (key, value) in declarations {
-                let important = value.trim_end().ends_with("!important");
+            for &(prop, ref value, important) in declarations {
                 let rank = (
                     important,
                     if important { -*layer } else { *layer },
                     [0, ids, classes, tags],
                     order,
                 );
-                if cascade
-                    .get(key.as_str())
-                    .is_none_or(|(old, _)| rank >= *old)
-                {
-                    cascade.insert(
-                        key.as_str().into(),
-                        (rank, value.trim_end_matches("!important").trim().into()),
-                    );
+                if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
+                    cascade.insert(prop, (rank, value.clone()));
                 }
             }
         }
@@ -1657,46 +1655,43 @@ pub(crate) fn cascade(
                 .map(|source| Cow::Owned(Declarations::parse(source)))
         });
         if let Some(inline) = inline {
-            for (key, value) in inline.resolve() {
-                let rank = (
-                    value.trim_end().ends_with("!important"),
-                    i32::MAX,
-                    [1, 0, 0, 0],
-                    rules.len(),
-                );
-                if cascade
-                    .get(key.as_str())
-                    .is_none_or(|(old, _)| rank >= *old)
-                {
+            for (prop, value) in inline.resolve().iter() {
+                let important = value.ends_with("!important");
+                let rank = (important, i32::MAX, [1, 0, 0, 0], rules.len());
+                if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
                     cascade.insert(
-                        key.into(),
+                        prop,
                         (
                             rank,
-                            value
-                                .trim_end_matches("!important")
-                                .trim()
-                                .to_owned()
-                                .into(),
+                            if important {
+                                value.trim_end_matches("!important").trim().into()
+                            } else {
+                                value.clone()
+                            },
                         ),
                     );
                 }
             }
         }
         if let Some(declarations) = context.and_then(|context| context.hosts.get(&id)) {
-            for (key, value) in declarations {
+            for (prop, value) in declarations.iter() {
                 let important = value.ends_with("!important");
                 if important
                     || cascade
-                        .get(key.as_str())
+                        .get(&prop)
                         .is_none_or(|((important, layer, ..), _)| {
                             !important && *layer == i32::MIN + 1
                         })
                 {
                     cascade.insert(
-                        key.as_str().into(),
+                        prop,
                         (
                             (important, 0, [0; 4], 0),
-                            value.trim_end_matches("!important").trim().into(),
+                            if important {
+                                value.trim_end_matches("!important").trim().into()
+                            } else {
+                                value.clone()
+                            },
                         ),
                     );
                 }
@@ -1705,40 +1700,36 @@ pub(crate) fn cascade(
         if node.tag == "apps-shadow-root" {
             *host_declarations = cascade
                 .iter()
-                .map(|(key, (rank, value))| {
+                .map(|(&prop, (rank, value))| {
                     (
-                        key.to_string(),
+                        prop,
                         if rank.0 {
-                            format!("{value}!important")
+                            format!("{value}!important").into()
                         } else {
-                            value.to_string()
+                            value.clone()
                         },
                     )
                 })
                 .collect();
         }
-        if let Some((rank, value)) = cascade.remove("all") {
-            for key in style.keys().filter(|key| !key.starts_with("--")) {
-                cascade
-                    .entry(key.clone().into())
-                    .or_insert((rank, value.clone()));
+        if let Some((rank, value)) = cascade.remove(&Prop::ALL) {
+            for (prop, _) in style.iter().filter(|(prop, _)| !prop.is_custom()) {
+                cascade.entry(prop).or_insert((rank, value.clone()));
             }
-            for (key, entry) in &mut cascade {
-                if entry.0 < rank && !key.starts_with("--") {
+            for (prop, entry) in &mut cascade {
+                if entry.0 < rank && !prop.is_custom() {
                     *entry = (rank, value.clone());
                 }
             }
         }
-        let explicit_size = cascade.contains_key("font-size");
-        for (key, (_, value)) in cascade {
-            style.insert(key.into_owned(), value.into_owned());
-        }
+        let explicit_size = cascade.contains_key(&Prop::FONT_SIZE);
+        style.extend(cascade.into_iter().map(|(prop, (_, value))| (prop, value)));
         resolve_style(&mut style, parent_style.map(Rc::as_ref));
         resolve_keywords(&mut style, parent_style.map(Rc::as_ref));
         if style
-            .get("background-clip")
+            .get(Prop::BACKGROUND_CLIP)
             .is_some_and(|value| value.contains("text"))
-            && let Some(ink) = style.remove("background-image").and_then(|image| {
+            && let Some(ink) = style.remove(Prop::BACKGROUND_IMAGE).and_then(|image| {
                 let body = image.split_once('(')?.1.to_owned();
                 components(&body, ',').into_iter().find_map(|part| {
                     components(part, ' ')
@@ -1748,55 +1739,59 @@ pub(crate) fn cascade(
                 })
             })
         {
-            style.insert("color".into(), ink.clone());
-            style.insert("-webkit-text-fill-color".into(), ink);
+            style.insert(Prop::COLOR, ink.clone());
+            style.insert(Prop::WEBKIT_TEXT_FILL_COLOR, ink);
         }
-        style.entry("color".into()).or_insert("#171717".into());
-        if node.tag == "table" && style.get("display").is_some_and(|value| value == "grid") {
+        if !style.contains(Prop::COLOR) {
+            style.insert(Prop::COLOR, "#171717");
+        }
+        if node.tag == "table"
+            && style
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| value == "grid")
+        {
             let spacing = if style
-                .get("border-collapse")
+                .get(Prop::BORDER_COLLAPSE)
                 .is_some_and(|value| value == "collapse")
             {
                 "0".to_owned()
             } else {
                 style
-                    .get("border-spacing")
-                    .cloned()
+                    .get(Prop::BORDER_SPACING)
+                    .map(str::to_owned)
                     .unwrap_or_else(|| "2px".into())
             };
             let parts = components(&spacing, ' ');
             if let Some(&column) = parts.first() {
                 let row = parts.get(1).copied().unwrap_or(column);
-                style.insert("column-gap".into(), column.into());
-                style.insert("row-gap".into(), row.into());
+                style.insert(Prop::COLUMN_GAP, column);
+                style.insert(Prop::ROW_GAP, row);
                 // Separated borders also keep the spacing between the table's edges and its cells.
                 if spacing != "0" {
-                    for (side, gap) in [
-                        ("top", row),
-                        ("right", column),
-                        ("bottom", row),
-                        ("left", column),
+                    for (prop, gap) in [
+                        (Prop::PADDING_TOP, row),
+                        (Prop::PADDING_RIGHT, column),
+                        (Prop::PADDING_BOTTOM, row),
+                        (Prop::PADDING_LEFT, column),
                     ] {
-                        let key = format!("padding-{side}");
-                        let padding = style.get(&key).map_or("0px", String::as_str);
-                        let value = format!("calc({padding} + {gap})");
-                        style.insert(key, value);
+                        let value = format!("calc({} + {gap})", style.get(prop).unwrap_or("0px"));
+                        style.insert(prop, value);
                     }
                 }
             }
-            if key.columns > 1 && !style.contains_key("grid-template-columns") {
+            if key.columns > 1 && !style.contains(Prop::GRID_TEMPLATE_COLUMNS) {
                 style.insert(
-                    "grid-template-columns".into(),
+                    Prop::GRID_TEMPLATE_COLUMNS,
                     format!("repeat({},auto)", key.columns),
                 );
             }
         }
         let parent_weight = parent_style
-            .and_then(|parent| parent.get("font-weight"))
+            .and_then(|parent| parent.get(Prop::FONT_WEIGHT))
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(400.);
-        if let Some(weight) = style.get_mut("font-weight") {
-            let value = match weight.as_str() {
+        if let Some(weight) = style.get(Prop::FONT_WEIGHT) {
+            let value = match weight {
                 "normal" => 400.,
                 "bold" => 700.,
                 "bolder" if parent_weight < 350. => 400.,
@@ -1811,14 +1806,14 @@ pub(crate) fn cascade(
                     .filter(|v| (1. ..=1000.).contains(v))
                     .unwrap_or(parent_weight),
             };
-            *weight = value.to_string();
+            style.insert(Prop::FONT_WEIGHT, value.to_string());
         }
         if let Some(family) = context.and_then(|context| {
             context
                 .aliases
-                .get(style.get("font-family")?.trim_matches(['\'', '"']))
+                .get(style.get(Prop::FONT_FAMILY)?.trim_matches(['\'', '"']))
         }) {
-            style.insert("font-family".into(), family.clone());
+            style.insert(Prop::FONT_FAMILY, family.as_str());
         }
         let mut units = Lengths {
             font: parent,
@@ -1826,7 +1821,7 @@ pub(crate) fn cascade(
             viewport: [width, height],
             container: None,
         };
-        let size = match style.get("font-size").map_or("medium", String::as_str) {
+        let size = match style.get(Prop::FONT_SIZE).unwrap_or("medium") {
             "xx-small" => Some(9.),
             "x-small" => Some(10.),
             "small" => Some(13.),
@@ -1845,7 +1840,7 @@ pub(crate) fn cascade(
         .unwrap_or(parent.em);
         let monospace = |style: Option<&Style>| {
             style
-                .and_then(|style| style.get("font-family"))
+                .and_then(|style| style.get(Prop::FONT_FAMILY))
                 .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"))
         };
         let size = if !explicit_size
@@ -1882,7 +1877,7 @@ pub(crate) fn cascade(
                 lh,
             };
         }
-        if let Some(value) = style.get("line-height") {
+        if let Some(value) = style.get(Prop::LINE_HEIGHT) {
             let mut line_units = units;
             line_units.font.lh = parent.lh;
             if node.tag == "html" {
@@ -1894,7 +1889,7 @@ pub(crate) fn cascade(
             {
                 units.font.lh = if dimensional { value } else { value * size };
                 style.insert(
-                    "line-height".into(),
+                    Prop::LINE_HEIGHT,
                     if dimensional {
                         format!("{value}px")
                     } else {
@@ -1907,14 +1902,13 @@ pub(crate) fn cascade(
             root = units.font;
         }
         units.root = root;
-        style.insert("font-size".into(), format!("{size}px"));
-        let mut pseudo_cascade: [BTreeMap<&str, (CascadeRank, &str)>; 12] = Default::default();
+        style.insert(Prop::FONT_SIZE, format!("{size}px"));
+        let mut pseudo_cascade: [BTreeMap<Prop, (CascadeRank, &Rc<str>)>; 12] = Default::default();
         for &index in &key.pseudos {
             let (pseudo, selector, order, _) = &scoped.pseudos[index];
             let (_, declarations, layer) = &rules[*order];
             let [ids, classes, tags] = selector.specificity;
-            for (key, value) in declarations {
-                let important = value.trim_end().ends_with("!important");
+            for &(prop, ref value, important) in declarations {
                 let rank = (
                     important,
                     if important { -*layer } else { *layer },
@@ -1922,13 +1916,10 @@ pub(crate) fn cascade(
                     *order,
                 );
                 if pseudo_cascade[*pseudo]
-                    .get(key.as_str())
+                    .get(&prop)
                     .is_none_or(|(old, _)| rank >= *old)
                 {
-                    pseudo_cascade[*pseudo].insert(
-                        key.as_str(),
-                        (rank, value.trim_end_matches("!important").trim()),
-                    );
+                    pseudo_cascade[*pseudo].insert(prop, (rank, value));
                 }
             }
         }
@@ -1946,18 +1937,18 @@ pub(crate) fn cascade(
             corner,
             mut hovered,
         ] = pseudo_cascade;
-        let derive = |cascade: BTreeMap<&str, (CascadeRank, &str)>| {
+        let derive = |cascade: BTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
             (!cascade.is_empty()).then(|| {
                 let mut values: Style = style
                     .iter()
-                    .filter(|(key, _)| {
-                        key.starts_with("--") || INHERITED.binary_search(&key.as_str()).is_ok()
-                    })
-                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .filter(|(prop, _)| prop.is_custom() || prop.inherited())
+                    .map(|(prop, value)| (prop, value.clone()))
                     .collect();
-                for (key, (_, value)) in cascade {
-                    values.insert(key.to_owned(), value.to_owned());
-                }
+                values.extend(
+                    cascade
+                        .into_iter()
+                        .map(|(prop, (_, value))| (prop, value.clone())),
+                );
                 resolve_style(&mut values, Some(&style));
                 resolve_keywords(&mut values, Some(&style));
                 values
@@ -1977,15 +1968,17 @@ pub(crate) fn cascade(
             .iter()
             .any(|cascade| !cascade.is_empty())
             && (matches!(node.tag.as_str(), "html" | "body")
-                || ["overflow-x", "overflow-y"].iter().any(|name| {
-                    style
-                        .get(*name)
-                        .is_some_and(|value| matches!(value.as_str(), "auto" | "scroll"))
-                }))
+                || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|prop| {
+                        style
+                            .get(prop)
+                            .is_some_and(|value| matches!(value, "auto" | "scroll"))
+                    }))
         {
             if !hovered.is_empty() {
-                for (key, value) in &thumb {
-                    hovered.entry(*key).or_insert(*value);
+                for (prop, value) in &thumb {
+                    hovered.entry(*prop).or_insert(*value);
                 }
             }
             scrollbars.insert(
@@ -2003,54 +1996,49 @@ pub(crate) fn cascade(
             values.extend(
                 style
                     .iter()
-                    .filter(|(key, _)| key.starts_with("--") || key.as_str() == "color-scheme")
-                    .map(|(key, value)| (key.clone(), value.clone())),
+                    .filter(|(prop, _)| prop.is_custom() || *prop == Prop::COLOR_SCHEME)
+                    .map(|(prop, value)| (prop, value.clone())),
             );
-            for (key, (_, value)) in selected {
-                if matches!(
-                    key,
-                    "color" | "background-color" | "-webkit-text-fill-color"
-                ) {
-                    let value = if matches!(value, "inherit" | "unset") {
-                        parent
-                            .and_then(|parent| parent.get(key))
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                if key == "background-color" {
-                                    "transparent"
-                                } else {
-                                    "currentColor"
-                                }
-                                .into()
-                            })
-                    } else {
-                        value.to_owned()
-                    };
-                    values.insert(key.to_owned(), value);
+            let fallback = |prop: Prop| -> Rc<str> {
+                parent
+                    .and_then(|parent| parent.value(prop))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if prop == Prop::BACKGROUND_COLOR {
+                            "transparent"
+                        } else {
+                            "currentColor"
+                        }
+                        .into()
+                    })
+            };
+            let painted = |prop: Prop| {
+                matches!(
+                    prop,
+                    Prop::COLOR | Prop::BACKGROUND_COLOR | Prop::WEBKIT_TEXT_FILL_COLOR
+                )
+            };
+            for (prop, (_, value)) in selected {
+                if painted(prop) {
+                    values.insert(
+                        prop,
+                        if matches!(&**value, "inherit" | "unset") {
+                            fallback(prop)
+                        } else {
+                            value.clone()
+                        },
+                    );
                 }
             }
             resolve_style(&mut values, parent);
-            values.retain(|key, value| {
-                if !matches!(
-                    key.as_str(),
-                    "color" | "background-color" | "-webkit-text-fill-color"
-                ) {
+            values.retain(|prop, value| {
+                if !painted(prop) {
                     return false;
                 }
-                if matches!(value.as_str(), "inherit" | "unset") {
-                    *value = parent
-                        .and_then(|parent| parent.get(key))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            if key == "background-color" {
-                                "transparent"
-                            } else {
-                                "currentColor"
-                            }
-                            .into()
-                        });
-                } else if value == "initial" {
-                    *value = if key == "background-color" {
+                if matches!(&**value, "inherit" | "unset") {
+                    *value = fallback(prop);
+                } else if &**value == "initial" {
+                    *value = if prop == Prop::BACKGROUND_COLOR {
                         "transparent"
                     } else {
                         "currentColor"
@@ -2059,7 +2047,7 @@ pub(crate) fn cascade(
                 }
                 if value.eq_ignore_ascii_case("currentcolor") || color(value).is_some() {
                     true
-                } else if let Some(inherited) = parent.and_then(|parent| parent.get(key)) {
+                } else if let Some(inherited) = parent.and_then(|parent| parent.value(prop)) {
                     *value = inherited.clone();
                     true
                 } else {
@@ -2073,30 +2061,36 @@ pub(crate) fn cascade(
         let pseudo_cascade = [before, after];
         if pseudo_cascade
             .iter()
-            .any(|values| values.contains_key("content"))
+            .any(|values| values.contains_key(&Prop::CONTENT))
         {
             let values = pseudo_cascade.map(|cascade| {
-                let mut values = Style::new();
-                for (key, value) in &style {
-                    if key.starts_with("--")
-                        || matches!(
-                            key.as_str(),
-                            "color" | "color-scheme" | "font-family" | "font-size" | "line-height"
-                        )
-                    {
-                        values.insert(key.clone(), value.clone());
-                    }
-                }
-                for (key, (_, value)) in cascade {
-                    values.insert(key.to_owned(), value.to_owned());
-                }
+                let mut values: Style = style
+                    .iter()
+                    .filter(|(prop, _)| {
+                        prop.is_custom()
+                            || matches!(
+                                *prop,
+                                Prop::COLOR
+                                    | Prop::COLOR_SCHEME
+                                    | Prop::FONT_FAMILY
+                                    | Prop::FONT_SIZE
+                                    | Prop::LINE_HEIGHT
+                            )
+                    })
+                    .map(|(prop, value)| (prop, value.clone()))
+                    .collect();
+                values.extend(
+                    cascade
+                        .into_iter()
+                        .map(|(prop, (_, value))| (prop, value.clone())),
+                );
                 resolve_style(&mut values, Some(&style));
                 resolve_keywords(&mut values, Some(&style));
                 values
             });
             pseudos.insert(id, Rc::new(values));
         }
-        if style.contains_key("animation") || style.contains_key("animation-name") {
+        if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
             let effects = Animation::parse(&style, &scoped.keyframes);
             if !effects.is_empty() {
                 animations.insert(id, effects);
@@ -2133,27 +2127,52 @@ pub(crate) fn cascade(
     // Collapsed table borders (CSS 2.1 17.6.2): cells overlap by half their borders, so shared borders straddle
     // the grid lines, and the table keeps half of the outer borders.
     // WARNING: this changes the styles after caching, so cached styles stay unadjusted.
-    const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+    const SIDES: [[Prop; 4]; 4] = [
+        [
+            Prop::BORDER_TOP_STYLE,
+            Prop::BORDER_TOP_WIDTH,
+            Prop::MARGIN_TOP,
+            Prop::PADDING_TOP,
+        ],
+        [
+            Prop::BORDER_RIGHT_STYLE,
+            Prop::BORDER_RIGHT_WIDTH,
+            Prop::MARGIN_RIGHT,
+            Prop::PADDING_RIGHT,
+        ],
+        [
+            Prop::BORDER_BOTTOM_STYLE,
+            Prop::BORDER_BOTTOM_WIDTH,
+            Prop::MARGIN_BOTTOM,
+            Prop::PADDING_BOTTOM,
+        ],
+        [
+            Prop::BORDER_LEFT_STYLE,
+            Prop::BORDER_LEFT_WIDTH,
+            Prop::MARGIN_LEFT,
+            Prop::PADDING_LEFT,
+        ],
+    ];
     for &table in &order {
         if doc.nodes[table].tag != "table"
             || styles[table]
-                .get("border-collapse")
+                .get(Prop::BORDER_COLLAPSE)
                 .is_none_or(|value| value != "collapse")
             || styles[table]
-                .get("display")
+                .get(Prop::DISPLAY)
                 .is_none_or(|value| value != "grid")
         {
             continue;
         }
-        let border = |id: usize, side: &str| {
+        let border = |id: usize, [style, width, ..]: [Prop; 4]| {
             if styles[id]
-                .get(&format!("border-{side}-style"))
-                .is_none_or(|kind| matches!(kind.as_str(), "none" | "hidden"))
+                .get(style)
+                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
             {
                 return 0.;
             }
             styles[id]
-                .get(&format!("border-{side}-width"))
+                .get(width)
                 .map_or(Some(3.), |value| lengths[id].resolve(value, 0.))
                 .unwrap_or(0.)
                 .max(0.)
@@ -2177,10 +2196,12 @@ pub(crate) fn cascade(
             .filter(|cells| !cells.is_empty())
             .collect();
         let edges = SIDES.map(|side| {
-            let cells: Vec<usize> = match side {
-                "top" => rows.first().cloned().unwrap_or_default(),
-                "bottom" => rows.last().cloned().unwrap_or_default(),
-                "right" => rows.iter().filter_map(|row| row.last().copied()).collect(),
+            let cells: Vec<usize> = match side[0] {
+                Prop::BORDER_TOP_STYLE => rows.first().cloned().unwrap_or_default(),
+                Prop::BORDER_BOTTOM_STYLE => rows.last().cloned().unwrap_or_default(),
+                Prop::BORDER_RIGHT_STYLE => {
+                    rows.iter().filter_map(|row| row.last().copied()).collect()
+                }
                 _ => rows.iter().filter_map(|row| row.first().copied()).collect(),
             };
             let widest = cells
@@ -2196,40 +2217,39 @@ pub(crate) fn cascade(
             .collect();
         let units = lengths[table];
         let style = Rc::make_mut(&mut styles[table]);
-        for (side, (own, widest)) in SIDES.iter().zip(edges) {
+        for ([_, width, margin, padding], (own, widest)) in SIDES.into_iter().zip(edges) {
             if own > widest {
                 // The table's border wins and straddles the outer grid line, half outside the box.
-                let key = format!("margin-{side}");
-                if let Some(margin) = style
-                    .get(&key)
+                if let Some(value) = style
+                    .get(margin)
                     .map_or(Some(0.), |value| units.resolve(value, f32::NAN))
                 {
-                    style.insert(key, format!("{}px", margin - own / 2.));
+                    style.insert(margin, format!("{}px", value - own / 2.));
                 }
-                style.insert(format!("padding-{side}"), "0".into());
+                style.insert(padding, "0");
             } else {
                 // The cells' borders win, and the table keeps half of them as space.
-                style.insert(format!("border-{side}-width"), "0".into());
-                style.insert(format!("padding-{side}"), format!("{}px", widest / 2.));
+                style.insert(width, "0");
+                style.insert(padding, format!("{}px", widest / 2.));
             }
         }
         for (cell, widths) in cells {
             let style = Rc::make_mut(&mut styles[cell]);
-            for (side, width) in SIDES.iter().zip(widths) {
-                style.insert(format!("margin-{side}"), format!("{}px", -width / 2.));
+            for ([_, _, margin, _], width) in SIDES.into_iter().zip(widths) {
+                style.insert(margin, format!("{}px", -width / 2.));
             }
         }
     }
 }
 
 fn resolve_style(style: &mut Style, parent: Option<&Style>) {
-    style.retain(|key, value| {
-        if !key.starts_with("--") || !matches!(value.as_str(), "inherit" | "unset" | "initial") {
+    style.retain(|prop, value| {
+        if !prop.is_custom() || !matches!(&**value, "inherit" | "unset" | "initial") {
             return true;
         }
         match parent
-            .and_then(|parent| parent.get(key))
-            .filter(|_| value != "initial")
+            .and_then(|parent| parent.value(prop))
+            .filter(|_| &**value != "initial")
         {
             Some(inherited) => {
                 *value = inherited.clone();
@@ -2241,8 +2261,8 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
     let resolved: Vec<_> = style
         .iter()
         .filter(|(_, value)| value.contains("var("))
-        .map(|(key, value)| {
-            let mut value = value.clone();
+        .map(|(prop, value)| {
+            let mut value = value.to_string();
             for _ in 0..64 {
                 let Some(start) = value.rfind("var(") else {
                     break;
@@ -2262,9 +2282,8 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
                 let (name, fallback) = value[start + 4..end]
                     .split_once(',')
                     .unwrap_or((&value[start + 4..end], ""));
-                let mut resolved = style
-                    .get(name.trim())
-                    .map(String::as_str)
+                let mut resolved = Prop::find(name.trim())
+                    .and_then(|prop| style.get(prop))
                     .unwrap_or(fallback.trim())
                     .to_owned();
                 // WARNING: `var()` substitutes tokens, so `var(--a)var(--b)` stays two values.
@@ -2282,33 +2301,36 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
                 }
                 value.replace_range(start..end + 1, &resolved);
             }
-            (key.clone(), value)
+            (prop, value)
         })
         .collect();
-    for (key, value) in resolved {
+    for (prop, value) in resolved {
         if let Some((shorthand, value)) = value
             .strip_prefix('\u{1}')
             .and_then(|value| value.split_once('\u{1}'))
         {
             let mut expanded = Vec::new();
             expand(shorthand, value.trim(), &mut expanded);
-            match expanded.into_iter().find(|(name, _)| *name == key) {
-                Some((_, value)) => style.insert(key, value),
-                None => style.remove(&key),
-            };
+            match expanded.into_iter().find(|(name, _)| name == prop.name()) {
+                Some((_, value)) => style.insert(prop, value),
+                None => {
+                    style.remove(prop);
+                }
+            }
         } else {
-            style.insert(key, value);
+            style.insert(prop, value);
         }
     }
     // `light dark` follows the system appearance, like browsers.
-    let dark = style.get("color-scheme").is_some_and(|v| {
+    let dark = style.get(Prop::COLOR_SCHEME).is_some_and(|v| {
         v.contains("dark")
             && (!v.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
     });
-    for (key, value) in &mut *style {
-        if key.starts_with("--") {
-            continue;
+    style.retain(|prop, slot| {
+        if prop.is_custom() || !slot.contains("light-dark(") {
+            return true;
         }
+        let mut value = slot.to_string();
         while let Some(start) = value.rfind("light-dark(") {
             let mut depth = 1;
             let Some(end) = value[start + 11..].char_indices().find_map(|(i, c)| {
@@ -2328,7 +2350,9 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
             let selected = parts[usize::from(dark)].trim().to_owned();
             value.replace_range(start..=end, &selected);
         }
-    }
+        *slot = value.into();
+        true
+    });
     let convert = |value: &str, current: &str| {
         if !value.starts_with("color-mix(") && !value.contains("(from ") {
             return None;
@@ -2337,41 +2361,42 @@ fn resolve_style(style: &mut Style, parent: Option<&Style>) {
         Some(format!("#{rgb:06x}{alpha:02x}"))
     };
     let inherited = parent
-        .and_then(|parent| parent.get("color"))
-        .map_or("canvastext", String::as_str);
+        .and_then(|parent| parent.get(Prop::COLOR))
+        .unwrap_or("canvastext");
     if let Some(value) = style
-        .get("color")
+        .get(Prop::COLOR)
         .and_then(|value| convert(value, inherited))
     {
-        style.insert("color".into(), value);
+        style.insert(Prop::COLOR, value);
     }
     let current = style
-        .get("color")
+        .get(Prop::COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
-        .map_or(inherited, String::as_str);
-    let converted: Vec<_> = style
-        .iter()
-        .filter(|(key, _)| {
-            key.as_str() != "color"
-                && !key.starts_with("--")
-                && (key.ends_with("color") || matches!(key.as_str(), "fill" | "stroke"))
-        })
-        .filter_map(|(key, value)| Some((key.clone(), convert(value, current)?)))
-        .collect();
-    style.extend(converted);
+        .unwrap_or(inherited)
+        .to_owned();
+    style.retain(|prop, value| {
+        if prop != Prop::COLOR
+            && !prop.is_custom()
+            && (prop.name().ends_with("color") || matches!(prop, Prop::FILL | Prop::STROKE))
+            && let Some(converted) = convert(value, &current)
+        {
+            *value = converted.into();
+        }
+        true
+    });
 }
 
 fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
-    style.retain(|key, value| {
-        let inherit = match value.as_str() {
-            _ if key.starts_with("--") => return true,
+    style.retain(|prop, value| {
+        let inherit = match &**value {
+            _ if prop.is_custom() => return true,
             "inherit" => true,
-            "unset" | "revert" | "revert-layer" => INHERITED.binary_search(&key.as_str()).is_ok(),
+            "unset" | "revert" | "revert-layer" => prop.inherited(),
             "initial" => false,
             _ => return true,
         };
         match parent
-            .and_then(|parent| parent.get(key))
+            .and_then(|parent| parent.value(prop))
             .filter(|_| inherit)
         {
             Some(inherited) => {
@@ -2382,31 +2407,39 @@ fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
         }
     });
     if style
-        .get("color")
+        .get(Prop::COLOR)
         .is_some_and(|value| value.eq_ignore_ascii_case("currentcolor"))
     {
-        match parent.and_then(|parent| parent.get("color")) {
-            Some(inherited) => style.insert("color".into(), inherited.clone()),
-            None => style.remove("color"),
-        };
+        match parent.and_then(|parent| parent.value(Prop::COLOR)) {
+            Some(inherited) => style.insert(Prop::COLOR, inherited.clone()),
+            None => {
+                style.remove(Prop::COLOR);
+            }
+        }
     }
-    let Some(current) = style.get("color").cloned() else {
+    let Some(current) = style.value(Prop::COLOR).cloned() else {
         return;
     };
-    for (key, value) in &mut *style {
-        if key.starts_with("--") || key == "color" || INHERITED.binary_search(&key.as_str()).is_ok()
-        {
-            continue;
+    style.retain(|prop, slot| {
+        if prop.is_custom() || prop == Prop::COLOR || prop.inherited() {
+            return true;
         }
         let mut start = 0;
-        while let Some(index) = value.as_bytes()[start..]
+        let mut value = None::<String>;
+        while let Some(index) = value.as_deref().unwrap_or(slot).as_bytes()[start..]
             .windows(12)
             .position(|window| window.eq_ignore_ascii_case(b"currentcolor"))
         {
-            value.replace_range(start + index..start + index + 12, &current);
+            value
+                .get_or_insert_with(|| slot.to_string())
+                .replace_range(start + index..start + index + 12, &current);
             start += index + current.len();
         }
-    }
+        if let Some(value) = value {
+            *slot = value.into();
+        }
+        true
+    });
 }
 
 pub fn declarations(source: &str) -> Style {
@@ -2432,10 +2465,11 @@ impl Declarations {
                         expanded.push((key.clone(), plain.to_owned()));
                     }
                     for (key, value) in expanded {
-                        if important || result.get(&key).is_none_or(|v| !v.ends_with("!important"))
+                        let prop = Prop::new(&key);
+                        if important || result.get(prop).is_none_or(|v| !v.ends_with("!important"))
                         {
                             result.insert(
-                                key,
+                                prop,
                                 if important {
                                     format!("{value} !important")
                                 } else {
@@ -2470,10 +2504,10 @@ impl Stylesheet {
             };
             let values = values.resolve();
             let family = values
-                .get("font-family")?
+                .get(Prop::FONT_FAMILY)?
                 .trim_matches(['\'', '"'])
                 .to_owned();
-            Some((family, values.get("src")?.clone()))
+            Some((family, values.get(Prop::new("src"))?.to_owned()))
         })
     }
 

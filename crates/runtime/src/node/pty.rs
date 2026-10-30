@@ -213,7 +213,7 @@ impl State {
                     .get_mut(&args[0].as_u64().context("Expected PTY ID")?)
                     .context("PTY is closed")?;
                 match op {
-                    "write" => session.input.send(crate::node::bytes(&args[1])?)?,
+                    "write" => session.input.send(crate::node::bytes(&args[1])?.to_vec())?,
                     "resize" => {
                         let cols = args[1].as_u64().context("Expected columns")?;
                         let rows = args[2].as_u64().context("Expected rows")?;

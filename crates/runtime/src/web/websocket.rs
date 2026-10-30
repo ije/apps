@@ -51,7 +51,10 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                 let size = command.len();
                 writer.send(command).await?;
                 written.fetch_add(size, Ordering::Relaxed);
-                wake.wake();
+                // WARNING: `bufferedAmount` only needs a wake once the queue drains; ticks read the count meanwhile.
+                if commands.is_empty() {
+                    wake.wake();
+                }
             }
             message = reader.next() => {
                 let Some(message) = message else {
@@ -187,14 +190,15 @@ impl State {
                                 request,
                                 stream,
                                 Some(limits()),
-                                None,
+                                Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
                             )
                             .await?
                         } else {
-                            tokio_tungstenite::connect_async_with_config(
+                            tokio_tungstenite::connect_async_tls_with_config(
                                 request,
                                 Some(limits()),
                                 false,
+                                Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
                             )
                             .await?
                         };

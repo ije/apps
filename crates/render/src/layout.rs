@@ -74,10 +74,15 @@ impl LayoutEngine {
         self.origins.clear();
     }
 
-    pub fn request_layout(&mut self, style: &Style, scale: f32, children: &[LayoutId]) -> LayoutId {
+    pub fn request_layout(
+        &mut self,
+        style: &Style,
+        scale: f32,
+        children: impl IntoIterator<Item = LayoutId>,
+    ) -> LayoutId {
         let style = style.to_taffy(scale);
         self.children.clear();
-        self.children.extend(children.iter().map(|id| id.0));
+        self.children.extend(children.into_iter().map(|id| id.0));
         LayoutId(
             self.taffy
                 .new_with_children(style, &self.children)
@@ -126,12 +131,17 @@ impl LayoutEngine {
         window: &mut Window,
     ) {
         // A node laid out again moves its subtree, so its cached bounds go.
-        let mut stack = vec![id.0];
-        while let Some(node) = stack.pop() {
-            if self.bounds.remove(&LayoutId(node)).is_some() {
-                self.origins.remove(&LayoutId(node));
+        if !self.bounds.is_empty() {
+            let mut stack = std::mem::take(&mut self.children);
+            stack.clear();
+            stack.push(id.0);
+            while let Some(node) = stack.pop() {
+                if self.bounds.remove(&LayoutId(node)).is_some() {
+                    self.origins.remove(&LayoutId(node));
+                }
+                stack.extend(self.taffy.child_ids(node));
             }
-            stack.extend(self.taffy.child_ids(node));
+            self.children = stack;
         }
         let scale = window.scale_factor();
         let space = taffy::Size {

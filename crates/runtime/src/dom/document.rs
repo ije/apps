@@ -111,23 +111,32 @@ fn stamp() -> u64 {
 pub struct Nodes {
     list: Vec<Node>,
     revisions: Vec<u64>,
+    latest: u64,
 }
 
 impl Nodes {
     pub fn push(&mut self, node: Node) {
         self.list.push(node);
-        self.revisions.push(stamp());
+        self.latest = stamp();
+        self.revisions.push(self.latest);
     }
 
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Node> {
         let node = self.list.get_mut(id)?;
-        self.revisions[id] = stamp();
+        self.latest = stamp();
+        self.revisions[id] = self.latest;
         Some(node)
     }
 
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Node> {
         self.revisions.fill_with(stamp);
+        self.latest = stamp();
         self.list.iter_mut()
+    }
+
+    /// The newest revision of any node, so it changes whenever a node does.
+    pub fn latest(&self) -> u64 {
+        self.latest
     }
 
     /// The revision of a node, never 0.
@@ -154,7 +163,8 @@ impl std::ops::Index<usize> for Nodes {
 
 impl std::ops::IndexMut<usize> for Nodes {
     fn index_mut(&mut self, id: usize) -> &mut Node {
-        self.revisions[id] = stamp();
+        self.latest = stamp();
+        self.revisions[id] = self.latest;
         &mut self.list[id]
     }
 }
@@ -162,7 +172,11 @@ impl std::ops::IndexMut<usize> for Nodes {
 impl From<Vec<Node>> for Nodes {
     fn from(list: Vec<Node>) -> Self {
         let revisions = list.iter().map(|_| stamp()).collect();
-        Self { list, revisions }
+        Self {
+            list,
+            revisions,
+            latest: stamp(),
+        }
     }
 }
 

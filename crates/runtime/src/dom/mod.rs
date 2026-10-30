@@ -7,6 +7,7 @@ pub(crate) use selector::{
 };
 
 use crate::style;
+use crate::style::Prop;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -389,7 +390,11 @@ pub(crate) fn load_image(
                     for pixel in pixels.pixels_mut() {
                         pixel.0.swap(0, 2);
                     }
-                    Ok(render::RenderImage::new(pixels.width(), pixels.height(), pixels.into_raw()))
+                    Ok(render::RenderImage::new(
+                        pixels.width(),
+                        pixels.height(),
+                        pixels.into_raw(),
+                    ))
                 }
                 Err(error) => {
                     let size = resvg::usvg::Tree::from_data(&bytes, &Default::default())
@@ -511,6 +516,7 @@ pub fn call(
                     && let Some(node) = state.layout_nodes.get_mut(id)
                 {
                     *node = None;
+                    state.cull.seen = None;
                 }
                 results.push(json!([
                     request,
@@ -729,12 +735,7 @@ pub fn call(
             let x = args[0].as_f64().context("Expected x")? as f32;
             let y = args[1].as_f64().context("Expected y")? as f32;
             let system = state.text_system.clone();
-            let computed = styles(
-                doc,
-                state,
-                viewport,
-                system.as_deref(),
-            );
+            let computed = styles(doc, state, viewport, system.as_deref());
             let first = args[2].as_bool().unwrap_or(false);
             let caret = args[3].as_bool().unwrap_or(false);
             let mut nearest = Vec::new();
@@ -757,16 +758,19 @@ pub fn call(
                 }
                 let node = &doc.nodes[id];
                 let style = &computed.values[id];
-                if style.get("display").is_some_and(|value| value == "none") {
+                if style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| value == "none")
+                {
                     continue;
                 }
                 if let Some(&[left, top, width, height]) = state.bounds.get(&id) {
                     let selectable = !style
-                        .get("pointer-events")
+                        .get(Prop::POINTER_EVENTS)
                         .is_some_and(|value| value == "none")
                         && !style
-                            .get("visibility")
-                            .is_some_and(|value| matches!(value.as_str(), "hidden" | "collapse"));
+                            .get(Prop::VISIBILITY)
+                            .is_some_and(|value| matches!(value, "hidden" | "collapse"));
                     if caret
                         && node.tag == "#text"
                         && selectable
@@ -795,12 +799,12 @@ pub fn call(
                     {
                         pending.push((id, clip, true));
                     }
-                    for (axis, name) in [(0, "overflow-x"), (1, "overflow-y")] {
+                    for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
                         if style
-                            .get(name)
-                            .or_else(|| style.get("overflow"))
+                            .get(prop)
+                            .or_else(|| style.get(Prop::OVERFLOW))
                             .is_some_and(|value| {
-                                matches!(value.as_str(), "hidden" | "clip" | "auto" | "scroll")
+                                matches!(value, "hidden" | "clip" | "auto" | "scroll")
                             })
                         {
                             clip[axis] = clip[axis].max([left, top][axis]);
@@ -1006,20 +1010,16 @@ pub fn call(
             }
             "dom.style" => {
                 let system = state.text_system.clone();
-                let styles = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref(),
-                );
+                let styles = styles(doc, state, viewport, system.as_deref());
                 let style = &styles.values[id];
                 Ok(match args[1].as_array() {
                     Some(names) => json!(
                         names
                             .iter()
-                            .filter_map(|name| name
-                                .as_str()
-                                .and_then(|name| style.get_key_value(name)))
+                            .filter_map(|name| {
+                                let name = name.as_str()?;
+                                Some((name, style.get(Prop::find(name)?)?))
+                            })
                             .collect::<HashMap<_, _>>()
                     ),
                     None => json!(&**style),
@@ -1060,12 +1060,7 @@ pub fn call(
             }
             "dom.userSelect" | "dom.selectionText" => {
                 let system = state.text_system.clone();
-                let computed = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref(),
-                );
+                let computed = styles(doc, state, viewport, system.as_deref());
                 if op == "dom.userSelect" {
                     return Ok(json!(computed.user_select[id]));
                 }
@@ -1367,17 +1362,14 @@ pub fn call(
                     doc.text(id)
                 };
                 let font_size = style::length(
-                    style.get("font-size").map(String::as_str).unwrap_or("16px"),
+                    style.get(Prop::FONT_SIZE).unwrap_or("16px"),
                     16.,
                     16.,
                     viewport[0],
                     viewport[1],
                 );
                 let height = style::length(
-                    style
-                        .get("line-height")
-                        .map(String::as_str)
-                        .unwrap_or("20px"),
+                    style.get(Prop::LINE_HEIGHT).unwrap_or("20px"),
                     font_size,
                     font_size,
                     viewport[0],
@@ -1396,8 +1388,8 @@ pub fn call(
                     font_size: None,
                 };
                 let wrap = (!style
-                    .get("white-space")
-                    .is_some_and(|s| matches!(s.as_str(), "pre" | "nowrap")))
+                    .get(Prop::WHITE_SPACE)
+                    .is_some_and(|s| matches!(s, "pre" | "nowrap")))
                 .then_some(render::px(bounds[2]));
                 let lines = system.shape_text(
                     text.clone().into(),
@@ -1438,7 +1430,8 @@ pub fn call(
                                 .chain(std::iter::once(line.text.len()))
                                 .filter(|i| *i >= a && *i <= b)
                             {
-                                if let Some(point) = line.position_for_index(byte, render::px(height))
+                                if let Some(point) =
+                                    line.position_for_index(byte, render::px(height))
                                 {
                                     let x = bounds[0] + f32::from(point.x);
                                     let y = bounds[1] + top + f32::from(point.y);
@@ -1477,10 +1470,10 @@ pub fn call(
                     .last()
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(10.);
-                let mut face = style::font(&style::Style::from([
-                    ("font-family".into(), family.trim().into()),
+                let mut face = style::font(&style::Style::from_iter([
+                    (Prop::FONT_FAMILY, family.trim().into()),
                     (
-                        "font-weight".into(),
+                        Prop::FONT_WEIGHT,
                         size.split_whitespace()
                             .rev()
                             .skip(1)
@@ -1597,12 +1590,7 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
 /// Writes the overflow clip and positioned flags of current styles into the layout mirror.
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
     let system = state.text_system.clone();
-    let computed = styles(
-        doc,
-        state,
-        viewport,
-        system.as_deref(),
-    );
+    let computed = styles(doc, state, viewport, system.as_deref());
     if state.layout_epoch == state.style_epoch {
         return;
     }
@@ -1610,12 +1598,16 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
     let mut known = rustc_hash::FxHashMap::default();
     for (id, style) in computed.values.iter().enumerate() {
         let bits = *known.entry(Rc::as_ptr(style)).or_insert_with(|| {
-            let clip = ["overflow", "overflow-x", "overflow-y"].iter().any(|name| {
-                style.get(*name).is_some_and(|value| {
-                    matches!(value.as_str(), "hidden" | "clip" | "auto" | "scroll")
-                })
-            });
-            let positioned = style.get("position").is_some_and(|value| value != "static");
+            let clip = [Prop::OVERFLOW, Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                .into_iter()
+                .any(|prop| {
+                    style
+                        .get(prop)
+                        .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
+                });
+            let positioned = style
+                .get(Prop::POSITION)
+                .is_some_and(|value| value != "static");
             (if clip { MIRROR_CLIP } else { 0 }) | if positioned { MIRROR_POSITIONED } else { 0 }
         });
         state.bounds.reserve(id);

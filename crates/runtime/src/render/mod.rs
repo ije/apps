@@ -11,8 +11,12 @@ mod paint;
 mod scrollbar;
 pub(crate) mod text;
 
+use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 use element::{Build, element};
+use render::{
+    App, MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Window, div, prelude::*, rgba,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -20,7 +24,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use render::{App, MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Window, div, prelude::*, rgba};
 
 /// The page of one window, shared with the elements that paint it.
 pub(crate) struct ViewData {
@@ -140,7 +143,12 @@ impl WebView {
         }
         let old = std::mem::replace(&mut *self.images.borrow_mut(), images);
         for (id, old) in old {
-            if self.images.borrow().get(&id).is_none_or(|image| image.id != old.id) {
+            if self
+                .images
+                .borrow()
+                .get(&id)
+                .is_none_or(|image| image.id != old.id)
+            {
                 window.drop_image(old);
             }
         }
@@ -159,7 +167,8 @@ impl WebView {
             window.drop_image(image);
         }
         let cached = dom.computed.clone();
-        let mut styles = crate::dom::styles(&mut doc, dom, [width, height], Some(window.text_system()));
+        let mut styles =
+            crate::dom::styles(&mut doc, dom, [width, height], Some(window.text_system()));
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
             && fonts::load(&doc, dom, &state.assets)
         {
@@ -181,7 +190,9 @@ impl WebView {
             let style = &styles.values[node];
             if !match dom.layout_nodes.get(node).and_then(Option::as_ref) {
                 Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
-                _ => style.get("display").is_some_and(|value| value == "none"),
+                _ => style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| value == "none"),
             } {
                 visible[node] = true;
                 pending.extend(&doc.nodes[node].children);
@@ -320,169 +331,188 @@ impl WebView {
             .position(|n| n.tag == "body")
             .and_then(|id| {
                 styles.values[id]
-                    .get("background-color")
-                    .or_else(|| styles.values[id].get("background"))
+                    .get(Prop::BACKGROUND_COLOR)
+                    .or_else(|| styles.values[id].get(Prop::BACKGROUND))
             })
-            .and_then(|s| style::color(s))
+            .and_then(style::color)
             .or_else(|| state.backgrounds.get(&self.id).copied())
             .unwrap_or((0xffffff, 255));
-        let mut order = Vec::new();
-        let mut pending = vec![0];
-        while let Some(id) = pending.pop() {
-            order.push(id);
-            pending.extend(&doc.nodes[id].children);
-        }
         dom.layout_nodes.resize_with(doc.nodes.len(), || None);
         let frame = [width, height, window.scale_factor(), dom.font_loads as f32];
-        // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
-        let units = |lengths: &style::Lengths| {
-            let [font, root] = [lengths.font, lengths.root];
-            let mut hasher = rustc_hash::FxHasher::default();
-            std::hash::Hash::hash(
-                &[
-                    font.em,
-                    font.ch,
-                    font.ex,
-                    font.cap,
-                    font.ic,
-                    font.lh,
-                    root.em,
-                    root.ch,
-                    root.ex,
-                    root.cap,
-                    root.ic,
-                    root.lh,
-                    lengths.viewport[0],
-                    lengths.viewport[1],
-                ]
-                .map(f32::to_bits),
-                &mut hasher,
-            );
-            std::hash::Hasher::finish(&hasher)
-        };
         let mut changed = Vec::new();
         let mut info = std::mem::take(&mut dom.cull.info);
-        info.clear();
-        info.resize(doc.nodes.len(), cull::Info::default());
-        // WARNING: lengths are cached with their style, so the style and the tag kind decide the flags within a frame.
-        let mut memo = rustc_hash::FxHashMap::default();
-        let mut own_flags = |tag: &str, style: &Rc<style::Style>, id: usize| {
-            let kind = if tag.starts_with('#') {
-                1
-            } else {
-                u8::from(matches!(
-                    tag,
-                    "iframe" | "webview" | "canvas" | "video" | "embed" | "object"
-                )) * 2
-            };
-            memo.entry((Rc::as_ptr(style), kind))
-                .or_insert_with(|| {
-                    (
-                        style.clone(),
-                        cull::flags(tag, style, &styles.lengths[id], height),
-                    )
-                })
-                .1
-        };
-        for (id, style) in &paint {
-            info[*id].flags =
-                own_flags(&doc.nodes[*id].tag, style, *id) & (cull::MOVED | cull::BLOCKED);
-        }
-        for id in order.into_iter().rev() {
-            let node = &doc.nodes[id];
-            let style = &styles.values[id];
-            let revision = doc.nodes.revision(id);
-            let old = dom.layout_nodes[id].as_ref();
-            let same = old.is_some_and(|old| old.seen == revision);
-            let edited = old.is_some_and(|old| {
-                !same && (old.node.text != node.text || old.node.attrs != node.attrs)
-            });
-            debug_assert!(
-                !same
-                    || old.is_some_and(|old| old.node.tag == node.tag
-                        && old.node.text == node.text
-                        && old.node.attrs == node.attrs),
-                "node {id} changed without a new revision"
-            );
-            let restyled = old.is_none_or(|old| {
-                !Rc::ptr_eq(&old.style, style) || !same && old.node.tag != node.tag
-            });
-            let own = restyled || edited;
-            let reshaped = old.is_none_or(|old| {
-                !same
-                    && (old.node.tag != node.tag
-                        || old.node.text != node.text
-                        || old.node.attrs != node.attrs
-                            && !cull::cosmetic_attrs(&old.node.attrs, &node.attrs))
-                    || !Rc::ptr_eq(&old.style, style)
-                        && (old.units != units(&styles.lengths[id])
-                            || !cull::cosmetic(&old.style, style))
-            });
-            let flags = match old {
-                Some(old) if !restyled => old.flags,
-                _ => own_flags(&node.tag, style, id),
-            };
-            let flowed = || {
-                node.children
-                    .iter()
-                    .copied()
-                    .filter(|&child| info[child].flags & cull::OUT == 0)
-            };
-            let children = || {
-                flowed().map(|child| {
-                    (
-                        child,
-                        dom.layout_nodes[child]
-                            .as_ref()
-                            .map_or(0, |node| node.revision),
-                    )
-                })
-            };
-            let mut relisted = false;
-            if own || old.is_some_and(|old| !old.children.iter().copied().eq(children())) {
-                relisted = old
-                    .is_none_or(|old| !old.children.iter().map(|&(child, _)| child).eq(flowed()));
-                // WARNING: the geometry revision ignores paint-only changes, so culled spacers survive them.
-                let geometry = old
-                    .filter(|old| {
-                        !reshaped
-                            && !relisted
-                            && flowed().all(|child| info[child].revision <= old.geometry)
-                    })
-                    .map(|old| old.geometry);
-                let children = children().collect();
-                dom.layout_revision += 1;
-                dom.layout_nodes[id] = Some(crate::dom::LayoutNode {
-                    node: node.clone(),
-                    seen: revision,
-                    style: style.clone(),
-                    units: units(&styles.lengths[id]),
-                    children,
-                    revision: dom.layout_revision,
-                    geometry: geometry.unwrap_or(dom.layout_revision),
-                    flags,
+        // WARNING: scroll-only frames change no node, style or focus, so last frame's flags hold
+        // without its per-frame change bits.
+        let seen = (doc.nodes.latest(), dom.focus);
+        let unchanged = paint.is_empty()
+            && dom
+                .cull
+                .seen
+                .as_ref()
+                .is_some_and(|(latest, focus, computed)| {
+                    (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
                 });
-                changed.push(id);
-            } else if let Some(old) = &mut dom.layout_nodes[id] {
-                old.seen = revision;
+        dom.cull.seen = paint.is_empty().then(|| (seen.0, seen.1, styles.clone()));
+        if unchanged {
+            for info in &mut info {
+                info.flags &= !(cull::CHANGED | cull::RELISTED | cull::STALE);
             }
-            info[id] = cull::Info {
-                revision: dom.layout_nodes[id]
-                    .as_ref()
-                    .map_or(0, |node| node.geometry),
-                flags: if flags & cull::HIDDEN != 0 {
-                    flags
-                } else {
-                    node.children.iter().fold(
-                        info[id].flags
-                            | flags
-                            | (u16::from(reshaped) * cull::CHANGED)
-                            | (u16::from(relisted) * cull::RELISTED)
-                            | (u16::from(dom.focus == Some(id)) * cull::BLOCKED),
-                        |flags, &child| flags | info[child].flags & cull::BLOCKED,
-                    )
-                },
+        } else {
+            let mut order = Vec::new();
+            let mut pending = vec![0];
+            while let Some(id) = pending.pop() {
+                order.push(id);
+                pending.extend(&doc.nodes[id].children);
+            }
+            // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
+            let units = |lengths: &style::Lengths| {
+                let [font, root] = [lengths.font, lengths.root];
+                let mut hasher = rustc_hash::FxHasher::default();
+                std::hash::Hash::hash(
+                    &[
+                        font.em,
+                        font.ch,
+                        font.ex,
+                        font.cap,
+                        font.ic,
+                        font.lh,
+                        root.em,
+                        root.ch,
+                        root.ex,
+                        root.cap,
+                        root.ic,
+                        root.lh,
+                        lengths.viewport[0],
+                        lengths.viewport[1],
+                    ]
+                    .map(f32::to_bits),
+                    &mut hasher,
+                );
+                std::hash::Hasher::finish(&hasher)
             };
+            info.clear();
+            info.resize(doc.nodes.len(), cull::Info::default());
+            // WARNING: lengths are cached with their style, so the style and the tag kind decide the flags within a frame.
+            let mut memo = rustc_hash::FxHashMap::default();
+            let mut own_flags = |tag: &str, style: &Rc<style::Style>, id: usize| {
+                let kind = if tag.starts_with('#') {
+                    1
+                } else {
+                    u8::from(matches!(
+                        tag,
+                        "iframe" | "webview" | "canvas" | "video" | "embed" | "object"
+                    )) * 2
+                };
+                memo.entry((Rc::as_ptr(style), kind))
+                    .or_insert_with(|| {
+                        (
+                            style.clone(),
+                            cull::flags(tag, style, &styles.lengths[id], height),
+                        )
+                    })
+                    .1
+            };
+            for (id, style) in &paint {
+                info[*id].flags =
+                    own_flags(&doc.nodes[*id].tag, style, *id) & (cull::MOVED | cull::BLOCKED);
+            }
+            for id in order.into_iter().rev() {
+                let node = &doc.nodes[id];
+                let style = &styles.values[id];
+                let revision = doc.nodes.revision(id);
+                let old = dom.layout_nodes[id].as_ref();
+                let same = old.is_some_and(|old| old.seen == revision);
+                let edited = old.is_some_and(|old| {
+                    !same && (old.node.text != node.text || old.node.attrs != node.attrs)
+                });
+                debug_assert!(
+                    !same
+                        || old.is_some_and(|old| old.node.tag == node.tag
+                            && old.node.text == node.text
+                            && old.node.attrs == node.attrs),
+                    "node {id} changed without a new revision"
+                );
+                let restyled = old.is_none_or(|old| {
+                    !Rc::ptr_eq(&old.style, style) || !same && old.node.tag != node.tag
+                });
+                let own = restyled || edited;
+                let reshaped = old.is_none_or(|old| {
+                    !same
+                        && (old.node.tag != node.tag
+                            || old.node.text != node.text
+                            || old.node.attrs != node.attrs
+                                && !cull::cosmetic_attrs(&old.node.attrs, &node.attrs))
+                        || !Rc::ptr_eq(&old.style, style)
+                            && (old.units != units(&styles.lengths[id])
+                                || !cull::cosmetic(&old.style, style))
+                });
+                let flags = match old {
+                    Some(old) if !restyled => old.flags,
+                    _ => own_flags(&node.tag, style, id),
+                };
+                let flowed = || {
+                    node.children
+                        .iter()
+                        .copied()
+                        .filter(|&child| info[child].flags & cull::OUT == 0)
+                };
+                let children = || {
+                    flowed().map(|child| {
+                        (
+                            child,
+                            dom.layout_nodes[child]
+                                .as_ref()
+                                .map_or(0, |node| node.revision),
+                        )
+                    })
+                };
+                let mut relisted = false;
+                if own || old.is_some_and(|old| !old.children.iter().copied().eq(children())) {
+                    relisted = old.is_none_or(|old| {
+                        !old.children.iter().map(|&(child, _)| child).eq(flowed())
+                    });
+                    // WARNING: the geometry revision ignores paint-only changes, so culled spacers survive them.
+                    let geometry = old
+                        .filter(|old| {
+                            !reshaped
+                                && !relisted
+                                && flowed().all(|child| info[child].revision <= old.geometry)
+                        })
+                        .map(|old| old.geometry);
+                    let children = children().collect();
+                    dom.layout_revision += 1;
+                    dom.layout_nodes[id] = Some(crate::dom::LayoutNode {
+                        node: node.clone(),
+                        seen: revision,
+                        style: style.clone(),
+                        units: units(&styles.lengths[id]),
+                        children,
+                        revision: dom.layout_revision,
+                        geometry: geometry.unwrap_or(dom.layout_revision),
+                        flags,
+                    });
+                    changed.push(id);
+                } else if let Some(old) = &mut dom.layout_nodes[id] {
+                    old.seen = revision;
+                }
+                info[id] = cull::Info {
+                    revision: dom.layout_nodes[id]
+                        .as_ref()
+                        .map_or(0, |node| node.geometry),
+                    flags: if flags & cull::HIDDEN != 0 {
+                        flags
+                    } else {
+                        node.children.iter().fold(
+                            info[id].flags
+                                | flags
+                                | (u16::from(reshaped) * cull::CHANGED)
+                                | (u16::from(relisted) * cull::RELISTED)
+                                | (u16::from(dom.focus == Some(id)) * cull::BLOCKED),
+                            |flags, &child| flags | info[child].flags & cull::BLOCKED,
+                        )
+                    },
+                };
+            }
         }
         if !paint.is_empty() {
             let values = &mut Rc::make_mut(&mut styles).values;
@@ -536,27 +566,29 @@ impl WebView {
                 ] {
                     let Some(values) = values else { continue };
                     for (key, value) in [
-                        "line-height",
-                        "vertical-align",
-                        "transform-style",
-                        "clip-path",
-                        "filter",
+                        Prop::LINE_HEIGHT,
+                        Prop::VERTICAL_ALIGN,
+                        Prop::TRANSFORM_STYLE,
+                        Prop::CLIP_PATH,
+                        Prop::FILTER,
                     ]
-                    .iter()
-                    .filter_map(|key| values.get_key_value(*key))
+                    .into_iter()
+                    .filter_map(|key| Some((key, values.get(key)?)))
                     {
                         if !pseudo.is_empty() && style.get(key) == Some(value) {
                             continue;
                         }
-                        let reason = match key.as_str() {
-                            "line-height" | "vertical-align" if !pseudo.is_empty() => {
+                        let reason = match key {
+                            Prop::LINE_HEIGHT | Prop::VERTICAL_ALIGN if !pseudo.is_empty() => {
                                 "line height and baseline can't change inside a line of text"
                             }
-                            "transform-style" if value == "preserve-3d" => {
+                            Prop::TRANSFORM_STYLE if value == "preserve-3d" => {
                                 "3D children are flattened into the parent's plane"
                             }
-                            "clip-path" if value.contains("shape(") => "shape() is not supported",
-                            "filter" if value.contains("url(") && !value.contains("url(#") => {
+                            Prop::CLIP_PATH if value.contains("shape(") => {
+                                "shape() is not supported"
+                            }
+                            Prop::FILTER if value.contains("url(") && !value.contains("url(#") => {
                                 "only filters defined in the page are supported"
                             }
                             _ => continue,
@@ -576,7 +608,8 @@ impl WebView {
                                 name = format!("{name}.{class}");
                             }
                             warnings.push(format!(
-                                "Unsupported CSS `{key}: {value}` on <{name}>{pseudo}: {reason}."
+                                "Unsupported CSS `{}: {value}` on <{name}>{pseudo}: {reason}.",
+                                key.name()
                             ));
                         }
                     }
@@ -600,16 +633,18 @@ impl WebView {
         });
         let source = html
             .filter(|&id| {
-                ["overflow-x", "overflow-y"].iter().any(|name| {
-                    styles.values[id]
-                        .get(*name)
-                        .is_some_and(|value| value != "visible")
-                })
+                [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|name| {
+                        styles.values[id]
+                            .get(name)
+                            .is_some_and(|value| value != "visible")
+                    })
             })
             .or(body);
         let overflow = source
-            .and_then(|id| styles.values[id].get("overflow-y"))
-            .map_or("visible", String::as_str);
+            .and_then(|id| styles.values[id].get(Prop::OVERFLOW_Y))
+            .unwrap_or("visible");
         let page_scrolls = !matches!(overflow, "hidden" | "clip");
         // Like Chromium, the page's bar takes the body's `::-webkit-scrollbar` styles, then the root's.
         let page_bar = html.filter(|_| page_scrolls).and_then(|html| {
@@ -759,7 +794,11 @@ impl WebView {
                 origin: [0.; 2],
             }))
             .children(crate::desktop::mcp::profiling().then(|| {
-                render::canvas(|_, _| (), move |_, _, _| crate::desktop::mcp::frame(id, started)).absolute()
+                render::canvas(
+                    |_, _| (),
+                    move |_, _, _| crate::desktop::mcp::frame(id, started),
+                )
+                .absolute()
             }))
             .into_any_element()
     }
@@ -808,7 +847,7 @@ fn retire(
                         .get(&id)
                         .and_then(|pseudos| pseudos.get(slot - 1)),
                 }
-                .and_then(|style| style.get("background-image"))
+                .and_then(|style| style.get(Prop::BACKGROUND_IMAGE))
                 .is_some_and(|value| value != "none")
         };
         if !keep && Arc::strong_count(image) == 1 {
@@ -844,7 +883,11 @@ mod tests {
             .unwrap();
         dom.canvases.insert(canvas, drawn);
         let image = |size: u32| {
-            Arc::new(render::RenderImage::new(size, size, vec![0; (size * size * 4) as usize]))
+            Arc::new(render::RenderImage::new(
+                size,
+                size,
+                vec![0; (size * size * 4) as usize],
+            ))
         };
         let shared = image(1);
         dom.backgrounds

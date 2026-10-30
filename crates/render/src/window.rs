@@ -362,9 +362,9 @@ impl Frame {
         self.controls.clear();
     }
 
-    /// The hit hitboxes, front first, and how many of them are hovered.
-    fn hit_test(&self, position: Point<Pixels>) -> (Vec<HitboxId>, usize) {
-        let mut ids = Vec::new();
+    /// Fills `ids` with the hit hitboxes, front first, and returns how many of them are hovered.
+    fn hit_test(&self, position: Point<Pixels>, ids: &mut Vec<HitboxId>) -> usize {
+        ids.clear();
         let mut hovered = None;
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
@@ -386,8 +386,7 @@ impl Frame {
                 }
             }
         }
-        let hovered = hovered.unwrap_or(ids.len());
-        (ids, hovered)
+        hovered.unwrap_or(ids.len())
     }
 }
 
@@ -406,9 +405,9 @@ pub struct Window {
     hit_test: Vec<HitboxId>,
     hover_count: usize,
     next_hitbox: u64,
-    content_masks: Vec<ContentMask<Pixels>>,
+    content_masks: Vec<(ContentMask<Pixels>, ContentMask<ScaledPixels>)>,
     offsets: Vec<Point<Pixels>>,
-    text_styles: Vec<TextStyle>,
+    pub(crate) text_styles: Vec<TextStyle>,
     hit_transform: Option<Rc<HitTransform>>,
     opacity: f32,
     states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
@@ -649,7 +648,7 @@ impl Window {
                     ),
                 );
                 root.prepaint_at(Point::default(), self);
-                (self.hit_test, self.hover_count) = self.next.hit_test(self.mouse_position);
+                self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
                 root.paint(self);
             }
             self.drawing = false;
@@ -666,11 +665,14 @@ impl Window {
         mem::swap(&mut self.states, &mut self.next_states);
         self.scene.finish();
         let captures = mem::take(&mut self.captures);
-        let frame = self.platform.draw(&self.scene, !captures.is_empty());
+        let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
         self.text_system.finish_frame();
-        for capture in captures {
+        self.platform.atlas().finish_frame();
+        let last = captures.len().wrapping_sub(1);
+        for (index, capture) in captures.into_iter().enumerate() {
             capture(
-                match &frame {
+                match &mut frame {
+                    Some(Ok(frame)) if index == last => Ok(mem::take(frame)),
                     Some(Ok(frame)) => Ok(frame.clone()),
                     Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
                     None => Err(anyhow::anyhow!("The frame was not drawn")),
@@ -731,7 +733,9 @@ impl Window {
                 | PlatformInput::ScrollWheel(_)
         );
         if mouse {
-            (self.hit_test, self.hover_count) = self.rendered.hit_test(self.mouse_position);
+            self.hover_count = self
+                .rendered
+                .hit_test(self.mouse_position, &mut self.hit_test);
             self.update_cursor(cx);
             let mut listeners = mem::take(&mut self.rendered.mouse_listeners);
             for listener in listeners.iter_mut().flatten() {
@@ -804,11 +808,10 @@ impl Window {
         style: &Style,
         children: impl IntoIterator<Item = LayoutId>,
     ) -> LayoutId {
-        let children: Vec<_> = children.into_iter().collect();
         let scale = self.scale_factor;
         match &mut self.layout {
-            Some(layout) => layout.request_layout(style, scale, &children),
-            None => LayoutEngine::default().request_layout(style, scale, &children),
+            Some(layout) => layout.request_layout(style, scale, children),
+            None => LayoutEngine::default().request_layout(style, scale, children),
         }
     }
 
@@ -893,14 +896,15 @@ impl Window {
         f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
     ) -> R {
         let key = (id, TypeId::of::<S>());
-        let state = self
+        let mut slot = self
             .next_states
             .remove(&key)
             .or_else(|| self.states.remove(&key))
-            .and_then(|state| state.downcast::<S>().ok())
-            .map(|state| *state);
-        let (result, state) = f(state, self);
-        self.next_states.insert(key, Box::new(state));
+            .and_then(|state| state.downcast::<Option<S>>().ok())
+            .unwrap_or_default();
+        let (result, state) = f(slot.take(), self);
+        *slot = Some(state);
+        self.next_states.insert(key, slot);
         result
     }
 
@@ -931,10 +935,16 @@ impl Window {
     }
 
     pub fn content_mask(&self) -> ContentMask<Pixels> {
-        self.content_masks
-            .last()
-            .copied()
-            .unwrap_or_else(|| ContentMask::from(Bounds::new(Point::default(), self.viewport_size)))
+        self.content_masks.last().map_or_else(
+            || ContentMask::from(Bounds::new(Point::default(), self.viewport_size)),
+            |(mask, _)| *mask,
+        )
+    }
+
+    /// Pushes a content mask with its device pixel form, which primitives copy.
+    fn push_content_mask(&mut self, mask: ContentMask<Pixels>) {
+        let snapped = self.snap_mask(mask);
+        self.content_masks.push((mask, snapped));
     }
 
     pub fn with_content_mask<R>(
@@ -945,8 +955,7 @@ impl Window {
         let Some(mask) = mask else {
             return f(self);
         };
-        let mask = mask.intersect(&self.content_mask());
-        self.content_masks.push(mask);
+        self.push_content_mask(mask.intersect(&self.content_mask()));
         let result = f(self);
         self.content_masks.pop();
         result
@@ -1037,7 +1046,7 @@ impl Window {
             inverse,
             window_mask,
         }));
-        self.content_masks.push(unbounded_mask());
+        self.push_content_mask(unbounded_mask());
         let result = f(self);
         self.content_masks.pop();
         self.hit_transform = outer;
@@ -1077,7 +1086,13 @@ impl Window {
     }
 
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        let mask = self.content_mask();
+        match self.content_masks.last() {
+            Some((_, snapped)) => *snapped,
+            None => self.snap_mask(self.content_mask()),
+        }
+    }
+
+    fn snap_mask(&self, mask: ContentMask<Pixels>) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(mask.bounds),
             rounded: mask.rounded.scale(self.scale_factor),
@@ -1257,7 +1272,7 @@ impl Window {
             content_mask,
         });
         // WARNING: ancestor clips apply after the effect, in window space, so the layer starts unclipped.
-        self.content_masks.push(unbounded_mask());
+        self.push_content_mask(unbounded_mask());
         let result = f(self);
         self.content_masks.pop();
         self.scene.pop_effect();
@@ -1396,7 +1411,7 @@ impl Window {
         };
         let bounds = Bounds {
             origin: quantized.map(|value| ScaledPixels(value.trunc()))
-                + raster.origin.map(ScaledPixels::from),
+                + raster.map(ScaledPixels::from),
             size: tile.bounds.size.map(ScaledPixels::from),
         };
         self.scene.insert(Primitive::Mono(MonochromeSprite {
@@ -1440,7 +1455,7 @@ impl Window {
             opacity: self.opacity,
             pad: 0,
             bounds: Bounds {
-                origin: origin + raster.origin.map(ScaledPixels::from),
+                origin: origin + raster.map(ScaledPixels::from),
                 size: tile.bounds.size.map(ScaledPixels::from),
             },
             content_mask: self.snapped_content_mask(),
@@ -1448,35 +1463,36 @@ impl Window {
         }));
     }
 
+    /// The glyph's tile and the offset of its pixels from the glyph origin.
     fn glyph_tile(
-        &mut self,
+        &self,
         params: RenderGlyphParams,
-    ) -> Option<(crate::scene::AtlasTile, Bounds<DevicePixels>)> {
-        let raster = self.text_system.raster_bounds(&params).ok()?;
-        if raster.size.width.0 == 0 || raster.size.height.0 == 0 {
-            return None;
-        }
-        let text = self.text_system.clone();
-        let tile = self
-            .platform
-            .atlas()
-            .get_or_insert_with(&AtlasKey::Glyph(params.clone()), &mut || {
-                let (size, bytes) = text.rasterize_glyph(&params)?;
-                Ok(Some((size, Cow::Owned(bytes))))
-            })
-            .ok()
-            .flatten()?;
-        Some((tile, raster))
-    }
-
-    fn image_tile(&mut self, image: &RenderImage) -> Option<crate::scene::AtlasTile> {
+    ) -> Option<(crate::scene::AtlasTile, Point<DevicePixels>)> {
+        let text = &self.text_system;
         self.platform
             .atlas()
-            .get_or_insert_with(&AtlasKey::Image(image.id), &mut || {
-                Ok(Some((image.size(), Cow::Borrowed(image.bytes()))))
+            .get_or_insert_with(&AtlasKey::Glyph(params), &mut || {
+                Ok(text
+                    .rasterize_glyph(&params)?
+                    .map(|(origin, size, bytes)| (origin, size, Cow::Owned(bytes))))
             })
             .ok()
             .flatten()
+    }
+
+    fn image_tile(&self, image: &RenderImage) -> Option<crate::scene::AtlasTile> {
+        self.platform
+            .atlas()
+            .get_or_insert_with(&AtlasKey::Image(image.id), &mut || {
+                Ok(Some((
+                    Point::default(),
+                    image.size(),
+                    Cow::Borrowed(image.bytes()),
+                )))
+            })
+            .ok()
+            .flatten()
+            .map(|(tile, _)| tile)
     }
 
     /// Paints the part of an image placed at `image_bounds` that `bounds` shows, with `corner_radii`

@@ -381,7 +381,7 @@ impl State {
                             Waker::current().wake();
                         }
                         events.push(match event {
-                            Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::web::base64(&data)}),
+                            Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
                             Event::Written(bytes) => json!({"id": id, "event": "written", "bytes": bytes}),
                             Event::End(stream) => {
@@ -420,7 +420,7 @@ impl State {
                 }
                 let bytes = crate::node::bytes(&args[1])?;
                 let size = bytes.len();
-                input.send(Some(bytes))?;
+                input.send(Some(bytes.to_vec()))?;
                 Ok(json!(size))
             }
             "kill" => {

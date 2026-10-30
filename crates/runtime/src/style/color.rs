@@ -138,18 +138,38 @@ const D50: [f64; 3] = [0.3457 / 0.3585, 1., (1. - 0.3457 - 0.3585) / 0.3585];
 const KAPPA: f64 = 24389. / 27.;
 const EPSILON: f64 = 216. / 24389.;
 
+type Rgb = Option<(u32, u8)>;
+
+thread_local! {
+    /// Parsed colors by source, since paint reads the same `oklch()` values every frame.
+    static COLORS: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Rgb>> = Default::default();
+}
+
 pub fn color(value: &str) -> Option<(u32, u8)> {
-    let (space, channels, alpha) = parse(value.trim(), 0)?;
-    let rgb = if space == Space::Srgb {
-        channels
-    } else {
-        from_xyz(Space::Srgb, to_xyz(space, channels))
-    };
-    let [r, g, b] = rgb.map(|v| (v.clamp(0., 1.) * 255.).round() as u32);
-    Some((
-        r << 16 | g << 8 | b,
-        (alpha.clamp(0., 1.) * 255.).round() as u8,
-    ))
+    let value = value.trim();
+    if let Some(color) = COLORS.with_borrow(|colors| colors.get(value).copied()) {
+        return color;
+    }
+    let color = parse(value, 0).map(|(space, channels, alpha)| {
+        let rgb = if space == Space::Srgb {
+            channels
+        } else {
+            from_xyz(Space::Srgb, to_xyz(space, channels))
+        };
+        let [r, g, b] = rgb.map(|v| (v.clamp(0., 1.) * 255.).round() as u32);
+        (
+            r << 16 | g << 8 | b,
+            (alpha.clamp(0., 1.) * 255.).round() as u8,
+        )
+    });
+    COLORS.with_borrow_mut(|colors| {
+        // WARNING: transitions make new color strings every frame, so the cache starts over when full.
+        if colors.len() >= 1024 {
+            colors.clear();
+        }
+        colors.insert(value.into(), color);
+    });
+    color
 }
 
 /// Returns the color in its own space. `none` channels are NaN.

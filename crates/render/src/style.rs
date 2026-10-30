@@ -511,7 +511,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             color: black(),
-            font_family: ".SystemUIFont".into(),
+            font_family: crate::text::SYSTEM_UI_FONT.with(std::rc::Rc::clone),
             font_features: FontFeatures::default(),
             font_fallbacks: None,
             font_size: px(16.),

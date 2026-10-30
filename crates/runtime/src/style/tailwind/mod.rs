@@ -1,7 +1,7 @@
 //! Tailwind CSS v4 without a build step. Like the Tailwind compiler, every class found in the
 //! document becomes a CSS rule in `@layer utilities`, and `@apply` expands into the author rules.
 
-use super::{Declaration, Declarations, Rule, Style, Stylesheet};
+use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -846,13 +846,13 @@ struct Compiled {
 #[derive(Default)]
 pub(crate) struct Compiler {
     sheets: Vec<*const Stylesheet>,
-    theme: Style,
+    theme: BTreeMap<String, String>,
     /// Variables of `@theme inline`, which utilities use as values instead of `var()`.
     inline: BTreeSet<String>,
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
     preflight: bool,
-    classes: HashMap<String, Option<(Sort, String)>>,
+    classes: rustc_hash::FxHashMap<String, Option<(Sort, String)>>,
     applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>, String)>,
     sheet: Option<Rc<Stylesheet>>,
     /// The theme variables, also set on the document node for pages without `<html>`.
@@ -877,7 +877,7 @@ impl Compiler {
         let mut dirty = self.sheet.is_none();
         let mut previous = None;
         if pointers != self.sheets {
-            let mut theme = Style::new();
+            let mut theme = BTreeMap::new();
             let mut inline = BTreeSet::new();
             let mut variants = Vec::new();
             let mut utilities = Vec::new();
@@ -889,11 +889,12 @@ impl Compiler {
                         Rule::Theme(inlined, children) => {
                             for child in children {
                                 if let Rule::Declarations(values) = child {
-                                    let values = values.resolve();
-                                    if *inlined {
-                                        inline.extend(values.keys().cloned());
+                                    for (prop, value) in values.resolve().iter() {
+                                        if *inlined {
+                                            inline.insert(prop.name().to_owned());
+                                        }
+                                        theme.insert(prop.name().to_owned(), value.to_string());
                                     }
-                                    theme.extend(values);
                                 }
                             }
                         }
@@ -1042,7 +1043,11 @@ impl Compiler {
         for (name, value) in &root {
             let _ = write!(css, "{name}:{value};");
         }
-        self.root = Rc::new(root);
+        self.root = Rc::new(
+            root.into_iter()
+                .map(|(name, value)| (Prop::new(&name), value.into()))
+                .collect(),
+        );
         css.push_str("}}@layer utilities{");
         for (_, rule) in utilities {
             css.push_str(rule);

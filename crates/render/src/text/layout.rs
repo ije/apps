@@ -3,8 +3,9 @@ use crate::{Pixels, Point, Size, platform, point, px};
 use rustc_hash::FxHashMap;
 use std::{
     borrow::Borrow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     hash::{Hash, Hasher},
+    mem,
     rc::Rc,
 };
 
@@ -504,46 +505,76 @@ impl WrappedLineLayout {
 
 #[derive(Default)]
 pub(crate) struct LineLayoutCache {
-    state: RefCell<Frames>,
+    state: RefCell<Lines>,
 }
 
-/// Layouts used in this frame and in the previous one. Older ones are dropped.
-#[derive(Default)]
-struct Frames {
-    previous: FrameCache,
-    current: FrameCache,
-}
+/// Lines unused for this many frames are dropped.
+const MAX_AGE: u32 = 60;
+/// Past this many bytes, only the lines of the last frame are kept.
+const MAX_BYTES: usize = 4 << 20;
+
+/// Layouts with the frame they were last used in and their size in bytes.
+type Entries<T> = FxHashMap<Rc<CacheKey>, (Rc<T>, Cell<u32>, usize)>;
 
 #[derive(Default)]
-struct FrameCache {
-    lines: FxHashMap<Rc<CacheKey>, Rc<LineLayout>>,
-    wrapped: FxHashMap<Rc<CacheKey>, Rc<WrappedLineLayout>>,
+struct Lines {
+    frame: u32,
+    bytes: usize,
+    lines: Entries<LineLayout>,
+    wrapped: Entries<WrappedLineLayout>,
+}
+
+fn size_of_line(text: &str, layout: &LineLayout) -> usize {
+    text.len()
+        + layout
+            .runs
+            .iter()
+            .map(|run| run.glyphs.len())
+            .sum::<usize>()
+            * mem::size_of::<ShapedGlyph>()
+}
+
+fn evict<T>(entries: &mut Entries<T>, bytes: &mut usize, keep: impl Fn(u32) -> bool) {
+    entries.retain(|_, (_, used, size)| {
+        keep(used.get()) || {
+            *bytes -= *size;
+            false
+        }
+    });
 }
 
 impl LineLayoutCache {
     pub fn clear(&self) {
-        *self.state.borrow_mut() = Frames::default();
+        *self.state.borrow_mut() = Lines::default();
     }
 
     pub fn finish_frame(&self) {
-        let Frames { previous, current } = &mut *self.state.borrow_mut();
-        std::mem::swap(previous, current);
-        current.lines.clear();
-        current.wrapped.clear();
+        let Lines {
+            frame,
+            bytes,
+            lines,
+            wrapped,
+        } = &mut *self.state.borrow_mut();
+        let (current, age) = (*frame, if *bytes > MAX_BYTES { 1 } else { MAX_AGE });
+        let keep = move |used: u32| current.wrapping_sub(used) < age;
+        evict(lines, bytes, keep);
+        evict(wrapped, bytes, keep);
+        *frame = current.wrapping_add(1);
     }
 
+    /// The wrapped layout and the text of the line.
     #[allow(clippy::too_many_arguments)]
     pub fn layout_wrapped_line(
         &self,
         platform: &platform::TextSystem,
-        text: &SharedString,
+        text: &str,
         font_size: Pixels,
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
         indent: Pixels,
         wrap: TextWrap,
-    ) -> Rc<WrappedLineLayout> {
+    ) -> (SharedString, Rc<WrappedLineLayout>) {
         let key = &CacheKeyRef {
             text,
             font_size,
@@ -555,13 +586,10 @@ impl LineLayoutCache {
             wrap,
         } as &dyn AsCacheKeyRef;
         {
-            let Frames { previous, current } = &mut *self.state.borrow_mut();
-            if let Some(layout) = current.wrapped.get(key) {
-                return layout.clone();
-            }
-            if let Some((key, layout)) = previous.wrapped.remove_entry(key) {
-                current.wrapped.insert(key, layout.clone());
-                return layout;
+            let state = self.state.borrow();
+            if let Some((key, (layout, used, _))) = state.wrapped.get_key_value(key) {
+                used.set(state.frame);
+                return (key.text.clone(), layout.clone());
             }
         }
         let unwrapped_layout = self.layout_line(platform, text, font_size, runs, None);
@@ -571,11 +599,14 @@ impl LineLayoutCache {
             }
             None => Vec::new(),
         };
+        let size = size_of_line(text, &unwrapped_layout)
+            + wrap_boundaries.len() * mem::size_of::<WrapBoundary>();
         let layout = Rc::new(WrappedLineLayout {
             unwrapped_layout,
             wrap_boundaries,
             wrap_width,
         });
+        let text: SharedString = text.into();
         let key = Rc::new(CacheKey {
             text: text.clone(),
             font_size,
@@ -586,12 +617,12 @@ impl LineLayoutCache {
             indent,
             wrap,
         });
-        self.state
-            .borrow_mut()
-            .current
+        let state = &mut *self.state.borrow_mut();
+        state.bytes += size;
+        state
             .wrapped
-            .insert(key, layout.clone());
-        layout
+            .insert(key, (layout.clone(), Cell::new(state.frame), size));
+        (text, layout)
     }
 
     pub fn layout_line(
@@ -613,13 +644,10 @@ impl LineLayoutCache {
             wrap: TextWrap::Wrap,
         } as &dyn AsCacheKeyRef;
         {
-            let Frames { previous, current } = &mut *self.state.borrow_mut();
-            if let Some(layout) = current.lines.get(key) {
+            let state = self.state.borrow();
+            if let Some((layout, used, _)) = state.lines.get(key) {
+                used.set(state.frame);
                 return layout.clone();
-            }
-            if let Some((key, layout)) = previous.lines.remove_entry(key) {
-                current.lines.insert(key, layout.clone());
-                return layout;
             }
         }
         let mut layout = platform.layout_line(text, font_size, runs);
@@ -632,6 +660,7 @@ impl LineLayoutCache {
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
         }
+        let size = size_of_line(text, &layout);
         let key = Rc::new(CacheKey {
             text: text.into(),
             font_size,
@@ -643,11 +672,11 @@ impl LineLayoutCache {
             wrap: TextWrap::Wrap,
         });
         let layout = Rc::new(layout);
-        self.state
-            .borrow_mut()
-            .current
+        let state = &mut *self.state.borrow_mut();
+        state.bytes += size;
+        state
             .lines
-            .insert(key, layout.clone());
+            .insert(key, (layout.clone(), Cell::new(state.frame), size));
         layout
     }
 }

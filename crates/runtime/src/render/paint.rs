@@ -1,4 +1,5 @@
 use crate::style;
+use crate::style::Prop;
 use render::{AnyElement, Bounds, Pixels, Point, Window, point, prelude::*, px};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -306,7 +307,7 @@ impl render::Element for DomBox {
         if let Some(matrix) = matrix
             && self
                 .style
-                .get("backface-visibility")
+                .get(Prop::BACKFACE_VISIBILITY)
                 .is_some_and(|value| value == "hidden")
             && super::effects::backface(matrix, bounds)
         {
@@ -335,11 +336,11 @@ impl DomBox {
         use super::effects::{self, Clip};
         let style = &self.style;
         let units = self.units;
-        let value = |name: &str| {
-            style
-                .get(name)
-                .or_else(|| style.get(&format!("-webkit-{name}")))
-                .filter(|value| !matches!(value.as_str(), "none" | "normal" | "auto"))
+        let value = |props: &[Prop]| {
+            props
+                .iter()
+                .find_map(|&prop| style.get(prop))
+                .filter(|value| !matches!(*value, "none" | "normal" | "auto"))
         };
         let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
         let view = &*self.view;
@@ -347,12 +348,12 @@ impl DomBox {
         let empty = crate::dom::Document::default();
         let host = &mut *host;
         let doc = host.pages.get(&view.id).map_or(&empty, |page| &page.doc);
-        let mut layers = value("filter")
+        let mut layers = value(&[Prop::FILTER, Prop::WEBKIT_FILTER])
             .map(|value| effects::filters(value, &units, doc, &self.ids))
             .unwrap_or_default();
         let mut clip = None;
         let mut shapes = None;
-        match value("clip-path")
+        match value(&[Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH])
             .and_then(|value| effects::clip(value, &units, size, doc, &self.ids))
         {
             Some(Clip::Rounded(rect, radii)) => {
@@ -405,10 +406,10 @@ impl DomBox {
         let radii = || {
             effects::corners(
                 [
-                    "border-top-left-radius",
-                    "border-top-right-radius",
-                    "border-bottom-right-radius",
-                    "border-bottom-left-radius",
+                    Prop::BORDER_TOP_LEFT_RADIUS,
+                    Prop::BORDER_TOP_RIGHT_RADIUS,
+                    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+                    Prop::BORDER_BOTTOM_LEFT_RADIUS,
                 ]
                 .map(|name| {
                     style
@@ -419,7 +420,7 @@ impl DomBox {
                 }),
             )
         };
-        let backdrop = value("backdrop-filter")
+        let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
             .and_then(|value| effects::backdrop(value, &units))
             .map(|(blur, color_matrix)| render::Backdrop {
                 bounds,
@@ -430,7 +431,7 @@ impl DomBox {
         let outer = render::PaintEffect {
             transform,
             opacity: self.effects.unwrap_or(1.),
-            blend_mode: value("mix-blend-mode").map_or(render::BlendMode::Normal, |value| {
+            blend_mode: value(&[Prop::MIX_BLEND_MODE]).map_or(render::BlendMode::Normal, |value| {
                 effects::blend_mode(value)
             }),
             mask: mask.flatten(),
@@ -438,7 +439,7 @@ impl DomBox {
             ..Default::default()
         };
         let isolate = style
-            .get("isolation")
+            .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate");
         let needed = outer.transform.is_some()
             || outer.opacity < 1.
@@ -484,26 +485,22 @@ fn mask_svg(
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
 ) -> Option<String> {
-    let get = |name: &str| {
-        style
-            .get(name)
-            .or_else(|| style.get(&format!("-webkit-{name}")))
-            .map_or("", String::as_str)
-    };
-    let images = get("mask-image");
+    let get =
+        |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
+    let images = get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]);
     if images.is_empty() || images == "none" {
         return None;
     }
-    let list = |name: &str| {
-        style::components(get(name), ',')
+    let list = |props| {
+        style::components(get(props), ',')
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
     let (sizes, positions, repeats) = (
-        list("mask-size"),
-        list("mask-position"),
-        list("mask-repeat"),
+        list([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
+        list([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
+        list([Prop::MASK_REPEAT, Prop::WEBKIT_MASK_REPEAT]),
     );
     let pick = |values: &[String], index: usize| {
         values

@@ -17,8 +17,9 @@ getrandom = "0.3"
 render = { package = "apps-render", path = "../render" }
 avif-parse = "=2.1.0"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-rustls = { version = "0.27", default-features = false }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 image.workspace = true
 libc.workspace = true
 libffi = "5.2.0"
@@ -31,17 +32,18 @@ raw-window-handle.workspace = true
 # The published rav1d can abort on corrupt AV1 data.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
 resvg.workspace = true
 rustc-hash.workspace = true
 ring = "0.17.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
-sha1_smol = "1"
 sha2 = "0.10"
 socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tower-service = "0.3"
 url.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

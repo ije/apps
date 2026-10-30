@@ -1,4 +1,4 @@
-use super::super::{StyleCache, compute_styles, length};
+use super::super::{Prop, StyleCache, compute_styles, length};
 use crate::dom::Document;
 use std::collections::HashMap;
 
@@ -40,7 +40,7 @@ fn custom_variants_follow_classes() {
             ),
             None,
         );
-        assert_eq!(styles.values[id(&doc, "p")]["color"], expected);
+        assert_eq!(&styles.values[id(&doc, "p")]["color"], expected);
     }
 }
 
@@ -53,9 +53,9 @@ fn variants_reach_pseudo_elements_attributes_and_descendants() {
         None,
     );
     let div = id(&doc, "div");
-    assert_eq!(styles.values[div]["background-color"], "#123456");
-    assert_eq!(styles.pseudos[&div][1]["width"], "3px");
-    assert_eq!(styles.pseudos[&div][1]["display"], "block");
+    assert_eq!(&styles.values[div]["background-color"], "#123456");
+    assert_eq!(&styles.pseudos[&div][1]["width"], "3px");
+    assert_eq!(&styles.pseudos[&div][1]["display"], "block");
     let svg = &styles.values[id(&doc, "svg")];
     assert_eq!(length(&svg["width"], 0., 16., 800., 600.), 16.);
     let (doc, styles) = computed(
@@ -63,7 +63,7 @@ fn variants_reach_pseudo_elements_attributes_and_descendants() {
         None,
     );
     assert_eq!(
-        styles.values[id(&doc, "div")]["background-color"],
+        &styles.values[id(&doc, "div")]["background-color"],
         "#ff000080"
     );
 }
@@ -76,9 +76,9 @@ fn utilities_sit_between_base_layer_and_author_rules() {
         None,
     );
     let p = &styles.values[id(&doc, "p")];
-    assert_eq!(p["color"], "#00ff00");
+    assert_eq!(&p["color"], "#00ff00");
     assert_eq!(length(&p["padding-top"], 0., 16., 800., 600.), 8.);
-    assert_eq!(styles.values[id(&doc, "b")]["color"], "blue");
+    assert_eq!(&styles.values[id(&doc, "b")]["color"], "blue");
 }
 
 #[test]
@@ -89,12 +89,12 @@ fn apply_expands_variants_into_author_rules() {
         <body><a class='link'>a</a><div class='card open'></div></body></html>";
     let (doc, styles) = computed(source, None);
     let link = &styles.values[id(&doc, "a")];
-    assert_eq!(link["text-decoration-line"], "underline");
-    assert_ne!(link.get("color").map(String::as_str), Some("#123456"));
+    assert_eq!(&link["text-decoration-line"], "underline");
+    assert_ne!(link.get(Prop::COLOR), Some("#123456"));
     let card = &styles.values[id(&doc, "div")];
     assert_eq!(length(&card["padding-left"], 0., 16., 800., 600.), 8.);
     let (doc, styles) = computed(source, Some("a"));
-    assert_eq!(styles.values[id(&doc, "a")]["color"], "#123456");
+    assert_eq!(&styles.values[id(&doc, "a")]["color"], "#123456");
 }
 
 #[test]
@@ -109,10 +109,10 @@ fn custom_utilities_resolve_values_from_inline_theme() {
         None,
     );
     let p = &styles.values[id(&doc, "p")];
-    assert_eq!(p["--tw-enter-opacity"], ".95");
-    assert_eq!(p["animation-play-state"], "running");
-    assert_eq!(p["animation"], "enter 1s ease");
-    assert_eq!(styles.values[id(&doc, "b")]["--tw-enter-opacity"], "0.3");
+    assert_eq!(&p["--tw-enter-opacity"], ".95");
+    assert_eq!(&p["animation-play-state"], "running");
+    assert_eq!(&p["animation"], "enter 1s ease");
+    assert_eq!(&styles.values[id(&doc, "b")]["--tw-enter-opacity"], "0.3");
 }
 
 #[test]
@@ -129,13 +129,13 @@ fn preflight_resets_elements_unless_left_out() {
         length(&style("body")["margin-top"], 0., 16., 800., 600.),
         0.
     );
-    assert_eq!(style("h1")["font-size"], "24px");
-    assert_eq!(style("h1").get("font-weight"), None);
-    assert_eq!(style("ul")["list-style-type"], "none");
-    assert_eq!(style("img")["display"], "block");
-    assert_eq!(style("button")["background-color"], "transparent");
+    assert_eq!(&style("h1")["font-size"], "24px");
+    assert_eq!(style("h1").get(Prop::FONT_WEIGHT), None);
+    assert_eq!(&style("ul")["list-style-type"], "none");
+    assert_eq!(&style("img")["display"], "block");
+    assert_eq!(&style("button")["background-color"], "transparent");
     assert_eq!(style("a")["color"], style("body")["color"]);
-    assert_eq!(style("div")["display"], "none");
+    assert_eq!(&style("div")["display"], "none");
     assert!(style("html")["font-family"].starts_with("ui-sans-serif"));
     let (doc, styles) = computed(
         &format!(
@@ -155,5 +155,5 @@ fn preflight_resets_elements_unless_left_out() {
         ),
         8.
     );
-    assert_eq!(styles.values[id(&doc, "ul")]["list-style-type"], "disc");
+    assert_eq!(&styles.values[id(&doc, "ul")]["list-style-type"], "disc");
 }

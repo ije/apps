@@ -1,3 +1,4 @@
+use crate::style::Prop;
 use crate::{dom::Document, style};
 use render::{AnyElement, prelude::*, px};
 use std::{collections::HashMap, rc::Rc};
@@ -45,6 +46,8 @@ pub(crate) struct Cull {
     pub(crate) frame: [f32; 4],
     /// The scroll offsets of the last frame, by scroll container, `0` for the page.
     pub(crate) offsets: HashMap<usize, render::Point<render::Pixels>>,
+    /// The newest node revision, focus and styles that `info` was built from, without animated paint.
+    pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
 }
 
 /// The visible vertical range of a subtree, from the last frame's bounds of its clipping ancestors.
@@ -56,11 +59,7 @@ pub(super) struct Zone {
 
 impl Zone {
     /// The visible vertical range in the window, from this frame's bounds of the clipping ancestors.
-    fn visible(
-        &self,
-        bounds: &crate::dom::LayoutMirror,
-        window: &render::Window,
-    ) -> [f32; 2] {
+    fn visible(&self, bounds: &crate::dom::LayoutMirror, window: &render::Window) -> [f32; 2] {
         self.clips.iter().filter_map(|clip| bounds.get(clip)).fold(
             [0., f32::from(window.viewport_size().height)],
             |[low, high], rect| [low.max(rect[1]), high.min(rect[1] + rect[3])],
@@ -84,8 +83,9 @@ pub(super) struct Run {
 
 /// Whether the styles differ only in properties that do not move or resize boxes.
 pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
-    let paint = |name: &str| {
-        name.starts_with("--")
+    let paint = |prop: Prop| {
+        let name = prop.name();
+        prop.is_custom()
             || [
                 "background",
                 "outline",
@@ -101,37 +101,37 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
             .any(|prefix| name.starts_with(prefix))
             || name.starts_with("border-") && name.ends_with("-color")
             || matches!(
-                name,
-                "color"
-                    | "opacity"
-                    | "visibility"
-                    | "cursor"
-                    | "box-shadow"
-                    | "text-shadow"
-                    | "caret-color"
-                    | "accent-color"
-                    | "filter"
-                    | "backdrop-filter"
-                    | "-webkit-backdrop-filter"
-                    | "mix-blend-mode"
-                    | "isolation"
-                    | "clip-path"
-                    | "pointer-events"
-                    | "user-select"
-                    | "-webkit-user-select"
-                    | "z-index"
-                    | "transform"
-                    | "transform-origin"
-                    | "translate"
-                    | "rotate"
-                    | "scale"
-                    | "perspective"
-                    | "perspective-origin"
-                    | "backface-visibility"
-                    | "will-change"
-                    | "-webkit-tap-highlight-color"
-                    | "-webkit-font-smoothing"
-                    | "-moz-osx-font-smoothing"
+                prop,
+                Prop::COLOR
+                    | Prop::OPACITY
+                    | Prop::VISIBILITY
+                    | Prop::CURSOR
+                    | Prop::BOX_SHADOW
+                    | Prop::TEXT_SHADOW
+                    | Prop::CARET_COLOR
+                    | Prop::ACCENT_COLOR
+                    | Prop::FILTER
+                    | Prop::BACKDROP_FILTER
+                    | Prop::WEBKIT_BACKDROP_FILTER
+                    | Prop::MIX_BLEND_MODE
+                    | Prop::ISOLATION
+                    | Prop::CLIP_PATH
+                    | Prop::POINTER_EVENTS
+                    | Prop::USER_SELECT
+                    | Prop::WEBKIT_USER_SELECT
+                    | Prop::Z_INDEX
+                    | Prop::TRANSFORM
+                    | Prop::TRANSFORM_ORIGIN
+                    | Prop::TRANSLATE
+                    | Prop::ROTATE
+                    | Prop::SCALE
+                    | Prop::PERSPECTIVE
+                    | Prop::PERSPECTIVE_ORIGIN
+                    | Prop::BACKFACE_VISIBILITY
+                    | Prop::WILL_CHANGE
+                    | Prop::WEBKIT_TAP_HIGHLIGHT_COLOR
+                    | Prop::WEBKIT_FONT_SMOOTHING
+                    | Prop::MOZ_OSX_FONT_SMOOTHING
             )
     };
     let (mut a, mut b) = (old.iter().peekable(), new.iter().peekable());
@@ -177,14 +177,14 @@ pub(super) fn cosmetic_attrs(old: &crate::dom::Attrs, new: &crate::dom::Attrs) -
 
 /// The flags of a box's own style.
 pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u16 {
-    let display = style.get("display").map_or("inline", String::as_str);
-    let position = style.get("position").map_or("static", String::as_str);
-    let auto = |name: &str| style.get(name).is_none_or(|value| value == "auto");
-    let moved = ["transform", "translate", "rotate", "scale"]
-        .iter()
-        .any(|name| style.get(*name).is_some_and(|value| value != "none"))
+    let display = style.get(Prop::DISPLAY).unwrap_or("inline");
+    let position = style.get(Prop::POSITION).unwrap_or("static");
+    let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
+    let moved = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+        .into_iter()
+        .any(|name| style.get(name).is_some_and(|value| value != "none"))
         || style
-            .get("writing-mode")
+            .get(Prop::WRITING_MODE)
             .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"));
     let blocked = moved
         || matches!(
@@ -193,9 +193,9 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         )
         || matches!(position, "absolute" | "fixed" | "sticky")
         || style
-            .get("container-type")
+            .get(Prop::CONTAINER_TYPE)
             .is_some_and(|value| value != "normal")
-        || style.get("box-shadow").is_some_and(|value| {
+        || style.get(Prop::BOX_SHADOW).is_some_and(|value| {
             units.shadows(value, false).iter().any(|shadow| {
                 f32::from(shadow.offset.y.abs() + shadow.blur_radius + shadow.spread_radius)
                     >= margin
@@ -204,24 +204,29 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
     let solid = !tag.starts_with('#')
         && !display.starts_with("inline")
         && !matches!(display, "contents" | "none")
-        && style.get("float").is_none_or(|value| value == "none")
+        && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
         && (position == "static"
             || position == "relative"
-                && ["top", "right", "bottom", "left"]
-                    .iter()
-                    .all(|name| auto(name)))
-        && ["margin-top", "margin-bottom"]
-            .iter()
-            .all(|name| style.get(*name).is_none_or(|value| value != "auto"))
+                && [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT]
+                    .into_iter()
+                    .all(auto))
+        && [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM]
+            .into_iter()
+            .all(|name| style.get(name).is_none_or(|value| value != "auto"))
         && style
-            .get("flex-grow")
+            .get(Prop::FLEX_GROW)
             .is_none_or(|value| value.parse::<f32>().is_ok_and(|grow| grow == 0.))
         && style
-            .get("align-self")
+            .get(Prop::ALIGN_SELF)
             .is_none_or(|value| !value.contains("baseline"))
-        && !["height", "min-height", "max-height", "flex-basis"]
-            .iter()
-            .any(|name| style.get(*name).is_some_and(|value| value.contains('%')));
+        && ![
+            Prop::HEIGHT,
+            Prop::MIN_HEIGHT,
+            Prop::MAX_HEIGHT,
+            Prop::FLEX_BASIS,
+        ]
+        .into_iter()
+        .any(|name| style.get(name).is_some_and(|value| value.contains('%')));
     [
         (moved, MOVED),
         (blocked, BLOCKED),
@@ -231,7 +236,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         ),
         (display == "none", HIDDEN),
         (solid, SOLID),
-        (!auto("height") || !auto("flex-basis"), SIZED),
+        (!auto(Prop::HEIGHT) || !auto(Prop::FLEX_BASIS), SIZED),
     ]
     .into_iter()
     .fold(0, |flags, (on, bit)| if on { flags | bit } else { flags })
@@ -581,7 +586,7 @@ mod tests {
             source
                 .split(';')
                 .filter_map(|pair| pair.split_once(':'))
-                .map(|(name, value)| (name.into(), value.into()))
+                .map(|(name, value)| (Prop::new(name), value.into()))
                 .collect()
         };
         let base = style("display:flex;color:red;padding-top:4px;width:10px");

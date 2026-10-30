@@ -488,7 +488,7 @@ impl AppleTextSystemState {
 
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
-                for pixel in bytes.chunks_exact_mut(4) {
+                for pixel in bytes.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                     let a = pixel[3] as f32 / 255.;
                     if a > 0. {
@@ -577,6 +577,7 @@ impl AppleTextSystemState {
                 })
                 .unwrap_or(font_size);
             let font_id = self.id_for_native_font(font);
+            let is_emoji = self.is_emoji(font_id);
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id && run.font_size == run_size => &mut run.glyphs,
@@ -595,17 +596,12 @@ impl AppleTextSystemState {
                 .zip(run.positions().iter())
                 .zip(run.string_indices().iter())
             {
-                let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
-                if ix_converter.utf16_ix > glyph_utf16_ix {
-                    // We cannot reuse current index converter, as it can only seek forward. Restart the search.
-                    ix_converter = StringIndexConverter::new(text);
-                }
-                ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
+                ix_converter.seek_to_utf16_ix(usize::try_from(glyph_utf16_ix).unwrap());
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
+                    is_emoji,
                 });
             }
         }
@@ -639,7 +635,14 @@ impl<'a> StringIndexConverter<'a> {
         }
     }
 
-    fn advance_to_utf16_ix(&mut self, utf16_target: usize) {
+    /// Moves forward or back to the first character at or after `utf16_target`.
+    fn seek_to_utf16_ix(&mut self, utf16_target: usize) {
+        while self.utf16_ix > utf16_target
+            && let Some(c) = self.text[..self.utf8_ix].chars().next_back()
+        {
+            self.utf8_ix -= c.len_utf8();
+            self.utf16_ix -= c.len_utf16();
+        }
         for (ix, c) in self.text[self.utf8_ix..].char_indices() {
             if self.utf16_ix >= utf16_target {
                 self.utf8_ix += ix;

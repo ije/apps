@@ -93,7 +93,7 @@ impl State {
             }
             "compression.write" => {
                 let id = args[0].as_u64().context("Expected compression ID")?;
-                let bytes = crate::web::bytes(&args[1])?;
+                let bytes = crate::node::bytes(&args[1])?;
                 let finish = args[2] == true;
                 let (codec, ended) = self
                     .codecs
@@ -109,7 +109,7 @@ impl State {
                         let input = encoder.total_in();
                         let produced = encoder.total_out();
                         let status = encoder.compress(
-                            &bytes,
+                            bytes,
                             &mut output,
                             if finish {
                                 FlushCompress::Finish
@@ -127,7 +127,7 @@ impl State {
                         let input = decoder.total_in();
                         let produced = decoder.total_out();
                         let status = decoder.decompress(
-                            &bytes,
+                            bytes,
                             &mut output,
                             if finish {
                                 FlushDecompress::Finish
@@ -152,7 +152,7 @@ impl State {
                     "Incomplete compressed data"
                 );
                 output.truncate(written as usize);
-                Ok(json!({"read": read, "bytes": crate::web::base64(&output), "done": *ended}))
+                Ok(json!({"read": read, "bytes": crate::jsc::payload::write(output), "done": *ended}))
             }
             "compression.close" => {
                 self.codecs

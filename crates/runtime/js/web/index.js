@@ -166,9 +166,8 @@ globalThis.__appsWeb = call => {
       let data = bytes(input);
       if (this.#pending.length) { const combined = new Uint8Array(this.#pending.length + data.length); combined.set(this.#pending); combined.set(data, this.#pending.length); data = combined; }
       try {
-        const result = call('web.decode', encodeBytes(data), !!options.stream, this.#fatal);
-        this.#pending = result.pending;
-        let text = result.text;
+        let [text, pending] = call('web.decode', encodeBytes(data), !!options.stream, this.#fatal);
+        this.#pending = pending ? data.slice(data.length - pending) : [];
         if (text && !this.#started) { this.#started = true; if (!this.#ignoreBOM && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); }
         if (!options.stream) { this.#pending = []; this.#started = false; }
         return text;
@@ -540,7 +539,8 @@ globalThis.__appsWeb = call => {
         if(comma<0)throw new TypeError('Invalid data URL');
         let type=source.slice(0,comma), bytes=[];
         const raw=source.slice(comma+1);
-        for(let i=0;i<raw.length;){if(raw[i]==='%'&&/^[0-9a-f]{2}$/i.test(raw.slice(i+1,i+3))){bytes.push(parseInt(raw.slice(i+1,i+3),16));i+=3;}else{const character=String.fromCodePoint(raw.codePointAt(i));bytes.push(...new TextEncoder().encode(character));i+=character.length;}}
+        const encoder=new TextEncoder();
+        for(let i=0;i<raw.length;){const code=raw.charCodeAt(i);if(code===37&&/^[0-9a-f]{2}$/i.test(raw.slice(i+1,i+3))){bytes.push(parseInt(raw.slice(i+1,i+3),16));i+=3;}else if(code<128){bytes.push(code);i++;}else{let end=i+1;while(end<raw.length&&raw.charCodeAt(end)>=128)end++;for(const byte of encoder.encode(raw.slice(i,end)))bytes.push(byte);i=end;}}
         if(/;base64$/i.test(type)){type=type.slice(0,-7);let text='';for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.slice(i,i+8192));bytes=Uint8Array.from(atob(text),character=>character.charCodeAt(0));}
         if(!type)type='text/plain;charset=US-ASCII';else if(type.startsWith(';'))type='text/plain'+type;
         resolve(new Response(new Uint8Array(bytes),{headers:{'content-type':type}}));return;

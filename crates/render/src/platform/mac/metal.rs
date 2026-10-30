@@ -34,6 +34,8 @@ const MAX_TEXTURE_SIZE: u32 = 16384;
 /// Metal requires buffers to be bound at 256-byte aligned offsets.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// Unused layer textures are kept this many frames, for layers that come back.
+const SPARE_FRAMES: u8 = 3;
 
 pub(crate) type MetalAtlas = Atlas<AtlasTextures>;
 
@@ -85,8 +87,10 @@ pub(crate) struct Renderer {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Pipelines,
     atlas: Rc<MetalAtlas>,
-    /// The offscreen layer textures, kept across frames.
-    pool: Vec<Texture>,
+    /// The offscreen layer textures with their size and the frames since they were last used.
+    pool: Vec<(Texture, [u32; 2], u8)>,
+    /// The pool index of each layer texture of the frame.
+    targets: Vec<usize>,
     frame: RenderFrame,
 }
 
@@ -206,6 +210,7 @@ impl Renderer {
             queue,
             atlas,
             pool: Vec::new(),
+            targets: Vec::new(),
             frame: RenderFrame::default(),
         })
     }
@@ -266,12 +271,13 @@ impl Renderer {
             let buffer = buffer?;
             commands.waitUntilCompleted();
             // SAFETY: the GPU finished writing the shared buffer.
-            let mut pixels = unsafe {
+            let bgra = unsafe {
                 slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
-            }
-            .to_vec();
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
+            };
+            let mut pixels = vec![0; bgra.len()];
+            for (rgba, &[b, g, r, a]) in pixels.as_chunks_mut().0.iter_mut().zip(bgra.as_chunks().0)
+            {
+                *rgba = [r, g, b, a];
             }
             Ok((window, pixels))
         })
@@ -324,33 +330,39 @@ impl Renderer {
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         let mut frame = mem::take(&mut self.frame);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
-        self.pool.truncate(frame.textures.len());
-        for (index, size) in frame.textures.iter().enumerate() {
-            if self
+        for (_, _, idle) in &mut self.pool {
+            *idle = idle.saturating_add(1);
+        }
+        self.pool.retain(|(_, _, idle)| *idle <= SPARE_FRAMES);
+        self.targets.clear();
+        for size in &frame.textures {
+            let index = match self
                 .pool
-                .get(index)
-                .is_some_and(|texture| [texture.width() as u32, texture.height() as u32] == *size)
+                .iter()
+                .position(|(_, pooled, idle)| *idle > 0 && pooled == size)
             {
-                continue;
-            }
-            let descriptor = MTLTextureDescriptor::new();
-            // SAFETY: the dimensions are positive and the texture is 2D.
-            unsafe {
-                descriptor.setWidth(size[0] as usize);
-                descriptor.setHeight(size[1] as usize);
-            }
-            descriptor.setPixelFormat(FORMAT);
-            descriptor.setStorageMode(MTLStorageMode::Private);
-            descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-            let texture = self
-                .device
-                .newTextureWithDescriptor(&descriptor)
-                .context("allocating layer texture")?;
-            if index < self.pool.len() {
-                self.pool[index] = texture;
-            } else {
-                self.pool.push(texture);
-            }
+                Some(index) => index,
+                None => {
+                    let descriptor = MTLTextureDescriptor::new();
+                    // SAFETY: the dimensions are positive and the texture is 2D.
+                    unsafe {
+                        descriptor.setWidth(size[0] as usize);
+                        descriptor.setHeight(size[1] as usize);
+                    }
+                    descriptor.setPixelFormat(FORMAT);
+                    descriptor.setStorageMode(MTLStorageMode::Private);
+                    descriptor
+                        .setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+                    let texture = self
+                        .device
+                        .newTextureWithDescriptor(&descriptor)
+                        .context("allocating layer texture")?;
+                    self.pool.push((texture, *size, 0));
+                    self.pool.len() - 1
+                }
+            };
+            self.pool[index].2 = 0;
+            self.targets.push(index);
         }
         let pool = POOL.with(Rc::clone);
         let mut writer = Writer::new(&self.device, pool.clone(), self.unified)?;
@@ -400,7 +412,7 @@ impl Renderer {
     ) -> Result<()> {
         let texture = |target: Target| match target {
             Target::Frame => drawable,
-            Target::Layer(index) => &*self.pool[frame.layers[index].texture],
+            Target::Layer(index) => &*self.pool[self.targets[frame.layers[index].texture]].0,
         };
         let text = TextParams::default();
         let alpha = if self.opaque { 1. } else { 0. };

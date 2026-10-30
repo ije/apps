@@ -1,9 +1,9 @@
-use super::{SharedString, TextRun, WhiteSpace, WrappedLine, WrappedLineLayout};
+use super::{SharedString, TextAlign, TextRun, WhiteSpace, WrappedLine, WrappedLineLayout};
 use crate::{
     AvailableSpace, Bounds, Element, IntoElement, LayoutId, Pixels, Point, Size, Style, TextStyle,
     Window, px,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
 /// Text in the inherited text style, or with its own runs.
 pub struct StyledText {
@@ -135,9 +135,11 @@ impl TextLayout {
             let system = window.text_system().clone();
             let (text, runs, truncated) = match truncate {
                 Some((affix, width)) => {
-                    truncate_text(&system, &style, &text, &runs, &affix, width, wrap_width)
+                    let (text, runs, truncated) =
+                        truncate_text(&system, &style, &text, &runs, &affix, width, wrap_width);
+                    (text, Cow::Owned(runs), truncated)
                 }
-                None => (text.clone(), runs.clone(), false),
+                None => (text.clone(), Cow::Borrowed(&runs), false),
             };
             let len = text.len();
             let lines = system
@@ -178,7 +180,10 @@ impl TextLayout {
         let Some(bounds) = inner.bounds else {
             return;
         };
-        let align = window.text_style().text_align;
+        let align = window
+            .text_styles
+            .last()
+            .map_or(TextAlign::Left, |style| style.text_align);
         let mut origin = bounds.origin;
         for line in &inner.lines {
             line.paint_background(origin, inner.line_height, align, Some(bounds), window);
