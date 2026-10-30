@@ -5,15 +5,15 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 ## Goals
 
 - 120FPS, 0 FPS when idle, low CPU load
-- Small runtime size (less than 15MB)
-- Low memory usage
+- Small runtime size (less than 10MB)
 - Fast launch (less than 300ms)
+- Low memory usage
 
 ## Architecture
 
 - Electron compatible API
 - Stanard Web API
-- DOM and CSS renderer using GPUI (no chrome bundled)
+- DOM and CSS renderer on GPU renderer with builtin tailwindCSS support
 - JSC as runtime
 
 ## Security
@@ -26,25 +26,22 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 
 ## Node Integration
 
-- Can import nodejs internal modules like `node:child_process`, `node:fs`, etc
+- Can import nodejs internal modules from `node:child_process`, `node:fs`, etc
 - Global `process` object
 - Support NAPI (`.node` module)
 - Support FFI via `node:ffi`
 
 > Unlike eletron bundles nodejs, `@pierre/apps` provides the node integration via rust code.
 
-## GPUI
+## Renderer
 
-The `crates/gpui*` crates are a fork of [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (main, October 2026), split into crates like upstream.
+`crates/render` (`apps-render`) is h2o's window system and GPU renderer. It started from [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), but keeps only what h2o needs: an element tree built each frame, taffy layout, text shaping, an atlas, and one renderer per platform.
 
-| Platform | Renderer |
-|---|---|
-| macOS | Metal. Shaders are compiled at build time when the Metal toolchain is installed |
-| Windows | Direct3D 11 with DirectComposition |
-| Linux | wgpu on Vulkan or OpenGL |
-
-h2o adds offscreen effect layers, rounded clips, dotted and double borders, per-run text sizes, letter and word spacing, and text indent.
-Parts h2o doesn't use are removed: HTTP images, screen capture, list elements, the web and iOS targets, and test support.
+| Platform | Window | Renderer | Text |
+|---|---|---|---|
+| macOS | AppKit | Metal. Shaders are compiled at build time when the Metal toolchain is installed | CoreText |
+| Windows | Win32 | Direct3D 11 with DirectComposition | DirectWrite |
+| Linux | X11 and Wayland | wgpu on Vulkan or OpenGL | cosmic-text |
 
 ## JSC
 

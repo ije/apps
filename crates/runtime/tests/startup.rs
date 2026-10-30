@@ -20,7 +20,7 @@ fn runs_a_streamed_bundle_with_project_assets_and_metadata() {
     });
     let bundle = apps_runtime::bundle::Bundle {
         files: bbtree::unsync::BBTreeMap::from([
-            ("app.js".into(), format!("define({definition});")),
+            ("app.js".into(), format!("$appsDefine({definition});")),
             ("package.json".into(), r#"{"name":"MemoryApp","version":"1.2.3"}"#.into()),
             ("page.html".into(), "<h1>In memory</h1><script type='preload'>if(__apps.fs.readFileSync('public/asset.txt','utf8')!=='project asset')throw Error('preload');</script><script type='module'>if(document.querySelector('h1').textContent!=='In memory')throw Error('renderer');</script>".into()),
         ]),
@@ -85,4 +85,34 @@ fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
         String::from_utf8_lossy(&output.stderr)
             .contains("Cannot use a directory with --bundle-stdin")
     );
+}
+
+#[test]
+#[ignore = "release performance measurement"]
+fn engine_launch() {
+    use apps_runtime::{
+        host::Role,
+        jsc::{Api, Engine},
+    };
+    let api = Api::load().unwrap();
+    let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = std::rc::Rc::default();
+    let mut times = Vec::new();
+    for id in 1..=9 {
+        host.borrow_mut().pages.insert(
+            id,
+            apps_runtime::host::Page {
+                doc: apps_runtime::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let start = std::time::Instant::now();
+        let preload =
+            Engine::new(api.clone(), std::rc::Rc::clone(&host), Role::Preload(id)).unwrap();
+        let page = Engine::new(api.clone(), std::rc::Rc::clone(&host), Role::Renderer(id)).unwrap();
+        times.push(start.elapsed().as_secs_f64() * 1000.);
+        drop((preload, page));
+    }
+    println!("window_engines_first_ms={:.3}", times[0]);
+    times.sort_by(f64::total_cmp);
+    println!("window_engines_median_ms={:.3}", times[4]);
 }

@@ -195,7 +195,8 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     },
     get defaultSession() { return this.fromPartition('persist:default'); },
   });
-  return { View, WebContentsView, session, poll, pending: () => contents.size > 0,
+  // WARNING: Linux webviews need GTK pumping from poll; other platforms wake the loop on events.
+  return { View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux',
     contentView(window, options) {
       const view = new View(), state = layouts.get(view);
       state.root = state.window = window;
@@ -263,12 +264,15 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     showItemInFolder: path => native('shell.showItemInFolder', String(path)),
   });
   const options = args => args.length > 1 ? args[1] : args[0] ?? {};
+  const dialogs = new Map();
+  let nextDialog = 0;
+  const later = (op, value) => new Promise(resolve => { const id = ++nextDialog; dialogs.set(id, resolve); native(op, { ...value, async: id }); });
   const dialog = Object.freeze({
-    showOpenDialog: async (...args) => native('dialog.open', options(args)),
+    showOpenDialog: async (...args) => later('dialog.open', options(args)),
     showOpenDialogSync: (...args) => { const result = native('dialog.open', options(args)); return result.canceled ? undefined : result.filePaths; },
-    showSaveDialog: async (...args) => native('dialog.save', options(args)),
+    showSaveDialog: async (...args) => later('dialog.save', options(args)),
     showSaveDialogSync: (...args) => { const result = native('dialog.save', options(args)); return result.canceled ? undefined : result.filePath; },
-    showMessageBox: async (...args) => native('dialog.message', options(args)),
+    showMessageBox: async (...args) => later('dialog.message', options(args)),
     showMessageBoxSync: (...args) => native('dialog.message', options(args)).response,
     showErrorBox: (title, content) => native('dialog.message', { message: String(title), detail: String(content) }),
   });
@@ -389,9 +393,10 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     on(name, listener) { native('power.init'); observePower = true; return EventEmitter.prototype.on.call(this, name, listener); },
   });
   const poll = () => {
-    if (!menuActive && !shortcuts.size && !notifications.size && !observeTheme && !observePower && !observeApp) return;
+    if (!menuActive && !shortcuts.size && !notifications.size && !dialogs.size && !observeTheme && !observePower && !observeApp) return;
     for (const event of native('poll')) {
-      if (event.type === 'shortcut') { for (const item of shortcuts.values()) if (item.id === event.id) item.callback(); }
+      if (event.type === 'dialog') { dialogs.get(event.id)?.(event.value); dialogs.delete(event.id); }
+      else if (event.type === 'shortcut') { for (const item of shortcuts.values()) if (item.id === event.id) item.callback(); }
       else if (event.type === 'menu') { const item = menuCallbacks.get(event.id); if (item) { if (item.item.type === 'checkbox') item.item.checked = event.checked; item.callback(item.item); } }
       else if (event.type === 'theme') nativeTheme.emit('updated');
       else if (event.type === 'power') powerMonitor.emit(event.event, event.event === 'thermal-state-change' ? { state: native('power.thermal') } : undefined);

@@ -110,13 +110,11 @@ impl State {
     pub(crate) fn set_authorizer_callback(&mut self, callback: AuthorizerCallback) {
         self.authorizer_callback = Some(callback);
     }
-    pub(crate) fn call(&mut self, role: Role, request: &Value) -> Result<Value> {
+    pub(crate) fn call(&mut self, role: Role, op: &str, args: &Value) -> Result<Value> {
         ensure!(
             !matches!(role, Role::Renderer(_)),
             "SQLite is unavailable in page scripts"
         );
-        let op = request["op"].as_str().context("Missing SQLite operation")?;
-        let args = &request["args"];
         if op == "sqlite.constants" {
             return Ok(json!({
                 "SQLITE_OK":ffi::SQLITE_OK,"SQLITE_DENY":ffi::SQLITE_DENY,"SQLITE_IGNORE":ffi::SQLITE_IGNORE,
@@ -336,6 +334,64 @@ impl State {
                 .get(&statement.database)
                 .context("Database is not open")?;
             let raw = statement.raw;
+            // WARNING: statements bind in the same call that steps them, so one row costs one host call.
+            let bind = |bindings: &[Value]| -> Result<()> {
+                ffi::sqlite3_reset(raw);
+                ffi::sqlite3_clear_bindings(raw);
+                for binding in bindings.chunks(3) {
+                    let [index, kind, value] = binding else {
+                        bail!("Invalid SQLite parameter");
+                    };
+                    let index: i32 = index
+                        .as_i64()
+                        .context("Invalid parameter index")?
+                        .try_into()?;
+                    let code = match kind.as_u64().context("Invalid parameter type")? {
+                        0 => ffi::sqlite3_bind_null(raw, index),
+                        1 => ffi::sqlite3_bind_int64(
+                            raw,
+                            index,
+                            value.as_str().context("Expected integer")?.parse()?,
+                        ),
+                        2 => ffi::sqlite3_bind_double(
+                            raw,
+                            index,
+                            match value.as_f64() {
+                                Some(value) => value,
+                                None => value.as_str().context("Expected number")?.parse()?,
+                            },
+                        ),
+                        3 => {
+                            let text = value.as_str().context("Expected string")?;
+                            ffi::sqlite3_bind_text(
+                                raw,
+                                index,
+                                text.as_ptr().cast(),
+                                text.len().try_into()?,
+                                ffi::SQLITE_TRANSIENT(),
+                            )
+                        }
+                        4 => {
+                            let bytes = crate::node::bytes(value)?;
+                            ffi::sqlite3_bind_blob(
+                                raw,
+                                index,
+                                bytes.as_ptr().cast(),
+                                bytes.len().try_into()?,
+                                ffi::SQLITE_TRANSIENT(),
+                            )
+                        }
+                        _ => bail!("Unsupported SQLite parameter type"),
+                    };
+                    database.check(code)?;
+                }
+                Ok(())
+            };
+            let rest = |from: usize| {
+                args.as_array()
+                    .and_then(|args| args.get(from..))
+                    .unwrap_or_default()
+            };
             match op {
                 "sqlite.columns" => {
                     let columns: Vec<_> = (0..ffi::sqlite3_column_count(raw)).map(|index| {
@@ -343,53 +399,6 @@ impl State {
                         json!({"name":text(ffi::sqlite3_column_name(raw,index)),"column":text(ffi::sqlite3_column_origin_name(raw,index)),"table":text(ffi::sqlite3_column_table_name(raw,index)),"database":text(ffi::sqlite3_column_database_name(raw,index)),"type":text(ffi::sqlite3_column_decltype(raw,index))})
                     }).collect();
                     Ok(json!(columns))
-                }
-                "sqlite.bind" => {
-                    ffi::sqlite3_reset(raw);
-                    ffi::sqlite3_clear_bindings(raw);
-                    for binding in args[1].as_array().context("Expected bindings")? {
-                        let index: i32 = binding[0]
-                            .as_i64()
-                            .context("Invalid parameter index")?
-                            .try_into()?;
-                        let value = &binding[1];
-                        let code = match value[0].as_str().context("Invalid parameter type")? {
-                            "null" => ffi::sqlite3_bind_null(raw, index),
-                            "integer" => ffi::sqlite3_bind_int64(
-                                raw,
-                                index,
-                                value[1].as_str().context("Expected integer")?.parse()?,
-                            ),
-                            "real" => ffi::sqlite3_bind_double(
-                                raw,
-                                index,
-                                value[1].as_str().context("Expected number")?.parse()?,
-                            ),
-                            "text" => {
-                                let text = value[1].as_str().context("Expected string")?;
-                                ffi::sqlite3_bind_text(
-                                    raw,
-                                    index,
-                                    text.as_ptr().cast(),
-                                    text.len().try_into()?,
-                                    ffi::SQLITE_TRANSIENT(),
-                                )
-                            }
-                            "blob" => {
-                                let bytes = crate::node::bytes(&value[1])?;
-                                ffi::sqlite3_bind_blob(
-                                    raw,
-                                    index,
-                                    bytes.as_ptr().cast(),
-                                    bytes.len().try_into()?,
-                                    ffi::SQLITE_TRANSIENT(),
-                                )
-                            }
-                            _ => bail!("Unsupported SQLite parameter type"),
-                        };
-                        database.check(code)?;
-                    }
-                    Ok(Value::Null)
                 }
                 "sqlite.reset" => {
                     database.check(ffi::sqlite3_reset(raw))?;
@@ -403,19 +412,30 @@ impl State {
                     Ok(result)
                 }
                 "sqlite.run" => {
+                    bind(rest(1))?;
                     let code = ffi::sqlite3_step(raw);
                     let result = database.check(code);
                     let reset = ffi::sqlite3_reset(raw);
                     result?;
                     database.check(reset)?;
-                    Ok(json!({
-                        "changes": ffi::sqlite3_changes64(database.0).to_string(),
-                        "lastInsertRowid": ffi::sqlite3_last_insert_rowid(database.0).to_string(),
-                    }))
+                    let number = |value: i64| {
+                        if value.unsigned_abs() < 1 << 53 {
+                            json!(value)
+                        } else {
+                            json!(value.to_string())
+                        }
+                    };
+                    Ok(json!([
+                        number(ffi::sqlite3_changes64(database.0)),
+                        number(ffi::sqlite3_last_insert_rowid(database.0)),
+                    ]))
                 }
                 "sqlite.rows" => {
                     let mode = args[1].as_str().context("Expected query mode")?;
                     let bigints = args[2] == true;
+                    if args[3] == true {
+                        bind(rest(4))?;
+                    }
                     let result = (|| -> Result<Value> {
                         let mut code = ffi::sqlite3_step(raw);
                         database.check(code)?;
@@ -469,7 +489,7 @@ impl State {
                                         if text {
                                             json!(String::from_utf8_lossy(bytes))
                                         } else {
-                                            json!({"blob": crate::node::latin1(bytes)})
+                                            json!({"blob": crate::web::base64(bytes)})
                                         }
                                     }
                                     _ => bail!("Unsupported SQLite value"),
@@ -524,7 +544,7 @@ mod tests {
         ] {
             assert!(
                 state
-                    .call(Role::Renderer(1), &json!({"op": op, "args": [":memory:"]}))
+                    .call(Role::Renderer(1), op, &json!([":memory:"]))
                     .unwrap_err()
                     .to_string()
                     .contains("unavailable in page scripts")

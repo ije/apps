@@ -8,6 +8,7 @@ pub(crate) const FOCUS: u8 = 1;
 pub(crate) const FOCUS_WITHIN: u8 = 2;
 pub(crate) const HOVER: u8 = 4;
 pub(crate) const ACTIVE: u8 = 8;
+const HAS: u8 = 16;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Selector {
@@ -130,12 +131,24 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
 }
 
 /// Match results and their dependencies, by selector address, node, scope and combinator flag.
-type Matches = HashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[(usize, u64)]>)>;
+type Matches =
+    rustc_hash::FxHashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[(usize, u64)]>)>;
+
+/// Element children positions of one parent: index, count, index among the same tag, count of that tag.
+type Positions = Rc<HashMap<usize, [usize; 4]>>;
+
+/// A node as selectors last saw it, with a revision per dependency kind.
+type Snapshot = Box<(Node, [u64; 6])>;
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
-    nodes: Vec<(Node, [u64; 6])>,
+    nodes: Vec<Option<Snapshot>>,
+    /// The document revision of each node when `nodes` last compared it.
+    seen: Vec<u64>,
     values: Matches,
+    /// Dependencies stored in `values`, to bound its memory.
+    size: usize,
+    positions: rustc_hash::FxHashMap<usize, (u64, Positions)>,
     pub(crate) dependencies: Vec<(usize, u64)>,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<usize>)>,
@@ -145,13 +158,25 @@ impl SelectorCache {
     pub fn update(&mut self, doc: &Document, order: &[usize]) {
         if self.values.len() > 131072 {
             self.values.clear();
+            self.size = 0;
         }
-        self.nodes
-            .resize_with(doc.nodes.len(), || (Node::default(), [0; 6]));
+        if self.positions.len() > 65536 {
+            self.positions.clear();
+        }
+        if self.nodes.len() < doc.nodes.len() {
+            self.nodes.resize_with(doc.nodes.len(), || None);
+            self.seen.resize(doc.nodes.len(), 0);
+        }
         let mut changes = Vec::new();
+        let mut retagged = Vec::new();
         for &id in order {
+            let revision = doc.nodes.revision(id);
+            let fresh = std::mem::replace(&mut self.seen[id], revision) != revision;
+            if !fresh && !cfg!(debug_assertions) {
+                continue;
+            }
             let node = &doc.nodes[id];
-            let (old, revisions) = &mut self.nodes[id];
+            let (old, revisions) = &mut **self.nodes[id].get_or_insert_default();
             let changed = [
                 node.tag != old.tag || node.attrs != old.attrs || node.inline != old.inline,
                 node.parent != old.parent,
@@ -160,12 +185,21 @@ impl SelectorCache {
                 node.tag != old.tag,
                 node.state != old.state,
             ];
+            debug_assert!(
+                fresh || !changed.contains(&true),
+                "node {id} changed without a new revision"
+            );
             if changed.iter().any(|&value| value) {
                 for (kind, (revision, changed)) in revisions.iter_mut().zip(changed).enumerate() {
                     if changed {
                         *revision += 1;
                         changes.push(id * 6 + kind);
                     }
+                }
+                if changed[4]
+                    && let Some(parent) = node.parent
+                {
+                    retagged.push(parent);
                 }
                 *old = Node {
                     tag: node.tag.clone(),
@@ -183,6 +217,13 @@ impl SelectorCache {
                 };
             }
         }
+        // WARNING: sibling selectors depend only on the parent's children, so a tag change counts as one.
+        for parent in retagged {
+            if let Some(slot) = self.nodes.get_mut(parent) {
+                slot.get_or_insert_default().1[2] += 1;
+                changes.push(parent * 6 + 2);
+            }
+        }
         if !changes.is_empty() {
             self.epoch += 1;
             self.changes.push_back((self.epoch, changes));
@@ -193,8 +234,9 @@ impl SelectorCache {
     }
 
     pub(crate) fn depend(&mut self, id: usize, kind: usize) {
-        if let Some((_, revisions)) = self.nodes.get(id) {
-            self.dependencies.push((id * 6 + kind, revisions[kind]));
+        if let Some(node) = self.nodes.get(id) {
+            self.dependencies
+                .push((id * 6 + kind, node.as_ref().map_or(0, |node| node.1[kind])));
         }
     }
 
@@ -202,9 +244,19 @@ impl SelectorCache {
         dependencies.iter().all(|(id, revision)| {
             self.nodes
                 .get(*id / 6)
-                .map_or(0, |(_, current)| current[*id % 6])
+                .and_then(Option::as_ref)
+                .map_or(0, |node| node.1[*id % 6])
                 == *revision
         })
+    }
+
+    /// Makes room for `count` more stored dependencies.
+    fn reserve(&mut self, count: usize) {
+        self.size += count;
+        if self.size > 2_000_000 {
+            self.values.clear();
+            self.size = count;
+        }
     }
 
     pub(crate) fn valid_since(
@@ -266,7 +318,15 @@ impl Selector {
                         (!part.trim().is_empty()).then(|| format!(":scope {}", part.trim()))
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Some((list(&relative.join(","))?, [0, 0]))
+                let selectors = list(&relative.join(","))?;
+                // WARNING: nested `:has()` is invalid and makes matching cost O(N²) or more.
+                if selectors
+                    .iter()
+                    .any(|selector| selector.states(&mut Vec::new()) & HAS != 0)
+                {
+                    return None;
+                }
+                Some((selectors, [0, 0]))
             }
             "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                 let of = argument.as_bytes().windows(4).position(|window| {
@@ -337,6 +397,34 @@ impl Selector {
         Ok(())
     }
 
+    /// Interaction states and `:has()` used here; nested `&` lists are added to `parents`.
+    pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u8 {
+        let mut states = self
+            .previous
+            .as_ref()
+            .map_or(0, |(_, previous)| previous.states(parents));
+        for simple in &self.simple {
+            match simple {
+                SimpleSelector::Pseudo(name, _, parsed, _) => {
+                    states |= match name.as_str() {
+                        "hover" => HOVER,
+                        "active" => ACTIVE,
+                        "focus" | "focus-visible" => FOCUS,
+                        "focus-within" => FOCUS_WITHIN,
+                        "has" => HAS,
+                        _ => 0,
+                    };
+                    for selector in parsed {
+                        states |= selector.states(parents);
+                    }
+                }
+                SimpleSelector::Parent(list, _) => parents.push(list.clone()),
+                _ => {}
+            }
+        }
+        states
+    }
+
     pub(crate) fn without_pseudo_element(&self) -> Option<(usize, Self)> {
         let (index, kind) = self.simple.iter().enumerate().find_map(|(index, part)| {
             let SimpleSelector::Element(name, _) = part else {
@@ -351,13 +439,30 @@ impl Selector {
                     "marker",
                     "first-letter",
                     "first-line",
+                    "placeholder",
+                    "-webkit-scrollbar",
+                    "-webkit-scrollbar-track",
+                    "-webkit-scrollbar-thumb",
+                    "-webkit-scrollbar-corner",
+                    "-webkit-scrollbar-track-piece",
                 ]
                 .iter()
                 .position(|n| n == name)?,
             ))
         })?;
         let mut selector = self.clone();
-        selector.simple.remove(index);
+        if kind < 7 {
+            selector.simple.remove(index);
+            return Some((kind, selector));
+        }
+        // WARNING: scrollbar parts keep only `:hover` on the thumb (kind 11); rules with other scrollbar states never match.
+        let kind = match (kind, &self.simple[index + 1..]) {
+            (11, []) => 8,
+            (_, []) => kind,
+            (9, [SimpleSelector::Pseudo(name, ..)]) if name == "hover" => 11,
+            _ => return None,
+        };
+        selector.simple.truncate(index);
         Some((kind, selector))
     }
 
@@ -827,7 +932,6 @@ impl Selector {
                             memo.depend(id, 2);
                             memo.depend(id, 3);
                             for &child in &node.children {
-                                memo.depend(child, 4);
                                 memo.depend(child, 3);
                             }
                             node.text.is_empty()
@@ -994,47 +1098,93 @@ impl Selector {
                             memo.depend(id, 1);
                             node.parent.is_some_and(|parent| {
                                 memo.depend(parent, 2);
-                                for &child in &doc.nodes[parent].children {
-                                    memo.depend(child, 4);
-                                }
-                                if !parsed.is_empty()
-                                    && !parsed
+                                let siblings = &doc.nodes[parent].children;
+                                let (index, count) = if parsed.is_empty() {
+                                    let revision = memo
+                                        .nodes
+                                        .get(parent)
+                                        .and_then(Option::as_ref)
+                                        .map_or(0, |node| node.1[2]);
+                                    let positions = match memo.positions.get(&parent) {
+                                        Some((cached, positions)) if *cached == revision => {
+                                            positions.clone()
+                                        }
+                                        _ => {
+                                            let mut types = HashMap::<&str, usize>::new();
+                                            let mut positions = HashMap::new();
+                                            for &child in siblings {
+                                                let tag = doc.nodes[child].tag.as_str();
+                                                if !tag.starts_with('#') {
+                                                    let of_type = types.entry(tag).or_default();
+                                                    positions.insert(
+                                                        child,
+                                                        [positions.len(), 0, *of_type, 0],
+                                                    );
+                                                    *of_type += 1;
+                                                }
+                                            }
+                                            let count = positions.len();
+                                            for (child, position) in &mut positions {
+                                                position[1] = count;
+                                                position[3] = types[doc.nodes[*child].tag.as_str()];
+                                            }
+                                            let positions = Rc::new(positions);
+                                            memo.positions
+                                                .insert(parent, (revision, positions.clone()));
+                                            positions
+                                        }
+                                    };
+                                    let Some(&[index, count, of_type, type_count]) =
+                                        positions.get(&id)
+                                    else {
+                                        return false;
+                                    };
+                                    if name.ends_with("of-type") {
+                                        (of_type, type_count)
+                                    } else {
+                                        (index, count)
+                                    }
+                                } else {
+                                    if !parsed
                                         .iter()
                                         .any(|s| s.matches_cached(doc, id, scope, memo))
-                                {
-                                    return false;
-                                }
-                                let of_type = name.ends_with("of-type");
-                                let mut siblings =
-                                    doc.nodes[parent].children.iter().filter(|&&child| {
-                                        let tag = &doc.nodes[child].tag;
-                                        !tag.starts_with('#')
-                                            && (!of_type || *tag == node.tag)
-                                            && (parsed.is_empty()
-                                                || child == id
-                                                || parsed.iter().any(|s| {
-                                                    s.matches_cached(doc, child, scope, memo)
-                                                }))
-                                    });
+                                    {
+                                        return false;
+                                    }
+                                    let matched: Vec<_> = siblings
+                                        .iter()
+                                        .filter(|&&child| {
+                                            !doc.nodes[child].tag.starts_with('#')
+                                                && (child == id
+                                                    || parsed.iter().any(|s| {
+                                                        s.matches_cached(doc, child, scope, memo)
+                                                    }))
+                                        })
+                                        .collect();
+                                    let Some(index) =
+                                        matched.iter().position(|&&child| child == id)
+                                    else {
+                                        return false;
+                                    };
+                                    (index, matched.len())
+                                };
                                 match name.as_str() {
-                                    "first-child" | "first-of-type" => siblings.next() == Some(&id),
-                                    "last-child" | "last-of-type" => {
-                                        siblings.next_back() == Some(&id)
-                                    }
-                                    "only-child" | "only-of-type" => siblings.nth(1).is_none(),
-                                    _ => if name.starts_with("nth-last") {
-                                        siblings.rev().position(|&child| child == id)
-                                    } else {
-                                        siblings.position(|&child| child == id)
-                                    }
-                                    .is_some_and(|index| {
+                                    "first-child" | "first-of-type" => index == 0,
+                                    "last-child" | "last-of-type" => index + 1 == count,
+                                    "only-child" | "only-of-type" => count == 1,
+                                    _ => {
+                                        let index = if name.starts_with("nth-last") {
+                                            count - 1 - index
+                                        } else {
+                                            index
+                                        };
                                         let (a, n) = (*a as i64, index as i64 + 1 - *b as i64);
                                         if a == 0 {
                                             n == 0
                                         } else {
                                             n % a == 0 && n / a >= 0
                                         }
-                                    }),
+                                    }
                                 }
                             })
                         }
@@ -1059,9 +1209,6 @@ impl Selector {
                 '>' => previous.matches_cached(doc, parent, scope, memo),
                 '+' | '~' => {
                     memo.depend(parent, 2);
-                    for &child in &doc.nodes[parent].children {
-                        memo.depend(child, 4);
-                    }
                     let mut siblings = doc.nodes[parent]
                         .children
                         .iter()
@@ -1105,6 +1252,7 @@ impl Selector {
                     memo.dependencies.truncate(start);
                     memo.dependencies.extend(&dependencies);
                     let dependencies: Rc<[_]> = dependencies.into();
+                    memo.reserve(dependencies.len());
                     for key in visited {
                         memo.values.insert(key, (matched, dependencies.clone()));
                     }
@@ -1121,6 +1269,7 @@ impl Selector {
         dependencies.dedup();
         memo.dependencies.truncate(start);
         memo.dependencies.extend(&dependencies);
+        memo.reserve(dependencies.len());
         memo.values.insert(key, (result, dependencies.into()));
         result
     }
@@ -1304,6 +1453,8 @@ mod tests {
             "#-1",
             ":not()",
             ":has()",
+            ":has(:has(a))",
+            ":has(:not(:has(a)))",
             "a::",
             ":lang()",
             ":dir()",
@@ -1321,6 +1472,7 @@ mod tests {
             ":unknown",
             "::-webkit-scrollbar",
             ":-webkit-any-link",
+            ":is(:has(a)):not(:has(b))",
         ] {
             assert!(!Selector::parse(selector, None).is_empty(), "{selector}");
         }

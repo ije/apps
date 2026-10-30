@@ -20,21 +20,18 @@ globalThis.__appsSQLite = native => {
     if (typeof value !== 'boolean') throw new TypeError(name + ' must be a boolean');
     return value;
   };
+  // WARNING: bindings go to Rust flat as index, kind, value, so one row costs one host call without JSON.
   const encode = value => {
-    if (value == null) return ['null'];
+    if (value == null) return [0, null];
     if (typeof value === 'bigint') {
       if (value < -9223372036854775808n || value > 9223372036854775807n) throw new RangeError('SQLite integers must fit in 64 bits');
-      return ['integer', String(value)];
+      return [1, String(value)];
     }
-    if (typeof value === 'boolean') return ['integer', value ? '1' : '0'];
-    if (typeof value === 'number') return ['real', String(value)];
-    if (typeof value === 'string') return ['text', value];
-    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)) {
-      const bytes = ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : new Uint8Array(value);
-      let latin1 = '';
-      for (let index = 0; index < bytes.length; index += 8192) latin1 += String.fromCharCode.apply(null, bytes.subarray(index, index + 8192));
-      return ['blob', { latin1 }];
-    }
+    if (typeof value === 'boolean') return [1, value ? '1' : '0'];
+    if (typeof value === 'number') return [2, Number.isFinite(value) ? value : String(value)];
+    if (typeof value === 'string') return [3, value];
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return [4, value];
+    if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return [4, new Uint8Array(value)];
     throw new TypeError('Unsupported SQLite parameter type');
   };
   const integer = (value, bigints) => {
@@ -144,24 +141,24 @@ globalThis.__appsSQLite = native => {
             if (this.#unknown) continue;
             throw new Error('Unknown named parameter: ' + name);
           }
-          bindings.push([index, encode(first[name])]);
+          bindings.push(index, ...encode(first[name]));
         }
       }
       if (args.length > this.#anonymous.length) throw new RangeError('Too many SQLite parameters');
       for (let index = 0; index < args.length; index++) {
-        bindings.push([this.#anonymous[index], encode(args[index])]);
+        bindings.push(this.#anonymous[index], ...encode(args[index]));
       }
-      call('sqlite.bind', this.#id, bindings);
+      return bindings;
     }
-    #rows(mode) {
-      const result = call('sqlite.rows', this.#id, mode, this.#bigints);
+    #rows(mode, bindings = null) {
+      const result = call('sqlite.rows', this.#id, mode, this.#bigints, bindings !== null, ...(bindings ?? []));
       return result.rows.map(values => {
         const row = this.#arrays ? [] : Object.create(null);
         for (let index = 0; index < values.length; index++) {
           let value = values[index];
           if (value && typeof value === 'object') {
             if ('integer' in value) value = integer(value.integer, this.#bigints);
-            else if ('blob' in value) { const text = value.blob, length = text.length; value = new Uint8Array(length); for (let byte = 0; byte < length; byte++) value[byte] = text.charCodeAt(byte); }
+            else if ('blob' in value) value = value.blob;
             else value = value.real === 'inf' ? Infinity : value.real === '-inf' ? -Infinity : Number(value.real);
           }
           row[this.#arrays ? index : result.columns[index]] = value;
@@ -169,15 +166,14 @@ globalThis.__appsSQLite = native => {
         return row;
       });
     }
-    all(...args) { this.#bind(args); return this.#rows('all'); }
-    get(...args) { this.#bind(args); return this.#rows('get')[0]; }
+    all(...args) { return this.#rows('all', this.#bind(args)); }
+    get(...args) { return this.#rows('get', this.#bind(args))[0]; }
     run(...args) {
-      this.#bind(args);
-      const result = call('sqlite.run', this.#id);
-      return { changes: integer(result.changes, this.#bigints), lastInsertRowid: integer(result.lastInsertRowid, this.#bigints) };
+      const [changes, lastInsertRowid] = call('sqlite.run', this.#id, ...this.#bind(args));
+      return { changes: integer(changes, this.#bigints), lastInsertRowid: integer(lastInsertRowid, this.#bigints) };
     }
     iterate(...args) {
-      this.#bind(args);
+      let bindings = this.#bind(args);
       const cursor = this.#cursor = { active: true };
       const finish = () => {
         if (cursor.active) {
@@ -190,7 +186,8 @@ globalThis.__appsSQLite = native => {
           if (cursor.invalidated) throw new Error('Iterator was invalidated');
           if (!cursor.active) return { done: true, value: undefined };
           try {
-            const rows = this.#rows('next');
+            const rows = this.#rows('next', bindings);
+            bindings = null;
             if (rows.length) return { done: false, value: rows[0] };
             cursor.active = false;
             return { done: true, value: undefined };

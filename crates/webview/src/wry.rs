@@ -38,6 +38,8 @@ impl Events {
             queue.pop_front();
         }
         queue.push_back(event);
+        drop(queue);
+        crate::wake();
     }
 
     fn evaluation(&self, token: &str, waiting: &RefCell<HashSet<u64>>, mut data: Value) {
@@ -173,7 +175,8 @@ impl Browser {
                 let Ok(data) = serde_json::from_str::<Value>(request.body()) else { return; };
                 if data["type"] == "evaluation" { ipc_events.evaluation(&ipc_token, &ipc_waiting, data); }
                 else if data["message"].is_object() {
-                    ipc_events.push(json!({"type":"message", "data":data["message"], "url":data["url"], "mainFrame":data["mainFrame"]}));
+                    // WARNING: the page writes the body, so the URL comes from the request and the frame is unknown.
+                    ipc_events.push(json!({"type":"message", "data":data["message"], "url":request.uri().to_string(), "mainFrame":null}));
                 }
             })
             .with_new_window_req_handler(move |url, _| {

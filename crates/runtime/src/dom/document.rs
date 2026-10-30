@@ -34,6 +34,14 @@ impl Attrs {
         }
     }
 
+    /// Sets a value in place, so updates of an existing attribute reuse its strings.
+    pub fn set(&mut self, name: &str, value: &str) {
+        match self.get_mut(name) {
+            Some(old) => value.clone_into(old),
+            None => self.0.push((name.into(), value.into())),
+        }
+    }
+
     pub fn remove(&mut self, name: &str) -> Option<String> {
         let index = self.0.iter().position(|(key, _)| key == name)?;
         Some(self.0.remove(index).1)
@@ -87,7 +95,114 @@ pub struct Node {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Document {
-    pub nodes: Vec<Node>,
+    pub nodes: Nodes,
+}
+
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn stamp() -> u64 {
+    REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The nodes of a document, each with a revision that changes on every mutable access, so
+/// caches can skip unchanged nodes without comparing them.
+// WARNING: revisions are unique across documents, so a cache never mistakes one node for another.
+#[derive(Clone, Debug, Default)]
+pub struct Nodes {
+    list: Vec<Node>,
+    revisions: Vec<u64>,
+}
+
+impl Nodes {
+    pub fn push(&mut self, node: Node) {
+        self.list.push(node);
+        self.revisions.push(stamp());
+    }
+
+    pub fn get_mut(&mut self, id: usize) -> Option<&mut Node> {
+        let node = self.list.get_mut(id)?;
+        self.revisions[id] = stamp();
+        Some(node)
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Node> {
+        self.revisions.fill_with(stamp);
+        self.list.iter_mut()
+    }
+
+    /// The revision of a node, never 0.
+    pub fn revision(&self, id: usize) -> u64 {
+        self.revisions[id]
+    }
+}
+
+impl std::ops::Deref for Nodes {
+    type Target = [Node];
+
+    fn deref(&self) -> &[Node] {
+        &self.list
+    }
+}
+
+impl std::ops::Index<usize> for Nodes {
+    type Output = Node;
+
+    fn index(&self, id: usize) -> &Node {
+        &self.list[id]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Nodes {
+    fn index_mut(&mut self, id: usize) -> &mut Node {
+        self.revisions[id] = stamp();
+        &mut self.list[id]
+    }
+}
+
+impl From<Vec<Node>> for Nodes {
+    fn from(list: Vec<Node>) -> Self {
+        let revisions = list.iter().map(|_| stamp()).collect();
+        Self { list, revisions }
+    }
+}
+
+impl IntoIterator for Nodes {
+    type Item = Node;
+    type IntoIter = std::vec::IntoIter<Node>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Nodes {
+    type Item = &'a Node;
+    type IntoIter = std::slice::Iter<'a, Node>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Nodes {
+    type Item = &'a mut Node;
+    type IntoIter = std::slice::IterMut<'a, Node>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl Serialize for Nodes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.list.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Nodes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<Node>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 impl Document {
@@ -96,9 +211,14 @@ impl Document {
             nodes: vec![Node {
                 tag: "#document".into(),
                 ..Node::default()
-            }],
+            }]
+            .into(),
         };
         let mut stack = vec![(0, false)];
+        // WARNING: end tags only search up to the nearest scope element, so open tag counts are kept per scope to skip unmatched end tags in O(1).
+        let mut open = vec![std::collections::HashMap::<String, usize>::new()];
+        let scope =
+            |tag: &str| matches!(tag, "html" | "table" | "td" | "th" | "template" | "select");
         let mut pos = 0;
         while pos < source.len() {
             let rest = &source[pos..];
@@ -132,17 +252,31 @@ impl Document {
             if let Some(close) = rest.strip_prefix("</") {
                 let end = close.find('>').unwrap_or(close.len());
                 let tag = close[..end].trim().to_ascii_lowercase();
-                for index in (1..stack.len()).rev() {
-                    let node = &doc.nodes[stack[index].0];
-                    if node.tag.eq_ignore_ascii_case(&tag) {
-                        stack.truncate(index);
-                        break;
-                    }
-                    if matches!(
-                        node.tag.as_str(),
-                        "html" | "table" | "td" | "th" | "template" | "select"
-                    ) {
-                        break;
+                if open
+                    .last()
+                    .unwrap()
+                    .get(&tag)
+                    .is_some_and(|&count| count > 0)
+                {
+                    for index in (1..stack.len()).rev() {
+                        let node = &doc.nodes[stack[index].0];
+                        if node.tag.eq_ignore_ascii_case(&tag) {
+                            for &(id, _) in stack[index..].iter().rev() {
+                                let tag = &doc.nodes[id].tag;
+                                if scope(tag) {
+                                    open.pop();
+                                } else if let Some(count) =
+                                    open.last_mut().unwrap().get_mut(&tag.to_ascii_lowercase())
+                                {
+                                    *count -= 1;
+                                }
+                            }
+                            stack.truncate(index);
+                            break;
+                        }
+                        if scope(&node.tag) {
+                            break;
+                        }
                     }
                 }
                 pos += (end + 3).min(rest.len());
@@ -262,6 +396,12 @@ impl Document {
                         pos += end + 1;
                     }
                 } else if !void && !(svg && inside.trim_end().ends_with('/')) {
+                    let tag = doc.nodes[id].tag.to_ascii_lowercase();
+                    if scope(&doc.nodes[id].tag) {
+                        open.push(std::collections::HashMap::from([(tag, 1)]));
+                    } else {
+                        *open.last_mut().unwrap().entry(tag).or_default() += 1;
+                    }
                     stack.push((id, svg));
                 }
             } else {
@@ -454,6 +594,35 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_end_tags_are_linear() {
+        let started = std::time::Instant::now();
+        for source in [
+            format!("{}{}", "<div>".repeat(50000), "</x>".repeat(50000)),
+            format!(
+                "<div><table>{}{}",
+                "<span>".repeat(50000),
+                "</div>".repeat(50000)
+            ),
+        ] {
+            assert!(Document::parse(&source).nodes.len() > 50000);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let doc = Document::parse(
+            "<div><b>x</div>y<svg><linearGradient><stop/></LINEARGRADIENT><g></g></svg><table><tr><td><p>in</table><i>out</i>",
+        );
+        let parent = |tag: &str| {
+            let id = doc.nodes.iter().position(|node| node.tag == tag).unwrap();
+            doc.nodes[doc.nodes[id].parent.unwrap()].tag.clone()
+        };
+        assert_eq!(
+            doc.nodes[doc.nodes.iter().position(|n| n.text == "y").unwrap()].parent,
+            Some(0)
+        );
+        assert_eq!(parent("g"), "svg");
+        assert_eq!(parent("i"), "p");
+    }
+
+    #[test]
     fn raw_text_and_attributes() {
         let doc = Document::parse(
             "<!doctype html><html><body><h1 id='g' data-x=\"a>b\">你好 &amp; &#65;</h1><script>if (a < b) x = '<div>';</script></body></html>",
@@ -468,6 +637,46 @@ mod tests {
                 .any(|n| n.text == "if (a < b) x = '<div>';")
         );
         assert_eq!(Document::parse(&doc.serialize(0)).text(h), doc.text(h));
+    }
+
+    #[test]
+    fn every_mutable_access_takes_a_new_revision() {
+        let mut doc = Document::parse("<p>a</p><p>b</p>");
+        let revisions = |doc: &Document| -> Vec<u64> {
+            (0..doc.nodes.len())
+                .map(|id| doc.nodes.revision(id))
+                .collect()
+        };
+        let before = revisions(&doc);
+        assert!(
+            revisions(&Document::parse("<p>a</p><p>b</p>"))
+                .iter()
+                .all(|revision| !before.contains(revision))
+        );
+        assert_eq!(doc.nodes[1].tag, "p");
+        assert_eq!(revisions(&doc.clone()), before);
+        doc.nodes[1].attrs.set("class", "x");
+        doc.nodes.get_mut(3).unwrap().state = 1;
+        let after = revisions(&doc);
+        assert_eq!(
+            (0..after.len())
+                .filter(|&id| after[id] != before[id])
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        doc.nodes.push(Node::default());
+        for node in &mut doc.nodes {
+            node.text.clear();
+        }
+        let all = revisions(&doc);
+        assert!(all.iter().zip(&after).all(|(new, old)| new > old));
+        let copy: Document = serde_json::from_value(serde_json::to_value(&doc).unwrap()).unwrap();
+        assert_eq!(copy.nodes.len(), doc.nodes.len());
+        assert!(
+            revisions(&copy)
+                .iter()
+                .all(|revision| !all.contains(revision))
+        );
     }
 
     #[test]

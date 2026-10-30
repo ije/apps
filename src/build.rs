@@ -13,7 +13,7 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: Target) -> Result<(
     target.validate(runtime).context(
         "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
     )?;
-    let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true)?;
+    let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true, None)?;
     if let Some(source) = files.get("native.json") {
         let addons: std::collections::BTreeMap<String, PathBuf> = serde_json::from_str(source)?;
         for path in addons.values() {
@@ -22,14 +22,24 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: Target) -> Result<(
                 .context("Native addon does not match the build target")?;
         }
     }
-    let source = apps_runtime::bundle_source(&files, false)?;
-    let allocator = oxc_allocator::Allocator::default();
-    let parsed = oxc_parser::Parser::new(&allocator, &source, oxc_span::SourceType::cjs()).parse();
-    ensure!(
-        parsed.diagnostics.is_empty(),
-        "Invalid app bundle: {:?}",
-        parsed.diagnostics
+    let app = (
+        "app.js".to_owned(),
+        apps_runtime::bundle_source(&files, false),
     );
+    for (name, source) in files
+        .iter()
+        .filter(|(name, _)| name.starts_with("script-"))
+        .chain([(&app.0, &app.1)])
+    {
+        let allocator = oxc_allocator::Allocator::default();
+        let parsed =
+            oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::cjs()).parse();
+        ensure!(
+            parsed.diagnostics.is_empty(),
+            "Invalid app bundle {name}: {:?}",
+            parsed.diagnostics
+        );
+    }
     let public = entry
         .parent()
         .context("Missing project directory")?
@@ -52,9 +62,19 @@ pub fn write_bundle(
     production: bool,
     target: Target,
 ) -> Result<(usize, PathBuf)> {
-    let (name, product_name, version) =
-        apps_runtime::bundle::package_metadata(files.get("package.json").map(String::as_str))?;
+    let package = files.get("package.json").map(String::as_str);
+    let (name, product_name, version) = apps_runtime::bundle::package_metadata(package)?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
+    let webgpu = match apps_runtime::gpu::library_name(target.platform) {
+        Some(name)
+            if apps_runtime::bundle::disabled_features(package)?
+                & apps_runtime::bundle::feature_bit("webgpu")
+                == 0 =>
+        {
+            Some(name)
+        }
+        _ => None,
+    };
     if target.platform == "windows" {
         for value in [&name, &product_name] {
             let stem = value.split('.').next().unwrap().to_ascii_uppercase();
@@ -145,11 +165,12 @@ pub fn write_bundle(
         let identifier = name.replace('_', "-");
         let name = apps_runtime::dom::escape(&name);
         let product_name = apps_runtime::dom::escape(&product_name);
+        let build = version.split('-').next().unwrap();
         let version = apps_runtime::dom::escape(&version);
         fs::write(
             app_directory.join("Contents/Info.plist"),
             format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>{name}</string><key>CFBundleIdentifier</key><string>dev.pierre.apps.{identifier}</string><key>CFBundleName</key><string>{product_name}</string><key>CFBundleDisplayName</key><string>{product_name}</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>{version}</string><key>CFBundleShortVersionString</key><string>{version}</string><key>NSHighResolutionCapable</key><true/></dict></plist>"#
+                r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>{name}</string><key>CFBundleIdentifier</key><string>dev.pierre.apps.{identifier}</string><key>CFBundleName</key><string>{product_name}</string><key>CFBundleDisplayName</key><string>{product_name}</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>{build}</string><key>CFBundleShortVersionString</key><string>{version}</string><key>NSHighResolutionCapable</key><true/></dict></plist>"#
             ),
         )?;
         #[cfg(unix)]
@@ -189,6 +210,15 @@ pub fn write_bundle(
         );
         bytes += fs::copy(license, destination)? as usize;
     }
+    if let Some(name) = webgpu {
+        let source = runtime.canonicalize()?.with_file_name(name);
+        target.validate(&source).context(
+            "The webgpu feature needs the WebGPU library next to the runtime. Build the workspace first with cargo build --workspace --release.",
+        )?;
+        let destination = libraries.join(name);
+        ensure!(!destination.exists(), "WebGPU conflicts with a build file");
+        bytes += fs::copy(source, destination)? as usize;
+    }
     if let Some(public) = public {
         let mut directories = vec![public.clone()];
         while let Some(directory) = directories.pop() {
@@ -204,18 +234,26 @@ pub fn write_bundle(
                     source.display()
                 );
                 ensure!(
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| !name.contains('\\')),
+                    "Public asset names must be UTF-8 without backslashes: {}",
+                    source.display()
+                );
+                ensure!(
                     !files.contains_key(relative.to_string_lossy().as_ref())
                         && !(target.platform == "windows"
                             && relative.to_str().is_some_and(|name| {
                                 name.eq_ignore_ascii_case(library_name)
                                     || name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
+                                    || webgpu.is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
                             }))
                         && relative != Path::new(&executable_name)
                         && !matches!(
                             relative.to_str(),
                             Some(
                                 "app.h2o"
-                                    | "deps.js"
                                     | "native.json"
                                     | "assets.json"
                                     | "package.json"
@@ -403,7 +441,8 @@ mod tests {
                         "<key>CFBundleShortVersionString</key><string>{version}</string>"
                     )));
                     assert!(plist.contains(&format!(
-                        "<key>CFBundleVersion</key><string>{version}</string>"
+                        "<key>CFBundleVersion</key><string>{}</string>",
+                        version.split('-').next().unwrap()
                     )));
                     assert!(apps_runtime::bundle::read(&app).is_ok());
                     let resources = app.join("Contents/Resources");
@@ -489,6 +528,7 @@ mod tests {
                     None,
                     Default::default(),
                     production,
+                    None,
                 )
                 .unwrap();
                 let (_, executable) = write_bundle(
@@ -510,6 +550,45 @@ mod tests {
                     0
                 );
             }
+        }
+    }
+
+    #[test]
+    fn webgpu_library_ships_only_with_the_feature() {
+        let target = Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let Some(name) = apps_runtime::gpu::library_name(target.platform) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::write(&runtime, b"runtime").unwrap();
+        let out = dir.path().join("dist");
+        let libraries = if cfg!(target_os = "macos") {
+            out.join("App.app/Contents/Frameworks")
+        } else {
+            out.clone()
+        };
+        let build = |features: &str| {
+            let files = BBTreeMap::from([
+                ("app.js".into(), String::new()),
+                ("package.json".into(), format!(r#"{{"features":{features}}}"#)),
+            ]);
+            write_bundle(&out, &files, &runtime, &dir.path().join("public"), true, target)
+        };
+        let error = build(r#"["webgpu"]"#).unwrap_err();
+        assert!(error.to_string().contains("WebGPU library"), "{error}");
+        fs::copy(
+            std::env::current_exe().unwrap().with_file_name(name),
+            dir.path().join(name),
+        )
+        .unwrap();
+        for (features, shipped) in [
+            ("[]", false),
+            (r#"["webgpu"]"#, true),
+            (r#"["*","-webgpu"]"#, false),
+        ] {
+            build(features).unwrap();
+            assert_eq!(libraries.join(name).is_file(), shipped, "{features}");
         }
     }
 
@@ -658,7 +737,6 @@ mod tests {
             .unwrap();
             for name in [
                 "app.js",
-                "deps.js",
                 "app.h2o",
                 "native.json",
                 "package.json",
@@ -682,6 +760,27 @@ mod tests {
                 );
                 assert_eq!(fs::read(&executable).unwrap(), b"runtime");
                 assert!(apps_runtime::bundle::read(&out).is_ok());
+                fs::remove_file(source).unwrap();
+            }
+            #[cfg(unix)]
+            for name in [
+                std::ffi::OsStr::new("..\\..\\escape.txt"),
+                std::os::unix::ffi::OsStrExt::from_bytes(b"invalid-\xff.txt"),
+            ] {
+                let source = public.join(name);
+                if fs::write(&source, "escape").is_err() {
+                    continue;
+                }
+                let error = write_bundle(
+                    &out,
+                    &files,
+                    &runtime,
+                    &public,
+                    production,
+                    Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("without backslashes"), "{error}");
                 fs::remove_file(source).unwrap();
             }
         }

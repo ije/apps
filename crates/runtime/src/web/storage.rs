@@ -189,7 +189,16 @@ pub(crate) struct State {
     path: PathBuf,
     transactions: HashMap<u64, Transaction>,
     next_id: u64,
-    idle: HashMap<String, Database>,
+    idle: Vec<Database>,
+}
+
+/// Drops the session storage of a closed window.
+pub(crate) fn forget(window: u64) {
+    if let Some(sessions) = SESSIONS.get()
+        && let Ok(mut sessions) = sessions.lock()
+    {
+        sessions.retain(|(_, id), _| *id != window);
+    }
 }
 impl State {
     pub(crate) fn configure(&mut self, namespace: &str, window: Option<u64>) {
@@ -228,13 +237,17 @@ impl State {
                 "get" => Ok(json!(values.get(key))),
                 "keys" => Ok(json!(values.keys().collect::<Vec<_>>())),
                 "set" => {
-                    values.insert(
-                        key.to_owned(),
-                        args[1]
-                            .as_str()
-                            .context("Expected storage value")?
-                            .to_owned(),
+                    let value = args[1].as_str().context("Expected storage value")?;
+                    let size = values
+                        .iter()
+                        .filter(|(name, _)| *name != key)
+                        .map(|(name, value)| name.len() + value.len())
+                        .sum::<usize>();
+                    ensure!(
+                        size + key.len() + value.len() <= 5 << 20,
+                        "QuotaExceededError: sessionStorage is full"
                     );
+                    values.insert(key.to_owned(), value.to_owned());
                     Ok(Value::Null)
                 }
                 "remove" => {
@@ -264,6 +277,7 @@ impl State {
             }
             let database = Database::open(&self.path)?;
             database.query("PRAGMA journal_mode=WAL", &[])?;
+            database.query("PRAGMA synchronous=NORMAL", &[])?;
             database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name))",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS records (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
@@ -275,6 +289,7 @@ impl State {
                 let database = Database::open(&self.path.with_file_name("local.sqlite"))?;
                 unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
                 database.query("PRAGMA journal_mode=WAL", &[])?;
+                database.query("PRAGMA synchronous=NORMAL", &[])?;
                 database.query(
                     "CREATE TABLE IF NOT EXISTS local (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
                     &[],
@@ -342,14 +357,16 @@ impl State {
             "begin"=>{
                 let name=args[0].as_str().context("Expected database name")?.to_owned();let writable=args[1]!="readonly";
                 if self.transactions.values().any(|transaction| transaction.name == name) { return Ok(json!({"busy":true})); }
-                let database=if let Some(database)=self.idle.remove(&name){database}else{Database::open(&self.path)?};
-                match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => { self.idle.insert(name, database); if error.to_string().contains("locked") { return Ok(json!({"busy":true})); } return Err(error); }}
+                let database=match self.idle.pop(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
+                match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => {
+                    if self.idle.len() < 4 { self.idle.push(database); }
+                    if error.to_string().contains("locked") { return Ok(json!({"busy":true})); } return Err(error); }}
                 self.next_id+=1;self.transactions.insert(self.next_id,Transaction{database,name,writable});Ok(json!({"id":self.next_id}))
             }
             "commit"|"abort"=>{
                 let id=args[0].as_u64().context("Expected transaction ID")?;
                 let transaction=self.transactions.remove(&id).context("Transaction is inactive")?;
-                transaction.database.query(if op=="commit"{"COMMIT"}else{"ROLLBACK"},&[])?;self.idle.insert(transaction.name, transaction.database);Ok(Value::Null)
+                transaction.database.query(if op=="commit"{"COMMIT"}else{"ROLLBACK"},&[])?;if self.idle.len() < 4 { self.idle.push(transaction.database); }Ok(Value::Null)
             }
             "databases"=>Ok(json!(db.query("SELECT name,version FROM databases",&[])?.into_iter().map(|r|json!({"name":r[0],"version":r[1].as_deref().and_then(|v|v.parse::<u64>().ok())})).collect::<Vec<_>>())),
             _=>{

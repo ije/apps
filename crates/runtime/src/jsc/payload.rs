@@ -100,6 +100,15 @@ pub(crate) fn read(value: &Value) -> Option<Result<Vec<u8>>> {
     }))
 }
 
+/// The bytes of binary argument `index` of the current call. They stay valid until the call returns.
+pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
+    FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        let bytes = frames.last()?.get(index)?;
+        Some((bytes.as_ptr(), bytes.len()))
+    })
+}
+
 pub(crate) fn write(bytes: &[u8]) -> Option<Value> {
     FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
@@ -110,11 +119,53 @@ pub(crate) fn write(bytes: &[u8]) -> Option<Value> {
     })
 }
 
+/// The bytes of an `ArrayBuffer` or typed array, valid until the next JavaScript allocation.
+pub(crate) fn view<'a>(
+    api: &crate::jsc::Api,
+    ctx: crate::jsc::Ptr,
+    value: crate::jsc::Ptr,
+) -> Result<&'a [u8]> {
+    let mut error = std::ptr::null_mut();
+    let kind = unsafe { (api.typed_kind)(ctx, value, &mut error) };
+    ensure!(error.is_null() && kind != 10, "Expected typed bytes");
+    let (pointer, length) = unsafe {
+        if kind == 9 {
+            (
+                (api.buffer_bytes)(ctx, value, &mut error).cast::<u8>(),
+                (api.buffer_length)(ctx, value, &mut error),
+            )
+        } else {
+            let length = (api.typed_length)(ctx, value, &mut error);
+            let offset = (api.typed_offset)(ctx, value, &mut error);
+            (
+                (api.typed_bytes)(ctx, value, &mut error)
+                    .cast::<u8>()
+                    .wrapping_add(offset),
+                length,
+            )
+        }
+    };
+    ensure!(
+        error.is_null() && (length == 0 || !pointer.is_null()),
+        "Invalid binary storage"
+    );
+    ensure!(length <= 1 << 31, "Binary arguments are too large");
+    Ok(if length == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pointer, length) }
+    })
+}
+
 pub(crate) fn input(
     api: &crate::jsc::Api,
     ctx: crate::jsc::Ptr,
     values: crate::jsc::Ptr,
 ) -> Result<Vec<Bytes>> {
+    ensure!(
+        unsafe { (api.value_type)(ctx, values) } == 5,
+        "Invalid binary arguments"
+    );
     let mut error = std::ptr::null_mut();
     let key = api.string("length");
     let count = unsafe { (api.get)(ctx, values, key, &mut error) };
@@ -130,45 +181,19 @@ pub(crate) fn input(
         "Invalid binary arguments"
     );
     let mut buffers = Vec::with_capacity(count as usize);
-    for index in 0..count as usize {
-        let key = api.string(&index.to_string());
-        let value = unsafe { (api.get)(ctx, values, key, &mut error) };
-        unsafe {
-            (api.string_release)(key);
-        }
-        let kind = unsafe { (api.typed_kind)(ctx, value, &mut error) };
-        ensure!(error.is_null() && kind != 10, "Expected typed bytes");
-        let (pointer, length) = unsafe {
-            if kind == 9 {
-                (
-                    (api.buffer_bytes)(ctx, value, &mut error).cast::<u8>(),
-                    (api.buffer_length)(ctx, value, &mut error),
-                )
-            } else {
-                let length = (api.typed_length)(ctx, value, &mut error);
-                let offset = (api.typed_offset)(ctx, value, &mut error);
-                (
-                    (api.typed_bytes)(ctx, value, &mut error)
-                        .cast::<u8>()
-                        .wrapping_add(offset),
-                    length,
-                )
-            }
-        };
-        ensure!(
-            error.is_null() && (length == 0 || !pointer.is_null()),
-            "Invalid binary storage"
-        );
-        buffers.push(if length == 0 {
-            Bytes::new()
-        } else {
-            Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(pointer, length) })
-        });
+    let mut total = 0usize;
+    for index in 0..count as u32 {
+        let value = unsafe { (api.get_index)(ctx, values, index, &mut error) };
+        ensure!(error.is_null(), "Expected typed bytes");
+        let bytes = view(api, ctx, value)?;
+        total += bytes.len();
+        ensure!(total <= 1 << 31, "Binary arguments are too large");
+        buffers.push(Bytes::copy_from_slice(bytes));
     }
     Ok(buffers)
 }
 
-unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
+pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
     drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
 }
 
@@ -177,28 +202,29 @@ pub(crate) fn output(
     ctx: crate::jsc::Ptr,
     mut payload: Payload,
 ) -> crate::jsc::Ptr {
-    let mut used = std::collections::HashMap::new();
     let mut buffers = Vec::new();
-    let mut pending = vec![&mut payload.value];
-    while let Some(value) = pending.pop() {
-        if let Some(index) = value.get("$appsBytes").and_then(Value::as_u64) {
-            if let Some(bytes) = payload.buffers.get(index as usize) {
-                let next = *used.entry(index).or_insert_with(|| {
-                    let next = buffers.len();
-                    buffers.push(bytes.to_vec());
-                    next
-                });
-                *value = json!({"$appsBytes":next});
-            }
-        } else {
-            match value {
-                Value::Array(values) => pending.extend(values),
-                Value::Object(values) => pending.extend(values.values_mut()),
-                _ => {}
+    if !payload.buffers.is_empty() {
+        let mut used = std::collections::HashMap::new();
+        let mut pending = vec![&mut payload.value];
+        while let Some(value) = pending.pop() {
+            if let Some(index) = value.get("$appsBytes").and_then(Value::as_u64) {
+                if let Some(bytes) = payload.buffers.get_mut(index as usize) {
+                    let next = *used.entry(index).or_insert_with(|| {
+                        buffers.push(Vec::from(std::mem::take(bytes)));
+                        buffers.len() - 1
+                    });
+                    *value = json!({"$appsBytes":next});
+                }
+            } else {
+                match value {
+                    Value::Array(values) => pending.extend(values),
+                    Value::Object(values) => pending.extend(values.values_mut()),
+                    _ => {}
+                }
             }
         }
     }
-    let source = api.string(&payload.value.to_string());
+    let source = api.string_owned(payload.value.to_string());
     let text = unsafe { (api.make_string)(ctx, source) };
     unsafe {
         (api.string_release)(source);

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct Canvas {
     pub pixels: skia::Pixmap,
-    pub image: Arc<gpui::RenderImage>,
+    pub image: Arc<render::RenderImage>,
 }
 
 pub fn escape(value: &str) -> String {
@@ -25,15 +25,19 @@ pub fn fonts() -> &'static Mutex<Arc<usvg::fontdb::Database>> {
     })
 }
 
-fn render_image(pixels: &skia::Pixmap) -> Arc<gpui::RenderImage> {
-    let mut bytes = Vec::with_capacity(pixels.data().len());
-    for pixel in pixels.pixels() {
-        let pixel = pixel.demultiply();
-        bytes.extend_from_slice(&[pixel.blue(), pixel.green(), pixel.red(), pixel.alpha()]);
+fn render_image(pixels: &skia::Pixmap) -> Arc<render::RenderImage> {
+    let mut bytes = vec![0; pixels.data().len()];
+    for (out, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(pixels.pixels()) {
+        if pixel.alpha() != 0 {
+            let pixel = pixel.demultiply();
+            *out = [pixel.blue(), pixel.green(), pixel.red(), pixel.alpha()];
+        }
     }
-    Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-        image::RgbaImage::from_raw(pixels.width(), pixels.height(), bytes).unwrap(),
-    )]))
+    Arc::new(render::RenderImage::new(
+        pixels.width(),
+        pixels.height(),
+        bytes,
+    ))
 }
 
 impl Canvas {
@@ -47,9 +51,11 @@ impl Canvas {
             "Canvas dimensions exceed the pixel limit"
         );
         let pixels = skia::Pixmap::new(width, height).context("Cannot allocate canvas")?;
-        let image = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-            image::RgbaImage::new(width, height),
-        )]));
+        let image = Arc::new(render::RenderImage::new(
+            width,
+            height,
+            vec![0; (width * height * 4) as usize],
+        ));
         Ok(Self { pixels, image })
     }
     fn render_svg(&mut self, body: &mut String) -> Result<()> {
@@ -323,7 +329,7 @@ pub fn svg(
     width: u32,
     height: u32,
     transform: Option<([f32; 2], [f32; 6])>,
-) -> Result<Arc<gpui::RenderImage>> {
+) -> Result<Arc<render::RenderImage>> {
     let tree = usvg::Tree::from_str(
         source,
         &usvg::Options {
@@ -352,14 +358,14 @@ mod tests {
     fn images_keep_straight_alpha_at_display_resolution() {
         let mut canvas = Canvas::new(2, 2).unwrap();
         canvas.draw(&[serde_json::json!({"op":"fillRect","x":0,"y":0,"width":2,"height":2,"fillStyle":"#ff0000","globalAlpha":0.5})]).unwrap();
-        assert_eq!(&canvas.image.as_bytes(0).unwrap()[..4], &[0, 0, 255, 128]);
+        assert_eq!(&canvas.image.bytes()[..4], &[0, 0, 255, 128]);
         assert_eq!(canvas.pixels.pixels()[0].red(), 128);
         let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
-        assert_eq!(u32::from(image.size(0).width), 4);
-        assert_eq!(image.as_bytes(0).unwrap(), [0, 0, 255, 128].repeat(16));
+        assert_eq!(u32::from(image.size().width), 4);
+        assert_eq!(image.bytes(), [0, 0, 255, 128].repeat(16));
         let rotated = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
         assert_eq!(
-            rotated.as_bytes(0).unwrap(),
+            rotated.bytes(),
             [[0, 0, 255, 255], [255, 0, 0, 255]].concat()
         );
     }

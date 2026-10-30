@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod devtools;
+pub(crate) mod mcp;
 pub(crate) mod native;
 
 use crate::{
@@ -10,16 +11,18 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
-use gpui::{
-    App, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions, prelude::*, px, size,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
-
-#[cfg(target_os = "macos")]
-gpui::actions!(desktop, [Quit]);
+use render::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 
 pub(crate) struct View {
-    pub(crate) handle: Option<WindowHandle<WebView>>,
+    pub(crate) handle: Option<WindowId>,
+    pub(crate) data: Weak<crate::render::ViewData>,
     pub(crate) title: Option<String>,
     pub(crate) preload: Option<Rc<Engine>>,
     pub(crate) renderer: Option<Rc<Engine>>,
@@ -35,7 +38,10 @@ pub struct Desktop {
     pages: BBTreeMap<String, Document>,
     error: Option<anyhow::Error>,
     quit: bool,
-    wake: Option<gpui::Task<()>>,
+    wake: Option<render::Timer>,
+    /// The waker of the running app, which async ops started before it ran use too.
+    waker: Arc<OnceLock<render::Waker>>,
+    scheduled: bool,
 }
 
 impl Desktop {
@@ -61,20 +67,29 @@ impl Desktop {
         let Some(renderer) = renderer else {
             return false;
         };
-        let result = renderer.eval(
-            &format!(
-                "__appsDispatch({},{},{})",
-                serde_json::json!(name),
-                serde_json::json!(path),
-                data
-            ),
-            "apps:input",
+        let result = renderer.call(
+            "__appsDispatch",
+            &[
+                &serde_json::json!(name).to_string(),
+                &serde_json::json!(path).to_string(),
+                &data.to_string(),
+            ],
         );
         let allowed = result.as_ref().is_ok_and(|value| value == "true");
         if let Err(error) = result {
             eprintln!("apps: {error}");
         }
-        cx.defer(move |cx| Self::drive(runtime, cx));
+        let schedule = runtime
+            .try_borrow_mut()
+            .is_ok_and(|mut app| !std::mem::replace(&mut app.scheduled, true));
+        if schedule {
+            cx.defer(move |cx| {
+                if let Ok(mut app) = runtime.try_borrow_mut() {
+                    app.scheduled = false;
+                }
+                Self::drive(runtime, cx)
+            });
+        }
         allowed
     }
 
@@ -88,10 +103,21 @@ impl Desktop {
         root: std::path::PathBuf,
     ) -> Result<Self> {
         let api = Api::load()?;
-        let (_, name, version) =
-            crate::bundle::package_metadata(files.get("package.json").map(String::as_str))?;
+        let waker = Arc::new(OnceLock::<render::Waker>::new());
+        crate::host::Waker::install({
+            let waker = waker.clone();
+            move || {
+                if let Some(waker) = waker.get() {
+                    waker.wake();
+                }
+            }
+        });
+        apps_webview::on_event(|| crate::host::Waker::current().wake());
+        let package = files.get("package.json").map(String::as_str);
+        let (_, name, version) = crate::bundle::package_metadata(package)?;
         let host = Rc::new(RefCell::new(Host {
             app_version: Some(version),
+            disabled: crate::bundle::disabled_features(package)?,
             app_name: Some(name.clone()),
             app_path: if root.as_os_str().is_empty() {
                 std::env::current_dir().unwrap_or_default()
@@ -125,6 +151,8 @@ impl Desktop {
             error: None,
             quit: false,
             wake: None,
+            waker,
+            scheduled: false,
         })
     }
 
@@ -133,32 +161,22 @@ impl Desktop {
         mut cx: Option<&mut App>,
         runtime: Option<&Rc<RefCell<Self>>>,
     ) -> Result<()> {
-        for _ in 0..1024 {
+        for _ in 0..64 {
             let commands = std::mem::take(&mut self.host.borrow_mut().commands);
             if commands.is_empty() {
-                for (&id, view) in &mut self.views {
-                    let host = self.host.borrow();
-                    let Some(page) = host.pages.get(&id).filter(|page| page.dirty) else {
-                        continue;
-                    };
-                    let title = page.doc.title();
-                    if view.title != title {
-                        if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                            handle.update(cx, |_, window, _| {
-                                window.set_window_title(title.as_deref().unwrap_or(""))
-                            })?;
-                        }
-                        view.title = title;
-                    }
+                // WARNING: titles walk the document, so windowed apps sync them once per drive.
+                if runtime.is_none() {
+                    self.titles(cx.as_deref_mut())?;
                 }
                 let attaches = self.host.borrow_mut().browsers.take_attaches();
                 for (browser, parent) in attaches {
                     if let Some(cx) = cx.as_deref_mut()
                         && let Some(handle) = self.views.get(&parent).and_then(|view| view.handle)
-                    {
-                        handle.update(cx, |_, window, _| {
+                        && let Some(result) = cx.update_window(handle, |window, _| {
                             self.host.borrow().browsers.attach(browser, window)
-                        })??;
+                        })
+                    {
+                        result?;
                     }
                 }
                 return Ok(());
@@ -188,18 +206,94 @@ impl Desktop {
                     "create" => {
                         ensure!(!self.views.contains_key(&id), "Window already exists");
                         let options = &args[2];
-                        let width = options["width"].as_f64().unwrap_or(800.) as f32;
-                        let height = options["height"].as_f64().unwrap_or(600.) as f32;
+                        let number = |key: &str, default: f64| {
+                            options[key].as_f64().unwrap_or(default) as f32
+                        };
+                        let min = [number("minWidth", 0.), number("minHeight", 0.)];
+                        let max = [number("maxWidth", 0.), number("maxHeight", 0.)];
+                        let limit = |value: f32, index: usize| {
+                            let value = value.max(min[index]);
+                            if max[index] > 0. {
+                                value.min(max[index])
+                            } else {
+                                value
+                            }
+                        };
+                        let width = limit(number("width", 800.), 0);
+                        let height = limit(number("height", 600.), 1);
                         self.host.borrow_mut().viewports.insert(id, [width, height]);
+                        let transparent = options["transparent"] == true;
+                        let background = options["backgroundColor"]
+                            .as_str()
+                            .and_then(crate::style::color)
+                            .unwrap_or(if transparent { (0, 0) } else { (0xffffff, 255) });
+                        self.host.borrow_mut().backgrounds.insert(id, background);
+                        let mut baseline = None;
+                        let mut data = Weak::new();
                         let handle = if let Some(cx) = cx.as_deref_mut() {
                             let runtime = runtime.unwrap().clone();
-                            let close_runtime = runtime.clone();
                             let host = self.host.clone();
-                            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
-                            Some(cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),titlebar:Some(TitlebarOptions{title:Some(options["title"].as_str().unwrap_or("apps").to_owned().into()),..Default::default()}),show:options["show"]!=false,is_resizable:options["resizable"]!=false,..Default::default()},move|window,cx|{
-                                window.on_window_should_close(cx,move|_,cx|{let runtime=close_runtime.clone();cx.defer(move|cx|{runtime.borrow().host.borrow_mut().commands.push(serde_json::json!({"op":"window","args":["close",id]}));Desktop::drive(runtime,cx);});false});
-                                cx.new(|cx|{let focus = cx.focus_handle(); window.focus(&focus, cx); cx.observe_window_activation(window,|view: &mut WebView,window,cx|{let runtime=view.runtime.clone();let event=format!("__appsEvent('{}',{})",if window.is_window_active(){"focus"}else{"blur"},view.id);cx.defer(move|cx|{if let Ok(app)=runtime.try_borrow()&&let Err(error)=app.main.eval(&event,"apps:focus"){eprintln!("apps: {error}");}Desktop::drive(runtime,cx);});}).detach(); WebView{id,runtime,host,images:HashMap::new(),focus,browsers:HashMap::new()}})
-                            })?)
+                            let frame = options["frame"] != false;
+                            let style = options["titleBarStyle"].as_str().unwrap_or("default");
+                            let hidden = !frame || style != "default";
+                            let lights = &options["trafficLightPosition"];
+                            let traffic_light_position = match (lights["x"].as_f64(), lights["y"].as_f64()) {
+                                (Some(x), Some(y)) => Some(point(px(x as f32), px(y as f32))),
+                                _ => (style == "hiddenInset").then(|| point(px(20.), px(18.))),
+                            }
+                            .filter(|_| frame && hidden);
+                            let outer = size(px(width), px(height));
+                            let origin = match (options["x"].as_f64(), options["y"].as_f64()) {
+                                (Some(x), Some(y)) => point(px(x as f32), px(y as f32)),
+                                _ => cx.centered(outer).origin,
+                            };
+                            let window_options = WindowOptions {
+                                bounds: Bounds::new(origin, outer),
+                                outer_size: options["useContentSize"] != true,
+                                title: options["title"].as_str().unwrap_or("apps").to_owned(),
+                                titlebar_hidden: hidden,
+                                traffic_light_position,
+                                frameless: !frame,
+                                transparent,
+                                show: options["show"] != false,
+                                resizable: options["resizable"] != false,
+                                minimizable: options["minimizable"] != false,
+                                movable: options["movable"] != false,
+                            };
+                            let handle = cx.open_window(window_options, |_, _| {
+                                let view = WebView::new(id, runtime, host);
+                                data = Rc::downgrade(&view.0);
+                                Box::new(view)
+                            })?;
+                            cx.update_window(handle, |window, _| {
+                                for (apply, change) in [
+                                    (
+                                        min != [0.; 2] || max != [0.; 2],
+                                        WindowChange::SizeLimits(
+                                            size(px(min[0]), px(min[1])),
+                                            size(px(max[0]), px(max[1])),
+                                        ),
+                                    ),
+                                    (options["alwaysOnTop"] == true, WindowChange::AlwaysOnTop(true)),
+                                    (options["maximizable"] == false, WindowChange::Maximizable(false)),
+                                    (options["closable"] == false, WindowChange::Closable(false)),
+                                    (true, WindowChange::Background(render::rgba((background.0 << 8) | background.1 as u32))),
+                                ] {
+                                    if apply {
+                                        window.change_window(change);
+                                    }
+                                }
+                                if options["fullscreen"] == true {
+                                    window.toggle_fullscreen();
+                                }
+                                let size = window.viewport_size();
+                                self.host
+                                    .borrow_mut()
+                                    .viewports
+                                    .insert(id, [f32::from(size.width), f32::from(size.height)]);
+                                baseline = Some(window_state(window));
+                            });
+                            Some(handle)
                         } else {
                             None
                         };
@@ -207,75 +301,109 @@ impl Desktop {
                             id,
                             View {
                                 handle,
+                                data,
                                 title: None,
                                 preload: None,
                                 renderer: None,
                             },
                         );
-                    }
-                    "loadURL" => {
-                        let url = args[2].as_str().context("Expected URL")?.to_owned();
-                        let view = self.views.get(&id).context("Window is closed")?;
-                        if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                            handle.update(cx, |view, window, cx| -> Result<()> {
-                                let browser = browser::Browser::new(
-                                    window,
-                                    &serde_json::json!({"persistent":true,"inspectable":!view.host.borrow().packaged,"application":view.host.borrow().app_name}),
-                                )?;
-                                let size = window.viewport_size();
-                                browser.set_bounds([
-                                    0.,
-                                    0.,
-                                    f32::from(size.width) as f64,
-                                    f32::from(size.height) as f64,
-                                ])?;
-                                browser.load_url(&url)?;
-                                view.browsers.insert(usize::MAX, (browser, url));
-                                cx.notify();
-                                Ok(())
-                            })??;
+                        if let Some(state) = baseline
+                            && let Err(error) = self
+                                .main
+                                .eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
+                        {
+                            eprintln!("apps: {error}");
                         }
                     }
                     "load" | "loadFile" => {
-                        self.host.borrow_mut().graphics.remove(&id);
                         let value = args[2].as_str().context("Expected HTML text or path")?;
-                        let doc = if action == "load" {
-                            Document::parse(value)
-                        } else if let Some(name) = value.strip_prefix("apps:///") {
-                            let name = name.split(['?', '#']).next().unwrap();
-                            if let Some(doc) = self.pages.get(name) {
-                                doc.clone()
-                            } else {
-                                Document::parse(
-                                    self.files.get(name).context("Missing bundled HTML file")?,
-                                )
+                        let page = args[3] == "page";
+                        let doc = (|| -> Result<Document> {
+                            if action == "load" {
+                                return Ok(Document::parse(value));
                             }
-                        } else {
+                            if let Some(name) = value.strip_prefix("apps:///") {
+                                let name = name.split(['?', '#']).next().unwrap();
+                                return Ok(match self.pages.get(name) {
+                                    Some(doc) => doc.clone(),
+                                    None => Document::parse(
+                                        self.files
+                                            .get(name)
+                                            .context("Missing bundled HTML file")?,
+                                    ),
+                                });
+                            }
+                            ensure!(!value.starts_with("apps:"), "Invalid bundled page URL");
                             let path = if value.starts_with("file:") {
-                                url::Url::parse(value)?
-                                    .to_file_path()
+                                let url = url::Url::parse(value)?;
+                                ensure!(
+                                    url.host_str().is_none_or(str::is_empty),
+                                    "Remote file URLs are not allowed"
+                                );
+                                url.to_file_path()
                                     .map_err(|_| anyhow::anyhow!("Invalid file URL"))?
                             } else {
                                 value.into()
                             };
-                            let source = std::fs::read_to_string(&path)
+                            let metadata = std::fs::metadata(&path)
                                 .with_context(|| format!("Cannot read {}", path.display()))?;
-                            Document::parse(&source)
+                            ensure!(
+                                metadata.is_file() && metadata.len() <= 64 << 20,
+                                "Page is not a file or is too large: {}",
+                                path.display()
+                            );
+                            Ok(Document::parse(
+                                &std::fs::read_to_string(&path)
+                                    .with_context(|| format!("Cannot read {}", path.display()))?,
+                            ))
+                        })();
+                        let doc = match doc {
+                            Ok(doc) => doc,
+                            Err(error) if page => {
+                                eprintln!("apps: navigation: {error:#}");
+                                continue;
+                            }
+                            Err(error) => return Err(error),
                         };
-                        let scripts: Vec<_> = doc
+                        self.host.borrow_mut().graphics.remove(&id);
+                        let bundled = self.host.borrow().scripts.clone();
+                        let scripts = doc
                             .nodes
                             .iter()
                             .filter(|n| n.tag == "script")
-                            .map(|n| {
-                                (
-                                    n.attrs
-                                        .get("type")
-                                        .cloned()
-                                        .unwrap_or_else(|| "module".into()),
-                                    n.text.clone(),
-                                )
+                            .filter_map(|n| {
+                                let kind = match n
+                                    .attrs
+                                    .get("type")
+                                    .map(|kind| kind.trim().to_ascii_lowercase())
+                                    .as_deref()
+                                {
+                                    None
+                                    | Some(
+                                        ""
+                                        | "module"
+                                        | "text/javascript"
+                                        | "application/javascript",
+                                    ) => "module",
+                                    Some("preload") => "preload",
+                                    _ => return None,
+                                };
+                                let Some(name) = n
+                                    .attrs
+                                    .get("src")
+                                    .and_then(|src| src.strip_prefix("apps:///"))
+                                else {
+                                    return Some((kind, n.text.as_str().into()));
+                                };
+                                let source = bundled
+                                    .get(name)
+                                    .map(|source: &std::sync::Arc<str>| (kind, source.clone()));
+                                if source.is_none() {
+                                    eprintln!("apps: missing bundled script {name}");
+                                }
+                                source
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
                         self.host
                             .borrow_mut()
                             .pages
@@ -283,19 +411,19 @@ impl Desktop {
                         self.host.borrow_mut().dom.remove(&id);
                         let view = self.views.get_mut(&id).context("Window is closed")?;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                            handle.update(cx, |_, window, _| {
+                            cx.update_window(handle, |window, _| {
                                 let mut host = self.host.borrow_mut();
                                 let state = host.dom.entry(id).or_default();
                                 state.text_system = Some(window.text_system().clone());
                                 state.pixel_ratio = window.scale_factor();
-                            })?;
+                            });
                         }
                         view.preload = None;
                         view.renderer = None;
                         self.host.borrow_mut().bridge.remove(&id);
-                        let trusted = args[3] != "page" || value.starts_with("apps:");
+                        let trusted = !page || value.starts_with("apps:///");
                         let preload = (trusted
-                            && scripts.iter().any(|(kind, _)| kind == "preload"))
+                            && scripts.iter().any(|(kind, _)| *kind == "preload"))
                         .then(|| {
                             Engine::new(self.api.clone(), self.host.clone(), Role::Preload(id))
                         })
@@ -307,10 +435,14 @@ impl Desktop {
                             Role::Renderer(id),
                         )?);
                         for (kind, script) in &scripts {
-                            if kind == "preload"
+                            if *kind == "preload"
                                 && let Some(preload) = &preload
+                                && let Err(error) = preload.eval(script, "apps:preload")
                             {
-                                preload.eval(script, "apps:preload")?;
+                                if cx.is_none() {
+                                    return Err(error);
+                                }
+                                eprintln!("apps: preload script: {error:#}");
                             }
                         }
                         let location = if action == "load" {
@@ -336,27 +468,21 @@ impl Desktop {
                             eprintln!("apps: {error}");
                         }
                         for (kind, script) in &scripts {
-                            if kind == "module" {
-                                if let Err(error) = renderer.eval(script, "apps:page") {
-                                    if cx.is_none() {
-                                        return Err(error);
-                                    }
-                                    eprintln!("apps: page script: {error:#}");
+                            if *kind == "module"
+                                && let Err(error) = renderer.eval_page(script, "apps:page")
+                            {
+                                if cx.is_none() {
+                                    return Err(error);
                                 }
-                            } else {
-                                ensure!(kind == "preload", "Unsupported script type: {kind}");
+                                eprintln!("apps: page script: {error:#}");
                             }
                         }
                         view.preload = preload;
                         view.renderer = Some(renderer);
-                        view.title = self.host.borrow().pages[&id].doc.title();
+                        // WARNING: `titles` sets the new page's title after `page-title-updated`.
+                        view.title = None;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                            handle.update(cx, |_, window, cx| {
-                                if let Some(title) = &view.title {
-                                    window.set_window_title(title);
-                                }
-                                cx.notify();
-                            })?;
+                            cx.refresh_window(handle);
                         }
                         self.main
                             .eval(&format!("__appsEvent('loaded',{id})"), "apps:loaded")?;
@@ -367,59 +493,199 @@ impl Desktop {
                         }
                         ensure!(cx.is_some(), "Developer Tools require a native window");
                         if self.devtools.remove(&id).is_none() {
-                            let view = self.views.get(&id).context("Window is closed")?;
-                            if view.renderer.is_none() {
-                                if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                                    handle.update(cx, |view, _, _| {
-                                        view.browsers
-                                            .get(&usize::MAX)
-                                            .context("Window has no document")?
-                                            .0
-                                            .inspect()
-                                    })??;
-                                }
-                            } else {
-                                self.devtools
-                                    .insert(id, devtools::DevTools::new(&format!("Window {id}"))?);
-                            }
+                            self.devtools
+                                .insert(id, devtools::DevTools::new(&format!("Window {id}"))?);
                         }
                     }
                     "close" => {
                         self.devtools.remove(&id);
                         if let Some(view) = self.views.remove(&id) {
                             self.host.borrow_mut().browsers.close_window(id)?;
+                            if let Some(data) = view.data.upgrade() {
+                                data.browsers.borrow_mut().clear();
+                            }
                             if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                                handle.update(cx, |view, window, _| {
-                                    view.browsers.clear();
-                                    window.remove_window();
-                                })?;
+                                cx.update_window(handle, |window, _| window.remove_window());
                             }
                             self.host.borrow_mut().pages.remove(&id);
                             self.host.borrow_mut().graphics.remove(&id);
                             self.host.borrow_mut().viewports.remove(&id);
+                            self.host.borrow_mut().backgrounds.remove(&id);
                             self.host.borrow_mut().dom.remove(&id);
                             self.host.borrow_mut().bridge.remove(&id);
+                            crate::web::storage::forget(id);
                             self.main
                                 .eval(&format!("__appsEvent('closed',{id})"), "apps:closed")?;
                         }
                     }
-                    "show" | "title" => {
+                    "capture" => {
+                        let request = args[2].as_u64().context("Missing capture request")?;
+                        let rect = args[3].clone();
                         let view = self.views.get(&id).context("Window is closed")?;
-                        if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                            handle.update(cx, |_, window, _| {
-                                if action == "title" {
-                                    window.set_window_title(args[2].as_str().unwrap_or(""));
-                                } else {
-                                    window.activate_window();
-                                }
-                            })?;
+                        if let (Some(handle), Some(cx), Some(runtime)) =
+                            (view.handle, cx.as_deref_mut(), runtime)
+                        {
+                            let runtime = runtime.clone();
+                            cx.update_window(handle, |window, _| {
+                                let scale = window.scale_factor();
+                                window.capture(move |frame, cx| {
+                                    let data = match frame.and_then(|frame| png(frame, scale, &rect, false)) {
+                                        Ok(([width, height], bytes)) => serde_json::json!({"id":request,"width":width,"height":height,"png":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}),
+                                        Err(error) => serde_json::json!({"id":request,"error":error.to_string()}),
+                                    };
+                                    if let Ok(app) = runtime.try_borrow()
+                                        && let Err(error) = app.main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
+                                    {
+                                        eprintln!("apps: {error}");
+                                    }
+                                    Desktop::drive(runtime, cx);
+                                });
+                            });
+                        }
+                    }
+                    "closing" => {
+                        if let Err(error) = self
+                            .main
+                            .eval(&format!("__appsEvent('close',{id})"), "apps:close")
+                        {
+                            eprintln!("apps: {error}");
+                        }
+                    }
+                    "background" => {
+                        let color = args[2]
+                            .as_str()
+                            .and_then(crate::style::color)
+                            .unwrap_or((0xffffff, 255));
+                        let mut host = self.host.borrow_mut();
+                        host.backgrounds.insert(id, color);
+                        if let Some(page) = host.pages.get_mut(&id) {
+                            page.dirty = true;
+                        }
+                        drop(host);
+                        if let (Some(handle), Some(cx)) =
+                            (self.views[&id].handle, cx.as_deref_mut())
+                        {
+                            cx.update_window(handle, |window, _| {
+                                window.change_window(WindowChange::Background(render::rgba(
+                                    (color.0 << 8) | color.1 as u32,
+                                )));
+                                window.refresh();
+                            });
+                        }
+                    }
+                    "show" | "title" | "bounds" | "center" | "minimize" | "maximize"
+                    | "unmaximize" | "restore" | "fullscreen" | "focus" | "blur" | "hide"
+                    | "showInactive" | "limits" | "resizable" | "minimizable" | "maximizable"
+                    | "closable" | "movable" | "alwaysOnTop" | "buttons" => {
+                        if let (Some(handle), Some(cx)) =
+                            (self.views[&id].handle, cx.as_deref_mut())
+                        {
+                            let number =
+                                |index: usize| px(args[index].as_f64().unwrap_or(0.) as f32);
+                            let on = args[2] == true;
+                            cx.update_window(handle, |window, _| {
+                                let change = match action {
+                                    "title" => {
+                                        window.set_window_title(args[2].as_str().unwrap_or(""));
+                                        return;
+                                    }
+                                    "bounds" if cfg!(target_os = "macos") => {
+                                        WindowChange::Frame(Bounds::new(
+                                            render::point(number(2), number(3)),
+                                            size(number(4), number(5)),
+                                        ))
+                                    }
+                                    "bounds" => {
+                                        let state = window.window_state();
+                                        return window.resize(size(
+                                            number(4)
+                                                - (state.frame.size.width
+                                                    - state.content.size.width),
+                                            number(5)
+                                                - (state.frame.size.height
+                                                    - state.content.size.height),
+                                        ));
+                                    }
+                                    "buttons" => {
+                                        #[cfg(target_os = "macos")]
+                                        window.set_window_button_visibility(on);
+                                        return;
+                                    }
+                                    "minimize" => return window.minimize_window(),
+                                    "maximize" | "unmaximize" => {
+                                        if window.window_state().maximized != (action == "maximize")
+                                        {
+                                            window.zoom_window();
+                                        }
+                                        return;
+                                    }
+                                    "fullscreen" => {
+                                        if window.is_fullscreen() != on {
+                                            window.toggle_fullscreen();
+                                        }
+                                        return;
+                                    }
+                                    "restore" if cfg!(target_os = "macos") => WindowChange::Restore,
+                                    "show" | "focus" | "restore" => {
+                                        return window.activate_window();
+                                    }
+                                    "center" => WindowChange::Center,
+                                    "blur" => WindowChange::Blur,
+                                    "hide" => WindowChange::Hide,
+                                    "showInactive" => WindowChange::Show(false),
+                                    "limits" => WindowChange::SizeLimits(
+                                        size(number(2), number(3)),
+                                        size(number(4), number(5)),
+                                    ),
+                                    "resizable" => WindowChange::Resizable(on),
+                                    "minimizable" => WindowChange::Minimizable(on),
+                                    "maximizable" => WindowChange::Maximizable(on),
+                                    "closable" => WindowChange::Closable(on),
+                                    "movable" => WindowChange::Movable(on),
+                                    _ => WindowChange::AlwaysOnTop(on),
+                                };
+                                window.change_window(change);
+                            });
                         }
                     }
                     _ => bail!("Unsupported window action: {action}"),
                 }
             }
         }
-        bail!("Too many window commands in one turn")
+        // WARNING: a page redirect loop must not quit the app, so later commands wait for the next turn.
+        Ok(())
+    }
+
+    fn titles(&mut self, mut cx: Option<&mut App>) -> Result<()> {
+        for (&id, view) in &mut self.views {
+            let Some(title) = self
+                .host
+                .borrow()
+                .pages
+                .get(&id)
+                .filter(|page| page.dirty)
+                .map(|page| page.doc.title())
+            else {
+                continue;
+            };
+            if view.title == title {
+                continue;
+            }
+            let text = title.as_deref().unwrap_or("");
+            view.title = title.clone();
+            let allowed = self
+                .main
+                .eval(
+                    &format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
+                    "apps:title",
+                )
+                .inspect_err(|error| eprintln!("apps: {error}"))
+                .is_ok_and(|allowed| allowed != "false");
+            if allowed && let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
+                cx.update_window(handle, |window, _| window.set_window_title(text));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn drive(runtime: Rc<RefCell<Self>>, cx: &mut App) {
@@ -432,6 +698,37 @@ impl Desktop {
             app.pump(Some(cx), Some(&runtime))?;
             if app.quit {
                 return Ok(None);
+            }
+            let resized = std::mem::take(&mut app.host.borrow_mut().resized);
+            for id in resized {
+                let Some([width, height]) = app.host.borrow().viewports.get(&id).copied() else {
+                    continue;
+                };
+                let event = format!(
+                    "__appsEvent('resize',{id},{{width:{},height:{}}})",
+                    width.round(),
+                    height.round()
+                );
+                if let Err(error) = app.main.eval(&event, "apps:resize") {
+                    eprintln!("apps: {error}");
+                }
+                if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
+                    && let Err(error) =
+                        renderer.eval("__appsDispatch('window:resize',[0])", "apps:resize")
+                {
+                    eprintln!("apps: {error}");
+                }
+            }
+            let changed = std::mem::take(&mut app.host.borrow_mut().window_changes);
+            for id in changed {
+                if let Some(handle) = app.views.get(&id).and_then(|view| view.handle)
+                    && let Some(state) = cx.update_window(handle, |window, _| window_state(window))
+                    && let Err(error) = app
+                        .main
+                        .eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
+                {
+                    eprintln!("apps: {error}");
+                }
             }
             let mut delay = i64::MAX;
             for (fatal, engine) in
@@ -451,6 +748,20 @@ impl Desktop {
                     Err(error) => return Err(error),
                 };
                 if next >= 0 {
+                    delay = delay.min(next);
+                }
+            }
+            // WARNING: a later engine's tick can add timers to an earlier one through IPC, so read all delays again.
+            for engine in std::iter::once(&app.main).chain(
+                app.views
+                    .values()
+                    .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref)),
+            ) {
+                if let Ok(next) = engine
+                    .call("__appsDelay", &[])
+                    .map(|next| next.parse().unwrap_or(-1))
+                    && next >= 0
+                {
                     delay = delay.min(next);
                 }
             }
@@ -487,69 +798,82 @@ impl Desktop {
                 }
             }
             app.devtools.retain(|_, tools| !tools.is_closed());
-            if !app.devtools.is_empty() {
+            let mcp = mcp::enabled();
+            if !app.devtools.is_empty() || mcp {
                 let logs: Vec<_> = app.host.borrow_mut().logs.drain(..).collect();
                 for tools in app.devtools.values() {
                     tools.events(&logs)?;
                 }
-                delay = delay.min(16);
+                mcp::logs(&logs);
+                if !app.devtools.is_empty() {
+                    delay = delay.min(16);
+                }
+            }
+            if mcp && mcp::poll(&app, cx) {
+                delay = delay.min(0);
             }
             app.pump(Some(cx), Some(&runtime))?;
             if app.quit {
                 return Ok(None);
             }
-            for (&id, view) in &app.views {
-                if let Some(handle) = view.handle {
-                    let (active, events) = handle.update(cx, |view, _, _| {
-                        (
-                            !view.browsers.is_empty(),
-                            view.browsers
-                                .iter()
-                                .flat_map(|(&node, (browser, _))| {
-                                    browser.poll().into_iter().map(move |event| (node, event))
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })?;
-                    if active {
+            for view in app.views.values() {
+                if let Some(data) = view.data.upgrade() {
+                    let browsers = data.browsers.borrow();
+                    let active = !browsers.is_empty();
+                    let events = browsers
+                        .iter()
+                        .flat_map(|(&node, (browser, _))| browser.poll().into_iter().map(move |event| (node, event)))
+                        .collect::<Vec<_>>();
+                    drop(browsers);
+                    if active && cfg!(target_os = "linux") {
                         delay = delay.min(16);
                     }
                     for (node, event) in events {
-                        if node == usize::MAX {
-                            if event["type"] == "did-finish-load" {
-                                app.main
-                                    .eval(&format!("__appsEvent('loaded',{id})"), "apps:browser")?;
-                            }
-                        } else if let Some(renderer) = &view.renderer {
-                            renderer.eval(
-                                &format!("__appsFrameEvent({node},{event})"),
-                                "apps:iframe",
-                            )?;
+                        if let Some(renderer) = &view.renderer
+                            && let Err(error) = renderer
+                                .eval(&format!("__appsFrameEvent({node},{event})"), "apps:iframe")
+                        {
+                            eprintln!("apps: page script: {error:#}");
                         }
                     }
                 }
             }
+            let host = app.host.borrow();
+            if !host.commands.is_empty()
+                || !host.resized.is_empty()
+                || !host.window_changes.is_empty()
+            {
+                delay = delay.min(0);
+            }
+            drop(host);
+            app.titles(Some(cx))?;
             for (&id, view) in &app.views {
-                let dirty = app.host.borrow().pages.get(&id).is_some_and(|p| p.dirty);
+                let dirty = {
+                    let host = app.host.borrow();
+                    host.pages.get(&id).is_some_and(|p| p.dirty)
+                        || host.graphics.get(&id).is_some_and(|gpu| gpu.presented())
+                };
                 if dirty && let Some(handle) = view.handle {
-                    handle.update(cx, |_, _, cx| cx.notify())?;
+                    cx.refresh_window(handle);
                 }
             }
             Ok(if delay == i64::MAX || app.quit {
                 None
             } else {
-                Some(delay.max(1) as u64)
+                Some(delay.clamp(1, 1 << 31) as u64)
             })
         })();
+        // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the VM
+        // is collected once, when JS has been quiet for a second.
+        let api = runtime.borrow().api.clone();
+        if api.shrink_pending() && !api.idle.replace(true) {
+            shrink_when_quiet(api, cx);
+        }
         match result {
             Ok(Some(delay)) => {
                 let wake = runtime.clone();
-                let task = cx.spawn(async move |cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(delay))
-                        .await;
-                    cx.update(|cx| Self::drive(wake, cx));
-                });
+                // WARNING: native dialogs and popup menus run a nested loop while the app is busy, so the timer runs after it.
+                let task = cx.timer(Duration::from_millis(delay), move |cx| Self::drive(wake, cx));
                 runtime.borrow_mut().wake = Some(task);
             }
             Ok(None) => runtime.borrow_mut().wake = None,
@@ -610,47 +934,66 @@ impl Desktop {
         Ok(self.host.borrow().exit_code)
     }
 
-    pub fn run(self, devtools: bool) -> Result<i32> {
+    pub fn run(self, devtools: bool, mcp: Option<u16>) -> Result<i32> {
         ensure!(
-            !devtools || !self.host.borrow().packaged,
+            !(devtools || mcp.is_some()) || !self.host.borrow().packaged,
             "Developer tools are unavailable in packaged apps"
         );
+        if let Some(port) = mcp {
+            mcp::start(port)?;
+        }
         let runtime = Rc::new(RefCell::new(self));
         let result = runtime.clone();
-        let reopen = runtime.clone();
-        let terminate = runtime.clone();
-        let (urls, mut opened) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
-        let application = gpui_platform::application().with_quit_mode(gpui::QuitMode::Explicit);
-        application.on_reopen(move |cx, visible| {
-            if let Err(error) = reopen.borrow().main.eval(
-                &format!("__appsEvent('activate',0,{visible})"),
-                "apps:activate",
-            ) {
-                eprintln!("apps: {error}");
-            }
-            Self::drive(reopen.clone(), cx);
-        });
-        application.on_should_quit(move |cx| {
-            let Ok(app) = terminate.try_borrow() else {
-                return true;
-            };
-            if app.quit {
-                return true;
-            }
-            if let Err(error) = app.main.eval("__appsEvent('before-quit')", "apps:quit") {
-                eprintln!("apps: {error}");
-                return true;
-            }
-            drop(app);
-            Self::drive(terminate.clone(), cx);
-            terminate.try_borrow().is_ok_and(|app| app.quit)
-        });
-        application.on_open_urls(move |list| {
-            let _ = urls.send(list);
-        });
-        application.run(move |cx| {
+        render::run(move |cx| {
+            let reopen = runtime.clone();
+            cx.on_reopen(move |cx, visible| {
+                if let Err(error) = reopen
+                    .borrow()
+                    .main
+                    .eval(&format!("__appsEvent('activate',0,{visible})"), "apps:activate")
+                {
+                    eprintln!("apps: {error}");
+                }
+                Self::drive(reopen.clone(), cx);
+            });
+            let terminate = runtime.clone();
+            cx.on_should_quit(move |cx| {
+                let Ok(app) = terminate.try_borrow() else {
+                    return true;
+                };
+                if app.quit {
+                    return true;
+                }
+                if let Err(error) = app.main.eval("__appsEvent('before-quit')", "apps:quit") {
+                    eprintln!("apps: {error}");
+                    return true;
+                }
+                drop(app);
+                Self::drive(terminate.clone(), cx);
+                terminate.try_borrow().is_ok_and(|app| app.quit)
+            });
+            let opened = Rc::downgrade(&runtime);
+            cx.on_open_urls(move |cx, list| {
+                let Some(runtime) = opened.upgrade() else {
+                    return;
+                };
+                for url in list {
+                    let event = match url::Url::parse(&url)
+                        .ok()
+                        .filter(|url| url.scheme() == "file")
+                        .and_then(|url| url.to_file_path().ok())
+                    {
+                        Some(path) => format!("__appsEvent('open-file',0,{})", serde_json::json!(path)),
+                        None => format!("__appsEvent('open-url',0,{})", serde_json::json!(url)),
+                    };
+                    if let Err(error) = runtime.borrow().main.eval(&event, "apps:open") {
+                        eprintln!("apps: {error}");
+                    }
+                }
+                Self::drive(runtime, cx);
+            });
             let host = runtime.borrow().host.clone();
-            cx.on_app_quit(move |_| {
+            cx.on_quit(move |_| {
                 if let Ok(host) = host.try_borrow() {
                     if let Some(command) = &host.relaunch {
                         #[cfg(unix)]
@@ -667,80 +1010,55 @@ impl Desktop {
                         .stdin(std::process::Stdio::null())
                         .spawn();
                         #[cfg(not(unix))]
-                        let _ = std::process::Command::new(&command[0])
-                            .args(&command[1..])
-                            .spawn();
+                        let _ = std::process::Command::new(&command[0]).args(&command[1..]).spawn();
                     }
                     // AppKit exits with 0 after this hook, so a failure code must exit here.
                     if host.exit_code != 0 {
                         std::process::exit(host.exit_code);
                     }
                 }
-                async {}
-            })
-            .detach();
-            let weak = Rc::downgrade(&runtime);
-            cx.spawn(async move |cx| {
-                while let Some(list) = opened.recv().await {
-                    let Some(runtime) = weak.upgrade() else { break };
-                    cx.update(|cx| {
-                        for url in list {
-                            let event = match url::Url::parse(&url)
-                                .ok()
-                                .filter(|url| url.scheme() == "file")
-                                .and_then(|url| url.to_file_path().ok())
-                            {
-                                Some(path) => format!(
-                                    "__appsEvent('open-file',0,{})",
-                                    serde_json::json!(path)
-                                ),
-                                None => {
-                                    format!("__appsEvent('open-url',0,{})", serde_json::json!(url))
-                                }
-                            };
-                            if let Err(error) = runtime.borrow().main.eval(&event, "apps:open") {
-                                eprintln!("apps: {error}");
-                            }
-                        }
-                        Self::drive(runtime, cx);
-                    });
+            });
+            let woken = Rc::downgrade(&runtime);
+            cx.on_wake(move |cx| {
+                if let Some(runtime) = woken.upgrade() {
+                    Self::drive(runtime, cx);
                 }
-            })
-            .detach();
+            });
+            let _ = runtime.borrow().waker.set(cx.waker());
             #[cfg(target_os = "macos")]
-            {
-                let mut changes = native::observe_theme();
-                let weak = Rc::downgrade(&runtime);
-                cx.spawn(async move |cx| {
-                    while changes.recv().await.is_some() {
-                        let Some(runtime) = weak.upgrade() else { break };
-                        cx.update(|cx| Self::drive(runtime, cx));
-                    }
-                })
-                .detach();
-                cx.on_action(|_: &Quit, cx| cx.quit());
-                cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
-            }
-            let startup = if cfg!(target_os = "macos") {
-                "__appsInitMenu();__appsEvent('ready')"
-            } else {
-                "__appsEvent('ready')"
-            };
-            if let Err(error) = runtime.borrow().main.eval(startup, "apps:ready") {
+            native::observe();
+            if let Err(error) = runtime.borrow().main.eval("__appsEvent('ready')", "apps:ready") {
                 eprintln!("apps: {error}");
                 runtime.borrow_mut().quit = true;
                 cx.quit();
                 return;
             }
             Self::drive(runtime.clone(), cx);
+            // WARNING: the first main menu costs AppKit 20-30 ms, so the default menu waits for the first frame.
+            #[cfg(target_os = "macos")]
+            {
+                let menu = runtime.clone();
+                let init = move || {
+                    if let Ok(app) = menu.try_borrow()
+                        && let Err(error) = app.main.eval("__appsInitMenu()", "apps:menu")
+                    {
+                        eprintln!("apps: {error}");
+                    }
+                };
+                let handle = runtime.borrow().views.values().find_map(|view| view.handle);
+                match handle {
+                    Some(handle) => {
+                        cx.update_window(handle, |window, _| {
+                            window.on_next_frame(|window, _| window.on_next_frame(move |_, _| init()))
+                        });
+                    }
+                    None => init(),
+                }
+            }
             if devtools && !runtime.borrow().quit {
                 let mut app = runtime.borrow_mut();
                 let id = app.views.keys().copied().min().unwrap_or(0);
-                let title = if id == 0 {
-                    "Main".to_owned()
-                } else {
-                    format!("Window {id}")
-                };
+                let title = if id == 0 { "Main".to_owned() } else { format!("Window {id}") };
                 match devtools::DevTools::new(&title) {
                     Ok(tools) => {
                         app.devtools.insert(id, tools);
@@ -753,7 +1071,7 @@ impl Desktop {
                     }
                 }
                 drop(app);
-                Self::drive(runtime, cx);
+                Self::drive(runtime.clone(), cx);
             }
             cx.activate(true);
         });
@@ -763,6 +1081,87 @@ impl Desktop {
         }
         Ok(app.host.borrow().exit_code)
     }
+}
+
+/// Collects garbage once JS has been quiet for a second.
+fn shrink_when_quiet(api: Rc<Api>, cx: &mut App) {
+    let busy = api.busy.get();
+    cx.timer(Duration::from_secs(1), move |cx| {
+        if api.busy.get() == busy {
+            api.idle.set(false);
+            api.shrink();
+        } else {
+            shrink_when_quiet(api, cx);
+        }
+    })
+    .detach();
+}
+
+/// Checks a window host call, so bad input throws in JS and never reaches `Desktop::pump`.
+pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
+    let number = |value: &serde_json::Value, low: f64, high: f64| {
+        value
+            .as_f64()
+            .is_some_and(|value| (low..=high).contains(&value))
+    };
+    let position = |value: &serde_json::Value| number(value, -1e6, 1e6);
+    let size = |value: &serde_json::Value| number(value, 1., 16384.);
+    match args[0].as_str().unwrap_or("") {
+        "create" => {
+            let options = &args[2];
+            for (key, value) in options.as_object().into_iter().flatten() {
+                let valid = match key.as_str() {
+                    "width" | "height" => size(value),
+                    "minWidth" | "minHeight" | "maxWidth" | "maxHeight" => {
+                        number(value, 0., 16384.)
+                    }
+                    "x" | "y" => position(value),
+                    "useContentSize" | "center" | "resizable" | "movable" | "minimizable"
+                    | "maximizable" | "closable" | "alwaysOnTop" | "fullscreen" | "show"
+                    | "frame" | "transparent" => value.is_boolean(),
+                    "title" => value.is_string(),
+                    "titleBarStyle" => {
+                        matches!(value.as_str(), Some("default" | "hidden" | "hiddenInset"))
+                    }
+                    "backgroundColor" => value.as_str().and_then(crate::style::color).is_some(),
+                    "trafficLightPosition" => position(&value["x"]) && position(&value["y"]),
+                    _ => bail!("Unsupported BrowserWindow option: {key}"),
+                };
+                ensure!(valid, "Invalid BrowserWindow option {key}: {value}");
+            }
+        }
+        "bounds" => ensure!(
+            position(&args[2]) && position(&args[3]) && size(&args[4]) && size(&args[5]),
+            "Invalid window bounds"
+        ),
+        "limits" => ensure!(
+            (2..6).all(|index| number(&args[index], 0., 16384.)),
+            "Window size limits must be between 0 and 16384"
+        ),
+        "fullscreen" | "resizable" | "minimizable" | "maximizable" | "closable" | "movable"
+        | "alwaysOnTop" => ensure!(args[2].is_boolean(), "Expected a boolean"),
+        "background" => ensure!(
+            args[2].as_str().and_then(crate::style::color).is_some(),
+            "Invalid background color"
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The window state that `BrowserWindow` caches, in screen points.
+fn window_state(window: &render::Window) -> serde_json::Value {
+    let state = window.window_state();
+    let rect = |bounds: Bounds<render::Pixels>| {
+        [
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ]
+        .map(|value| f32::from(value).round())
+    };
+    serde_json::json!({"frame":rect(state.frame),"content":rect(state.content),"minimized":state.minimized,"maximized":state.maximized,"fullscreen":state.fullscreen,"visible":state.visible,"focused":window.is_window_active(),"resizing":state.resizing})
 }
 
 #[cfg(test)]
@@ -781,7 +1180,7 @@ mod tests {
         let files = BBTreeMap::from([(
             "app.js".into(),
             format!(
-                "define({});",
+                "$appsDefine({});",
                 serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":"globalThis.pwned=0;__apps.ipcMain.on('pwned',()=>pwned++);__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.load('<body>first</body>')})"})
             ),
         )]);
@@ -828,11 +1227,51 @@ mod tests {
     }
 
     #[test]
+    fn page_navigation_stays_local_and_never_quits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.html");
+        std::fs::write(&path, "<script type='application/json'>{}</script><script type='text/javascript'>globalThis.ran=1</script><body>ok</body>").unwrap();
+        let files = BBTreeMap::from([(
+            "app.js".into(),
+            format!(
+                "$appsDefine({});",
+                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":"__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.load('<body>first</body>')})"})
+            ),
+        )]);
+        let mut desktop = Desktop::new(&files).unwrap();
+        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        let navigate = |desktop: &Desktop, url: &str| {
+            desktop.host.borrow_mut().call(
+                Role::Renderer(1),
+                "dom.navigate",
+                serde_json::json!([url]),
+            )
+        };
+        for url in [
+            "https://example.com/",
+            "apps:/../../x.html",
+            "file://host/share/x.html",
+        ] {
+            assert!(navigate(&desktop, url).is_err(), "{url}");
+        }
+        navigate(&desktop, "file:///missing/page.html").unwrap();
+        desktop.pump(None, None).unwrap();
+        assert!(!desktop.quit);
+        let url = url::Url::from_file_path(&path).unwrap();
+        navigate(&desktop, url.as_str()).unwrap();
+        desktop.pump(None, None).unwrap();
+        let renderer = desktop.views[&1].renderer.clone().unwrap();
+        assert_eq!(renderer.eval("globalThis.ran", "test").unwrap(), "1");
+        assert!(desktop.views[&1].preload.is_none());
+    }
+
+    #[test]
     fn check_reports_page_script_errors() {
         let files = BBTreeMap::from([(
             "app.js".into(),
             format!(
-                "define({});",
+                "$appsDefine({});",
                 serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":"__apps.app.whenReady().then(()=>new __apps.BrowserWindow().load(`<script>throw Error('page failure')</script>`))"})
             ),
         )]);
@@ -852,7 +1291,7 @@ mod tests {
         let files = BBTreeMap::from([(
             "app.js".into(),
             format!(
-                "define({});",
+                "$appsDefine({});",
                 serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
             ),
         )]);
@@ -892,13 +1331,13 @@ mod tests {
         let files = BBTreeMap::from([(
             "app.js".into(),
             format!(
-                "define({});",
+                "$appsDefine({});",
                 serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
             ),
         )]);
         let mut desktop = Desktop::new(&files).unwrap();
         desktop.main.eval("__appsEvent('ready')", "test").unwrap();
-        desktop.main.eval("__appsEvent('focus',1);__appsEvent('activate',0,true);__appsEvent('open-url',0,'myapp://x');__appsEvent('open-file',0,'/tmp/a');__appsEvent('before-quit')", "test").unwrap();
+        desktop.main.eval("__appsEvent('state',1,{frame:[0,0,800,600],content:[0,28,800,572],minimized:false,maximized:false,fullscreen:false,visible:true,focused:true,resizing:false});__appsEvent('activate',0,true);__appsEvent('open-url',0,'myapp://x');__appsEvent('open-file',0,'/tmp/a');__appsEvent('before-quit')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         assert!(!desktop.quit);
         desktop
@@ -925,7 +1364,7 @@ mod tests {
             let files = BBTreeMap::from([(
                 "app.js".into(),
                 format!(
-                    "define({});",
+                    "$appsDefine({});",
                     serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
                 ),
             )]);
@@ -934,6 +1373,126 @@ mod tests {
             desktop.pump(None, None).unwrap();
             assert_eq!(desktop.quit, quits);
         }
+    }
+
+    #[test]
+    fn window_state_events_and_close_follow_electron() {
+        let code = r#"
+            const {app, BrowserWindow} = __apps;
+            globalThis.log = [];
+            app.on('window-all-closed', () => {});
+            app.whenReady().then(() => {
+                globalThis.win = new BrowserWindow({width: 400, height: 300, minWidth: 200, minHeight: 100, title: 'Start', backgroundColor: '#80112233'});
+                for (const name of ['resize', 'resized', 'move', 'moved', 'focus', 'blur', 'maximize', 'unmaximize', 'minimize', 'restore', 'enter-full-screen', 'leave-full-screen', 'show', 'hide', 'close', 'closed', 'page-title-updated'])
+                    win.on(name, () => log.push(name));
+                win.on('page-title-updated', event => event.preventDefault());
+                win.on('close', event => { if (!globalThis.allow) event.preventDefault(); });
+                win.load('<title>Page</title>');
+            });
+        "#;
+        let files = BBTreeMap::from([(
+            "app.js".into(),
+            format!(
+                "$appsDefine({});",
+                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
+            ),
+        )]);
+        let mut desktop = Desktop::new(&files).unwrap();
+        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        assert_eq!(
+            eval(
+                &desktop,
+                "JSON.stringify([win.getBounds(), win.getTitle(), log])"
+            ),
+            r#"[{"x":0,"y":0,"width":400,"height":300},"Start",["page-title-updated"]]"#
+        );
+        assert_eq!(desktop.views[&1].title.as_deref(), Some("Page"));
+        assert_eq!(desktop.host.borrow().backgrounds[&1], (0x112233, 0x80));
+        let state = |frame: [i32; 4], extra: &str| {
+            let [x, y, width, height] = frame;
+            format!(
+                "__appsEvent('state',1,{{frame:[{x},{y},{width},{height}],content:[{x},{},{width},{}],minimized:false,maximized:false,fullscreen:false,visible:true,focused:true,resizing:false,{extra}}})",
+                y + 28,
+                height - 28
+            )
+        };
+        for (script, events) in [
+            (state([10, 20, 400, 300], ""), "focus"),
+            (state([10, 20, 500, 300], "resizing:true"), "resize"),
+            (state([10, 20, 500, 300], ""), "resized"),
+            (state([30, 40, 500, 300], ""), "move,moved"),
+            (
+                state([0, 0, 900, 700], "maximized:true"),
+                "maximize,resize,resized,move,moved",
+            ),
+            (
+                state(
+                    [0, 0, 900, 700],
+                    "minimized:true,visible:false,focused:false",
+                ),
+                "minimize,unmaximize,hide,blur",
+            ),
+            (
+                state([0, 0, 900, 700], "fullscreen:true"),
+                "restore,enter-full-screen,show,focus",
+            ),
+        ] {
+            eval(&desktop, &format!("log.length = 0; {script}"));
+            assert_eq!(eval(&desktop, "log.join()"), events, "{script}");
+        }
+        assert_eq!(
+            eval(
+                &desktop,
+                "JSON.stringify([win.getBounds(), win.getContentSize(), win.isFullScreen(), win.isNormal(), win.isFocused(), __apps.BrowserWindow.getFocusedWindow() === win, win.contentView.getBounds()])"
+            ),
+            r#"[{"x":0,"y":0,"width":900,"height":700},[900,672],true,false,true,true,{"x":0,"y":0,"width":900,"height":672}]"#
+        );
+        desktop.host.borrow_mut().commands.clear();
+        assert_eq!(
+            eval(
+                &desktop,
+                "win.setSize(50.4, 50); win.setContentBounds({y: 100}); JSON.stringify([win.getBounds(), win.getContentBounds()])"
+            ),
+            r#"[{"x":0,"y":72,"width":200,"height":100},{"x":0,"y":100,"width":200,"height":72}]"#
+        );
+        assert_eq!(
+            desktop.host.borrow().commands[1]["args"],
+            serde_json::json!(["bounds", 1, 0, 72, 200, 100])
+        );
+        for script in [
+            "win.setSize('x', 1)",
+            "win.setMinimumSize(-1, 0)",
+            "win.setBackgroundColor('nope')",
+            "new __apps.BrowserWindow({frame: 'no'})",
+            "new __apps.BrowserWindow({x: Infinity})",
+        ] {
+            assert_eq!(
+                eval(
+                    &desktop,
+                    &format!("try {{ {script}; 'ok' }} catch {{ 'threw' }}")
+                ),
+                "threw",
+                "{script}"
+            );
+        }
+        eval(&desktop, "__apps.app.quit()");
+        desktop
+            .host
+            .borrow_mut()
+            .commands
+            .push(serde_json::json!({"op":"window","args":["closing",1]}));
+        desktop.pump(None, None).unwrap();
+        assert!(!desktop.quit && desktop.views.contains_key(&1));
+        assert_eq!(
+            eval(&desktop, "log.filter(name => name === 'close').length"),
+            "2"
+        );
+        eval(&desktop, "allow = true; __apps.app.quit()");
+        desktop.pump(None, None).unwrap();
+        assert!(desktop.quit && !desktop.views.contains_key(&1));
+        assert_eq!(eval(&desktop, "log.slice(-2).join()"), "close,closed");
     }
 
     #[test]
@@ -956,7 +1515,7 @@ mod tests {
             let files = BBTreeMap::from([(
                 "app.js".into(),
                 format!(
-                    "define({});",
+                    "$appsDefine({});",
                     serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
                 ),
             )]);
@@ -1016,4 +1575,42 @@ mod tests {
             );
         }
     }
+}
+
+/// Crops a captured frame to `rect` (in window points) and encodes it as PNG, in CSS pixels when `css` is set.
+fn png(
+    ([width, height], pixels): ([u32; 2], Vec<u8>),
+    scale: f32,
+    rect: &serde_json::Value,
+    css: bool,
+) -> Result<([u32; 2], Vec<u8>)> {
+    let mut image = image::RgbaImage::from_raw(width, height, pixels).context("Invalid frame")?;
+    if rect.is_object() {
+        let value = |key: &str| {
+            (rect[key].as_f64().unwrap_or(0.) as f32 * scale)
+                .round()
+                .max(0.) as u32
+        };
+        let (x, y) = (value("x").min(width), value("y").min(height));
+        let size = [
+            value("width").min(width - x),
+            value("height").min(height - y),
+        ];
+        image = image::imageops::crop_imm(&image, x, y, size[0], size[1]).to_image();
+    }
+    if css && scale > 1. {
+        let size = |value: u32| ((value as f32 / scale).round() as u32).max(1);
+        image = image::imageops::resize(
+            &image,
+            size(image.width()),
+            size(image.height()),
+            image::imageops::FilterType::Triangle,
+        );
+    }
+    let mut bytes = Vec::new();
+    image.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )?;
+    Ok(([image.width(), image.height()], bytes))
 }

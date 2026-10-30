@@ -1,6 +1,6 @@
 globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOptions, deepEqual }, info) => {
   const windows = info.platform === 'win32';
-  const bytes = text => { if(typeof text !== 'string')return Buffer.from(text); const length = text.length, out = new Buffer(length); for (let i = 0; i < length; i++) out[i] = text.charCodeAt(i); return out; };
+  const bytes = text => { if(typeof text !== 'string')return new Buffer(text.buffer, text.byteOffset, text.byteLength); const length = text.length, out = new Buffer(length); for (let i = 0; i < length; i++) out[i] = text.charCodeAt(i); return out; };
   const binary = data => { let s = ''; for (let i = 0; i < data.length; i += 8192) s += String.fromCharCode.apply(null, data.subarray(i, i + 8192)); return s; };
   const view = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
   const utf8 = /^utf-?8$/i;
@@ -50,7 +50,10 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       if (typeof value !== 'string' && !ArrayBuffer.isView(value)) return super.fill(Number(value) & 255, offset, end);
       const pattern = typeof value === 'string' ? encode(value, encoding) : view(value);
       if (!pattern.length) { if (typeof value === 'string') return super.fill(0, offset, end); throw Object.assign(new TypeError('The argument \'value\' is invalid'), { code: 'ERR_INVALID_ARG_VALUE' }); }
-      for (let i = offset; i < end; i += pattern.length) this.set(pattern.subarray(0, Math.min(pattern.length, end - i)), i);
+      if (pattern.length === 1) return super.fill(pattern[0], offset, end);
+      if (end <= offset) return this;
+      this.set(pattern.subarray(0, Math.min(pattern.length, end - offset)), offset);
+      for (let size = pattern.length; size < end - offset; size *= 2) this.copyWithin(offset + size, offset, offset + Math.min(size, end - offset - size));
       return this;
     }
     toJSON() { return { type: 'Buffer', data: Array.from(this) }; }
@@ -219,11 +222,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
         return new Dirent(name.slice(index + 1), type, index < 0 ? args[0] : path.join(args[0], name.slice(0, index)));
       });
     }
-    if (name === 'open') return handle(result);
     return result ?? undefined;
   };
-  const handle = fd => ({ fd,
-    async close() { await asyncCall('close', fd); },
+  const handles = new __appsFinalizers(fd => { try { sync('close', fd); } catch {} });
+  const handle = fd => { const file = { fd,
+    async close() { handles.unregister(file); await asyncCall('close', fd); },
     async read(buffer = Buffer.alloc(16384), offset = 0, length = buffer.length - offset, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length = buffer.length - offset, position = null } = buffer ?? {}); const data = bytes(await asyncCall('read', fd, length, position)); buffer.set(data, offset); return { bytesRead: data.length, buffer }; },
     async write(buffer, ...args) { return { bytesWritten: await asyncCall('write', fd, ...chunk(buffer, ...args)), buffer }; },
     async readFile(o) { const chunks = []; for (;;) { const b = await asyncCall('read', fd, 1048576, null); if (!b.length) break; chunks.push(bytes(b)); } const b = Buffer.concat(chunks); const encoding = options(o).encoding; return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; },
@@ -233,7 +236,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     async sync() { await asyncCall('fsync', fd); }, async datasync() { await asyncCall('fsync', fd); },
     async truncate(size = 0) { await asyncCall('ftruncate', fd, size); },
     [Symbol.asyncDispose]() { return this.close(); },
-  });
+  }; handles.register(file, fd, file); return file; };
   const prepare = (name, args) => {
     args = [...args];
     if (typeof args[0] !== 'number') args[0] = pathArg(args[0]);
@@ -252,11 +255,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       let result;
       try { result = sync(name, ...args); }
       catch (error) { if ((name === 'stat' || name === 'lstat') && args[1]?.throwIfNoEntry === false && error.code === 'ENOENT') return undefined; throw failure(error, name, args); }
-      return name === 'open' ? result : finish(name, result, args);
+      return finish(name, result, args);
     };
     const task = async (...args) => { args = prepare(name, args); try { return finish(name, await asyncCall(name, ...args), args); } catch (error) { throw failure(error, name, args); } };
-    if (!['close', 'fsync', 'ftruncate', 'fstat'].includes(name)) files.promises[name] = task;
-    files[name] = (...args) => { const callback = args.pop(); if (typeof callback !== 'function') throw Object.assign(new TypeError('The "cb" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' }); task(...args).then(result => callback(null, name === 'open' ? result.fd : result), callback); };
+    if (!['close', 'fsync', 'ftruncate', 'fstat'].includes(name)) files.promises[name] = name === 'open' ? async (...args) => handle(await task(...args)) : task;
+    files[name] = (...args) => { const callback = args.pop(); if (typeof callback !== 'function') throw Object.assign(new TypeError('The "cb" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' }); task(...args).then(result => callback(null, result), callback); };
   }
   files.realpathSync.native = files.realpathSync; files.realpath.native = files.realpath;
   files.existsSync = value => { try { sync('access', pathArg(value)); return true; } catch { return false; } };
@@ -425,6 +428,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     URL, URLSearchParams,
     fileURLToPath(value) {
       const u = typeof value === 'string' ? new URL(value) : value;
+      if (u.protocol === 'apps:') return path.join(info.appPath, decodeURIComponent(u.pathname));
       if (u.protocol !== 'file:') throw Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
       if (/%2f/i.test(u.pathname) || (windows && /%5c/i.test(u.pathname))) throw Object.assign(new TypeError(`File URL path must not include encoded ${windows ? '\\ or /' : '/'} characters`), { code: 'ERR_INVALID_FILE_URL_PATH' });
       const pathname = decodeURIComponent(u.pathname);

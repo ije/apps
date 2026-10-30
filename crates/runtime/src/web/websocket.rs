@@ -19,7 +19,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message,
         client::IntoClientRequest,
-        protocol::{CloseFrame, frame::coding::CloseCode},
+        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
 };
 
@@ -41,6 +41,7 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     mut commands: mpsc::UnboundedReceiver<Message>,
     events: mpsc::Sender<crate::jsc::payload::Payload>,
     written: Arc<AtomicUsize>,
+    wake: crate::host::Waker,
 ) -> Result<()> {
     let (mut writer, mut reader) = socket.split();
     loop {
@@ -50,10 +51,12 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                 let size = command.len();
                 writer.send(command).await?;
                 written.fetch_add(size, Ordering::Relaxed);
+                wake.wake();
             }
             message = reader.next() => {
                 let Some(message) = message else {
                     let _ = events.send(json!({"kind":"close","code":1006,"reason":"","clean":false}).into()).await;
+                    wake.wake();
                     break;
                 };
                 let event = match message? {
@@ -63,15 +66,23 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
                         let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1005,String::new()));
                         let _ = writer.close().await;
                         let _ = events.send(json!({"kind":"close","code":code,"reason":reason,"clean":true}).into()).await;
+                        wake.wake();
                         break;
                     }
                     _ => continue,
                 };
                 if events.send(event).await.is_err() { break; }
+                wake.wake();
             }
         }
     }
     Ok(())
+}
+
+fn limits() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(16 << 20))
+        .max_frame_size(Some(16 << 20))
 }
 
 #[derive(Default)]
@@ -86,29 +97,33 @@ impl State {
         upgrade: hyper::upgrade::OnUpgrade,
         protocol: String,
     ) -> Result<u64> {
+        ensure!(self.sockets.len() < 1024, "Too many WebSockets");
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel(64);
         let written = Arc::new(AtomicUsize::new(0));
         let counter = written.clone();
+        let wake = crate::host::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result = async {
                 let transport = hyper_util::rt::TokioIo::new(upgrade.await?);
                 let socket = WebSocketStream::from_raw_socket(
                     transport,
                     tokio_tungstenite::tungstenite::protocol::Role::Server,
-                    None,
+                    Some(limits()),
                 )
                 .await;
                 let _ = event_tx
                     .send(json!({"kind":"open","protocol":protocol}).into())
                     .await;
-                run(socket, command_rx, event_tx.clone(), counter).await
+                wake.wake();
+                run(socket, command_rx, event_tx.clone(), counter, wake.clone()).await
             }
             .await;
             if let Err(error) = result {
                 let _ = event_tx
                     .send(json!({"kind":"error","message":format!("{error:#}")}).into())
                     .await;
+                wake.wake();
             }
         });
         self.next_id += 1;
@@ -144,6 +159,7 @@ impl State {
                 let (event_tx, events) = mpsc::channel(64);
                 let written = Arc::new(AtomicUsize::new(0));
                 let counter = written.clone();
+                let wake = crate::host::Waker::current();
                 let task = crate::web::network()?.spawn(async move {
                     let result = async {
                         let (socket, response) = if renderer {
@@ -167,9 +183,20 @@ impl State {
                             );
                             let stream =
                                 tokio::net::TcpStream::connect(addresses.as_slice()).await?;
-                            tokio_tungstenite::client_async_tls(request, stream).await?
+                            tokio_tungstenite::client_async_tls_with_config(
+                                request,
+                                stream,
+                                Some(limits()),
+                                None,
+                            )
+                            .await?
                         } else {
-                            tokio_tungstenite::connect_async(request).await?
+                            tokio_tungstenite::connect_async_with_config(
+                                request,
+                                Some(limits()),
+                                false,
+                            )
+                            .await?
                         };
                         let protocol = response
                             .headers()
@@ -184,13 +211,15 @@ impl State {
                         let _ = event_tx
                             .send(json!({"kind":"open","protocol":protocol}).into())
                             .await;
-                        run(socket, command_rx, event_tx.clone(), counter).await
+                        wake.wake();
+                        run(socket, command_rx, event_tx.clone(), counter, wake.clone()).await
                     }
                     .await;
                     if let Err(error) = result {
                         let _ = event_tx
                             .send(json!({"kind":"error","message":format!("{error:#}")}).into())
                             .await;
+                        wake.wake();
                     }
                 });
                 self.next_id += 1;

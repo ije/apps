@@ -114,15 +114,12 @@ pub fn dispatch(
             let expression = params["expression"]
                 .as_str()
                 .context("Expected JavaScript expression")?;
-            let output = engine.eval(&format!("(()=>{{const result=(0,eval)({});try{{return JSON.stringify(result,(_,v)=>typeof v==='bigint'?String(v)+'n':v)}}catch{{return JSON.stringify(String(result))}}}})()", json!(expression)), "apps:devtools")?;
+            let output = engine.eval_page(&format!("(()=>{{const result=this.__appsCompile({},'apps:console');try{{return JSON.stringify(result,(_,v)=>typeof v==='bigint'?String(v)+'n':v)}}catch{{return JSON.stringify(String(result))}}}})()", json!(expression)), "apps:devtools")?;
             Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
         }
         "DOM.getDocument" => {
             let host = host.borrow();
-            let page = host
-                .pages
-                .get(&window)
-                .context("Window has no GPUI document")?;
+            let page = host.pages.get(&window).context("Window has no document")?;
             Ok(page.doc.serialize(0).into())
         }
         "DOM.querySelector" => {
@@ -130,10 +127,7 @@ pub fn dispatch(
                 .as_str()
                 .context("Expected CSS selector")?;
             let host = host.borrow();
-            let page = host
-                .pages
-                .get(&window)
-                .context("Window has no GPUI document")?;
+            let page = host.pages.get(&window).context("Window has no document")?;
             let mut pending = vec![0];
             while let Some(node) = pending.pop() {
                 if page.doc.matches(node, selector) {
@@ -155,10 +149,10 @@ pub fn dispatch(
         }
         "Debugger.pause" => {
             engine.eval("debugger;", "apps:devtools")?;
-            Ok("Debugger statement requested. Execution pauses only when a Web Inspector debugger is attached.".into())
+            Ok("Debugger statement ran. App contexts have no attached debugger, so execution did not pause.".into())
         }
         "Debugger.open" => bail!(
-            "Connect to this apps JavaScript context from Safari → Develop → this application. WebKit browser views can open their inspector directly."
+            "App JavaScript contexts have no step debugger. WebKit browser views can open their inspector directly."
         ),
         method => bail!("Unsupported developer tools method: {method}"),
     }
@@ -194,7 +188,7 @@ mod tests {
         );
         assert_eq!(engine.eval("answer", "test").unwrap(), "42");
         host.borrow_mut()
-            .call(Role::Main, json!({"op":"window","args":["devtools",1]}))
+            .call(Role::Main, "window", json!(["devtools", 1]))
             .unwrap();
         assert!(host.borrow().commands.is_empty());
         assert_eq!(

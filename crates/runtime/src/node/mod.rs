@@ -4,7 +4,7 @@ mod fs;
 pub(crate) mod napi;
 pub(crate) mod pty;
 pub(crate) mod sqlite;
-mod system;
+pub(crate) mod system;
 
 use anyhow::{Context, Result};
 use fs::Files;
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
 };
 use system::Hasher;
 
@@ -21,19 +21,53 @@ pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
     if let Some(bytes) = crate::jsc::payload::read(value) {
         return bytes;
     }
-    Ok(match value.as_str() {
-        Some(text) => text.as_bytes().to_vec(),
-        None => value["latin1"]
-            .as_str()
-            .context("Expected bytes")?
-            .chars()
-            .map(|c| c as u8)
-            .collect(),
-    })
+    Ok(value
+        .as_str()
+        .context("Expected bytes")?
+        .as_bytes()
+        .to_vec())
 }
 
-pub(crate) fn latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| char::from(b)).collect()
+#[cfg(unix)]
+pub(crate) type Exit = u32;
+#[cfg(windows)]
+pub(crate) type Exit = std::os::windows::io::OwnedHandle;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn WaitForSingleObject(handle: std::os::windows::io::RawHandle, milliseconds: u32) -> u32;
+}
+
+/// Runs `done` on a thread after the child exits. The child stays unreaped for `try_wait`.
+pub(crate) fn on_exit(child: Exit, done: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("apps-exit".into())
+        .spawn(move || {
+            // WARNING: WNOWAIT keeps the zombie, so the PID cannot be reused while this waits.
+            #[cfg(unix)]
+            while unsafe {
+                let mut info = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            } != 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
+            #[cfg(windows)]
+            unsafe {
+                WaitForSingleObject(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&child),
+                    u32::MAX,
+                );
+            }
+            done();
+        })?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -174,6 +208,13 @@ pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
 }
 
+type Job = (
+    u64,
+    String,
+    crate::jsc::payload::Payload,
+    crate::host::Waker,
+);
+
 pub(crate) struct State {
     files: Arc<Files>,
     next: u64,
@@ -181,7 +222,8 @@ pub(crate) struct State {
     receiver: mpsc::Receiver<crate::jsc::payload::Payload>,
     watchers: HashMap<u64, notify::RecommendedWatcher>,
     hashers: HashMap<u64, Hasher>,
-    tasks: Option<mpsc::Sender<(u64, String, crate::jsc::payload::Payload)>>,
+    tasks: Option<mpsc::Sender<Job>>,
+    pool: Option<mpsc::Sender<Job>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -194,19 +236,24 @@ impl Default for State {
             watchers: HashMap::new(),
             hashers: HashMap::new(),
             tasks: None,
+            pool: None,
         }
     }
 }
 impl State {
     pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         match op {
-            "poll" => Ok(json!(
-                self.receiver
-                    .try_iter()
-                    .take(256)
-                    .map(crate::jsc::payload::Payload::into_value)
-                    .collect::<Vec<_>>()
-            )),
+            "poll" => {
+                let mut events = Vec::new();
+                for event in self.receiver.try_iter() {
+                    events.push(event.into_value());
+                    if events.len() == 256 {
+                        crate::host::Waker::current().wake();
+                        break;
+                    }
+                }
+                Ok(json!(events))
+            }
             "async" => {
                 let task = |files: &Files,
                             id: u64,
@@ -225,43 +272,50 @@ impl State {
                 let id = self.next;
                 let op = args[0].as_str().context("Expected operation")?.to_owned();
                 let payload = crate::jsc::payload::Payload::snapshot(args[1].clone());
-                // Slow work gets its own thread so it cannot stall queued file operations.
-                if matches!(op.as_str(), "lookup" | "zlib" | "pbkdf2") {
-                    let (files, sender) = (self.files.clone(), self.sender.clone());
-                    std::thread::Builder::new()
-                        .name("apps-node".into())
-                        .spawn(move || {
-                            let _ = sender.send(task(&files, id, &op, payload));
-                        })?;
-                    return Ok(json!(id));
-                }
-                if self.tasks.is_none() {
-                    let (tasks, receiver) =
-                        mpsc::channel::<(u64, String, crate::jsc::payload::Payload)>();
-                    let files = self.files.clone();
-                    let sender = self.sender.clone();
-                    std::thread::Builder::new()
-                        .name("apps-files".into())
-                        .spawn(move || {
-                            while let Ok((id, op, args)) = receiver.recv() {
-                                if sender.send(task(&files, id, &op, args)).is_err() {
-                                    break;
-                                }
-                            }
-                        })?;
-                    self.tasks = Some(tasks);
-                }
-                self.tasks
-                    .as_ref()
-                    .unwrap()
-                    .send((id, op, payload))
-                    .context("Filesystem queue is closed")?;
+                // Slow work uses a small pool so it cannot stall queued file operations.
+                let slow = matches!(op.as_str(), "lookup" | "zlib" | "pbkdf2");
+                let queue = if slow {
+                    &mut self.pool
+                } else {
+                    &mut self.tasks
+                };
+                let jobs = match queue {
+                    Some(jobs) => jobs,
+                    None => {
+                        let (jobs, receiver) = mpsc::channel::<Job>();
+                        let receiver = Arc::new(Mutex::new(receiver));
+                        let workers = if slow {
+                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+                        } else {
+                            1
+                        };
+                        for _ in 0..workers {
+                            let (files, sender, receiver) =
+                                (self.files.clone(), self.sender.clone(), receiver.clone());
+                            std::thread::Builder::new()
+                                .name(if slow { "apps-node" } else { "apps-files" }.into())
+                                .spawn(move || {
+                                    while let Ok(Ok((id, op, args, wake))) =
+                                        receiver.lock().map(|receiver| receiver.recv())
+                                    {
+                                        if sender.send(task(&files, id, &op, args)).is_err() {
+                                            break;
+                                        }
+                                        wake.wake();
+                                    }
+                                })?;
+                        }
+                        queue.insert(jobs)
+                    }
+                };
+                jobs.send((id, op, payload, crate::host::Waker::current()))
+                    .context("Node task queue is closed")?;
                 Ok(json!(id))
             }
             "watch" => {
                 self.next += 1;
                 let id = self.next;
-                let sender = self.sender.clone();
+                let (sender, wake) = (self.sender.clone(), crate::host::Waker::current());
                 let root = Path::new(args[0].as_str().context("Expected watch path")?);
                 let base = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
                 let mut watcher = notify::recommended_watcher(
@@ -272,7 +326,9 @@ impl State {
                             }
                             Err(e) => json!({"id":id,"watch":true,"error":e.to_string()}),
                         };
-                        let _ = sender.send(value.into());
+                        if sender.send(value.into()).is_ok() {
+                            wake.wake();
+                        }
                     },
                 )?;
                 watcher.watch(
@@ -288,7 +344,7 @@ impl State {
             }
             "hash.new" | "hash.copy" => {
                 let hasher = if op == "hash.new" {
-                    Hasher::new(&args[0])?
+                    Hasher::new(&args[0], &args[1])?
                 } else {
                     self.hashers
                         .get(&args[0].as_u64().context("Expected hash ID")?)

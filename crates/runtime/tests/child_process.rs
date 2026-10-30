@@ -194,7 +194,101 @@ fn files_transfer_bytes_and_text() {
         const terminal = __apps.pty.spawn('/bin/sh', ['-c', 'printf "🌊é🌊é"; printf "\\377"']);
         let text = ''; terminal.onData(data => text += data);
         await new Promise(resolve => terminal.onExit(resolve));
+        for (let i = 0; i < 200 && !text.endsWith('�'); i++) await new Promise(resolve => setTimeout(resolve, 5));
         assert(text.includes('🌊é🌊é') && text.endsWith('�'), 'Terminal text');
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_events_wake_the_event_loop() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counter = wakes.clone();
+    apps_runtime::host::Waker::install(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let engine = Engine::new(
+        Api::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    for start in [
+        "__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05'],{stdio:'ignore'}).on('exit',()=>done=true)",
+        "globalThis.out='';__apps.child_process.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).stdout.on('data',data=>done=(out+=data)==='hi')",
+        "__apps.fs.promises.stat('/').then(()=>done=true)",
+        "__apps.zlib.gzip('wake',()=>done=true)",
+        "globalThis.out='';__apps.pty.spawn('/bin/sh',['-c','sleep 0.05; printf hi']).onData(data=>done=(out+=data).includes('hi'))",
+        "__apps.pty.spawn('/bin/sh',['-c','sleep 0.05']).onExit(()=>done=true)",
+    ] {
+        engine
+            .eval(&format!("globalThis.done=false;{start}"), "wake")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = wakes.load(Ordering::SeqCst);
+            engine.tick().unwrap();
+            if engine.eval("done", "wake").unwrap() == "true" {
+                break;
+            }
+            while wakes.load(Ordering::SeqCst) == seen {
+                assert!(Instant::now() < deadline, "No wake for: {start}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_terminals_does_not_block_on_kill() {
+    let engine = Engine::new(
+        Api::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    let pid: libc::pid_t = engine
+        .eval(
+            "__apps.pty.spawn('/bin/sh',['-c','trap \"\" HUP; exec sleep 30']).pid",
+            "pty-close",
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let start = Instant::now();
+    drop(engine);
+    assert!(
+        start.elapsed() < Duration::from_millis(150),
+        "Closing a terminal blocked for {:?}",
+        start.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(Instant::now() < deadline, "Terminal child was not killed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn child_output_applies_backpressure() {
+    run(r#"
+        const { spawn, spawnSync } = __apps.child_process;
+        const child = spawn('/bin/sh', ['-c', 'head -c 4194304 /dev/zero']);
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const buffered = child.stdout.readableLength;
+        let total = 0;
+        child.stdout.on('data', data => total += data.length);
+        await __apps.events.once(child, 'close');
+        if (buffered > 524288 || total !== 4194304) throw Error(`Buffered ${buffered} bytes, received ${total}`);
+        const result = spawnSync('/bin/sh', ['-c', 'head -c 2097152 /dev/zero'], { maxBuffer: Infinity });
+        if (result.error || result.stdout.length !== 2097152) throw Error('maxBuffer: Infinity');
     "#);
 }
 

@@ -69,6 +69,7 @@ impl State {
                 let _guard = network.enter();
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let (sender, events) = mpsc::channel(64);
+                let wake = crate::host::Waker::current();
                 let task = network.spawn(async move {
                     let next_id = Arc::new(AtomicU64::new(0));
                     let mut connections = JoinSet::new();
@@ -85,9 +86,11 @@ impl State {
                         let _ = stream.set_nodelay(true);
                         let sender = sender.clone();
                         let next_id = next_id.clone();
+                        let wake = wake.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |mut request: Request<Incoming>| {
                                 let sender = sender.clone();
+                                let wake = wake.clone();
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                                 async move {
                                     let upgrade = request.headers().get("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket")).then(|| hyper::upgrade::on(&mut request));
@@ -107,6 +110,9 @@ impl State {
                                     if sender.send((event.into(), Some(((reply, upgrade), demand)))).await.is_err() {
                                         return Ok::<_, Infallible>(Response::builder().status(503).body(full(Bytes::new())).unwrap());
                                     }
+                                    wake.wake();
+                                    // WARNING: `poll` only sees a dropped reply, so wake it when the client goes away.
+                                    let _closed = crate::host::WakeOnDrop(wake.clone());
                                     let (failed, failure) = oneshot::channel();
                                     tokio::spawn(async move {
                                       let (mut buffer, mut wanted, mut ended) = (Vec::new(), false, false);
@@ -119,6 +125,7 @@ impl State {
                                                 error => {
                                                     let (status,message)=match error { Err(_)=>(408,"Request body timed out".to_owned()),Ok(Some(Err(error)))=>(if error.is::<LengthLimitError>(){413}else{400},error.to_string()),_=>unreachable!() };
                                                     let _=sender.send((json!({"kind":"body","id":id,"error":message}).into(),None)).await;
+                                                    wake.wake();
                                                     let _=failed.send(status); return;
                                                 }
                                             },
@@ -127,7 +134,9 @@ impl State {
                                             wanted=false;
                                             let done=buffer.is_empty();
                                             let event=if done { json!({"kind":"body","id":id,"done":true}).into() } else { crate::jsc::payload::Payload::with_bytes(json!({"kind":"body","id":id}), "bytes", std::mem::take(&mut buffer)) };
-                                            if sender.send((event,None)).await.is_err() || done { break; }
+                                            if sender.send((event,None)).await.is_err() { break; }
+                                            wake.wake();
+                                            if done { break; }
                                         }
                                       }
                                     });
@@ -260,15 +269,16 @@ impl State {
                     response = response.extension(hyper::ext::ReasonPhrase::try_from(bytes)?);
                 }
                 let body = if value["stream"] == true {
-                    let (sender, receiver) = mpsc::channel::<Option<Bytes>>(1);
+                    let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
                     server.streams.insert(id, sender);
+                    let closed = crate::host::WakeOnDrop(crate::host::Waker::current());
                     StreamBody::new(futures_util::stream::unfold(
-                        receiver,
-                        |mut receiver| async move {
+                        (receiver, closed),
+                        |(mut receiver, closed)| async move {
                             let bytes = receiver.recv().await.flatten()?;
                             Some((
                                 Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes)),
-                                receiver,
+                                (receiver, closed),
                             ))
                         },
                     ))

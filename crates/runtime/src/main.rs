@@ -4,6 +4,7 @@ fn main() {
     let result = (|| -> anyhow::Result<i32> {
         let mut check = false;
         let mut devtools = false;
+        let mut mcp = None;
         let mut directory = None;
         let mut bundle_stdin = false;
         let mut home = std::env::current_exe()?
@@ -21,12 +22,14 @@ fn main() {
                 check = true;
             } else if arg == "--devtools" {
                 devtools = true;
+            } else if let Some(port) = arg.strip_prefix("--devtools-mcp=") {
+                mcp = Some(port.parse().context("Invalid devtools MCP port")?);
             } else if arg == "--bundle-stdin" {
                 bundle_stdin = true;
             } else {
                 anyhow::ensure!(
                     directory.is_none() && !arg.starts_with('-'),
-                    "Usage: apps-runtime [directory | --bundle-stdin] [--check] [--devtools]"
+                    "Usage: apps-runtime [directory | --bundle-stdin] [--check] [--devtools] [--devtools-mcp=<port>]"
                 );
                 directory = Some(std::path::PathBuf::from(arg));
             }
@@ -43,13 +46,15 @@ fn main() {
             bundle
         } else {
             let directory = directory.unwrap_or(home);
-            apps_runtime::bundle::read(&directory)?
+            let mut bundle = apps_runtime::bundle::read(&directory)?;
+            bundle.packaged |= packaged;
+            bundle
         };
         let app = apps_runtime::desktop::Desktop::from_bundle(bundle)?;
         if check {
             app.check()
         } else {
-            app.run(devtools)
+            app.run(devtools, mcp)
         }
     })();
     match result {

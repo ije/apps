@@ -7,8 +7,8 @@ globalThis.__appsWeb = call => {
     throw new TypeError('Expected an ArrayBuffer or a view');
   };
   const encodeBytes = value => value;
-  const decodeBytes = value => typeof value === 'string' ? (Uint8Array.fromBase64 ? Uint8Array.fromBase64(value) : Uint8Array.from(atob(value), c => c.charCodeAt(0))) : value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value);
-  globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes };
+  const decodeBytes = value => typeof value === 'string' ? (Uint8Array.fromBase64 ? Uint8Array.fromBase64(value) : Uint8Array.from(atob(value), c => c.charCodeAt(0))) : value instanceof Uint8Array ? value : new Uint8Array(value);
+  globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes, memory: body => memoryBodies.get(body) };
   class DOMException extends Error {
     constructor(message = '', name = 'Error') { super(String(message)); this.name = String(name); }
     get code() { return ({ InvalidCharacterError: 5, NotFoundError: 8, TypeMismatchError: 17, NoModificationAllowedError: 7, InvalidModificationError: 13, AbortError: 20, QuotaExceededError: 22, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, TimeoutError: 23, DataCloneError: 25 })[this.name] ?? 0; }
@@ -561,7 +561,8 @@ globalThis.__appsWeb = call => {
     };
     signal.addEventListener('abort', state.onAbort, { once: true });
     const start = data => {
-      if (pending.size >= 64) { queued.push(() => start(data)); return; }
+      let connecting = 0; for (const other of pending.values()) if (!other.controller) connecting++;
+      if (connecting >= 64 || pending.size >= 256) { queued.push(() => start(data)); return; }
       try {
         signal.throwIfAborted();
         const fields = [...request.headers].filter(([name]) => !['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade'].includes(name));

@@ -32,7 +32,7 @@ const assert = (condition, message) => { if (!condition) throw Error(message); }
   const second = serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answer: 42 }) });
   try {
     assert(server.port > 0 && server.hostname === '127.0.0.1', 'Server address');
-    assert(__appsDelay() >= 0 && !__appsPending(), 'Server polling does not block startup checks');
+    assert(__appsDelay() < 0 && __appsAlive() && !__appsPending(), 'Servers wake the loop without polling or blocking startup checks');
     let occupied = false;
     try { serve({ hostname: server.hostname, port: server.port, fetch() {} }); } catch { occupied = true; }
     assert(occupied, 'Bind failure is synchronous');

@@ -2,7 +2,7 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
   const children = new Map();
   const key = {};
   let failureID = 0;
-  const latin1 = data => new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const view = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   class Input extends EventEmitter {
     #id;
     #ended = false;
@@ -11,10 +11,7 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
     get writable() { return !this.#ended; }
     write(data) {
       if (this.#ended) throw new Error('Child stdin is closed');
-      if (typeof data !== 'string') {
-        if (!ArrayBuffer.isView(data)) throw new TypeError('Expected a string or typed array');
-        data = latin1(data);
-      }
+      if (typeof data !== 'string' && !ArrayBuffer.isView(data)) throw new TypeError('Expected a string or typed array');
       this.#buffered += call('child.write', this.#id, data);
       return this.#buffered < 65536;
     }
@@ -43,8 +40,9 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
       this.signalCode = null;
       this.killed = false;
       this.stdin = options.stdio[0] === 'pipe' ? new Input(result.id) : null;
-      this.stdout = options.stdio[1] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)({ read() {} }) : null;
-      this.stderr = options.stdio[2] === 'pipe' ? new (globalThis.__apps?.stream.Readable ?? EventEmitter)({ read() {} }) : null;
+      const output = name => new (globalThis.__apps?.stream.Readable ?? EventEmitter)({ read() { if (this._paused) { this._paused = false; call('child.pause', result.id, name, false); } } });
+      this.stdout = options.stdio[1] === 'pipe' ? output('stdout') : null;
+      this.stderr = options.stdio[2] === 'pipe' ? output('stderr') : null;
       this.stdio = [this.stdin, this.stdout, this.stderr];
     }
     ref() { call('child.unref',this.#id,false);this._unreferenced=false;return this; }
@@ -111,7 +109,7 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
     for (const event of call('child.poll')) {
       const child = children.get(event.id)?.child;
       if (!child) continue;
-      if (event.event === 'data') { const output=child[event.stream], data=Buffer.from(event.data,'latin1'); if(output.push)output.push(data);else output.emit('data',data); }
+      if (event.event === 'data') { const output=child[event.stream], data=view(event.data); if(!output.push)output.emit('data',data);else if(!output.push(data)&&!output._paused){output._paused=true;call('child.pause',event.id,event.stream,true);} }
       else if (event.event === 'written') child.stdin._written(event.bytes);
       else if (event.event === 'finish') child.stdin._finish();
       else if (event.event === 'end') { const output=child[event.stream]; if(output.push)output.push(null);else output.emit('end');queueMicrotask(()=>output.emit('close')); }
@@ -128,8 +126,8 @@ globalThis.__appsChildProcess = (call, EventEmitter) => {
   const spawnSync=(command,args=[],options={})=>{
     if(!Array.isArray(args)){options=args;args=[];}
     if(options.shell){const text=[command,...args].join(' ');command=typeof options.shell==='string'?options.shell:shell();args=shellArgs(command,text);}
-    const result=call('child.sync',command,args,{...options,env:options.env??globalThis.process?.env,input:ArrayBuffer.isView(options.input)?latin1(options.input):options.input});
-    for(const name of ['stdout','stderr']){if(result[name]==null)continue;result[name]=Buffer.from(result[name],'latin1');if(options.encoding&&options.encoding!=='buffer')result[name]=result[name].toString(options.encoding);}
+    const result=call('child.sync',command,args,{...options,env:options.env??globalThis.process?.env,maxBuffer:options.maxBuffer===Infinity?Number.MAX_SAFE_INTEGER:options.maxBuffer});
+    for(const name of ['stdout','stderr']){if(result[name]==null)continue;result[name]=view(result[name]);if(options.encoding&&options.encoding!=='buffer')result[name]=result[name].toString(options.encoding);}
     result.output=[null,result.stdout,result.stderr];if(result.error)result.error=Object.assign(new Error(result.error.message),result.error);return result;
   };
   const execFileSync=(command,args,options={},cmd=[command,...(Array.isArray(args)?args:[])].join(' '))=>{

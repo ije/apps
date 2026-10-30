@@ -1,5 +1,5 @@
 pub(crate) mod crypto;
-pub(crate) mod gpu;
+pub mod gpu;
 pub(crate) mod platform;
 pub(crate) mod serve;
 pub(crate) mod storage;
@@ -57,16 +57,26 @@ pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
                 || a >= 240
                 || (a == 100 && (64..=127).contains(&b))
         }
-        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
-            || {
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_multicast()
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-            },
-            |ip| private_address(ip.into()),
-        ),
+        std::net::IpAddr::V6(ip) => {
+            let s = ip.segments();
+            // WARNING: NAT64 prefixes reach the embedded IPv4 address, so check that address instead.
+            if s[0] == 0x64 && s[1] == 0xff9b && (s[2..6] == [0; 4] || s[2] == 1) {
+                let [a, b, c, d] = [(s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8];
+                return private_address(std::net::Ipv4Addr::new(a, b, c, d).into());
+            }
+            ip.to_ipv4_mapped().map_or_else(
+                || {
+                    ip.is_loopback()
+                        || ip.is_unspecified()
+                        || ip.is_multicast()
+                        || s[..6] == [0; 6]
+                        || (s[0] & 0xfe00) == 0xfc00
+                        || (s[0] & 0xffc0) == 0xfe80
+                        || (s[0] & 0xffc0) == 0xfec0
+                },
+                |ip| private_address(ip.into()),
+            )
+        }
     }
 }
 
@@ -120,9 +130,11 @@ pub struct State {
 }
 
 impl State {
-    pub fn configure_storage(&mut self, packaged: bool, namespace: &str, window: Option<u64>) {
+    pub fn configure_storage(&mut self, host: &crate::host::Host, window: Option<u64>) {
+        let namespace = host.app_name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
-        self.workers.configure(namespace, packaged);
+        self.workers
+            .configure(namespace, host.packaged, host.disabled, host.scripts.clone());
     }
     pub fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         match op {
@@ -215,7 +227,7 @@ impl State {
                 )
             }
             "fetch.start" => {
-                ensure!(self.fetches.len() < 64, "Too many active fetch requests");
+                ensure!(self.fetches.len() < 256, "Too many active fetch requests");
                 let mut url = Url::parse(args[0]["url"].as_str().context("Expected URL")?)?;
                 ensure!(
                     matches!(url.scheme(), "http" | "https"),
@@ -232,6 +244,21 @@ impl State {
                     .to_owned();
                 let mut headers: Vec<(String, String)> =
                     serde_json::from_value(args[0]["headers"].clone())?;
+                headers.retain(|(name, _)| {
+                    let name = name.to_ascii_lowercase();
+                    !matches!(
+                        name.as_str(),
+                        "host"
+                            | "content-length"
+                            | "transfer-encoding"
+                            | "connection"
+                            | "upgrade"
+                            | "keep-alive"
+                            | "te"
+                            | "trailer"
+                            | "expect"
+                    ) && !name.starts_with("proxy-")
+                });
                 let mut body = bytes::Bytes::from(bytes(&args[0]["body"])?);
                 let redirect = args[0]["redirect"].as_str().unwrap_or("follow").to_owned();
                 let network = network()?;
@@ -252,9 +279,10 @@ impl State {
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
                 let mut upload_rx = (args[0]["stream"] == true).then_some(upload_rx);
+                let wake = crate::host::Waker::current();
                 let task = network.spawn(async move {
                     let result: Result<()> = async {
-                        if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } }
+                        if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }
                         let mut redirects = 0;
                         let mut response = loop {
                             if renderer {
@@ -269,10 +297,11 @@ impl State {
                             for (name, value) in &headers { request = request.header(name, value); }
                             let streaming = upload_rx.is_some();
                             let request_body = if let Some(receiver) = upload_rx.take() {
-                                let sender = events_tx.clone();
+                                let sender = (events_tx.clone(), wake.clone());
                                 reqwest::Body::wrap_stream(futures_util::stream::unfold((receiver, sender), |(mut receiver, sender)| async move {
                                     let chunk = receiver.recv().await.flatten()?;
-                                    sender.send(json!({"kind": "upload"}).into()).await.ok()?;
+                                    sender.0.send(json!({"kind": "upload"}).into()).await.ok()?;
+                                    sender.1.wake();
                                     Some((Ok::<_, std::io::Error>(chunk), (receiver, sender)))
                                 }))
                             } else { reqwest::Body::from(body.clone()) };
@@ -306,22 +335,26 @@ impl State {
                             "statusText": response.status().canonical_reason().unwrap_or(""), "headers": headers,
                             "url": response.url().to_string(), "redirected": redirects > 0});
                         if events_tx.send(metadata.into()).await.is_err() { return Ok(()); }
-                        let (mut buffer, mut wanted, mut ended) = (Vec::new(), false, false);
+                        wake.wake();
+                        let (mut buffer, mut wanted, mut ended, mut pulled) = (Vec::new(), false, false, false);
                         loop {
+                            // WARNING: an unread body holds its buffer until GC, so read ahead little before the first pull.
                             tokio::select! {
-                                demand = demand_rx.recv() => { if demand.is_none() { break; } wanted = true; }
-                                chunk = response.chunk(), if !ended && buffer.len() < 1 << 20 => match chunk? { Some(bytes) => buffer.extend_from_slice(&bytes), None => ended = true },
+                                demand = demand_rx.recv() => { if demand.is_none() { break; } wanted = true; pulled = true; }
+                                chunk = response.chunk(), if !ended && buffer.len() < if pulled { 1 << 20 } else { 64 << 10 } => match chunk? { Some(bytes) => buffer.extend_from_slice(&bytes), None => ended = true },
                             }
                             if wanted && (ended || !buffer.is_empty()) {
                                 wanted = false;
                                 let done = buffer.is_empty();
                                 let event = if done { json!({"kind": "done"}).into() } else { crate::jsc::payload::Payload::with_bytes(json!({"kind":"chunk"}), "bytes", std::mem::take(&mut buffer)) };
-                                if events_tx.send(event).await.is_err() || done { break; }
+                                if events_tx.send(event).await.is_err() { break; }
+                                wake.wake();
+                                if done { break; }
                             }
                         }
                         Ok(())
                     }.await;
-                    if let Err(error) = result { let _ = events_tx.send(json!({"kind": "error", "message": format!("{error:#}")}).into()).await; }
+                    if let Err(error) = result { let _ = events_tx.send(json!({"kind": "error", "message": format!("{error:#}")}).into()).await; wake.wake(); }
                 });
                 self.next_id += 1;
                 self.fetches.insert(

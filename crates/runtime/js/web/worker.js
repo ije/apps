@@ -108,24 +108,23 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
     constructor(source, options = {}, token) {
       super();
       const native = token === nativeToken && nativeAccess;
-      const start = text => {
+      const start = (text, bundled = false) => {
         if (this._closed) return;
-        this.threadId = call('web.worker.start', text, native, encode(options.workerData));
+        this.threadId = call('web.worker.start', text, native, encode(options.workerData), bundled);
         workers.set(this.threadId, this);
         for (const message of this._queue) call('web.worker.send', this.threadId, message);
         this._queue.length = 0;
       };
-      if (options.eval && native) start(String(source));
-      else if (native && !/^(?:https?|data|blob):/.test(String(source))) {
-        const path = String(source).startsWith('file:') ? decodeURIComponent(new URL(source).pathname) : String(source);
-        start(__apps.fs.readFileSync(path, 'utf8'));
-      } else {
-        Promise.resolve().then(async () => {
-          const url = String(source);
-          if (url.startsWith('data:')) { const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? atob(url.slice(comma + 1)) : decodeURIComponent(url.slice(comma + 1))); }
-          else { const response = await fetch(source); if (!response.ok) throw new Error('Cannot load worker: ' + response.status); start(await response.text()); }
-        }).catch(error => { this._closed = true; this._emit('error', error); });
-      }
+      const url = String(source);
+      // WARNING: workers run bundled or local code only; remote scripts are rejected.
+      if (options.eval && native) start(url);
+      else if (/^(?:data|blob|apps):/.test(url)) Promise.resolve().then(async () => {
+        if (url.startsWith('apps:')) return start(url, true);
+        if (url.startsWith('blob:')) return start(await (await fetch(url)).text());
+        const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? atob(url.slice(comma + 1)) : decodeURIComponent(url.slice(comma + 1)));
+      }).catch(error => { this._closed = true; this._emit('error', error); });
+      else if (native && !/^[a-z][a-z0-9+.-]+:/i.test(url.replace(/^file:/, ''))) start(__apps.fs.readFileSync(url.startsWith('file:') ? decodeURIComponent(new URL(url).pathname) : url, 'utf8'));
+      else throw new DOMException('Workers can only load bundled or local scripts', 'SecurityError');
     }
     postMessage(value, options) {
       if (this._closed) return;

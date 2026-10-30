@@ -37,11 +37,28 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut input = cssparser::Parser::new(value);
     let mut start = input.position();
+    let mut block = false;
     loop {
         let position = input.position();
-        let Ok(token) = input.next_including_whitespace() else {
+        let Ok(token) = input.next_including_whitespace().cloned() else {
             break;
         };
+        // A function or block ends a value, so `rotate(1deg)scale(2)` is two values.
+        if separator == ' '
+            && std::mem::take(&mut block)
+            && !matches!(
+                token,
+                cssparser::Token::WhiteSpace(_)
+                    | cssparser::Token::Comma
+                    | cssparser::Token::Delim(_)
+            )
+        {
+            let part = input.slice(start..position).trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = position;
+        }
         if matches!(token, cssparser::Token::Comma) && separator == ','
             || matches!(token, cssparser::Token::WhiteSpace(_)) && separator == ' '
         {
@@ -56,15 +73,18 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
                 | cssparser::Token::ParenthesisBlock
                 | cssparser::Token::SquareBracketBlock
                 | cssparser::Token::CurlyBracketBlock
-        ) && input
-            .parse_nested_block(|input| {
-                input
-                    .expect_no_error_token()
-                    .map_err(cssparser::ParseError::<()>::from)
-            })
-            .is_err()
-        {
-            return Vec::new();
+        ) {
+            if input
+                .parse_nested_block(|input| {
+                    input
+                        .expect_no_error_token()
+                        .map_err(cssparser::ParseError::<()>::from)
+                })
+                .is_err()
+            {
+                return Vec::new();
+            }
+            block = true;
         }
     }
     let part = input.slice_from(start).trim();
@@ -75,7 +95,7 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
 }
 
 impl Lengths {
-    pub fn shadows(&self, value: &str, inset: bool) -> Vec<gpui::BoxShadow> {
+    pub fn shadows(&self, value: &str, inset: bool) -> Vec<render::BoxShadow> {
         let mut shadows = Vec::new();
         if value == "none" {
             return shadows;
@@ -99,12 +119,12 @@ impl Lengths {
             if !(2..=4).contains(&lengths.len()) {
                 return Vec::new();
             }
-            shadows.push(gpui::BoxShadow {
-                color: gpui::rgba((ink.0 << 8) | u32::from(ink.1)).into(),
-                offset: gpui::point(gpui::px(lengths[0]), gpui::px(lengths[1])),
-                // WARNING: gpui uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
-                blur_radius: gpui::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
-                spread_radius: gpui::px(lengths.get(3).copied().unwrap_or(0.)),
+            shadows.push(render::BoxShadow {
+                color: render::rgba((ink.0 << 8) | u32::from(ink.1)),
+                offset: render::point(render::px(lengths[0]), render::px(lengths[1])),
+                // WARNING: the renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
+                blur_radius: render::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
+                spread_radius: render::px(lengths.get(3).copied().unwrap_or(0.)),
                 inset,
             });
         }
@@ -116,10 +136,10 @@ impl Lengths {
 pub(crate) struct Filter(pub [[f32; 4]; 3]);
 
 impl Filter {
-    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32, Vec<gpui::BoxShadow>) {
+    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32, Vec<render::BoxShadow>) {
         let identity = Self([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
         let (mut matrix, mut opacity, mut shadows) =
-            (identity, 1f32, Vec::<gpui::BoxShadow>::new());
+            (identity, 1f32, Vec::<render::BoxShadow>::new());
         for part in components(value, ' ') {
             let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
             else {
@@ -248,16 +268,14 @@ impl Filter {
         (r << 16 | g << 8 | b, alpha)
     }
 
-    pub fn hsla(&self, color: gpui::Hsla) -> gpui::Hsla {
-        let color = color.to_rgb();
+    pub fn hsla(&self, color: render::Rgba) -> render::Rgba {
         let [r, g, b] = self.rgb([color.r, color.g, color.b]);
-        gpui::Rgba {
+        render::Rgba {
             r,
             g,
             b,
             a: color.a,
         }
-        .into()
     }
 }
 

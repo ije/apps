@@ -3,7 +3,12 @@ use apps_runtime::{
     host::{Host, Page, Role},
     jsc::{Api, Engine},
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[test]
 fn canvas_identity_and_webgl_errors() {
@@ -47,45 +52,62 @@ fn canvas_identity_and_webgl_errors() {
     "#, "canvas-test").unwrap();
 }
 
-#[test]
-#[ignore = "Requires a native GPU adapter"]
-fn renders_pixels_and_runs_compute() {
+fn page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
         Page {
-            doc: Document::parse(
-                "<html><body><canvas id='canvas' width='64' height='64'></canvas></body></html>",
-            ),
+            doc: Document::parse(html),
             dirty: false,
         },
     );
     let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
-    engine.eval(include_str!("webgpu.js"), "gpu-test").unwrap();
-    for _ in 0..1000 {
-        if engine
-            .eval("globalThis.gpuTestResult ?? 'pending'", "gpu-test")
-            .unwrap()
-            != "pending"
-        {
-            break;
+    (host, engine)
+}
+
+fn wait(engine: &Engine, ready: &str) -> String {
+    for _ in 0..5000 {
+        let value = engine.eval(ready, "gpu-test").unwrap();
+        if value != "pending" {
+            return value;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        engine.tick().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(
-        engine
-            .eval("globalThis.gpuTestResult ?? 'pending'", "gpu-test")
-            .unwrap(),
-        "ok"
-    );
+    panic!("GPU work did not finish: {ready}");
+}
+
+fn present(host: &RefCell<Host>, node: usize) -> Arc<render::RenderImage> {
+    for _ in 0..5000 {
+        if let Some(image) = host
+            .borrow_mut()
+            .graphics
+            .get_mut(&1)
+            .unwrap()
+            .image(node)
+            .unwrap()
+        {
+            return image;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("Canvas was not presented");
+}
+
+#[test]
+#[ignore = "Requires a native GPU adapter"]
+fn renders_pixels_and_runs_compute() {
+    let (host, engine) =
+        page("<html><body><canvas id='canvas' width='64' height='64'></canvas></body></html>");
+    engine.eval(include_str!("webgpu.js"), "gpu-test").unwrap();
+    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
     let broken: usize = engine
         .eval("brokenCanvas", "gpu-test")
         .unwrap()
         .parse()
         .unwrap();
-    let mut state = host.borrow_mut();
     assert!(
-        state
+        host.borrow_mut()
             .graphics
             .get_mut(&1)
             .unwrap()
@@ -93,39 +115,110 @@ fn renders_pixels_and_runs_compute() {
             .unwrap()
             .is_none()
     );
-    let node = state.pages[&1]
+    let node = host.borrow().pages[&1]
         .doc
         .nodes
         .iter()
         .position(|n| n.tag == "canvas")
         .unwrap();
-    let image = state
-        .graphics
-        .get_mut(&1)
-        .unwrap()
-        .image(node)
-        .unwrap()
-        .unwrap();
-    let pixels = image.as_bytes(0).unwrap();
+    let image = present(&host, node);
+    let pixels = image.bytes();
     assert_eq!(
         &pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4],
         &[0, 0, 255, 255]
     );
     assert_eq!(&pixels[0..4], &[0, 0, 0, 255]);
-    drop(state);
     engine
         .eval(
             "canvas.width = 16; canvas.height = 8; context.getCurrentTexture();",
             "resize",
         )
         .unwrap();
-    let mut state = host.borrow_mut();
-    let image = state
-        .graphics
-        .get_mut(&1)
-        .unwrap()
-        .image(node)
-        .unwrap()
+    assert_eq!(present(&host, node).bytes().len(), 16 * 8 * 4);
+}
+
+#[test]
+#[ignore = "Requires a native GPU adapter"]
+fn map_async_and_work_done_resolve_without_blocking_the_tick() {
+    let (_host, engine) = page("<body></body>");
+    engine.eval(r#"(async () => {
+        const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+        const output = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: `
+            @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+            @compute @workgroup_size(1) fn main() { var v = 1u; for (var i = 0u; i < 4000000u; i++) { v = v * 1664525u + 1013904223u; } out[0] = v; }
+        ` }), entryPoint: 'main' } });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: output } }] }));
+        pass.dispatchWorkgroups(1); pass.end();
+        encoder.copyBufferToBuffer(output, 0, readback, 0, 4);
+        device.queue.submit([encoder.finish()]);
+        const started = performance.now();
+        const mapped = readback.mapAsync(GPUMapMode.READ).then(() => {
+            globalThis.mapped = performance.now() - started;
+            let v = 1; for (let i = 0; i < 4000000; i++) v = (Math.imul(v, 1664525) + 1013904223) >>> 0;
+            if (new Uint32Array(readback.getMappedRange())[0] !== v) throw Error('Wrong compute result');
+        });
+        const done = device.queue.onSubmittedWorkDone().then(() => { globalThis.done = true; });
+        globalThis.issued = performance.now() - started;
+        globalThis.state = readback.mapState;
+        await Promise.all([mapped, done]);
+        const aborted = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ });
+        const abort = aborted.mapAsync(GPUMapMode.READ).then(() => 'mapped', error => error.name);
+        aborted.unmap();
+        if (await abort !== 'AbortError' || aborted.mapState !== 'unmapped') throw Error('Unmap did not abort the mapping');
+        await aborted.mapAsync(GPUMapMode.READ);
+        aborted.unmap();
+        globalThis.gpuTestResult = 'ok';
+    })().catch(error => { globalThis.gpuTestResult = String(error); });"#, "gpu-test").unwrap();
+    assert_eq!(engine.eval("state", "gpu-test").unwrap(), "pending");
+    let tick = Instant::now();
+    engine.tick().unwrap();
+    let tick = tick.elapsed().as_secs_f64() * 1000.;
+    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
+    let issued: f64 = engine.eval("issued", "gpu-test").unwrap().parse().unwrap();
+    let mapped: f64 = engine.eval("mapped", "gpu-test").unwrap().parse().unwrap();
+    assert_eq!(engine.eval("done", "gpu-test").unwrap(), "true");
+    assert!(
+        issued + tick < mapped / 2.,
+        "mapAsync blocked: issued in {issued:.1} ms, tick {tick:.1} ms, mapped after {mapped:.1} ms"
+    );
+}
+
+#[test]
+#[ignore = "Requires a native GPU adapter"]
+fn static_canvas_stops_presenting_when_idle() {
+    let (host, engine) = page("<body><canvas id='canvas' width='32' height='32'></canvas></body>");
+    engine.eval(r#"(async () => {
+        const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+        const context = document.getElementById('canvas').getContext('webgpu');
+        context.configure({ device, format: 'rgba8unorm' });
+        const encoder = device.createCommandEncoder();
+        encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: [0, 1, 0, 1], loadOp: 'clear', storeOp: 'store' }] }).end();
+        device.queue.submit([encoder.finish()]);
+        globalThis.gpuTestResult = 'ok';
+    })().catch(error => { globalThis.gpuTestResult = String(error); });"#, "gpu-test").unwrap();
+    assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
+    let node = host.borrow().pages[&1]
+        .doc
+        .nodes
+        .iter()
+        .position(|n| n.tag == "canvas")
         .unwrap();
-    assert_eq!(image.as_bytes(0).unwrap().len(), 16 * 8 * 4);
+    let image = present(&host, node);
+    assert_eq!(&image.bytes()[..4], &[0, 255, 0, 255]);
+    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    std::thread::sleep(Duration::from_millis(20));
+    for _ in 0..3 {
+        assert_eq!(engine.tick().unwrap(), -1);
+        let mut state = host.borrow_mut();
+        let gpu = state.graphics.get_mut(&1).unwrap();
+        assert!(!gpu.presented());
+        assert_eq!(gpu.image(node).unwrap().unwrap().id, image.id);
+        assert!(!state.pages[&1].dirty);
+        assert!(!state.dom[&1].frame_requested);
+    }
 }

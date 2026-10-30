@@ -1,6 +1,20 @@
 use apps_runtime::dom::{self, Document};
 use image::{ImageFormat, Limits};
-use serde_json::json;
+use serde_json::{Value, json};
+
+fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let results = dom::call("dom.decoded", &json!([]), doc, state, [640., 480.])
+            .unwrap()
+            .unwrap();
+        if let Some(result) = results.get(0) {
+            return result[1].clone();
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 
 #[test]
 fn web_images_decode_in_the_dom() {
@@ -16,7 +30,7 @@ fn web_images_decode_in_the_dom() {
         include_bytes!("images/sample.avif"),
         include_bytes!("images/alpha.avif"),
     ] {
-        let result = dom::call(
+        dom::call(
             "dom.image",
             &json!([1, bytes]),
             &mut doc,
@@ -25,7 +39,7 @@ fn web_images_decode_in_the_dom() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(result, json!([4, 3]));
+        assert_eq!(decoded(&mut doc, &mut state), json!([4, 3]));
         assert!(state.images.contains_key(&1));
     }
     let image =
@@ -83,26 +97,27 @@ fn svg_and_bundled_images_load_through_the_host() {
     let mut doc = Document::parse("<body><img></body>");
     let mut state = dom::State::default();
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"><rect width="30" height="12"/></svg>"#;
-    let result = dom::call(
+    dom::call(
         "dom.image",
         &json!([1, svg.as_slice()]),
         &mut doc,
         &mut state,
         [640., 480.],
-    );
-    assert_eq!(result.unwrap().unwrap(), json!([30., 12.]));
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
     assert!(!state.images.contains_key(&1));
-    assert!(
-        dom::call(
-            "dom.image",
-            &json!([1, b"not an image".as_slice()]),
-            &mut doc,
-            &mut state,
-            [640., 480.]
-        )
-        .unwrap()
-        .is_err()
-    );
+    dom::call(
+        "dom.image",
+        &json!([1, b"not an image".as_slice()]),
+        &mut doc,
+        &mut state,
+        [640., 480.],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(decoded(&mut doc, &mut state).is_string());
 
     let directory = tempfile::tempdir().unwrap();
     let png = directory.path().join("sample.png");
@@ -117,25 +132,33 @@ fn svg_and_bundled_images_load_through_the_host() {
         },
     );
     host.dom.entry(1).or_default().base = Some(url::Url::parse("apps:///page-0.html").unwrap());
-    let mut load = |source: &str| {
-        host.call(
-            Role::Renderer(1),
-            json!({"op":"dom.imageURL","args":[1, source]}),
-        )
+    let load = |host: &mut Host, source: &str| {
+        host.call(Role::Renderer(1), "dom.imageURL", json!([1, source]))
     };
-    assert_eq!(load("assets/sample.png").unwrap(), json!([4, 3]));
-    assert!(load("apps:///assets/missing.png").is_err());
-    assert!(load(png.to_str().unwrap()).is_err());
-    assert!(load(url::Url::from_file_path(&png).unwrap().as_str()).is_err());
+    let decoded = |host: &mut Host| {
+        let started = std::time::Instant::now();
+        loop {
+            let results = host
+                .call(Role::Renderer(1), "dom.decoded", json!([]))
+                .unwrap();
+            if let Some(result) = results.get(0) {
+                return result[1].clone();
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    assert!(load(&mut host, "assets/sample.png").unwrap().is_u64());
+    assert!(!host.pages[&1].dirty && !host.dom[&1].images.contains_key(&1));
+    assert_eq!(decoded(&mut host), json!([4, 3]));
     assert!(host.pages[&1].dirty && host.dom[&1].images.contains_key(&1));
+    assert!(load(&mut host, "apps:///assets/missing.png").is_err());
+    assert!(load(&mut host, png.to_str().unwrap()).is_err());
+    assert!(load(&mut host, url::Url::from_file_path(&png).unwrap().as_str()).is_err());
     host.dom.get_mut(&1).unwrap().base =
         Some(url::Url::from_directory_path(directory.path()).unwrap());
-    assert_eq!(
-        host.call(
-            Role::Renderer(1),
-            json!({"op":"dom.imageURL","args":[1, "sample.png"]})
-        )
-        .unwrap(),
-        json!([4, 3])
-    );
+    load(&mut host, "sample.png").unwrap();
+    assert_eq!(decoded(&mut host), json!([4, 3]));
+    load(&mut host, "missing.png").unwrap();
+    assert!(decoded(&mut host).is_string());
 }

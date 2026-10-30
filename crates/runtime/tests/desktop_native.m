@@ -9,10 +9,10 @@ static int themeWakes;
 static void themeWake(void) { themeWakes++; }
 static BOOL preferenceEnabled;
 static BOOL preference(id object, SEL selector) { return preferenceEnabled; }
-@interface GPUIView : NSView
+@interface AppsView : NSView
 @property(nonatomic, strong) NSEvent *key;
 @end
-@implementation GPUIView
+@implementation AppsView
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)performKeyEquivalent:(NSEvent *)event { self.key = event; return YES; }
 @end
@@ -88,7 +88,7 @@ int main(int argc, const char *argv[]) {
         }
         [window makeKeyWindow];
         if (![NSApp sendAction:select.action to:select.target from:select] || text.selectedRange.length != text.string.length) return 15;
-        GPUIView *view = [[GPUIView alloc] initWithFrame:window.contentView.bounds];
+        AppsView *view = [[AppsView alloc] initWithFrame:window.contentView.bounds];
         window.contentView = view;
         [window makeFirstResponder:view];
         if (![NSApp sendAction:copy.action to:copy.target from:copy] || view.key.keyCode != kVK_ANSI_C || view.key.modifierFlags != NSEventModifierFlagCommand) return 16;
@@ -124,6 +124,24 @@ int main(int argc, const char *argv[]) {
         if (![locale[@"system"] length] || ![locale[@"languages"] isKindOfClass:NSArray.class]) return 11;
         native("app.about","{\"applicationName\":\"Smoke\",\"credits\":\"Thanks\"}");
         if ([[menu itemAtIndex:0].submenu itemAtIndex:0].action != @selector(about:)) return 28;
+        [native("poll", "null") count];
+        NSWindow *owner = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 200, 100) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+        [owner orderFront:nil];
+        for (NSString *request in @[@"{\"message\":\"Async\",\"async\":7}", @"{\"async\":8}"]) {
+            __block BOOL running = NO;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                running = !NSApp.modalWindow;
+                if (owner.attachedSheet) [owner endSheet:owner.attachedSheet returnCode:NSAlertSecondButtonReturn];
+                for (NSWindow *panel in NSApp.windows) if ([panel isKindOfClass:NSSavePanel.class] && panel.visible) [(NSSavePanel *)panel cancel:nil];
+            });
+            if (native([request containsString:@"message"] ? "dialog.message" : "dialog.open", request.UTF8String) != [NSNull null]) return 29;
+            NSArray *events = @[];
+            for (int i = 0; i < 300 && !events.count; i++) {
+                [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                events = native("poll", "null");
+            }
+            if (!running || events.count != 1 || ![events[0][@"type"] isEqual:@"dialog"] || !events[0][@"value"]) return 30;
+        }
         return 0;
     }
 }

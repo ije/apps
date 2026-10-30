@@ -117,7 +117,16 @@ options=(
 
 case "$system" in
   macos)
-    options+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0)
+    # WARNING: jsc-cc.sh picks -O3, -Os or -Oz per file. Clang rejects a PCH built at another level.
+    options+=(
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+      '-DCMAKE_C_FLAGS_RELEASE=-Os -DNDEBUG'
+      '-DCMAKE_CXX_FLAGS_RELEASE=-Os -DNDEBUG'
+      -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+      "-DCMAKE_C_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
+      "-DCMAKE_CXX_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
+      "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-dead_strip -Wl,-exported_symbols_list,$root/scripts/jsc.exports"
+    )
     ;;
   windows)
     options+=('-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DU_STATIC_IMPLEMENTATION')
@@ -142,12 +151,14 @@ case "$system" in
     ;;
 esac
 
-cp -p "$library" "$output/$name"
+# WARNING: macOS caches a library's code signature per file, so a rewrite in place kills every process that loads it. Replace it with a new file.
+cp -p "$library" "$output/.$name"
 if [[ $system == macos ]]; then
-  install_name_tool -id "@rpath/$name" "$output/$name"
-  xcrun strip -x "$output/$name"
-  codesign --force --sign - "$output/$name"
+  install_name_tool -id "@rpath/$name" "$output/.$name"
+  xcrun strip -x "$output/.$name"
+  codesign --force --sign - "$output/.$name"
 fi
+mv -f "$output/.$name" "$output/$name"
 
 {
   printf 'JavaScriptCore from https://github.com/oven-sh/WebKit/tree/%s\n' "$revision"

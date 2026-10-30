@@ -1,5 +1,5 @@
 globalThis.__appsServe = call => {
-  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), { encode, decode } = globalThis.__appsBytes;
+  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), { encode, decode, memory } = globalThis.__appsBytes;
   return {
     serve(options) {
       if (!options || typeof options.fetch !== 'function') throw new TypeError('Expected a fetch handler');
@@ -64,10 +64,10 @@ globalThis.__appsServe = call => {
             if (pending.upgraded) return;
             if (!(response instanceof Response) || response.status === 0) throw new TypeError('Fetch handler must return a Response');
             if(response.bodyUsed||response.body?.locked)throw new TypeError('Response body is already used');
-            const stream = event.method !== 'HEAD' && response.body !== null;
+            const data = response.body && memory(response.body), stream = !data && event.method !== 'HEAD' && response.body !== null;
             if (event.method === 'HEAD') await response.body?.cancel();
             call('web.serve.respond', event.server, event.id, {
-              status: response.status, statusText: response.statusText, headers: [...response.headers], body: [], stream,
+              status: response.status, statusText: response.statusText, headers: [...response.headers], body: event.method === 'HEAD' || !data ? [] : encode(data), stream,
             });
             if (stream) {
               const reader = response.body.getReader();

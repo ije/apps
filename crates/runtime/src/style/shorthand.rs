@@ -164,7 +164,7 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         "gap" | "grid-gap" => (["row-gap", "column-gap"].map(String::from).into(), 2),
         "overflow" => (["overflow-x", "overflow-y"].map(String::from).into(), 2),
-        "text-decoration" => (
+        "text-decoration" | "-webkit-text-decoration" => (
             ["line", "style", "color", "thickness"]
                 .map(|part| format!("text-decoration-{part}"))
                 .into(),

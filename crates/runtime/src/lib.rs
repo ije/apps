@@ -8,34 +8,18 @@ mod node;
 pub mod render;
 pub mod style;
 mod web;
+pub use web::gpu;
 
-pub fn bundle_source(
-    files: &bbtree::unsync::BBTreeMap<String, String>,
-    execute: bool,
-) -> anyhow::Result<String> {
+// WARNING: module code must stay outside the loader function, or it could see loader internals such as
+// `compile`. Definitions run in a second function whose only binding is `$appsDefine`.
+pub fn bundle_source(files: &bbtree::unsync::BBTreeMap<String, String>, execute: bool) -> String {
     let modules = include_str!("../js/modules.js");
-    let mut source = String::with_capacity(
-        modules.len()
-            + 256
-            + files
-                .iter()
-                .map(|(_, source)| source.len() + 1)
-                .sum::<usize>(),
-    );
-    source.push_str("(()=>{\n");
+    let app = files.get("app.js").map_or("", String::as_str);
+    let mut source = String::with_capacity(modules.len() + app.len() + 64);
+    source.push_str("(()=>{");
     source.push_str(modules);
-    for (name, file) in files.iter() {
-        if name.ends_with(".js") {
-            source.push('\n');
-            source.push_str(file);
-        }
-    }
-    source.push_str("\nprepare();");
-    if execute {
-        source.push_str(
-            "const start=()=>globalThis.__appsStart?.(modules.get(0).namespace.default);const result=load(0);if(result instanceof Promise)globalThis.__appsTrackModule(result.then(start));else start();",
-        );
-    }
-    source.push_str("\n})();");
-    Ok(source)
+    source.push_str("})()(($appsDefine)=>{\n");
+    source.push_str(app);
+    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
+    source
 }

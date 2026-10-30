@@ -61,7 +61,7 @@ fn web_contents_view_matches_electron_api() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 #[ignore = "requires a desktop display, JavaScriptCore, and the system webview"]
-fn gpui_iframe_delivers_load_after_native_layout() {
+fn iframe_delivers_load_after_native_layout() {
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -69,7 +69,7 @@ fn gpui_iframe_delivers_load_after_native_layout() {
     let output = tempfile::tempdir().unwrap();
     let app = serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"commonjs":false,"code":"__apps.app.whenReady().then(()=>{const w=new __apps.BrowserWindow({width:800,height:600});w.loadFile('apps:///index.html');setTimeout(()=>__apps.app.quit(),5000)});"});
     let files = bbtree::unsync::BBTreeMap::from_iter([
-        ("app.js".to_owned(), format!("define({app});")),
+        ("app.js".to_owned(), format!("$appsDefine({app});")),
         ("index.html".to_owned(), "<html><body><script type='module'>const frame=document.createElement('iframe');frame.setAttribute('srcdoc','<h1>Native iframe</h1>');frame.style.width='600px';frame.style.height='150px';frame.addEventListener('load',()=>console.log('IFRAME_NATIVE_LOAD',frame.getBoundingClientRect().width,frame.getBoundingClientRect().height));document.body.append(frame);</script></body></html>".to_owned()),
     ]);
     apps_runtime::bundle::write(&output.path().join("app.h2o"), &files).unwrap();
@@ -114,7 +114,7 @@ fn page_error_survives_and_native_window_runs_finalizers() {
         (
             "app.js".to_owned(),
             format!(
-                "define({});",
+                "$appsDefine({});",
                 serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main})
             ),
         ),

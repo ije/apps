@@ -212,11 +212,13 @@ impl Files {
                     use std::os::windows::fs::OpenOptionsExt;
                     let time = |value: &Value| -> Result<SystemTime> {
                         let seconds = value.as_f64().context("Expected time")?;
-                        Ok(if seconds < 0. {
-                            UNIX_EPOCH - std::time::Duration::from_secs_f64(-seconds)
+                        let offset = std::time::Duration::try_from_secs_f64(seconds.abs())?;
+                        let time = if seconds < 0. {
+                            UNIX_EPOCH.checked_sub(offset)
                         } else {
-                            UNIX_EPOCH + std::time::Duration::from_secs_f64(seconds)
-                        })
+                            UNIX_EPOCH.checked_add(offset)
+                        };
+                        time.context("Time is out of range")
                     };
                     // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS let this work on directories and read-only files.
                     OpenOptions::new()

@@ -31,6 +31,19 @@ unsafe extern "C" {
     fn apps_browser_free(text: *mut c_char);
 }
 
+static WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Sets the callback that wakes the app loop when a browser queues an event.
+pub fn on_event(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = WAKE.set(Box::new(wake));
+}
+
+pub(crate) fn wake() {
+    if let Some(wake) = WAKE.get() {
+        wake();
+    }
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn receive(context: *mut c_void, message: *const c_char) {
     if context.is_null() || message.is_null() {
@@ -47,6 +60,8 @@ unsafe extern "C" fn receive(context: *mut c_void, message: *const c_char) {
             events.pop_front();
         }
         events.push_back(value);
+        drop(events);
+        wake();
     }
 }
 

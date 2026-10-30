@@ -19,7 +19,7 @@ bool apps_reduce_motion(void) { return NSWorkspace.sharedWorkspace.accessibility
 
 static NSString *AppsThemeSource = @"system";
 static NSDictionary *AppsAboutOptions;
-static void (*AppsThemeWake)(void);
+static void (*AppsWake)(void);
 static _Atomic(uint32_t) AppsThemeCache = UINT32_MAX;
 
 static uint32_t AppsReadTheme(void) {
@@ -82,7 +82,7 @@ static void AppsNativeEmit(NSDictionary *event) {
         NSMutableArray *events = AppsNativeEvents();
         if (events.count >= 4096) [events removeObjectAtIndex:0];
         [events addObject:event];
-        if ([event[@"type"] isEqual:@"theme"] && AppsThemeWake) AppsThemeWake();
+        if (AppsWake) AppsWake();
     });
 }
 
@@ -118,7 +118,7 @@ static void AppsNativeEmit(NSDictionary *event) {
     if ([command[0] length] && [NSApp sendAction:NSSelectorFromString(command[0]) to:nil from:item]) return;
     NSWindow *window = NSApp.keyWindow;
     NSResponder *responder = [command[2] boolValue] ? window.contentView : window.firstResponder;
-    if (![responder isKindOfClass:NSClassFromString(@"GPUIView")]) return;
+    if (![responder isKindOfClass:NSClassFromString(@"AppsView")]) return;
     NSArray *key = command[1];
     NSString *text = [key[0] isEqual:@"backspace"] ? @"\177" : key[0];
     NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:[key[1] unsignedIntegerValue] timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:[key[2] unsignedShortValue]];
@@ -175,7 +175,7 @@ static AppsNative *AppsNativeOwner(void) {
 }
 
 void apps_theme_observe(void (*wake)(void)) {
-    AppsThemeWake = wake;
+    AppsWake = wake;
     NSApp.appearance = [AppsThemeSource isEqual:@"system"] ? nil : [NSAppearance appearanceNamed:[AppsThemeSource isEqual:@"dark"] ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     AppsNative *owner = AppsNativeOwner();
     atomic_store_explicit(&AppsThemeCache, owner.themeState, memory_order_relaxed);
@@ -448,41 +448,64 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             result = @{ @"openAtLogin": @((BOOL)(service.status == SMAppServiceStatusEnabled)), @"status": @[@"not-registered", @"enabled", @"requires-approval", @"not-found"][MIN(3, service.status)] };
         } else result = @{ @"openAtLogin": @NO, @"status": @"not-found" };
     }
-    else if ([op isEqualToString:@"dialog.open"]) {
-        NSOpenPanel *panel = [NSOpenPanel openPanel];
-        NSArray *properties = args[@"properties"] ?: @[@"openFile"];
-        panel.canChooseDirectories = [properties containsObject:@"openDirectory"];
-        panel.canChooseFiles = [properties containsObject:@"openFile"] || !panel.canChooseDirectories;
-        panel.allowsMultipleSelection = [properties containsObject:@"multiSelections"];
-        panel.canCreateDirectories = [properties containsObject:@"createDirectory"];
-        panel.title = args[@"title"] ?: @"Open";
-        if (args[@"defaultPath"]) panel.directoryURL = [NSURL fileURLWithPath:args[@"defaultPath"]];
-        BOOL ok = [panel runModal] == NSModalResponseOK;
-        NSMutableArray *paths = [NSMutableArray new];
-        if (ok) for (NSURL *url in panel.URLs) [paths addObject:url.path];
-        result = @{ @"canceled": @(!ok), @"filePaths": paths };
-    } else if ([op isEqualToString:@"dialog.save"]) {
-        NSSavePanel *panel = [NSSavePanel savePanel];
-        panel.title = args[@"title"] ?: @"Save";
-        if (args[@"defaultPath"]) {
-            NSString *path = args[@"defaultPath"];
-            panel.directoryURL = [NSURL fileURLWithPath:path.stringByDeletingLastPathComponent];
-            panel.nameFieldStringValue = path.lastPathComponent;
-        }
-        BOOL ok = [panel runModal] == NSModalResponseOK;
-        result = @{ @"canceled": @(!ok), @"filePath": ok ? panel.URL.path : [NSNull null] };
-    } else if ([op isEqualToString:@"dialog.message"]) {
-        NSAlert *alert = [NSAlert new];
-        alert.messageText = args[@"message"] ?: @"";
-        alert.informativeText = args[@"detail"] ?: @"";
-        for (NSString *button in args[@"buttons"] ?: @[@"OK"]) [alert addButtonWithTitle:button];
-        if (args[@"checkboxLabel"]) {
-            alert.showsSuppressionButton = YES;
-            alert.suppressionButton.title = args[@"checkboxLabel"];
-            alert.suppressionButton.state = [args[@"checkboxChecked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
-        }
-        NSInteger response = [alert runModal] - NSAlertFirstButtonReturn;
-        result = @{ @"response": @(response), @"checkboxChecked": @(alert.suppressionButton.state == NSControlStateValueOn) };
+    else if ([op hasPrefix:@"dialog."]) {
+        // WARNING: async dialogs must not run a modal loop: the app stays borrowed and the main queue stops while it runs.
+        NSNumber *request = args[@"async"];
+        void (^emit)(NSDictionary *) = ^(NSDictionary *value) { AppsNativeEmit(@{ @"type": @"dialog", @"id": request, @"value": value }); };
+        if ([op isEqualToString:@"dialog.open"] || [op isEqualToString:@"dialog.save"]) {
+            BOOL open = [op isEqualToString:@"dialog.open"];
+            NSSavePanel *panel = open ? [NSOpenPanel openPanel] : [NSSavePanel savePanel];
+            panel.title = args[@"title"] ?: (open ? @"Open" : @"Save");
+            if (open) {
+                NSOpenPanel *chooser = (NSOpenPanel *)panel;
+                NSArray *properties = args[@"properties"] ?: @[@"openFile"];
+                chooser.canChooseDirectories = [properties containsObject:@"openDirectory"];
+                chooser.canChooseFiles = [properties containsObject:@"openFile"] || !chooser.canChooseDirectories;
+                chooser.allowsMultipleSelection = [properties containsObject:@"multiSelections"];
+                chooser.canCreateDirectories = [properties containsObject:@"createDirectory"];
+                if (args[@"defaultPath"]) chooser.directoryURL = [NSURL fileURLWithPath:args[@"defaultPath"]];
+            } else if (args[@"defaultPath"]) {
+                NSString *path = args[@"defaultPath"];
+                panel.directoryURL = [NSURL fileURLWithPath:path.stringByDeletingLastPathComponent];
+                panel.nameFieldStringValue = path.lastPathComponent;
+            }
+            NSDictionary *(^finish)(NSModalResponse) = ^NSDictionary *(NSModalResponse response) {
+                BOOL ok = response == NSModalResponseOK;
+                if (!open) return @{ @"canceled": @(!ok), @"filePath": ok ? panel.URL.path : [NSNull null] };
+                NSMutableArray *paths = [NSMutableArray new];
+                if (ok) for (NSURL *url in ((NSOpenPanel *)panel).URLs) [paths addObject:url.path];
+                return @{ @"canceled": @(!ok), @"filePaths": paths };
+            };
+            if (request) [panel beginWithCompletionHandler:^(NSModalResponse response) { emit(finish(response)); }];
+            else result = finish([panel runModal]);
+        } else if ([op isEqualToString:@"dialog.message"]) {
+            NSAlert *alert = [NSAlert new];
+            alert.messageText = args[@"message"] ?: @"";
+            alert.informativeText = args[@"detail"] ?: @"";
+            for (NSString *button in args[@"buttons"] ?: @[@"OK"]) [alert addButtonWithTitle:button];
+            if (args[@"checkboxLabel"]) {
+                alert.showsSuppressionButton = YES;
+                alert.suppressionButton.title = args[@"checkboxLabel"];
+                alert.suppressionButton.state = [args[@"checkboxChecked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+            }
+            NSDictionary *(^finish)(NSModalResponse) = ^NSDictionary *(NSModalResponse response) {
+                return @{ @"response": @(response - NSAlertFirstButtonReturn), @"checkboxChecked": @(alert.suppressionButton.state == NSControlStateValueOn) };
+            };
+            NSWindow *window = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject, *host = nil;
+            if (request && !window) {
+                // WARNING: an alert without a window has no non-modal form, so it hangs from a clear window.
+                NSRect screen = NSScreen.mainScreen.visibleFrame;
+                host = [[NSWindow alloc] initWithContentRect:NSMakeRect(NSMidX(screen) - 210, NSMidY(screen) + 120, 420, 1) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+                host.opaque = NO;
+                host.backgroundColor = NSColor.clearColor;
+                host.releasedWhenClosed = NO;
+                host.level = NSModalPanelWindowLevel;
+                [host orderFrontRegardless];
+                window = host;
+            }
+            if (request) [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) { emit(finish(response)); [host orderOut:nil]; }];
+            else result = finish([alert runModal]);
+        } else return strdup("{\"error\":\"Unknown native operation\"}");
     } else return strdup("{\"error\":\"Unknown native operation\"}");
     return strdup(AppsJSON(@{ @"value": result }).UTF8String);
 }

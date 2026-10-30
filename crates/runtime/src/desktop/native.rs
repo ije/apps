@@ -23,21 +23,11 @@ pub(crate) fn theme_state() -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn observe_theme() -> tokio::sync::mpsc::Receiver<()> {
-    thread_local! {
-        static WAKE: std::cell::RefCell<Option<tokio::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-    }
+pub(crate) fn observe() {
     extern "C" fn wake() {
-        WAKE.with_borrow(|sender| {
-            if let Some(sender) = sender {
-                let _ = sender.try_send(());
-            }
-        });
+        crate::host::Waker::current().wake();
     }
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
-    WAKE.with_borrow_mut(|slot| *slot = Some(sender));
     unsafe { apps_theme_observe(wake) };
-    receiver
 }
 
 fn validate_menu(template: &Value) -> Result<()> {
@@ -208,6 +198,10 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                     "Expected boolean option: {name}"
                 );
             }
+            ensure!(
+                options.get("async").is_none_or(Value::is_u64),
+                "Expected dialog request id"
+            );
         }
         _ => bail!("Unknown native operation: {operation}"),
     }

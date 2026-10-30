@@ -93,7 +93,7 @@ impl State {
     pub fn take_attaches(&mut self) -> Vec<(u64, u64)> {
         std::mem::take(&mut self.attaches)
     }
-    pub fn attach(&self, id: u64, window: &gpui::Window) -> Result<()> {
+    pub fn attach(&self, id: u64, window: &render::Window) -> Result<()> {
         self.views
             .get(&id)
             .context("Browser is destroyed")?

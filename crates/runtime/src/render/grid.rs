@@ -4,7 +4,7 @@ use crate::{
 };
 use std::collections::HashMap;
 
-pub(crate) type Measurements = HashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>;
+pub(crate) type Measurements = rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Grid {
@@ -480,7 +480,7 @@ pub(crate) fn intrinsic(
     styles: &ComputedStyles,
     width: Option<f32>,
     height: Option<f32>,
-    text: &gpui::WindowTextSystem,
+    text: &render::TextSystem,
     measured: &mut Measurements,
 ) -> [f32; 4] {
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
@@ -568,9 +568,9 @@ pub(crate) fn intrinsic(
         let lines = text
             .shape_text(
                 inline.text.to_string().into(),
-                gpui::px(units.font.em),
+                render::px(units.font.em),
                 &inline.runs,
-                available.filter(|_| wrap).map(gpui::px),
+                available.filter(|_| wrap).map(render::px),
                 None,
             )
             .unwrap_or_default();
@@ -737,7 +737,7 @@ pub(crate) fn layout(
     width: Option<f32>,
     height: Option<f32>,
     inherited: Option<&Grid>,
-    text: &gpui::WindowTextSystem,
+    text: &render::TextSystem,
     measured: &mut Measurements,
 ) -> Grid {
     use Sizing::*;
@@ -855,13 +855,13 @@ pub(crate) fn layout(
                 .max(0.),
         }
     });
+    // Each string is a row; strings need no space between them, like `'a a''b c'`.
     let area_rows: Vec<Vec<&str>> = areas
         .as_deref()
-        .map(|v| style::components(v, ' '))
         .unwrap_or_default()
-        .into_iter()
-        .filter(|row| row.len() > 1 && row.starts_with(['"', '\'']))
-        .filter_map(|row| row.get(1..row.len() - 1))
+        .split(['"', '\''])
+        .skip(1)
+        .step_by(2)
         .map(|row| row.split_whitespace().collect())
         .collect();
     let mut regions: HashMap<&str, [usize; 4]> = HashMap::new();
@@ -918,74 +918,164 @@ pub(crate) fn layout(
         fit[axis] = collapse;
     }
     let automatic = [0, 1].map(|axis| tracks(&implicit[axis], units, available[axis], 0.).0);
-    let mut children: Vec<usize> = doc.nodes[id]
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| {
-            let style = &styles.values[child];
-            !style.get("display").is_some_and(|v| v == "none")
-                && !style
-                    .get("position")
-                    .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed"))
-                && !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty())
-        })
-        .collect();
-    children.sort_by_key(|&child| {
-        styles.values[child]
-            .get("order")
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0)
-    });
     let ident = |value: &&str| {
         *value != "auto" && !value.contains(char::is_whitespace) && value.parse::<isize>().is_err()
     };
-    let items: Vec<([Option<usize>; 2], [usize; 2])> = children
-        .iter()
-        .map(|&child| {
-            let style = &styles.values[child];
-            let split = |name: &str| {
-                style.get(name).map_or(Vec::new(), |v| {
-                    v.split('/').map(str::trim).collect::<Vec<_>>()
-                })
-            };
-            let area = split("grid-area");
-            let (mut position, mut span) = ([None; 2], [1; 2]);
-            for axis in 0..2 {
-                let name = ["column", "row"][axis];
-                let pair = split(&format!("grid-{name}"));
-                let shorthand = if let Some(&first) = pair.first() {
-                    (
-                        Some(first),
-                        pair.get(1).copied().or(Some(first).filter(ident)),
-                    )
-                } else {
-                    let start = area
-                        .get(1 - axis)
-                        .copied()
-                        .or(area.first().copied().filter(ident));
-                    (start, area.get(3 - axis).copied().or(start.filter(ident)))
-                };
-                let longhand = |side: &str| {
-                    style
-                        .get(&format!("grid-{name}-{side}"))
-                        .map(String::as_str)
-                };
-                (position[axis], span[axis]) = placement(
-                    longhand("start").or(shorthand.0).unwrap_or("auto"),
-                    longhand("end").or(shorthand.1).unwrap_or("auto"),
-                    &names[axis],
-                    explicit[axis],
-                );
-                if shared[axis].is_some() {
-                    let start = position[axis].map(|v| v.min(explicit[axis] - 1));
-                    position[axis] = start;
-                    span[axis] = span[axis].min(explicit[axis] - start.unwrap_or(0));
-                }
+    let alignment = |child: usize, axis: usize| {
+        let own = &styles.values[child];
+        let margins = [
+            ["margin-left", "margin-right"],
+            ["margin-top", "margin-bottom"],
+        ][axis]
+            .map(|name| own.get(name).is_some_and(|v| v == "auto"));
+        let mut value = "normal";
+        for (style, name, shorthand) in [
+            (own, ["justify-self", "align-self"][axis], "place-self"),
+            (style, ["justify-items", "align-items"][axis], "place-items"),
+        ] {
+            let parts: Vec<&str> = style
+                .get(shorthand)
+                .map_or(Vec::new(), |v| v.split_whitespace().collect());
+            if let Some(found) = style
+                .get(name)
+                .map(String::as_str)
+                .or(parts.get(axis ^ 1).or(parts.first()).copied())
+                .filter(|v| *v != "auto")
+            {
+                value = found;
+                break;
             }
-            (position, span)
+        }
+        match (margins, value.split_whitespace().last().unwrap_or(value)) {
+            ([true, true], _) => Some(0.5),
+            ([true, false], _) => Some(1.),
+            ([false, true], _) => Some(0.),
+            (_, "normal")
+                if matches!(
+                    doc.nodes[child].tag.as_str(),
+                    "img" | "svg" | "canvas" | "video"
+                ) =>
+            {
+                Some(0.)
+            }
+            (_, "normal" | "stretch") => None,
+            (_, "center") => Some(0.5),
+            (_, "end" | "flex-end" | "self-end" | "right") => Some(1.),
+            _ => Some(0.),
+        }
+    };
+    /// What an item's style says, read once per style.
+    #[derive(Clone, Copy)]
+    struct Item<'a> {
+        flowed: bool,
+        order: i32,
+        placed: ([Option<usize>; 2], [usize; 2]),
+        alignment: [Option<f32>; 2],
+        /// Whether the minimum size is zero, per axis.
+        shrink: [bool; 2],
+        auto_width: bool,
+        height: Option<&'a str>,
+        subgrid: [bool; 2],
+    }
+    // WARNING: large grids repeat a few styles over thousands of items, so each style is read once.
+    let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
+    let mut read = |child: usize| -> Item {
+        let style = &styles.values[child];
+        let replaced = matches!(
+            doc.nodes[child].tag.as_str(),
+            "img" | "svg" | "canvas" | "video"
+        );
+        *memo
+            .entry((std::rc::Rc::as_ptr(style), replaced))
+            .or_insert_with(|| {
+                let flowed = !style.get("display").is_some_and(|v| v == "none")
+                    && !style
+                        .get("position")
+                        .is_some_and(|v| matches!(v.as_str(), "absolute" | "fixed"));
+                let order = style
+                    .get("order")
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let placed = {
+                    let split = |name: &str| {
+                        style.get(name).map_or(Vec::new(), |v| {
+                            v.split('/').map(str::trim).collect::<Vec<_>>()
+                        })
+                    };
+                    let area = split("grid-area");
+                    let (mut position, mut span) = ([None; 2], [1; 2]);
+                    for axis in 0..2 {
+                        let [name, start, end] = [
+                            ["grid-column", "grid-column-start", "grid-column-end"],
+                            ["grid-row", "grid-row-start", "grid-row-end"],
+                        ][axis];
+                        let pair = split(name);
+                        let shorthand = if let Some(&first) = pair.first() {
+                            (
+                                Some(first),
+                                pair.get(1).copied().or(Some(first).filter(ident)),
+                            )
+                        } else {
+                            let start = area
+                                .get(1 - axis)
+                                .copied()
+                                .or(area.first().copied().filter(ident));
+                            (start, area.get(3 - axis).copied().or(start.filter(ident)))
+                        };
+                        let longhand = |name: &str| style.get(name).map(String::as_str);
+                        (position[axis], span[axis]) = placement(
+                            longhand(start).or(shorthand.0).unwrap_or("auto"),
+                            longhand(end).or(shorthand.1).unwrap_or("auto"),
+                            &names[axis],
+                            explicit[axis],
+                        );
+                        if shared[axis].is_some() {
+                            let start = position[axis].map(|v| v.min(explicit[axis] - 1));
+                            position[axis] = start;
+                            span[axis] = span[axis].min(explicit[axis] - start.unwrap_or(0));
+                        }
+                    }
+                    (position, span)
+                };
+                let shrink = [0, 1].map(|axis| {
+                    style
+                        .get(["overflow-x", "overflow-y"][axis])
+                        .or_else(|| style.get("overflow"))
+                        .is_some_and(|v| !matches!(v.as_str(), "visible" | "clip"))
+                        || style
+                            .get(["min-width", "min-height"][axis])
+                            .is_some_and(|v| v == "0" || v == "0px")
+                });
+                let subgrid = [0, 1].map(|axis| {
+                    style
+                        .get(["grid-template-columns", "grid-template-rows"][axis])
+                        .is_some_and(|v| v.starts_with("subgrid"))
+                });
+                Item {
+                    flowed,
+                    order,
+                    placed,
+                    alignment: [alignment(child, 0), alignment(child, 1)],
+                    shrink,
+                    auto_width: style.get("width").is_none_or(|v| v == "auto"),
+                    height: style.get("height").map(String::as_str),
+                    subgrid,
+                }
+            })
+    };
+    let mut children: Vec<(usize, Item)> = doc.nodes[id]
+        .children
+        .iter()
+        .filter(|&&child| {
+            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty())
         })
+        .map(|&child| (child, read(child)))
+        .filter(|(_, item)| item.flowed)
         .collect();
+    children.sort_by_key(|(_, item)| item.order);
+    let (children, derived): (Vec<usize>, Vec<Item>) = children.into_iter().unzip();
+    let items: Vec<([Option<usize>; 2], [usize; 2])> =
+        derived.iter().map(|item| item.placed).collect();
     let across = usize::from(flow.contains("column"));
     let down = 1 - across;
     let dense = flow.contains("dense");
@@ -1022,17 +1112,21 @@ pub(crate) fn layout(
             mark(&mut occupied, placed[index], *span);
         }
     }
+    // WARNING: dense packing rescans placed cells for every item, so a budget of cell checks
+    // bounds pathological grids, which then fall back to sparse placement.
+    let mut budget = 1usize << 24;
     let mut lanes = HashMap::new();
     for (index, (position, span)) in items.iter().enumerate() {
         if let (None, Some(lane)) = (position[across], position[down]) {
             let mut at = [0; 2];
             at[down] = lane;
-            at[across] = if dense {
+            at[across] = if dense && budget > 0 {
                 0
             } else {
                 lanes.get(&lane).copied().unwrap_or(0)
             };
-            while !fits(&occupied, at, *span) && at[across] + span[across] < 4096 {
+            while budget > 0 && !fits(&occupied, at, *span) && at[across] + span[across] < 4096 {
+                budget = budget.saturating_sub(span[0] * span[1]);
                 at[across] += 1;
             }
             lanes.insert(lane, at[across] + span[across]);
@@ -1042,17 +1136,30 @@ pub(crate) fn layout(
         }
     }
     let mut cursor = [0; 2];
+    let mut free = 0;
     for (index, (position, span)) in items.iter().enumerate() {
         if position[down].is_some() {
             continue;
         }
-        let mut at = if dense { [0; 2] } else { cursor };
+        let dense = dense && budget > 0;
+        let mut at = cursor;
+        if dense {
+            while occupied.get(free).is_some_and(|row: &Vec<bool>| {
+                row.len() >= count[across] && !row[..count[across]].contains(&false)
+            }) {
+                free += 1;
+            }
+            budget = budget.saturating_sub(count[across]);
+            at = [0; 2];
+            at[down] = free;
+        }
         if let Some(fixed) = position[across] {
             if !dense && fixed < at[across] {
                 at[down] += 1;
             }
             at[across] = fixed;
-            while !fits(&occupied, at, *span) && at[down] < 4096 {
+            while budget > 0 && !fits(&occupied, at, *span) && at[down] < 4096 {
+                budget = budget.saturating_sub(span[0] * span[1]);
                 at[down] += 1;
             }
         } else {
@@ -1061,9 +1168,10 @@ pub(crate) fn layout(
                     at[across] = 0;
                     at[down] += 1;
                 }
-                if at[down] >= 4096 || fits(&occupied, at, *span) {
+                if at[down] >= 4096 || budget == 0 || fits(&occupied, at, *span) {
                     break;
                 }
+                budget = budget.saturating_sub(span[0] * span[1]);
                 at[across] += 1;
             }
         }
@@ -1154,52 +1262,19 @@ pub(crate) fn layout(
             value
         }
     };
-    let alignment = |child: usize, axis: usize| {
-        let own = &styles.values[child];
-        let margins = [
-            ["margin-left", "margin-right"],
-            ["margin-top", "margin-bottom"],
-        ][axis]
-            .map(|name| own.get(name).is_some_and(|v| v == "auto"));
-        let mut value = "normal";
-        for (style, name, shorthand) in [
-            (own, ["justify-self", "align-self"][axis], "place-self"),
-            (style, ["justify-items", "align-items"][axis], "place-items"),
-        ] {
-            let parts: Vec<&str> = style
-                .get(shorthand)
-                .map_or(Vec::new(), |v| v.split_whitespace().collect());
-            if let Some(found) = style
-                .get(name)
-                .map(String::as_str)
-                .or(parts.get(axis ^ 1).or(parts.first()).copied())
-                .filter(|v| *v != "auto")
-            {
-                value = found;
-                break;
-            }
-        }
-        match (margins, value.split_whitespace().last().unwrap_or(value)) {
-            ([true, true], _) => Some(0.5),
-            ([true, false], _) => Some(1.),
-            ([false, true], _) => Some(0.),
-            (_, "normal")
-                if matches!(
-                    doc.nodes[child].tag.as_str(),
-                    "img" | "svg" | "canvas" | "video"
-                ) =>
-            {
-                Some(0.)
-            }
-            (_, "normal" | "stretch") => None,
-            (_, "center") => Some(0.5),
-            (_, "end" | "flex-end" | "self-end" | "right") => Some(1.),
-            _ => Some(0.),
-        }
+    // WARNING: large grids have thousands of tracks, so track starts are summed once, in the same order as before.
+    let starts = |sizes: &[f32]| {
+        let mut sum = 0f32;
+        std::iter::once(0.)
+            .chain(sizes.iter().map(|size| {
+                sum += size;
+                sum
+            }))
+            .collect::<Vec<_>>()
     };
-    let area = |sizes: &[f32], offset: f32, gap: f32, start: usize, span: usize| {
+    let area = |sizes: &[f32], starts: &[f32], offset: f32, gap: f32, start: usize, span: usize| {
         [
-            offset + sizes.iter().take(start).sum::<f32>() + start as f32 * gap,
+            offset + starts[start.min(sizes.len())] + start as f32 * gap,
             sizes.iter().skip(start).take(span).sum::<f32>() + span.saturating_sub(1) as f32 * gap,
         ]
     };
@@ -1211,16 +1286,20 @@ pub(crate) fn layout(
     let mut boxes = vec![[0f32; 4]; cells.len()];
     for axis in 0..2 {
         if axis == 1 {
+            let column_starts = starts(&grid.columns);
             for (index, (&child, cell)) in children.iter().zip(&cells).enumerate() {
-                let [x, area] = area(&grid.columns, offsets[0], grid.gap[0], cell[0], cell[2]);
+                let [x, area] = area(
+                    &grid.columns,
+                    &column_starts,
+                    offsets[0],
+                    grid.gap[0],
+                    cell[0],
+                    cell[2],
+                );
                 let [min, max, used, height] =
                     intrinsic(doc, child, styles, Some(area), None, text, measured);
-                let fraction = alignment(child, 0);
-                let size = if fraction.is_some()
-                    && styles.values[child]
-                        .get("width")
-                        .is_none_or(|v| v == "auto")
-                {
+                let fraction = derived[index].alignment[0];
+                let size = if fraction.is_some() && derived[index].auto_width {
                     max.min(area).max(min)
                 } else {
                     used
@@ -1238,10 +1317,7 @@ pub(crate) fn layout(
             if shared[axis].is_some() {
                 break;
             }
-            if !styles.values[child]
-                .get(["grid-template-columns", "grid-template-rows"][axis])
-                .is_some_and(|v| v.starts_with("subgrid"))
-            {
+            if !derived[index].subgrid[axis] {
                 let [min, max] = if axis == 0 {
                     let value = intrinsic(doc, child, styles, None, None, text, measured);
                     [value[0], value[1]]
@@ -1251,7 +1327,7 @@ pub(crate) fn layout(
                 contributions.push((
                     cell[axis],
                     cell[axis + 2],
-                    [minimum(child, axis, min), min, max],
+                    [if derived[index].shrink[axis] { 0. } else { min }, min, max],
                 ));
                 continue;
             }
@@ -1323,11 +1399,19 @@ pub(crate) fn layout(
             grid.rows = sizes;
         }
     }
+    let row_starts = starts(&grid.rows);
     for (index, (&child, cell)) in children.iter().zip(&cells).enumerate() {
-        let [y, area] = area(&grid.rows, offsets[1], grid.gap[1], cell[1], cell[3]);
+        let [y, area] = area(
+            &grid.rows,
+            &row_starts,
+            offsets[1],
+            grid.gap[1],
+            cell[1],
+            cell[3],
+        );
         let [x, _, width, mut height] = boxes[index];
-        let fraction = alignment(child, 1);
-        let value = styles.values[child].get("height");
+        let fraction = derived[index].alignment[1];
+        let value = derived[index].height;
         if value.is_some_and(|v| v.contains('%')) {
             height = intrinsic(doc, child, styles, Some(width), Some(area), text, measured)[3];
         }
@@ -1503,5 +1587,51 @@ mod tests {
         assert_eq!(placement("auto", "span 3", &names, 3), (None, 3));
         assert_eq!(placement("99999", "auto", &names, 3), (Some(4095), 1));
         assert_eq!(placement("1", "span 99999", &names, 3), (Some(0), 4096));
+    }
+
+    #[test]
+    fn dense_packing_fills_holes_and_stays_bounded() {
+        let text = render::TextSystem::new();
+        let place = |html: &str| {
+            let mut doc = Document::parse(html);
+            let mut state = crate::dom::State::default();
+            let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+            let grid = doc
+                .nodes
+                .iter()
+                .position(|node| node.tag == "main")
+                .unwrap();
+            layout(
+                &doc,
+                grid,
+                &styles,
+                Some(800.),
+                None,
+                None,
+                &text,
+                &mut Default::default(),
+            )
+            .cells
+            .into_iter()
+            .map(|(_, cell, _)| cell)
+            .collect::<Vec<_>>()
+        };
+        let cells = place(
+            "<style>main{display:grid;grid-template-columns:repeat(3,10px);grid-auto-flow:row dense}.w{grid-column:span 2}</style><main><i class=w></i><i class=w></i><i></i><i></i></main>",
+        );
+        assert_eq!(
+            cells,
+            [[0, 0, 2, 1], [0, 1, 2, 1], [2, 0, 1, 1], [2, 1, 1, 1]]
+        );
+        let cells = place(&format!(
+            "<style>main{{display:grid;grid-template-columns:repeat(4096,1px);grid-auto-flow:dense}}i{{grid-column:span 4096}}</style><main>{}</main>",
+            "<i></i>".repeat(3000)
+        ));
+        assert!(
+            cells
+                .iter()
+                .enumerate()
+                .all(|(row, cell)| *cell == [0, row, 4096, 1])
+        );
     }
 }

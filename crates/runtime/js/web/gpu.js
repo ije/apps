@@ -5,6 +5,11 @@
   const garbage = new __appsFinalizers(({ device, id }) => { try { call('gpu.release', device, [id]); } catch {} });
   const adapters = new __appsFinalizers(id => call('gpu.releaseAdapter', id));
   const devices = new __appsFinalizers(id => { try { call('gpu.destroyDevice', id, null); } catch {} });
+  const waiting = new Map();
+  const settle = (device, token) => new Promise((resolve, reject) => waiting.set(token, { device, resolve, reject }));
+  globalThis.__appsGPUPoll = () => {
+    if (waiting.size) for (const [token, value] of call('gpu.poll')) { const entry = waiting.get(token); waiting.delete(token); entry?.resolve(value); }
+  };
   const wire = (value, refs) => {
     if (objects.has(value)) { refs?.push(value); return objects.get(value); }
     if (value?.[rawBytes]) return value[rawBytes];
@@ -47,12 +52,11 @@
       if (this.mapState !== 'unmapped' || ![1, 2].includes(mode)) throw new Error('Buffer cannot be mapped');
       if (offset % 8 || size % 4 || offset < 0 || size < 0 || offset + size > this.size) throw new RangeError('Invalid mapped range');
       this.mapState = 'pending';
-      try {
-        const data = this._device._call('mapBuffer', [this, mode, offset, size]);
-        if (!(data instanceof Uint8Array)) throw new Error('Buffer mapping failed');
-        this._data = data.buffer;
-        this._offset = offset; this._mode = mode; this.mapState = 'mapped';
-      } catch (error) { this.mapState = 'unmapped'; throw error; }
+      try { this._token = this._device._call('mapBuffer', [this, mode, offset, size]); } catch (error) { this.mapState = 'unmapped'; throw error; }
+      const data = await settle(this._device, this._token);
+      if (!(data instanceof Uint8Array)) { this.mapState = 'unmapped'; throw new Error('Buffer mapping failed'); }
+      this._data = data.buffer;
+      this._offset = offset; this._mode = mode; this.mapState = 'mapped';
     }
     getMappedRange(offset = 0, size = this.size - offset) {
       if (this.mapState !== 'mapped') throw new Error('Buffer is not mapped');
@@ -65,6 +69,7 @@
     unmap() {
       if (this.mapState === 'unmapped') return;
       this._device._call('unmapBuffer', [this, this._mode === 2 ? this._ranges.map(([offset, data]) => [offset, binary(bytes(data))]) : []]);
+      if (this.mapState === 'pending') { waiting.get(this._token)?.reject(new DOMException('Buffer mapping was aborted', 'AbortError')); waiting.delete(this._token); }
       for (const [, data] of this._ranges) data.transfer?.(0);
       this._ranges = []; this._data = null; this.mapState = 'unmapped';
     }
@@ -173,7 +178,7 @@
       this._device._call('writeBuffer', [buffer, offset, binary(value)]);
     }
     writeTexture(destination, data, dataLayout, size) { this._device._call('writeTexture', [destination, binary(bytes(data)), dataLayout, size]); }
-    async onSubmittedWorkDone() { this._device._call('wait', null); }
+    async onSubmittedWorkDone() { await settle(this._device, this._device._call('workDone', null)); }
     copyExternalImageToTexture() { throw new Error('External image uploads are not supported; use writeTexture with pixel data'); }
   }
   class GPUDevice {
@@ -207,7 +212,12 @@
     async popErrorScope() { if (!this._scopes.length) throw new Error('No GPU error scope'); return this._scopes.pop().error; }
     addEventListener(type, fn) { const list = this._events.get(type) ?? []; list.push(fn); this._events.set(type, list); }
     removeEventListener(type, fn) { this._events.set(type, (this._events.get(type) ?? []).filter(f => f !== fn)); }
-    destroy() { if (this._destroyed) return; this._call('destroyDevice', null); devices.unregister(this); this._destroyed = true; this._resolveLost({ reason: 'destroyed', message: 'Device destroyed' }); }
+    destroy() {
+      if (this._destroyed) return;
+      this._call('destroyDevice', null); devices.unregister(this); this._destroyed = true;
+      for (const [token, entry] of waiting) if (entry.device === this) { waiting.delete(token); entry.reject(new Error('GPU device is destroyed')); }
+      this._resolveLost({ reason: 'destroyed', message: 'Device destroyed' });
+    }
     importExternalTexture() { throw new Error('External textures are not supported'); }
     createQuerySet() { throw new Error('GPU query sets are not supported'); }
   }

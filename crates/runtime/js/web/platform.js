@@ -80,16 +80,21 @@ globalThis.__appsPlatform = call => {
     }
   }
   const rejections = new WeakMap(), nativeThen = Promise.prototype.then;
-  Object.defineProperty(Promise.prototype, 'then', { configurable: true, writable: true, value: function then(onFulfilled, onRejected) {
-    const record = rejections.get(this);
-    const result = Reflect.apply(nativeThen, this, [onFulfilled, onRejected]);
-    if (record && !record.handled) {
-      record.handled = true;
-      if (record.reported) setTimeout(() => dispatchEvent(new PromiseRejectionEvent('rejectionhandled', { promise: this, reason: record.reason })), 0);
-    }
-    return result;
-  } });
+  let tracking = false;
   globalThis.__appsRejection = (promise, reason) => {
+    // WARNING: a custom `then` slows every promise in JSC, so it is installed only after the first rejection.
+    if (!tracking) {
+      tracking = true;
+      Object.defineProperty(Promise.prototype, 'then', { configurable: true, writable: true, value: function then(onFulfilled, onRejected) {
+        const record = rejections.get(this);
+        const result = Reflect.apply(nativeThen, this, [onFulfilled, onRejected]);
+        if (record && !record.handled) {
+          record.handled = true;
+          if (record.reported) setTimeout(() => dispatchEvent(new PromiseRejectionEvent('rejectionhandled', { promise: this, reason: record.reason })), 0);
+        }
+        return result;
+      } });
+    }
     if (rejections.has(promise)) return;
     const record = { reason, handled: false, reported: false }; rejections.set(promise, record);
     setTimeout(() => {

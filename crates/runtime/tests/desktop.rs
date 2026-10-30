@@ -96,6 +96,65 @@ fn native_theme_properties_and_events() {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
+fn oversized_windows_open_and_report_their_size() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let main = r#"
+        const { app, BrowserWindow, ipcMain } = __apps;
+        ipcMain.on('size', (_, width, height) => {
+            if (!(width > 0 && height > 0 && width < 6000)) throw Error('Wrong size: ' + width + 'x' + height);
+            console.log('OVERSIZED_OK'); app.quit();
+        });
+        app.whenReady().then(() => {
+            new BrowserWindow({ width: 6000, height: 5000 }).loadFile('apps:///index.html');
+            setTimeout(() => process.exit(1), 5000);
+        });
+    "#;
+    let page = r#"
+        <body>
+        <script type='preload'>__apps.contextBridge.exposeInMainWorld('report', (...args) => __apps.ipcRenderer.send('size', ...args));</script>
+        <script>addEventListener('resize', () => report(innerWidth, innerHeight));</script>
+    "#;
+    let bundle = serde_json::json!({"files": [
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+        ["index.html", page],
+    ], "pages": []});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bundle.to_string().as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("OVERSIZED_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
 fn native_theme_updates_hidden_renderers_and_cached_styles() {
     use std::{
         io::Write,
@@ -141,7 +200,7 @@ fn native_theme_updates_hidden_renderers_and_cached_styles() {
         </script>
     "#;
     let bundle = serde_json::json!({"files": [
-        ["app.js", format!("define({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
         ["index.html", page],
     ], "pages": []});
     let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
@@ -170,6 +229,103 @@ fn native_theme_updates_hidden_renderers_and_cached_styles() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success() && stdout.contains("NATIVE_THEME_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn native_browser_window_geometry_state_and_close() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let main = r#"
+        const { app, BrowserWindow } = __apps;
+        const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        const once = (win, name) => new Promise((resolve, reject) => { const timer = setTimeout(() => reject(Error('No ' + name + ' event')), 5000); win.once(name, () => { clearTimeout(timer); resolve(); }); });
+        const expect = (ok, what) => { if (!ok) throw Error(what + ': ' + JSON.stringify([win.getBounds(), win.getContentBounds()])); };
+        let win;
+        app.on('window-all-closed', () => {});
+        app.whenReady().then(async () => {
+            setTimeout(() => { throw Error('Window test timed out'); }, 20000);
+            win = new BrowserWindow({ x: 80, y: 90, width: 400, height: 300, minWidth: 200, minHeight: 150, show: false });
+            win.load('<title>Native</title><body></body>');
+            await once(win, 'ready-to-show');
+            const bar = win.getSize()[1] - win.getContentSize()[1];
+            expect(same(win.getBounds(), { x: 80, y: 90, width: 400, height: 300 }) && bar > 0 && !win.isVisible(), 'initial bounds');
+            const focus = once(win, 'focus');
+            win.show();
+            await focus;
+            expect(win.isVisible() && win.isFocused() && BrowserWindow.getFocusedWindow() === win, 'show');
+            win.setBounds({ x: 120, y: 130, width: 500, height: 350 });
+            await once(win, 'resized');
+            expect(same(win.getBounds(), { x: 120, y: 130, width: 500, height: 350 }), 'setBounds');
+            win.setContentSize(100, 100);
+            await once(win, 'resized');
+            expect(same(win.getSize(), [200, 150]), 'minimum size');
+            const maximized = once(win, 'resized');
+            win.maximize();
+            await once(win, 'maximize');
+            await maximized;
+            expect(win.isMaximized() && win.getSize()[0] > 500, 'maximize');
+            const restored = once(win, 'resized');
+            win.unmaximize();
+            await once(win, 'unmaximize');
+            await restored;
+            expect(!win.isMaximized() && same(win.getSize(), [200, 150]), 'unmaximize');
+            win.minimize();
+            await once(win, 'minimize');
+            expect(win.isMinimized() && !win.isVisible(), 'minimize');
+            win.restore();
+            await once(win, 'restore');
+            expect(!win.isMinimized() && win.isVisible(), 'restore');
+            win.hide();
+            await once(win, 'hide');
+            win.show();
+            await once(win, 'show');
+            let closes = 0;
+            win.on('close', event => { if (++closes === 1) event.preventDefault(); });
+            win.close();
+            await new Promise(resolve => setTimeout(resolve, 100));
+            expect(!win.isDestroyed(), 'close prevented');
+            win.close();
+            await once(win, 'closed');
+            console.log('BROWSER_WINDOW_OK');
+            app.quit();
+        });
+    "#;
+    let bundle = serde_json::json!({"files": [
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+    ], "pages": []});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bundle.to_string().as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("BROWSER_WINDOW_OK"),
         "{stdout}\n{stderr}"
     );
 }

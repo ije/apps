@@ -1,7 +1,9 @@
 use super::{
-    WebView,
+    ViewData,
     background::css_background,
+    cull,
     paint::{DomBox, PaintLayers, Stacked, Turned, paint_layers},
+    scrollbar,
     text::{InlineText, TextHighlight, paint_text},
 };
 use crate::{
@@ -9,26 +11,37 @@ use crate::{
     dom::Document,
     style::{self, ComputedStyles},
 };
-use gpui::{
-    AnyElement, Bounds, Context, MouseButton, SharedString, div, img, point, prelude::*, px,
-    relative, rgba, size,
+use render::{
+    AnyElement, Bounds, MouseButton, SharedString, div, img, point, prelude::*, px, relative, rgba,
+    size,
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 pub(super) struct Build<'a> {
     pub(super) doc: &'a Document,
     pub(super) styles: &'a ComputedStyles,
-    pub(super) text: &'a gpui::WindowTextSystem,
+    pub(super) text: &'a render::TextSystem,
     pub(super) pixel_ratio: f32,
-    pub(super) view: &'a WebView,
+    pub(super) view: &'a Rc<ViewData>,
     pub(super) layers: PaintLayers,
-    pub(super) path: Rc<[usize]>,
+    /// The boxes from the root to the parent.
+    pub(super) ancestors: Rc<[usize]>,
+    /// Where the boxes after the stacking context root start in `ancestors`.
+    pub(super) stacking: usize,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
     pub(super) inline_text: &'a RefCell<HashMap<usize, Option<Rc<style::InlineText>>>>,
     /// The parent's `perspective` distance and `perspective-origin`.
     pub(super) perspective: Option<(f32, String)>,
+    /// The in-flow children (`false`) and list items (`true`) of a parent, with their indexes.
+    pub(super) siblings: &'a RefCell<HashMap<(usize, bool), Rc<Siblings>>>,
+    pub(super) ids: &'a Rc<super::effects::Ids>,
+    pub(super) info: &'a [cull::Info],
+    /// The visible range for culling children, or `None` where nothing is culled.
+    pub(super) zone: Option<Rc<cull::Zone>>,
 }
+
+type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
 
 pub(super) fn element(
     build: &Build<'_>,
@@ -36,7 +49,6 @@ pub(super) fn element(
     containing: [f32; 2],
     container: [f32; 2],
     slot: Option<([f32; 4], super::grid::Grid)>,
-    cx: &mut Context<WebView>,
 ) -> AnyElement {
     let Build {
         doc,
@@ -45,11 +57,16 @@ pub(super) fn element(
         pixel_ratio,
         view,
         ref layers,
-        ref path,
+        ref ancestors,
+        stacking: stack,
         flex_parent,
         measured,
         inline_text,
         perspective: ref parent_perspective,
+        siblings,
+        ids,
+        info,
+        ref zone,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -81,6 +98,7 @@ pub(super) fn element(
             .get("opacity")
             .and_then(|value| value.parse::<f32>().ok())
             .is_some_and(|value| value < 1.);
+    let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
         doc,
         styles,
@@ -89,16 +107,33 @@ pub(super) fn element(
         view,
         measured,
         inline_text,
+        siblings,
+        ids,
+        info,
+        zone: zone
+            .as_ref()
+            .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVED) == 0)
+            .and_then(|zone| {
+                if style
+                    .get("overflow-y")
+                    .is_none_or(|value| value == "visible")
+                {
+                    return Some(zone.clone());
+                }
+                let rect = *view.host.borrow().dom.get(&view.id)?.bounds.get(&id)?;
+                Some(Rc::new(cull::Zone {
+                    top: zone.top.max(rect[1]),
+                    bottom: zone.bottom.min(rect[1] + rect[3]),
+                    clips: zone.clips.iter().copied().chain([id]).collect(),
+                }))
+            }),
         layers: if stacking {
             Rc::default()
         } else {
             layers.clone()
         },
-        path: if stacking {
-            Rc::default()
-        } else {
-            path.iter().copied().chain([id]).collect()
-        },
+        stacking: if stacking { chain.len() } else { stack },
+        ancestors: chain.clone(),
         flex_parent: matches!(display, "flex" | "inline-flex"),
         perspective: style
             .get("perspective")
@@ -117,14 +152,8 @@ pub(super) fn element(
     let build = &child_build;
     let mut units = styles.lengths[id];
     units.container = Some(container);
-    let mut ancestors = vec![id];
-    let mut parent = node.parent;
-    while let Some(id) = parent {
-        ancestors.push(id);
-        parent = doc.nodes[id].parent;
-    }
-    // WARNING: element building and gpui layout recurse per level, so deep pages must not overflow the stack.
-    if ancestors.len() > 256 || style.get("display").is_some_and(|s| s == "none") {
+    // WARNING: element building and layout recurse per level, so deep pages must not overflow the stack.
+    if chain.len() > 256 || style.get("display").is_some_and(|s| s == "none") {
         return div().hidden().into_any_element();
     }
     let opacity = style
@@ -168,17 +197,26 @@ pub(super) fn element(
         .font_family(face.family)
         .font_weight(face.weight)
         .line_height(px(units.font.lh));
-    el.style().flex_shrink = Some(if flex_parent { 1. } else { 0. });
+    el.style().flex_shrink = if flex_parent { 1. } else { 0. };
     {
         let text = el.text_style();
         text.letter_spacing = Some(style::spacing(style, &units, "letter-spacing"));
         text.word_spacing = Some(style::spacing(style, &units, "word-spacing"));
+        text.font_smoothing = Some(
+            !["-webkit-font-smoothing", "-moz-osx-font-smoothing"]
+                .iter()
+                .any(|name| {
+                    style
+                        .get(*name)
+                        .is_some_and(|v| v == "antialiased" || v == "grayscale")
+                }),
+        );
         text.text_indent = Some(px(style
             .get("text-indent")
             .and_then(|value| units.resolve(value, containing[0]))
             .unwrap_or(0.)));
     }
-    if face.style != gpui::FontStyle::Normal {
+    if face.style != render::FontStyle::Normal {
         el.text_style().font_style = Some(face.style);
     }
     if node.tag == "br" {
@@ -218,8 +256,8 @@ pub(super) fn element(
     };
     let all_inline = flow && !flat.is_empty() && flat.iter().all(|&child| inline_level(child));
     let line_justify = match style.get("text-align").map(String::as_str) {
-        Some("right" | "end") => Some(gpui::JustifyContent::End),
-        Some("center" | "-webkit-center") => Some(gpui::JustifyContent::Center),
+        Some("right" | "end") => Some(render::JustifyContent::End),
+        Some("center" | "-webkit-center") => Some(render::JustifyContent::Center),
         _ => None,
     };
     let line_align = Some(
@@ -228,9 +266,9 @@ pub(super) fn element(
                 .get("vertical-align")
                 .is_some_and(|value| value == "middle")
         }) {
-            gpui::AlignItems::Center
+            render::AlignItems::Center
         } else {
-            gpui::AlignItems::Baseline
+            render::AlignItems::Baseline
         },
     );
     if all_inline || display == "inline" {
@@ -250,7 +288,7 @@ pub(super) fn element(
                 .get("height")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(150.)));
-        if let Some(image) = view.images.get(&id) {
+        if let Some(image) = view.images.borrow().get(&id) {
             el = el.child(img(image.clone()).size_full());
         }
         if let Some(image) = view
@@ -281,7 +319,7 @@ pub(super) fn element(
         if let Some(natural) = image
             .as_ref()
             .map(|image| {
-                let size = image.size(0);
+                let size = image.size();
                 [u32::from(size.width) as f32, u32::from(size.height) as f32]
             })
             .or(vector.as_ref().map(|(_, natural)| *natural))
@@ -307,37 +345,25 @@ pub(super) fn element(
                 el = el.h(px(height));
             }
             let fit = match style.get("object-fit").map(String::as_str) {
-                Some("contain") => gpui::ObjectFit::Contain,
-                Some("cover") => gpui::ObjectFit::Cover,
-                Some("none") => gpui::ObjectFit::None,
-                Some("scale-down") => gpui::ObjectFit::ScaleDown,
-                _ => gpui::ObjectFit::Fill,
+                Some("contain") => render::ObjectFit::Contain,
+                Some("cover") => render::ObjectFit::Cover,
+                Some("none") => render::ObjectFit::None,
+                Some("scale-down") => render::ObjectFit::ScaleDown,
+                _ => render::ObjectFit::Fill,
             };
             if let Some(image) = image {
-                if matches!(fit, gpui::ObjectFit::Cover | gpui::ObjectFit::None) {
+                if matches!(fit, render::ObjectFit::Cover | render::ObjectFit::None) {
                     cropped = Some((image, fit));
                 } else {
                     image_child = Some(img(image).size_full().object_fit(fit));
                 }
-            } else if let Some((source, _)) = vector {
-                el = el.child(svg_layer(source.to_string(), id, cx.entity()));
+            } else if vector.is_some() {
+                el = el.child(svg_layer(id, false, view.clone()));
             }
-        } else if let Some(path) = node.attrs.get("src").and_then(|source| {
-            let base = view
-                .host
-                .borrow()
-                .dom
-                .get(&view.id)
-                .and_then(|state| state.base.clone())?;
-            base.join(source)
-                .ok()
-                .filter(|url| url.scheme() == "file")?
-                .to_file_path()
-                .ok()
-        }) {
-            let auto = |name: &str| style.get(name).is_none_or(|value| value == "auto");
+        } else {
+            // WARNING: images that are loading or failed to decode keep only their attribute size.
             for (name, horizontal) in [("width", true), ("height", false)] {
-                if auto(name)
+                if style.get(name).is_none_or(|value| value == "auto")
                     && let Some(length) = node
                         .attrs
                         .get(name)
@@ -351,24 +377,6 @@ pub(super) fn element(
                     };
                 }
             }
-            let sized = [
-                !auto("width") || node.attrs.contains_key("width"),
-                !auto("height") || node.attrs.contains_key("height"),
-            ];
-            let image = img(path).object_fit(match style.get("object-fit").map(String::as_str) {
-                Some("contain") => gpui::ObjectFit::Contain,
-                Some("cover") => gpui::ObjectFit::Cover,
-                Some("none") => gpui::ObjectFit::None,
-                Some("scale-down") => gpui::ObjectFit::ScaleDown,
-                _ => gpui::ObjectFit::Fill,
-            });
-            el = el.overflow_hidden();
-            image_child = Some(match sized {
-                [true, true] => image.size_full(),
-                [true, false] => image.w_full(),
-                [false, true] => image.h_full(),
-                _ => image,
-            });
         }
     }
     if node.tag == "svg" {
@@ -384,20 +392,15 @@ pub(super) fn element(
             .or_else(|| node.attrs.get("height").and_then(|v| v.parse().ok()))
             .unwrap_or(24.)
             .clamp(1., 4096.);
+        let color = style.get("color").map_or("", String::as_str);
         let cached = view
             .host
             .borrow()
             .dom
             .get(&view.id)
             .and_then(|state| state.svg_sources.get(&id))
-            .filter(|(size, color, _)| {
-                *size == [width, height]
-                    && color == &style.get("color").cloned().unwrap_or_default()
-            })
-            .map(|(_, _, source)| source.clone());
-        let source = if let Some(source) = cached {
-            source
-        } else {
+            .is_some_and(|(size, old, _)| *size == [width, height] && old == color);
+        if !cached {
             let mut source = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\""
             );
@@ -446,20 +449,21 @@ pub(super) fn element(
                         .get("href")
                         .or_else(|| child.attrs.get("xlink:href"))
                         .and_then(|value| value.strip_prefix('#'))
-                    && let Some((target, _)) =
-                        doc.nodes.iter().enumerate().find(|(target, node)| {
-                            if !node.attrs.get("id").is_some_and(|value| value == reference) {
-                                return false;
-                            }
-                            let mut root = *target;
-                            while let Some(parent) = doc.nodes[root].parent {
-                                if parent == id {
-                                    return false;
-                                }
-                                root = parent;
-                            }
-                            root == scope
-                        })
+                    && let Some(target) =
+                        super::effects::index(ids, doc)
+                            .get(reference)
+                            .and_then(|targets| {
+                                targets.iter().copied().find(|&target| {
+                                    let mut root = target;
+                                    while let Some(parent) = doc.nodes[root].parent {
+                                        if parent == id {
+                                            return false;
+                                        }
+                                        root = parent;
+                                    }
+                                    root == scope
+                                })
+                            })
                     && !visited.contains(&target)
                 {
                     source.push_str(&doc.serialize(target));
@@ -471,30 +475,38 @@ pub(super) fn element(
                 source.push_str(&doc.serialize(*child));
             }
             source.push_str("</svg>");
-            source = source.replace(
-                "currentColor",
-                style.get("color").map(String::as_str).unwrap_or("black"),
-            );
-            view.host
-                .borrow_mut()
-                .dom
-                .entry(view.id)
-                .or_default()
+            // CSS keywords ignore case, and resvg does not parse every CSS color, so `currentcolor`
+            // becomes the resolved color in hex.
+            let current = style::color(style.get("color").map_or("", String::as_str))
+                .map_or("black".to_owned(), |(rgb, alpha)| {
+                    format!("#{rgb:06x}{alpha:02x}")
+                });
+            let lower = source.to_ascii_lowercase();
+            let mut end = 0;
+            let mut replaced = String::with_capacity(source.len());
+            for (start, _) in lower.match_indices("currentcolor") {
+                replaced.push_str(&source[end..start]);
+                replaced.push_str(&current);
+                end = start + "currentcolor".len();
+            }
+            replaced.push_str(&source[end..]);
+            source = replaced;
+            let mut host = view.host.borrow_mut();
+            let state = host.dom.entry(view.id).or_default();
+            // WARNING: paint only checks the raster size of inline SVGs, so a changed source drops the raster here.
+            if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
+                && let Some((_, image)) = state.svgs.remove(&id)
+            {
+                state.retired.push(image);
+            }
+            state
                 .svg_sources
-                .insert(
-                    id,
-                    (
-                        [width, height],
-                        style.get("color").cloned().unwrap_or_default(),
-                        source.clone(),
-                    ),
-                );
-            source
-        };
+                .insert(id, ([width, height], color.to_owned(), source));
+        }
         el = el
             .w(px(width))
             .h(px(height))
-            .child(svg_layer(source, id, cx.entity()));
+            .child(svg_layer(id, true, view.clone()));
     }
     if node.tag == "iframe" {
         el = el.min_w(px(300.)).min_h(px(150.));
@@ -531,10 +543,6 @@ pub(super) fn element(
         ));
     }
     if editable {
-        if !style.contains_key("width") {
-            el = el.w(px(180.));
-        }
-
         let text = node.attrs.get("value").cloned().unwrap_or_else(|| {
             if node.tag == "textarea" {
                 doc.text(id)
@@ -548,20 +556,29 @@ pub(super) fn element(
         let line_height = units.font.lh;
         let text_color = style::color(&style["color"])
             .map(|(c, a)| rgba((c << 8) | a as u32))
-            .unwrap_or(gpui::black().into());
+            .unwrap_or(render::black());
         let caret_color = style
             .get("caret-color")
             .filter(|value| !matches!(value.as_str(), "auto" | "currentColor"))
             .and_then(|value| style::color(value))
             .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
             .unwrap_or(text_color);
-        let placeholder_color = rgba(0x888888ff);
-        let entity = cx.entity();
-        el = el.cursor(gpui::CursorStyle::IBeam).child(
-            gpui::canvas(
-                |_, _, _| (),
-                move |bounds, _, window, cx| {
-                    let view = entity.read(cx);
+        // WebKit draws placeholders in darkgray unless `::placeholder` sets a color.
+        let placeholder_color = styles
+            .text_pseudos
+            .get(&id)
+            .and_then(|pseudos| style::color(pseudos[3].as_ref()?.get("color")?))
+            .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
+            .unwrap_or(rgba(0xa9a9a9ff));
+        let single_line = node.tag != "textarea";
+        // The text is drawn in the content box.
+        let padding = units.edges(style, "padding", containing[0]);
+        let entity = view.clone();
+        el = el.cursor(render::CursorStyle::IBeam).child(
+            render::canvas(
+                |_, _| (),
+                move |bounds, _, window| {
+                    let view = &*entity;
                     let host = view.host.borrow();
                     let state = host.dom.get(&view.id);
                     let selected = state.and_then(|s| s.selection.get(&id).copied());
@@ -579,15 +596,15 @@ pub(super) fn element(
                     };
                     let mut offset = 0;
                     for (row, text) in shown.split('\n').enumerate() {
-                        let run = gpui::TextRun {
+                        let run = render::TextRun {
                             len: text.len(),
                             font: face.clone(),
-                            color: color.into(),
+                            color,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
-                            letter_spacing: gpui::px(0.),
-                            word_spacing: gpui::px(0.),
+                            letter_spacing: render::px(0.),
+                            word_spacing: render::px(0.),
                             font_size: None,
                         };
                         let line = window.text_system().shape_line(
@@ -597,7 +614,13 @@ pub(super) fn element(
                             None,
                         );
                         let length = text.encode_utf16().count();
-                        let top = bounds.top() + px(row as f32 * line_height);
+                        // A single-line input centers its line, like browsers.
+                        let middle = if single_line {
+                            ((bounds.size.height - px(line_height)) / 2.).max(px(0.))
+                        } else {
+                            px(0.)
+                        };
+                        let top = bounds.top() + middle + px(row as f32 * line_height);
                         let mut highlights = Vec::new();
                         if focused
                             && let Some([start, end]) = selected
@@ -615,7 +638,7 @@ pub(super) fn element(
                             let x = line.x_for_index(left);
                             let end_x = line.x_for_index(right);
                             if start == end {
-                                window.paint_quad(gpui::fill(
+                                window.paint_quad(render::fill(
                                     Bounds::new(
                                         point(bounds.left() + x, top),
                                         size(px(1.), px(line_height)),
@@ -625,19 +648,18 @@ pub(super) fn element(
                             } else if end_x > x {
                                 highlights.push(TextHighlight {
                                     range: left..right,
-                                    color: selection_colors.0.map(|color| rgba(color).into()),
-                                    background: rgba(selection_colors.1).into(),
+                                    color: selection_colors.0.map(rgba),
+                                    background: rgba(selection_colors.1),
                                 });
                             }
                         }
                         if highlights.is_empty() {
-                            let _ = line.paint(
+                            line.paint(
                                 point(bounds.left(), top),
                                 px(line_height),
-                                gpui::TextAlign::Left,
+                                render::TextAlign::Left,
                                 None,
                                 window,
-                                cx,
                             );
                         } else {
                             paint_text(
@@ -659,7 +681,10 @@ pub(super) fn element(
                 },
             )
             .absolute()
-            .size_full(),
+            .top(px(padding[0]))
+            .right(px(padding[1]))
+            .bottom(px(padding[2]))
+            .left(px(padding[3])),
         );
     }
     if let Some((ink, alpha)) = style::color(&style["color"]) {
@@ -689,7 +714,6 @@ pub(super) fn element(
                 .get("position")
                 .is_some_and(|value| value == "absolute")
         {
-            let text = cx.text_system();
             let font = text.resolve_font(&style::font(style));
             let font_size = px(units.font.em);
             let height = text.ascent(font, font_size) - text.descent(font, font_size);
@@ -699,13 +723,16 @@ pub(super) fn element(
                 .and_then(|value| units.resolve(value, containing[0]))
                 .unwrap_or(0.));
             el = el.child(
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, _| {
+                render::canvas(
+                    |_, _| (),
+                    move |bounds, _, window| {
+                        let step = line_height.max(px(1.));
+                        let mask = window.content_mask().bounds;
                         let mut top = bounds.top() + (line_height - height) / 2.;
-                        while top < bounds.bottom() {
+                        top += step * ((mask.top() - top - height) / step).floor().max(0.);
+                        while top < bounds.bottom().min(mask.bottom()) {
                             window.paint_quad(
-                                gpui::fill(
+                                render::fill(
                                     Bounds::new(
                                         point(bounds.left(), top),
                                         size(bounds.size.width, height),
@@ -714,7 +741,7 @@ pub(super) fn element(
                                 )
                                 .corner_radii(radius),
                             );
-                            top += line_height.max(px(1.));
+                            top += step;
                         }
                     },
                 )
@@ -725,148 +752,91 @@ pub(super) fn element(
             el = el.bg(color);
         }
     }
-    let padding = units
+    // CSS: `visible` and `clip` compute to `auto` and `hidden` when the other axis scrolls or hides. The root
+    // and the body keep theirs, as the page scrolls for them.
+    let overflow =
+        ["overflow-x", "overflow-y"].map(|name| style.get(name).map_or("visible", String::as_str));
+    let page = matches!(node.tag.as_str(), "html" | "body");
+    let boxed = !page
+        && overflow
+            .iter()
+            .any(|value| !matches!(*value, "visible" | "clip"));
+    let overflow = overflow.map(|value| match value {
+        "auto" | "scroll" => render::Overflow::Scroll,
+        "hidden" => render::Overflow::Hidden,
+        "clip" if boxed => render::Overflow::Hidden,
+        "clip" => render::Overflow::Clip,
+        _ if boxed => render::Overflow::Scroll,
+        _ => render::Overflow::Visible,
+    });
+    if overflow != [render::Overflow::Visible; 2] {
+        el.style().overflow.x = overflow[0];
+        el.style().overflow.y = overflow[1];
+    }
+    let scrolls = overflow.map(|axis| axis == render::Overflow::Scroll);
+    let look = if scrolls.contains(&true) {
+        scrollbar::Look::new(
+            style,
+            styles.scrollbars.get(&id).map(|parts| &**parts),
+            &units,
+            chain.iter().rev().find_map(|&id| {
+                let (ink, alpha) = style::color(styles.values[id].get("background-color")?)?;
+                (alpha >= 128).then_some(ink)
+            }),
+        )
+        .map(|mut look| {
+            if page {
+                look.forced = [false; 2];
+            }
+            look
+        })
+    } else {
+        None
+    };
+    // Custom bars take their space when last frame's box overflowed.
+    let reserved = look.as_ref().map_or([0.; 2], |look| {
+        let max = view
+            .host
+            .borrow()
+            .dom
+            .get(&view.id)
+            .and_then(|dom| dom.scroll.get(&id))
+            .map(render::ScrollHandle::max_offset)
+            .unwrap_or_default();
+        look.space(look.shown(scrolls, max))
+    });
+    let mut padding = units
         .edges(style, "padding", containing[0])
         .map(|value| value.max(0.));
+    padding[1] += reserved[1];
+    padding[2] += reserved[0];
     el = el
         .pt(px(padding[0]))
         .pr(px(padding[1]))
         .pb(px(padding[2]))
         .pl(px(padding[3]));
-    let mut margin = units.edges(style, "margin", containing[0]);
-    let edge = |id: usize, name: &str| {
-        styles.values[id]
-            .get(name)
-            .and_then(|value| styles.lengths[id].resolve(value, containing[0]))
-            .unwrap_or(0.)
-    };
-    let in_flow = |id: usize| {
-        let (node, style) = (&doc.nodes[id], &styles.values[id]);
-        node.tag != "#comment"
-            && !(node.tag == "#text" && node.text.trim().is_empty())
-            && style.get("display").is_none_or(|value| value != "none")
-            && style
-                .get("position")
-                .is_none_or(|value| !matches!(value.as_str(), "absolute" | "fixed"))
-    };
-    let block = |id: usize| {
-        !doc.nodes[id].tag.starts_with('#')
-            && styles.values[id]
-                .get("display")
-                .is_some_and(|value| !value.starts_with("inline") && value != "contents")
-    };
-    // WARNING: margins only collapse through plain block boxes; flex/grid items and scroll containers keep their own.
-    let collapses = |id: usize, side: usize| {
-        let style = &styles.values[id];
-        let [padding, border, kind] = if side == 0 {
-            ["padding-top", "border-top-width", "border-top-style"]
-        } else {
-            [
-                "padding-bottom",
-                "border-bottom-width",
-                "border-bottom-style",
-            ]
-        };
-        id != 0
-            && doc.nodes[id].tag != "html"
-            && doc.nodes[id].parent.is_none_or(|parent| {
-                !styles.values[parent].get("display").is_some_and(|value| {
-                    matches!(
-                        value.as_str(),
-                        "flex" | "inline-flex" | "grid" | "inline-grid"
-                    )
-                })
-            })
-            && style
-                .get("display")
-                .is_some_and(|value| matches!(value.as_str(), "block" | "list-item"))
-            && ["overflow-x", "overflow-y"]
-                .iter()
-                .all(|key| style.get(*key).is_none_or(|value| value == "visible"))
-            && style
-                .get("position")
-                .is_none_or(|value| !matches!(value.as_str(), "absolute" | "fixed"))
-            && edge(id, padding) == 0.
-            && (edge(id, border) == 0.
-                || style
-                    .get(kind)
-                    .is_none_or(|value| matches!(value.as_str(), "none" | "hidden")))
-            && (side == 0 || style.get("height").is_none_or(|value| value == "auto"))
-    };
-    if block(id)
-        && in_flow(id)
-        && slot.is_none()
-        && !flex_parent
-        && let Some(parent) = node.parent
-    {
-        let siblings: Vec<usize> = doc.nodes[parent]
-            .children
-            .iter()
-            .copied()
-            .filter(|&child| in_flow(child))
-            .collect();
-        let index = siblings.iter().position(|&child| child == id);
-        if let Some(previous) = index
-            .and_then(|index| index.checked_sub(1))
-            .map(|index| siblings[index])
-            .filter(|&previous| block(previous))
-        {
-            let (a, b) = (margin[0], edge(previous, "margin-bottom"));
-            margin[0] = if a >= 0. && b >= 0. {
-                a.max(b)
-            } else if a < 0. && b < 0. {
-                a.min(b)
-            } else {
-                a + b
-            } - b;
-        }
-        if index == Some(0)
-            && margin[0] >= 0.
-            && edge(parent, "margin-top") >= 0.
-            && collapses(parent, 0)
-        {
-            margin[0] = 0.;
-        }
-        if index.is_some_and(|index| index + 1 == siblings.len())
-            && margin[2] >= 0.
-            && edge(parent, "margin-bottom") >= 0.
-            && collapses(parent, 2)
-        {
-            margin[2] = 0.;
-        }
-    }
-    let children: Vec<usize> = node
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| in_flow(child))
-        .collect();
-    if let Some(&first) = children
-        .first()
-        .filter(|&&first| block(first) && margin[0] >= 0. && collapses(id, 0))
-    {
-        margin[0] = margin[0].max(edge(first, "margin-top"));
-    }
-    if let Some(&last) = children
-        .last()
-        .filter(|&&last| block(last) && margin[2] >= 0. && collapses(id, 2))
-    {
-        margin[2] = margin[2].max(edge(last, "margin-bottom"));
-    }
+    let margin = margins(
+        build,
+        id,
+        &units,
+        containing[0],
+        flex_parent,
+        slot.is_some(),
+    );
     el = el
         .mt(px(margin[0]))
         .mr(px(margin[1]))
         .mb(px(margin[2]))
         .ml(px(margin[3]));
-    for side in ["top", "right", "bottom", "left"] {
-        if style
-            .get(&format!("margin-{side}"))
-            .is_some_and(|s| s == "auto")
-        {
+    for (side, name) in ["margin-top", "margin-right", "margin-bottom", "margin-left"]
+        .into_iter()
+        .enumerate()
+    {
+        if style.get(name).is_some_and(|s| s == "auto") {
             el = match side {
-                "top" => el.mt_auto(),
-                "right" => el.mr_auto(),
-                "bottom" => el.mb_auto(),
+                0 => el.mt_auto(),
+                1 => el.mr_auto(),
+                2 => el.mb_auto(),
                 _ => el.ml_auto(),
             };
         }
@@ -931,18 +901,18 @@ pub(super) fn element(
         {
             el = el.border_color(border_colors[first]);
         } else {
-            el = el.border_color(gpui::transparent_black());
+            el = el.border_color(render::transparent_black());
         }
         if visible
             .iter()
             .all(|&side| border_kinds[side] == border_kinds[first])
         {
-            el.style().border_style = Some(border_style(border_kinds[first]));
+            el.style().border_style = border_style(border_kinds[first]);
         } else if visible
             .iter()
             .any(|&side| matches!(border_kinds[side], "dashed" | "dotted"))
         {
-            el.style().border_style = Some(gpui::BorderStyle::Dashed);
+            el.style().border_style = render::BorderStyle::Dashed;
         }
     }
     let extra = if style
@@ -952,16 +922,98 @@ pub(super) fn element(
         [0.; 2]
     } else {
         [
-            padding[1] + padding[3] + borders[1] + borders[3],
-            padding[0] + padding[2] + borders[0] + borders[2],
+            padding[1] + padding[3] + borders[1] + borders[3] - reserved[1],
+            padding[0] + padding[2] + borders[0] + borders[2] - reserved[0],
         ]
     };
-    if editable && style.get("height").is_none_or(|value| value == "auto") {
-        el = el.min_h(px(if node.tag == "textarea" {
-            2. * units.font.lh
-        } else {
-            units.font.lh
-        } + extra[1]));
+    if editable {
+        // Fields size their content like WebKit, then add padding and borders whatever `box-sizing` is.
+        let chrome = [
+            padding[1] + padding[3] + borders[1] + borders[3],
+            padding[0] + padding[2] + borders[0] + borders[2],
+        ];
+        let textarea = node.tag == "textarea";
+        let count = |name, default| {
+            node.attrs
+                .get(name)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|&value| value > 0)
+                .unwrap_or(default) as f32
+        };
+        if style.get("width").is_none_or(|v| v == "auto") {
+            let face = style::font(style);
+            let em = px(units.font.em);
+            let width = if style.get("field-sizing").is_some_and(|v| v == "content") {
+                // The box fits its text, or the placeholder while empty, plus the caret.
+                let shown = node
+                    .attrs
+                    .get("value")
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| node.attrs.get("placeholder"))
+                    .cloned()
+                    .unwrap_or_default();
+                shown
+                    .split('\n')
+                    .map(|line| {
+                        let run = render::TextRun {
+                            len: line.len(),
+                            font: face.clone(),
+                            color: render::black(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                            letter_spacing: px(0.),
+                            word_spacing: px(0.),
+                            font_size: None,
+                        };
+                        f32::from(
+                            text.shape_line(line.to_owned().into(), em, &[run], None)
+                                .width,
+                        )
+                    })
+                    .fold(0., f32::max)
+                    + 1.
+            } else {
+                // `size` or `cols` characters. System fonts and fonts with a bad OS/2 table use the width
+                // of `0`; other fonts use the OS/2 average, and inputs add the widest glyph's extra width.
+                let family = style
+                    .get("font-family")
+                    .and_then(|value| value.split(',').next())
+                    .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+                    .unwrap_or_default();
+                let id = text.resolve_font(&face);
+                let zero = text
+                    .ch_advance(id, em)
+                    .map_or(units.font.em / 2., f32::from);
+                let average = f32::from(text.average_width(id, em));
+                let (char_width, extra) = if family.starts_with("ui-")
+                    || "|system-ui|-apple-system|blinkmacsystemfont|american typewriter|arial hebrew|\
+                        chalkboard|cochin|corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|\
+                        helvetica|hoefler text|inaimathi|kai|lucida grande|marker felt|monaco|mshtakan|\
+                        new peninim mt|osaka|raanana|stheiti|symbol|times|apple braille|apple ligothic|\
+                        apple lisung|apple symbols|applegothic|applemyungjo|#gungseo|#headlinea|\
+                        #pcmyungjo|#pilgi|"
+                        .contains(&format!("|{family}|"))
+                {
+                    (zero, 0.)
+                } else {
+                    let average = if average > 0. { average } else { zero }.round();
+                    let widest = f32::from(text.bounding_box(id, em).size.width).round();
+                    (average, if textarea { 0. } else { widest - average })
+                };
+                if textarea {
+                    (char_width * count("cols", 20)).ceil()
+                } else {
+                    // The inner text box has 1px padding on each side.
+                    (char_width * count("size", 20) * 64.).ceil() / 64. + extra + 2.
+                }
+            };
+            el = el.w(px(width + chrome[0]));
+        }
+        if style.get("height").is_none_or(|value| value == "auto") {
+            let rows = if textarea { count("rows", 2) } else { 1. };
+            el = el.min_h(px(rows * units.font.lh + chrome[1]));
+        }
     }
     let flexbox = matches!(display, "flex" | "inline-flex");
     let position = style.get("position").map_or("static", String::as_str);
@@ -978,7 +1030,7 @@ pub(super) fn element(
         match name.as_str() {
             "width" | "height" | "min-width" | "max-width" | "min-height" | "max-height" => {
                 let axis = usize::from(vertical);
-                let length: gpui::Length = if let Some(percent) = value
+                let length: render::Length = if let Some(percent) = value
                     .strip_suffix('%')
                     .and_then(|s| s.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
@@ -986,14 +1038,14 @@ pub(super) fn element(
                     if extra[axis] > 0. && base > 0. {
                         px(percent.max(0.) / 100. * base + extra[axis]).into()
                     } else {
-                        relative(percent.max(0.) / 100.).into()
+                        relative(percent.max(0.) / 100.)
                     }
                 } else if let Some(length) = length() {
                     px(length.max(0.) + extra[axis]).into()
                 } else if matches!(name.as_str(), "width" | "height") && value == "auto" {
-                    gpui::Length::Auto
+                    render::Length::Auto
                 } else if matches!(value, "stretch" | "-webkit-fill-available") {
-                    relative(1.).into()
+                    relative(1.)
                 } else if matches!(value, "fit-content" | "max-content" | "min-content")
                     && axis == 0
                 {
@@ -1060,7 +1112,7 @@ pub(super) fn element(
                 };
             }
             "box-shadow" => {
-                el.style().box_shadow = Some(units.shadows(value, false));
+                el.style().box_shadow = units.shadows(value, false);
                 inner_shadows = units.shadows(value, true);
             }
             "aspect-ratio" => {
@@ -1079,19 +1131,19 @@ pub(super) fn element(
             "display" if matches!(value, "grid" | "inline-grid") => el = el.grid(),
             "display" if matches!(value, "flex" | "inline-flex") => el = el.flex().flex_row(),
             "flex-direction" if flexbox => {
-                el.style().flex_direction = Some(match value {
-                    "row-reverse" => gpui::FlexDirection::RowReverse,
-                    "column" => gpui::FlexDirection::Column,
-                    "column-reverse" => gpui::FlexDirection::ColumnReverse,
-                    _ => gpui::FlexDirection::Row,
-                })
+                el.style().flex_direction = match value {
+                    "row-reverse" => render::FlexDirection::RowReverse,
+                    "column" => render::FlexDirection::Column,
+                    "column-reverse" => render::FlexDirection::ColumnReverse,
+                    _ => render::FlexDirection::Row,
+                }
             }
             "flex-wrap" if flexbox => {
-                el.style().flex_wrap = Some(match value {
-                    "wrap" => gpui::FlexWrap::Wrap,
-                    "wrap-reverse" => gpui::FlexWrap::WrapReverse,
-                    _ => gpui::FlexWrap::NoWrap,
-                })
+                el.style().flex_wrap = match value {
+                    "wrap" => render::FlexWrap::Wrap,
+                    "wrap-reverse" => render::FlexWrap::WrapReverse,
+                    _ => render::FlexWrap::NoWrap,
+                }
             }
             "flex-grow" | "flex-shrink" => {
                 if let Some(factor) = value
@@ -1100,34 +1152,38 @@ pub(super) fn element(
                     .filter(|v| v.is_finite() && *v >= 0.)
                 {
                     if name == "flex-grow" {
-                        el.style().flex_grow = Some(factor);
+                        el.style().flex_grow = factor;
                     } else {
-                        el.style().flex_shrink = Some(factor);
+                        el.style().flex_shrink = factor;
                     }
                 }
             }
             "flex-basis" => {
-                el.style().flex_basis = Some(
-                    if let Some(percent) = value
-                        .strip_suffix('%')
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .filter(|v| v.is_finite())
-                    {
-                        relative(percent.max(0.) / 100.).into()
-                    } else if let Some(length) = length() {
-                        px(length.max(0.) + extra[0]).into()
-                    } else {
-                        gpui::Length::Auto
-                    },
-                )
+                el.style().flex_basis = if let Some(percent) = value
+                    .strip_suffix('%')
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite())
+                {
+                    relative(percent.max(0.) / 100.)
+                } else if let Some(length) = length() {
+                    // The basis runs along the parent's main axis.
+                    let column = node.parent.is_some_and(|parent| {
+                        styles.values[parent]
+                            .get("flex-direction")
+                            .is_some_and(|v| v.starts_with("column"))
+                    });
+                    px(length.max(0.) + extra[usize::from(column)]).into()
+                } else {
+                    render::Length::Auto
+                };
             }
             "align-items" | "align-self" if flex_parent || flexbox => {
                 let align = match value {
-                    "center" => gpui::AlignItems::Center,
-                    "flex-start" | "start" | "self-start" => gpui::AlignItems::FlexStart,
-                    "flex-end" | "end" | "self-end" => gpui::AlignItems::FlexEnd,
-                    "baseline" | "first baseline" | "last baseline" => gpui::AlignItems::Baseline,
-                    "stretch" | "normal" => gpui::AlignItems::Stretch,
+                    "center" => render::AlignItems::Center,
+                    "flex-start" | "start" | "self-start" => render::AlignItems::FlexStart,
+                    "flex-end" | "end" | "self-end" => render::AlignItems::FlexEnd,
+                    "baseline" | "first baseline" | "last baseline" => render::AlignItems::Baseline,
+                    "stretch" | "normal" => render::AlignItems::Stretch,
                     _ => continue,
                 };
                 if name == "align-self" {
@@ -1138,13 +1194,13 @@ pub(super) fn element(
             }
             "align-content" | "justify-content" if flexbox => {
                 let align = match value {
-                    "center" => gpui::AlignContent::Center,
-                    "flex-end" | "end" | "right" => gpui::AlignContent::FlexEnd,
-                    "space-between" => gpui::AlignContent::SpaceBetween,
-                    "space-around" => gpui::AlignContent::SpaceAround,
-                    "space-evenly" => gpui::AlignContent::SpaceEvenly,
-                    "stretch" => gpui::AlignContent::Stretch,
-                    _ => gpui::AlignContent::FlexStart,
+                    "center" => render::AlignContent::Center,
+                    "flex-end" | "end" | "right" => render::AlignContent::FlexEnd,
+                    "space-between" => render::AlignContent::SpaceBetween,
+                    "space-around" => render::AlignContent::SpaceAround,
+                    "space-evenly" => render::AlignContent::SpaceEvenly,
+                    "stretch" => render::AlignContent::Stretch,
+                    _ => render::AlignContent::FlexStart,
                 };
                 if name == "justify-content" {
                     el.style().justify_content = Some(align);
@@ -1161,12 +1217,12 @@ pub(super) fn element(
             }
             "position" if matches!(value, "absolute" | "fixed") => el = el.absolute(),
             "left" | "right" | "top" | "bottom" if matches!(position, "relative" | "absolute") => {
-                let length: gpui::Length = if let Some(percent) = value
+                let length: render::Length = if let Some(percent) = value
                     .strip_suffix('%')
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    relative(percent / 100.).into()
+                    relative(percent / 100.)
                 } else if let Some(length) = length() {
                     px(length).into()
                 } else {
@@ -1180,28 +1236,25 @@ pub(super) fn element(
                 };
             }
             "visibility" => {
-                el.style().visibility = Some(if value == "hidden" || value == "collapse" {
-                    gpui::Visibility::Hidden
+                el.style().visibility = if value == "hidden" || value == "collapse" {
+                    render::Visibility::Hidden
                 } else {
-                    gpui::Visibility::Visible
-                })
+                    render::Visibility::Visible
+                }
             }
             "opacity" if effect_layer.is_none() => el = el.opacity(opacity),
             "white-space" if matches!(value, "nowrap" | "pre") => {
                 el = el.whitespace_nowrap().flex_nowrap()
             }
-            "overflow-x" | "overflow-y" => {
-                let overflow = match value {
-                    "auto" | "scroll" => gpui::Overflow::Scroll,
-                    "hidden" => gpui::Overflow::Hidden,
-                    "clip" => gpui::Overflow::Clip,
-                    _ => gpui::Overflow::Visible,
-                };
-                if name == "overflow-x" {
-                    el.style().overflow.x = Some(overflow);
+            "text-wrap" if value.contains("nowrap") => el = el.whitespace_nowrap().flex_nowrap(),
+            "text-wrap" => {
+                el.text_style().text_wrap = Some(if value.contains("balance") {
+                    render::TextWrap::Balance
+                } else if value.contains("pretty") {
+                    render::TextWrap::Pretty
                 } else {
-                    el.style().overflow.y = Some(overflow);
-                }
+                    render::TextWrap::Wrap
+                })
             }
             "cursor" => {
                 if let Some(cursor) = style::cursor(value) {
@@ -1221,9 +1274,9 @@ pub(super) fn element(
             .get("vertical-align")
             .map_or("baseline", String::as_str);
         el.style().align_self = match align {
-            "middle" => Some(gpui::AlignItems::Center),
-            "top" | "text-top" => Some(gpui::AlignItems::FlexStart),
-            "bottom" => Some(gpui::AlignItems::FlexEnd),
+            "middle" => Some(render::AlignItems::Center),
+            "top" | "text-top" => Some(render::AlignItems::FlexStart),
+            "bottom" => Some(render::AlignItems::FlexEnd),
             _ => None,
         };
         let below = |style: &style::Style, font: style::FontUnits| {
@@ -1252,20 +1305,31 @@ pub(super) fn element(
                     doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty()
                 });
         let field = editable && node.tag == "input";
-        // WARNING: line boxes align text bottoms, so boxes without text are lifted by the parent's descent and half-leading.
-        let lift =
-            if (replaced || field) && el.style().align_self.is_none() && align != "text-bottom" {
-                below(&styles.values[parent], line)
-                    - if field {
-                        padding[2] + borders[2] + below(style, units.font)
-                    } else {
-                        0.
-                    }
+        // WARNING: line boxes align box bottoms, so boxes are lifted until their baseline meets the parent's.
+        let lift = if el.style().align_self.is_none() && align != "text-bottom" {
+            let parent = below(&styles.values[parent], line);
+            if replaced {
+                parent
+            } else if field {
+                parent - padding[2] - borders[2] - below(style, units.font)
+            } else if display == "inline" {
+                parent - below(style, units.font)
             } else {
                 0.
-            };
+            }
+        } else {
+            0.
+        };
+        // Relative offsets apply after line layout, so they add to the shift. Percentages keep their own inset.
+        let inset = |key| style.get(key).filter(|value| *value != "auto");
+        let offset = match (inset("top"), inset("bottom")) {
+            _ if position != "relative" => Some(0.),
+            (Some(top), _) => units.resolve(top, f32::NAN),
+            (None, Some(bottom)) => units.resolve(bottom, f32::NAN).map(|bottom| -bottom),
+            (None, None) => Some(0.),
+        };
         let raise = match align {
-            _ if style.contains_key("top") || style.contains_key("bottom") => 0.,
+            _ if offset.is_none() => 0.,
             "super" => line.em / 3. + lift,
             "sub" => -line.em / 5. + lift,
             "baseline" => lift,
@@ -1273,9 +1337,14 @@ pub(super) fn element(
         };
         // WARNING: the margin reserves the shift so the line box grows instead of overlapping its neighbors.
         if raise > 0. {
-            el = el.mt(px(margin[0] + raise)).top(px(-raise));
+            el = el.mt(px(margin[0] + raise));
         } else if raise < 0. {
-            el = el.mb(px(margin[2] - raise)).top(px(-raise));
+            el = el.mb(px(margin[2] - raise));
+        }
+        if let Some(offset) = offset
+            && (raise != 0. || offset != 0.)
+        {
+            el = el.top(px(offset - raise));
         }
     }
     if style
@@ -1294,7 +1363,7 @@ pub(super) fn element(
             id,
             0,
             radius,
-            cx.entity(),
+            view.clone(),
             base.as_ref(),
             &view.host.borrow().assets,
         ));
@@ -1321,13 +1390,13 @@ pub(super) fn element(
                     .rounded_bl(px(corners[3])),
             );
         } else if let Some((image, fit)) = cropped {
-            let view = cx.entity();
-            // WARNING: gpui rounds the fitted image bounds, so overflowing fits paint a cached crop of the visible part.
+            let view = view.clone();
+            // WARNING: the renderer rounds the fitted image bounds, so overflowing fits paint a cached crop of the visible part.
             el = el.child(
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        let natural = image.size(0);
+                render::canvas(
+                    |_, _| (),
+                    move |bounds, _, window| {
+                        let natural = image.size();
                         let [width, height] = [u32::from(natural.width), u32::from(natural.height)];
                         let fitted = fit.get_bounds(bounds, natural);
                         let visible = fitted.intersect(&bounds);
@@ -1359,7 +1428,7 @@ pub(super) fn element(
                         let shown = if crop == [0, 0, width, height] {
                             Some(image.clone())
                         } else {
-                            let view = view.read(cx);
+                            let view = &*view;
                             let mut host = view.host.borrow_mut();
                             let state = host.dom.entry(view.id).or_default();
                             let key = {
@@ -1370,7 +1439,7 @@ pub(super) fn element(
                             };
                             match state.image_crops.get(&id) {
                                 Some((cached, shown)) if *cached == key => Some(shown.clone()),
-                                _ => image.as_bytes(0).map(|bytes| {
+                                _ => Some(image.bytes()).map(|bytes| {
                                     let pixels = image::RgbaImage::from_fn(
                                         crop[2],
                                         crop[3],
@@ -1386,28 +1455,29 @@ pub(super) fn element(
                                             ])
                                         },
                                     );
-                                    let shown =
-                                        Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-                                            pixels,
-                                        )]));
+                                    let shown = Arc::new(render::RenderImage::new(
+                                        pixels.width(),
+                                        pixels.height(),
+                                        pixels.into_raw(),
+                                    ));
                                     if let Some((_, old)) =
                                         state.image_crops.insert(id, (key, shown.clone()))
                                     {
-                                        let _ = window.drop_image(old);
+                                        window.drop_image(old);
                                     }
                                     shown
                                 }),
                             }
                         };
                         if let Some(shown) = shown {
-                            let corners = gpui::Corners {
+                            let corners = render::Corners {
                                 top_left: px(corners[0]),
                                 top_right: px(corners[1]),
                                 bottom_right: px(corners[2]),
                                 bottom_left: px(corners[3]),
                             }
                             .clamp_radii_for_quad_size(visible.size);
-                            let _ = window.paint_image(visible, visible, corners, shown, 0, false);
+                            window.paint_image(visible, visible, corners, shown, false);
                         }
                     },
                 )
@@ -1426,18 +1496,14 @@ pub(super) fn element(
                 && style
                     .get("white-space")
                     .is_some_and(|value| matches!(value.as_str(), "nowrap" | "pre"))
-                && el
-                    .style()
-                    .overflow
-                    .x
-                    .is_some_and(|overflow| overflow != gpui::Overflow::Visible))
-            .then_some(1)
+                && el.style().overflow.x != render::Overflow::Visible)
+                .then_some(1)
         })
     {
         let text = el.text_style();
-        text.white_space = Some(gpui::WhiteSpace::Normal);
+        text.white_space = Some(render::WhiteSpace::Normal);
         text.line_clamp = Some(lines.max(1));
-        text.text_overflow = Some(gpui::TextOverflow::Truncate("…".into()));
+        text.text_overflow = Some("…".into());
     }
     if position == "fixed" {
         let viewport = units.viewport;
@@ -1490,9 +1556,8 @@ pub(super) fn element(
             .rounded_tr(px(radius[1] + grow))
             .rounded_br(px(radius[2] + grow))
             .rounded_bl(px(radius[3] + grow));
-        outline.style().border_style = Some(border_style(
-            style.get("outline-style").map_or("solid", String::as_str),
-        ));
+        outline.style().border_style =
+            border_style(style.get("outline-style").map_or("solid", String::as_str));
         el = el.child(outline);
     }
     if shaded
@@ -1501,13 +1566,13 @@ pub(super) fn element(
             .any(|&side| border_colors[side] != border_colors[visible[0]])
     {
         // Each side is painted alone; 3D styles shade it, and groove and ridge split it in two halves.
-        let mut bands = vec![([0.; 4], borders, [gpui::transparent_black(); 4])];
+        let mut bands = vec![([0.; 4], borders, [render::transparent_black(); 4])];
         let split = (0..4).any(|side| matches!(border_kinds[side], "groove" | "ridge"));
         if split {
-            bands.push(([0.; 4], [0.; 4], [gpui::transparent_black(); 4]));
+            bands.push(([0.; 4], [0.; 4], [render::transparent_black(); 4]));
         }
         for side in 0..4 {
-            let color = gpui::Hsla::from(border_colors[side]);
+            let color = border_colors[side];
             let raised = side == 0 || side == 3;
             let (outer, inner) = match border_kinds[side] {
                 "inset" => (shade_border(color, raised), None),
@@ -1542,9 +1607,9 @@ pub(super) fn element(
         }
         let kinds = border_kinds.map(border_style);
         el = el.child(
-            gpui::canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| {
+            render::canvas(
+                |_, _| (),
+                move |bounds, _, window| {
                     let outer = Bounds::new(
                         point(
                             bounds.left() - px(borders[3]),
@@ -1563,23 +1628,24 @@ pub(super) fn element(
                         let shrink = |corner: usize, a: usize, b: usize| {
                             px((radius[corner] - inset[a].max(inset[b])).max(0.))
                         };
-                        let corners = gpui::Corners {
+                        let corners = render::Corners {
                             top_left: shrink(0, 0, 3),
                             top_right: shrink(1, 0, 1),
                             bottom_right: shrink(2, 2, 1),
                             bottom_left: shrink(3, 2, 3),
-                        };
+                        }
+                        .clamp_radii_for_quad_size(bounds.size);
                         for side in 0..4 {
                             if widths[side] <= 0. {
                                 continue;
                             }
                             let mut edges = [px(0.); 4];
                             edges[side] = px(widths[side]);
-                            window.paint_quad(gpui::quad(
+                            window.paint_quad(render::quad(
                                 bounds,
                                 corners,
-                                gpui::transparent_black(),
-                                gpui::Edges {
+                                render::transparent_black(),
+                                render::Edges {
                                     top: edges[0],
                                     right: edges[1],
                                     bottom: edges[2],
@@ -1623,28 +1689,34 @@ pub(super) fn element(
                 },
             );
     }
-    if el.style().overflow.x == Some(gpui::Overflow::Scroll)
-        || el.style().overflow.y == Some(gpui::Overflow::Scroll)
-    {
-        let scroll = view
-            .host
-            .borrow_mut()
-            .dom
-            .entry(view.id)
-            .or_default()
-            .scroll
-            .entry(id)
-            .or_default()
-            .clone();
-        el = el.track_scroll(&scroll);
-        el.style().restrict_scroll_to_axis = Some(true);
-        el = el.child(
-            div()
-                .absolute()
-                .left(px(padding[3] - borders[1] - borders[3]))
-                .top(px(padding[0] - borders[0] - borders[2]))
-                .size(px(0.)),
-        );
+    // WARNING: `overflow: hidden` boxes track a scroll handle only once a script scrolls them.
+    let handle = {
+        let mut host = view.host.borrow_mut();
+        let scroll = &mut host.dom.entry(view.id).or_default().scroll;
+        if scrolls.contains(&true) {
+            Some(scroll.entry(id).or_default().clone())
+        } else if overflow.contains(&render::Overflow::Hidden) {
+            scroll.get(&id).cloned()
+        } else {
+            None
+        }
+    };
+    let mut bars = None;
+    if let Some(handle) = handle {
+        el = el.track_scroll(&handle);
+        el.style().restrict_scroll_to_axis = true;
+        bars = Some(scrollbar::Scrollbar {
+            id,
+            handle,
+            look,
+            axes: scrolls,
+            reserved,
+            borders,
+            origin: [
+                padding[3] - borders[1] - borders[3],
+                padding[0] - borders[0] - borders[2],
+            ],
+        });
     }
     let marker_style = styles
         .text_pseudos
@@ -1660,18 +1732,32 @@ pub(super) fn element(
             .filter(|kind| kind.as_str() != "none" || content.is_some())
     {
         let list = node.parent.map(|parent| &doc.nodes[parent]);
-        let items: Vec<usize> = list.map_or(vec![id], |list| {
-            list.children
-                .iter()
-                .copied()
-                .filter(|&child| {
-                    styles.values[child]
-                        .get("display")
-                        .is_some_and(|value| value == "list-item")
+        let items = node.parent.map(|parent| {
+            siblings
+                .borrow_mut()
+                .entry((parent, true))
+                .or_insert_with(|| {
+                    let items: Vec<usize> = doc.nodes[parent]
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|&child| {
+                            styles.values[child]
+                                .get("display")
+                                .is_some_and(|value| value == "list-item")
+                        })
+                        .collect();
+                    let index = items.iter().enumerate().map(|(index, &item)| (item, index));
+                    let index = index.collect();
+                    Rc::new((items, index))
                 })
-                .collect()
+                .clone()
         });
-        let position = items.iter().position(|&item| item == id).unwrap_or(0) as i64;
+        let position = items
+            .as_ref()
+            .and_then(|items| items.1.get(&id).copied())
+            .unwrap_or(0) as i64;
+        let count = items.as_ref().map_or(1, |items| items.0.len()) as i64;
         let start = list
             .and_then(|list| list.attrs.get("start"))
             .and_then(|value| value.parse::<i64>().ok());
@@ -1681,7 +1767,7 @@ pub(super) fn element(
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(
                 if list.is_some_and(|list| list.attrs.contains_key("reversed")) {
-                    start.unwrap_or(items.len() as i64) - position
+                    start.unwrap_or(count) - position
                 } else {
                     start.unwrap_or(1) + position
                 },
@@ -1918,13 +2004,13 @@ pub(super) fn element(
                 let vertical =
                     name.ends_with("height") || matches!(name.as_str(), "top" | "bottom");
                 let base = containing[usize::from(vertical)];
-                let length = || -> Option<gpui::Length> {
+                let length = || -> Option<render::Length> {
                     match value
                         .strip_suffix('%')
                         .and_then(|v| v.parse::<f32>().ok())
                         .filter(|v| v.is_finite())
                     {
-                        Some(percent) => Some(relative(percent / 100.).into()),
+                        Some(percent) => Some(relative(percent / 100.)),
                         None => pseudo_units
                             .resolve(value, base)
                             .map(|value| px(value).into()),
@@ -1983,7 +2069,7 @@ pub(super) fn element(
                         }
                     }
                     "box-shadow" => {
-                        decoration.style().box_shadow = Some(pseudo_units.shadows(value, false));
+                        decoration.style().box_shadow = pseudo_units.shadows(value, false);
                         pseudo_shadows = pseudo_units.shadows(value, true);
                     }
                     _ => {}
@@ -2005,7 +2091,7 @@ pub(super) fn element(
                     id,
                     index + 1,
                     [0.; 4],
-                    cx.entity(),
+                    view.clone(),
                     base.as_ref(),
                     &view.host.borrow().assets,
                 ));
@@ -2030,7 +2116,7 @@ pub(super) fn element(
                     inner: Some(decoration.into_any_element()),
                     layers: build.layers.clone(),
                     order,
-                    path: build.path.clone(),
+                    path: build.ancestors[build.stacking..].into(),
                 }
                 .into_any_element()
             } else {
@@ -2067,11 +2153,13 @@ pub(super) fn element(
             .clone()
     };
     let hit_test = inline.is_some();
+    let drag = style.get("app-region").is_some_and(|value| value == "drag");
     if (hit_test || node.tag == "#text")
+        && !drag
         && styles.user_select[id].0 != style::UserSelect::None
         && style.get("cursor").is_none_or(|value| value == "auto")
     {
-        el = el.cursor(gpui::CursorStyle::IBeam);
+        el = el.cursor(render::CursorStyle::IBeam);
     }
     if let Some(data) = inline {
         if style
@@ -2100,7 +2188,7 @@ pub(super) fn element(
                 .containers
                 .insert(id, size);
         }
-        let inner = gpui::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
+        let inner = render::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
         el = el.child(
             div()
                 .min_w(px(0.))
@@ -2109,9 +2197,9 @@ pub(super) fn element(
                 .child(InlineText {
                     inner,
                     data,
-                    view: cx.entity(),
+                    view: view.clone(),
                     runs: None,
-                    measured: false,
+                    measured: None,
                     justify: style
                         .get("text-align")
                         .is_some_and(|value| value == "justify")
@@ -2198,6 +2286,50 @@ pub(super) fn element(
         } else {
             container
         };
+        // A flexed grid gets its height from the flex layout, which runs after this. Its
+        // tracks use the height from the last layout, and prepaint renders again on change.
+        let flexed = style.get("display").is_some_and(|v| v.ends_with("grid"))
+            && slot.is_none()
+            && style.get("height").is_none_or(|v| v == "auto")
+            && node.parent.is_some_and(|parent| {
+                let parent = &styles.values[parent];
+                parent.get("display").is_some_and(|v| v.ends_with("flex"))
+                    && parent
+                        .get("flex-direction")
+                        .is_some_and(|v| v.starts_with("column"))
+            })
+            && (style
+                .get("flex-grow")
+                .and_then(|v| v.parse::<f32>().ok())
+                .is_some_and(|v| v > 0.)
+                || style
+                    .get("flex-basis")
+                    .is_some_and(|v| v != "auto" && v != "content"));
+        // An auto width grid in a box sized by its content, like a row flex item, gets its
+        // width from the flex layout. Its tracks use the width from the last layout.
+        let shrunk = style.get("display").is_some_and(|v| v == "grid")
+            && slot.is_none()
+            && style.get("width").is_none_or(|v| v == "auto")
+            && {
+                let mut child = id;
+                loop {
+                    let Some(parent) = doc.nodes[child].parent else {
+                        break false;
+                    };
+                    let parent = &styles.values[parent];
+                    let display = parent.get("display").map_or("block", String::as_str);
+                    if display.ends_with("flex") {
+                        break parent
+                            .get("flex-direction")
+                            .is_none_or(|v| v.starts_with("row"));
+                    }
+                    if display != "block" || parent.get("width").is_some_and(|v| v != "auto") {
+                        break false;
+                    }
+                    child = doc.nodes[child].parent.unwrap_or(child);
+                }
+            };
+        let mut widest = None;
         let grid = if let Some(display) = style
             .get("display")
             .filter(|v| matches!(v.as_str(), "grid" | "inline-grid"))
@@ -2219,8 +2351,59 @@ pub(super) fn element(
                 );
                 content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
             }
-            let height = (slot.is_some() || style.get("height").is_some_and(|v| v != "auto"))
-                .then_some(content[1]);
+            let horizontal = padding[1] + padding[3] + borders[1] + borders[3];
+            let vertical = padding[0] + padding[2] + borders[0] + borders[2];
+            let mut tracked = [None; 2];
+            if shrunk {
+                let [_, max, ..] = super::grid::intrinsic(
+                    doc,
+                    id,
+                    styles,
+                    None,
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                let max = (max - horizontal - margin[1] - margin[3]).max(0.);
+                widest = Some(max);
+                let last = view.host.borrow().dom.get(&view.id).and_then(|state| {
+                    state
+                        .bounds
+                        .get(&id)
+                        .map(|bounds| (bounds[2] - horizontal).max(0.))
+                });
+                // Laid-out bounds snap to device pixels, so a fitting grid may look narrower.
+                content[0] = last.map_or(content[0].min(max), |last| {
+                    if last + 0.5 >= max {
+                        last.max(max)
+                    } else {
+                        last
+                    }
+                });
+                tracked[0] = Some((last.unwrap_or(f32::NAN), horizontal));
+            }
+            let height = if slot.is_some() || style.get("height").is_some_and(|v| v != "auto") {
+                Some(content[1])
+            } else if flexed {
+                let height = view.host.borrow().dom.get(&view.id).and_then(|state| {
+                    state
+                        .bounds
+                        .get(&id)
+                        .map(|bounds| (bounds[3] - vertical).max(0.))
+                });
+                tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
+                height
+            } else {
+                None
+            };
+            if tracked.iter().any(Option::is_some) {
+                let mut host = view.host.borrow_mut();
+                host.dom
+                    .entry(view.id)
+                    .or_default()
+                    .flexed_grids
+                    .insert(id, tracked);
+            }
             let cached = view
                 .host
                 .borrow()
@@ -2265,12 +2448,17 @@ pub(super) fn element(
             None
         };
         if let Some(grid) = &grid {
-            el = el.flex().flex_col().w(px(content[0]
-                + padding[1]
-                + padding[3]
-                + borders[1]
-                + borders[3]));
-            if style.get("height").is_none_or(|v| v == "auto") {
+            el = el.flex().flex_col();
+            // A shrunk grid stretches; a spacer gives it its max-content width.
+            el = match widest {
+                Some(widest) => el.child(div().w(px(widest)).h(px(0.)).flex_shrink_0()),
+                None => el.w(px(content[0]
+                    + padding[1]
+                    + padding[3]
+                    + borders[1]
+                    + borders[3])),
+            };
+            if style.get("height").is_none_or(|v| v == "auto") && !flexed {
                 el = el.h(px(grid.rows.iter().sum::<f32>()
                     + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1]
                     + padding[0]
@@ -2299,15 +2487,16 @@ pub(super) fn element(
                     .unwrap_or(0)
             });
         }
+        // Whitespace between inline content, text included, is one space.
         let inline_element = |child: Option<&usize>| {
             child.is_some_and(|&child| {
-                !doc.nodes[child].tag.starts_with('#')
-                    && doc.nodes[child].tag != "br"
-                    && inline_level(child)
+                let node = &doc.nodes[child];
+                node.tag == "#text" && !node.text.trim().is_empty()
+                    || !node.tag.starts_with('#') && node.tag != "br" && inline_level(child)
             })
         };
         let multicol = columns(style, &units, content[0]);
-        let mut line: Option<gpui::Div> = None;
+        let mut line: Option<render::Div> = None;
         let mut floating = Vec::new();
         // Floats and the content after them, until a `clear`, share a row: left floats, the
         // content, then right floats. Text does not flow under a float that ends early.
@@ -2315,6 +2504,190 @@ pub(super) fn element(
         // With multiple columns, block content is collected and split into columns at the end.
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
         let mut collected: Vec<(Option<usize>, AnyElement)> = Vec::new();
+        let shown = |index: usize| {
+            let child = &doc.nodes[children[index]];
+            preserve
+                || !(child.tag == "#text" && child.text.trim().is_empty())
+                || flow
+                    && grid.is_none()
+                    && inline_element(index.checked_sub(1).and_then(|index| children.get(index)))
+                    && inline_element(children.get(index + 1))
+        };
+        // WARNING: wrapped lines are culled whole, and only when the container's height is its content's, so `align-content` has no space to share.
+        let wrap = display == "flex"
+            && style.get("flex-direction").is_none_or(|v| v == "row")
+            && style.get("flex-wrap").is_some_and(|v| v == "wrap")
+            && style.get("align-content").is_none_or(|v| {
+                matches!(v.as_str(), "normal" | "stretch" | "flex-start" | "start")
+            })
+            && style
+                .get("align-items")
+                .is_none_or(|v| !v.contains("baseline"))
+            && ["height", "min-height", "max-height"].iter().all(|name| {
+                style
+                    .get(*name)
+                    .is_none_or(|v| matches!(v.as_str(), "auto" | "none" | "0" | "0px"))
+            })
+            && !flex_parent
+            && slot.is_none()
+            && info[id].flags & cull::RELISTED == 0;
+        // Offscreen children that did not change since their last layout become spacers.
+        let stack = build.zone.clone().filter(|_| {
+            grid.is_none()
+                && columns.is_none()
+                && !all_inline
+                && display != "inline"
+                && if flexbox {
+                    wrap || style.get("flex-direction").is_some_and(|v| v == "column")
+                        && style.get("flex-wrap").is_none_or(|v| v == "nowrap")
+                        && style.get("justify-content").is_none_or(|v| {
+                            matches!(v.as_str(), "normal" | "flex-start" | "start" | "stretch")
+                        })
+                } else {
+                    flow && !children.iter().any(|&child| floated(child))
+                }
+        });
+        let mut plan = None;
+        if let Some(zone) = stack {
+            let host = view.host.borrow();
+            if let Some(dom) = host.dom.get(&view.id)
+                && let Some(&[left, ..]) = dom.bounds.get(&id)
+                && let Some(&width) = dom.cull.widths.get(&id)
+            {
+                let gap = if flexbox {
+                    style
+                        .get("row-gap")
+                        .and_then(|v| units.resolve(v, containing[0]))
+                        .unwrap_or(0.)
+                        .max(0.)
+                } else {
+                    0.
+                };
+                let (slots, mut runs) = if wrap {
+                    cull::lines(
+                        &children,
+                        |index| shown(index) && info[children[index]].flags & cull::OUT == 0,
+                        |child| {
+                            let placed = *dom.cull.placed.get(child)?;
+                            let bounds = dom.bounds.get(&child)?;
+                            let [top, _, bottom, left] = placed.2;
+                            let member = cull::member(
+                                info[child],
+                                placed,
+                                Some(bounds),
+                                &zone,
+                                units.viewport[1],
+                                false,
+                            );
+                            Some((
+                                member.is_some(),
+                                [
+                                    bounds[0] - left,
+                                    bounds[1] - top,
+                                    bounds[0] - left + placed.1[0],
+                                    bounds[1] + bounds[3] + bottom,
+                                ],
+                            ))
+                        },
+                        gap,
+                    )
+                } else {
+                    cull::plan(
+                        &children,
+                        shown,
+                        |child| {
+                            cull::member(
+                                info[child],
+                                dom.cull.placed.get(child).copied().unwrap_or_default(),
+                                dom.bounds.get(&child),
+                                &zone,
+                                units.viewport[1],
+                                flexbox,
+                            )
+                        },
+                        gap,
+                    )
+                };
+                if wrap {
+                    let mut watch = Vec::new();
+                    for (index, &child) in children.iter().enumerate() {
+                        match slots[index] {
+                            0 => {
+                                let placed =
+                                    dom.cull.placed.get(child).copied().unwrap_or_default();
+                                if placed.0 != info[child].revision {
+                                    watch.push((child, placed.1[0]));
+                                }
+                            }
+                            slot => {
+                                if let Some(run) = runs[slot - 1]
+                                    .as_mut()
+                                    .filter(|run| run.members[0] == child)
+                                {
+                                    run.width = width;
+                                    run.watch = std::mem::take(&mut watch);
+                                }
+                            }
+                        }
+                    }
+                }
+                // WARNING: the first and last box of a run collapse their margins with siblings outside it, which may have changed.
+                if !flexbox {
+                    let collapsed = |child: usize, side: usize| {
+                        let mut units = styles.lengths[child];
+                        units.container = Some(container);
+                        margins(build, child, &units, content[0], false, false)[side]
+                    };
+                    for run in runs.iter_mut().flatten() {
+                        run.margins = [
+                            collapsed(run.members[0], 0),
+                            collapsed(run.members[run.members.len() - 1], 2),
+                        ];
+                    }
+                }
+                plan = (!runs.is_empty()).then_some((slots, runs, [left, width], zone));
+            }
+        }
+        // Offscreen grid items that did not change and keep their cell size are not built.
+        let mut culled = Vec::new();
+        if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
+            if let Some(dom) = view.host.borrow().dom.get(&view.id) {
+                for &(child, _, [x, y, width, height]) in &grid.cells {
+                    let placed = dom.cull.placed.get(child).copied().unwrap_or_default();
+                    let [top, right, bottom, left] = placed.2;
+                    // WARNING: the cell sizes come before layout snaps boxes to pixels, so they compare with the unsnapped cell sizes of the last layout.
+                    if placed.1 == [width, height]
+                        && cull::member(
+                            info[child],
+                            placed,
+                            dom.bounds.get(&child),
+                            zone,
+                            units.viewport[1],
+                            false,
+                        )
+                        .is_some()
+                    {
+                        // WARNING: layout rounds each inset and margin to device pixels, half toward zero, so the offsets from the anchor do too.
+                        let snap = |value: f32| {
+                            let value = value * pixel_ratio;
+                            (value.abs() - 0.5).ceil().copysign(value) / pixel_ratio
+                        };
+                        culled.push((
+                            child,
+                            [
+                                snap(x + padding[3]) + snap(left),
+                                snap(y + padding[0]) + snap(top),
+                                width - left - right,
+                                height - top - bottom,
+                            ],
+                        ));
+                    }
+                }
+            }
+            if !culled.is_empty() {
+                el = el.child(cull::anchor(culled.clone(), zone.clone(), view.clone()));
+            }
+        }
         macro_rules! place {
             ($element:expr, $child:expr) => {{
                 let element = $element.into_any_element();
@@ -2355,13 +2728,24 @@ pub(super) fn element(
             }};
         }
         for (index, &child) in children.iter().enumerate() {
-            if preserve
-                || !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty())
-                || flow
-                    && grid.is_none()
-                    && inline_element(index.checked_sub(1).and_then(|index| children.get(index)))
-                    && inline_element(children.get(index + 1))
-            {
+            if shown(index) {
+                if let Some((slots, runs, then, zone)) = plan.as_mut()
+                    && let Some(&slot) = slots.get(index).filter(|&&slot| slot > 0)
+                {
+                    if let Some(run) = runs[slot - 1].take() {
+                        if let Some(open) = line.take() {
+                            place!(open, None);
+                        }
+                        place!(
+                            cull::spacer(run, id, *then, zone.clone(), view.clone()),
+                            None
+                        );
+                    }
+                    continue;
+                }
+                if culled.binary_search_by_key(&child, |&(id, _)| id).is_ok() {
+                    continue;
+                }
                 let placement = grid.as_ref().and_then(|grid| {
                     let index = grid
                         .cells
@@ -2380,7 +2764,7 @@ pub(super) fn element(
                         },
                     ))
                 });
-                let child_element = element(build, child, content, container, placement, cx);
+                let child_element = element(build, child, content, container, placement);
                 let out_of_flow = styles.values[child]
                     .get("position")
                     .is_some_and(|value| matches!(value.as_str(), "absolute" | "fixed"));
@@ -2433,10 +2817,10 @@ pub(super) fn element(
                     let block = child_style
                         .get("display")
                         .is_some_and(|value| !value.starts_with("inline"));
-                    let entity = cx.entity();
-                    let mut placeholder = gpui::canvas(
-                        move |bounds, _, cx| {
-                            let view = entity.read(cx);
+                    let entity = view.clone();
+                    let mut placeholder = render::canvas(
+                        move |bounds, _| {
+                            let view = &*entity;
                             view.host
                                 .borrow_mut()
                                 .dom
@@ -2445,7 +2829,7 @@ pub(super) fn element(
                                 .anchors
                                 .insert(child, bounds);
                         },
-                        |_, _, _, _| {},
+                        |_, _, _| {},
                     )
                     .w(px(0.))
                     .flex_shrink_0()
@@ -2453,14 +2837,16 @@ pub(super) fn element(
                         if block
                             && (line.is_some()
                                 || all_inline
-                                    && flat.iter().any(|&other| other != child && in_flow(other)))
+                                    && flat
+                                        .iter()
+                                        .any(|&other| other != child && in_flow(doc, info, other)))
                         {
                             units.font.lh
                         } else {
                             0.
                         },
                     ));
-                    placeholder.style().align_self = Some(gpui::AlignSelf::FlexStart);
+                    placeholder.style().align_self = Some(render::AlignSelf::FlexStart);
                     match line.take() {
                         Some(open) => line = Some(open.child(placeholder)),
                         None if all_inline || block => place!(placeholder, None),
@@ -2547,8 +2933,8 @@ pub(super) fn element(
     }
     if slot.is_some() && flow && matches!(node.tag.as_str(), "td" | "th") {
         let align = match style.get("vertical-align").map(String::as_str) {
-            Some("middle") => Some(gpui::AlignContent::Center),
-            Some("bottom") => Some(gpui::AlignContent::FlexEnd),
+            Some("middle") => Some(render::AlignContent::Center),
+            Some("bottom") => Some(render::AlignContent::FlexEnd),
             _ => None,
         };
         if all_inline {
@@ -2569,16 +2955,32 @@ pub(super) fn element(
             .w(px((bounds[2] - margin[1] - margin[3]).max(0.)))
             .h(px((bounds[3] - margin[0] - margin[2]).max(0.)));
     }
-    if style
+    // WARNING: Windows moves the window in the native hit test (`window_control_area`), macOS and Linux on the first drag.
+    if drag {
+        el = el
+            .window_control_area(render::WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |event: &render::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    if event.click_count != 2 {
+                        view.moving.set(true);
+                    } else if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
+                }
+            });
+    } else if style
         .get("pointer-events")
         .is_none_or(|value| value != "none")
     {
-        let path = ancestors.clone();
-        el = el.on_mouse_down(MouseButton::Left, cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
-            window.focus(&view.focus, cx);
+        let view = view.clone();
+        el = el.on_mouse_down(MouseButton::Left, move |event: &render::MouseDownEvent, _, cx| {
             cx.stop_propagation();
-            Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", if hit_test { &[] } else { &path }, serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":0,"buttons":1,"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), cx);
-        }));
+            Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", if hit_test { &[] } else { std::slice::from_ref(&id) }, serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":0,"buttons":1,"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), cx);
+        });
     }
     let mut parent = node.parent;
     while let Some(ancestor) = parent
@@ -2623,14 +3025,16 @@ pub(super) fn element(
     if stacking {
         el = el.child(paint_layers(build.layers.clone(), false));
     }
-    let scroll_ancestors = ancestors.clone();
-    let el = if style
-        .get("pointer-events")
-        .is_some_and(|value| value == "none")
+    el = el.children(bars);
+    let el = if drag
+        || style
+            .get("pointer-events")
+            .is_some_and(|value| value == "none")
     {
         el
     } else {
-        el.on_click(cx.listener(move |view, event: &gpui::ClickEvent, _, cx| {
+        let view = view.clone();
+        el.on_click(move |event: &render::ClickEvent, window, cx| {
             cx.stop_propagation();
             let runtime = view.runtime.clone();
             let result = {
@@ -2642,7 +3046,7 @@ pub(super) fn element(
                         engine.eval(
                             &format!(
                                 "__appsDispatch('click',{},{})",
-                                serde_json::to_string(if hit_test { &[][..] } else { &ancestors[..] }).unwrap(),
+                                if hit_test { String::from("[]") } else { format!("[{id}]") },
                                 serde_json::json!({"clientX": f32::from(event.position().x), "clientY": f32::from(event.position().y), "detail":event.click_count(), "ctrlKey":event.modifiers().control,"metaKey":event.modifiers().platform,"altKey":event.modifiers().alt,"shiftKey":event.modifiers().shift})
                             ),
                             "apps:click",
@@ -2652,14 +3056,14 @@ pub(super) fn element(
             if let Some(Err(error)) = result {
                 eprintln!("apps: {error}");
             }
-            cx.notify();
+            window.refresh();
             cx.defer(move |cx| Desktop::drive(runtime, cx));
-        }))
+        })
     };
     let sticky = (style.get("position").is_some_and(|v| v == "sticky"))
         .then(|| {
             let host = view.host.borrow();
-            scroll_ancestors.into_iter().skip(1).find_map(|parent| {
+            ancestors.iter().rev().copied().find_map(|parent| {
                 let scroll = host.dom.get(&view.id)?.scroll.get(&parent)?.clone();
                 let style = &styles.values[parent];
                 let border = [
@@ -2676,7 +3080,7 @@ pub(super) fn element(
                         .unwrap_or(0.)
                         .max(0.)
                 });
-                Some((scroll, border))
+                Some((scroll, border, node.parent))
             })
         })
         .flatten();
@@ -2739,8 +3143,13 @@ pub(super) fn element(
         effects: effect_layer,
         perspective: parent_perspective.clone().zip(parent),
         units,
+        revision: info[id].revision,
+        sides: padding[1] + padding[3] + borders[1] + borders[3],
+        margin,
+        cell: slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]),
         id,
-        view: cx.entity(),
+        ids: ids.clone(),
+        view: view.clone(),
         sticky,
         fixed: position == "fixed",
         inset: ["top", "right", "bottom", "left"].map(|name| {
@@ -2763,12 +3172,166 @@ pub(super) fn element(
             inner: Some(element),
             layers: layers.clone(),
             order,
-            path: path.clone(),
+            path: ancestors[stack..].into(),
         }
         .into_any_element()
     } else {
         element
     }
+}
+
+/// Whether a child takes part in its parent's flow: not a comment, blank text, hidden or out of flow.
+fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
+    let node = &doc.nodes[id];
+    node.tag != "#comment"
+        && !(node.tag == "#text" && node.text.trim().is_empty())
+        && info[id].flags & cull::OUT == 0
+}
+
+/// The margins of a box. Vertical margins collapse with block siblings, the first and the
+/// last child, and the parent, like block layout.
+// WARNING: culled spacers take the margins of their first and last box from here, so these must stay the margins the box is laid out with.
+pub(super) fn margins(
+    build: &Build<'_>,
+    id: usize,
+    units: &style::Lengths,
+    width: f32,
+    flex_parent: bool,
+    slot: bool,
+) -> [f32; 4] {
+    let (doc, styles, node, style) = (
+        build.doc,
+        build.styles,
+        &build.doc.nodes[id],
+        &build.styles.values[id],
+    );
+    let mut margin = units.edges(style, "margin", width);
+    let edge = |id: usize, name: &str| {
+        styles.values[id]
+            .get(name)
+            .and_then(|value| styles.lengths[id].resolve(value, width))
+            .unwrap_or(0.)
+    };
+    let in_flow = |id: usize| in_flow(doc, build.info, id);
+    let block = |id: usize| {
+        !doc.nodes[id].tag.starts_with('#')
+            && styles.values[id]
+                .get("display")
+                .is_some_and(|value| !value.starts_with("inline") && value != "contents")
+    };
+    // WARNING: margins only collapse through plain block boxes; flex/grid items and scroll containers keep their own.
+    let collapses = |id: usize, side: usize| {
+        let style = &styles.values[id];
+        let [padding, border, kind] = if side == 0 {
+            ["padding-top", "border-top-width", "border-top-style"]
+        } else {
+            [
+                "padding-bottom",
+                "border-bottom-width",
+                "border-bottom-style",
+            ]
+        };
+        id != 0
+            && doc.nodes[id].tag != "html"
+            && doc.nodes[id].parent.is_none_or(|parent| {
+                !styles.values[parent].get("display").is_some_and(|value| {
+                    matches!(
+                        value.as_str(),
+                        "flex" | "inline-flex" | "grid" | "inline-grid"
+                    )
+                })
+            })
+            && style
+                .get("display")
+                .is_some_and(|value| matches!(value.as_str(), "block" | "list-item"))
+            && ["overflow-x", "overflow-y"]
+                .iter()
+                .all(|key| style.get(*key).is_none_or(|value| value == "visible"))
+            && style
+                .get("position")
+                .is_none_or(|value| !matches!(value.as_str(), "absolute" | "fixed"))
+            && edge(id, padding) == 0.
+            && (edge(id, border) == 0.
+                || style
+                    .get(kind)
+                    .is_none_or(|value| matches!(value.as_str(), "none" | "hidden")))
+            && (side == 0 || style.get("height").is_none_or(|value| value == "auto"))
+    };
+    if block(id)
+        && in_flow(id)
+        && !slot
+        && !flex_parent
+        && let Some(parent) = node.parent
+    {
+        let siblings = build
+            .siblings
+            .borrow_mut()
+            .entry((parent, false))
+            .or_insert_with(|| {
+                let list: Vec<usize> = doc.nodes[parent]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&child| in_flow(child))
+                    .collect();
+                let index = list
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &child)| (child, index));
+                let index = index.collect();
+                Rc::new((list, index))
+            })
+            .clone();
+        let index = siblings.1.get(&id).copied();
+        let siblings = &siblings.0;
+        if let Some(previous) = index
+            .and_then(|index| index.checked_sub(1))
+            .map(|index| siblings[index])
+            .filter(|&previous| block(previous))
+        {
+            let (a, b) = (margin[0], edge(previous, "margin-bottom"));
+            margin[0] = if a >= 0. && b >= 0. {
+                a.max(b)
+            } else if a < 0. && b < 0. {
+                a.min(b)
+            } else {
+                a + b
+            } - b;
+        }
+        if index == Some(0)
+            && margin[0] >= 0.
+            && edge(parent, "margin-top") >= 0.
+            && collapses(parent, 0)
+        {
+            margin[0] = 0.;
+        }
+        if index.is_some_and(|index| index + 1 == siblings.len())
+            && margin[2] >= 0.
+            && edge(parent, "margin-bottom") >= 0.
+            && collapses(parent, 2)
+        {
+            margin[2] = 0.;
+        }
+    }
+    if let Some(first) = node
+        .children
+        .iter()
+        .copied()
+        .find(|&child| in_flow(child))
+        .filter(|&first| block(first) && margin[0] >= 0. && collapses(id, 0))
+    {
+        margin[0] = margin[0].max(edge(first, "margin-top"));
+    }
+    if let Some(last) = node
+        .children
+        .iter()
+        .copied()
+        .rfind(|&child| in_flow(child))
+        .filter(|&last| block(last) && margin[2] >= 0. && collapses(id, 2))
+    {
+        margin[2] = margin[2].max(edge(last, "margin-bottom"));
+    }
+    margin
 }
 
 /// `Some(true)` for a box floated right, `Some(false)` for left.
@@ -2781,7 +3344,7 @@ fn float_side(style: &style::Style) -> Option<bool> {
 }
 
 /// The width, color and style of a column rule.
-type ColumnRule = (f32, gpui::Hsla, gpui::BorderStyle);
+type ColumnRule = (f32, render::Rgba, render::BorderStyle);
 
 /// The column count, gap and rule of a multi-column box with the given content width.
 fn columns(
@@ -2855,8 +3418,8 @@ fn columns(
             let color = rule_color
                 .or_else(|| style.get("color").map(String::as_str))
                 .and_then(style::color)
-                .map_or(gpui::black(), |(ink, alpha)| {
-                    rgba(ink << 8 | alpha as u32).into()
+                .map_or(render::black(), |(ink, alpha)| {
+                    rgba(ink << 8 | alpha as u32)
                 });
             (width, color, border_style(kind))
         })
@@ -2869,20 +3432,20 @@ fn column_rules(
     count: usize,
     gap: f32,
     width: f32,
-    color: gpui::Hsla,
-    kind: gpui::BorderStyle,
+    color: render::Rgba,
+    kind: render::BorderStyle,
 ) -> AnyElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
+    render::canvas(
+        |_, _| (),
+        move |bounds, _, window| {
             let column = (f32::from(bounds.size.width) - gap * (count - 1) as f32) / count as f32;
             for index in 1..count {
                 let x = bounds.left() + px(index as f32 * (column + gap) - gap / 2. - width / 2.);
-                window.paint_quad(gpui::quad(
+                window.paint_quad(render::quad(
                     Bounds::new(point(x, bounds.top()), size(px(width), bounds.size.height)),
-                    gpui::Corners::default(),
-                    gpui::transparent_black(),
-                    gpui::Edges {
+                    render::Corners::default(),
+                    render::transparent_black(),
+                    render::Edges {
                         left: px(width),
                         ..Default::default()
                     },
@@ -2899,45 +3462,48 @@ fn column_rules(
     .into_any_element()
 }
 
-fn border_style(kind: &str) -> gpui::BorderStyle {
+fn border_style(kind: &str) -> render::BorderStyle {
     match kind {
-        "dashed" => gpui::BorderStyle::Dashed,
-        "dotted" => gpui::BorderStyle::Dotted,
-        "double" => gpui::BorderStyle::Double,
-        _ => gpui::BorderStyle::Solid,
+        "dashed" => render::BorderStyle::Dashed,
+        "dotted" => render::BorderStyle::Dotted,
+        "double" => render::BorderStyle::Double,
+        _ => render::BorderStyle::Solid,
     }
 }
 
 /// The darker or lighter shade of a 3D border, like WebKit.
-fn shade_border(color: gpui::Hsla, dark: bool) -> gpui::Hsla {
-    let rgba = color.to_rgb();
+fn shade_border(color: render::Rgba, dark: bool) -> render::Rgba {
+    let rgba = color;
     let value = rgba.r.max(rgba.g).max(rgba.b);
     let factor = if value <= 0. {
         return if dark {
             color
         } else {
-            gpui::Hsla::from(gpui::Rgba {
+            render::Rgba {
                 r: 0.33,
                 g: 0.33,
                 b: 0.33,
                 a: rgba.a,
-            })
+            }
         };
     } else if dark {
         ((value - 0.33) / value).max(0.)
     } else {
         (value + 0.33).min(1.) / value
     };
-    gpui::Rgba {
+    render::Rgba {
         r: (rgba.r * factor).min(1.),
         g: (rgba.g * factor).min(1.),
         b: (rgba.b * factor).min(1.),
         a: rgba.a,
     }
-    .into()
 }
 
-fn inset_shadows(shadows: Vec<gpui::BoxShadow>, radius: [f32; 4], borders: [f32; 4]) -> AnyElement {
+fn inset_shadows(
+    shadows: Vec<render::BoxShadow>,
+    radius: [f32; 4],
+    borders: [f32; 4],
+) -> AnyElement {
     let inner =
         |corner: usize, a: usize, b: usize| (radius[corner] - borders[a].max(borders[b])).max(0.);
     let radii = super::effects::corners([
@@ -2946,9 +3512,9 @@ fn inset_shadows(shadows: Vec<gpui::BoxShadow>, radius: [f32; 4], borders: [f32;
         inner(2, 2, 1),
         inner(3, 2, 3),
     ]);
-    gpui::canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| window.paint_inset_shadows(bounds, radii, &shadows),
+    render::canvas(
+        |_, _| (),
+        move |bounds, _, window| window.paint_inset_shadows(bounds, radii, &shadows),
     )
     .absolute()
     .top_0()
@@ -2957,10 +3523,11 @@ fn inset_shadows(shadows: Vec<gpui::BoxShadow>, radius: [f32; 4], borders: [f32;
     .into_any_element()
 }
 
-fn svg_layer(source: String, id: usize, view: gpui::Entity<WebView>) -> AnyElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |bounds, _, window, cx| {
+/// Paints the inline `<svg>` or the SVG `<img>` source of a node, rasterized at the box size.
+fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
+    render::canvas(
+        |_, _| (),
+        move |bounds, _, window| {
             let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
             if width <= 0. || height <= 0. {
                 return;
@@ -2968,18 +3535,27 @@ fn svg_layer(source: String, id: usize, view: gpui::Entity<WebView>) -> AnyEleme
             let scale = window.scale_factor();
             let raster =
                 [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
-            let view = view.read(cx);
+            let view = &*view;
             let mut host = view.host.borrow_mut();
             let state = host.dom.entry(view.id).or_default();
+            let source = if inline {
+                state
+                    .svg_sources
+                    .get(&id)
+                    .map(|(_, _, source)| source.as_str())
+            } else {
+                state.svg_images.get(&id).map(|(source, _)| &**source)
+            };
+            let Some(source) = source else { return };
             if state.svgs.get(&id).is_none_or(|(old, image)| {
-                *old != source
-                    || u32::from(image.size(0).width) != raster[0]
-                    || u32::from(image.size(0).height) != raster[1]
+                !inline && old != source
+                    || u32::from(image.size().width) != raster[0]
+                    || u32::from(image.size().height) != raster[1]
             }) {
-                match super::canvas::svg(&source, raster[0], raster[1], None) {
+                match super::canvas::svg(source, raster[0], raster[1], None) {
                     Ok(image) => {
-                        if let Some((_, old)) = state.svgs.insert(id, (source.clone(), image)) {
-                            let _ = window.drop_image(old);
+                        if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image)) {
+                            window.drop_image(old);
                         }
                     }
                     Err(error) => eprintln!("apps: SVG: {error}"),
@@ -2988,8 +3564,7 @@ fn svg_layer(source: String, id: usize, view: gpui::Entity<WebView>) -> AnyEleme
             let image = state.svgs.get(&id).map(|(_, image)| image.clone());
             drop(host);
             if let Some(image) = image {
-                let _ =
-                    window.paint_image(bounds, bounds, gpui::Corners::default(), image, 0, false);
+                window.paint_image(bounds, bounds, render::Corners::default(), image, false);
             }
         },
     )

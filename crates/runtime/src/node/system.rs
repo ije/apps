@@ -99,12 +99,26 @@ pub(super) enum Hasher {
     Sha256(sha2::Sha256),
     Sha384(sha2::Sha384),
     Sha512(sha2::Sha512),
+    Hmac(ring::hmac::Context),
 }
 
 impl Hasher {
-    pub(super) fn new(name: &Value) -> Result<Self> {
+    pub(super) fn new(name: &Value, key: &Value) -> Result<Self> {
         use sha2::Digest;
-        Ok(match name.as_str().context("Expected digest")? {
+        let name = name.as_str().context("Expected digest")?;
+        if !key.is_null() {
+            let algorithm = match name {
+                "sha1" => ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+                "sha256" => ring::hmac::HMAC_SHA256,
+                "sha384" => ring::hmac::HMAC_SHA384,
+                "sha512" => ring::hmac::HMAC_SHA512,
+                name => bail!("Digest method not supported: {name}"),
+            };
+            return Ok(Self::Hmac(ring::hmac::Context::with_key(
+                &ring::hmac::Key::new(algorithm, &bytes(key)?),
+            )));
+        }
+        Ok(match name {
             "md5" => Self::Md5(md5::Md5::new()),
             "sha1" => Self::Sha1(sha1_smol::Sha1::new()),
             "sha224" => Self::Sha224(sha2::Sha224::new()),
@@ -123,6 +137,7 @@ impl Hasher {
             Self::Sha256(hasher) => hasher.update(data),
             Self::Sha384(hasher) => hasher.update(data),
             Self::Sha512(hasher) => hasher.update(data),
+            Self::Hmac(context) => context.update(data),
         }
     }
     pub(super) fn finish(self) -> Value {
@@ -134,14 +149,15 @@ impl Hasher {
             Self::Sha256(hasher) => hasher.finalize().to_vec(),
             Self::Sha384(hasher) => hasher.finalize().to_vec(),
             Self::Sha512(hasher) => hasher.finalize().to_vec(),
+            Self::Hmac(context) => context.sign().as_ref().to_vec(),
         })
     }
 }
 
-pub(super) fn system(op: &str, args: &Value) -> Result<Value> {
+pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
     match op {
         "hash" => {
-            let mut hasher = Hasher::new(&args[0])?;
+            let mut hasher = Hasher::new(&args[0], &args[2])?;
             hasher.update(&bytes(&args[1])?);
             Ok(hasher.finish())
         }

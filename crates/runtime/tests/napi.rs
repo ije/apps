@@ -25,10 +25,14 @@ fn native_addons_values_callbacks_and_contexts() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let second = dir.path().join("second.node");
+    std::fs::copy(&library, &second).unwrap();
     for role in [Role::Main, Role::Preload(1)] {
         let mut host = Host::default();
         host.native_modules
             .insert("fixture/addon.node".into(), library.clone());
+        host.native_modules
+            .insert("fixture/second.node".into(), second.clone());
         let engine = Engine::new(Api::load().unwrap(), Rc::new(RefCell::new(host)), role).unwrap();
         engine.eval(include_str!("napi.js"), "napi-test").unwrap();
         assert_eq!(engine.eval("napiPromise", "test").unwrap(), "true");
@@ -42,33 +46,40 @@ fn native_addons_values_callbacks_and_contexts() {
             "18:0"
         );
         engine.eval("globalThis.initialFinalizers=addon.finalizerCount();for(let i=0;i<100000;i++)addon.garbage()", "test").unwrap();
-        for _ in 0..20 {
-            engine.collect_garbage();
-            engine.tick().unwrap();
-            if engine
-                .eval("addon.finalizerCount()-initialFinalizers", "test")
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()
-                >= 270000
-            {
-                break;
+        let collect = |done: &str| {
+            for _ in 0..200 {
+                engine.tick().unwrap();
+                if engine.eval(done, "test").unwrap() == "true" {
+                    return true;
+                }
+                engine
+                    .eval(
+                        "(()=>{const values=Array.from({length:10000},()=>({}))})()",
+                        "test",
+                    )
+                    .unwrap();
             }
+            false
+        };
+        assert!(
+            collect("addon.finalizerCount()-initialFinalizers>=299990"),
+            "Finalizers waited for a lazy sweep"
+        );
+        engine.eval("globalThis.externals=addon.externalCount();globalThis.moved=addon.externalBuffer().buffer.transfer();addon.setLoader(()=>{try{globalThis.loaded=__appsLoadAddon('fixture/second.node').add(1,1)}catch(error){globalThis.loaded=String(error)}});addon.loading();", "test").unwrap();
+        assert!(collect("globalThis.loaded!==undefined"));
+        assert_eq!(engine.eval("loaded", "test").unwrap(), "3");
+        assert_eq!(
             engine
                 .eval(
-                    "(()=>{const values=Array.from({length:10000},()=>({}))})()",
-                    "test",
+                    "addon.externalCount()-externals+':'+new TextDecoder().decode(moved)",
+                    "test"
                 )
-                .unwrap();
-        }
-        assert!(
-            engine
-                .eval("addon.finalizerCount()-initialFinalizers", "test")
-                .unwrap()
-                .parse::<usize>()
-                .unwrap()
-                >= 270000
+                .unwrap(),
+            "0:napi",
+            "A transferred external buffer was freed"
         );
+        engine.eval("moved=null", "test").unwrap();
+        assert!(collect("addon.externalCount()-externals===1"));
         assert!(
             engine
                 .eval("__appsLoadAddon('missing.node')", "test")

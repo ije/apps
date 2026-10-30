@@ -30,13 +30,17 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   }
 
   class Interface extends EventEmitter {
-    #rest = ''; #decoder = new StringDecoder('utf8'); #questions = []; #prompt;
+    #rest = []; #cr = false; #decoder = new StringDecoder('utf8'); #questions = []; #prompt;
     #data = chunk => {
-      const lines = (this.#rest + (typeof chunk === 'string' ? chunk : this.#decoder.write(chunk))).split(/\r\n|\n|\r(?!$)/);
-      this.#rest = lines.pop();
-      for (const line of lines) this.#line(line.replace(/\r$/, ''));
+      const lines = ((this.#cr ? '\r' : '') + (typeof chunk === 'string' ? chunk : this.#decoder.write(chunk))).split(/\r\n|\n|\r(?!$)/);
+      let last = lines.pop();
+      this.#cr = last.endsWith('\r');
+      if (this.#cr) last = last.slice(0, -1);
+      if (lines.length) { lines[0] = this.#rest.join('') + lines[0]; this.#rest = []; }
+      if (last) this.#rest.push(last);
+      for (const line of lines) this.#line(line);
     };
-    #end = () => { const rest = this.#rest + this.#decoder.end(); this.#rest = ''; if (rest) this.#line(rest.replace(/\r$/, '')); this.close(); };
+    #end = () => { const rest = this.#rest.join('') + (this.#cr ? '\r' : '') + this.#decoder.end(); this.#rest = []; this.#cr = false; if (rest) this.#line(rest.replace(/\r$/, '')); this.close(); };
     constructor(input, output, _completer, terminal) {
       super();
       const options = input?.input ? input : { input, output, terminal };
@@ -92,8 +96,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       if (this.#done) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' });
       data = Buffer.from(input(data, encoding));
       this.#chunks.push(data); this.#size += data.length;
-      if (!this.#secret && this.#size >= 65536) {
-        if (this.#id === null) { this.#id = sync('hash.new', this.#algorithm); handles.register(this, this.#id, this); }
+      if (this.#size >= 65536) {
+        if (this.#id === null) { this.#id = sync('hash.new', this.#algorithm, this.#secret); handles.register(this, this.#id, this); }
         sync('hash.update', this.#id, Buffer.concat(this.#chunks)); this.#chunks = []; this.#size = 0;
       }
       return this;
@@ -104,8 +108,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       const data = Buffer.concat(this.#chunks);
       this.#chunks = [];
       let result;
-      if (this.#secret) result = call('web.crypto.sign', 'HMAC', this.#secret, new Uint8Array(0), data, new Uint8Array(0), { sha1: 'SHA-1', sha256: 'SHA-256', sha384: 'SHA-384', sha512: 'SHA-512' }[this.#algorithm] ?? this.#algorithm);
-      else if (this.#id === null) result = sync('hash', this.#algorithm, data);
+      if (this.#id === null) result = sync('hash', this.#algorithm, data, this.#secret);
       else { if (data.length) sync('hash.update', this.#id, data); result = sync('hash.digest', this.#id); handles.unregister(this); }
       return encoded(output(result), encoding);
     }

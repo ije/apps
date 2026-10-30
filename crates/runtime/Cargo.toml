@@ -14,8 +14,8 @@ cssparser = "0.38"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 futures-util = "0.3"
 getrandom = "0.3"
-gpui.workspace = true
-gpui_platform = { workspace = true, features = ["font-kit", "x11", "wayland"] }
+render = { package = "apps-render", path = "../render" }
+avif-parse = "=2.1.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -25,13 +25,15 @@ libffi = "5.2.0"
 libloading = "0.8"
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 md-5 = "0.10"
-naga = { version = "30", features = ["termcolor"] }
 notify = "8.2"
-pollster.workspace = true
 portable-pty = "0.9"
+raw-window-handle.workspace = true
+# The published rav1d can abort on corrupt AV1 data.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
 resvg.workspace = true
+rustc-hash.workspace = true
 ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
@@ -41,13 +43,17 @@ socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 url.workspace = true
-wgpu = { workspace = true, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl", "serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+apps-webgpu = { path = "../webgpu" }
 
 [[bin]]
 name = "apps-runtime"
 path = "src/main.rs"
 
+# Puts the WebGPU library next to test executables.
 [dev-dependencies]
+apps-webgpu = { path = "../webgpu" }
 tempfile = "3"
 
 [build-dependencies]

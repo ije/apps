@@ -54,10 +54,34 @@ index f96eb07c4..d3b545b68 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b2619..baf4eb2c6 100644
+index b8e3b2619..f2d93117c 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
-@@ -166,7 +166,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
+@@ -43,7 +43,9 @@
+ #include <wtf/text/StringBuilder.h>
+ 
+ #if ENABLE(REMOTE_INSPECTOR)
++#include "InspectorFrontendChannel.h"
+ #include "JSGlobalObjectDebuggable.h"
++#include "JSGlobalObjectDebugger.h"
+ #include "JSGlobalObjectInspectorController.h"
+ #include "JSRemoteInspector.h"
+ #endif
+@@ -85,6 +87,13 @@ void JSContextGroupRelease(JSContextGroupRef group)
+     vm.derefSuppressingSaferCPPChecking();
+ }
+ 
++void JSContextGroupShrinkFootprint(JSContextGroupRef group)
++{
++    VM& vm = *toJS(group);
++    JSLockHolder locker(&vm);
++    vm.shrinkFootprintNow(VM::ShrinkFootprint::KeepCodeInUse);
++}
++
+ static bool internalScriptTimeoutCallback(JSGlobalObject* globalObject, void* callbackPtr, void* callbackData)
+ {
+     JSShouldTerminateCallback callback = reinterpret_cast<JSShouldTerminateCallback>(callbackPtr);
+@@ -166,7 +175,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -66,7 +90,7 @@ index b8e3b2619..baf4eb2c6 100644
  
      gcProtect(globalObject);
      vm.refSuppressingSaferCPPChecking();
-@@ -177,7 +177,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
+@@ -177,7 +186,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -75,7 +99,7 @@ index b8e3b2619..baf4eb2c6 100644
  
      bool protectCountIsZero = vm.heap.unprotect(globalObject);
      if (protectCountIsZero)
-@@ -192,7 +192,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
+@@ -192,7 +201,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -84,7 +108,7 @@ index b8e3b2619..baf4eb2c6 100644
  
      return toRef(uncheckedDowncast<JSObject>(JSValue(globalObject).toThis(globalObject, ECMAMode::sloppy())));
  }
-@@ -214,7 +214,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
+@@ -214,7 +223,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -93,7 +117,7 @@ index b8e3b2619..baf4eb2c6 100644
  
      return toGlobalRef(globalObject);
  }
-@@ -227,6 +227,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
+@@ -227,6 +236,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -101,7 +125,7 @@ index b8e3b2619..baf4eb2c6 100644
  
      String name = globalObject->name();
      if (name.isNull())
-@@ -243,6 +244,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
+@@ -243,6 +253,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -109,7 +133,75 @@ index b8e3b2619..baf4eb2c6 100644
      globalObject->setName(name ? name->string() : String());
  }
  
-@@ -283,7 +285,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
+@@ -274,6 +285,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
+     globalObject->setInspectable(inspectable);
+ }
+ 
++#if ENABLE(REMOTE_INSPECTOR)
++namespace {
++
++class JSAPIInspectorChannel final : public Inspector::FrontendChannel {
++public:
++    JSAPIInspectorChannel(JSInspectorMessageCallback callback, void* data)
++        : m_callback(callback)
++        , m_data(data)
++    {
++    }
++
++    ConnectionType connectionType() const final { return ConnectionType::Local; }
++
++    void sendMessageToFrontend(const String& message) final
++    {
++        auto utf8 = message.utf8();
++        m_callback(m_data, reinterpret_cast<const char*>(utf8.data()), utf8.length());
++    }
++
++private:
++    JSInspectorMessageCallback m_callback;
++    void* m_data;
++};
++
++JSInspectorPauseCallback apiInspectorPauseCallback;
++
++}
++
++void* JSGlobalContextConnectInspector(JSGlobalContextRef ctx, JSInspectorMessageCallback message, JSInspectorPauseCallback pause, void* data)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    JSLockHolder locker(globalObject->vm());
++    apiInspectorPauseCallback = pause;
++    auto* channel = new JSAPIInspectorChannel(message, data);
++    globalObject->inspectorController().connectFrontend(*channel, false, false);
++    return channel;
++}
++
++void JSGlobalContextDispatchInspectorMessage(JSGlobalContextRef ctx, const char* message, size_t length)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    JSLockHolder locker(globalObject->vm());
++    globalObject->inspectorController().dispatchMessageFromFrontend(String::fromUTF8(std::span { message, length }));
++    // The debugger exists once Debugger.enable ran. Without this callback a pause would wait on a run loop that never cycles.
++    if (auto* debugger = globalObject->debugger()) {
++        static_cast<Inspector::JSGlobalObjectDebugger*>(debugger)->runWhilePausedCallback = [](JSGlobalObject& globalObject, bool& done) {
++            apiInspectorPauseCallback(toGlobalRef(&globalObject), &done);
++        };
++    }
++}
++
++void JSGlobalContextDisconnectInspector(JSGlobalContextRef ctx, void* connection)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    JSLockHolder locker(globalObject->vm());
++    auto* channel = static_cast<JSAPIInspectorChannel*>(connection);
++    globalObject->inspectorController().disconnectFrontend(*channel);
++    delete channel;
++}
++#endif
++
+ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function, JSValueRef* exception)
+ {
+     if (!ctx) {
+@@ -283,7 +355,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -118,6 +210,50 @@ index b8e3b2619..baf4eb2c6 100644
  
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
+diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
+index c009bb5a2..83b0e6046 100644
+--- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
++++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
+@@ -69,6 +69,39 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
+ typedef bool
+ (*JSShouldTerminateCallback) (JSContextRef ctx, void* context);
+ 
++/*!
++@function
++@abstract Collects garbage and returns free memory to the system. Code that still runs keeps its compiled form. Does nothing while JavaScript is running.
++@param group The JavaScript context group to shrink.
++*/
++JS_EXPORT void JSContextGroupShrinkFootprint(JSContextGroupRef group);
++
++typedef void (*JSInspectorMessageCallback)(void* data, const char* message, size_t length);
++typedef void (*JSInspectorPauseCallback)(JSGlobalContextRef ctx, bool* done);
++
++/*!
++@function
++@abstract Connects a Web Inspector protocol frontend to a context. Call the other inspector functions on the context's thread.
++@param ctx The JSGlobalContext to inspect.
++@param message Receives every protocol response and event as UTF-8 JSON.
++@param pause Runs while the debugger is paused. It must dispatch messages until done is true.
++@param data Passed to message.
++@result The connection, for JSGlobalContextDisconnectInspector.
++*/
++JS_EXPORT void* JSGlobalContextConnectInspector(JSGlobalContextRef ctx, JSInspectorMessageCallback message, JSInspectorPauseCallback pause, void* data);
++
++/*!
++@function
++@abstract Sends a UTF-8 JSON protocol message to the context's inspector.
++*/
++JS_EXPORT void JSGlobalContextDispatchInspectorMessage(JSGlobalContextRef ctx, const char* message, size_t length);
++
++/*!
++@function
++@abstract Disconnects and frees a connection from JSGlobalContextConnectInspector. Call it before the context is released.
++*/
++JS_EXPORT void JSGlobalContextDisconnectInspector(JSGlobalContextRef ctx, void* connection);
++
+ /*!
+ @function
+ @abstract Sets the script execution time limit.
 diff --git a/Source/JavaScriptCore/API/JSTypedArray.cpp b/Source/JavaScriptCore/API/JSTypedArray.cpp
 index fb7313c36..7da81f65b 100644
 --- a/Source/JavaScriptCore/API/JSTypedArray.cpp
@@ -272,6 +408,21 @@ index 02389f1e1..045edddb0 100644
      add_dependencies(JavaScriptCore_CopyPrivateHeaders JavaScriptCore)
  endif()
  
+diff --git a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp b/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
+index 8efc3dcab..7fdee2ca1 100644
+--- a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
++++ b/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
+@@ -39,6 +39,10 @@ AgentRegistry::~AgentRegistry()
+     // make it difficult to establish a correct destruction order for all agents.
+     for (auto& agent : m_agents)
+         agent->discardAgent();
++
++    // Agents keep CheckedPtrs to agents made before them, like the debugger agent to the console agent.
++    while (!m_agents.isEmpty())
++        m_agents.removeLast();
+ }
+ 
+ void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
 diff --git a/Source/JavaScriptCore/runtime/JSMicrotask.cpp b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 index b17afacd7..475ba4957 100644
 --- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp

@@ -84,6 +84,62 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)
     Ok((name.into(), product_name.into(), version.into()))
 }
 
+/// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
+pub const FEATURES: [(&str, bool); 1] = [("webgpu", false)];
+
+/// The bit of `feature` in a set returned by `disabled_features`.
+pub fn feature_bit(feature: &str) -> u32 {
+    1 << FEATURES
+        .iter()
+        .position(|(name, _)| *name == feature)
+        .expect("Known feature")
+}
+
+/// Applies package.json `features` in order: `"name"` enables, `"-name"` disables, `"*"` means all.
+/// Returns the disabled features as bits by `FEATURES` index.
+pub fn disabled_features(source: Option<&str>) -> Result<u32> {
+    let package: serde_json::Value =
+        serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
+    let mut disabled = FEATURES
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, enabled))| !enabled)
+        .fold(0, |bits, (index, _)| bits | 1 << index);
+    let Some(features) = package.get("features") else {
+        return Ok(disabled);
+    };
+    for feature in features
+        .as_array()
+        .context("package.json features must be an array")?
+    {
+        let feature = feature
+            .as_str()
+            .context("package.json features must be strings")?;
+        let (name, enable) = feature
+            .strip_prefix('-')
+            .map_or((feature, true), |name| (name, false));
+        let bits = if name == "*" {
+            (1 << FEATURES.len()) - 1
+        } else {
+            1 << FEATURES
+                .iter()
+                .position(|(known, _)| *known == name)
+                .with_context(|| {
+                    format!(
+                        "Unknown feature {name:?} in package.json; expected *, {}",
+                        FEATURES.map(|(name, _)| name).join(", ")
+                    )
+                })?
+        };
+        disabled = if enable {
+            disabled & !bits
+        } else {
+            disabled | bits
+        };
+    }
+    Ok(disabled)
+}
+
 pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     ensure!(files.contains_key("app.js"), "Missing app.js");
     let mut bundle = Bundle::default();
@@ -199,9 +255,10 @@ pub fn read(directory: &Path) -> Result<Bundle> {
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("Invalid bundle filename"))?;
             if (name.ends_with(".html")
+                || name.starts_with("script-") && name.ends_with(".js")
                 || matches!(
                     name.as_str(),
-                    "app.js" | "deps.js" | "native.json" | "package.json" | "assets.json"
+                    "app.js" | "native.json" | "package.json" | "assets.json"
                 ))
                 && entry.file_type()?.is_file()
             {
@@ -431,6 +488,30 @@ mod tests {
     }
 
     #[test]
+    fn package_features_enable_and_disable_in_order() {
+        for (features, disabled) in [
+            (None, 1),
+            (Some(json!([])), 1),
+            (Some(json!(["webgpu"])), 0),
+            (Some(json!(["*"])), 0),
+            (Some(json!(["-*"])), 1),
+            (Some(json!(["*", "-webgpu"])), 1),
+            (Some(json!(["-*", "webgpu"])), 0),
+            (Some(json!(["webgpu", "-webgpu"])), 1),
+        ] {
+            let package = features.map_or(json!({}), |features| json!({ "features": features }));
+            assert_eq!(
+                disabled_features(Some(&package.to_string())).unwrap(),
+                disabled,
+                "{package}"
+            );
+        }
+        for features in [json!("webgpu"), json!([1]), json!(["sqlite"]), json!(["-"])] {
+            assert!(disabled_features(Some(&json!({ "features": features }).to_string())).is_err());
+        }
+    }
+
+    #[test]
     fn package_versions_match_the_complete_pattern() {
         for version in [
             "0.0.0",
@@ -511,7 +592,7 @@ mod tests {
         </style></head><body><div id="card" class="card active" style="height:30px !important; @apply p-4;"><span class="label">你好 &amp; hello</span></div></body></html>"#;
         let dir = tempfile::tempdir().unwrap();
         let files = BBTreeMap::from([
-            ("app.js".into(), "define({id:0});".into()),
+            ("app.js".into(), "$appsDefine({id:0});".into()),
             ("page-0.html".into(), html.into()),
         ]);
         write(&dir.path().join("app.h2o"), &files).unwrap();
@@ -544,40 +625,32 @@ mod tests {
         }
         let mut host = Host::default();
         host.pages.insert(1, Page { doc, dirty: false });
-        let style = host
-            .call(
-                Role::Renderer(1),
-                json!({"op":"dom.attr","args":[card,"style"]}),
-            )
+        let tree = host
+            .call(Role::Renderer(1), "dom.tree", json!([card]))
             .unwrap();
-        assert!(style.as_str().unwrap().contains("height:30px !important"));
-        host.call(
-            Role::Renderer(1),
-            json!({"op":"dom.setAttr","args":[card,"style","height:42px"]}),
-        )
-        .unwrap();
-        assert_eq!(
-            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
-            "42px"
+        let tree = tree.as_array().unwrap();
+        let style = tree.iter().position(|value| value == "style").unwrap();
+        assert!(
+            tree[style + 1]
+                .as_str()
+                .unwrap()
+                .contains("height:30px !important")
         );
-        host.call(
-            Role::Renderer(1),
-            json!({"op":"dom.removeAttr","args":[card,"style"]}),
-        )
-        .unwrap();
-        assert_eq!(
-            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
-            "20px"
-        );
-        host.call(
-            Role::Renderer(1),
-            json!({"op":"dom.setText","args":[sheet,"#card {height:55px}"]}),
-        )
-        .unwrap();
-        assert_eq!(
-            style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
-            "55px"
-        );
+        for (codes, text, height) in [
+            ([4, card as i32, 5, 11], "styleheight:42px", "42px"),
+            ([5, card as i32, 5, 0], "style", "20px"),
+            ([1, sheet as i32, 19, 0], "#card {height:55px}", "55px"),
+        ] {
+            let codes: Vec<u8> = codes
+                .iter()
+                .flat_map(|code: &i32| code.to_ne_bytes())
+                .collect();
+            assert!(host.batch(1, &codes, text).unwrap().is_null());
+            assert_eq!(
+                style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
+                height
+            );
+        }
     }
 
     #[test]

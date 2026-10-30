@@ -1,0 +1,1173 @@
+// WARNING: these structs must match the `repr(C)` structs in `scene.rs` and `frame.rs`, like the
+// Metal and WGSL shaders. Structured buffers are tightly packed, so `float4` needs no padding.
+
+// The render target covers `viewport_size` device pixels from `viewport_origin` of the window.
+cbuffer Globals: register(b0) {
+    float4 gamma_ratios;
+    float2 viewport_size;
+    float2 viewport_origin;
+    float2 window_size;
+    float grayscale_enhanced_contrast;
+    float subpixel_enhanced_contrast;
+    uint premultiplied_alpha;
+    uint is_bgr;
+    uint2 globals_pad;
+};
+
+// Instance IDs start at zero, so draws pass the index of their first instance.
+cbuffer Batch: register(b1) {
+    uint batch_start;
+    uint3 batch_pad;
+};
+
+Texture2D<float4> t_sprite: register(t0);
+Texture2D<float4> t_mask: register(t2);
+Texture2D<float4> t_backdrop: register(t3);
+SamplerState s_sprite: register(s0);
+
+struct Bounds {
+    float2 origin;
+    float2 size;
+};
+
+struct Corners {
+    float top_left;
+    float top_right;
+    float bottom_right;
+    float bottom_left;
+};
+
+struct Edges {
+    float top;
+    float right;
+    float bottom;
+    float left;
+};
+
+struct ContentMask {
+    Bounds bounds;
+    Bounds rounded;
+    Corners radii;
+};
+
+struct AtlasTextureId {
+    uint index;
+    uint kind;
+};
+
+struct AtlasBounds {
+    int2 origin;
+    int2 size;
+};
+
+struct AtlasTile {
+    AtlasTextureId texture_id;
+    uint tile_id;
+    uint padding;
+    AtlasBounds bounds;
+};
+
+static const float M_PI_F = 3.141592653f;
+static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
+
+float2 unit_vertex_of(uint vertex_id) {
+    return float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+}
+
+float4 to_device_position_impl(float2 position) {
+    float2 device_position = (position - viewport_origin) / viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    return float4(device_position, 0., 1.);
+}
+
+float4 to_device_position(float2 unit_vertex, Bounds bounds) {
+    return to_device_position_impl(unit_vertex * bounds.size + bounds.origin);
+}
+
+float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
+    float2 tl = position - clip_bounds.origin;
+    float2 br = clip_bounds.origin + clip_bounds.size - position;
+    return float4(tl.x, br.x, tl.y, br.y);
+}
+
+float4 distance_from_clip_rect(float2 unit_vertex, Bounds bounds, Bounds clip_bounds) {
+    return distance_from_clip_rect_impl(unit_vertex * bounds.size + bounds.origin, clip_bounds);
+}
+
+// The window position of a fragment.
+float2 window_position(float4 position) {
+    return position.xy + viewport_origin;
+}
+
+// This approximates the error function, needed for the gaussian integral
+float2 erf(float2 x) {
+    float2 s = sign(x);
+    float2 a = abs(x);
+    float2 r1 = 1. + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
+    float2 r2 = r1 * r1;
+    return s - s / (r2 * r2);
+}
+
+float blur_along_x(float x, float y, float sigma, float corner, float2 half_size) {
+    float delta = min(half_size.y - corner - abs(y), 0.);
+    float curved = half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+    float2 integral = 0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
+    return integral.y - integral.x;
+}
+
+// A standard gaussian function, used for weighting samples
+float gaussian(float x, float sigma) {
+    return exp(-(x * x) / (2. * sigma * sigma)) / (sqrt(2. * M_PI_F) * sigma);
+}
+
+float4 over(float4 below, float4 above) {
+    float4 result;
+    float alpha = above.a + below.a * (1.0 - above.a);
+    result.rgb = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
+    result.a = alpha;
+    return result;
+}
+
+float2 to_tile_position(float2 unit_vertex, AtlasTile tile) {
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+    return (float2(tile.bounds.origin) + unit_vertex * float2(tile.bounds.size)) / atlas_size;
+}
+
+// Selects corner radius based on quadrant.
+float pick_corner_radius(float2 center_to_point, Corners corner_radii) {
+    if (center_to_point.x < 0.) {
+        if (center_to_point.y < 0.) {
+            return corner_radii.top_left;
+        } else {
+            return corner_radii.bottom_left;
+        }
+    } else {
+        if (center_to_point.y < 0.) {
+            return corner_radii.top_right;
+        } else {
+            return corner_radii.bottom_right;
+        }
+    }
+}
+
+// Implementation of quad signed distance field
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+    if (corner_radius == 0.0) {
+        // Fast path for unrounded corners
+        return max(corner_center_to_point.x, corner_center_to_point.y);
+    } else {
+        // Signed distance of the point from a quad that is inset by corner_radius
+        // It is negative inside this quad, and positive outside
+        float signed_distance_to_inset_quad =
+            // 0 inside the inset quad, and positive outside
+            length(max(float2(0.0, 0.0), corner_center_to_point)) +
+            // 0 outside the inset quad, and negative inside
+            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+
+        return signed_distance_to_inset_quad - corner_radius;
+    }
+}
+
+float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
+    float2 half_size = bounds.size / 2.;
+    float2 center = bounds.origin + half_size;
+    float2 center_to_point = pt - center;
+    float corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    float2 corner_to_point = abs(center_to_point) - half_size;
+    float2 corner_center_to_point = corner_to_point + corner_radius;
+    return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+// Coverage of the rounded part of a content mask.
+float mask_alpha(float2 position, ContentMask mask) {
+    if (mask.radii.top_left == 0.0 && mask.radii.top_right == 0.0 &&
+            mask.radii.bottom_right == 0.0 && mask.radii.bottom_left == 0.0) {
+        return 1.0;
+    }
+    return saturate(0.5 - quad_sdf(position, mask.rounded, mask.radii));
+}
+
+// Adapted from https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.hlsl
+// Copyright (c) Microsoft Corporation. Licensed under the MIT license.
+float apply_contrast_and_gamma_correction(float sample, float3 color) {
+    float brightness = dot(color, float3(0.30f, 0.59f, 0.11f));
+    float k = grayscale_enhanced_contrast * saturate(4.0f * (0.75f - brightness));
+    float contrasted = sample * (k + 1.0f) / (sample * k + 1.0f);
+    float4 g = gamma_ratios;
+    float correction = (g.x * brightness + g.y) * contrasted + (g.z * brightness + g.w);
+    return contrasted + contrasted * (1.0f - contrasted) * correction;
+}
+
+// Returns the dash velocity of a corner given the dash velocity of the two
+// sides, by returning the slower velocity (larger dashes).
+//
+// Since 0 is used for dash velocity when the border width is 0 (instead of
+// +inf), this returns the other dash velocity in that case.
+//
+// An alternative to this might be to appropriately interpolate the dash
+// velocity around the corner, but that seems overcomplicated.
+float corner_dash_velocity(float dv1, float dv2) {
+    if (dv1 == 0.0) {
+        return dv2;
+    } else if (dv2 == 0.0) {
+        return dv1;
+    } else {
+        return min(dv1, dv2);
+    }
+}
+
+// Returns alpha used to render antialiased dashes.
+// `t` is within the dash when `fmod(t, period) < length`.
+float dash_alpha(
+    float t, float period, float length, float dash_velocity,
+    float antialias_threshold
+) {
+    float half_period = period / 2.0;
+    float half_length = length / 2.0;
+    // Value in [-half_period, half_period]
+    // The dash is in [-half_length, half_length]
+    float centered = fmod(t + half_period - half_length, period) - half_period;
+    // Signed distance for the dash, negative values are inside the dash
+    float signed_distance = abs(centered) - half_length;
+    // Antialiased alpha based on the signed distance
+    return saturate(antialias_threshold - signed_distance / dash_velocity);
+}
+
+// Returns alpha used to render antialiased round dots of a dotted border.
+float dot_alpha(float t, float period, float dot_length, float dash_velocity, float depth, float inner_depth, float antialias_threshold) {
+    float width = depth + inner_depth;
+    float half_period = period / 2.0;
+    float half_length = dot_length / 2.0;
+    float along = (fmod(t + half_period - half_length, period) - half_period) / dash_velocity;
+    float across = depth - width / 2.0;
+    return saturate(antialias_threshold - (length(float2(along, across)) - width / 2.0));
+}
+
+// This approximates distance to the nearest point to a quarter ellipse in a way
+// that is sufficient for anti-aliasing when the ellipse is not very eccentric.
+// The components of `point` are expected to be positive.
+//
+// Negative on the outside and positive on the inside.
+float quarter_ellipse_sdf(float2 pt, float2 radii) {
+    // Scale the space to treat the ellipse like a unit circle
+    float2 circle_vec = pt / radii;
+    float unit_circle_sdf = length(circle_vec) - 1.0;
+    // Approximate up-scaling of the length by using the average of the radii.
+    //
+    // TODO: A better solution would be to use the gradient of the implicit
+    // function for an ellipse to approximate a scaling factor.
+    return unit_circle_sdf * (radii.x + radii.y) * -0.5;
+}
+
+/*
+**
+**              Quads
+**
+*/
+
+struct Quad {
+    uint order;
+    uint border_style;
+    Bounds bounds;
+    ContentMask content_mask;
+    float4 background;
+    float4 border_color;
+    Corners corner_radii;
+    Edges border_widths;
+};
+
+struct QuadVertexOutput {
+    nointerpolation uint quad_id: TEXCOORD0;
+    float4 position: SV_Position;
+    nointerpolation float4 border_color: COLOR0;
+    nointerpolation float4 background_color: COLOR1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct QuadFragmentInput {
+    nointerpolation uint quad_id: TEXCOORD0;
+    float4 position: SV_Position;
+    nointerpolation float4 border_color: COLOR0;
+    nointerpolation float4 background_color: COLOR1;
+};
+
+StructuredBuffer<Quad> quads: register(t1);
+
+QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint quad_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    Quad quad = quads[quad_id];
+    QuadVertexOutput output;
+    output.position = to_device_position(unit_vertex, quad.bounds);
+    output.border_color = quad.border_color;
+    output.background_color = quad.background;
+    output.quad_id = quad_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
+    return output;
+}
+
+float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
+    float4 background_color = input.background_color;
+
+    bool unrounded = quad.corner_radii.top_left == 0.0 &&
+        quad.corner_radii.top_right == 0.0 &&
+        quad.corner_radii.bottom_left == 0.0 &&
+        quad.corner_radii.bottom_right == 0.0;
+
+    // Fast path when the quad is not rounded and doesn't have any border
+    if (quad.border_widths.top == 0.0 &&
+        quad.border_widths.left == 0.0 &&
+        quad.border_widths.right == 0.0 &&
+        quad.border_widths.bottom == 0.0 &&
+        unrounded) {
+        return background_color;
+    }
+
+    float2 size = quad.bounds.size;
+    float2 half_size = size / 2.;
+    float2 the_point = position - quad.bounds.origin;
+    float2 center_to_point = the_point - half_size;
+
+    // Signed distance field threshold for inclusion of pixels. 0.5 is the
+    // minimum distance between the center of the pixel and the edge.
+    const float antialias_threshold = 0.5;
+
+    // Radius of the nearest corner
+    float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+
+    float2 border = float2(
+        center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
+        center_to_point.y < 0.0 ? quad.border_widths.top : quad.border_widths.bottom
+    );
+
+    // 0-width borders are reduced so that `inner_sdf >= antialias_threshold`.
+    // The purpose of this is to not draw antialiasing pixels in this case.
+    float2 reduced_border = float2(
+        border.x == 0.0 ? -antialias_threshold : border.x,
+        border.y == 0.0 ? -antialias_threshold : border.y
+    );
+
+    // Far borders wider than half the quad reach past its center, like the top border of an empty `<hr>`.
+    float2 far_border = float2(
+        center_to_point.x < 0.0 ? quad.border_widths.right : quad.border_widths.left,
+        center_to_point.y < 0.0 ? quad.border_widths.bottom : quad.border_widths.top
+    );
+    float2 reduced_far_border = far_border == 0.0 ? -antialias_threshold : far_border;
+
+    // Vector from the corner of the quad bounds to the point, after mirroring
+    // the point into the bottom right quadrant. Both components are <= 0.
+    float2 corner_to_point = abs(center_to_point) - half_size;
+
+    // Vector from the point to the center of the rounded corner's circle, also
+    // mirrored into bottom right quadrant.
+    float2 corner_center_to_point = corner_to_point + corner_radius;
+
+    // Whether the nearest point on the border is rounded
+    bool is_near_rounded_corner =
+            corner_center_to_point.x >= 0.0 &&
+            corner_center_to_point.y >= 0.0;
+
+    // Vector from straight border inner corner to point.
+    //
+    // 0-width borders are turned into width -1 so that inner_sdf is > 1.0 near
+    // the border. Without this, antialiasing pixels would be drawn.
+    float2 straight_border_inner_corner_to_point =
+        max(corner_to_point + reduced_border, reduced_far_border - size - corner_to_point);
+
+    // Whether the point is beyond the inner edge of the straight border
+    bool is_beyond_inner_straight_border =
+            straight_border_inner_corner_to_point.x > 0.0 ||
+            straight_border_inner_corner_to_point.y > 0.0;
+
+    // Whether the point is far enough inside the quad, such that the pixels are
+    // not affected by the straight border.
+    bool is_within_inner_straight_border =
+        straight_border_inner_corner_to_point.x < -antialias_threshold &&
+        straight_border_inner_corner_to_point.y < -antialias_threshold;
+
+    // Fast path for points that must be part of the background
+    if (is_within_inner_straight_border && !is_near_rounded_corner) {
+        return background_color;
+    }
+
+    // Signed distance of the point to the outside edge of the quad's border
+    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+
+    // Approximate signed distance of the point to the inside edge of the quad's
+    // border. It is negative outside this edge (within the border), and
+    // positive inside.
+    //
+    // This is not always an accurate signed distance:
+    // * The rounded portions with varying border width use an approximation of
+    //   nearest-point-on-ellipse.
+    // * When it is quickly known to be outside the edge, -1.0 is used.
+    float inner_sdf = 0.0;
+    if (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0) {
+        // Fast paths for straight borders
+        inner_sdf = -max(straight_border_inner_corner_to_point.x,
+                        straight_border_inner_corner_to_point.y);
+    } else if (is_beyond_inner_straight_border) {
+        // Fast path for points that must be outside the inner edge
+        inner_sdf = -1.0;
+    } else if (reduced_border.x == reduced_border.y) {
+        // Fast path for circular inner edge.
+        inner_sdf = -(outer_sdf + reduced_border.x);
+    } else {
+        float2 ellipse_radii = max(float2(0.0, 0.0), float2(corner_radius, corner_radius) - reduced_border);
+        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    }
+
+    // Negative when inside the border
+    float border_sdf = max(inner_sdf, outer_sdf);
+
+    float4 color = background_color;
+    if (border_sdf < antialias_threshold) {
+        float4 border_color = input.border_color;
+
+        // Exact distance to the inner edge, for the double and dotted styles.
+        Bounds inner_bounds;
+        inner_bounds.origin = quad.bounds.origin + float2(quad.border_widths.left, quad.border_widths.top);
+        inner_bounds.size = max(float2(0.0, 0.0), quad.bounds.size - float2(
+            quad.border_widths.left + quad.border_widths.right,
+            quad.border_widths.top + quad.border_widths.bottom));
+        Corners inner_radii;
+        inner_radii.top_left = max(0.0, quad.corner_radii.top_left - max(quad.border_widths.top, quad.border_widths.left));
+        inner_radii.top_right = max(0.0, quad.corner_radii.top_right - max(quad.border_widths.top, quad.border_widths.right));
+        inner_radii.bottom_right = max(0.0, quad.corner_radii.bottom_right - max(quad.border_widths.bottom, quad.border_widths.right));
+        inner_radii.bottom_left = max(0.0, quad.corner_radii.bottom_left - max(quad.border_widths.bottom, quad.border_widths.left));
+        float inner_depth = quad_sdf(position, inner_bounds, inner_radii);
+
+        // Double borders keep the outer and inner thirds.
+        if (quad.border_style == 3) {
+            float depth = -outer_sdf;
+            float width = depth + inner_depth;
+            border_color.a *= saturate(antialias_threshold - min(depth - width / 3.0, width * 2.0 / 3.0 - depth));
+        }
+
+        // Dashed (1) and dotted (2) border logic
+        if (quad.border_style == 1 || quad.border_style == 2) {
+            // Position along the perimeter in "dash space", where each dash
+            // period has length 1
+            float t = 0.0;
+
+            // Total number of dash periods, so that the dash spacing can be
+            // adjusted to evenly divide it
+            float max_t = 0.0;
+
+            // Border width is proportional to dash size. This is the behavior
+            // used by browsers, but also avoids dashes from different segments
+            // overlapping when dash size is smaller than the border width.
+            //
+            // Dash pattern: (2 * border width) dash, (1 * border width) gap
+            bool dotted = quad.border_style == 2;
+            float dash_length_per_width = dotted ? 1.0 : 2.0;
+            const float dash_gap_per_width = 1.0;
+            float dash_period_per_width = dash_length_per_width + dash_gap_per_width;
+
+            // Since the dash size is determined by border width, the density of
+            // dashes varies. Multiplying a pixel distance by this returns a
+            // position in dash space - it has units (dash period / pixels). So
+            // a dash velocity of (1 / 10) is 1 dash every 10 pixels.
+            float dash_velocity = 0.0;
+
+            // Dividing this by the border width gives the dash velocity
+            float dv_numerator = 1.0 / dash_period_per_width;
+
+            if (unrounded) {
+                // When corners aren't rounded, the dashes are separately laid
+                // out on each straight line, rather than around the whole
+                // perimeter. This way each line starts and ends with a dash.
+                bool is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
+                // Choosing the right border width for dashed borders.
+                // TODO: A better solution exists taking a look at the whole file.
+                // this does not fix single dashed borders at the corners
+                float2 dashed_border = float2(
+                    max(quad.border_widths.bottom, quad.border_widths.top),
+                    max(quad.border_widths.right, quad.border_widths.left)
+                );
+                float border_width = is_horizontal ? dashed_border.x : dashed_border.y;
+                dash_velocity = dv_numerator / border_width;
+                t = is_horizontal ? the_point.x : the_point.y;
+                t *= dash_velocity;
+                max_t = is_horizontal ? size.x : size.y;
+                max_t *= dash_velocity;
+            } else {
+                // When corners are rounded, the dashes are laid out clockwise
+                // around the whole perimeter.
+
+                float r_tr = quad.corner_radii.top_right;
+                float r_br = quad.corner_radii.bottom_right;
+                float r_bl = quad.corner_radii.bottom_left;
+                float r_tl = quad.corner_radii.top_left;
+
+                float w_t = quad.border_widths.top;
+                float w_r = quad.border_widths.right;
+                float w_b = quad.border_widths.bottom;
+                float w_l = quad.border_widths.left;
+
+                // Straight side dash velocities
+                float dv_t = w_t <= 0.0 ? 0.0 : dv_numerator / w_t;
+                float dv_r = w_r <= 0.0 ? 0.0 : dv_numerator / w_r;
+                float dv_b = w_b <= 0.0 ? 0.0 : dv_numerator / w_b;
+                float dv_l = w_l <= 0.0 ? 0.0 : dv_numerator / w_l;
+
+                // Straight side lengths in dash space
+                float s_t = (size.x - r_tl - r_tr) * dv_t;
+                float s_r = (size.y - r_tr - r_br) * dv_r;
+                float s_b = (size.x - r_br - r_bl) * dv_b;
+                float s_l = (size.y - r_bl - r_tl) * dv_l;
+
+                float corner_dash_velocity_tr = corner_dash_velocity(dv_t, dv_r);
+                float corner_dash_velocity_br = corner_dash_velocity(dv_b, dv_r);
+                float corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
+                float corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
+
+                // Corner lengths in dash space. Dots follow the middle of the border.
+                float middle = dotted ? 0.5 : 0.0;
+                float c_tr = max(0.0, r_tr - middle * max(w_t, w_r)) * (M_PI_F / 2.0) * corner_dash_velocity_tr;
+                float c_br = max(0.0, r_br - middle * max(w_b, w_r)) * (M_PI_F / 2.0) * corner_dash_velocity_br;
+                float c_bl = max(0.0, r_bl - middle * max(w_b, w_l)) * (M_PI_F / 2.0) * corner_dash_velocity_bl;
+                float c_tl = max(0.0, r_tl - middle * max(w_t, w_l)) * (M_PI_F / 2.0) * corner_dash_velocity_tl;
+
+                // Cumulative dash space upto each segment
+                float upto_tr = s_t;
+                float upto_r = upto_tr + c_tr;
+                float upto_br = upto_r + s_r;
+                float upto_b = upto_br + c_br;
+                float upto_bl = upto_b + s_b;
+                float upto_l = upto_bl + c_bl;
+                float upto_tl = upto_l + s_l;
+                max_t = upto_tl + c_tl;
+
+                if (is_near_rounded_corner) {
+                    float radians = atan2(corner_center_to_point.y, corner_center_to_point.x);
+                    float corner_t = radians * max(0.0, corner_radius - middle * max(border.x, border.y));
+
+                    if (center_to_point.x >= 0.0) {
+                        if (center_to_point.y < 0.0) {
+                            dash_velocity = corner_dash_velocity_tr;
+                            // Subtracted because radians is pi/2 to 0 when
+                            // going clockwise around the top right corner,
+                            // since the y axis has been flipped
+                            t = upto_r - corner_t * dash_velocity;
+                        } else {
+                            dash_velocity = corner_dash_velocity_br;
+                            // Added because radians is 0 to pi/2 when going
+                            // clockwise around the bottom-right corner
+                            t = upto_br + corner_t * dash_velocity;
+                        }
+                    } else {
+                        if (center_to_point.y >= 0.0) {
+                            dash_velocity = corner_dash_velocity_bl;
+                            // Subtracted because radians is pi/2 to 0 when
+                            // going clockwise around the bottom-left corner,
+                            // since the x axis has been flipped
+                            t = upto_l - corner_t * dash_velocity;
+                        } else {
+                            dash_velocity = corner_dash_velocity_tl;
+                            // Added because radians is 0 to pi/2 when going
+                            // clockwise around the top-left corner, since both
+                            // axis were flipped
+                            t = upto_tl + corner_t * dash_velocity;
+                        }
+                    }
+                } else {
+                    // Straight borders
+                    bool is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
+                    if (is_horizontal) {
+                        if (center_to_point.y < 0.0) {
+                            dash_velocity = dv_t;
+                            t = (the_point.x - r_tl) * dash_velocity;
+                        } else {
+                            dash_velocity = dv_b;
+                            t = upto_bl - (the_point.x - r_bl) * dash_velocity;
+                        }
+                    } else {
+                        if (center_to_point.x < 0.0) {
+                            dash_velocity = dv_l;
+                            t = upto_tl - (the_point.y - r_tl) * dash_velocity;
+                        } else {
+                            dash_velocity = dv_r;
+                            t = upto_r + (the_point.y - r_tr) * dash_velocity;
+                        }
+                    }
+                }
+            }
+            float dash_length = dash_length_per_width / dash_period_per_width;
+
+            // Straight borders should start and end with a dash, so max_t is
+            // reduced to cause this.
+            max_t -= unrounded ? dash_length : 0.0;
+            if (max_t >= 1.0) {
+                // Adjust dash gap to evenly divide max_t
+                float dash_count = floor(max_t);
+                float dash_period = max_t / dash_count;
+                if (dotted) {
+                    border_color.a *= dot_alpha(t, dash_period, dash_length, dash_velocity, -outer_sdf, inner_depth, antialias_threshold);
+                } else {
+                    border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity, antialias_threshold);
+                }
+            } else if (unrounded) {
+                // When there isn't enough space for the full gap between the
+                // two start / end dashes of a straight border, reduce gap to
+                // make them fit.
+                float dash_gap = max_t - dash_length;
+                if (dash_gap > 0.0) {
+                    float dash_period = dash_length + dash_gap;
+                    border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity, antialias_threshold);
+                }
+            }
+        }
+
+        // Blend the border on top of the background and then linearly interpolate
+        // between the two as we slide inside the background.
+        float4 blended_border = over(background_color, border_color);
+        color = lerp(background_color, blended_border,
+                    saturate(antialias_threshold - inner_sdf));
+    }
+
+    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+}
+
+float4 quad_fragment(QuadFragmentInput input): SV_Target {
+    Quad quad = quads[input.quad_id];
+    float2 position = window_position(input.position);
+    float4 color = quad_color(input, quad, position);
+    color.a *= mask_alpha(position, quad.content_mask);
+    return color;
+}
+
+/*
+**
+**              Shadows
+**
+*/
+
+struct Shadow {
+    uint order;
+    float blur_radius;
+    Bounds bounds;
+    Corners corner_radii;
+    ContentMask content_mask;
+    float4 color;
+    Bounds element_bounds;
+    Corners element_corner_radii;
+    uint inset;
+    uint pad;
+};
+
+struct ShadowVertexOutput {
+    nointerpolation uint shadow_id: TEXCOORD0;
+    float4 position: SV_Position;
+    nointerpolation float4 color: COLOR;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct ShadowFragmentInput {
+  nointerpolation uint shadow_id: TEXCOORD0;
+  float4 position: SV_Position;
+  nointerpolation float4 color: COLOR;
+};
+
+StructuredBuffer<Shadow> shadows: register(t1);
+
+ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint shadow_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    Shadow shadow = shadows[shadow_id];
+
+    Bounds bounds = shadow.element_bounds;
+    if (shadow.inset == 0) {
+        float margin = 3.0 * shadow.blur_radius;
+        bounds = shadow.bounds;
+        bounds.origin -= margin;
+        bounds.size += 2.0 * margin;
+    }
+
+    ShadowVertexOutput output;
+    output.position = to_device_position(unit_vertex, bounds);
+    output.color = shadow.color;
+    output.shadow_id = shadow_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+    return output;
+}
+
+// Coverage of the shadow-casting box, blurred by a gaussian.
+float shadow_coverage(float2 position, Shadow shadow) {
+    if (shadow.blur_radius < 0.25) {
+        return saturate(0.5 - quad_sdf(position, shadow.bounds, shadow.corner_radii));
+    }
+    float2 half_size = shadow.bounds.size / 2.;
+    float2 center = shadow.bounds.origin + half_size;
+    float2 point0 = position - center;
+    float corner_radius = pick_corner_radius(point0, shadow.corner_radii);
+
+    // The signal is only non-zero in a limited range, so don't waste samples
+    float low = point0.y - half_size.y;
+    float high = point0.y + half_size.y;
+    float start = clamp(-3. * shadow.blur_radius, low, high);
+    float end = clamp(3. * shadow.blur_radius, low, high);
+
+    // Accumulate samples (we can get away with surprisingly few samples)
+    float step = (end - start) / 4.;
+    float y = start + step * 0.5;
+    float alpha = 0.;
+    for (int i = 0; i < 4; i++) {
+        alpha += blur_along_x(point0.x, point0.y - y, shadow.blur_radius,
+                            corner_radius, half_size) *
+                gaussian(y, shadow.blur_radius) * step;
+        y += step;
+    }
+    return alpha;
+}
+
+float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
+    Shadow shadow = shadows[input.shadow_id];
+    float2 position = window_position(input.position);
+    float coverage = shadow_coverage(position, shadow);
+    float masked = mask_alpha(position, shadow.content_mask);
+    if (shadow.inset != 0) {
+        float inside = saturate(0.5 - quad_sdf(position, shadow.element_bounds, shadow.element_corner_radii));
+        coverage = (1.0 - coverage) * inside;
+    }
+    return input.color * float4(1., 1., 1., coverage * masked);
+}
+
+/*
+**
+**              Underlines
+**
+*/
+
+struct Underline {
+    uint order;
+    uint wavy;
+    Bounds bounds;
+    ContentMask content_mask;
+    float4 color;
+    float thickness;
+    uint pad;
+};
+
+struct UnderlineVertexOutput {
+  nointerpolation uint underline_id: TEXCOORD0;
+  float4 position: SV_Position;
+  nointerpolation float4 color: COLOR;
+  float4 clip_distance: SV_ClipDistance;
+};
+
+struct UnderlineFragmentInput {
+  nointerpolation uint underline_id: TEXCOORD0;
+  float4 position: SV_Position;
+  nointerpolation float4 color: COLOR;
+};
+
+StructuredBuffer<Underline> underlines: register(t1);
+
+UnderlineVertexOutput underline_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint underline_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    Underline underline = underlines[underline_id];
+
+    UnderlineVertexOutput output;
+    output.position = to_device_position(unit_vertex, underline.bounds);
+    output.color = underline.color;
+    output.underline_id = underline_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask.bounds);
+    return output;
+}
+
+float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
+    const float WAVE_FREQUENCY = 2.0;
+    const float WAVE_HEIGHT_RATIO = 0.8;
+
+    Underline underline = underlines[input.underline_id];
+    float2 position = window_position(input.position);
+    float alpha = mask_alpha(position, underline.content_mask);
+    if ((underline.wavy & 0xFFu) != 0u) {
+        float half_thickness = underline.thickness * 0.5;
+        float2 st = ((position - underline.bounds.origin) / underline.bounds.size.y) - float2(0., 0.5);
+        float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.y;
+        float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
+
+        float sine = sin(st.x * frequency) * amplitude;
+        float dSine = cos(st.x * frequency) * amplitude * frequency;
+        float distance = (st.y - sine) / sqrt(1. + dSine * dSine);
+        float distance_in_pixels = distance * underline.bounds.size.y;
+        float distance_from_top_border = distance_in_pixels - half_thickness;
+        float distance_from_bottom_border = distance_in_pixels + half_thickness;
+        alpha *= saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
+    }
+    return input.color * float4(1., 1., 1., alpha);
+}
+
+
+/*
+**
+**              Monochrome sprites
+**
+*/
+
+struct MonochromeSprite {
+    uint order;
+    uint pad;
+    AtlasTile tile;
+    Bounds bounds;
+    ContentMask content_mask;
+    float4 color;
+};
+
+struct MonochromeSpriteVertexOutput {
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+    nointerpolation float4 color: COLOR;
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 clip_distance: TEXCOORD1;
+};
+
+StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
+
+MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint sprite_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    MonochromeSprite sprite = mono_sprites[sprite_id];
+    float2 position = unit_vertex * sprite.bounds.size + sprite.bounds.origin;
+
+    MonochromeSpriteVertexOutput output;
+    output.position = to_device_position_impl(position);
+    output.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    output.color = sprite.color;
+    output.sprite_id = sprite_id;
+    output.clip_distance = distance_from_clip_rect_impl(position, sprite.content_mask.bounds);
+    return output;
+}
+
+float4 monochrome_sprite_fragment(MonochromeSpriteVertexOutput input): SV_Target {
+    float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distance < 0.0)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb);
+    float masked = mask_alpha(window_position(input.position), mono_sprites[input.sprite_id].content_mask);
+    return float4(input.color.rgb, input.color.a * alpha_corrected * masked);
+}
+
+/*
+**
+**              Polychrome sprites
+**
+*/
+
+struct PolychromeSprite {
+    uint order;
+    uint grayscale;
+    AtlasTile tile;
+    float opacity;
+    uint pad;
+    Bounds bounds;
+    ContentMask content_mask;
+    Corners corner_radii;
+};
+
+struct PolychromeSpriteVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct PolychromeSpriteFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+};
+
+StructuredBuffer<PolychromeSprite> poly_sprites: register(t1);
+
+PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint sprite_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    PolychromeSprite sprite = poly_sprites[sprite_id];
+
+    PolychromeSpriteVertexOutput output;
+    output.position = to_device_position(unit_vertex, sprite.bounds);
+    output.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    output.sprite_id = sprite_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
+    return output;
+}
+
+float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
+    PolychromeSprite sprite = poly_sprites[input.sprite_id];
+    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float2 position = window_position(input.position);
+    float distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
+
+    float4 color = sample;
+    if ((sprite.grayscale & 0xFFu) != 0u) {
+        float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+        color = float4(grayscale, sample.a);
+    }
+    color.a *= sprite.opacity * saturate(0.5 - distance) * mask_alpha(position, sprite.content_mask);
+    return color;
+}
+
+/*
+**
+**              Effects
+**
+*/
+
+struct Composite {
+    float4x4 transform;
+    float4x4 color_matrix;
+    float4 color_offset;
+    float4 shadow_color;
+    float4 bounds;
+    float4 clip;
+    float4 clip_radii;
+    float4 mask_rect;
+    float4 mask_tile;
+    float4 content_mask;
+    float4 rounded_mask;
+    float4 rounded_radii;
+    float4 shadow;
+    float4 source_rect;
+    float4 backdrop_rect;
+    float opacity;
+    float blur;
+    uint flags;
+    uint blend;
+};
+
+static const uint COMPOSITE_MATRIX = 1;
+static const uint COMPOSITE_CLIP = 2;
+static const uint COMPOSITE_MASK = 4;
+static const uint COMPOSITE_SHADOW = 8;
+static const uint COMPOSITE_BACKDROP = 16;
+static const uint COMPOSITE_BLEND = 32;
+
+StructuredBuffer<Composite> composites: register(t1);
+
+struct CompositeVertexOutput {
+    float4 position: SV_Position;
+    float2 local: TEXCOORD0;
+    nointerpolation uint composite_id: TEXCOORD1;
+};
+
+CompositeVertexOutput composite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint composite_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    Composite c = composites[composite_id];
+    float2 local = c.bounds.xy + unit_vertex * c.bounds.zw;
+    float4 p = mul(c.transform, float4(local, 0.0, 1.0));
+    float2 target_position = p.xy - viewport_origin * p.w;
+
+    CompositeVertexOutput output;
+    output.position = float4(
+        target_position.x / viewport_size.x * 2.0 - p.w,
+        p.w - target_position.y / viewport_size.y * 2.0,
+        0.0,
+        p.w);
+    output.local = local;
+    output.composite_id = composite_id;
+    return output;
+}
+
+// Samples a premultiplied texel of a texture covering `rect` of the window, transparent outside it.
+float4 sample_layer(float2 position, float4 rect) {
+    float2 uv = (position - rect.xy) / rect.zw;
+    if (any(uv < 0.0) || any(uv > 1.0)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return t_sprite.SampleLevel(s_sprite, uv, 0.0);
+}
+
+// Sums gaussian taps along `direction`, spaced to keep large blurs cheap.
+float4 gaussian_sample(float2 position, float2 direction, float sigma, float4 rect) {
+    if (sigma < 0.25) {
+        return sample_layer(position, rect);
+    }
+    float radius = ceil(3.0 * sigma);
+    float taps = min(radius, 32.0);
+    float step = radius / taps;
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float weight = 0.0;
+    [loop]
+    for (float i = -taps; i <= taps; i += 1.0) {
+        float offset = i * step;
+        float w = exp(-(offset * offset) / (2.0 * sigma * sigma));
+        sum += sample_layer(position + direction * offset, rect) * w;
+        weight += w;
+    }
+    return sum / weight;
+}
+
+float luminosity(float3 color) {
+    return dot(color, float3(0.3, 0.59, 0.11));
+}
+
+float3 clip_color(float3 color) {
+    float l = luminosity(color);
+    float n = min(min(color.r, color.g), color.b);
+    float x = max(max(color.r, color.g), color.b);
+    float3 c = color;
+    if (n < 0.0) {
+        c = l + (c - l) * l / (l - n);
+    }
+    if (x > 1.0) {
+        c = l + (c - l) * (1.0 - l) / (x - l);
+    }
+    return c;
+}
+
+float3 set_luminosity(float3 color, float l) {
+    return clip_color(color + (l - luminosity(color)));
+}
+
+float saturation(float3 color) {
+    return max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
+}
+
+float3 set_saturation(float3 color, float s) {
+    float n = min(min(color.r, color.g), color.b);
+    float x = max(max(color.r, color.g), color.b);
+    if (x <= n) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    return (color - n) * s / (x - n);
+}
+
+float3 hard_light(float3 cb, float3 cs) {
+    return cs <= 0.5 ? cb * 2.0 * cs : cb + 2.0 * cs - 1.0 - cb * (2.0 * cs - 1.0);
+}
+
+float3 soft_light(float3 cb, float3 cs) {
+    float3 d = cb <= 0.25 ? ((16.0 * cb - 12.0) * cb + 4.0) * cb : sqrt(cb);
+    return cs <= 0.5 ? cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb) : cb + (2.0 * cs - 1.0) * (d - cb);
+}
+
+// The CSS blend modes, on unpremultiplied colors.
+float3 blend_mode(float3 cb, float3 cs, uint mode) {
+    switch (mode) {
+        case 1: return cb * cs;
+        case 2: return cb + cs - cb * cs;
+        case 3: return hard_light(cs, cb);
+        case 4: return min(cb, cs);
+        case 5: return max(cb, cs);
+        case 6: return cb <= 0.0 ? (float3)0.0 : (cs >= 1.0 ? (float3)1.0 : min((float3)1.0, cb / max(1.0 - cs, 1e-6)));
+        case 7: return cb >= 1.0 ? (float3)1.0 : (cs <= 0.0 ? (float3)0.0 : 1.0 - min((float3)1.0, (1.0 - cb) / max(cs, 1e-6)));
+        case 8: return hard_light(cb, cs);
+        case 9: return soft_light(cb, cs);
+        case 10: return abs(cb - cs);
+        case 11: return cb + cs - 2.0 * cb * cs;
+        case 12: return set_luminosity(set_saturation(cs, saturation(cb)), luminosity(cb));
+        case 13: return set_luminosity(set_saturation(cb, saturation(cs)), luminosity(cb));
+        case 14: return set_luminosity(cs, luminosity(cb));
+        case 15: return set_luminosity(cb, luminosity(cs));
+        default: return cs;
+    }
+}
+
+float4 composite_fragment(CompositeVertexOutput input): SV_Target {
+    Composite c = composites[input.composite_id];
+    float2 target_position = window_position(input.position);
+    if (any(target_position < c.content_mask.xy) || any(target_position > c.content_mask.xy + c.content_mask.zw)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float4 color;
+    if ((c.flags & COMPOSITE_BACKDROP) != 0) {
+        color = gaussian_sample(target_position, float2(0.0, 1.0), c.blur, c.source_rect);
+    } else if ((c.flags & COMPOSITE_SHADOW) != 0) {
+        color = c.shadow_color * gaussian_sample(input.local - c.shadow.xy, float2(0.0, 1.0), c.blur, c.source_rect).a;
+    } else {
+        color = gaussian_sample(input.local, float2(0.0, 1.0), c.blur, c.source_rect);
+    }
+
+    if ((c.flags & COMPOSITE_MATRIX) != 0 && color.a > 0.0) {
+        float4 straight = float4(color.rgb / color.a, color.a);
+        float4 mapped = saturate(mul(c.color_matrix, straight) + c.color_offset);
+        color = float4(mapped.rgb * mapped.a, mapped.a);
+    }
+
+    ContentMask content_mask;
+    content_mask.bounds.origin = c.content_mask.xy;
+    content_mask.bounds.size = c.content_mask.zw;
+    content_mask.rounded.origin = c.rounded_mask.xy;
+    content_mask.rounded.size = c.rounded_mask.zw;
+    content_mask.radii.top_left = c.rounded_radii.x;
+    content_mask.radii.top_right = c.rounded_radii.y;
+    content_mask.radii.bottom_right = c.rounded_radii.z;
+    content_mask.radii.bottom_left = c.rounded_radii.w;
+    float coverage = c.opacity * mask_alpha(target_position, content_mask);
+    if ((c.flags & COMPOSITE_CLIP) != 0) {
+        Bounds bounds;
+        bounds.origin = c.clip.xy;
+        bounds.size = c.clip.zw;
+        Corners radii;
+        radii.top_left = c.clip_radii.x;
+        radii.top_right = c.clip_radii.y;
+        radii.bottom_right = c.clip_radii.z;
+        radii.bottom_left = c.clip_radii.w;
+        coverage *= saturate(0.5 - quad_sdf(input.local, bounds, radii));
+    }
+    if ((c.flags & COMPOSITE_MASK) != 0) {
+        float2 t = (input.local - c.mask_rect.xy) / c.mask_rect.zw;
+        if (any(t < 0.0) || any(t > 1.0)) {
+            coverage = 0.0;
+        } else {
+            float2 mask_size;
+            t_mask.GetDimensions(mask_size.x, mask_size.y);
+            coverage *= t_mask.SampleLevel(s_sprite, (c.mask_tile.xy + t * c.mask_tile.zw) / mask_size, 0.0).a;
+        }
+    }
+    color *= coverage;
+
+    if ((c.flags & COMPOSITE_BLEND) != 0 && color.a > 0.0) {
+        float4 backdrop = t_backdrop.SampleLevel(s_sprite, (target_position - c.backdrop_rect.xy) / c.backdrop_rect.zw, 0.0);
+        if (c.blend == 16) {
+            // plus-lighter adds both layers.
+            return float4(min(color.rgb + backdrop.rgb, (float3)1.0) - backdrop.rgb * (1.0 - color.a), color.a);
+        }
+        float3 cb = backdrop.a > 0.0 ? backdrop.rgb / backdrop.a : float3(0.0, 0.0, 0.0);
+        float3 cs = color.rgb / color.a;
+        float3 mixed = (1.0 - backdrop.a) * cs + backdrop.a * saturate(blend_mode(cb, cs, c.blend));
+        color = float4(mixed * color.a, color.a);
+    }
+    return color;
+}
+
+struct Blur {
+    float4 region;
+    float4 source_rect;
+    float sigma;
+    float pad0;
+    float pad1;
+    float pad2;
+};
+
+StructuredBuffer<Blur> blurs: register(t1);
+
+struct BlurVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation uint blur_id: TEXCOORD0;
+};
+
+BlurVertexOutput blur_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    uint blur_id = batch_start + instance_id;
+    float2 unit_vertex = unit_vertex_of(vertex_id);
+    Blur blur = blurs[blur_id];
+
+    BlurVertexOutput output;
+    output.position = to_device_position_impl(blur.region.xy + unit_vertex * blur.region.zw);
+    output.blur_id = blur_id;
+    return output;
+}
+
+// The horizontal half of a separable blur; the composite does the vertical half.
+float4 blur_fragment(BlurVertexOutput input): SV_Target {
+    Blur blur = blurs[input.blur_id];
+    return gaussian_sample(window_position(input.position), float2(1.0, 0.0), blur.sigma, blur.source_rect);
+}

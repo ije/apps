@@ -1,5 +1,6 @@
 {
   "private": true,
   "type": "module",
+  "features": ["webgpu"],
   "dependencies": { "three": "0.186.1" }
 }

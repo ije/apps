@@ -11,6 +11,7 @@ struct Rules {
     parent: Option<SelectorList>,
     top_level: bool,
     declarations_only: bool,
+    theme: bool,
 }
 
 enum Item {
@@ -109,6 +110,8 @@ impl<'i> DeclarationParser<'i> for Rules {
                 name.to_string()
             } else if name.eq_ignore_ascii_case("-webkit-user-select") {
                 "user-select".into()
+            } else if name.eq_ignore_ascii_case("-webkit-app-region") {
+                "app-region".into()
             } else {
                 name.to_ascii_lowercase()
             },
@@ -158,18 +161,45 @@ impl<'i> AtRuleParser<'i> for Rules {
         input: &mut Parser<'i>,
     ) -> Result<Item, ParseError<()>> {
         if name.eq_ignore_ascii_case("import") && self.top_level {
-            if input.expect_url_or_string()?.as_ref() != "tailwindcss" {
-                return Err(ParseError::unexpected_token());
-            }
-            return Ok(Item::Rule(Rule::Tailwind));
+            let url = input.expect_url_or_string()?.clone();
+            let preflight = match url.strip_suffix(".css").unwrap_or(&url) {
+                "tailwindcss" | "tailwindcss/index" | "tailwindcss/preflight" => true,
+                "tailwindcss/theme" | "tailwindcss/utilities" => false,
+                _ => return Err(ParseError::unexpected_token()),
+            };
+            // WARNING: `layer()`, `source()`, `prefix()` and `important` are ignored.
+            while input.next().is_ok() {}
+            return Ok(Item::Rule(Rule::Tailwind(preflight)));
         }
         if name.eq_ignore_ascii_case("keyframes") && !self.declarations_only {
             let name = input.expect_ident_or_string()?.to_string();
             input.expect_exhausted()?;
             return Ok(Item::Rule(Rule::Keyframes(name, Vec::new())));
         }
+        if name.eq_ignore_ascii_case("custom-variant") && self.top_level {
+            let name = input.expect_ident_cloned()?.to_string();
+            input.expect_parenthesis_block()?;
+            let mut template = String::new();
+            input.parse_nested_block(|input| source(input, &mut template))?;
+            input.expect_exhausted()?;
+            return Ok(Item::Rule(Rule::Variant(name, template.trim().to_owned())));
+        }
         if name.eq_ignore_ascii_case("theme") && self.top_level {
-            return Ok(Item::Rule(Rule::Theme(Declarations::default())));
+            let mut inline = false;
+            while let Ok(option) = input.try_parse(|input| input.expect_ident_cloned()) {
+                inline |= option.eq_ignore_ascii_case("inline");
+            }
+            return Ok(Item::Rule(Rule::Theme(inline, Vec::new())));
+        }
+        if name.eq_ignore_ascii_case("font-face") && self.top_level {
+            input.expect_exhausted()?;
+            return Ok(Item::Rule(Rule::FontFace(Declarations::default())));
+        }
+        if name.eq_ignore_ascii_case("utility") && self.top_level {
+            let mut name = String::new();
+            source(input, &mut name)?;
+            name.retain(|c| !c.is_whitespace());
+            return Ok(Item::Rule(Rule::Utility(name, String::new())));
         }
         if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
             let mut value = String::new();
@@ -197,7 +227,9 @@ impl<'i> AtRuleParser<'i> for Rules {
         if name.eq_ignore_ascii_case("supports") && !self.declarations_only {
             input.skip_whitespace();
             let start = input.state();
-            let supported = condition(input, true, true)?.matches(0., 0., false, 0) == Some(true);
+            let supported =
+                condition(input, true, true)?.matches(0., 0., false, 0, FontUnits::new(16.))
+                    == Some(true);
             input.expect_exhausted()?;
             input.reset(&start);
             let mut value = String::new();
@@ -321,9 +353,8 @@ impl<'i> AtRuleParser<'i> for Rules {
 
     fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
         match item {
-            Item::Rule(Rule::Tailwind) | Item::Rule(Rule::Layer(_, _)) | Item::Declaration(_) => {
-                Ok(item)
-            }
+            Item::Rule(Rule::Tailwind(_) | Rule::Variant(..) | Rule::Layer(..))
+            | Item::Declaration(_) => Ok(item),
             _ => Err(()),
         }
     }
@@ -352,7 +383,20 @@ impl<'i> AtRuleParser<'i> for Rules {
                 }
                 .body(input),
             ),
-            Item::Rule(Rule::Theme(_)) => Rule::Theme(Declarations::parse_input(input)),
+            Item::Rule(Rule::Theme(inline, _)) => Rule::Theme(
+                inline,
+                Rules {
+                    theme: true,
+                    ..Rules::default()
+                }
+                .body(input),
+            ),
+            Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input)),
+            Item::Rule(Rule::Utility(name, _)) => {
+                let mut body = String::new();
+                source(input, &mut body)?;
+                Rule::Utility(name, body)
+            }
             Item::Rule(Rule::Keyframes(name, _)) => Rule::Keyframes(
                 name,
                 StyleSheetParser::new(input, &mut Keyframes)
@@ -385,7 +429,7 @@ impl<'i> AtRuleParser<'i> for Rules {
 
 impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
     fn parse_declarations(&self) -> bool {
-        self.declarations_only || self.parent.is_some()
+        self.declarations_only || self.theme || self.parent.is_some()
     }
 
     fn parse_qualified(&self) -> bool {
@@ -648,7 +692,9 @@ impl Lengths {
             vars,
         };
         let value = parser.atom()?;
-        (parser.rest.trim().is_empty() && value.0.is_finite()).then_some(value)
+        // Infinite results clamp to the largest length, like WebKit (CSS Values 4).
+        (parser.rest.trim().is_empty() && !value.0.is_nan())
+            .then_some((value.0.clamp(-33_554_428., 33_554_428.), value.1))
     }
 
     pub fn resolve(&self, source: &str, base: f32) -> Option<f32> {
@@ -706,7 +752,7 @@ impl Math<'_> {
                 (b'/', a, b) if a == b && right.0 != 0. => (left.0 / right.0, Kind::Number),
                 _ => return None,
             };
-            if !left.0.is_finite() {
+            if left.0.is_nan() {
                 return None;
             }
         }
@@ -843,7 +889,7 @@ impl Math<'_> {
                 ("log", 2) if number && same => (a.ln() / b.ln(), Kind::Number),
                 _ => return None,
             })
-            .filter(|value| value.0.is_finite());
+            .filter(|value| !value.0.is_nan());
         }
         let bytes = self.rest.as_bytes();
         let mut end = usize::from(bytes.first().is_some_and(|b| matches!(b, b'+' | b'-')));
@@ -1137,7 +1183,6 @@ mod tests {
             "NaN",
             "inf",
             "1e999px",
-            "1e40px",
             "5unknown",
             "2 px",
             "1px garbage",
@@ -1174,22 +1219,27 @@ mod tests {
             "abs(1px, 2px)",
             "calc(asin(2) * 1px)",
             "calc(sqrt(-1) * 1px)",
-            "calc(log(0) * 1px)",
             "calc(pow(1px, 2) * 1px)",
             "sin(1px)",
             "calc(30deg)",
             "calc(1px + 30deg)",
-            "calc(infinity * 1px)",
-            "calc(-infinity * 1px)",
             "calc(NaN * 1px)",
             "calc(1px * e)px",
             "pi",
             "e",
-            "calc(pow(10, 400) * 1px)",
-            "calc(exp(1000) * 1px)",
             "hypot(1px, 2)",
         ] {
             assert_eq!(units.resolve(source, 100.), None, "{source}");
+        }
+        for (source, value) in [
+            ("1e40px", 33_554_428.),
+            ("calc(infinity * 1px)", 33_554_428.),
+            ("calc(-infinity * 1px)", -33_554_428.),
+            ("calc(pow(10, 400) * 1px)", 33_554_428.),
+            ("calc(exp(1000) * 1px)", 33_554_428.),
+            ("calc(log(0) * 1px)", -33_554_428.),
+        ] {
+            assert_eq!(units.resolve(source, 100.), Some(value), "{source}");
         }
         assert_eq!(
             units.resolve(
@@ -1208,9 +1258,9 @@ mod tests {
                 return None;
             };
             let matched = queries.is_empty()
-                || queries
-                    .iter()
-                    .any(|query| query.matches(800., 600., false, 0) == Some(true));
+                || queries.iter().any(|query| {
+                    query.matches(800., 600., false, 0, FontUnits::new(16.)) == Some(true)
+                });
             Some((matched, sheet.source()))
         };
         for (query, expected) in [

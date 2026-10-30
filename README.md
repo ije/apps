@@ -5,10 +5,28 @@ A tiny(small bundle), high performance, low memory usage and memory-safe electro
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main.ts`, then `main.js`.
 - `apps run --watch` / `-W`: Restart when the entry or its imports change. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.
+- `apps run --enable-devtools-mcp [--devtools-mcp-port <port>]`: Serve devtools to agents on `127.0.0.1`. The default port is `19876`, and `0` picks a free port. It is off by default.
+- `apps skill`: Print the agent skill that explains the devtools server.
 - `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>]`: Create a production app with Bun's JavaScriptCore. Defaults to `main.ts`, then `main.js`.
+
+The devtools server gives agents screenshots, DOM, JavaScript evaluation, console, mouse and keyboard input, memory, CPU and frame profiles, and a breakpoint debugger that uses source maps.
+Agents call the tools with plain HTTP (`curl -s http://127.0.0.1:<port>/` lists them), or connect an MCP client to `http://127.0.0.1:<port>/mcp`.
+To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.claude/skills/apps-devtools && apps skill > ~/.claude/skills/apps-devtools/SKILL.md`.
 
 `apps run` keeps source maps in memory and reads assets and native addons from their original paths. It does not create `.apps/`.
 `apps build` writes to `dist/` by default and does not generate source maps.
+
+WebGPU is off by default. Turn it on with `features` in `package.json`:
+
+```json
+{
+  "name": "my_app",
+  "features": ["webgpu"]
+}
+```
+
+`"name"` enables a feature, `"-name"` disables it, and `"*"` means all features. Entries apply in order.
+A disabled feature is not loaded, and its API throws an error when called. On macOS and Windows, WebGPU is a separate library (3.2 MB) that `apps build` copies only for apps that enable it. Linux always includes it, because the renderer uses wgpu.
 
 The main module can export an object with lifecycle handlers and an HTTP server:
 

@@ -35,7 +35,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
     let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().dom[&1].scroll[&id].set_offset(gpui::point(gpui::px(-60.), gpui::px(-25.)));
+    host.borrow().dom[&1].scroll[&id].set_offset(render::point(render::px(-60.), render::px(-25.)));
     engine.eval(r#"
         __appsLayout(); __appsLayout();
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
@@ -50,7 +50,37 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
 }
 
 #[test]
-fn utility_classes_follow_dom_changes_without_css_generation() {
+fn window_scroll_moves_the_page() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<html><body><main></main></body></html>"),
+            dirty: false,
+        },
+    );
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const received = [];
+        addEventListener('scroll', e => received.push([e.target === document, e.bubbles, scrollX, scrollY]));
+        scrollTo(0, 40); scrollBy({top: 10});
+        if (scrollY !== 50 || pageYOffset !== 50 || document.scrollingElement.scrollTop !== 50) throw Error('Page scroll was not set');
+        if (document.querySelector('main').scrollTop !== 0) throw Error('Page scroll moved an element');
+        __appsLayout();
+        if (JSON.stringify(received) !== '[[true,true,0,50]]') throw Error(JSON.stringify(received));
+        if (document.documentElement.clientHeight !== innerHeight) throw Error('Root client height is not the viewport');
+    "#, "test").unwrap();
+    host.borrow().dom[&1].scroll[&0].set_offset(render::point(render::px(0.), render::px(-120.)));
+    engine
+        .eval(
+            "__appsLayout(); if (scrollY !== 120) throw Error(String(scrollY));",
+            "test",
+        )
+        .unwrap();
+}
+
+#[test]
+fn utility_classes_follow_dom_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>"),
@@ -67,8 +97,9 @@ fn utility_classes_follow_dom_changes_without_css_generation() {
             .position(|n| n.attrs.get("id").is_some_and(|v| v == "dot"))
             .unwrap();
         let styles = apps_runtime::style::styles(doc, 800., 600.);
-        assert_eq!(styles[id]["height"], "2rem");
-        assert_eq!(styles[id]["width"], "2rem");
+        let px = |value: &str| apps_runtime::style::length(value, 0., 16., 800., 600.);
+        assert_eq!(px(&styles[id]["height"]), 32.);
+        assert_eq!(px(&styles[id]["width"]), 32.);
         assert_eq!(styles[id]["background-color"], "#123456");
         assert_eq!(styles[id]["display"], "block");
     }
@@ -683,5 +714,341 @@ fn core_dom_interfaces_follow_the_standard() {
       check('compareDocumentPosition', () => (a.compareDocumentPosition(a.firstChild) & Node.DOCUMENT_POSITION_CONTAINED_BY) !== 0);
       check('implementation', () => typeof document.implementation.createHTMLDocument === 'function' && document.implementation.hasFeature());
       if (fails.length) throw Error(fails.join('\n'));
+    "#, "test").unwrap();
+}
+
+#[test]
+fn shadow_cycles_child_access_release_and_retired_images() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<html><body><div id='box'></div></body></html>"),
+            dirty: false,
+        },
+    );
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const el = document.createElement('div'); document.body.append(el);
+        const root = el.attachShadow({mode:'open'}), inner = document.createElement('span'); root.append(inner);
+        let rejected = 0;
+        for (const [parent, child] of [[root, el], [inner, el], [inner, document.body]]) try { parent.appendChild(child); } catch { rejected++; }
+        if (rejected !== 3 || el.parentNode !== document.body || !inner.isConnected) throw Error('Shadow cycle accepted');
+        const list = document.createElement('ul'); for (let i = 0; i < 3; i++) list.append(document.createElement('li'));
+        if (list.firstChild !== list.children[0] || list.lastChild !== list.children[2] || !list.hasChildNodes() || list.lastChild.parentNode !== list) throw Error('Child access');
+        while (list.firstChild) list.removeChild(list.firstChild);
+        if (list.hasChildNodes() || list.firstChild || list.lastChild) throw Error('Empty list');
+        const a = document.createElement('i'), b = document.createElement('b'); list.append(a); list.replaceChildren(b, 'c');
+        if (a.parentNode || list.firstChild !== b || list.childNodes.length !== 2 || list.lastChild.data !== 'c') throw Error('replaceChildren');
+        el.style.cssText = 'content: "a;b"; color: red';
+        const style = getComputedStyle(el);
+        if (style.content !== '"a;b"' || style.color !== 'red' || style.getPropertyValue('constructor') !== '' || style[0] !== style.item(0) || !style.cssText.includes('color:red')) throw Error('Computed style');
+        let threw = false; try { style.color = 'blue'; } catch { threw = true; }
+        if (!threw) throw Error('Computed style is writable');
+        const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 4; document.body.append(canvas);
+        const ctx = canvas.getContext('2d'); ctx.fillRect(0, 0, 4, 4); ctx._flush(); ctx.fillRect(0, 0, 2, 2); ctx._flush(); canvas.width = 8;
+        globalThis.image = document.createElement('img'); document.body.append(image);
+        document.getElementById('box').innerHTML = '<p>a</p><canvas></canvas>';
+        __appsDomSweep(true);
+        document.getElementById('box').textContent = '';
+    "#, "test").unwrap();
+    let [p, canvas] = ["p", "canvas"].map(|tag| {
+        host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == tag && node.parent.is_none())
+            .unwrap()
+    });
+    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    let freed = host
+        .borrow_mut()
+        .call(
+            Role::Renderer(1),
+            "dom.release",
+            serde_json::json!([[], []]),
+        )
+        .unwrap();
+    assert_eq!(freed, serde_json::json!([canvas]));
+    assert!(host.borrow().pages[&1].doc.nodes[p].tag.is_empty());
+    assert!(!host.borrow().pages[&1].dirty);
+    let image: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
+    {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read("tests/images/sample.png").unwrap());
+        for _ in 0..2 {
+            host.borrow_mut()
+                .call(
+                    Role::Renderer(1),
+                    "dom.image",
+                    serde_json::json!([image, png]),
+                )
+                .unwrap();
+            let started = std::time::Instant::now();
+            while host
+                .borrow_mut()
+                .call(Role::Renderer(1), "dom.decoded", serde_json::json!([]))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    assert_eq!(host.borrow().dom[&1].retired.len(), 3);
+}
+
+#[test]
+fn images_decode_on_workers_and_load_after_a_wake() {
+    let (wake, woken) = std::sync::mpsc::channel();
+    apps_runtime::host::Waker::install(move || {
+        let _ = wake.send(());
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/images/sample.png",
+        directory.path().join("sample.png"),
+    )
+    .unwrap();
+    image::GrayImage::new(16385, 1)
+        .save(directory.path().join("wide.png"))
+        .unwrap();
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body></body>"),
+            dirty: false,
+        },
+    );
+    let base = url::Url::from_directory_path(directory.path()).unwrap();
+    host.borrow_mut().dom.entry(1).or_default().base = Some(base.clone());
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let settle = |count: usize| {
+        let started = std::time::Instant::now();
+        while engine
+            .eval("events.length", "test")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            < count
+        {
+            woken
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            engine.tick().unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        }
+        engine
+            .eval("JSON.stringify(events.splice(0).sort())", "test")
+            .unwrap()
+    };
+    engine.eval(&format!(r#"
+        globalThis.base = {}; globalThis.events = [];
+        globalThis.image = new Image(); globalThis.wide = new Image(); document.body.append(image, wide);
+        image.addEventListener('load', () => events.push('load:' + image.naturalWidth + ':' + image.complete));
+        image.addEventListener('error', () => events.push('error'));
+        wide.addEventListener('load', () => events.push('wide:load'));
+        wide.addEventListener('error', () => events.push('wide:error:' + wide.complete + ':' + wide.naturalWidth));
+        image.src = base + 'sample.png'; wide.src = base + 'wide.png';
+        image.decode().then(() => events.push('decoded:' + image.naturalHeight));
+        if (image.complete || wide.complete || image.naturalWidth || events.length) throw Error('Image loaded synchronously');
+    "#, serde_json::json!(base.as_str())), "test").unwrap();
+    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    assert_eq!(
+        settle(3),
+        r#"["decoded:3","load:4:true","wide:error:true:0"]"#
+    );
+    let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
+    {
+        let host = host.borrow();
+        assert!(host.pages[&1].dirty && host.dom[&1].images.contains_key(&id));
+        assert!(host.dom[&1].retired.is_empty());
+    }
+    engine.eval(r#"
+        const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"></svg>');
+        image.src = base + 'wide.png'; image.src = base + 'sample.png'; image.src = svg;
+    "#, "test").unwrap();
+    assert_eq!(settle(1), r#"["load:30:true"]"#);
+    engine
+        .eval("image.src = base + 'sample.png'", "test")
+        .unwrap();
+    assert_eq!(settle(1), r#"["load:4:true"]"#);
+    engine
+        .eval("image.src = base + 'missing.png'", "test")
+        .unwrap();
+    assert_eq!(settle(1), r#"["error"]"#);
+    let host = host.borrow();
+    assert_eq!(host.dom[&1].retired.len(), 1);
+    assert!(host.dom[&1].images.contains_key(&id));
+}
+
+#[test]
+fn sibling_walks_follow_mutations() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>"),
+            dirty: false,
+        },
+    );
+    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const list = document.querySelector('ul'), other = document.querySelector('ol');
+        for (let i = 0; i < 6; i++) { const li = document.createElement('li'); li.id = 'i' + i; li.append('x'); list.append(li); }
+        const seen = [];
+        for (let n = list.firstChild; n; n = n.nextSibling) {
+            seen.push(n.id + (n.firstChild.nextSibling ? '!' : '') + other.firstChild.nextSibling.textContent);
+            if (n.id === 'i1') list.removeChild(n.previousSibling);
+            if (n.id === 'i3') list.insertBefore(document.createElement('b'), n);
+            if (n.id === 'i4') list.append(n.previousSibling);
+        }
+        const back = [];
+        for (let n = list.lastChild; n; n = n.previousSibling) back.push(n.id || n.localName);
+        if (seen.join() !== 'i0b,i1b,i2b,i3b,i4b,i5b,i3b' || back.join() !== 'i3,b,i5,i4,b,i2,i1') throw Error(seen + ' ' + back);
+    "#, "test").unwrap();
+}
+
+#[test]
+fn mirror_follows_random_mutations_and_releases() {
+    for seed in 1..17u32 {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>"), dirty: false });
+        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        engine.eval(&format!(r#"
+          let seed = {seed};
+          const rand = n => {{ seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }};
+          const root = document.body, pool = [], all = () => {{ const list = []; const walk = n => {{ list.push(n); for (const c of n.childNodes) walk(c); }}; walk(root); return list; }};
+          const pick = () => {{ const list = all().slice(1).concat(pool); return list.length ? list[rand(list.length)] : document.createElement('s'); }};
+          const el = () => {{ const list = all().concat(pool).filter(n => n.nodeType === 1); return list[rand(list.length)]; }};
+          globalThis.step = () => {{ for (let i = 0; i < 400; i++) try {{
+            switch (rand(15)) {{
+              case 0: pool.push(document.createElement(['div','span','b','i'][rand(4)])); break;
+              case 1: pool.push(document.createTextNode('t' + rand(100))); break;
+              case 2: el().appendChild(pick()); break;
+              case 3: {{ const p = el(), kids = p.childNodes; p.insertBefore(pick(), kids.length ? kids[rand(kids.length)] : null); break; }}
+              case 4: {{ const n = pick(); n.parentNode?.removeChild(n); break; }}
+              case 5: el().setAttribute(['a','b','class','data-x'][rand(4)], 'v' + rand(5)); break;
+              case 6: el().removeAttribute(['a','b','class','data-x'][rand(4)]); break;
+              case 7: el().textContent = rand(2) ? 'txt' + rand(9) : ''; break;
+              case 8: el().innerHTML = '<i a=1>x<b>y</b></i>z<!--q-->'; break;
+              case 9: el().classList.toggle('k' + rand(3)); break;
+              case 10: {{ const n = pick(); if (n.nodeType === 3) n.data = 'd' + rand(9); break; }}
+              case 11: el().replaceChildren(document.createElement('em'), 'w'); break;
+              case 12: pool.push(el().cloneNode(true)); break;
+              case 13: {{ const n = el(); n.firstChild?.nextSibling?.previousSibling; n.lastChild?.remove(); if (!rand(4)) pool.length = 0; break; }}
+              case 14: {{ const h = el(); if (h !== root && !h.shadowRoot && h.localName !== 'em') {{ const r = h.attachShadow({{ mode: 'open' }}); r.innerHTML = '<b>s<i>t</i></b>'; pool.push(r.firstChild, r); }} break; }}
+            }}
+          }} catch (e) {{ if (!(e instanceof DOMException)) throw e; }} }};
+          globalThis.dumpMirror = () => {{ let out = ''; const walk = n => {{ out += '(' + (n.nodeType === 1 ? n.localName : n.nodeType === 11 ? '#fragment' : n.nodeName); if (n.nodeType === 3 || n.nodeType === 8) out += '|' + n.data; if (n.nodeType === 1) for (const name of n.getAttributeNames()) out += ' ' + name + '=' + n.getAttribute(name); if (n.shadowRoot) {{ out += '['; walk(n.shadowRoot); out += ']'; }} for (const c of n.childNodes) walk(c); out += ')'; }}; walk(document); return out; }};
+          step();
+        "#), "test").unwrap();
+        for round in 0..4 {
+            let rust = {
+                let host = host.borrow();
+                let (doc, shadows) = (&host.pages[&1].doc, &host.dom[&1].shadows);
+                let (mut out, mut pending) = (String::new(), vec![Ok(0)]);
+                while let Some(item) = pending.pop() {
+                    let id = match item {
+                        Ok(id) => id,
+                        Err(text) => {
+                            out.push_str(text);
+                            continue;
+                        }
+                    };
+                    let node = &doc.nodes[id];
+                    out.push('(');
+                    out.push_str(&node.tag);
+                    if matches!(node.tag.as_str(), "#text" | "#comment") {
+                        out.push('|');
+                        out.push_str(&node.text);
+                    }
+                    for (key, value) in &node.attrs {
+                        out.push_str(&format!(" {key}={value}"));
+                    }
+                    assert!(
+                        node.children
+                            .iter()
+                            .all(|&child| doc.nodes[child].parent == Some(id))
+                    );
+                    pending.push(Err(")"));
+                    pending.extend(node.children.iter().rev().map(|&child| Ok(child)));
+                    if let Some(&root) = shadows.get(&id) {
+                        pending.extend([Err("]"), Ok(root), Err("[")]);
+                    }
+                }
+                out
+            };
+            assert_eq!(
+                engine.eval("dumpMirror()", "test").unwrap(),
+                rust,
+                "seed {seed} round {round}"
+            );
+            engine.collect_garbage();
+            engine
+                .eval("__appsDomSweep(true); step(); __appsDomSweep(true)", "test")
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn layout_mirror_feeds_observers_offsets_and_scrolling() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let place = |rects: &[(&str, [f32; 4])]| {
+        let mut host = host.borrow_mut();
+        let host = &mut *host;
+        let doc = &host.pages[&1].doc;
+        let state = host.dom.entry(1).or_default();
+        for (name, rect) in rects {
+            let id = doc
+                .nodes
+                .iter()
+                .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
+                .unwrap();
+            state.bounds.insert(id, *rect);
+        }
+    };
+    place(&[
+        ("clip", [0., 0., 100., 100.]),
+        ("a", [0., 50., 100., 100.]),
+        ("b", [0., 200., 100., 50.]),
+        ("rel", [10., 300., 200., 100.]),
+        ("c", [30., 320., 20., 10.]),
+    ]);
+    engine.eval(r#"
+        globalThis.seen = [];
+        const io = new IntersectionObserver(entries => seen.push(...entries.map(e => [e.target.id, e.isIntersecting, e.intersectionRatio, e.intersectionRect.y, e.intersectionRect.height].join())), { threshold: [0, 0.5, 1] });
+        for (const id of ['a', 'b', 'c']) io.observe(document.getElementById(id));
+        __appsLayout();
+        if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10') throw Error(seen.join(';'));
+        seen.length = 0; __appsLayout();
+        if (seen.length) throw Error('Unchanged targets reported');
+        const c = document.getElementById('c'), clip = document.getElementById('clip');
+        if (c.offsetParent.id !== 'rel' || c.offsetTop !== 20 || c.offsetLeft !== 20) throw Error('Offsets');
+        if (document.getElementById('a').offsetParent !== document.body) throw Error('Static offset parent');
+        document.getElementById('rel').style.position = 'static';
+        if (c.offsetParent !== document.body) throw Error('Offset parent ignores a style change');
+        if (c.getBoundingClientRect().right !== 50 || c.clientWidth !== 20 || c.offsetHeight !== 10) throw Error('Rect');
+        clip.scrollTop = 30;
+        if (clip.scrollTop !== 30 || clip.scrollLeft !== 0 || clip.scrollHeight !== 100 || document.documentElement.scrollTop !== 0) throw Error('Scroll');
+        globalThis.late = []; for (let i = 0; i < 3000; i++) late.push(document.body.appendChild(document.createElement('i')));
+        late.at(-1).id = 'late';
+    "#, "test").unwrap();
+    place(&[("a", [0., 0., 100., 100.]), ("late", [1., 2., 3., 4.])]);
+    engine.eval(r#"
+        __appsLayout();
+        if (seen.join(';') !== 'a,true,1,0,100') throw Error(seen.join(';'));
+        if (late.at(-1).getBoundingClientRect().height !== 4 || document.getElementById('c').getBoundingClientRect().x !== 30) throw Error('Grown mirror');
     "#, "test").unwrap();
 }

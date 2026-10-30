@@ -1,15 +1,63 @@
 use crate::dom::{Document, Node};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
 
-#[derive(Clone, Copy, Serialize, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Main,
     Preload(u64),
     Renderer(u64),
+}
+
+/// Wakes the event loop of the thread that started a native operation.
+#[derive(Clone, Default)]
+pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
+
+thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
+
+impl Waker {
+    pub fn install(wake: impl Fn() + Send + Sync + 'static) {
+        WAKER.set(Self(Some(std::sync::Arc::new(wake))));
+    }
+
+    pub(crate) fn current() -> Self {
+        WAKER.with_borrow(Clone::clone)
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(wake) = &self.0 {
+            wake();
+        }
+    }
+}
+
+/// Wakes when dropped, for state that `poll` only sees after a task ends or is cancelled.
+pub(crate) struct WakeOnDrop(pub(crate) Waker);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.wake();
+    }
+}
+
+fn connected(doc: &Document, hosts: &HashMap<usize, usize>, mut id: usize) -> bool {
+    loop {
+        if id == 0 {
+            return true;
+        }
+        match doc
+            .nodes
+            .get(id)
+            .and_then(|node| node.parent)
+            .or_else(|| hosts.get(&id).copied())
+        {
+            Some(parent) => id = parent,
+            None => return false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -26,8 +74,11 @@ pub struct Host {
     pub paths: HashMap<String, PathBuf>,
     pub relaunch: Option<Vec<String>>,
     pub packaged: bool,
+    /// Features that package.json disables, as bits by `bundle::FEATURES` index.
+    pub disabled: u32,
     pub native_modules: HashMap<String, PathBuf>,
     pub assets: HashMap<String, PathBuf>,
+    pub scripts: std::sync::Arc<HashMap<String, std::sync::Arc<str>>>,
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
     pub dom: HashMap<u64, crate::dom::State>,
@@ -36,12 +87,19 @@ pub struct Host {
     pub logs: std::collections::VecDeque<Value>,
     pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
     pub viewports: HashMap<u64, [f32; 2]>,
+    pub resized: Vec<u64>,
+    pub window_changes: Vec<u64>,
+    pub backgrounds: HashMap<u64, (u32, u8)>,
     pub exit_code: i32,
     pub theme: u32,
     pub theme_changed: bool,
 }
 
 impl Host {
+    pub fn enabled(&self, feature: &str) -> bool {
+        self.disabled & crate::bundle::feature_bit(feature) == 0
+    }
+
     fn app_dir(&self, name: &str) -> Result<PathBuf> {
         if let Some(path) = self.paths.get(name) {
             return Ok(path.clone());
@@ -92,9 +150,228 @@ impl Host {
         }
     }
 
-    pub fn call(&mut self, role: Role, request: Value) -> Result<Value> {
-        let op = request["op"].as_str().context("Missing operation")?;
-        let args = &request["args"];
+    /// Applies the page writes that `dom.js` queued: `code, a, b, c` runs of 32-bit integers, where string arguments are UTF-16 lengths of consecutive parts of `text`.
+    // WARNING: `dom.js` mirrors the tree for reads, so only this batch and `dom.html` may change nodes, attributes or text of a page.
+    pub(crate) fn batch(&mut self, id: u64, codes: &[u8], mut text: &str) -> Result<Value> {
+        let node = |doc: &Document, value: i32| {
+            usize::try_from(value)
+                .ok()
+                .filter(|&id| doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty()))
+                .context("Invalid node")
+        };
+        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let state = self.dom.entry(id).or_default();
+        let doc = &mut page.doc;
+        let mut errors = Vec::new();
+        'ops: for op in codes.as_chunks::<16>().0 {
+            let [code, a, b, c] =
+                [0, 4, 8, 12].map(|i| i32::from_ne_bytes([op[i], op[i + 1], op[i + 2], op[i + 3]]));
+            let mut parts = ["", ""];
+            for (part, units) in parts.iter_mut().zip([b, c]).take(match code {
+                0 | 4 => 2,
+                1 | 5 => 1,
+                _ => 0,
+            }) {
+                let units = usize::try_from(units).unwrap_or(usize::MAX);
+                let end = if text.as_bytes().get(..units).is_some_and(<[u8]>::is_ascii) {
+                    units
+                } else {
+                    let (mut end, mut count) = (0, 0);
+                    for character in text.chars() {
+                        if count >= units {
+                            break;
+                        }
+                        count += character.len_utf16();
+                        end += character.len_utf8();
+                    }
+                    if count != units {
+                        errors.push("Invalid DOM batch".into());
+                        break 'ops;
+                    }
+                    end
+                };
+                (*part, text) = text.split_at(end);
+            }
+            // WARNING: pages validate writes before they queue them, so a failed operation is skipped and reported instead of stopping the batch.
+            let result = (|| -> Result<bool> {
+                Ok(match code {
+                    0 => {
+                        let (id, tag) = (usize::try_from(a).context("Invalid node")?, parts[0]);
+                        ensure!(
+                            matches!(tag, "#text" | "#comment" | "#fragment" | "#document")
+                                || !tag.is_empty()
+                                    && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+                            "Invalid tag"
+                        );
+                        ensure!(state.reserved.remove(&id), "Invalid node");
+                        state.place(
+                            doc,
+                            id,
+                            Node {
+                                tag: tag.to_ascii_lowercase(),
+                                text: parts[1].into(),
+                                ..Node::default()
+                            },
+                        );
+                        false
+                    }
+                    1 => {
+                        let (id, value) = (node(doc, a)?, parts[0]);
+                        let current = &doc.nodes[id];
+                        // WARNING: selectors only see whether text is empty and layout diffs the text itself, so other text edits keep the styles; SVG sources embed the text.
+                        if current.tag == "#text"
+                            && current.text.is_empty() == value.is_empty()
+                            && current
+                                .parent
+                                .is_none_or(|parent| doc.nodes[parent].tag != "style")
+                        {
+                            let mut parent = current.parent;
+                            while let Some(id) = parent {
+                                state.svg_sources.remove(&id);
+                                parent = doc.nodes[id].parent;
+                            }
+                        } else if state.computed.is_some() && connected(doc, &state.hosts, id) {
+                            state.computed = None;
+                        }
+                        doc.nodes[id].text = value.into();
+                        doc.nodes[id].stylesheet = None;
+                        for child in std::mem::take(&mut doc.nodes[id].children) {
+                            doc.nodes[child].parent = None;
+                            state.detached.push(child);
+                        }
+                        true
+                    }
+                    2 => {
+                        let (parent, child) = (node(doc, a)?, node(doc, b)?);
+                        ensure!(child > 0, "Invalid child");
+                        let tag = &doc.nodes[parent].tag;
+                        ensure!(
+                            !tag.starts_with('#') || parent == 0 || tag == "#fragment",
+                            "Invalid parent"
+                        );
+                        let before = usize::try_from(c).ok();
+                        ensure!(
+                            before
+                                .is_none_or(|before| doc.nodes[parent].children.contains(&before)),
+                            "Reference is not a child"
+                        );
+                        let mut ancestor = Some(parent);
+                        while let Some(id) = ancestor {
+                            ensure!(id != child, "Cannot create a DOM cycle");
+                            ancestor = doc.nodes[id]
+                                .parent
+                                .or_else(|| state.hosts.get(&id).copied());
+                        }
+                        if state.computed.is_some()
+                            && (connected(doc, &state.hosts, parent)
+                                || connected(doc, &state.hosts, child))
+                        {
+                            state.computed = None;
+                        }
+                        if before == Some(child) {
+                            return Ok(false);
+                        }
+                        if let Some(old) = doc.nodes[child].parent {
+                            doc.nodes[old].children.retain(|&id| id != child);
+                        }
+                        let children = &mut doc.nodes[parent].children;
+                        let index = before
+                            .and_then(|before| children.iter().position(|&id| id == before))
+                            .unwrap_or(children.len());
+                        children.insert(index, child);
+                        doc.nodes[child].parent = Some(parent);
+                        true
+                    }
+                    3 => {
+                        let parent = node(doc, a)?;
+                        let child = usize::try_from(b)
+                            .ok()
+                            .filter(|id| doc.nodes[parent].children.contains(id))
+                            .context("Node is not a child")?;
+                        if state.computed.is_some() && connected(doc, &state.hosts, parent) {
+                            state.computed = None;
+                        }
+                        doc.nodes[parent].children.retain(|&id| id != child);
+                        doc.nodes[child].parent = None;
+                        state.detached.push(child);
+                        true
+                    }
+                    4 | 5 => {
+                        let (id, key) = (node(doc, a)?, parts[0]);
+                        let value = (code == 4).then_some(parts[1]);
+                        let current = &doc.nodes[id];
+                        if !(key == "style" && current.inline.is_some())
+                            && current.attrs.get(key).map(String::as_str) == value
+                        {
+                            return Ok(false);
+                        }
+                        if state.computed.is_some() && connected(doc, &state.hosts, id) {
+                            state.computed = None;
+                        }
+                        let current = &mut doc.nodes[id];
+                        match value {
+                            Some(value) => current.attrs.set(key, value),
+                            None => drop(current.attrs.remove(key)),
+                        }
+                        if key == "style" {
+                            current.inline = None;
+                        }
+                        true
+                    }
+                    6 => {
+                        let (host, root) = (node(doc, a)?, node(doc, b)?);
+                        ensure!(
+                            !doc.nodes[host].tag.starts_with('#')
+                                && doc.nodes[root].tag == "#fragment"
+                                && doc.nodes[root].parent.is_none(),
+                            "Invalid shadow root"
+                        );
+                        ensure!(
+                            !state.shadows.contains_key(&host) && !state.hosts.contains_key(&root),
+                            "Shadow root already exists"
+                        );
+                        let mut current = Some(host);
+                        while let Some(id) = current {
+                            ensure!(id != root, "Cannot create a DOM cycle");
+                            current = doc.nodes[id]
+                                .parent
+                                .or_else(|| state.hosts.get(&id).copied());
+                        }
+                        if state.computed.is_some() && connected(doc, &state.hosts, host) {
+                            state.computed = None;
+                        }
+                        state.shadows.insert(host, root);
+                        state.hosts.insert(root, host);
+                        true
+                    }
+                    _ => bail!("Unknown DOM operation"),
+                })
+            })();
+            match result {
+                Ok(changed) => page.dirty |= changed,
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Ok(if errors.is_empty() {
+            Value::Null
+        } else {
+            json!(errors)
+        })
+    }
+
+    /// Runs WebGPU `op` of page `id` with arguments as JSON text.
+    pub fn gpu(&mut self, id: u64, op: &str, args: &[u8]) -> Result<Value> {
+        ensure!(self.enabled("webgpu"), "The webgpu feature is disabled");
+        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let result = self.graphics.entry(id).or_default().call(op, args)?;
+        if matches!(op, "submit" | "writeTexture" | "resetCanvas") {
+            page.dirty = true;
+        }
+        Ok(result)
+    }
+
+    pub fn call(&mut self, role: Role, op: &str, args: Value) -> Result<Value> {
+        let args = &args;
         if op == "log" {
             let text = args[0].as_str().unwrap_or("");
             let _ = if matches!(args[1].as_str(), Some("error" | "warn")) {
@@ -102,38 +379,34 @@ impl Host {
             } else {
                 writeln!(std::io::stdout(), "{text}")
             };
-            if self.logs.len() == 500 {
-                self.logs.pop_front();
+            // WARNING: only developer tools drain logs, and packaged apps have none.
+            if !self.packaged {
+                if self.logs.len() == 500 {
+                    self.logs.pop_front();
+                }
+                let text: String = text.chars().take(16384).collect();
+                self.logs.push_back(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role}}));
             }
-            self.logs.push_back(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":args[0],"context":role}}));
             return Ok(Value::Null);
         }
         if let Role::Renderer(id) = role {
             ensure!(
-                op.starts_with("dom.") || op.starts_with("gpu."),
+                op.starts_with("dom."),
                 "Host operation is unavailable in page scripts: {op}"
             );
             if op == "dom.navigate" {
                 ensure!(self.pages.contains_key(&id), "Window is closed");
                 let url = args[0].as_str().context("Expected navigation URL")?;
+                // WARNING: like `loadURL`, pages cannot navigate the window to remote or non-local URLs.
                 ensure!(
-                    url.starts_with("apps:")
-                        || url.starts_with("file:")
-                        || url.starts_with("https:")
-                        || url.starts_with("http:"),
-                    "Unsupported navigation scheme"
+                    url.starts_with("apps:///") || url.starts_with("file:///"),
+                    "Pages can only navigate to bundled or local files"
                 );
-                self.commands.push(json!({"op":"window", "args":[if url.starts_with("http") {"loadURL"} else {"loadFile"},id,url,"page"]}));
+                self.commands
+                    .push(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
                 return Ok(Value::Null);
             }
             let page = self.pages.get_mut(&id).context("Window is closed")?;
-            if let Some(op) = op.strip_prefix("gpu.") {
-                let result = self.graphics.entry(id).or_default().call(op, args)?;
-                if matches!(op, "submit" | "resetCanvas") {
-                    page.dirty = true;
-                }
-                return Ok(result);
-            }
             if op == "dom.viewport" {
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
                 return Ok(json!([
@@ -145,18 +418,6 @@ impl Host {
                     crate::desktop::native::theme_state()
                 ]));
             }
-            if matches!(op, "dom.setAttr" | "dom.removeAttr")
-                && let Some(node) = args[0]
-                    .as_u64()
-                    .and_then(|id| page.doc.nodes.get(id as usize))
-                && let Some(key) = args[1].as_str()
-                && !(key == "style" && node.inline.is_some())
-                && (op == "dom.setAttr"
-                    && node.attrs.get(key).map(String::as_str) == args[2].as_str()
-                    || op == "dom.removeAttr" && !node.attrs.contains_key(key))
-            {
-                return Ok(Value::Null);
-            }
             let state = self.dom.entry(id).or_default();
             if op == "dom.imageURL" {
                 let node = args[0].as_u64().context("Invalid node")? as usize;
@@ -165,197 +426,49 @@ impl Host {
                 let url = base.join(args[1].as_str().context("Expected image URL")?)?;
                 let path = match url.scheme() {
                     "apps" => self.assets.get(url.path().trim_start_matches('/')).cloned(),
-                    "file" if base.scheme() == "file" => url.to_file_path().ok(),
+                    "file"
+                        if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) =>
+                    {
+                        url.to_file_path().ok()
+                    }
                     _ => None,
                 }
                 .context("Image is not a bundled asset or local file")?;
-                let metadata = std::fs::metadata(&path)?;
-                ensure!(
-                    metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
-                    "Image is not a file or is too large"
-                );
-                let result = crate::dom::load_image(state, node, &std::fs::read(&path)?);
-                page.dirty |= std::mem::take(&mut state.dirty);
-                return result;
+                return Ok(crate::dom::load_image(state, node, move || {
+                    let metadata = std::fs::metadata(&path)?;
+                    ensure!(
+                        metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
+                        "Image is not a file or is too large"
+                    );
+                    Ok(std::fs::read(&path)?)
+                }));
             }
-            if matches!(
-                op,
-                "dom.setText"
-                    | "dom.insert"
-                    | "dom.remove"
-                    | "dom.setAttr"
-                    | "dom.removeAttr"
-                    | "dom.html"
-                    | "dom.shadow"
-                    | "dom.font"
-                    | "dom.focus"
-            ) {
-                let connected = |id: usize| {
-                    let mut current = Some(id);
-                    while let Some(id) = current {
-                        if id == 0 {
-                            return true;
-                        }
-                        current =
-                            page.doc
-                                .nodes
-                                .get(id)
-                                .and_then(|node| node.parent)
-                                .or_else(|| {
-                                    state
-                                        .shadows
-                                        .iter()
-                                        .find_map(|(&host, &root)| (root == id).then_some(host))
-                                });
-                    }
-                    false
-                };
-                if matches!(op, "dom.font" | "dom.focus")
-                    || args[0].as_u64().is_some_and(|id| connected(id as usize))
-                    || op == "dom.insert"
-                        && args[1].as_u64().is_some_and(|id| connected(id as usize))
-                {
-                    state.computed = None;
-                }
+            if op == "dom.font"
+                || op == "dom.html"
+                    && args[0]
+                        .as_u64()
+                        .is_some_and(|id| connected(&page.doc, &state.hosts, id as usize))
+            {
+                state.computed = None;
             }
-            if let Some(result) = crate::dom::call(
+            let result = crate::dom::call(
                 op,
                 args,
                 &mut page.doc,
                 state,
                 *self.viewports.get(&id).unwrap_or(&[800., 600.]),
-            ) {
-                page.dirty |= std::mem::take(&mut state.dirty);
-                if op == "dom.release"
-                    && let Ok(ids) = &result
-                    && let Some(gpu) = self.graphics.get_mut(&id)
-                {
-                    for node in ids.as_array().into_iter().flatten() {
-                        let _ = gpu.call("resetCanvas", &json!([node]));
-                    }
+            )
+            .unwrap_or_else(|| Err(anyhow::anyhow!("Unknown DOM operation: {op}")));
+            page.dirty |= std::mem::take(&mut state.dirty);
+            if op == "dom.release"
+                && let Ok(ids) = &result
+                && let Some(gpu) = self.graphics.get_mut(&id)
+            {
+                for node in ids.as_array().into_iter().flatten() {
+                    let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
                 }
-                return result;
             }
-            if op == "dom.create" {
-                let tag = args[0].as_str().context("Expected tag")?;
-                ensure!(
-                    tag == "#text" || tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
-                    "Invalid tag"
-                );
-                ensure!(!tag.is_empty(), "Invalid tag");
-                let node = state.allocate(
-                    &mut page.doc,
-                    Node {
-                        tag: tag.to_ascii_lowercase(),
-                        text: args[1].as_str().unwrap_or("").into(),
-                        ..Node::default()
-                    },
-                );
-                return Ok(json!(node));
-            }
-            let node = args[0].as_u64().context("Invalid node")? as usize;
-            ensure!(
-                page.doc
-                    .nodes
-                    .get(node)
-                    .is_some_and(|node| !node.tag.is_empty()),
-                "Invalid node"
-            );
-            return match op {
-                "dom.node" => {
-                    let node = &page.doc.nodes[node];
-                    Ok(json!({"tag":node.tag,"parent":node.parent,"children":node.children}))
-                }
-                "dom.text" => Ok(json!(page.doc.text(node))),
-                "dom.setText" => {
-                    page.doc.nodes[node].text = args[1].as_str().context("Expected text")?.into();
-                    page.doc.nodes[node].stylesheet = None;
-                    for child in std::mem::take(&mut page.doc.nodes[node].children) {
-                        page.doc.nodes[child].parent = None;
-                    }
-                    page.dirty = true;
-                    Ok(Value::Null)
-                }
-                "dom.insert" => {
-                    let child = args[1].as_u64().context("Invalid child")? as usize;
-                    ensure!(child > 0 && child < page.doc.nodes.len(), "Invalid child");
-                    ensure!(
-                        !page.doc.nodes[node].tag.starts_with('#')
-                            || node == 0
-                            || page.doc.nodes[node].tag == "#fragment",
-                        "Invalid parent"
-                    );
-                    let before = args[2].as_u64().map(|id| id as usize);
-                    if let Some(before) = before {
-                        ensure!(
-                            page.doc.nodes[node].children.contains(&before),
-                            "Reference is not a child"
-                        );
-                    }
-                    let mut ancestor = Some(node);
-                    while let Some(id) = ancestor {
-                        ensure!(id != child, "Cannot create a DOM cycle");
-                        ancestor = page.doc.nodes[id].parent;
-                    }
-                    if before != Some(child) {
-                        if let Some(parent) = page.doc.nodes[child].parent {
-                            page.doc.nodes[parent].children.retain(|&id| id != child);
-                        }
-                        let children = &mut page.doc.nodes[node].children;
-                        let index = before.map_or(children.len(), |id| {
-                            children.iter().position(|&c| c == id).unwrap()
-                        });
-                        children.insert(index, child);
-                        page.doc.nodes[child].parent = Some(node);
-                        page.dirty = true;
-                    }
-                    Ok(Value::Null)
-                }
-                "dom.remove" => {
-                    let child = args[1].as_u64().context("Invalid child")? as usize;
-                    ensure!(
-                        page.doc.nodes[node].children.contains(&child),
-                        "Node is not a child"
-                    );
-                    page.doc.nodes[node].children.retain(|&id| id != child);
-                    page.doc.nodes[child].parent = None;
-                    page.dirty = true;
-                    Ok(Value::Null)
-                }
-                "dom.attr" => {
-                    let key = args[1].as_str().context("Expected attribute")?;
-                    let node = &page.doc.nodes[node];
-                    if key == "style"
-                        && let Some(inline) = &node.inline
-                    {
-                        Ok(json!(inline.source()))
-                    } else {
-                        Ok(json!(node.attrs.get(key)))
-                    }
-                }
-                "dom.setAttr" => {
-                    let key = args[1].as_str().context("Expected attribute")?;
-                    page.doc.nodes[node].attrs.insert(
-                        key.into(),
-                        args[2].as_str().context("Expected attribute value")?.into(),
-                    );
-                    if key == "style" {
-                        page.doc.nodes[node].inline = None;
-                    }
-                    page.dirty = true;
-                    Ok(Value::Null)
-                }
-                "dom.removeAttr" => {
-                    let key = args[1].as_str().context("Expected attribute")?;
-                    page.doc.nodes[node].attrs.remove(key);
-                    if key == "style" {
-                        page.doc.nodes[node].inline = None;
-                    }
-                    page.dirty = true;
-                    Ok(Value::Null)
-                }
-                _ => bail!("Unknown DOM operation: {op}"),
-            };
+            return result;
         }
         match op {
             "process.write" => {
@@ -460,27 +573,10 @@ impl Host {
                 if self.packaged && op == "window" && args[0] == "devtools" {
                     return Ok(Value::Null);
                 }
-                if op == "window" && args[0] == "create" {
-                    let options = &args[2];
-                    if let Some(object) = options.as_object() {
-                        for key in object.keys() {
-                            ensure!(
-                                matches!(
-                                    key.as_str(),
-                                    "width" | "height" | "title" | "show" | "resizable"
-                                ),
-                                "Unsupported BrowserWindow option: {key}"
-                            );
-                        }
-                    }
-                    for (key, default) in [("width", 800.), ("height", 600.)] {
-                        ensure!(
-                            (1.0..=16384.0).contains(&options[key].as_f64().unwrap_or(default)),
-                            "Window dimensions must be between 1 and 16384"
-                        );
-                    }
+                if op == "window" {
+                    crate::desktop::validate(args)?;
                 }
-                self.commands.push(request);
+                self.commands.push(json!({"op": op, "args": args}));
                 Ok(Value::Null)
             }
             _ => bail!("Unsupported host operation: {op}"),

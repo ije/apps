@@ -208,7 +208,22 @@ mod process {
         let bundle: apps_runtime::bundle::Bundle =
             serde_json::from_slice(&fs::read(app.directory.path().join("bundle.json")).unwrap())
                 .unwrap();
-        assert!(bundle.files["app.js"].contains(&value));
+        let app_js = &bundle.files["app.js"];
+        assert!(app_js.is_ascii());
+        let module: serde_json::Value = serde_json::from_str(
+            app_js
+                .trim_end()
+                .strip_prefix("$appsDefine(")
+                .and_then(|source| source.strip_suffix(");"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            module["map"]["sourcesContent"][0]
+                .as_str()
+                .unwrap()
+                .contains(&value)
+        );
         assert_eq!(fs::read_dir(&app.root).unwrap().count(), 2);
     }
 
@@ -264,6 +279,26 @@ mod process {
                 .all(|line| line == "--bundle-stdin --devtools")
         );
         assert!(!app.root.join(".apps").exists());
+    }
+
+    #[test]
+    fn watch_waits_for_a_fix_when_the_first_build_fails() {
+        let mut app = App::new();
+        let entry = app.root.join("main.js");
+        fs::write(&entry, "invalid javascript !!!").unwrap();
+        app.child = Some(
+            app.command()
+                .arg("--watch")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(app.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert_eq!(app.launches(), "");
+        fs::write(&entry, "console.log(1);").unwrap();
+        app.wait(1);
     }
 
     #[test]

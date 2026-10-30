@@ -49,20 +49,20 @@ pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Opt
 #[derive(Clone)]
 pub(crate) struct InlineText {
     pub text: Rc<str>,
-    pub runs: Vec<gpui::TextRun>,
+    pub runs: Vec<render::TextRun>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub backgrounds: Vec<(usize, u32)>,
-    pub cursors: Vec<(usize, gpui::CursorStyle)>,
+    pub cursors: Vec<(usize, render::CursorStyle)>,
     pub shadows: Vec<(f32, f32, f32, u32)>,
-    pub first_line: Option<(gpui::TextRun, gpui::TextRun, Option<String>)>,
+    pub first_line: Option<(render::TextRun, render::TextRun, Option<String>)>,
 }
 
 pub(crate) fn restyle(
-    runs: &[gpui::TextRun],
+    runs: &[render::TextRun],
     range: std::ops::Range<usize>,
-    base: &gpui::TextRun,
-    pseudo: &gpui::TextRun,
-) -> Vec<gpui::TextRun> {
+    base: &render::TextRun,
+    pseudo: &render::TextRun,
+) -> Vec<render::TextRun> {
     let mut restyled = Vec::with_capacity(runs.len() + 2);
     let mut start = 0;
     for run in runs {
@@ -133,8 +133,8 @@ pub(crate) fn text_transform(text: &mut String, range: std::ops::Range<usize>, m
     text.replace_range(range, &mapped);
 }
 
-pub(crate) fn cursor(value: &str) -> Option<gpui::CursorStyle> {
-    use gpui::CursorStyle::*;
+pub(crate) fn cursor(value: &str) -> Option<render::CursorStyle> {
+    use render::CursorStyle::*;
     Some(match value {
         "default" => Arrow,
         "pointer" => PointingHand,
@@ -161,38 +161,49 @@ pub(crate) fn cursor(value: &str) -> Option<gpui::CursorStyle> {
     })
 }
 
-pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> gpui::TextRun {
+pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> render::TextRun {
     let (ink, alpha) = style
         .get("color")
         .and_then(|value| color(value))
         .unwrap_or((0, 255));
-    let ink: gpui::Hsla = gpui::rgba(ink << 8 | alpha as u32).into();
+    let ink: render::Rgba = render::rgba(ink << 8 | alpha as u32);
     let lines = style.get("text-decoration-line").map_or("", String::as_str);
     let decoration = style
         .get("text-decoration-color")
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
         .and_then(|value| color(value))
-        .map_or(ink, |(ink, alpha)| {
-            gpui::rgba(ink << 8 | alpha as u32).into()
-        });
-    let thickness = gpui::px(1.);
-    gpui::TextRun {
+        .map_or(ink, |(ink, alpha)| render::rgba(ink << 8 | alpha as u32));
+    let length = |name: &str| {
+        style
+            .get(name)
+            .and_then(|value| units.resolve(value, units.font.em))
+            .map(render::px)
+    };
+    let thickness = length("text-decoration-thickness").unwrap_or(render::px(1.));
+    let decoration_style = match style.get("text-decoration-style").map(String::as_str) {
+        Some("double") => render::DecorationStyle::Double,
+        Some("dotted") => render::DecorationStyle::Dotted,
+        Some("dashed") => render::DecorationStyle::Dashed,
+        Some("wavy") => render::DecorationStyle::Wavy,
+        _ => render::DecorationStyle::Solid,
+    };
+    render::TextRun {
         len,
         font: font(style),
         color: ink,
         background_color: None,
-        underline: lines.contains("underline").then(|| gpui::UnderlineStyle {
+        underline: lines.contains("underline").then(|| render::UnderlineStyle {
             thickness,
             color: Some(decoration),
-            wavy: style
-                .get("text-decoration-style")
-                .is_some_and(|value| value == "wavy"),
+            style: decoration_style,
+            offset: length("text-underline-offset"),
         }),
         strikethrough: lines
             .contains("line-through")
-            .then_some(gpui::StrikethroughStyle {
+            .then_some(render::StrikethroughStyle {
                 thickness,
                 color: Some(decoration),
+                style: decoration_style,
             }),
         letter_spacing: spacing(style, units, "letter-spacing"),
         word_spacing: spacing(style, units, "word-spacing"),
@@ -201,8 +212,8 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> gpui::Text
 }
 
 /// A CSS `letter-spacing` or `word-spacing` value.
-pub(crate) fn spacing(style: &Style, units: &Lengths, name: &str) -> gpui::Pixels {
-    gpui::px(
+pub(crate) fn spacing(style: &Style, units: &Lengths, name: &str) -> render::Pixels {
+    render::px(
         style
             .get(name)
             .filter(|value| *value != "normal")
@@ -237,18 +248,25 @@ pub(crate) fn inline_text(
         .iter()
         .position(|&sibling| sibling == id)
         .unwrap_or(0);
+    // Text in a flex or grid container is an item of its own, so its edges are trimmed.
+    let item = doc.nodes[id].parent.is_some_and(|parent| {
+        styles.values[parent]
+            .get("display")
+            .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"))
+    });
     let inline_sibling = |sibling: Option<&usize>| {
-        own && sibling.is_some_and(|&sibling| {
-            !doc.nodes[sibling].tag.starts_with('#')
-                && doc.nodes[sibling].tag != "br"
-                && styles.values[sibling]
-                    .get("display")
-                    .is_none_or(|value| value.starts_with("inline"))
-        })
+        own && !item
+            && sibling.is_some_and(|&sibling| {
+                !doc.nodes[sibling].tag.starts_with('#')
+                    && doc.nodes[sibling].tag != "br"
+                    && styles.values[sibling]
+                        .get("display")
+                        .is_none_or(|value| value.starts_with("inline"))
+            })
     };
     let trailing = inline_sibling(siblings.get(position + 1));
     let mut text = String::new();
-    let mut runs: Vec<gpui::TextRun> = Vec::new();
+    let mut runs: Vec<render::TextRun> = Vec::new();
     let mut ranges = Vec::new();
     let mut backgrounds = Vec::new();
     let mut cursors = Vec::new();
@@ -305,8 +323,8 @@ pub(crate) fn inline_text(
                 ))
             || styles.pseudos.contains_key(&child)
             || styles.animations.contains_key(&child)
-            || styles.lengths[child].font.em != styles.lengths[id].font.em
-            || styles.lengths[child].font.lh != styles.lengths[id].font.lh
+            // Runs carry their own font size; the paragraph's line height must hold the child's.
+            || styles.lengths[child].font.lh > styles.lengths[id].font.lh + 0.01
             || ["white-space", "visibility", "pointer-events", "text-shadow"]
                 .iter()
                 .any(|key| style.get(*key) != parent.get(*key))
@@ -355,6 +373,24 @@ pub(crate) fn inline_text(
                             | "box-decoration-break"
                             | "user-select"
                             | "-webkit-user-select"
+                            | "font-size"
+                            | "line-height"
+                            | "letter-spacing"
+                            | "word-spacing"
+                            | "transition-property"
+                            | "transition-duration"
+                            | "transition-timing-function"
+                            | "transition-delay"
+                            | "transition-behavior"
+                            | "will-change"
+                            | "font-feature-settings"
+                            | "font-variation-settings"
+                            | "-webkit-font-smoothing"
+                            | "-moz-osx-font-smoothing"
+                            | "outline-color"
+                            | "outline-style"
+                            | "outline-width"
+                            | "outline-offset"
                     )
             })
         {
@@ -424,7 +460,12 @@ pub(crate) fn inline_text(
                 word = !c.is_alphanumeric();
             }
             if text.len() > start {
-                runs.push(text_run(style, &styles.lengths[child], text.len() - start));
+                let mut run = text_run(style, &styles.lengths[child], text.len() - start);
+                let size = styles.lengths[child].font.em;
+                if (size - styles.lengths[id].font.em).abs() > 0.01 {
+                    run.font_size = Some(render::px(size));
+                }
+                runs.push(run);
             }
         }
     }
@@ -461,12 +502,12 @@ pub(crate) fn inline_text(
             .get("font-size")
             .and_then(|value| units.resolve(value, units.font.em))
             .filter(|size| (size - units.font.em).abs() > 0.01)
-            .map(gpui::px);
+            .map(render::px);
         run.background_color = style
             .get("background-color")
             .and_then(|value| color(value))
             .filter(|(_, alpha)| *alpha != 0)
-            .map(|(ink, alpha)| gpui::rgba(ink << 8 | alpha as u32).into());
+            .map(|(ink, alpha)| render::rgba(ink << 8 | alpha as u32));
         run
     };
     let pseudos = styles
@@ -545,19 +586,25 @@ pub(crate) fn inline_text(
     })
 }
 
-pub(crate) fn font(style: &Style) -> gpui::Font {
+pub(crate) fn font(style: &Style) -> render::Font {
     let families = style.get("font-family").map_or("system-ui", String::as_str);
     let family = FONT_NAMES.with(|names| {
         let mut names = names.borrow_mut();
         if let Some(family) = names.1.get(families) {
             return family.clone();
         }
-        let family: gpui::SharedString = components(families, ',')
+        let family: render::SharedString = components(families, ',')
             .into_iter()
             .find_map(|family| {
                 let family = family.trim().trim_matches(['\'', '"']);
                 let lower = family.to_ascii_lowercase();
                 let generic: &[&str] = match lower.as_str() {
+                    // The macOS system fonts, like WebKit: SF Mono, New York and SF Rounded.
+                    "ui-monospace" if cfg!(target_os = "macos") => {
+                        &[".AppleSystemUIFontMonospaced"]
+                    }
+                    "ui-serif" if cfg!(target_os = "macos") => &[".AppleSystemUIFontSerif"],
+                    "ui-rounded" if cfg!(target_os = "macos") => &[".AppleSystemUIFontRounded"],
                     "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif"
                     | "sans-serif" | "ui-rounded" => &[".SystemUIFont"],
                     "monospace" | "ui-monospace" => &[
@@ -599,7 +646,7 @@ pub(crate) fn font(style: &Style) -> gpui::Font {
         }
         family
     });
-    let mut font = gpui::font(family);
+    let mut font = render::font(family);
     let weight = match style.get("font-weight").map(String::as_str) {
         Some("bold") => 700.,
         Some(value) => value
@@ -609,11 +656,11 @@ pub(crate) fn font(style: &Style) -> gpui::Font {
             .unwrap_or(400.),
         None => 400.,
     };
-    font.weight = gpui::FontWeight(weight.clamp(1., 1000.));
+    font.weight = render::FontWeight(weight.clamp(1., 1000.));
     font.style = match style.get("font-style").map(String::as_str) {
-        Some("italic") => gpui::FontStyle::Italic,
-        Some(value) if value.starts_with("oblique") => gpui::FontStyle::Oblique,
-        _ => gpui::FontStyle::Normal,
+        Some("italic") => render::FontStyle::Italic,
+        Some(value) if value.starts_with("oblique") => render::FontStyle::Oblique,
+        _ => render::FontStyle::Normal,
     };
     font
 }

@@ -1,3 +1,4 @@
+use crate::jsc::payload::Payload;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{collections::HashMap, time::Duration};
@@ -42,11 +43,15 @@ impl Transport for tokio::net::UnixStream {
 async fn run<T: Transport>(
     stream: T,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    events: mpsc::Sender<Value>,
+    output: mpsc::Sender<Payload>,
+    wake: &crate::host::Waker,
 ) -> Result<()> {
-    events
-        .send(json!({"kind":"connect","address":stream.address()}))
-        .await?;
+    let events = async |event: Payload| {
+        output.send(event).await?;
+        wake.wake();
+        Ok::<_, anyhow::Error>(())
+    };
+    events(json!({"kind":"connect","address":stream.address()}).into()).await?;
     let mut paused = false;
     let mut reading = true;
     let mut ended = false;
@@ -57,8 +62,8 @@ async fn run<T: Transport>(
         tokio::select! {
             command = commands.recv() => {
                 match command {
-                    Some(Command::Write(data)) => { writer.write_all(&data).await?; events.send(json!({"kind":"written","bytes":data.len()})).await?; }
-                    Some(Command::End) => { writer.shutdown().await?; ended=true; events.send(json!({"kind":"finish"})).await?; if !reading {break;} }
+                    Some(Command::Write(data)) => { writer.write_all(&data).await?; events(json!({"kind":"written","bytes":data.len()}).into()).await?; }
+                    Some(Command::End) => { writer.shutdown().await?; ended=true; events(json!({"kind":"finish"}).into()).await?; if !reading {break;} }
                     Some(Command::Pause(value)) => paused=value,
                     Some(Command::NoDelay(value)) => { let _ = control.set_tcp_nodelay(value); }
                     Some(Command::KeepAlive(value, delay)) => {
@@ -70,8 +75,8 @@ async fn run<T: Transport>(
             }
             result = reader.read(&mut bytes), if !paused && reading => {
                 let size = result?;
-                if size == 0 { reading=false; events.send(json!({"kind":"end"})).await?; if ended {break;} }
-                else { events.send(json!({"kind":"data","bytes":crate::web::base64(&bytes[..size])})).await?; }
+                if size == 0 { reading=false; events(json!({"kind":"end"}).into()).await?; if ended {break;} }
+                else { events(Payload::with_bytes(json!({"kind":"data"}), "bytes", bytes[..size].to_vec())).await?; }
             }
         }
     }
@@ -85,7 +90,7 @@ enum Accepted {
 }
 struct Connection {
     commands: mpsc::UnboundedSender<Command>,
-    events: mpsc::Receiver<Value>,
+    events: mpsc::Receiver<Payload>,
     task: JoinHandle<()>,
 }
 impl Drop for Connection {
@@ -116,23 +121,25 @@ impl State {
     ) -> Result<u64> {
         let (commands, incoming) = mpsc::unbounded_channel();
         let (output, events) = mpsc::channel(64);
+        let wake = crate::host::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result = async {
                 match future.await? {
-                    Accepted::Tcp(stream) => run(stream, incoming, output.clone()).await,
+                    Accepted::Tcp(stream) => run(stream, incoming, output.clone(), &wake).await,
                     #[cfg(unix)]
-                    Accepted::Unix(stream) => run(stream, incoming, output.clone()).await,
+                    Accepted::Unix(stream) => run(stream, incoming, output.clone(), &wake).await,
                 }
             }
             .await;
             if let Err(error) = &result {
                 let _ = output
-                    .send(json!({"kind":"error","message":format!("{error:#}")}))
+                    .send(json!({"kind":"error","message":format!("{error:#}")}).into())
                     .await;
             }
             let _ = output
-                .send(json!({"kind":"close","hadError":result.is_err()}))
+                .send(json!({"kind":"close","hadError":result.is_err()}).into())
                 .await;
+            wake.wake();
         });
         self.next_id += 1;
         self.connections.insert(
@@ -180,6 +187,7 @@ impl State {
                 let runtime = crate::web::network()?;
                 let _guard = runtime.enter();
                 let (sender, events) = mpsc::channel(64);
+                let wake = crate::host::Waker::current();
                 let (address, task) = if let Some(path) = options["path"].as_str() {
                     #[cfg(unix)]
                     {
@@ -194,6 +202,7 @@ impl State {
                                             if sender.send(Accepted::Unix(stream)).await.is_err() {
                                                 break;
                                             }
+                                            wake.wake();
                                         }
                                         Err(_) => {
                                             tokio::time::sleep(Duration::from_millis(100)).await
@@ -224,6 +233,7 @@ impl State {
                                         if sender.send(Accepted::Tcp(stream)).await.is_err() {
                                             break;
                                         }
+                                        wake.wake();
                                     }
                                     Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
                                 }
@@ -281,7 +291,8 @@ impl State {
                 self.connections.retain(|id, socket| {
                     for _ in 0..64 {
                         match socket.events.try_recv() {
-                            Ok(mut event) => {
+                            Ok(event) => {
+                                let mut event = event.into_value();
                                 let done = event["kind"] == "close";
                                 event["id"] = json!(id);
                                 events.push(event);

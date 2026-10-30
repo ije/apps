@@ -30,6 +30,7 @@ struct ErrorInfo {
 struct Function {
     callback: Callback,
     data: Ptr,
+    id: u64,
 }
 struct Info {
     this: Ptr,
@@ -66,33 +67,17 @@ struct Property {
     data: Ptr,
 }
 
-#[repr(C)]
-pub(crate) struct ClassDefinition {
-    version: i32,
-    attributes: u32,
-    before_finalize: [Ptr; 5],
-    finalize: Option<unsafe extern "C" fn(Ptr)>,
-    after_finalize: [Ptr; 9],
-}
-
 struct Holder {
     queue: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     id: u64,
+    byte: u8,
 }
 
-static GET_PRIVATE: std::sync::OnceLock<unsafe extern "C" fn(Ptr) -> Ptr> =
-    std::sync::OnceLock::new();
-
-unsafe extern "C" fn finalize_holder(object: Ptr) {
-    // WARNING: JSC can finalize on a GC thread. Queue work without calling JavaScript.
-    if let Some(get_private) = GET_PRIVATE.get() {
-        let pointer = unsafe { get_private(object) }.cast::<Holder>();
-        if !pointer.is_null() {
-            let holder = unsafe { Box::from_raw(pointer) };
-            if let Ok(mut queue) = holder.queue.lock() {
-                queue.push(holder.id);
-            }
-        }
+unsafe extern "C" fn release_holder(_: Ptr, holder: Ptr) {
+    // WARNING: JSC frees array buffers at the end of a GC, maybe on a GC thread. Only queue the ID here.
+    let holder = unsafe { Box::from_raw(holder.cast::<Holder>()) };
+    if let Ok(mut queue) = holder.queue.lock() {
+        queue.push(holder.id);
     }
 }
 
@@ -110,12 +95,11 @@ pub(crate) struct State {
     #[allow(clippy::vec_box)]
     scopes: RefCell<Vec<Box<Scope>>>,
     references: RefCell<HashMap<usize, Box<Reference>>>,
-    // WARNING: GC can reuse an object address before its holder is finalized.
+    // WARNING: GC can reuse an object address before its holder is finalized, so address maps keep the holder ID.
     wraps: RefCell<HashMap<u64, Ptr>>,
-    externals: RefCell<HashMap<usize, Ptr>>,
+    externals: RefCell<HashMap<usize, (u64, Ptr)>>,
     held: RefCell<Vec<Ptr>>,
     finalizers: RefCell<HashMap<u64, Finalizer>>,
-    holder_class: Ptr,
     next_holder: Cell<u64>,
     holders: RefCell<HashMap<u64, (usize, u8)>>,
     finalized: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
@@ -124,7 +108,6 @@ pub(crate) struct State {
     instance_finalizer: Cell<Option<Finalizer>>,
     pending: Cell<Ptr>,
     error: Cell<ErrorInfo>,
-    libraries: RefCell<Vec<Library>>,
     modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
 }
 thread_local! { static FUNCTIONS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
@@ -181,15 +164,6 @@ impl State {
                 (api.unprotect)(ctx, object);
             }
         }
-        let _ = GET_PRIVATE.set(api.get_private);
-        let definition = ClassDefinition {
-            version: 0,
-            attributes: 0,
-            before_finalize: [ptr::null_mut(); 5],
-            finalize: Some(finalize_holder),
-            after_finalize: [ptr::null_mut(); 9],
-        };
-        let holder_class = unsafe { (api.class_create)(&definition) };
         let state = Rc::new_cyclic(|owner| Self {
             api,
             ctx,
@@ -206,7 +180,6 @@ impl State {
             externals: RefCell::default(),
             held: RefCell::default(),
             finalizers: RefCell::default(),
-            holder_class,
             next_holder: Cell::new(0),
             holders: RefCell::default(),
             finalized: Default::default(),
@@ -220,7 +193,6 @@ impl State {
                 engine_code: 0,
                 code: 0,
             }),
-            libraries: RefCell::default(),
             modules: RefCell::default(),
         });
         CONTEXTS.with(|contexts| {
@@ -263,15 +235,19 @@ impl State {
         finalizer: Option<Finalizer>,
     ) -> std::result::Result<u64, i32> {
         self.sweep();
-        let id = self.next_holder.get() + 1;
-        self.next_holder.set(id);
-        let holder = Box::new(Holder {
-            queue: self.finalized.clone(),
-            id,
-        });
+        let (id, holder) = self.holder();
+        let mut exception = ptr::null_mut();
         let holder = unsafe {
-            (self.api.object_make)(self.ctx, self.holder_class, Box::into_raw(holder).cast())
+            (self.api.make_buffer)(
+                self.ctx,
+                (&raw mut (*holder).byte).cast(),
+                1,
+                Some(release_holder),
+                holder.cast(),
+                &mut exception,
+            )
         };
+        check(!holder.is_null() && exception.is_null(), 9)?;
         self.keep(holder);
         self.js("holder", &[object, holder])?;
         self.holders
@@ -283,8 +259,21 @@ impl State {
         Ok(id)
     }
 
+    fn holder(&self) -> (u64, *mut Holder) {
+        let id = self.next_holder.get() + 1;
+        self.next_holder.set(id);
+        let holder = Holder {
+            queue: self.finalized.clone(),
+            id,
+            byte: 0,
+        };
+        (id, Box::into_raw(Box::new(holder)))
+    }
+
     pub(crate) fn sweep(&self) {
-        for environment in self.environments.borrow().iter() {
+        // WARNING: Finalizers can load addons, which pushes to `environments`.
+        let environments = self.environments.borrow().clone();
+        for environment in &environments {
             environment.sweep();
         }
         let ids = self
@@ -302,13 +291,31 @@ impl State {
                         finalizer = self.wrap_finalizers.borrow_mut().remove(&id);
                     }
                     2 => {
-                        self.externals.borrow_mut().remove(&object);
+                        let mut externals = self.externals.borrow_mut();
+                        if externals
+                            .get(&object)
+                            .is_some_and(|external| external.0 == id)
+                        {
+                            externals.remove(&object);
+                        }
                     }
                     3 => {
-                        self.callbacks.borrow_mut().remove(&object);
-                        FUNCTIONS.with(|functions| {
-                            functions.borrow_mut().remove(&object);
-                        });
+                        let mut callbacks = self.callbacks.borrow_mut();
+                        if callbacks
+                            .get(&object)
+                            .is_some_and(|function| function.id == id)
+                        {
+                            callbacks.remove(&object);
+                            FUNCTIONS.with(|functions| {
+                                let mut functions = functions.borrow_mut();
+                                if functions
+                                    .get(&object)
+                                    .is_some_and(|owner| owner.ptr_eq(&self.owner))
+                                {
+                                    functions.remove(&object);
+                                }
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -379,6 +386,18 @@ impl State {
         Ok(self.keep(result))
     }
 
+    fn external(&self, value: Ptr) -> std::result::Result<Option<Ptr>, i32> {
+        let entry = self.externals.borrow().get(&(value as usize)).copied();
+        let Some((id, data)) = entry else {
+            return Ok(None);
+        };
+        let owner = self.js("external", &[value])?;
+        Ok(
+            (unsafe { (self.api.to_number)(self.ctx, owner, ptr::null_mut()) } == id as f64)
+                .then_some(data),
+        )
+    }
+
     fn text(&self, value: &str) -> Ptr {
         let string = self.api.string(value);
         let value = unsafe { (self.api.make_string)(self.ctx, string) };
@@ -435,7 +454,7 @@ impl State {
             (self.api.string_release)(string);
         }
         self.keep(native);
-        self.track(native, 3, None)?;
+        let id = self.track(native, 3, None)?;
         FUNCTIONS.with(|functions| {
             functions
                 .borrow_mut()
@@ -443,7 +462,7 @@ impl State {
         });
         self.callbacks
             .borrow_mut()
-            .insert(native as usize, Function { callback, data });
+            .insert(native as usize, Function { callback, data, id });
         self.js("function", &[native, self.text(name)])
     }
 
@@ -510,12 +529,14 @@ impl State {
         FUNCTIONS.with(|functions| {
             let mut functions = functions.borrow_mut();
             for key in self.callbacks.borrow().keys() {
-                functions.remove(key);
+                if functions
+                    .get(key)
+                    .is_some_and(|owner| owner.ptr_eq(&self.owner))
+                {
+                    functions.remove(key);
+                }
             }
         });
-        unsafe {
-            (self.api.class_release)(self.holder_class);
-        }
         CONTEXTS.with(|contexts| {
             let mut contexts = contexts.borrow_mut();
             if contexts
@@ -574,7 +595,8 @@ impl State {
         }
         let environment = State::new(self.api.clone(), self.ctx, &host, true)?;
         self.environments.borrow_mut().push(environment.clone());
-        environment.libraries.borrow_mut().push(library);
+        // WARNING: Like Node.js, never unload an addon. Its threads and static destructors may still run.
+        std::mem::forget(library);
         environment.scopes.borrow_mut().push(Box::new(Scope {
             kept: HashSet::new(),
             values: Vec::new(),
@@ -617,7 +639,7 @@ unsafe extern "C" fn invoke(
             .get(&(function as usize))
             .and_then(Weak::upgrade)
     });
-    let Some(env) = state else {
+    let Some(env) = state.filter(|_| count >= 2) else {
         return ptr::null_mut();
     };
     let callback = env.callbacks.borrow().get(&(function as usize)).copied();
@@ -713,7 +735,7 @@ api!(napi_create_array_with_length(env, length: usize, result: *mut Ptr) {
 });
 api!(napi_typeof(env, value: Ptr, result: *mut u32) {
     check(!result.is_null(), 1)?;
-    *result = if env.externals.borrow().contains_key(&(value as usize)) {
+    *result = if env.external(value)?.is_some() {
         8
     } else {
         env.kind(value)?
@@ -1760,13 +1782,14 @@ api!(napi_create_external(
     result: *mut Ptr,
 ) {
     let value = env.js("object", &[])?;
-    env.track(value, 2, callback.map(|callback| Finalizer { callback, data, hint }))?;
-    env.externals.borrow_mut().insert(value as usize, data);
+    let id = env.track(value, 2, callback.map(|callback| Finalizer { callback, data, hint }))?;
+    env.js("external", &[value, env.number(id as f64)])?;
+    env.externals.borrow_mut().insert(value as usize, (id, data));
     env.value(result, value)
 });
 api!(napi_get_value_external(env, value: Ptr, result: *mut Ptr) {
     check(!result.is_null(), 1)?;
-    *result = *env.externals.borrow().get(&(value as usize)).ok_or(1)?;
+    *result = env.external(value)?.ok_or(1)?;
     Ok(())
 });
 
@@ -1809,13 +1832,17 @@ api!(napi_create_external_arraybuffer(
     result: *mut Ptr,
 ) {
     check((!data.is_null() || length == 0) && !result.is_null(), 1)?;
+    // WARNING: The finalizer follows the bytes, not the wrapper, because ArrayBuffer.transfer() moves them.
+    let (id, holder) = env.holder();
     let mut exception = ptr::null_mut();
-    let value = (env.api.make_buffer)(env.ctx, data, length, None, ptr::null_mut(), &mut exception);
+    let value = (env.api.make_buffer)(env.ctx, data, length, Some(release_holder), holder.cast(), &mut exception);
     if !exception.is_null() {
         env.exception(exception);
         return Err(10);
     }
-    env.track(value, 0, callback.map(|callback| Finalizer { callback, data, hint }))?;
+    if let Some(callback) = callback {
+        env.finalizers.borrow_mut().insert(id, Finalizer { callback, data, hint });
+    }
     env.value(result, value)
 });
 api!(napi_is_arraybuffer(env, value: Ptr, result: *mut bool) {
@@ -2064,5 +2091,60 @@ pub(crate) unsafe extern "C" fn load(
             }
             env.undefined()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn callback(_: *const State, _: *const Info) -> Ptr {
+        ptr::null_mut()
+    }
+
+    #[test]
+    fn reused_addresses_and_short_calls_are_rejected() {
+        let api = Api::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        let _engine =
+            crate::jsc::Engine::new(api.clone(), host.clone(), crate::host::Role::Main).unwrap();
+        let root = CONTEXTS
+            .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
+            .unwrap();
+        let env = State::new(api, root.ctx, &host, true).unwrap();
+        let raw = Rc::as_ptr(&env);
+        let object = env.js("object", &[]).unwrap();
+        env.externals
+            .borrow_mut()
+            .insert(object as usize, (u64::MAX, raw.cast_mut().cast()));
+        let (mut kind, mut data) = (0, ptr::null_mut());
+        assert_eq!(unsafe { napi_typeof(raw, object, &mut kind) }, 0);
+        assert_eq!(kind, 6, "A stale external address aliased a new object");
+        assert_eq!(
+            unsafe { napi_get_value_external(raw, object, &mut data) },
+            1
+        );
+        env.function("live", callback, ptr::null_mut()).unwrap();
+        let native = *env.callbacks.borrow().keys().next().unwrap();
+        env.holders.borrow_mut().insert(u64::MAX, (native, 3));
+        env.finalized.lock().unwrap().push(u64::MAX);
+        env.sweep();
+        assert!(
+            env.callbacks.borrow().contains_key(&native),
+            "A stale holder removed a live function"
+        );
+        let mut exception = ptr::null_mut();
+        let value = unsafe {
+            invoke(
+                env.ctx,
+                native as Ptr,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                &mut exception,
+            )
+        };
+        assert!(value.is_null() && exception.is_null());
+        env.close();
     }
 }

@@ -61,3 +61,34 @@ fn serve_is_main_only() {
             .contains("only available in the main context")
     );
 }
+
+#[test]
+fn native_events_wake_the_loop_without_polling() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counter = wakes.clone();
+    apps_runtime::host::Waker::install(move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    engine.eval("globalThis.done='pending';const server=__apps.serve({hostname:'127.0.0.1',port:0,fetch:async request=>new Response(await request.text()+'!')});fetch(`http://127.0.0.1:${server.port}`,{method:'POST',body:'woken'}).then(r=>r.text()).then(text=>{done=text;server.stop()},error=>done=String(error))", "wake").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = wakes.load(Ordering::Relaxed);
+        assert_eq!(engine.tick().unwrap(), -1, "the loop must not poll");
+        if engine.eval("done", "wake").unwrap() != "pending" {
+            break;
+        }
+        while wakes.load(Ordering::Relaxed) == seen {
+            assert!(
+                Instant::now() < deadline,
+                "a native event did not wake the loop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(engine.eval("done", "wake").unwrap(), "woken!");
+}

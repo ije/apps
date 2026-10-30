@@ -1,8 +1,15 @@
 (() => {
   const native = globalThis.__appsNative;
-  const role = globalThis.__appsRole;
+  const role = globalThis.__appsRole, disabled = new Set(globalThis.__appsDisabled);
   delete globalThis.__appsNative;
   delete globalThis.__appsRole;
+  delete globalThis.__appsDisabled;
+  // A disabled feature is a stub that throws when it is called, so imports and feature checks still work.
+  const feature = name => {
+    const fail = () => { throw new Error(`The ${name} feature is disabled. Add "${name}" to "features" in package.json`); };
+    const stub = new Proxy(function() {}, { get: (_, key) => typeof key === 'symbol' || key === 'then' ? undefined : stub, apply: fail, construct: fail });
+    return stub;
+  };
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   const pack = value => {
     const buffers = [];
@@ -18,14 +25,26 @@
     return { json, buffers };
   };
   const unpack = result => typeof result === 'string' ? parse(result) : parse(result.json, (_, value) => value && typeof value === 'object' && Object.hasOwn(value, '$appsBytes') ? new Uint8Array(result[value.$appsBytes]) : value);
-  const call = (op, ...args) => {
-    const request = pack({ __proto__: null, op, args });
-    const result = unpack(native(request.json, request.buffers));
-    if (result.error) throw Object.assign(new Error(result.error), result.code ? {code: result.code} : {});
-    return result.value;
+  const nested = (value, depth) => {
+    if (value === null || typeof value !== 'object') return false;
+    if (depth > 32 || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+    for (const key in value) if (nested(value[key], depth + 1)) return true;
+    return false;
   };
-  globalThis.__appsBridgeReceiveBytes = value => pack(__appsBridgeReceive(unpack(value)));
+  // WARNING: primitives and top-level bytes go to Rust as JS values. Other arguments go as JSON, and a JSON.stringify replacer is slow in JSC, so only arguments that hold bytes use it.
+  const call = (op, ...args) => {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === null || typeof arg !== 'object' || arg instanceof ArrayBuffer || ArrayBuffer.isView(arg) && !(arg instanceof DataView)) continue;
+      if (!nested(args, 0)) return native(0, op, stringify(args));
+      const request = pack(args);
+      return native(0, op, request.json, request.buffers);
+    }
+    return native(op, ...args);
+  };
+  Object.defineProperty(globalThis, '__appsBridgeReceiveBytes', { value: value => pack(__appsBridgeReceive(unpack(value))) });
   const finalizers = new Set();
+  let collected = new WeakRef({});
   globalThis.__appsFinalizers = class {
     constructor(release) { this.release = release; this.live = new Map(); this.tokens = new WeakMap(); finalizers.add(this); }
     register(object, value, token) { const key = {}; this.live.set(key, { ref: new WeakRef(object), value }); if (token) { let keys = this.tokens.get(token); if (!keys) this.tokens.set(token, keys = new Set()); keys.add(key); } }
@@ -86,14 +105,15 @@
   globalThis.setTimeout = (fn, delay = 0, ...args) => {
     if (typeof fn !== 'function') throw new TypeError('Expected a timer function');
     const id = ++timerID;
-    delay = Math.max(0, Number(delay) || 0);
+    delay = Number(delay);
+    delay = delay >= 0 && delay <= 2147483647 ? delay : delay > 0 ? 1 : 0;
     timers.set(id, { fn, args, delay, at: Date.now() + delay, ref: true });
     return nodeRole ? new Timeout(id) : id;
   };
   globalThis.clearTimeout = id => { timers.delete(+id); };
   globalThis.setInterval = (fn, delay = 0, ...args) => {
     const id = setTimeout(fn, delay, ...args);
-    timers.get(+id).interval = Math.max(1, Number(delay) || 1);
+    timers.get(+id).interval = Math.max(1, timers.get(+id).delay);
     return id;
   };
   globalThis.clearInterval = clearTimeout;
@@ -120,8 +140,11 @@
   globalThis.__appsTick = () => {
     if (moduleErrors.length) throw moduleErrors.shift();
     try {
-      for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); }
+      // WARNING: WeakRef targets only die in a GC, so sweep only after the canary is collected.
+      if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); } }
       globalThis.__appsDomSweep?.();
+      globalThis.__appsDecoded?.();
+      globalThis.__appsGPUPoll?.();
       pollWeb();
       children?.poll();
       servers?.poll();
@@ -145,12 +168,15 @@
     let at = Infinity;
     for (const timer of timers.values()) if (timer.at < at) at = timer.at;
     const delay = at === Infinity ? -1 : Math.max(0, at - Date.now());
-    return pollWeb.pending() || servers?.pending() || __appsPending() || moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() || nativeShell?.pending?.() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
+    // WARNING: native producers wake the loop when they queue events, so only bridge replies and module errors poll here.
+    return moduleErrors.length || bridge.poll.pending() ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
+  globalThis.__appsAlive = () => timers.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
-    globalThis.__appsGPU = call;
+    if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
+    else { globalThis.navigator.gpu = feature('webgpu'); globalThis.GPUCanvasContext = feature('webgpu'); }
     return;
   }
   const info = call('info');
@@ -270,31 +296,128 @@
   const { path, os } = node;
   let ready = false, nextWindow = 0, resolveReady;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-  const windows = new Map();
+  const windows = new Map(), captures = new Map(), states = new WeakMap();
+  let nextCapture = 0;
+  const state = win => { if (win.isDestroyed()) throw Error('Window is closed'); return states.get(win); };
+  const int = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return Math.round(value); };
+  // WARNING: Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
+  const argb = color => /^#([\da-f]{4}|[\da-f]{8})$/i.test(color) ? '#' + color.slice(color.length === 5 ? 2 : 3) + color.slice(1, color.length === 5 ? 2 : 3) : color;
+  const resize = (win, next, content) => {
+    const s = state(win), { bounds, content: inner } = s, base = content ? inner : bounds, target = { ...base };
+    for (const key of ['x', 'y', 'width', 'height']) if (next?.[key] !== undefined) target[key] = int(next[key], key);
+    if (info.platform !== 'darwin' && (target.x !== base.x || target.y !== base.y)) throw Error('Moving a window is only available on macOS');
+    const [dx, dy, dw, dh] = [inner.x - bounds.x, inner.y - bounds.y, bounds.width - inner.width, bounds.height - inner.height];
+    if (content) Object.assign(target, { x: target.x - dx, y: target.y - dy, width: target.width + dw, height: target.height + dh });
+    target.width = Math.min(Math.max(target.width, s.min[0], 1), s.max[0] || 16384);
+    target.height = Math.min(Math.max(target.height, s.min[1], 1), s.max[1] || 16384);
+    call('window', 'bounds', win.id, target.x, target.y, target.width, target.height);
+    s.bounds = target;
+    s.content = { x: target.x + dx, y: target.y + dy, width: target.width - dw, height: target.height - dh };
+  };
   class BrowserWindow extends events.EventEmitter {
     constructor(options = {}) {
       super();
       if (!ready) throw Error('Call app.whenReady() before creating a window');
+      options = { ...options, title: String(options.title ?? name) };
+      if (typeof options.backgroundColor === 'string') options.backgroundColor = argb(options.backgroundColor);
       this.id = ++nextWindow;
       this.webContents = new events.EventEmitter();
-      Object.assign(this.webContents, { id: this.id, send: (channel, ...args) => bridge.send(this.id, channel, ...args), openDevTools: () => call('window', 'devtools', this.id), toggleDevTools: () => call('window', 'devtools', this.id) });
+      Object.assign(this.webContents, { id: this.id, send: (channel, ...args) => bridge.send(this.id, channel, ...args), openDevTools: () => call('window', 'devtools', this.id), toggleDevTools: () => call('window', 'devtools', this.id),
+        capturePage: rect => new Promise((resolve, reject) => {
+          if (this.isDestroyed()) throw Error('Window is closed');
+          const id = ++nextCapture;
+          captures.set(id, { resolve, reject });
+          call('window', 'capture', this.id, id, rect ?? null);
+        }) });
       call('window', 'create', this.id, options);
+      const { x = 0, y = 0, width = 800, height = 600 } = options;
+      states.set(this, { bounds: { x, y, width, height }, content: { x, y, width, height }, minimized: false, maximized: false, fullscreen: false, visible: options.show !== false, focused: false,
+        title: options.title, min: [options.minWidth ?? 0, options.minHeight ?? 0], max: [options.maxWidth ?? 0, options.maxHeight ?? 0], alwaysOnTop: options.alwaysOnTop === true,
+        resizable: options.resizable !== false, movable: options.movable !== false, minimizable: options.minimizable !== false, maximizable: options.maximizable !== false, closable: options.closable !== false, native: null, closing: false });
       windows.set(this.id, this);
       Object.defineProperty(this, 'contentView', { value: browsers.contentView(this, options), enumerable: true });
       app.emit('web-contents-created', event(), this.webContents);
       app.emit('browser-window-created', event(), this);
     }
     load(html) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'load', this.id, String(html)); }
-    loadFile(file) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'loadFile', this.id, String(file)); }
+    loadFile(file, options = {}) {
+      if (this.isDestroyed()) throw Error('Window is closed');
+      let target = String(file);
+      if (options.query || options.search !== undefined || options.hash !== undefined) {
+        const url = /^(apps|file):/.test(target) ? new URL(target) : __apps.url.pathToFileURL(__apps.path.resolve(target));
+        if (options.query) url.search = new URLSearchParams(options.query).toString();
+        if (options.search !== undefined) url.search = options.search;
+        if (options.hash !== undefined) url.hash = options.hash;
+        target = url.href;
+      }
+      call('window', 'loadFile', this.id, target);
+    }
     loadURL() { throw Error('loadURL is not allowed, use WebContentsView to load webpage'); }
-    close() { if (!this.isDestroyed()) call('window', 'close', this.id); }
-    destroy() { this.close(); }
-    show() { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'show', this.id); }
-    setTitle(title) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'title', this.id, String(title)); }
+    close() {
+      if (this.isDestroyed() || states.get(this).closing) return;
+      const close = event();
+      this.emit('close', close);
+      if (close.defaultPrevented) { quitting = false; return; }
+      states.get(this).closing = true;
+      call('window', 'close', this.id);
+    }
+    destroy() { if (!this.isDestroyed()) call('window', 'close', this.id); }
+    setWindowButtonVisibility(visible) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'buttons', this.id, !!visible); }
     isDestroyed() { return !windows.has(this.id); }
+    getTitle() { return state(this).title; }
+    setTitle(title) { const s = state(this); s.title = String(title); call('window', 'title', this.id, s.title); }
+    setBackgroundColor(color) { state(this); call('window', 'background', this.id, argb(String(color))); }
+    getBounds() { return { ...state(this).bounds }; }
+    setBounds(bounds) { resize(this, bounds, false); }
+    getContentBounds() { return { ...state(this).content }; }
+    setContentBounds(bounds) { resize(this, bounds, true); }
+    getSize() { const { width, height } = state(this).bounds; return [width, height]; }
+    setSize(width, height) { resize(this, { width, height }, false); }
+    getContentSize() { const { width, height } = state(this).content; return [width, height]; }
+    setContentSize(width, height) { resize(this, { width, height }, true); }
+    getPosition() { const { x, y } = state(this).bounds; return [x, y]; }
+    setPosition(x, y) { resize(this, { x, y }, false); }
+    center() { state(this); call('window', 'center', this.id); }
+    getMinimumSize() { return [...state(this).min]; }
+    setMinimumSize(width, height) { const s = state(this), min = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...min, ...s.max); s.min = min; }
+    getMaximumSize() { return [...state(this).max]; }
+    setMaximumSize(width, height) { const s = state(this), max = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...s.min, ...max); s.max = max; }
+    #flag(key, value) { const s = state(this); call('window', key, this.id, !!value); s[key] = !!value; }
+    isResizable() { return state(this).resizable; }
+    setResizable(resizable) { this.#flag('resizable', resizable); }
+    isMovable() { return state(this).movable; }
+    setMovable(movable) { this.#flag('movable', movable); }
+    isMinimizable() { return state(this).minimizable; }
+    setMinimizable(minimizable) { this.#flag('minimizable', minimizable); }
+    isMaximizable() { return state(this).maximizable; }
+    setMaximizable(maximizable) { this.#flag('maximizable', maximizable); }
+    isClosable() { return state(this).closable; }
+    setClosable(closable) { this.#flag('closable', closable); }
+    isAlwaysOnTop() { return state(this).alwaysOnTop; }
+    setAlwaysOnTop(flag) { this.#flag('alwaysOnTop', flag); }
+    minimize() { state(this).minimized = true; call('window', 'minimize', this.id); }
+    isMinimized() { return state(this).minimized; }
+    maximize() { state(this).maximized = true; call('window', 'maximize', this.id); }
+    unmaximize() { state(this).maximized = false; call('window', 'unmaximize', this.id); }
+    isMaximized() { return state(this).maximized; }
+    restore() { state(this).minimized = false; call('window', 'restore', this.id); }
+    isNormal() { const s = state(this); return !s.minimized && !s.maximized && !s.fullscreen; }
+    setFullScreen(flag) { state(this).fullscreen = !!flag; call('window', 'fullscreen', this.id, !!flag); }
+    isFullScreen() { return state(this).fullscreen; }
+    show() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'show', this.id); }
+    showInactive() { state(this).visible = true; call('window', 'showInactive', this.id); }
+    hide() { Object.assign(state(this), { visible: false, focused: false }); call('window', 'hide', this.id); }
+    isVisible() { return state(this).visible; }
+    focus() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'focus', this.id); }
+    blur() { state(this).focused = false; call('window', 'blur', this.id); }
+    isFocused() { return state(this).focused; }
     static getAllWindows() { return [...windows.values()]; }
     static fromId(id) { return windows.get(id) ?? null; }
+    static fromWebContents(webContents) { for (const win of windows.values()) if (win.webContents === webContents) return win; return null; }
+    static getFocusedWindow() { for (const win of windows.values()) if (states.get(win).focused) return win; return null; }
   }
+  if (info.platform !== 'darwin') for (const method of ['center', 'unmaximize', 'showInactive', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop'])
+    BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is only available on macOS`); };
   const app = new events.EventEmitter();
   const event = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
   const switches = new Map(info.argv.slice(1).flatMap(arg => { const match = /^--([^=]+)(?:=(.*))?$/s.exec(arg); return match ? [[match[1], match[2] ?? '']] : []; }));
@@ -383,12 +506,42 @@
       else if (app.listenerCount('window-all-closed') || app.listenerCount('window-close')) app.emit('window-all-closed');
       else quit();
     }
-    else if (name === 'resize') { if (win) { win.contentView.setBounds({ x: 0, y: 0, ...data }); win.emit('resize'); } }
+    else if (name === 'resize') win?.contentView.setBounds({ x: 0, y: 0, ...data });
+    else if (name === 'state') {
+      const s = win && states.get(win);
+      if (!s) return;
+      // WARNING: the first state is the window's initial state, so it only reports focus.
+      const old = s.native ?? { ...data, focused: false }, [x, y, width, height] = data.frame, [left, top, innerWidth, innerHeight] = data.content;
+      s.native = data;
+      Object.assign(s, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
+      win.contentView.setBounds({ x: 0, y: 0, width: innerWidth, height: innerHeight });
+      for (const [key, on, off] of [['minimized', 'minimize', 'restore'], ['maximized', 'maximize', 'unmaximize'], ['fullscreen', 'enter-full-screen', 'leave-full-screen'], ['visible', 'show', 'hide']])
+        if (old[key] !== data[key]) win.emit(data[key] ? on : off);
+      const resized = old.frame[2] !== width || old.frame[3] !== height;
+      if (resized) win.emit('resize');
+      if (!data.resizing && (resized || old.resizing)) win.emit('resized');
+      if (old.frame[0] !== x || old.frame[1] !== y) { win.emit('move'); win.emit('moved'); }
+      if (old.focused !== data.focused) { const kind = data.focused ? 'focus' : 'blur'; win.emit(kind); app.emit('browser-window-' + kind, event(), win); }
+    }
+    else if (name === 'close') win?.close();
+    else if (name === 'title') {
+      if (!win) return true;
+      const updated = event();
+      win.emit('page-title-updated', updated, data, true);
+      if (!updated.defaultPrevented) states.get(win).title = data;
+      return !updated.defaultPrevented;
+    }
     else if (name === 'loaded') win?.emit('ready-to-show');
-    else if (name === 'focus' || name === 'blur') { if (win) { win.emit(name); app.emit('browser-window-' + name, event(), win); } }
     else if (name === 'activate') app.emit('activate', event(), !!data);
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
+    else if (name === 'captured') {
+      const request = captures.get(data.id);
+      captures.delete(data.id);
+      if (data.error) return request?.reject(new Error(data.error));
+      const bytes = Uint8Array.from(atob(data.png), char => char.charCodeAt(0));
+      request?.resolve(Object.freeze({ toPNG: () => bytes.slice(), toDataURL: () => 'data:image/png;base64,' + data.png, getSize: () => ({ width: data.width, height: data.height }), isEmpty: () => !data.width || !data.height }));
+    }
   };
   const timerModule = { setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate, promises: {
     setTimeout: (delay, value, options) => scheduler.wait(delay, options).then(() => value),

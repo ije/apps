@@ -2,6 +2,7 @@
   object: () => ({}),
   holder: (() => { const held = new WeakMap(); return (object, holder) => { const values = held.get(object); if (values) values.push(holder); else held.set(object, [holder]); }; })(),
   wrap: (() => { const ids = new WeakMap(); return (object, id) => { const previous = ids.get(object) || 0; if (id !== undefined) { if (id) ids.set(object, id); else ids.delete(object); } return previous; }; })(),
+  external: (() => { const ids = new WeakMap(); return (object, id) => { if (id !== undefined) ids.set(object, id); return ids.get(object) || 0; }; })(),
   array: length => new Array(length),
   function: (native, name) => {
     const fn = function(...args) { return native(this, new.target, ...args); };

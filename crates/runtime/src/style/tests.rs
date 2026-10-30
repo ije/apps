@@ -221,6 +221,32 @@ fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
 }
 
 #[test]
+fn scrollbar_parts_reach_scroll_containers_only() {
+    let doc = Document::parse(
+        "<style>::-webkit-scrollbar{width:8px}.s::-webkit-scrollbar-thumb{background:red;border-radius:4px}.s::-webkit-scrollbar-thumb:hover{background:blue}::-webkit-scrollbar-thumb:vertical{background:green}::-webkit-scrollbar-track-piece{background:#eee}.s{overflow-y:auto}</style><div class=s></div><p></p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let parts = &computed.scrollbars[&element(&doc, "div")];
+    assert_eq!(parts[0].as_ref().unwrap()["width"], "8px");
+    assert_eq!(parts[1].as_ref().unwrap()["background-color"], "#eee");
+    let [thumb, hovered] = [&parts[2], &parts[4]].map(|part| part.as_ref().unwrap());
+    assert_eq!(
+        (&*thumb["background-color"], &*hovered["background-color"]),
+        ("red", "blue")
+    );
+    assert_eq!(hovered["border-top-left-radius"], "4px");
+    assert!(!computed.scrollbars.contains_key(&element(&doc, "p")));
+}
+
+#[test]
 fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     let doc = Document::parse(
         "<style>p{color:#111111;text-shadow:1px 2px red,0 0 3px}p::first-letter{color:#ff0000;text-transform:uppercase}p::first-line{font-weight:700;color:#0000ff}li::marker{content:'-';color:blue}b{color:#00ff00}</style><p>\"hi <b>there</b> <span style='text-shadow:inherit'>x</span></p><ul><li>item</li></ul>",
@@ -245,7 +271,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
     );
-    let ink = |color: u32| gpui::Hsla::from(gpui::rgba(color));
+    let ink = |color: u32| render::Rgba::from(render::rgba(color));
     assert_eq!(
         (inline.runs[0].len, inline.runs[0].color),
         (2, ink(0xff0000ff))
@@ -265,7 +291,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     );
     assert!(
         runs.iter()
-            .all(|run| run.font.weight == gpui::FontWeight(700.))
+            .all(|run| run.font.weight == render::FontWeight(700.))
     );
     let doc = Document::parse(
         "<p style='text-shadow:1px 1px red'>a <span style='text-shadow:none'>b</span></p><table><tr><td>a</td><td style='vertical-align:top'>b</td></tr></table>",
@@ -463,11 +489,44 @@ fn editor_media_caret_and_selection_styles() {
         !reduced_motion()
     );
     let motion = |value: &str| {
-        MediaQuery::Feature("prefers-reduced-motion".into(), ":".into(), value.into())
-            .matches(800., 600., true, 0)
+        MediaQuery::Feature("prefers-reduced-motion".into(), ":".into(), value.into()).matches(
+            800.,
+            600.,
+            true,
+            0,
+            FontUnits::new(16.),
+        )
     };
     assert_eq!(motion("reduce"), Some(true));
     assert_eq!(motion("no-preference"), Some(false));
+}
+
+#[test]
+fn app_region_is_inherited_and_accepts_the_webkit_name() {
+    let doc = Document::parse(
+        r#"<style>
+            header { -webkit-app-region: drag; }
+            button { app-region: no-drag; }
+        </style><header><span id="title">Title</span><button id="close"><b id="icon">x</b></button></header><main id="main"></main>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let region = |selector| {
+        computed.values[element(&doc, selector)]
+            .get("app-region")
+            .cloned()
+    };
+    assert_eq!(region("header").as_deref(), Some("drag"));
+    assert_eq!(region("#title").as_deref(), Some("drag"));
+    assert_eq!(region("#icon").as_deref(), Some("no-drag"));
+    assert_eq!(region("#main"), None);
 }
 
 #[test]
@@ -770,8 +829,8 @@ fn math_values_work_in_variables_shorthands_shadows_and_utilities() {
     assert_eq!(units.resolve(&style["height"], 600.), Some(560.));
     assert_eq!(units.resolve(&style["width"], 800.), Some(400.));
     let shadows = units.shadows(&style["box-shadow"], false);
-    assert_eq!(shadows[0].offset.y, gpui::px(30.));
-    assert_eq!(shadows[0].blur_radius, gpui::px(4.));
+    assert_eq!(shadows[0].offset.y, render::px(30.));
+    assert_eq!(shadows[0].blur_radius, render::px(4.));
 }
 
 #[test]
@@ -811,14 +870,24 @@ fn theme_colors_and_apply_reach_native_paint() {
         assert_eq!(style[property], "oklch(0.72 0.11 178)");
         assert!(color(&style[property]).is_some());
     }
-    assert_eq!(style["border-bottom-left-radius"], "8px");
-    assert_eq!(style["border-bottom-right-radius"], "8px");
+    assert_eq!(
+        length(&style["border-bottom-left-radius"], 0., 16., 800., 600.),
+        8.
+    );
+    assert_eq!(
+        length(&style["border-bottom-right-radius"], 0., 16., 800., 600.),
+        8.
+    );
     assert!(!style.contains_key("border-top-left-radius"));
     let paint = Lengths::new(16., 800., 600.).shadows(&style["box-shadow"], false);
+    let paint: Vec<_> = paint.iter().filter(|shadow| shadow.color.a > 0.).collect();
     assert_eq!(paint.len(), 2);
-    assert_eq!(paint[1].offset, gpui::point(gpui::px(0.), gpui::px(4.)));
-    assert_eq!(paint[1].blur_radius, gpui::px(3.));
-    assert_eq!(paint[1].spread_radius, gpui::px(-1.));
+    assert_eq!(
+        paint[1].offset,
+        render::point(render::px(0.), render::px(4.))
+    );
+    assert_eq!(paint[1].blur_radius, render::px(3.));
+    assert_eq!(paint[1].spread_radius, render::px(-1.));
     assert!((paint[1].color.a - 0.1).abs() < 0.003);
 }
 
@@ -853,7 +922,7 @@ fn theme_tokens_apply_order_and_scoped_overrides() {
     assert_eq!(style["background-color"], "#123456");
     assert_eq!(style["color"], "blue");
     assert_eq!(style["border-bottom-left-radius"], "10px");
-    assert_eq!(style["font-size"], "32px");
+    assert_eq!(length(&style["font-size"], 0., 16., 799., 600.), 32.);
     assert_eq!(style["font-family"], "Helvetica");
     assert_eq!(style["font-weight"], "850");
     assert_eq!(
@@ -868,7 +937,9 @@ fn theme_tokens_apply_order_and_scoped_overrides() {
     assert_eq!(
         Lengths::new(32., 799., 600.)
             .shadows(&style["box-shadow"], false)
-            .len(),
+            .iter()
+            .filter(|shadow| shadow.color.a > 0.)
+            .count(),
         1
     );
     let wide = styles(&doc, 800., 600.).pop().unwrap();
@@ -902,10 +973,13 @@ fn shadows_split_inset_and_outer_lists() {
     let outer = units.shadows(value, false);
     let inset = units.shadows(value, true);
     assert_eq!(outer.len(), 1);
-    assert_eq!(outer[0].blur_radius, gpui::px(4.));
+    assert_eq!(outer[0].blur_radius, render::px(4.));
     assert_eq!(inset.len(), 2);
-    assert_eq!(inset[0].offset, gpui::point(gpui::px(1.), gpui::px(2.)));
-    assert_eq!(inset[1].spread_radius, gpui::px(2.));
+    assert_eq!(
+        inset[0].offset,
+        render::point(render::px(1.), render::px(2.))
+    );
+    assert_eq!(inset[1].spread_radius, render::px(2.));
 }
 
 #[test]
@@ -938,8 +1012,14 @@ fn filters_fold_into_one_color_matrix() {
     assert_eq!(parse("sepia(1) unknown(2)").0, None);
     let (matrix, _, shadows) = parse("drop-shadow(2px 3px 4px #ff0000) invert(1)");
     assert_eq!(shadows.len(), 1);
-    assert_eq!(shadows[0].offset, gpui::point(gpui::px(2.), gpui::px(3.)));
-    assert_eq!(gpui::Rgba::from(shadows[0].color), gpui::rgba(0x00ffffff));
+    assert_eq!(
+        shadows[0].offset,
+        render::point(render::px(2.), render::px(3.))
+    );
+    assert_eq!(
+        render::Rgba::from(shadows[0].color),
+        render::rgba(0x00ffffff)
+    );
     let twice = matrix.unwrap().then(matrix.unwrap());
     assert!(
         twice
@@ -1255,21 +1335,17 @@ fn tailwind_classes_have_stable_order_and_respond_to_width() {
         let doc = Document::parse(&format!(
             "<style>@import 'tailwindcss';</style><div class='{classes}'></div>"
         ));
-        for (width, expected) in [
-            (639., "1rem"),
-            (640., "2rem"),
-            (768., "3rem"),
-            (1024., "4rem"),
-        ] {
+        for (width, expected) in [(639., 16.), (640., 32.), (768., 48.), (1024., 64.)] {
             let style = styles(&doc, width, 600.).pop().unwrap();
-            assert_eq!(style["width"], expected);
-            assert_eq!(style["height"], "2rem");
+            let px = |key: &str| length(&style[key], 0., 16., width, 600.);
+            assert_eq!(px("width"), expected);
+            assert_eq!(px("height"), 32.);
             assert_eq!(
                 edges(&style, "padding", width, 16., width, 600.),
                 [32., 16., 32., 8.]
             );
-            assert_eq!(style["row-gap"], "1rem");
-            assert_eq!(style["column-gap"], "0.5rem");
+            assert_eq!(px("row-gap"), 16.);
+            assert_eq!(px("column-gap"), 8.);
         }
     }
 }
@@ -1312,20 +1388,21 @@ fn tailwind_sizes_colors_and_unknown_classes() {
         "<style>@import 'tailwindcss';</style><div class='grid grid-cols-2 min-h-screen max-w-full w-1/2 h-[30px] -mt-2 mx-auto border-2 border-[#123456] rounded-xl bg-[#abcdef] text-lg font-semibold hover:hidden w-NaN w-1/0 p--4 custom'></div>",
     );
     let style = styles(&doc, 800., 600.).pop().unwrap();
+    let px = |key: &str| length(&style[key], 800., 16., 800., 600.);
     assert_eq!(style["display"], "grid");
-    assert_eq!(style["grid-template-columns"], "repeat(2,1fr)");
+    assert_eq!(style["grid-template-columns"], "repeat(2, minmax(0, 1fr))");
     assert_eq!(style["min-height"], "100vh");
     assert_eq!(style["max-width"], "100%");
-    assert_eq!(style["width"], "50%");
+    assert_eq!(px("width"), 400.);
     assert_eq!(style["height"], "30px");
-    assert_eq!(style["margin-top"], "-0.5rem");
+    assert_eq!(px("margin-top"), -8.);
     assert_eq!(style["margin-left"], "auto");
     assert_eq!(style["margin-right"], "auto");
     assert_eq!(style["border-left-width"], "2px");
     assert_eq!(style["border-bottom-color"], "#123456");
-    assert_eq!(style["border-bottom-left-radius"], "12px");
+    assert_eq!(px("border-bottom-left-radius"), 12.);
     assert_eq!(style["background-color"], "#abcdef");
-    assert_eq!(style["font-size"], "18px");
+    assert_eq!(px("font-size"), 18.);
     assert_eq!(style["font-weight"], "600");
     assert_eq!(style["padding-top"], "0");
 }
@@ -1386,4 +1463,159 @@ fn cascade_variables_media_and_specificity() {
     assert_eq!(wide[id]["grid-template-columns"], "repeat(2,1fr)");
     let narrow = styles(&doc, 400., 600.);
     assert_eq!(narrow[id]["grid-template-columns"], "1fr");
+}
+
+#[test]
+fn table_columns_follow_rows_and_stay_cached() {
+    let mut doc = Document::parse(
+        "<table id=t><thead><tr><th>a</th><th>b</th><th>c</th></tr></thead><tbody><tr><td>1</td><td><table id=inner><tr><td></td><td></td><td></td><td></td><td></td></tr></table></td></tr></tbody></table><table id=one><tr><td>x</td></tr></table><table id=own style='grid-template-columns:1fr 2fr'><tr><td></td><td></td></tr></table>",
+    );
+    let [table, inner, one, own] = ["#t", "#inner", "#one", "#own"].map(|s| element(&doc, s));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let first = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        first.values[table]["grid-template-columns"],
+        "repeat(3,auto)"
+    );
+    assert_eq!(
+        first.values[inner]["grid-template-columns"],
+        "repeat(5,auto)"
+    );
+    assert!(!first.values[one].contains_key("grid-template-columns"));
+    assert_eq!(first.values[own]["grid-template-columns"], "1fr 2fr");
+    let second = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert!(Rc::ptr_eq(&first.values[table], &second.values[table]));
+    let row = doc.nodes[doc.nodes[table].children[1]].children[0];
+    for _ in 0..3 {
+        let cell = doc.nodes.len();
+        doc.nodes.push(crate::dom::Node {
+            tag: "td".into(),
+            parent: Some(row),
+            ..Default::default()
+        });
+        doc.nodes[row].children.push(cell);
+    }
+    let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        cached.values[table]["grid-template-columns"],
+        "repeat(5,auto)"
+    );
+    let last = *doc.nodes[row].children.last().unwrap();
+    doc.nodes[last].tag = "#text".into();
+    let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let fresh = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut sheets,
+        &mut StyleCache::default(),
+        None,
+    );
+    assert_eq!(cached.values, fresh.values);
+    assert_eq!(
+        cached.values[table]["grid-template-columns"],
+        "repeat(4,auto)"
+    );
+}
+
+#[test]
+fn structural_selectors_follow_sibling_changes() {
+    let mut doc = Document::parse(
+        "<style>li:nth-child(2n){color:red} li:nth-last-of-type(1){font-weight:700} li:only-child{padding-top:1px} li+li{margin-top:2px} li:nth-child(odd of .k){border-top-width:3px} p~li{margin-left:4px}</style><ul><li id=a class=k></li><li id=b></li><li id=c class=k></li></ul>",
+    );
+    let list = element(&doc, "ul");
+    let [a, b, c] = ["#a", "#b", "#c"].map(|s| element(&doc, s));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for step in 0..7 {
+        match step {
+            1 => doc.nodes[list].children.swap(0, 2),
+            2 => doc.nodes[b].tag = "p".into(),
+            3 => {
+                doc.nodes[c].attrs.remove("class");
+            }
+            4 => doc.nodes[list].children.retain(|&id| id == a),
+            5 => doc.nodes[b].tag = "li".into(),
+            6 => doc.nodes[list].children = vec![b, a, c],
+            _ => {}
+        }
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values, "step {step}");
+    }
+}
+
+#[test]
+fn huge_font_sizes_are_clamped() {
+    let doc = Document::parse(
+        "<p id=a style='font-size:100000000px'>a</p><p id=b style='font-size:calc(1e38px * 100)'>b</p>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    assert_eq!(styles[element(&doc, "#a")]["font-size"], "10000px");
+    assert_eq!(styles[element(&doc, "#b")]["font-size"], "10000px");
+}
+
+#[test]
+fn passes_drop_unused_scopes_and_report_interaction_states() {
+    let mut doc = Document::parse("<style></style><div class=a></div>");
+    let sheet = element(&doc, "style");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (source, states) in [
+        (".a:hover{color:red}", crate::dom::HOVER),
+        (
+            ".a{color:blue} .b:active{&>i{color:red}}",
+            crate::dom::ACTIVE,
+        ),
+        (".a{color:green}", 0),
+    ] {
+        doc.nodes[sheet].text = source.into();
+        compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        cache.finish();
+        assert_eq!(cache.scopes.len(), 1);
+        assert!(
+            cache
+                .values
+                .keys()
+                .all(|key| key.scope == cache.scopes[0].id)
+        );
+        assert_eq!(cache.states & !crate::dom::FOCUS, states, "{source}");
+    }
+}
+
+#[test]
+fn collapsed_table_borders_straddle_grid_lines() {
+    let doc = Document::parse(
+        "<style>table { border-collapse: collapse } td { border: 2px solid } .own { border: 6px solid }</style>
+        <table id=cells><tr><td>a</td><td>b</td></tr></table>
+        <table id=own class=own style='margin: 10px'><tr><td>a</td></tr></table>
+        <table id=separate style='border-collapse: separate; border-spacing: 3px'><tr><td>a</td></tr></table>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let edges = |selector, name| {
+        edges(
+            &computed[element(&doc, selector)],
+            name,
+            0.,
+            16.,
+            800.,
+            600.,
+        )
+    };
+    assert_eq!(edges("#cells td", "margin"), [-1.; 4]);
+    assert_eq!(edges("#cells", "padding"), [1.; 4]);
+    assert_eq!(computed[element(&doc, "#cells")]["border-top-width"], "0");
+    assert_eq!(edges("#own", "margin"), [7.; 4]);
+    assert_eq!(edges("#own", "padding"), [0.; 4]);
+    assert_eq!(edges("#separate", "padding"), [3.; 4]);
 }

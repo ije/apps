@@ -58,6 +58,8 @@ extern napi_status napi_set_instance_data(napi_env, void *, napi_finalize, void 
 extern napi_status napi_get_instance_data(napi_env, void **);
 extern napi_status napi_get_dataview_info(napi_env, napi_value, size_t *, void **, napi_value *, size_t *);
 extern napi_status napi_get_value_int64(napi_env, napi_value, int64_t *);
+extern napi_status napi_get_global(napi_env, napi_value *);
+extern napi_status napi_create_external_buffer(napi_env, size_t, void *, napi_finalize, void *, napi_value *);
 
 #define OK(call) do { if ((call) != 0) { napi_throw_type_error(env, "ERR_FIXTURE", #call); return NULL; } } while (0)
 
@@ -237,6 +239,32 @@ static napi_value garbage(napi_env env, napi_callback_info info) {
 static napi_value finalizer_count(napi_env env, napi_callback_info info) {
   (void)info; napi_value result; OK(napi_create_double(env, finalized, &result)); return result;
 }
+static unsigned external_finalized = 0;
+static void external_release(napi_env env, void *data, void *hint) {
+  (void)env; (void)hint; free(data); external_finalized++;
+}
+static napi_value external_buffer(napi_env env, napi_callback_info info) {
+  (void)info; napi_value result; char *data = malloc(4); memcpy(data, "napi", 4);
+  OK(napi_create_external_buffer(env, 4, data, external_release, NULL, &result)); return result;
+}
+static napi_value external_count(napi_env env, napi_callback_info info) {
+  (void)info; napi_value result; OK(napi_create_double(env, external_finalized, &result)); return result;
+}
+static napi_ref loader = NULL;
+static napi_value set_loader(napi_env env, napi_callback_info info) {
+  napi_value fn; size_t count = 1;
+  OK(napi_get_cb_info(env, info, &count, &fn, NULL, NULL));
+  OK(napi_create_reference(env, fn, 1, &loader)); return NULL;
+}
+static void call_loader(napi_env env, void *data, void *hint) {
+  (void)data; (void)hint; napi_value fn, global;
+  if (napi_get_reference_value(env, loader, &fn) == 0 && napi_get_global(env, &global) == 0) napi_call_function(env, global, fn, 0, NULL, NULL);
+}
+static napi_value loading(napi_env env, napi_callback_info info) {
+  (void)info; napi_value object;
+  OK(napi_create_object(env, &object));
+  OK(napi_add_finalizer(env, object, NULL, call_loader, NULL, NULL)); return object;
+}
 static napi_value date_status(napi_env env, napi_callback_info info) {
   napi_value value, result; size_t count=1; double date;
   OK(napi_get_cb_info(env, info, &count, &value, NULL, NULL));
@@ -250,6 +278,10 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_property_descriptor methods[] = {
     {"garbage", NULL, garbage, NULL, NULL, NULL, 7, NULL},
     {"finalizerCount", NULL, finalizer_count, NULL, NULL, NULL, 7, NULL},
+    {"externalBuffer", NULL, external_buffer, NULL, NULL, NULL, 7, NULL},
+    {"externalCount", NULL, external_count, NULL, NULL, NULL, 7, NULL},
+    {"setLoader", NULL, set_loader, NULL, NULL, NULL, 7, NULL},
+    {"loading", NULL, loading, NULL, NULL, NULL, 7, NULL},
     {"dateStatus", NULL, date_status, NULL, NULL, NULL, 7, NULL},
     {"add", NULL, add, NULL, NULL, NULL, 7, (void *)1},
     {"text", NULL, text, NULL, NULL, NULL, 7, NULL},

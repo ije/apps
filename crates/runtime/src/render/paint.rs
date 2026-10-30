@@ -1,6 +1,5 @@
-use super::WebView;
 use crate::style;
-use gpui::{AnyElement, App, Bounds, Pixels, Point, Window, point, prelude::*, px};
+use render::{AnyElement, Bounds, Pixels, Point, Window, point, prelude::*, px};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 /// A box turned a quarter turn for vertical writing modes.
@@ -34,65 +33,47 @@ impl IntoElement for Turned {
     }
 }
 
-impl gpui::Element for Turned {
+impl render::Element for Turned {
     type RequestLayoutState = ();
     type PrepaintState = super::effects::Matrix;
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-    fn request_layout(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, ()) {
-        let child = self.child.request_layout(window, cx);
-        let mut style = gpui::Style {
-            position: gpui::Position::Absolute,
+    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
+        let child = self.child.request_layout(window);
+        let mut style = render::Style {
+            position: render::Position::Absolute,
             ..Default::default()
         };
         style.size.width = px(self.block).into();
         style.size.height = px(self.inline).into();
-        (window.request_layout(style, [child], cx), ())
+        (window.request_layout(&style, [child]), ())
     }
     fn prepaint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
         window: &mut Window,
-        cx: &mut App,
     ) -> super::effects::Matrix {
         let matrix = self.matrix(bounds.origin);
-        window.with_hit_transform(matrix, |window| self.child.prepaint(window, cx));
+        window.with_hit_transform(matrix, |window| self.child.prepaint(window));
         matrix
     }
     fn paint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut (),
         matrix: &mut super::effects::Matrix,
         window: &mut Window,
-        cx: &mut App,
     ) {
-        let effect = gpui::PaintEffect {
+        let effect = render::PaintEffect {
             transform: Some(*matrix),
             ..Default::default()
         };
-        window.paint_effect(effect, |window| self.child.paint(window, cx));
+        window.paint_effect(effect, |window| self.child.paint(window));
     }
 }
 
 /// Paints a child through an effect layer.
 pub(super) struct Effected {
-    pub(super) effect: gpui::PaintEffect,
+    pub(super) effect: render::PaintEffect,
     pub(super) child: AnyElement,
 }
 
@@ -103,55 +84,28 @@ impl IntoElement for Effected {
     }
 }
 
-impl gpui::Element for Effected {
+impl render::Element for Effected {
     type RequestLayoutState = ();
     type PrepaintState = ();
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
+    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
+        (self.child.request_layout(window), ())
     }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
+    fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), window: &mut Window) {
+        self.child.prepaint(window);
     }
-    fn request_layout(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, ()) {
-        (self.child.request_layout(window, cx), ())
-    }
-    fn prepaint(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.child.prepaint(window, cx);
-    }
-    fn paint(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.paint_effect(self.effect.clone(), |window| self.child.paint(window, cx));
+    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
+        window.paint_effect(self.effect.clone(), |window| self.child.paint(window));
     }
 }
 
 pub(super) struct DomBox {
-    pub(super) inner: Option<gpui::Stateful<gpui::Div>>,
+    pub(super) inner: Option<render::Div>,
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
-    pub(super) view: gpui::Entity<WebView>,
-    pub(super) sticky: Option<(gpui::ScrollHandle, [f32; 4])>,
+    pub(super) ids: Rc<super::effects::Ids>,
+    pub(super) view: Rc<super::ViewData>,
+    /// The scroll container, its borders, and the containing block of a sticky box.
+    pub(super) sticky: Option<(render::ScrollHandle, [f32; 4], Option<usize>)>,
     pub(super) fixed: bool,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
@@ -160,6 +114,14 @@ pub(super) struct DomBox {
     /// The parent's perspective, and the parent.
     pub(super) perspective: Option<((f32, String), usize)>,
     pub(super) units: style::Lengths,
+    /// The subtree revision to record with the bounds.
+    pub(super) revision: u64,
+    /// The horizontal padding and borders.
+    pub(super) sides: f32,
+    /// The margins after collapsing.
+    pub(super) margin: [f32; 4],
+    /// The size of the grid cell the box fills, before layout snaps it to pixels.
+    pub(super) cell: Option<[f32; 2]>,
 }
 
 impl IntoElement for DomBox {
@@ -169,38 +131,23 @@ impl IntoElement for DomBox {
     }
 }
 
-impl gpui::Element for DomBox {
+impl render::Element for DomBox {
     type RequestLayoutState = AnyElement;
     type PrepaintState = (Bounds<Pixels>, Option<super::effects::Matrix>);
-    fn id(&self) -> Option<gpui::ElementId> {
-        Some(gpui::ElementId::Name(format!("dom-{}", self.id).into()))
-    }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-    fn request_layout(
-        &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, AnyElement) {
+    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, AnyElement) {
         let mut inner = self.inner.take().unwrap().into_any_element();
-        (inner.request_layout(window, cx), inner)
+        (inner.request_layout(window), inner)
     }
     fn prepaint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         mut bounds: Bounds<Pixels>,
         inner: &mut AnyElement,
         window: &mut Window,
-        cx: &mut App,
     ) -> Self::PrepaintState {
         let mut offset = point(px(0.), px(0.));
         if let Some((axes, block, margin)) = self.anchor
             && let Some(anchor) = {
-                let view = self.view.read(cx);
+                let view = &*self.view;
                 let host = view.host.borrow();
                 host.dom
                     .get(&view.id)
@@ -216,7 +163,7 @@ impl gpui::Element for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some((scroll, border)) = &self.sticky {
+        if let Some((scroll, border, parent)) = &self.sticky {
             let mut viewport = scroll.bounds();
             viewport.origin += point(px(border[3]), px(border[0]));
             viewport.size.width -= px(border[1] + border[3]);
@@ -234,6 +181,21 @@ impl gpui::Element for DomBox {
                 offset.y = offset
                     .y
                     .min(viewport.bottom() - px(bottom) - bounds.bottom());
+            }
+            // A sticky box never leaves its containing block, which was laid out first.
+            if let Some([x, y, width, height]) = parent.and_then(|parent| {
+                let view = &*self.view;
+                let host = view.host.borrow();
+                host.dom.get(&view.id)?.bounds.get(&parent).copied()
+            }) {
+                offset.x = offset
+                    .x
+                    .min(px(x + width) - bounds.right())
+                    .max(px(x) - bounds.left());
+                offset.y = offset
+                    .y
+                    .min(px(y + height) - bounds.bottom())
+                    .max(px(y) - bounds.top());
             }
             bounds.origin += offset;
         }
@@ -255,7 +217,7 @@ impl gpui::Element for DomBox {
             .perspective
             .as_ref()
             .and_then(|((distance, origin), parent)| {
-                let view = self.view.read(cx);
+                let view = &*self.view;
                 let host = view.host.borrow();
                 let [x, y, width, height] = *host.dom.get(&view.id)?.bounds.get(parent)?;
                 let [ox, oy, _] = super::effects::origin(origin, &self.units, [width, height]);
@@ -271,14 +233,23 @@ impl gpui::Element for DomBox {
         }
         let mut prepaint = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
-            let view = self.view.read(cx);
-            view.host
-                .borrow_mut()
-                .dom
-                .entry(view.id)
-                .or_default()
-                .bounds
-                .insert(
+            let view = &*self.view;
+            {
+                let mut host = view.host.borrow_mut();
+                let dom = host.dom.entry(view.id).or_default();
+                if let Some(axes) = dom.flexed_grids.get(&self.id)
+                    && axes
+                        .iter()
+                        .zip([window_bounds.size.width, window_bounds.size.height])
+                        .any(|(axis, size)| {
+                            axis.is_some_and(|(used, extent)| {
+                                !((f32::from(size) - extent - used).abs() <= 0.5)
+                            })
+                        })
+                {
+                    window.refresh();
+                }
+                dom.bounds.insert(
                     self.id,
                     [
                         window_bounds.origin.x.into(),
@@ -287,7 +258,23 @@ impl gpui::Element for DomBox {
                         window_bounds.size.height.into(),
                     ],
                 );
-            if let Some((browser, _)) = view.browsers.get(&self.id) {
+                let cull = &mut dom.cull;
+                let width = f32::from(bounds.size.width);
+                if cull.placed.len() <= self.id {
+                    cull.placed.resize(self.id + 1, Default::default());
+                }
+                let [top, right, bottom, left] = self.margin;
+                cull.placed[self.id] = (
+                    self.revision,
+                    self.cell.unwrap_or([
+                        (width + right + left).max(0.),
+                        f32::from(bounds.size.height) + top + bottom,
+                    ]),
+                    self.margin,
+                );
+                cull.widths.insert(self.id, width - self.sides);
+            }
+            if let Some((browser, _)) = view.browsers.borrow().get(&self.id) {
                 let _ = browser.set_bounds([
                     f32::from(window_bounds.origin.x) as f64,
                     f32::from(window_bounds.origin.y) as f64,
@@ -296,7 +283,7 @@ impl gpui::Element for DomBox {
                 ]);
             }
             window.with_element_offset(offset, |window| {
-                inner.prepaint(window, cx);
+                inner.prepaint(window);
             });
         };
         match matrix {
@@ -307,16 +294,13 @@ impl gpui::Element for DomBox {
     }
     fn paint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         inner: &mut AnyElement,
         (bounds, matrix): &mut Self::PrepaintState,
         window: &mut Window,
-        cx: &mut App,
     ) {
         if matrix.is_none() && self.effects.is_none() {
-            return inner.paint(window, cx);
+            return inner.paint(window);
         }
         let bounds = *bounds;
         if let Some(matrix) = matrix
@@ -328,10 +312,10 @@ impl gpui::Element for DomBox {
         {
             return;
         }
-        let (clip, mut layers) = self.effects(bounds, *matrix, window, cx);
+        let (clip, mut layers) = self.effects(bounds, *matrix, window);
         let mut paint = |window: &mut Window| match &clip {
-            Some(clip) => window.with_content_mask(Some(*clip), |window| inner.paint(window, cx)),
-            None => inner.paint(window, cx),
+            Some(clip) => window.with_content_mask(Some(*clip), |window| inner.paint(window)),
+            None => inner.paint(window),
         };
         nest_effects(&mut layers, window, &mut paint);
     }
@@ -344,8 +328,10 @@ impl DomBox {
         bounds: Bounds<Pixels>,
         transform: Option<super::effects::Matrix>,
         window: &mut Window,
-        cx: &mut App,
-    ) -> (Option<gpui::ContentMask<Pixels>>, Vec<gpui::PaintEffect>) {
+    ) -> (
+        Option<render::ContentMask<Pixels>>,
+        Vec<render::PaintEffect>,
+    ) {
         use super::effects::{self, Clip};
         let style = &self.style;
         let units = self.units;
@@ -356,22 +342,24 @@ impl DomBox {
                 .filter(|value| !matches!(value.as_str(), "none" | "normal" | "auto"))
         };
         let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-        let view = self.view.read(cx);
+        let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let empty = crate::dom::Document::default();
         let host = &mut *host;
         let doc = host.pages.get(&view.id).map_or(&empty, |page| &page.doc);
         let mut layers = value("filter")
-            .map(|value| effects::filters(value, &units, doc))
+            .map(|value| effects::filters(value, &units, doc, &self.ids))
             .unwrap_or_default();
         let mut clip = None;
         let mut shapes = None;
-        match value("clip-path").and_then(|value| effects::clip(value, &units, size, doc)) {
+        match value("clip-path")
+            .and_then(|value| effects::clip(value, &units, size, doc, &self.ids))
+        {
             Some(Clip::Rounded(rect, radii)) => {
-                clip = Some(gpui::ContentMask::rounded(
+                clip = Some(render::ContentMask::rounded(
                     Bounds::new(
                         bounds.origin + point(px(rect[0]), px(rect[1])),
-                        gpui::size(px(rect[2]), px(rect[3])),
+                        render::size(px(rect[2]), px(rect[3])),
                     ),
                     effects::corners(radii),
                 ))
@@ -400,13 +388,13 @@ impl DomBox {
             let masks = &mut host.dom.entry(view.id).or_default().masks;
             if masks.get(&self.id).is_none_or(|(old, image)| {
                 *old != source
-                    || u32::from(image.size(0).width) != raster[0]
-                    || u32::from(image.size(0).height) != raster[1]
+                    || u32::from(image.size().width) != raster[0]
+                    || u32::from(image.size().height) != raster[1]
             }) {
                 match super::canvas::svg(&source, raster[0], raster[1], None) {
                     Ok(image) => {
                         if let Some((_, old)) = masks.insert(self.id, (source, image)) {
-                            let _ = window.drop_image(old);
+                            window.drop_image(old);
                         }
                     }
                     Err(error) => eprintln!("apps: mask: {error}"),
@@ -433,17 +421,18 @@ impl DomBox {
         };
         let backdrop = value("backdrop-filter")
             .and_then(|value| effects::backdrop(value, &units))
-            .map(|(blur, color_matrix)| gpui::Backdrop {
+            .map(|(blur, color_matrix)| render::Backdrop {
                 bounds,
                 corner_radii: radii(),
                 blur,
                 color_matrix,
             });
-        let outer = gpui::PaintEffect {
+        let outer = render::PaintEffect {
             transform,
             opacity: self.effects.unwrap_or(1.),
-            blend_mode: value("mix-blend-mode")
-                .map_or(gpui::BlendMode::Normal, |value| effects::blend_mode(value)),
+            blend_mode: value("mix-blend-mode").map_or(render::BlendMode::Normal, |value| {
+                effects::blend_mode(value)
+            }),
             mask: mask.flatten(),
             backdrop,
             ..Default::default()
@@ -453,7 +442,7 @@ impl DomBox {
             .is_some_and(|value| value == "isolate");
         let needed = outer.transform.is_some()
             || outer.opacity < 1.
-            || outer.blend_mode != gpui::BlendMode::Normal
+            || outer.blend_mode != render::BlendMode::Normal
             || outer.mask.is_some()
             || outer.backdrop.is_some()
             || isolate;
@@ -461,7 +450,7 @@ impl DomBox {
             // One filter function and no clip can share the outer layer.
             if layers.len() == 1 && clip.is_none() {
                 let filter = layers.pop().unwrap();
-                layers.push(gpui::PaintEffect {
+                layers.push(render::PaintEffect {
                     color_matrix: filter.color_matrix,
                     blur: filter.blur,
                     shadow: filter.shadow,
@@ -477,7 +466,7 @@ impl DomBox {
 
 /// Paints through the effect layers, the last one outermost.
 fn nest_effects(
-    layers: &mut Vec<gpui::PaintEffect>,
+    layers: &mut Vec<render::PaintEffect>,
     window: &mut Window,
     paint: &mut dyn FnMut(&mut Window),
 ) {
@@ -589,7 +578,7 @@ pub(super) type PaintLayers = Rc<
         Vec<(
             i32,
             Rc<RefCell<AnyElement>>,
-            gpui::ContentMask<Pixels>,
+            render::ContentMask<Pixels>,
             Rc<[usize]>,
         )>,
     >,
@@ -609,36 +598,24 @@ impl IntoElement for Stacked {
     }
 }
 
-impl gpui::Element for Stacked {
+impl render::Element for Stacked {
     type RequestLayoutState = Rc<RefCell<AnyElement>>;
     type PrepaintState = ();
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
     fn request_layout(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+    ) -> (render::LayoutId, Self::RequestLayoutState) {
         let mut inner = self.inner.take().unwrap();
-        let id = inner.request_layout(window, cx);
+        let id = inner.request_layout(window);
         (id, Rc::new(RefCell::new(inner)))
     }
     fn prepaint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         inner: &mut Self::RequestLayoutState,
         window: &mut Window,
-        cx: &mut App,
     ) {
-        inner.borrow_mut().prepaint(window, cx);
+        inner.borrow_mut().prepaint(window);
         self.layers.borrow_mut().push((
             self.order,
             inner.clone(),
@@ -648,42 +625,23 @@ impl gpui::Element for Stacked {
     }
     fn paint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut (),
         _: &mut Window,
-        _: &mut App,
     ) {
     }
 }
 
-/// Re-enters the element id scopes between a stacking root and a stacked element, so paint sees the prepaint ids.
-fn with_path(path: &[usize], window: &mut Window, paint: &mut dyn FnMut(&mut Window)) {
-    match path.split_first() {
-        Some((&id, rest)) => window.with_element_namespace(
-            gpui::ElementId::Name(format!("dom-{id}").into()),
-            |window| window.with_element_namespace(id, |window| with_path(rest, window, paint)),
-        ),
-        None => paint(window),
-    }
-}
-
 pub(super) fn paint_layers(layers: PaintLayers, negative: bool) -> impl IntoElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |_, _, window, cx| {
+    render::canvas(
+        |_, _| (),
+        move |_, _, window| {
             let mut layers = layers.borrow_mut();
             layers.sort_by_key(|(order, ..)| *order);
-            for (_, inner, mask, path) in
-                layers.iter().filter(|(order, ..)| (*order < 0) == negative)
+            for (_, inner, mask, _) in layers.iter().filter(|(order, ..)| (*order < 0) == negative)
             {
-                window.with_content_mask(Some(*mask), |window| {
-                    with_path(path, window, &mut |window| {
-                        inner.borrow_mut().paint(window, cx)
-                    })
-                });
+                window.with_content_mask(Some(*mask), |window| inner.borrow_mut().paint(window));
             }
         },
     )

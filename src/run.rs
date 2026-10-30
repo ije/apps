@@ -19,7 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<i32> {
+pub fn run(
+    entry: &Path,
+    runtime: &Path,
+    watch: bool,
+    devtools: bool,
+    mcp: Option<u16>,
+) -> Result<i32> {
     let root = entry.parent().context("Missing project directory")?;
     let public = root.join("public");
     let runtime = runtime.canonicalize().context(
@@ -27,17 +33,32 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
     )?;
     let library = apps_runtime::jsc::library_path(&runtime, std::env::consts::OS)?;
     let mut files = Rc::new(RefCell::new(BTreeSet::new()));
+    let cache = watch.then(Rc::<bundler::Cache>::default);
     let started = Instant::now();
-    let bundle = bundler::compile(entry, bundler::Realm::Main, None, files.clone(), false)?;
-    let validator = Engine::new(Api::load()?, Rc::default(), Role::Main)?;
-    validator.validate(&bundle)?;
-    let validator = watch.then_some(validator);
-    println!(
-        "apps: compiled {} bytes in {} ms",
-        bundle.values().map(String::len).sum::<usize>(),
-        started.elapsed().as_millis()
-    );
-    let mut bundle = Some(bundle);
+    let mut bundle = match bundler::compile(
+        entry,
+        bundler::Realm::Main,
+        None,
+        files.clone(),
+        false,
+        cache.clone(),
+    ) {
+        Ok(bundle) => {
+            println!(
+                "apps: compiled {} bytes in {} ms",
+                bundle.values().map(String::len).sum::<usize>(),
+                started.elapsed().as_millis()
+            );
+            Some(bundle)
+        }
+        Err(error) if watch => {
+            eprintln!("apps: {error:#}");
+            println!("apps: waiting for changes");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let mut validator = None;
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
@@ -54,8 +75,8 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
     let mut writer = None;
     let result = (|| -> Result<i32> {
         let mut fresh = true;
-        let mut launch = true;
-        let mut failed = false;
+        let mut launch = bundle.is_some();
+        let mut failed = bundle.is_none();
         let mut changed = None;
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -101,6 +122,7 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
                     Command::new(&runtime)
                         .arg("--bundle-stdin")
                         .args(devtools.then_some("--devtools"))
+                        .args(mcp.map(|port| format!("--devtools-mcp={port}")))
                         .env("APPS_JSC_LIBRARY", &library)
                         .current_dir(root)
                         .stdin(Stdio::piped())
@@ -152,6 +174,21 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(event)) if !matches!(event.kind, notify::EventKind::Access(_)) => {
+                    // WARNING: created, removed or renamed files and package.json edits can change how imports resolve.
+                    if let Some(cache) = &cache
+                        && (!matches!(
+                            event.kind,
+                            notify::EventKind::Modify(
+                                notify::event::ModifyKind::Data(_)
+                                    | notify::event::ModifyKind::Metadata(_)
+                            )
+                        ) || event
+                            .paths
+                            .iter()
+                            .any(|path| path.ends_with("package.json")))
+                    {
+                        cache.resolutions.borrow_mut().clear();
+                    }
                     for path in &event.paths {
                         if !path.exists() {
                             watched.retain(|directory| !directory.starts_with(path));
@@ -178,14 +215,19 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
                 changed = None;
                 fresh = true;
                 let next_files = Rc::default();
+                let rebuild = Instant::now();
                 let rebuilt = bundler::compile(
                     entry,
                     bundler::Realm::Main,
                     None,
                     Rc::clone(&next_files),
                     false,
+                    cache.clone(),
                 )
                 .and_then(|bundle| {
+                    if validator.is_none() {
+                        validator = Some(Engine::new(Api::load()?, Rc::default(), Role::Main)?);
+                    }
                     validator.as_ref().unwrap().validate(&bundle)?;
                     Ok(bundle)
                 });
@@ -202,7 +244,7 @@ pub fn run(entry: &Path, runtime: &Path, watch: bool, devtools: bool) -> Result<
                         bundle = Some(next_bundle);
                         failed = false;
                         launch = true;
-                        println!("apps: restarted");
+                        println!("apps: restarted in {} ms", rebuild.elapsed().as_millis());
                     }
                     Err(error) => {
                         files

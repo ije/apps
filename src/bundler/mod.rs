@@ -1,26 +1,26 @@
 use anyhow::{Context, Result, bail, ensure};
 use apps_runtime::{bundle_source, dom::Document};
 use bbtree::unsync::BBTreeMap;
-use oxc_allocator::{Allocator, ArenaVec};
+use oxc_allocator::{Allocator, ArenaVec, TakeIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
-use oxc_ast_visit::{VisitMut, walk_mut};
+use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
 use oxc_minifier::{Minifier, MinifierOptions};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_transformer::{TransformOptions, Transformer};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::Write,
     fs,
     path::{Path, PathBuf},
     rc::Rc,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Realm {
     Main,
     Preload,
@@ -31,12 +31,47 @@ struct Builder {
     realm: Realm,
     production: bool,
     modules: Vec<Value>,
+    lines: Vec<Option<Rc<str>>>,
     ids: BBTreeMap<PathBuf, usize>,
-    dependencies: BTreeSet<usize>,
+    graph: Graph,
+    requests: Vec<(PathBuf, String, bool, usize)>,
+    inlined: usize,
     package_roots: BTreeSet<PathBuf>,
     dynamic: BTreeSet<usize>,
     assets: BBTreeMap<PathBuf, (String, String)>,
     files: Rc<RefCell<BTreeSet<PathBuf>>>,
+    shared: Rc<Shared>,
+}
+
+#[derive(Default)]
+struct Shared {
+    root: PathBuf,
+    manifests: RefCell<BBTreeMap<PathBuf, Rc<Value>>>,
+    workers: RefCell<BBTreeMap<(PathBuf, Realm), usize>>,
+    scripts: RefCell<Vec<String>>,
+    cache: Option<Rc<Cache>>,
+}
+
+// WARNING: cached modules contain `$appsImport(N)` and `$appsN<id>`, so a graph never reuses or changes module ids.
+#[derive(Default)]
+pub struct Cache {
+    graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
+    pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
+}
+
+type Resolved = (PathBuf, Option<PathBuf>, Option<PathBuf>);
+type Entry = (PathBuf, Option<String>);
+
+#[derive(Default)]
+struct Graph {
+    ids: HashMap<PathBuf, usize>,
+    modules: HashMap<usize, Cached>,
+}
+
+struct Cached {
+    stamp: (std::time::SystemTime, u64),
+    line: Rc<str>,
+    requests: Vec<(PathBuf, String, bool, usize)>,
 }
 
 struct Linker<'a, 'b> {
@@ -46,7 +81,192 @@ struct Linker<'a, 'b> {
     scoping: &'b oxc_semantic::Scoping,
     path: &'b Path,
     commonjs: bool,
+    cacheable: bool,
+    imported: Vec<usize>,
+    required: Vec<usize>,
     error: Option<anyhow::Error>,
+}
+
+/// `$appsN<module>.<name>`: how linked module code reads an import, so it needs no `with` scope.
+fn namespace_access(dep: usize, name: &str) -> String {
+    let identifier = name.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '$')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    match name {
+        "*" => format!("$appsN{dep}"),
+        _ if identifier => format!("$appsN{dep}.{name}"),
+        _ => format!("$appsN{dep}[{}]", json!(name)),
+    }
+}
+
+/// Rewrites references to import bindings into namespace reads. Namespace getters keep them live.
+struct Imports<'a, 'b> {
+    ast: AstBuilder<'a>,
+    allocator: &'a Allocator,
+    scoping: &'b oxc_semantic::Scoping,
+    bindings: &'b HashMap<oxc_semantic::SymbolId, (usize, String)>,
+}
+
+impl<'a> Imports<'a, '_> {
+    fn binding(&self, ident: &IdentifierReference<'a>) -> Option<&(usize, String)> {
+        let reference = ident.reference_id.get()?;
+        self.bindings
+            .get(&self.scoping.get_reference(reference).symbol_id()?)
+    }
+
+    fn access(&self, span: Span, (dep, name): &(usize, String)) -> Expression<'a> {
+        let namespace = Expression::new_identifier(
+            span,
+            self.allocator.alloc_str(&format!("$appsN{dep}")),
+            &self.ast,
+        );
+        if name == "*" {
+            return namespace;
+        }
+        let property = self.allocator.alloc_str(name);
+        if namespace_access(*dep, name).contains('[') {
+            Expression::new_computed_member_expression(
+                span,
+                namespace,
+                Expression::new_string_literal(span, property, None, &self.ast),
+                false,
+                &self.ast,
+            )
+        } else {
+            Expression::new_static_member_expression(
+                span,
+                namespace,
+                IdentifierName::new(span, property, &self.ast),
+                false,
+                &self.ast,
+            )
+        }
+    }
+
+    /// `(0, ns.f)` keeps `this` undefined when an imported function is called.
+    fn callee(&self, expression: &mut Expression<'a>) {
+        if let Expression::Identifier(ident) = expression
+            && let Some(binding) = self.binding(ident).filter(|(_, name)| name != "*").cloned()
+        {
+            let span = ident.span;
+            let zero =
+                Expression::new_numeric_literal(span, 0., None, NumberBase::Decimal, &self.ast);
+            *expression = Expression::new_sequence_expression(
+                span,
+                ArenaVec::from_array_in([zero, self.access(span, &binding)], &self.ast),
+                &self.ast,
+            );
+        }
+    }
+}
+
+impl<'a> VisitMut<'a> for Imports<'a, '_> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        if let Expression::Identifier(ident) = expression
+            && let Some(binding) = self.binding(ident).cloned()
+        {
+            *expression = self.access(ident.span, &binding);
+            return;
+        }
+        walk_mut::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &mut CallExpression<'a>) {
+        self.callee(&mut call.callee);
+        walk_mut::walk_call_expression(self, call);
+    }
+
+    fn visit_tagged_template_expression(&mut self, tagged: &mut TaggedTemplateExpression<'a>) {
+        self.callee(&mut tagged.tag);
+        walk_mut::walk_tagged_template_expression(self, tagged);
+    }
+
+    fn visit_object_property(&mut self, property: &mut ObjectProperty<'a>) {
+        if let Expression::Identifier(ident) = &property.value
+            && self.binding(ident).is_some()
+        {
+            property.shorthand = false;
+        }
+        walk_mut::walk_object_property(self, property);
+    }
+}
+
+/// Finds top-level `await` and `for await`.
+struct TopLevelAwait(bool, bool);
+
+impl<'a> Visit<'a> for TopLevelAwait {
+    fn visit_function(&mut self, _: &Function<'a>, _: oxc_semantic::ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+    fn visit_await_expression(&mut self, expression: &AwaitExpression<'a>) {
+        self.0 = true;
+        walk::walk_await_expression(self, expression);
+    }
+    fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
+        self.1 |= statement.r#await;
+        walk::walk_for_of_statement(self, statement);
+    }
+}
+
+// WARNING: top-level `await` becomes `yield`, and the loader resumes the generator with the awaited value.
+// The body then runs synchronously until its first `await`, like an ES module, so later page scripts run after it.
+struct Awaits<'a>(AstBuilder<'a>);
+
+impl<'a> VisitMut<'a> for Awaits<'a> {
+    fn visit_function(&mut self, _: &mut Function<'a>, _: oxc_semantic::ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &mut ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &mut Class<'a>) {}
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        if let Expression::AwaitExpression(node) = expression {
+            let argument = node.argument.take_in(&self.0);
+            *expression =
+                Expression::new_yield_expression(node.span, false, Some(argument), &self.0);
+        }
+        walk_mut::walk_expression(self, expression);
+    }
+}
+
+/// Collects `$appsN<module>.<name>` reads; `None` means the whole namespace is used.
+struct Uses(Vec<(usize, Option<String>)>);
+
+impl<'a> Visit<'a> for Uses {
+    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
+        if let Expression::Identifier(object) = &member.object
+            && let Some(dep) = object
+                .name
+                .strip_prefix("$appsN")
+                .and_then(|id| id.parse().ok())
+        {
+            self.0.push((dep, Some(member.property.name.to_string())));
+        } else {
+            walk::walk_static_member_expression(self, member);
+        }
+    }
+
+    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if let (Expression::Identifier(object), Expression::StringLiteral(key)) =
+            (&member.object, &member.expression)
+            && let Some(dep) = object
+                .name
+                .strip_prefix("$appsN")
+                .and_then(|id| id.parse().ok())
+        {
+            self.0.push((dep, key.value.as_str().map(str::to_owned)));
+        } else {
+            walk::walk_computed_member_expression(self, member);
+        }
+    }
+
+    fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+        if let Some(dep) = ident
+            .name
+            .strip_prefix("$appsN")
+            .and_then(|id| id.parse().ok())
+        {
+            self.0.push((dep, None));
+        }
+    }
 }
 
 impl<'a> VisitMut<'a> for Linker<'a, '_> {
@@ -75,36 +295,63 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     specifier.starts_with('.'),
                     "Worker URL must be a relative path"
                 );
-                let target =
-                    resolve_file(&self.path.parent().unwrap_or(Path::new(".")).join(specifier))?;
-                ensure!(
-                    target != self.path,
-                    "A worker cannot bundle its own entry recursively"
-                );
-                let worker_files = compile(
-                    &target,
+                let key = (
+                    resolve_file(&self.path.parent().unwrap_or(Path::new(".")).join(specifier))?,
                     if self.builder.realm == Realm::Renderer {
                         Realm::Renderer
                     } else {
                         Realm::Main
                     },
-                    None,
-                    self.builder.files.clone(),
-                    self.builder.production,
-                )?;
-                let code = script(&worker_files, self.builder.production)?;
-                let mut value = String::with_capacity(code.len() + 32);
-                value.push_str("data:application/javascript,");
-                for character in code.chars() {
-                    if matches!(character, '%' | '#' | '\x7f') || character < ' ' {
-                        let _ = write!(value, "%{:02X}", character as u8);
-                    } else {
-                        value.push(character);
+                );
+                self.cacheable = false;
+                let shared = self.builder.shared.clone();
+                let existing = shared.workers.borrow().get(&key).copied();
+                let index = match existing {
+                    Some(index) => index,
+                    None => {
+                        let index = shared.scripts.borrow().len();
+                        shared.scripts.borrow_mut().push(String::new());
+                        shared.workers.borrow_mut().insert(key.clone(), index);
+                        let files = bundle(
+                            vec![(key.0, None)],
+                            key.1,
+                            self.builder.files.clone(),
+                            shared.clone(),
+                            self.builder.production,
+                        )?;
+                        shared.scripts.borrow_mut()[index] = bundle_source(&files, true);
+                        index
                     }
-                }
-                let value = self.allocator.alloc_str(&value);
+                };
+                let value = self
+                    .allocator
+                    .alloc_str(&format!("apps:///script-{index}.js"));
                 worker.arguments[0] =
                     Expression::new_string_literal(url.span, value, None, &self.ast).into();
+            }
+            if let Expression::NewExpression(url) = expression
+                && url.callee.is_specific_id("URL")
+                && let [
+                    Argument::StringLiteral(specifier),
+                    Argument::StaticMemberExpression(base),
+                ] = url.arguments.as_slice()
+                && base.property.name == "url"
+                && matches!(
+                    base.object.get_inner_expression(),
+                    Expression::ImportMeta(_)
+                )
+                && let Some(path) = specifier.value.as_str()
+                && path.starts_with('.')
+                && let Some(asset) = asset(
+                    self.path.parent().unwrap_or(Path::new(".")),
+                    path,
+                    &self.builder.files,
+                )
+            {
+                self.cacheable = false;
+                let value = self.allocator.alloc_str(&asset);
+                url.arguments[0] =
+                    Expression::new_string_literal(specifier.span, value, None, &self.ast).into();
             }
             if let Expression::StaticMemberExpression(member) = expression {
                 if member.property.name == "NODE_ENV"
@@ -136,10 +383,48 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     Expression::ImportMeta(_)
                 ) && member.property.name == "url"
                 {
-                    let url = url::Url::from_file_path(std::path::absolute(self.path)?).map_err(
-                        |_| anyhow::anyhow!("Cannot create a file URL for {}", self.path.display()),
-                    )?;
-                    let value = self.allocator.alloc_str(url.as_str());
+                    let url = if self.builder.production {
+                        let relative = self
+                            .path
+                            .strip_prefix(&self.builder.shared.root)
+                            .ok()
+                            .or_else(|| {
+                                self.path
+                                    .ancestors()
+                                    .find(|directory| directory.ends_with("node_modules"))
+                                    .and_then(Path::parent)
+                                    .and_then(|base| self.path.strip_prefix(base).ok())
+                            })
+                            .or_else(|| self.path.file_name().map(Path::new))
+                            .unwrap_or(Path::new(""));
+                        let mut url = String::from("apps:///");
+                        for &byte in relative.as_os_str().as_encoded_bytes() {
+                            match byte {
+                                b'a'..=b'z'
+                                | b'A'..=b'Z'
+                                | b'0'..=b'9'
+                                | b'-'
+                                | b'.'
+                                | b'_'
+                                | b'~' => url.push(byte as char),
+                                _ if byte == std::path::MAIN_SEPARATOR as u8 => url.push('/'),
+                                _ => {
+                                    let _ = write!(url, "%{byte:02X}");
+                                }
+                            }
+                        }
+                        url
+                    } else {
+                        url::Url::from_file_path(std::path::absolute(self.path)?)
+                            .map_err(|_| {
+                                anyhow::anyhow!(
+                                    "Cannot create a file URL for {}",
+                                    self.path.display()
+                                )
+                            })?
+                            .into()
+                    };
+                    let value = self.allocator.alloc_str(&url);
                     *expression = Expression::new_string_literal(span, value, None, &self.ast);
                     return Ok(());
                 }
@@ -185,11 +470,16 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 let target = target
                     .canonicalize()
                     .with_context(|| format!("Cannot resolve {}", target.display()))?;
+                self.cacheable = false;
                 if !self.builder.assets.contains_key(&target) {
                     self.builder.files.borrow_mut().insert(target.clone());
                     let name = format!("page-{}.html", self.builder.assets.len());
-                    let source =
-                        html(&target, self.builder.files.clone(), self.builder.production)?;
+                    let source = html(
+                        &target,
+                        self.builder.files.clone(),
+                        self.builder.shared.clone(),
+                        self.builder.production,
+                    )?;
                     self.builder.assets.insert(target.clone(), (name, source));
                 }
                 let value = self
@@ -249,12 +539,23 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 _ => None,
             };
             if let Some((name, specifier)) = import {
-                let dep = self.builder.resolve(
-                    self.path.parent().unwrap_or(Path::new(".")),
-                    specifier,
+                let base = self.path.parent().unwrap_or(Path::new("."));
+                let dep = self
+                    .builder
+                    .resolve(base, specifier, name == "$appsRequire")?;
+                self.builder.requests.push((
+                    base.to_owned(),
+                    specifier.to_owned(),
                     name == "$appsRequire",
-                )?;
+                    dep,
+                ));
                 self.builder.dynamic.insert(dep);
+                if name == "$appsRequire" {
+                    &mut self.required
+                } else {
+                    &mut self.imported
+                }
+                .push(dep);
                 *expression = Expression::new_call_expression(
                     span,
                     Expression::new_identifier(span, name, &self.ast),
@@ -1024,14 +1325,29 @@ impl Builder {
             !specifier.contains("://") && !specifier.starts_with("//"),
             "Only local ESM imports are supported: {specifier}"
         );
+        let cache = self.shared.cache.clone();
+        let resolution = (self.realm, base.to_owned(), specifier.to_owned(), require);
+        let cached = cache
+            .as_ref()
+            .and_then(|cache| cache.resolutions.borrow().get(&resolution).cloned());
+        if let Some((target, root, manifest)) = cached {
+            self.package_roots.extend(root);
+            self.files.borrow_mut().extend(manifest);
+            return self.visit(target, None);
+        }
         if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
             let path = base.join(specifier);
             let package = path
                 .components()
                 .any(|part| part.as_os_str() == "node_modules");
             let path = resolve_file(&path)?;
-            if package && let Some(parent) = path.parent() {
-                self.package_roots.insert(parent.to_owned());
+            let root = path.parent().filter(|_| package).map(Path::to_owned);
+            self.package_roots.extend(root.clone());
+            if let Some(cache) = cache {
+                cache
+                    .resolutions
+                    .borrow_mut()
+                    .insert(resolution, (path.clone(), root, None));
             }
             return self.visit(path, None);
         }
@@ -1067,12 +1383,27 @@ impl Builder {
             self.package_roots.insert(directory.clone());
         }
         let package_file = directory.join("package.json");
-        self.files.borrow_mut().insert(package_file.clone());
-        let metadata: Value = serde_json::from_str(
-            &fs::read_to_string(&package_file)
-                .with_context(|| format!("Cannot read {}", package_file.display()))?,
-        )
-        .with_context(|| format!("Invalid package metadata in {}", package_file.display()))?;
+        let cached = self.shared.manifests.borrow().get(&package_file).cloned();
+        let metadata = match cached {
+            Some(metadata) => metadata,
+            None => {
+                self.files.borrow_mut().insert(package_file.clone());
+                let metadata = Rc::new(
+                    serde_json::from_str::<Value>(
+                        &fs::read_to_string(&package_file)
+                            .with_context(|| format!("Cannot read {}", package_file.display()))?,
+                    )
+                    .with_context(|| {
+                        format!("Invalid package metadata in {}", package_file.display())
+                    })?,
+                );
+                self.shared
+                    .manifests
+                    .borrow_mut()
+                    .insert(package_file.clone(), metadata.clone());
+                metadata
+            }
+        };
         let entry = if let Some(exports) = metadata.get(if imports { "imports" } else { "exports" })
         {
             let mut replacement = None;
@@ -1163,21 +1494,41 @@ impl Builder {
             target.starts_with(&directory),
             "Package export escapes its directory"
         );
+        if let Some(cache) = cache {
+            cache.resolutions.borrow_mut().insert(
+                resolution,
+                (
+                    target.clone(),
+                    (!imports).then_some(directory),
+                    Some(package_file),
+                ),
+            );
+        }
         self.visit(target, None)
     }
 
     fn visit(&mut self, path: PathBuf, inline: Option<String>) -> Result<usize> {
-        if let Some(&id) = self.ids.get(&path) {
+        let inline_html = inline.is_some() && path.extension().is_some_and(|e| e == "html");
+        let key = if inline_html {
+            self.inlined += 1;
+            let mut key = path.clone().into_os_string();
+            key.push(format!("#{}", self.inlined));
+            PathBuf::from(key)
+        } else {
+            path.clone()
+        };
+        if let Some(&id) = self.ids.get(&key) {
             return Ok(id);
         }
-        let id = self.modules.len();
-        self.ids.insert(path.clone(), id);
-        self.modules.push(Value::Null);
+        let next = self.graph.ids.len();
+        let id = *self.graph.ids.entry(key.clone()).or_insert(next);
+        self.ids.insert(key, id);
+        if self.lines.len() <= id {
+            self.lines.resize(id + 1, None);
+            self.modules.resize(id + 1, Value::Null);
+        }
         let dependency = path.components().any(|p| p.as_os_str() == "node_modules")
             || self.package_roots.iter().any(|root| path.starts_with(root));
-        if dependency {
-            self.dependencies.insert(id);
-        }
         if inline.is_none()
             && path
                 .extension()
@@ -1189,10 +1540,39 @@ impl Builder {
             );
             self.files.borrow_mut().insert(path.clone());
             let name = native_specifier(&path)?;
-            self.modules[id] = json!({"id": id, "code": format!("module.exports=globalThis.__appsLoadAddon({});", serde_json::to_string(&name)?), "imports": [], "exports": [], "stars": [], "commonjs": true});
+            let module = json!({"id": id, "code": format!("module.exports=globalThis.__appsLoadAddon({});", serde_json::to_string(&name)?), "deps": [], "imports": [], "exports": [], "stars": [], "commonjs": true});
+            if self.production {
+                self.modules[id] = module;
+            } else {
+                self.lines[id] = Some(format!("$appsDefine({});\n", ascii_json(&module)?).into());
+            }
             return Ok(id);
         }
-        let inline_html = inline.is_some() && path.extension().is_some_and(|e| e == "html");
+        let stamp = (self.shared.cache.is_some() && inline.is_none())
+            .then(|| fs::metadata(&path).ok())
+            .flatten()
+            .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+        let cached = self
+            .graph
+            .modules
+            .get(&id)
+            .filter(|cached| Some(cached.stamp) == stamp)
+            .map(|cached| (cached.line.clone(), cached.requests.clone()));
+        if let Some((line, requests)) = cached {
+            self.files.borrow_mut().insert(path.clone());
+            let mut valid = true;
+            for (base, specifier, require, dep) in &requests {
+                if self.resolve(base, specifier, *require)? != *dep {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                self.lines[id] = Some(line);
+                return Ok(id);
+            }
+        }
+        let outer = std::mem::take(&mut self.requests);
         let source = if let Some(source) = inline {
             source
         } else {
@@ -1205,12 +1585,21 @@ impl Builder {
                     );
                     format!(
                         "export default {};",
-                        serde_json::to_string(&html(&path, self.files.clone(), self.production)?)?
+                        serde_json::to_string(&html(
+                            &path,
+                            self.files.clone(),
+                            self.shared.clone(),
+                            self.production
+                        )?)?
                     )
                 }
                 "json" => {
-                    let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
-                    format!("export default {value};")
+                    let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)
+                        .with_context(|| format!("Invalid JSON in {}", path.display()))?;
+                    format!(
+                        "export default JSON.parse({});",
+                        serde_json::to_string(&value.to_string())?
+                    )
                 }
                 "cjs" | "cts" if !dependency => bail!(
                     "CommonJS is only supported in npm packages: {}",
@@ -1289,6 +1678,10 @@ impl Builder {
                 || ["require", "module", "exports"]
                     .iter()
                     .any(|name| references.contains_key(*name)));
+        // WARNING: direct `eval` needs import names in scope, so only those modules keep the `with` scope.
+        let linked = !commonjs && !references.contains_key("eval");
+        let mut asynchronous = TopLevelAwait(false, false);
+        asynchronous.visit_program(&program);
         let mut linker = Linker {
             builder: self,
             allocator: &allocator,
@@ -1296,46 +1689,52 @@ impl Builder {
             scoping: &transformed.scoping,
             path: &path,
             commonjs,
+            cacheable: stamp.is_some() && !path.extension().is_some_and(|e| e == "html"),
+            imported: Vec::new(),
+            required: Vec::new(),
             error: None,
         };
         linker.visit_program(&mut program);
         if let Some(error) = linker.error {
             return Err(error);
         }
+        let (cacheable, imported, required) = (linker.cacheable, linker.imported, linker.required);
         let ast = AstBuilder::new(&allocator);
         let mut imports = Vec::new();
         let mut exports = Vec::new();
         let mut stars = Vec::new();
+        let mut bindings = HashMap::new();
+        let mut aliases = Vec::new();
         let mut body = ArenaVec::new_in(&ast);
         for statement in program.body {
             match statement {
                 Statement::ImportDeclaration(import) => {
-                    let dep = self.resolve(
-                        path.parent().unwrap_or(Path::new(".")),
-                        import
-                            .source
-                            .value
-                            .as_str()
-                            .context("Invalid module path")?,
-                        false,
-                    )?;
+                    let base = path.parent().unwrap_or(Path::new("."));
+                    let specifier = import
+                        .source
+                        .value
+                        .as_str()
+                        .context("Invalid module path")?;
+                    let dep = self.resolve(base, specifier, false)?;
+                    self.requests
+                        .push((base.to_owned(), specifier.to_owned(), false, dep));
                     imports.push(json!({"id":dep,"local":null,"name":"*"}));
                     for specifier in import.unbox().specifiers.into_iter().flatten() {
-                        if types.contains(&specifier.local().symbol_id()) {
+                        let symbol = specifier.local().symbol_id();
+                        if types.contains(&symbol) {
                             continue;
                         }
-                        let (name, local) = match specifier {
-                            ImportDeclarationSpecifier::ImportSpecifier(specifier) => (
-                                specifier.imported.name().to_string(),
-                                specifier.local.name.to_string(),
-                            ),
-                            ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
-                                ("default".into(), specifier.local.name.to_string())
+                        let local = specifier.local().name.to_string();
+                        let name = match specifier {
+                            ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                                specifier.imported.name().to_string()
                             }
-                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
-                                ("*".into(), specifier.local.name.to_string())
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {
+                                "default".into()
                             }
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => "*".into(),
                         };
+                        bindings.insert(symbol, (dep, name.clone()));
                         imports.push(json!({"id":dep,"local":local,"name":name}));
                     }
                 }
@@ -1373,43 +1772,59 @@ impl Builder {
                 }
                 Statement::ExportNamedDeclaration(export) => {
                     for specifier in &export.specifiers {
+                        if let ModuleExportName::IdentifierReference(ident) = &specifier.local
+                            && let Some(symbol) = ident.reference_id.get().and_then(|reference| {
+                                transformed.scoping.get_reference(reference).symbol_id()
+                            })
+                        {
+                            aliases.push((exports.len(), symbol));
+                        }
                         exports.push(json!({"name":specifier.exported.name().as_str(),"value":specifier.local.name().as_str()}));
                     }
                 }
                 Statement::ExportFromDeclaration(export) => {
-                    let dep = self.resolve(
-                        path.parent().unwrap_or(Path::new(".")),
-                        export
-                            .source
-                            .value
-                            .as_str()
-                            .context("Invalid module path")?,
-                        false,
-                    )?;
+                    let base = path.parent().unwrap_or(Path::new("."));
+                    let specifier = export
+                        .source
+                        .value
+                        .as_str()
+                        .context("Invalid module path")?;
+                    let dep = self.resolve(base, specifier, false)?;
+                    self.requests
+                        .push((base.to_owned(), specifier.to_owned(), false, dep));
                     imports.push(json!({"id":dep,"local":null,"name":"*"}));
                     for specifier in &export.specifiers {
                         let local = format!("$appsRe{}", imports.len());
-                        imports.push(
-                            json!({"id":dep,"local":local,"name":specifier.local.name().as_str()}),
-                        );
+                        let name = specifier.local.name();
+                        imports.push(json!({"id":dep,"local":local,"name":name.as_str()}));
+                        let value = if linked {
+                            namespace_access(dep, &name)
+                        } else {
+                            local
+                        };
                         exports
-                            .push(json!({"name":specifier.exported.name().as_str(),"value":local}));
+                            .push(json!({"name":specifier.exported.name().as_str(),"value":value}));
                     }
                 }
                 Statement::ExportAllDeclaration(export) => {
-                    let dep = self.resolve(
-                        path.parent().unwrap_or(Path::new(".")),
-                        export
-                            .source
-                            .value
-                            .as_str()
-                            .context("Invalid module path")?,
-                        false,
-                    )?;
+                    let base = path.parent().unwrap_or(Path::new("."));
+                    let specifier = export
+                        .source
+                        .value
+                        .as_str()
+                        .context("Invalid module path")?;
+                    let dep = self.resolve(base, specifier, false)?;
+                    self.requests
+                        .push((base.to_owned(), specifier.to_owned(), false, dep));
                     if let Some(name) = &export.exported {
                         let local = format!("$appsRe{}", imports.len());
                         imports.push(json!({"id":dep,"local":local,"name":"*"}));
-                        exports.push(json!({"name":name.name().as_str(),"value":local}));
+                        let value = if linked {
+                            namespace_access(dep, "*")
+                        } else {
+                            local
+                        };
+                        exports.push(json!({"name":name.name().as_str(),"value":value}));
                     } else {
                         stars.push(dep);
                     }
@@ -1462,15 +1877,56 @@ impl Builder {
                 statement => body.push(statement),
             }
         }
+        // WARNING: `for await` keeps an async generator, whose body starts one microtask after `load`.
+        let asynchronous = if !asynchronous.0 && !asynchronous.1 {
+            0
+        } else if asynchronous.1 {
+            2
+        } else {
+            1
+        };
+        if asynchronous == 1 {
+            let mut awaits = Awaits(AstBuilder::new(&allocator));
+            for statement in body.iter_mut() {
+                awaits.visit_statement(statement);
+            }
+        }
+        if linked {
+            let mut imports = Imports {
+                ast: AstBuilder::new(&allocator),
+                allocator: &allocator,
+                scoping: &transformed.scoping,
+                bindings: &bindings,
+            };
+            for statement in body.iter_mut() {
+                imports.visit_statement(statement);
+            }
+            for (index, symbol) in aliases {
+                if let Some((dep, name)) = bindings.get(&symbol) {
+                    exports[index]["value"] = namespace_access(*dep, name).into();
+                }
+            }
+        }
         program.body = body;
         program.hashbang = None;
         let output = Codegen::new()
             .with_options(CodegenOptions {
+                ascii_only: true,
                 source_map_path: (!self.production).then(|| path.clone()),
                 ..CodegenOptions::default()
             })
             .build(&program);
-        let mut module = json!({"id":id,"code":output.code,"imports":imports,"exports":exports,"stars":stars,"commonjs":commonjs});
+        let mut deps = Vec::new();
+        for dep in imports
+            .iter()
+            .filter_map(|item| item["id"].as_u64())
+            .chain(stars.iter().map(|&dep| dep as u64))
+        {
+            if !deps.contains(&dep) {
+                deps.push(dep);
+            }
+        }
+        let mut module = json!({"id":id,"deps":deps,"code":output.code,"imports":imports,"exports":exports,"stars":stars,"commonjs":commonjs,"linked":linked,"async":asynchronous});
         if let Some(map) = output.map {
             let mut map: Value = serde_json::from_str(&map.to_json_string())?;
             // WARNING: The runtime adds one line before the module body.
@@ -1480,9 +1936,84 @@ impl Builder {
                 .map(|url| Value::String(url.into()))
                 .unwrap_or_else(|_| Value::String(path.to_string_lossy().into()));
         }
-        self.modules[id] = module;
+        let requests = std::mem::replace(&mut self.requests, outer);
+        if self.production {
+            let manifests = self.shared.manifests.borrow();
+            let package = path
+                .ancestors()
+                .skip(1)
+                .find_map(|root| Some((root, manifests.get(&root.join("package.json"))?)));
+            module["pure"] = match package.map(|(root, manifest)| (root, &manifest["sideEffects"]))
+            {
+                Some((_, Value::Bool(false))) => true,
+                Some((root, Value::Array(patterns))) => {
+                    let relative = path
+                        .strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    !patterns.iter().filter_map(Value::as_str).any(|pattern| {
+                        let pattern = pattern.trim_start_matches("./");
+                        if pattern.contains('/') {
+                            glob(pattern.as_bytes(), relative.as_bytes())
+                        } else {
+                            glob(format!("**/{pattern}").as_bytes(), relative.as_bytes())
+                        }
+                    })
+                }
+                _ => false,
+            }
+            .into();
+            drop(manifests);
+            module["imported"] = json!(imported);
+            module["required"] = json!(required);
+            self.modules[id] = module;
+        } else {
+            let line: Rc<str> = format!("$appsDefine({});\n", ascii_json(&module)?).into();
+            if cacheable && let Some(stamp) = stamp {
+                self.graph.modules.insert(
+                    id,
+                    Cached {
+                        stamp,
+                        line: line.clone(),
+                        requests,
+                    },
+                );
+            }
+            self.lines[id] = Some(line);
+        }
         Ok(id)
     }
+}
+
+fn glob(pattern: &[u8], text: &[u8]) -> bool {
+    match pattern {
+        [] => text.is_empty(),
+        [b'*', b'*', b'/', rest @ ..] => {
+            (0..=text.len()).any(|i| (i == 0 || text[i - 1] == b'/') && glob(rest, &text[i..]))
+        }
+        [b'*', b'*', rest @ ..] => (0..=text.len()).any(|i| glob(rest, &text[i..])),
+        [b'*', rest @ ..] => (0..=text.len())
+            .take_while(|&i| i == 0 || text[i - 1] != b'/')
+            .any(|i| glob(rest, &text[i..])),
+        [b'?', rest @ ..] => text.first().is_some_and(|&c| c != b'/') && glob(rest, &text[1..]),
+        [c, rest @ ..] => text.first() == Some(c) && glob(rest, &text[1..]),
+    }
+}
+
+// WARNING: JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
+fn ascii_json(value: &Value) -> Result<String> {
+    let json = serde_json::to_string(value)?;
+    let mut result = String::with_capacity(json.len());
+    let mut start = 0;
+    for (index, matched) in json.match_indices(|c: char| !c.is_ascii()) {
+        result.push_str(&json[start..index]);
+        start = index + matched.len();
+        for unit in matched.encode_utf16() {
+            let _ = write!(result, "\\u{unit:04x}");
+        }
+    }
+    result.push_str(&json[start..]);
+    Ok(result)
 }
 
 pub fn compile(
@@ -1491,21 +2022,68 @@ pub fn compile(
     inline: Option<String>,
     files: Rc<RefCell<BTreeSet<PathBuf>>>,
     production: bool,
+    cache: Option<Rc<Cache>>,
 ) -> Result<BBTreeMap<String, String>> {
+    let root = entry.parent().context("Missing entry directory")?;
+    let shared = Rc::new(Shared {
+        root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
+        cache,
+        ..Shared::default()
+    });
+    let mut output = bundle(
+        vec![(entry.to_owned(), inline)],
+        realm,
+        files,
+        shared.clone(),
+        production,
+    )?;
+    for (index, code) in shared.scripts.take().into_iter().enumerate() {
+        output.insert(format!("script-{index}.js"), code);
+    }
+    Ok(output)
+}
+
+fn bundle(
+    entries: Vec<Entry>,
+    realm: Realm,
+    files: Rc<RefCell<BTreeSet<PathBuf>>>,
+    shared: Rc<Shared>,
+    production: bool,
+) -> Result<BBTreeMap<String, String>> {
+    let key = (realm, entries[0].0.clone());
+    let graph = shared
+        .cache
+        .as_ref()
+        .and_then(|cache| cache.graphs.borrow_mut().remove(&key));
     let mut builder = Builder {
         realm,
         production,
         modules: Vec::new(),
+        lines: Vec::new(),
         ids: BBTreeMap::new(),
-        dependencies: BTreeSet::new(),
+        graph: graph.unwrap_or_default(),
+        requests: Vec::new(),
+        inlined: 0,
         package_roots: BTreeSet::new(),
         dynamic: BTreeSet::new(),
         assets: BBTreeMap::new(),
         files,
+        shared,
     };
-    builder.visit(entry.to_owned(), inline)?;
+    let result = entries
+        .into_iter()
+        .map(|(path, inline)| builder.visit(path, inline))
+        .collect::<Result<Vec<_>>>();
+    if let Some(cache) = &builder.shared.cache {
+        cache
+            .graphs
+            .borrow_mut()
+            .insert(key.clone(), std::mem::take(&mut builder.graph));
+    }
+    let entries = result?;
+    let mut chunked = serde_json::Map::new();
     if production {
-        let modules = &mut builder.modules;
+        let modules = &builder.modules;
         let mut available: Vec<BTreeSet<String>> = modules
             .iter()
             .map(|module| {
@@ -1557,11 +2135,12 @@ pub fn compile(
         }
 
         let mut needed = vec![BTreeSet::new(); modules.len()];
-        needed[0] = available[0].clone();
-        for &id in &builder.dynamic {
+        for &id in entries.iter().chain(&builder.dynamic) {
             needed[id] = available[id].clone();
         }
         let mut used_imports = vec![BTreeSet::new(); modules.len()];
+        let mut factories = vec![String::new(); modules.len()];
+        let mut whole = vec![false; modules.len()];
         let mut pending = vec![true; modules.len()];
         let mut queue = VecDeque::with_capacity(modules.len());
         let mut seen = vec![false; modules.len()];
@@ -1613,22 +2192,24 @@ pub fn compile(
                     })
                     .collect::<Vec<_>>()
                     .join(",");
+                let params = if module["linked"] == true {
+                    let deps = module["deps"].as_array().into_iter().flatten();
+                    deps.fold(String::from(",$appsImport"), |params, dep| {
+                        params + ",$appsN" + &dep.to_string()
+                    })
+                } else {
+                    String::new()
+                };
                 format!(
-                    "$appsFactory=function*($out,$appsBind){{'use strict';$appsBind($out,{{{getters}}});yield;\n{}\n}};",
+                    "$appsFactory=function*($out,$appsBind{params}){{'use strict';$appsBind($out,{{{getters}}});yield;\n{}\n}};",
                     module["code"].as_str().unwrap()
                 )
             };
-            let mut allocator = Allocator::default();
-            let parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
-            let asynchronous = !parsed.diagnostics.is_empty() && module["commonjs"] != true;
-            let mut parsed = if asynchronous {
-                drop(parsed);
-                allocator.reset();
+            if module["async"] == 2 {
                 source = source.replacen("=function*(", "=async function*(", 1);
-                Parser::new(&allocator, &source, SourceType::cjs()).parse()
-            } else {
-                parsed
-            };
+            }
+            let allocator = Allocator::default();
+            let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
             ensure!(
                 parsed.diagnostics.is_empty(),
                 "Invalid JavaScript in module {id} ({}): {:?}",
@@ -1642,15 +2223,41 @@ pub fn compile(
             let eval = references.contains_key("eval");
             used_imports[id].clear();
             let mut requests = Vec::new();
+            let linked = module["linked"] == true;
+            let mut uses = Uses(Vec::new());
+            if linked {
+                uses.visit_program(&parsed.program);
+                for (target, name) in &uses.0 {
+                    match name {
+                        Some(name) => requests.push((*target, name.clone())),
+                        None => {
+                            whole[*target] = true;
+                            requests.extend(
+                                available[*target]
+                                    .iter()
+                                    .map(|name| (*target, name.clone())),
+                            );
+                        }
+                    }
+                }
+            }
             for import in module["imports"].as_array().unwrap() {
                 let Some(local) = import["local"].as_str() else {
                     continue;
                 };
-                if eval || references.contains_key(local) {
+                let target = import["id"].as_u64().unwrap() as usize;
+                let name = import["name"].as_str().unwrap();
+                if linked {
+                    if uses.0.iter().any(|(dep, used)| {
+                        *dep == target
+                            && (name == "*" || used.as_deref().is_none_or(|used| used == name))
+                    }) {
+                        used_imports[id].insert(local.to_owned());
+                    }
+                } else if eval || references.contains_key(local) {
                     used_imports[id].insert(local.to_owned());
-                    let target = import["id"].as_u64().unwrap() as usize;
-                    let name = import["name"].as_str().unwrap();
                     if name == "*" {
+                        whole[target] = true;
                         requests
                             .extend(available[target].iter().map(|name| (target, name.clone())));
                     } else {
@@ -1685,45 +2292,160 @@ pub fn compile(
             let mut codegen = Codegen::new()
                 .with_options(CodegenOptions {
                     minify: true,
+                    ascii_only: true,
                     comments: CommentOptions::disabled(),
                     ..CodegenOptions::default()
                 })
                 .with_scoping(result.scoping)
                 .with_private_member_mappings(result.class_private_mappings);
             codegen.print_expression(&assignment.right);
-            modules[id]["factory"] = Value::String(codegen.into_source_text());
-            modules[id]["async"] = Value::Bool(asynchronous);
+            factories[id] = codegen.into_source_text();
         }
-        for (id, module) in modules.iter_mut().enumerate() {
-            for import in module["imports"].as_array_mut().unwrap() {
-                if import["local"]
-                    .as_str()
-                    .is_some_and(|local| !used_imports[id].contains(local))
-                {
-                    import["local"] = Value::Null;
-                }
+        // WARNING: a module that package.json marks free of side effects is dropped when nothing reads it, and so is
+        // everything only it imports, like other bundlers. Its importers get `null` for its namespace.
+        let pruned: Vec<_> = (0..modules.len())
+            .map(|id| {
+                modules[id]["pure"] == true
+                    && needed[id].is_empty()
+                    && !whole[id]
+                    && !dynamic_stars[id]
+                    && !entries.contains(&id)
+                    && !builder.dynamic.contains(&id)
+            })
+            .collect();
+        let ids = |module: &Value, field: &str| {
+            module[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .map(|id| id as usize)
+                .collect::<Vec<_>>()
+        };
+        let mut compiled = vec![false; modules.len()];
+        for (id, module) in modules.iter().enumerate().filter(|&(id, _)| !pruned[id]) {
+            let mut line = format!("$appsDefine({{id:{id}");
+            let deps: Vec<_> = ids(module, "deps")
+                .into_iter()
+                .map(|dep| (!pruned[dep]).then_some(dep))
+                .collect();
+            let stars: Vec<_> = ids(module, "stars")
+                .into_iter()
+                .filter(|&star| !pruned[star])
+                .collect();
+            if !deps.is_empty() {
+                let _ = write!(line, ",deps:{}", json!(deps));
             }
-            let module = module.as_object_mut().unwrap();
-            module.remove("code");
-            module.remove("exports");
+            if !stars.is_empty() {
+                let _ = write!(line, ",stars:{}", json!(stars));
+            }
+            if module["commonjs"] == true {
+                line.push_str(",commonjs:1");
+            }
+            if module["async"] != 0 {
+                let _ = write!(line, ",async:{}", module["async"]);
+            }
+            let mut factory = std::mem::take(&mut factories[id]);
+            if module["linked"] == false && module["commonjs"] == false {
+                let imports: Vec<_> = module["imports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|import| {
+                        import["local"]
+                            .as_str()
+                            .is_some_and(|local| used_imports[id].contains(local))
+                            && !pruned[import["id"].as_u64().unwrap() as usize]
+                    })
+                    .collect();
+                let _ = write!(
+                    line,
+                    ",linked:false,imports:{}",
+                    ascii_json(&json!(imports))?
+                );
+                factory = format!("function($scope){{with($scope)return {factory}}}");
+            }
+            // WARNING: codegen cannot escape some text, like raw template strings. Those modules compile from a string, so the bundle stays ASCII.
+            if factory.is_ascii() {
+                let _ = writeln!(line, ",factory:{factory}}});");
+            } else {
+                compiled[id] = true;
+                let _ = writeln!(line, ",source:{}}});", ascii_json(&Value::String(factory))?);
+            }
+            builder.lines[id] = Some(line.into());
+        }
+        // WARNING: modules only reachable through `import()` go to chunk scripts that the loader runs on first use. Pages
+        // compile strings only while their own script runs, so modules that compile from a string stay in the bundle.
+        let mut owner = vec![usize::MAX; modules.len()];
+        let mut groups = VecDeque::from([entries
+            .iter()
+            .copied()
+            .chain((0..modules.len()).filter(|&id| compiled[id]))
+            .collect::<Vec<_>>()]);
+        let mut chunks: Vec<Vec<usize>> = Vec::new();
+        while let Some(mut stack) = groups.pop_front() {
+            let mut members = Vec::new();
+            while let Some(id) = stack.pop() {
+                if pruned[id] || owner[id] != usize::MAX {
+                    continue;
+                }
+                owner[id] = chunks.len();
+                members.push(id);
+                stack.extend(
+                    ids(&modules[id], "deps")
+                        .into_iter()
+                        .chain(ids(&modules[id], "required")),
+                );
+                groups.extend(
+                    ids(&modules[id], "imported")
+                        .into_iter()
+                        .map(|target| vec![target]),
+                );
+            }
+            if chunks.is_empty() || !members.is_empty() {
+                members.sort_unstable();
+                chunks.push(members);
+            }
+        }
+        for members in chunks.iter().skip(1) {
+            let mut source = String::from("(($appsDefine)=>{\n");
+            for &id in members {
+                source.push_str(builder.lines[id].as_deref().unwrap_or(""));
+            }
+            source.push_str("})");
+            let mut scripts = builder.shared.scripts.borrow_mut();
+            scripts.push(source);
+            chunked.insert(format!("script-{}.js", scripts.len() - 1), json!(members));
+        }
+        for (id, line) in builder.lines.iter_mut().enumerate() {
+            if owner[id] != 0 {
+                *line = None;
+            }
         }
     }
-    let mut app = String::new();
-    let mut deps = String::new();
-    for (id, module) in builder.modules.iter().enumerate() {
-        let target = if builder.dependencies.contains(&id) {
-            &mut deps
-        } else {
-            &mut app
-        };
-        target.push_str("define(");
-        target.push_str(&serde_json::to_string(module)?.replace('<', "\\u003c"));
-        target.push_str(");\n");
+    let mut app = String::with_capacity(
+        builder
+            .lines
+            .iter()
+            .flatten()
+            .map(|line| line.len())
+            .sum::<usize>()
+            + 32,
+    );
+    for line in builder.lines.iter().flatten() {
+        app.push_str(line);
+    }
+    if !chunked.is_empty() {
+        let _ = write!(
+            app,
+            "return[{},{}];",
+            json!(entries),
+            Value::Object(chunked)
+        );
+    } else if entries != [0] {
+        let _ = write!(app, "return[{}];", json!(entries));
     }
     let mut files = BBTreeMap::from([("app.js".into(), app)]);
-    if !deps.is_empty() {
-        files.insert("deps.js".into(), deps);
-    }
     for (_, (name, source)) in builder.assets {
         files.insert(name, source);
     }
@@ -1755,7 +2477,7 @@ pub fn compile(
         files.insert("assets.json".into(), serde_json::to_string(&assets)?);
     }
     if realm == Realm::Main {
-        let root = entry.parent().context("Missing entry directory")?;
+        let root = key.1.parent().context("Missing entry directory")?;
         let mut package = json!({});
         for directory in root.ancestors() {
             let path = directory.join("package.json");
@@ -1799,39 +2521,17 @@ pub fn compile(
                 builder.files.borrow_mut().insert(path);
             }
         }
+        let source = package.to_string();
         let (name, product_name, version) =
-            apps_runtime::bundle::package_metadata(Some(&package.to_string()))?;
-        files.insert(
-            "package.json".into(),
-            json!({"name":name,"productName":product_name,"version":version}).to_string(),
-        );
+            apps_runtime::bundle::package_metadata(Some(&source))?;
+        apps_runtime::bundle::disabled_features(Some(&source))?;
+        let mut metadata = json!({"name":name,"productName":product_name,"version":version});
+        if let Some(features) = package.get("features") {
+            metadata["features"] = features.clone();
+        }
+        files.insert("package.json".into(), metadata.to_string());
     }
     Ok(files)
-}
-
-fn script(files: &BBTreeMap<String, String>, production: bool) -> Result<String> {
-    let source = bundle_source(files, true)?;
-    if !production {
-        return Ok(source);
-    }
-    let allocator = Allocator::default();
-    let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
-    ensure!(
-        parsed.diagnostics.is_empty(),
-        "Invalid script bundle: {:?}",
-        parsed.diagnostics
-    );
-    let result = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut parsed.program);
-    Ok(Codegen::new()
-        .with_options(CodegenOptions {
-            minify: true,
-            comments: CommentOptions::disabled(),
-            ..CodegenOptions::default()
-        })
-        .with_scoping(result.scoping)
-        .with_private_member_mappings(result.class_private_mappings)
-        .build(&parsed.program)
-        .code)
 }
 
 fn native_specifier(path: &Path) -> Result<String> {
@@ -1909,6 +2609,16 @@ fn resolve_file(path: &Path) -> Result<PathBuf> {
         }
     }
     if path.is_dir() {
+        if let Ok(source) = fs::read_to_string(path.join("package.json"))
+            && let Ok(metadata) = serde_json::from_str::<Value>(&source)
+            && let Some(entry) = ["module", "main"]
+                .iter()
+                .find_map(|key| metadata.get(key).and_then(Value::as_str))
+            && !matches!(entry.trim_end_matches('/'), "" | ".")
+            && let Ok(target) = resolve_file(&path.join(entry))
+        {
+            return Ok(target);
+        }
         for name in [
             "index.ts",
             "index.tsx",
@@ -1932,7 +2642,19 @@ fn asset_name(path: &Path) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if !matches!(
         extension.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "svg"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "bmp"
+            | "ico"
+            | "svg"
+            | "ttf"
+            | "otf"
+            | "woff"
+            | "woff2"
     ) {
         return None;
     }
@@ -1979,10 +2701,16 @@ fn urls(source: &str, directory: &Path, files: &Rc<RefCell<BTreeSet<PathBuf>>>) 
     result
 }
 
-fn html(path: &Path, files: Rc<RefCell<BTreeSet<PathBuf>>>, production: bool) -> Result<String> {
+fn html(
+    path: &Path,
+    files: Rc<RefCell<BTreeSet<PathBuf>>>,
+    shared: Rc<Shared>,
+    production: bool,
+) -> Result<String> {
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
-    for node in &mut doc.nodes {
+    let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
+    for (index, node) in doc.nodes.iter_mut().enumerate() {
         if let Some(style) = node.attrs.get_mut("style") {
             *style = urls(style, parent, &files);
         }
@@ -1993,17 +2721,29 @@ fn html(path: &Path, files: Rc<RefCell<BTreeSet<PathBuf>>>, production: bool) ->
             *source = url;
         }
         if node.tag == "style" {
-            node.text = urls(&node.text, parent, &files);
+            node.text = css(
+                path,
+                Some(std::mem::take(&mut node.text)),
+                &mut Vec::new(),
+                &files,
+            )?;
         } else if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
             ensure!(
                 !href.contains("://") && !href.starts_with("//"),
                 "Only local CSS is supported"
             );
-            let file = parent.join(href).canonicalize()?;
-            files.borrow_mut().insert(file.clone());
+            let text = css(
+                &parent.join(href).canonicalize()?,
+                None,
+                &mut Vec::new(),
+                &files,
+            )?;
+            node.text = match node.attrs.get("media") {
+                Some(media) => format!("@media {media}{{{text}}}"),
+                None => text,
+            };
             node.tag = "style".into();
-            node.text = css(&file, &mut Vec::new(), &files)?;
             node.attrs.clear();
         } else if node.tag == "script" {
             let kind = node
@@ -2015,50 +2755,72 @@ fn html(path: &Path, files: Rc<RefCell<BTreeSet<PathBuf>>>, production: bool) ->
                 matches!(kind, "module" | "preload"),
                 "Use type=module or type=preload for HTML scripts"
             );
-            let realm = if kind == "preload" {
-                Realm::Preload
-            } else {
-                Realm::Renderer
+            let preload = kind == "preload";
+            let entry = match node.attrs.remove("src") {
+                Some(src) => {
+                    ensure!(
+                        !src.contains("://") && !src.starts_with("//"),
+                        "Only local scripts are supported"
+                    );
+                    (parent.join(src).canonicalize()?, None)
+                }
+                None => (path.to_owned(), Some(std::mem::take(&mut node.text))),
             };
-            let scripts = if let Some(src) = node.attrs.get("src") {
-                ensure!(
-                    !src.contains("://") && !src.starts_with("//"),
-                    "Only local scripts are supported"
-                );
-                compile(
-                    &parent.join(src).canonicalize()?,
-                    realm,
-                    None,
-                    files.clone(),
-                    production,
-                )?
-            } else {
-                compile(
-                    path,
-                    realm,
-                    Some(node.text.clone()),
-                    files.clone(),
-                    production,
-                )?
-            };
-            node.text = script(&scripts, production)?;
-            node.attrs.remove("src");
             node.attrs.insert(
                 "type".into(),
-                if realm == Realm::Preload {
-                    "preload"
-                } else {
-                    "module"
-                }
-                .into(),
+                if preload { "preload" } else { "module" }.into(),
             );
+            scripts[usize::from(preload)].push((index, entry));
         }
+    }
+    for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
+        let Some(&(first, _)) = list.first() else {
+            continue;
+        };
+        let entries = list.into_iter().map(|(_, entry)| entry).collect();
+        let code = bundle_source(
+            &bundle(entries, realm, files.clone(), shared.clone(), production)?,
+            true,
+        );
+        let mut scripts = shared.scripts.borrow_mut();
+        scripts.push(code);
+        doc.nodes[first].attrs.insert(
+            "src".into(),
+            format!("apps:///script-{}.js", scripts.len() - 1),
+        );
     }
     Ok(doc.serialize(0))
 }
 
+/// Resolves `@import "package"` to the stylesheet of an npm package, like postcss-import.
+fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
+    let count = if name.starts_with('@') { 2 } else { 1 };
+    let package = name.split('/').take(count).collect::<Vec<_>>().join("/");
+    let subpath = name[package.len()..].trim_start_matches('/');
+    let root = directory
+        .ancestors()
+        .map(|directory| directory.join("node_modules").join(&package))
+        .find(|path| path.is_dir())
+        .with_context(|| format!("Cannot resolve CSS import {name}"))?;
+    if !subpath.is_empty() {
+        return Ok(root.join(subpath));
+    }
+    let metadata: Value = serde_json::from_str(&fs::read_to_string(root.join("package.json"))?)?;
+    let entry = metadata["exports"]["."]["style"]
+        .as_str()
+        .or_else(|| metadata["style"].as_str())
+        .or_else(|| {
+            metadata["main"]
+                .as_str()
+                .filter(|main| main.ends_with(".css"))
+        })
+        .unwrap_or("index.css");
+    Ok(root.join(entry))
+}
+
 fn css(
     path: &Path,
+    inline: Option<String>,
     stack: &mut Vec<PathBuf>,
     files: &Rc<RefCell<BTreeSet<PathBuf>>>,
 ) -> Result<String> {
@@ -2068,9 +2830,21 @@ fn css(
         path.display()
     );
     stack.push(path.to_owned());
-    files.borrow_mut().insert(path.to_owned());
+    let source = match inline {
+        Some(source) => source,
+        None => {
+            files.borrow_mut().insert(path.to_owned());
+            ensure!(
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("css")),
+                "Stylesheets must be .css files: {}",
+                path.display()
+            );
+            fs::read_to_string(path)?
+        }
+    };
     let source = urls(
-        &fs::read_to_string(path)?,
+        &source,
         path.parent().context("Missing CSS directory")?,
         files,
     );
@@ -2105,7 +2879,11 @@ fn css(
                 depth += 1;
             } else if byte == b'}' {
                 depth -= 1;
-            } else if depth == 0 && bytes[pos..].starts_with(b"@import") {
+            } else if depth == 0
+                && bytes[pos..]
+                    .get(..7)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"@import"))
+            {
                 found = Some(pos);
                 break;
             }
@@ -2118,6 +2896,14 @@ fn css(
         rest = &rest[start + 7..];
         let end = rest.find(';').context("CSS @import needs a semicolon")?;
         let spec = rest[..end].trim();
+        // Tailwind's parts take `layer(...)` and other options after the name.
+        let spec = match spec.as_bytes().first() {
+            Some(&quote @ (b'\'' | b'"')) => spec[1..]
+                .find(quote as char)
+                .filter(|&close| spec[1..close + 1].starts_with("tailwindcss/"))
+                .map_or(spec, |close| &spec[..close + 2]),
+            _ => spec,
+        };
         let spec = spec
             .strip_prefix("url(")
             .and_then(|s| s.strip_suffix(')'))
@@ -2132,8 +2918,15 @@ fn css(
             !name.contains('\\'),
             "Escaped CSS imports are not supported"
         );
-        if name == "tailwindcss" {
-            result.push_str("@import \"tailwindcss\";");
+        if name == "tailwindcss"
+            || name.strip_prefix("tailwindcss/").is_some_and(|part| {
+                matches!(
+                    part.strip_suffix(".css").unwrap_or(part),
+                    "index" | "theme" | "preflight" | "utilities"
+                )
+            })
+        {
+            let _ = write!(result, "@import \"{name}\";");
             rest = &rest[end + 1..];
             continue;
         }
@@ -2141,14 +2934,21 @@ fn css(
             !name.contains("://") && !name.starts_with("//"),
             "Remote CSS is not supported"
         );
-        result.push_str(&css(
-            &path.parent().unwrap().join(name).canonicalize()?,
-            stack,
-            files,
-        )?);
+        let directory = path.parent().unwrap();
+        let target = if name.starts_with('.') || Path::new(name).is_absolute() {
+            directory.join(name)
+        } else {
+            css_package(directory, name)?
+        };
+        result.push_str(&css(&target.canonicalize()?, None, stack, files)?);
         rest = &rest[end + 1..];
     }
     result.push_str(rest);
+    ensure!(
+        !result.to_ascii_lowercase().contains("</style"),
+        "CSS cannot contain </style>: {}",
+        path.display()
+    );
     stack.pop();
     Ok(result)
 }

@@ -1,29 +1,29 @@
-use super::WebView;
 use crate::style;
 use anyhow::Result;
-use gpui::{App, Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
+use render::{Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
 use std::{ops::Range, rc::Rc};
 
 pub(super) struct TextHighlight {
     pub(super) range: Range<usize>,
-    pub(super) color: Option<gpui::Hsla>,
-    pub(super) background: gpui::Hsla,
+    pub(super) color: Option<render::Rgba>,
+    pub(super) background: render::Rgba,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_text(
-    line: &gpui::LineLayout,
-    wraps: &[gpui::WrapBoundary],
+    line: &render::LineLayout,
+    wraps: &[render::WrapBoundary],
     origin: Point<Pixels>,
     line_height: Pixels,
-    runs: &[gpui::TextRun],
+    runs: &[render::TextRun],
     offset: usize,
     highlights: &[TextHighlight],
     rows: &[crate::dom::Row],
     text: &str,
-    ink: Option<gpui::Hsla>,
+    ink: Option<render::Rgba>,
     window: &mut Window,
 ) {
+    let smoothing = window.text_style().font_smoothing;
     let shift = |row: usize| rows.get(row).map_or(px(0.), |row| row.shift);
     // Justified rows widen each space by the row gap.
     let justify = |row: usize, index: usize| {
@@ -59,17 +59,41 @@ pub(super) fn paint_text(
                 });
             let baseline = (line_height - ascent - descent) / 2. + ascent;
             let drop = |row: usize| rows.get(row).map_or(px(0.), |row| row.drop);
+            let top = |row: usize| origin.y + line_height * row + drop(row);
+            let mask = window.content_mask().bounds;
+            let tall = line.runs.iter().fold(line_height, |tall, run| {
+                tall.max(
+                    window
+                        .text_system()
+                        .bounding_box(run.font_id, run.font_size)
+                        .size
+                        .height,
+                )
+            });
+            let shown = |row: usize| top(row) < mask.bottom() && top(row) + tall > mask.top();
             let mut start = 0;
             let mut left = px(0.);
+            let mut first_run = (0, 0);
             for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
                 let (end, right) = boundary.map_or((line.len, line.width), |boundary| {
                     let glyph = &line.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
                     (glyph.index, glyph.position.x)
                 });
+                if !shown(row) {
+                    start = end;
+                    left = right;
+                    continue;
+                }
                 let row_left = origin.x + shift(row) - left;
-                let top = origin.y + line_height * row + drop(row);
-                let mut run_start = 0;
-                for run in runs {
+                let top = top(row);
+                while first_run.0 < runs.len()
+                    && first_run.1 + runs[first_run.0].len <= offset + start
+                {
+                    first_run.1 += runs[first_run.0].len;
+                    first_run.0 += 1;
+                }
+                let mut run_start = first_run.1;
+                for run in &runs[first_run.0..] {
                     if run_start >= offset + end {
                         break;
                     }
@@ -92,7 +116,7 @@ pub(super) fn paint_text(
                         line.x_for_index(b - offset) + justify(row, b)
                     };
                     if let Some(background) = run.background_color.filter(|_| ink.is_none()) {
-                        window.paint_quad(gpui::fill(
+                        window.paint_quad(render::fill(
                             Bounds::new(
                                 point(row_left + x, top + baseline - line.ascent),
                                 size(end_x - x, line.ascent + line.descent),
@@ -102,9 +126,12 @@ pub(super) fn paint_text(
                     }
                     if let Some(underline) = &run.underline {
                         window.paint_underline(
-                            point(row_left + x, top + baseline + line.descent * 0.618),
+                            point(
+                                row_left + x,
+                                top + baseline + underline.offset.unwrap_or(line.descent * 0.618),
+                            ),
                             end_x - x,
-                            &gpui::UnderlineStyle {
+                            &render::UnderlineStyle {
                                 color: ink.or(underline.color),
                                 ..*underline
                             },
@@ -114,7 +141,7 @@ pub(super) fn paint_text(
                         window.paint_strikethrough(
                             point(row_left + x, top + (line.ascent * 0.5 + baseline) * 0.5),
                             end_x - x,
-                            &gpui::StrikethroughStyle {
+                            &render::StrikethroughStyle {
                                 color: ink.or(strikethrough.color),
                                 ..*strikethrough
                             },
@@ -134,7 +161,7 @@ pub(super) fn paint_text(
                         line.x_for_index(b - offset) + justify(row, b)
                     };
                     if end_x > x && highlight.background.a > 0. {
-                        window.paint_quad(gpui::fill(
+                        window.paint_quad(render::fill(
                             Bounds::new(point(row_left + x, top), size(end_x - x, line_height)),
                             highlight.background,
                         ));
@@ -143,19 +170,33 @@ pub(super) fn paint_text(
                 start = end;
                 left = right;
             }
-            let mut wrap = 0;
-            let mut left = px(0.);
+            // WARNING: rows only grow downward, so painting starts at the first row that reaches the content mask.
+            let Some(mut wrap) = (0..=wraps.len()).find(|&row| top(row) + tall > mask.top()) else {
+                return;
+            };
+            let (mut left, from) = match wrap.checked_sub(1).map(|row| wraps[row]) {
+                Some(at) => (
+                    line.runs[at.run_ix].glyphs[at.glyph_ix].position.x,
+                    (at.run_ix, at.glyph_ix),
+                ),
+                None => (px(0.), (0, 0)),
+            };
             let mut run_index = 0;
             let mut run_end = runs.first().map_or(0, |run| run.len);
-            for (run_ix, run) in line.runs.iter().enumerate() {
+            let mut spaced = (usize::MAX, 0, 0.);
+            'rows: for (run_ix, run) in line.runs.iter().enumerate().skip(from.0) {
                 let glyph_size = window
                     .text_system()
                     .bounding_box(run.font_id, run.font_size)
                     .size;
-                for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-                    if wraps.get(wrap) == Some(&gpui::WrapBoundary { run_ix, glyph_ix }) {
+                let skip = if run_ix == from.0 { from.1 } else { 0 };
+                for (glyph_ix, glyph) in run.glyphs.iter().enumerate().skip(skip) {
+                    if wraps.get(wrap) == Some(&render::WrapBoundary { run_ix, glyph_ix }) {
                         wrap += 1;
                         left = glyph.position.x;
+                    }
+                    if top(wrap) >= mask.bottom() {
+                        break 'rows;
                     }
                     let index = offset + glyph.index;
                     while index >= run_end && run_index + 1 < runs.len() {
@@ -172,8 +213,19 @@ pub(super) fn paint_text(
                     if color.a == 0. {
                         continue;
                     }
+                    let gap = rows
+                        .get(wrap)
+                        .filter(|row| row.gap > px(0.))
+                        .map_or(px(0.), |row| {
+                            if spaced.0 != wrap || index < spaced.1 {
+                                spaced = (wrap, row.start.min(index), 0.);
+                            }
+                            spaced.2 += spaces(text.get(spaced.1..index).unwrap_or(""));
+                            spaced.1 = index;
+                            row.gap * spaced.2
+                        });
                     let position = point(
-                        origin.x + shift(wrap) + glyph.position.x - left + justify(wrap, index),
+                        origin.x + shift(wrap) + glyph.position.x - left + gap,
                         origin.y + line_height * wrap + baseline + drop(wrap),
                     );
                     if !Bounds::new(point(position.x, position.y - baseline), glyph_size)
@@ -182,14 +234,15 @@ pub(super) fn paint_text(
                         continue;
                     }
                     if glyph.is_emoji {
-                        let _ = window.paint_emoji(position, run.font_id, glyph.id, run.font_size);
+                        window.paint_emoji(position, run.font_id, glyph.id, run.font_size);
                     } else {
-                        let _ = window.paint_glyph(
+                        window.paint_glyph(
                             position,
                             run.font_id,
                             glyph.id,
                             run.font_size,
                             color,
+                            smoothing,
                         );
                     }
                 }
@@ -205,7 +258,7 @@ pub(super) fn spaces(text: &str) -> f32 {
 /// How much taller the first row is than the line height, when larger first-letter or
 /// first-line runs rise above the normal baseline.
 fn first_row_drop(
-    line: Option<&gpui::WrappedLineLayout>,
+    line: Option<&render::WrappedLineLayout>,
     line_height: Pixels,
     window: &Window,
 ) -> Pixels {
@@ -242,7 +295,7 @@ fn first_row_drop(
 }
 
 pub(crate) fn text_position(
-    layout: &gpui::TextLayout,
+    layout: &render::TextLayout,
     text: &str,
     rows: &[crate::dom::Row],
     index: usize,
@@ -258,7 +311,7 @@ pub(crate) fn text_position(
 }
 
 pub(crate) fn text_index(
-    layout: &gpui::TextLayout,
+    layout: &render::TextLayout,
     text: &str,
     rows: &[crate::dom::Row],
     mut position: Point<Pixels>,
@@ -290,8 +343,8 @@ fn first_line(
     data: &style::InlineText,
     width: Option<Pixels>,
     font_size: Pixels,
-    text_system: &gpui::WindowTextSystem,
-) -> (SharedString, Vec<gpui::TextRun>) {
+    text_system: &render::TextSystem,
+) -> (SharedString, Vec<render::TextRun>) {
     let mut text = data.text.to_string();
     let Some((base, pseudo, mode)) = &data.first_line else {
         return (text.into(), data.runs.clone());
@@ -326,14 +379,15 @@ fn first_line(
 }
 
 pub(super) struct InlineText {
-    pub(super) inner: gpui::StyledText,
+    pub(super) inner: render::StyledText,
     pub(super) data: Rc<style::InlineText>,
-    pub(super) view: gpui::Entity<WebView>,
-    pub(super) runs: Option<Vec<gpui::TextRun>>,
+    pub(super) view: Rc<super::ViewData>,
+    pub(super) runs: Option<Vec<render::TextRun>>,
     /// For justified text, whether the last row is justified too.
     pub(super) justify: Option<bool>,
-    /// Whether the text was measured here instead of by `inner`.
-    pub(super) measured: bool,
+    /// Set when the text is measured here instead of by `inner`: the last measured wrap
+    /// width and text width.
+    pub(super) measured: Option<Rc<std::cell::Cell<[Pixels; 2]>>>,
 }
 
 impl IntoElement for InlineText {
@@ -343,66 +397,65 @@ impl IntoElement for InlineText {
     }
 }
 
-impl gpui::Element for InlineText {
+impl render::Element for InlineText {
     type RequestLayoutState = ();
-    type PrepaintState = (Vec<(gpui::Hitbox, gpui::CursorStyle)>, crate::dom::Rows);
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-    fn request_layout(
-        &mut self,
-        id: Option<&gpui::GlobalElementId>,
-        inspector: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, ()) {
+    type PrepaintState = (Vec<(render::Hitbox, render::CursorStyle)>, crate::dom::Rows);
+    fn request_layout(&mut self, window: &mut Window) -> (render::LayoutId, ()) {
         let sized = self.data.runs.iter().any(|run| run.font_size.is_some())
             || self
                 .data
                 .first_line
                 .as_ref()
                 .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
-        self.measured = self.data.first_line.is_some() || sized;
-        if !self.measured {
-            return self.inner.request_layout(id, inspector, window, cx);
-        }
+        self.measured = (self.data.first_line.is_some() || sized).then(Default::default);
+        let Some(measured) = self.measured.clone() else {
+            return self.inner.request_layout(window);
+        };
         let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = style
-            .line_height
-            .to_pixels(font_size.into(), window.rem_size());
+        let font_size = style.font_size;
+        let line_height = style.line_height;
         let data = self.data.clone();
         let cached = std::cell::Cell::new(None);
         let layout = window.request_measured_layout(
-            Default::default(),
-            move |known, available, window, _| {
+            &render::Style::default(),
+            move |known, available, window| {
                 let width = known
                     .width
                     .or(match available.width {
-                        gpui::AvailableSpace::Definite(width) => Some(width),
+                        render::AvailableSpace::Definite(width) => Some(width),
                         _ => None,
                     })
-                    .filter(|_| style.white_space == gpui::WhiteSpace::Normal);
-                if let Some((_, size)) = cached.get().filter(|(cached, _)| *cached == width) {
+                    .filter(|_| style.white_space == render::WhiteSpace::Normal);
+                if let Some((_, size)) = cached
+                    .get()
+                    .filter(|(cached, _): &(_, render::Size<Pixels>)| *cached == width)
+                {
+                    measured.set([width.unwrap_or_default(), size.width]);
                     return size;
                 }
-                let (text, runs) = first_line(&data, width, font_size, window.text_system());
-                let mut size = gpui::Size::<Pixels>::default();
-                let lines = window
-                    .text_system()
-                    .shape_text(text, font_size, &runs, width, style.line_clamp)
+                let system = window.text_system().clone();
+                let (text, runs) = first_line(&data, width, font_size, &system);
+                let mut size = render::Size::<Pixels>::default();
+                let lines = system
+                    .shape_text_indented(
+                        text,
+                        font_size,
+                        &runs,
+                        width,
+                        style.line_clamp,
+                        style.text_indent,
+                        style.text_wrap,
+                    )
                     .unwrap_or_default();
                 for line in &lines {
                     let line = line.size(line_height);
                     size.height += line.height;
-                    size.width = size.width.max(line.width).ceil();
+                    size.width = size.width.max(line.width);
                 }
                 size.height +=
-                    first_row_drop(lines.first().map(|line| &***line), line_height, window);
+                    first_row_drop(lines.first().map(|line| &**line), line_height, window);
                 cached.set(Some((width, size)));
+                measured.set([width.unwrap_or_default(), size.width]);
                 size
             },
         );
@@ -410,47 +463,49 @@ impl gpui::Element for InlineText {
     }
     fn prepaint(
         &mut self,
-        id: Option<&gpui::GlobalElementId>,
-        inspector: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         state: &mut (),
         window: &mut Window,
-        cx: &mut App,
     ) -> Self::PrepaintState {
         let style = window.text_style();
-        if self.measured {
-            let width =
-                (style.white_space == gpui::WhiteSpace::Normal).then_some(bounds.size.width);
-            let font_size = style.font_size.to_pixels(window.rem_size());
-            let (text, runs) = first_line(&self.data, width, font_size, window.text_system());
-            self.inner = gpui::StyledText::new(text).with_runs(runs.clone());
-            let (layout, _) = self.inner.request_layout(id, inspector, window, cx);
+        if let Some(measured) = &self.measured {
+            // Bounds snap to device pixels and can be a little narrower than the measured
+            // wrap or text width, which must not wrap or truncate again.
+            let wrap = measured
+                .get()
+                .into_iter()
+                .filter(|width| *width >= bounds.size.width && *width - bounds.size.width < px(1.))
+                .fold(bounds.size.width, Pixels::max);
+            let width = (style.white_space == render::WhiteSpace::Normal).then_some(wrap);
+            let font_size = style.font_size;
+            let system = window.text_system().clone();
+            let (text, runs) = first_line(&self.data, width, font_size, &system);
+            self.inner = render::StyledText::new(text).with_runs(runs.clone());
+            let (layout, _) = self.inner.request_layout(window);
             window.compute_layout(
                 layout,
                 size(
-                    gpui::AvailableSpace::Definite(bounds.size.width),
-                    gpui::AvailableSpace::MinContent,
+                    render::AvailableSpace::Definite(wrap),
+                    render::AvailableSpace::MinContent,
                 ),
-                cx,
             );
             self.runs = Some(runs);
         }
-        self.inner
-            .prepaint(id, inspector, bounds, state, window, cx);
+        self.inner.prepaint(bounds, state, window);
         let layout = self.inner.layout();
         let mut rows = Vec::new();
         let indent = style.text_indent;
         let drop = layout.line_layout_for_index(0).map_or(px(0.), |line| {
             first_row_drop(Some(&line), layout.line_height(), window)
         });
-        if style.text_align != gpui::TextAlign::Left
+        if style.text_align != render::TextAlign::Left
             || !self.data.backgrounds.is_empty()
             || indent != px(0.)
             || self.justify.is_some()
             || drop > px(0.)
         {
             let mut offset = 0;
-            while let Some(line) = layout.line_layout_for_index(offset) {
+            for line in layout.line_layouts() {
                 let glyphs = &line.unwrapped_layout.runs;
                 let mut left = px(0.);
                 let mut start = offset;
@@ -488,9 +543,9 @@ impl gpui::Element for InlineText {
                         (indent, free / gaps)
                     } else {
                         let shift = match style.text_align {
-                            gpui::TextAlign::Left => px(0.),
-                            gpui::TextAlign::Center => free / 2.,
-                            gpui::TextAlign::Right => free,
+                            render::TextAlign::Left => px(0.),
+                            render::TextAlign::Center => free / 2.,
+                            render::TextAlign::Right => free,
                         };
                         (indent + shift, px(0.))
                     };
@@ -528,12 +583,12 @@ impl gpui::Element for InlineText {
                     )
                 };
                 Some((
-                    window.insert_hitbox(rect, gpui::HitboxBehavior::Normal),
+                    window.insert_hitbox(rect, render::HitboxBehavior::Normal),
                     cursor,
                 ))
             })
             .collect();
-        let view = self.view.read(cx);
+        let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
         let layout = self.inner.layout();
@@ -573,20 +628,17 @@ impl gpui::Element for InlineText {
     }
     fn paint(
         &mut self,
-        _: Option<&gpui::GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut (),
         (hitboxes, rows): &mut Self::PrepaintState,
         window: &mut Window,
-        cx: &mut App,
     ) {
         for (hitbox, cursor) in hitboxes.iter() {
             window.set_cursor_style(*cursor, hitbox);
         }
         let mut highlights = Vec::new();
         {
-            let view = self.view.read(cx);
+            let view = &*self.view;
             let host = view.host.borrow();
             let dom = &host.dom[&view.id];
             let layout = self.inner.layout();
@@ -598,18 +650,22 @@ impl gpui::Element for InlineText {
                     if let Some((a, b)) = text_position(layout, &self.data.text, rows, range.start)
                         .zip(text_position(layout, &self.data.text, rows, range.end))
                     {
-                        let font = cx.text_system().resolve_font(&style::font(style));
-                        let height = cx.text_system().ascent(font, px(units.font.em))
-                            - cx.text_system().descent(font, px(units.font.em));
-                        let radii = ["top-left", "top-right", "bottom-right", "bottom-left"].map(
-                            |corner| {
-                                px(style
-                                    .get(&format!("border-{corner}-radius"))
-                                    .or_else(|| style.get("border-radius"))
-                                    .and_then(|v| units.resolve(v, (b.x - a.x).into()))
-                                    .unwrap_or(0.))
-                            },
-                        );
+                        let font = window.text_system().resolve_font(&style::font(style));
+                        let height = window.text_system().ascent(font, px(units.font.em))
+                            - window.text_system().descent(font, px(units.font.em));
+                        let radii = [
+                            "border-top-left-radius",
+                            "border-top-right-radius",
+                            "border-bottom-right-radius",
+                            "border-bottom-left-radius",
+                        ]
+                        .map(|corner| {
+                            px(style
+                                .get(corner)
+                                .or_else(|| style.get("border-radius"))
+                                .and_then(|v| units.resolve(v, (b.x - a.x).into()))
+                                .unwrap_or(0.))
+                        });
                         let (top, line_height) = (layout.bounds().top(), layout.line_height());
                         let [first, last] = [a.y, b.y].map(|y| {
                             (((y - top) / line_height).round() as usize)
@@ -637,7 +693,7 @@ impl gpui::Element for InlineText {
                             };
                             let [left_side, right_side] = [start || clone, end || clone];
                             window.paint_quad(
-                                gpui::fill(
+                                render::fill(
                                     Bounds::new(
                                         point(
                                             x,
@@ -647,7 +703,7 @@ impl gpui::Element for InlineText {
                                     ),
                                     rgba(ink),
                                 )
-                                .corner_radii(gpui::Corners {
+                                .corner_radii(render::Corners {
                                     top_left: if left_side { radii[0] } else { px(0.) },
                                     top_right: if right_side { radii[1] } else { px(0.) },
                                     bottom_right: if right_side { radii[2] } else { px(0.) },
@@ -681,7 +737,7 @@ impl gpui::Element for InlineText {
                         .map(|(color, alpha)| color << 8 | alpha as u32)
                         .unwrap_or(0x000000ff);
                     if let Some(position) = text_position(layout, &self.data.text, rows, start) {
-                        window.paint_quad(gpui::fill(
+                        window.paint_quad(render::fill(
                             Bounds::new(position, size(px(1.), layout.line_height())),
                             rgba(ink),
                         ));
@@ -691,8 +747,8 @@ impl gpui::Element for InlineText {
                         style::selection_colors(&styles.values[*id], styles.selections.get(id));
                     highlights.push(TextHighlight {
                         range: start.min(end)..start.max(end),
-                        color: color.map(|color| rgba(color).into()),
-                        background: rgba(background).into(),
+                        color: color.map(rgba),
+                        background: rgba(background),
                     });
                 }
             }
@@ -703,31 +759,38 @@ impl gpui::Element for InlineText {
             .data
             .shadows
             .iter()
-            .map(|&(x, y, blur, color)| (point(px(x), px(y)), Some(rgba(color).into()), blur))
+            .map(|&(x, y, blur, color)| (point(px(x), px(y)), Some(rgba(color)), blur))
             .chain([(point(px(0.), px(0.)), None, 0.)]);
         for (shift, ink, blur) in passes {
             let paint = |window: &mut Window| {
                 let mut offset = 0;
                 let mut row = 0;
                 let mut origin = layout.bounds().origin + shift;
-                while let Some(line) = layout.line_layout_for_index(offset) {
+                let mask = window.content_mask().bounds;
+                for line in layout.line_layouts() {
                     let count = line.wrap_boundaries.len() + 1;
-                    paint_text(
-                        &line.unwrapped_layout,
-                        &line.wrap_boundaries,
-                        origin,
-                        layout.line_height(),
-                        runs,
-                        offset,
-                        if ink.is_some() { &[] } else { &highlights },
-                        rows.get(row..row + count).unwrap_or_default(),
-                        &self.data.text,
-                        ink,
-                        window,
-                    );
+                    let height = line.size(layout.line_height()).height;
+                    if origin.y > mask.bottom() {
+                        break;
+                    }
+                    if origin.y + height + layout.line_height() > mask.top() {
+                        paint_text(
+                            &line.unwrapped_layout,
+                            &line.wrap_boundaries,
+                            origin,
+                            layout.line_height(),
+                            runs,
+                            offset,
+                            if ink.is_some() { &[] } else { &highlights },
+                            rows.get(row..row + count).unwrap_or_default(),
+                            &self.data.text,
+                            ink,
+                            window,
+                        );
+                    }
                     row += count;
                     offset += line.len() + 1;
-                    origin.y += line.size(layout.line_height()).height;
+                    origin.y += height;
                     if offset > self.data.text.len() {
                         break;
                     }
@@ -735,7 +798,7 @@ impl gpui::Element for InlineText {
             };
             if blur > 0. {
                 // The CSS blur radius is twice the gaussian deviation.
-                let effect = gpui::PaintEffect {
+                let effect = render::PaintEffect {
                     blur: px(blur / 2.),
                     ..Default::default()
                 };

@@ -1,0 +1,18 @@
+[package]
+name = "apps-webgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The runtime loads the cdylib on macOS and Windows, and links the rlib on Linux, where the render crate already uses wgpu.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+naga = { version = "30", features = ["termcolor"] }
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu = { workspace = true, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl", "serde"] }

@@ -37,9 +37,13 @@ fn run() -> Result<i32> {
                 .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\n\nRun and build default to main.ts, then main.js. Watching is off by default.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
+            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\napps skill\n\nRun and build default to main.ts, then main.js. Watching is off by default.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
             env!("CARGO_PKG_VERSION")
         );
+        return Ok(0);
+    }
+    if command == "skill" {
+        print!("{}", include_str!("../skills/apps-devtools/SKILL.md"));
         return Ok(0);
     }
     if command == "--version" {
@@ -57,10 +61,20 @@ fn run() -> Result<i32> {
     let mut explicit_target = false;
     let mut watch = false;
     let mut devtools = false;
+    let mut mcp = false;
+    let mut mcp_port = 19876;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--watch" | "-W" if command == "run" => watch = true,
             "--devtools" | "-D" if command == "run" => devtools = true,
+            "--enable-devtools-mcp" if command == "run" => mcp = true,
+            "--devtools-mcp-port" if command == "run" => {
+                mcp_port = args
+                    .next()
+                    .context("Expected devtools MCP port")?
+                    .parse()
+                    .context("Invalid devtools MCP port")?;
+            }
             "--out-dir" if command == "build" => {
                 out = Some(std::path::absolute(
                     args.next().context("Expected output directory")?,
@@ -110,7 +124,15 @@ fn run() -> Result<i32> {
         })
     };
     match command.as_str() {
-        "run" => run::run(&entry, &runtime, watch, devtools),
+        "run" => {
+            // Port 0 picks a free port once, so `--watch` restarts keep it.
+            let mcp = match (mcp, mcp_port) {
+                (false, _) => None,
+                (true, 0) => Some(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port()),
+                (true, port) => Some(port),
+            };
+            run::run(&entry, &runtime, watch, devtools, mcp)
+        }
         "build" => {
             let out = out.unwrap_or_else(|| {
                 let out = root.join("dist");

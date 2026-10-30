@@ -2,10 +2,28 @@ use crate::{
     dom::Document,
     style::{self, Lengths, Style, components, parser},
 };
-use gpui::{BlendMode, Bounds, Corners, Hsla, PaintEffect, Pixels, point, px};
+use render::{BlendMode, Bounds, Corners, PaintEffect, Pixels, Rgba, point, px};
 
 /// A 4x4 column-major matrix.
 pub(crate) type Matrix = [f32; 16];
+
+/// The nodes with each `id` attribute in node order, built once per frame when first needed.
+pub(crate) type Ids = std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>;
+
+pub(crate) fn index<'a>(
+    ids: &'a Ids,
+    doc: &Document,
+) -> &'a std::collections::HashMap<String, Vec<usize>> {
+    ids.get_or_init(|| {
+        let mut ids = std::collections::HashMap::<String, Vec<usize>>::new();
+        for (node, value) in doc.nodes.iter().enumerate() {
+            if let Some(id) = value.attrs.get("id") {
+                ids.entry(id.clone()).or_default().push(node);
+            }
+        }
+        ids
+    })
+}
 
 pub(crate) const IDENTITY: Matrix = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
@@ -318,7 +336,7 @@ fn then_matrix(inner: &[f32; 20], outer: &[f32; 20]) -> [f32; 20] {
 
 /// The effects of a CSS `filter`, innermost first. Each blur and drop shadow gets its own layer,
 /// and consecutive color functions share one.
-pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document) -> Vec<PaintEffect> {
+pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Vec<PaintEffect> {
     let mut effects: Vec<PaintEffect> = Vec::new();
     let push_matrix = |effects: &mut Vec<PaintEffect>, matrix: [f32; 20]| {
         if let Some(last) = effects.last_mut()
@@ -363,7 +381,7 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document) -> Vec<Paint
                     });
                 }
             }
-            "url" => effects.extend(svg_filter(args, units, doc)),
+            "url" => effects.extend(svg_filter(args, units, doc, ids)),
             _ => {
                 let (filter, opacity, _) = style::Filter::parse(part, units);
                 if let Some(matrix) = color_matrix(filter, opacity) {
@@ -376,13 +394,16 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document) -> Vec<Paint
 }
 
 /// Maps the primitives of an inline SVG `<filter>` to effects.
-fn svg_filter(reference: &str, units: &Lengths, doc: &Document) -> Vec<PaintEffect> {
+fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Vec<PaintEffect> {
     let id = reference.trim().trim_matches(['"', '\'']);
     let Some(id) = id.strip_prefix('#') else {
         return Vec::new();
     };
-    let Some(filter) = doc.nodes.iter().position(|node| {
-        node.tag == "filter" && node.attrs.get("id").is_some_and(|value| value == id)
+    let Some(filter) = index(ids, doc).get(id).and_then(|nodes| {
+        nodes
+            .iter()
+            .copied()
+            .find(|&node| doc.nodes[node].tag == "filter")
     }) else {
         return Vec::new();
     };
@@ -424,7 +445,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document) -> Vec<PaintEffe
                     .and_then(|value| style::color(value))
                     .unwrap_or((0, 255));
                 let opacity = numbers("flood-opacity").first().copied().unwrap_or(1.);
-                let mut ink: Hsla = gpui::rgba(color.0 << 8 | color.1 as u32).into();
+                let mut ink: Rgba = render::rgba(color.0 << 8 | color.1 as u32);
                 ink.a *= opacity;
                 effects.push(PaintEffect {
                     shadow: Some((
@@ -474,7 +495,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document) -> Vec<PaintEffe
         // `feOffset` after a blur of the alpha is the usual drop shadow recipe.
         let sigma = effects.remove(blur).blur;
         effects.push(PaintEffect {
-            shadow: Some((offset, sigma, gpui::black().opacity(0.5))),
+            shadow: Some((offset, sigma, render::black().opacity(0.5))),
             ..Default::default()
         });
     }
@@ -485,7 +506,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document) -> Vec<PaintEffe
 pub(crate) fn backdrop(value: &str, units: &Lengths) -> Option<(Pixels, Option<[f32; 20]>)> {
     let mut blur = px(0.);
     let mut matrix: Option<[f32; 20]> = None;
-    for effect in filters(value, units, &Document::default()) {
+    for effect in filters(value, units, &Document::default(), &Ids::new()) {
         blur = blur.max(effect.blur);
         if let Some(next) = effect.color_matrix {
             matrix = Some(match matrix {
@@ -527,7 +548,13 @@ pub(crate) enum Clip {
     Shape(String),
 }
 
-pub(crate) fn clip(value: &str, units: &Lengths, size: [f32; 2], doc: &Document) -> Option<Clip> {
+pub(crate) fn clip(
+    value: &str,
+    units: &Lengths,
+    size: [f32; 2],
+    doc: &Document,
+    ids: &Ids,
+) -> Option<Clip> {
     let [width, height] = size;
     let (name, args) = components(value, ' ')
         .into_iter()
@@ -539,7 +566,10 @@ pub(crate) fn clip(value: &str, units: &Lengths, size: [f32; 2], doc: &Document)
             Some(Clip::Rounded(rect, radii))
         }
         "circle" | "ellipse" => {
-            let (rect, _) = style::clip_path(value, units, size)?;
+            let (rect, radii) = style::clip_path(value, units, size)?;
+            if (rect[2] - rect[3]).abs() <= rect[2].max(rect[3]) * 1e-4 {
+                return Some(Clip::Rounded(rect, radii));
+            }
             Some(svg(format!(
                 "<ellipse cx=\"{}\" cy=\"{}\" rx=\"{}\" ry=\"{}\"/>",
                 rect[0] + rect[2] / 2.,
@@ -586,10 +616,11 @@ pub(crate) fn clip(value: &str, units: &Lengths, size: [f32; 2], doc: &Document)
         }
         "url" => {
             let id = args.trim().trim_matches(['"', '\'']).strip_prefix('#')?;
-            let clip = doc.nodes.iter().position(|node| {
-                node.tag.eq_ignore_ascii_case("clipPath")
-                    && node.attrs.get("id").is_some_and(|value| value == id)
-            })?;
+            let clip = index(ids, doc)
+                .get(id)?
+                .iter()
+                .copied()
+                .find(|&node| doc.nodes[node].tag.eq_ignore_ascii_case("clipPath"))?;
             let object = doc.nodes[clip]
                 .attrs
                 .get("clipPathUnits")
@@ -609,7 +640,7 @@ pub(crate) fn clip(value: &str, units: &Lengths, size: [f32; 2], doc: &Document)
     }
 }
 
-/// The corner radii of a box as gpui corners.
+/// The corner radii of a box as render corners.
 pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     Corners {
         top_left: px(radii[0]),
@@ -961,7 +992,7 @@ pub(crate) fn gradient_svg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::size;
+    use render::size;
 
     fn style(pairs: &[(&str, &str)]) -> Style {
         pairs
@@ -1036,6 +1067,7 @@ mod tests {
             "grayscale(1) contrast(2) blur(4px) drop-shadow(1px 2px 6px red) opacity(.5)",
             &units,
             &doc,
+            &Ids::new(),
         );
         assert_eq!(effects.len(), 4);
         assert!(effects[0].color_matrix.is_some());
@@ -1055,9 +1087,12 @@ mod tests {
     #[test]
     fn clip_paths_become_shapes() {
         let units = Lengths::new(16., 800., 600.);
-        let doc = Document::default();
+        let doc = Document::parse(
+            "<svg><clipPath id=c><rect width=5 height=5></rect></clipPath></svg><p id=c></p>",
+        );
+        let ids = &Ids::new();
         assert!(matches!(
-            clip("inset(10px round 4px)", &units, [100., 60.], &doc),
+            clip("inset(10px round 4px)", &units, [100., 60.], &doc, ids),
             Some(Clip::Rounded([10., 10., 80., 40.], [4., 4., 4., 4.]))
         ));
         let Some(Clip::Shape(polygon)) = clip(
@@ -1065,17 +1100,27 @@ mod tests {
             &units,
             [100., 60.],
             &doc,
+            ids,
         ) else {
             panic!("polygon");
         };
         assert!(polygon.contains("points=\"50,0 100,60 0,60 \""));
+        let Some(Clip::Rounded(rect, radii)) = clip("circle(40%)", &units, [100., 60.], &doc, ids)
+        else {
+            panic!("circle");
+        };
+        assert!((rect[2] - rect[3]).abs() < 1e-3 && (radii[0] * 2. - rect[2]).abs() < 1e-3);
         assert!(matches!(
-            clip("circle(40%)", &units, [100., 60.], &doc),
+            clip("ellipse(40% 20%)", &units, [100., 60.], &doc, ids),
             Some(Clip::Shape(_))
         ));
         assert!(matches!(
-            clip("path('M0 0 L10 0 L5 5 Z')", &units, [100., 60.], &doc),
+            clip("path('M0 0 L10 0 L5 5 Z')", &units, [100., 60.], &doc, ids),
             Some(Clip::Shape(_))
         ));
+        let Some(Clip::Shape(shapes)) = clip("url(#c)", &units, [100., 60.], &doc, ids) else {
+            panic!("url");
+        };
+        assert!(shapes.contains("<rect"));
     }
 }

@@ -5,7 +5,7 @@ use std::{collections::HashMap, io::Write, sync::mpsc};
 
 struct Session {
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     input: mpsc::Sender<Vec<u8>>,
     events: mpsc::Receiver<Vec<u8>>,
     pending: Vec<u8>,
@@ -48,11 +48,18 @@ mod tests {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        // WARNING: Never signal a reaped child; its PID may belong to another process.
-        if let Ok(None) = self.child.try_wait()
-            && self.child.kill().is_ok()
-        {
-            let _ = self.child.wait();
+        if let Some(mut child) = self.child.take().filter(|_| !self.exited) {
+            // WARNING: kill() waits up to 200 ms for SIGHUP, so it must not run on the UI thread.
+            let _ = std::thread::Builder::new()
+                .name("apps-pty-kill".into())
+                .spawn(move || {
+                    // WARNING: Never signal a reaped child; its PID may belong to another process.
+                    if let Ok(None) = child.try_wait()
+                        && child.kill().is_ok()
+                    {
+                        let _ = child.wait();
+                    }
+                });
         }
     }
 }
@@ -98,6 +105,8 @@ impl State {
                 let mut reader = pair.master.try_clone_reader()?;
                 let mut writer = pair.master.take_writer()?;
                 let (tx, events) = mpsc::sync_channel(32);
+                let wake = crate::host::Waker::current();
+                let waker = wake.clone();
                 std::thread::Builder::new()
                     .name("apps-pty-read".into())
                     .spawn(move || {
@@ -107,12 +116,27 @@ impl State {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
                                     if tx.send(bytes[..n].to_vec()).is_err() {
-                                        break;
+                                        return;
                                     }
+                                    waker.wake();
                                 }
                             }
                         }
+                        drop(tx);
+                        waker.wake();
                     })?;
+                #[cfg(unix)]
+                let exit = pid.context("Missing PTY process ID")?;
+                #[cfg(windows)]
+                let exit = unsafe {
+                    std::os::windows::io::BorrowedHandle::borrow_raw(
+                        child
+                            .as_raw_handle()
+                            .context("Missing PTY process handle")?,
+                    )
+                }
+                .try_clone_to_owned()?;
+                crate::node::on_exit(exit, move || wake.wake())?;
                 let (input, rx) = mpsc::channel::<Vec<u8>>();
                 std::thread::Builder::new()
                     .name("apps-pty-write".into())
@@ -128,7 +152,7 @@ impl State {
                     self.next,
                     Session {
                         master: pair.master,
-                        child,
+                        child: Some(child),
                         input,
                         events,
                         pending: Vec::new(),
@@ -167,7 +191,8 @@ impl State {
                         session.pending.drain(..end);
                     }
                     if !session.exited
-                        && let Some(status) = session.child.try_wait()?
+                        && let Some(child) = &mut session.child
+                        && let Some(status) = child.try_wait()?
                     {
                         events.push(json!({"id":id,"type":"exit","exitCode":status.exit_code(),"signal":status.signal()}));
                         session.exited = true;
@@ -204,6 +229,10 @@ impl State {
                         })?;
                     }
                     _ => {
+                        // WARNING: Never signal a reaped child; its PID may belong to another process.
+                        let Some(child) = session.child.as_mut().filter(|_| !session.exited) else {
+                            return Ok(Value::Null);
+                        };
                         #[cfg(unix)]
                         {
                             let signal = match args[1].as_str().unwrap_or("SIGHUP") {
@@ -213,14 +242,14 @@ impl State {
                                 "SIGHUP" => libc::SIGHUP,
                                 _ => bail!("Unsupported signal"),
                             };
-                            if let Some(pid) = session.child.process_id()
+                            if let Some(pid) = child.process_id()
                                 && unsafe { libc::kill(-(pid as i32), signal) } != 0
                             {
-                                session.child.kill()?;
+                                child.kill()?;
                             }
                         }
                         #[cfg(not(unix))]
-                        session.child.kill()?;
+                        child.kill()?;
                     }
                 }
                 Ok(Value::Null)
