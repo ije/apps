@@ -362,7 +362,8 @@ fn cached_styles_follow_selectors_inheritance_and_stylesheets() {
         .iter()
         .position(|node| node.tag == "style")
         .unwrap();
-    doc.nodes[sheet].text = "span{color:purple}".into();
+    let text = doc.nodes[sheet].children[0];
+    doc.nodes[text].text = "span{color:purple}".into();
     doc.nodes[sheet].stylesheet = None;
     let changed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(&changed.values[children[0]]["color"], "purple");
@@ -635,11 +636,22 @@ fn relative_and_mixed_colors_resolve_with_current_color() {
     let computed = styles(&doc, 800., 600.);
     let item = element(&doc, ".item");
     let span = element(&doc, "span");
-    assert_eq!(computed[item]["color"], "#ff0000ff");
-    assert_eq!(computed[item]["border-top-color"], "#ff000080");
-    assert_eq!(computed[item]["background-color"], "#ff000080");
-    assert_eq!(computed[span]["color"], "#ff8080ff");
-    assert_eq!(computed[span]["fill"], "#ff8080ff");
+    assert_eq!(
+        [
+            &computed[item]["color"],
+            &computed[item]["border-top-color"],
+            &computed[item]["background-color"],
+            &computed[span]["color"],
+            &computed[span]["fill"]
+        ],
+        [
+            "color(srgb 1 0 0)",
+            "color(srgb 1 0 0 / 0.5)",
+            "oklch(0.627955 0.257683 29.2339 / 0.5)",
+            "color(srgb 1 0.5 0.5)",
+            "lab(68.6724 49.4694 23.9289)"
+        ]
+    );
     assert_eq!(
         computed[span]["--mix-color"],
         "color-mix(in srgb, red, blue)"
@@ -1443,7 +1455,7 @@ fn tailwind_state_variants_follow_interaction_states() {
         );
         assert_eq!(
             style.get(Prop::COLOR),
-            Some(if hovered { "#333333" } else { "#171717" })
+            Some(if hovered { "#333333" } else { "#000000" })
         );
         assert_eq!(
             cached.values[span].get(Prop::FONT_WEIGHT),
@@ -1602,11 +1614,12 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
 #[test]
 fn resizes_keep_scopes_until_a_media_query_changes() {
     let doc = Document::parse(
-        "<style>.a{font-size:2vw} @media (max-width: 500px){.a{color:red}}</style><div class=a></div>",
+        "<style>.a{font-size:2vw} @media (max-width: 500px){.a{color:red}}</style><div class=a></div><p></p>",
     );
-    let div = element(&doc, "div");
+    let (div, p) = (element(&doc, "div"), element(&doc, "p"));
     let mut cache = StyleCache::default();
     let mut scopes = Vec::new();
+    let mut last: Option<ComputedStyles> = None;
     for width in [800., 700., 400., 300.] {
         let computed = compute_styles(
             &doc,
@@ -1628,6 +1641,13 @@ fn resizes_keep_scopes_until_a_media_query_changes() {
             &computed.values[div]["font-size"],
             format!("{}px", width / 50.)
         );
+        // Values without viewport units are kept and get the new viewport.
+        if let Some(last) = last.filter(|_| width == 700.) {
+            assert!(Rc::ptr_eq(&last.values[p], &computed.values[p]));
+            assert!(!Rc::ptr_eq(&last.values[div], &computed.values[div]));
+            assert_eq!(computed.lengths[p].viewport, [700., 600.]);
+        }
+        last = Some(computed);
     }
     assert_eq!(scopes, [scopes[0], scopes[0], scopes[2], scopes[2]]);
     assert_ne!(scopes[0], scopes[2]);
@@ -1648,8 +1668,13 @@ fn collapsed_table_borders_straddle_grid_lines() {
     assert_eq!(edges("#cells td", MARGIN), [-1.; 4]);
     assert_eq!(edges("#cells", PADDING), [1.; 4]);
     assert_eq!(computed[element(&doc, "#cells")]["border-top-width"], "0");
-    assert_eq!(edges("#own", MARGIN), [7.; 4]);
-    assert_eq!(edges("#own", PADDING), [0.; 4]);
+    assert_eq!(edges("#own", MARGIN), [10.; 4]);
+    assert_eq!(edges("#own", PADDING), [3.; 4]);
+    assert_eq!(edges("#own td", MARGIN), [-3.; 4]);
+    assert_eq!(
+        computed[element(&doc, "#own td")]["border-top-width"],
+        "6px"
+    );
     assert_eq!(edges("#separate", PADDING), [3.; 4]);
 }
 
@@ -1658,4 +1683,558 @@ fn typed(values: &BTreeMap<String, String>) -> Style {
         .iter()
         .map(|(name, value)| (Prop::new(name), value.as_str().into()))
         .collect()
+}
+
+#[test]
+fn nested_parent_selector_inside_pseudo_class_arguments() {
+    let doc = Document::parse(
+        "<style>.p{:where(& > span){color:red}}.q{:is(&:hover,&.on){color:blue}}.space-x-4{:where(& > :not(:last-child)){margin-right:4px}}.n{:not(& > .x){width:1px}}</style><div class=p><span id=a></span><i><span id=b></span></i></div><div class='q on' id=q></div><div class=space-x-4><b id=c></b><b id=d></b></div><div class=n><b id=e class=x></b><b id=f></b></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "color").as_deref(), Some("red"));
+    assert_ne!(get("#b", "color").as_deref(), Some("red"));
+    assert_eq!(get("#q", "color").as_deref(), Some("blue"));
+    assert_eq!(get("#c", "margin-right").as_deref(), Some("4px"));
+    assert_eq!(get("#d", "margin-right"), None);
+    assert_eq!(get("#e", "width"), None);
+    assert_eq!(get("#f", "width").as_deref(), Some("1px"));
+}
+
+#[test]
+fn invalid_variables_act_as_unset_and_cycles_use_fallbacks() {
+    let fan = vec!["var(--x)"; 85].join(" ");
+    let chain: String = (1..=24)
+        .map(|i| format!("--l{i}:var(--l{0}) var(--l{0});", i - 1))
+        .collect();
+    let doc = Document::parse(&format!(
+        "<style>#c3{{--a:var(--b);--b:var(--a);color:var(--a,red)}}#c4{{--a:var(--b,1px);--b:var(--a,2px)}}#c7{{--b:var(--a) var(--d);--a:var(--b);--d:3px}}#c8{{border:var(--nope) solid}}#c6{{--x:1px;--y:{fan};width:var(--nope2,var(--y2,3px))}}#c1{{--a:var(--nope)}}#e{{--l0:{};{chain}}}</style><div style=color:red><span id=s style=color:var(--nope)></span></div><div id=c3></div><div id=c4></div><div id=c7></div><div id=c8></div><div id=c6></div><div style=--a:red><p id=c1></p></div><div id=e></div>",
+        "x".repeat(1024)
+    ));
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#s", "color").as_deref(), Some("red"));
+    assert_eq!(get("#c3", "color").as_deref(), Some("red"));
+    assert_eq!(get("#c3", "--a"), None);
+    assert_eq!((get("#c4", "--a"), get("#c4", "--b")), (None, None));
+    assert_eq!(get("#c7", "--d").as_deref(), Some("3px"));
+    assert_eq!(get("#c7", "--a"), None);
+    assert_eq!(get("#c8", "border-top-style"), None);
+    let fanned = get("#c6", "--y").unwrap();
+    assert_eq!(fanned, vec!["1px"; 85].join(" "));
+    assert_eq!(get("#c6", "width").as_deref(), Some("3px"));
+    assert_eq!(get("#c1", "--a"), None);
+    assert!(get("#e", "--l9").is_some_and(|value| value.len() > 500_000));
+    assert_eq!(get("#e", "--l24"), None);
+}
+
+#[test]
+fn registered_properties_follow_syntax_inheritance_and_initial_values() {
+    let doc = Document::parse(
+        "<style>@property --r{syntax:'<length>';inherits:false;initial-value:5px}@property --tw-border-style{syntax:'*';inherits:false;initial-value:solid}@property --q{syntax:'<color>';inherits:true;initial-value:blue}@property --bad{syntax:'<length>'}@property --tw-shadow{syntax:'*';inherits:false;initial-value:0 0 #0000}
+        #p9{--r:7px}#c9,#p9{width:var(--r)}.border{border-style:var(--tw-border-style);border-width:1px}#c10{--r:red;width:var(--r)}#p11{--q:green}#c11{--q:var(--nope)}#c12{--q:2px}#p13{--bad:1px}.shadow{--tw-shadow:0 1px 2px red;box-shadow:var(--tw-shadow)}.child{box-shadow:var(--tw-shadow)}</style><div id=p9><div id=c9></div></div><div id=b class=border></div><div id=c10></div><div id=p11><div id=c11></div></div><div id=c12></div><div id=p13><i id=c13></i></div><div class=shadow id=sh><div class=child id=ch></div></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#p9", "width").as_deref(), Some("7px"));
+    assert_eq!(get("#c9", "width").as_deref(), Some("5px"));
+    assert_eq!(get("#c9", "--r"), None);
+    assert_eq!(get("#b", "border-top-style").as_deref(), Some("solid"));
+    assert_eq!(get("#c10", "width").as_deref(), Some("5px"));
+    assert_eq!(get("#c11", "--q").as_deref(), Some("green"));
+    assert_eq!(get("#c12", "--q").as_deref(), Some("blue"));
+    assert_eq!(get("#c13", "--bad").as_deref(), Some("1px"));
+    assert_eq!(get("#sh", "box-shadow").as_deref(), Some("0 1px 2px red"));
+    assert_eq!(get("#ch", "box-shadow").as_deref(), Some("0 0 #0000"));
+    assert!(
+        Stylesheet::parse("@property --x{syntax:'<length>';inherits:true;initial-value:1em}")
+            .source()
+            .contains("@property --x")
+    );
+}
+
+#[test]
+fn revert_rolls_back_to_user_agent_and_lower_layers() {
+    let doc = Document::parse(
+        "<style>:where(.reset *){all:unset;display:revert}@layer a{.x{color:red}}@layer b{.x{color:revert-layer}}.y{color:blue}.y{color:revert}a{color:green}a.r{color:revert}</style><div class=reset><div id=d></div><span id=s></span><p id=p></p></div><div style=color:orange><div class='x' id=x></div><div class=y id=y></div></div><a href=# class=r id=a>a</a>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#d", "display").as_deref(), Some("block"));
+    assert_eq!(get("#s", "display"), None);
+    assert_eq!(get("#p", "display").as_deref(), Some("block"));
+    assert_eq!(get("#p", "margin-top"), None);
+    assert_eq!(get("#x", "color").as_deref(), Some("red"));
+    assert_eq!(get("#y", "color").as_deref(), Some("orange"));
+    assert_eq!(get("#a", "color").as_deref(), Some("#0000ee"));
+}
+
+#[test]
+fn generated_content_inherits_every_inherited_property() {
+    let doc = Document::parse(
+        "<style>p{font-weight:700;text-transform:uppercase;letter-spacing:2px;width:10px}p::before{content:'x'}</style><p>a</p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let before = &computed.pseudos[&element(&doc, "p")][0];
+    assert_eq!(before.get(Prop::FONT_WEIGHT), Some("700"));
+    assert_eq!(before.get(Prop::TEXT_TRANSFORM), Some("uppercase"));
+    assert_eq!(before.get(Prop::LETTER_SPACING), Some("2px"));
+    assert_eq!(before.get(Prop::WIDTH), None);
+}
+
+#[test]
+fn inherited_custom_properties_are_shared_until_a_node_sets_one() {
+    let vars: String = (0..300).map(|i| format!("--v{i}:{i}px;")).collect();
+    let doc = Document::parse(&format!(
+        "<html><style>:root{{{vars}}}.own{{--v7:1px}}</style><body><div id=a></div><div id=b><p id=c></p></div><div id=d class=own></div></body></html>"
+    ));
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let vars = |selector| computed.values[element(&doc, selector)].vars().clone();
+    assert_eq!(vars("html").len(), 300);
+    assert!(Rc::ptr_eq(&vars("html"), &vars("#a")));
+    assert!(Rc::ptr_eq(&vars("#a"), &vars("#c")));
+    assert!(!Rc::ptr_eq(&vars("#a"), &vars("#d")));
+    assert_eq!(
+        computed.values[element(&doc, "#d")].get(Prop::find("--v7").unwrap()),
+        Some("1px")
+    );
+}
+
+#[test]
+fn color_scheme_changes_system_colors_default_text_and_form_controls() {
+    let dark = Document::parse(
+        "<html><style>:root{color-scheme:dark}div{background-color:Canvas;border-color:ButtonBorder}.light{color-scheme:light;color:CanvasText}</style><body><div id=d>x</div><a href=# id=a>a</a><input id=i><p class=light id=l>l</p></body></html>",
+    );
+    let styles = styles(&dark, 800., 600.);
+    let get = |selector, name| styles[element(&dark, selector)].get(name).cloned();
+    assert_eq!(get("html", "color").as_deref(), Some("#ffffff"));
+    assert_eq!(get("#d", "color").as_deref(), Some("#ffffff"));
+    assert_eq!(get("#d", "background-color").as_deref(), Some("#121212"));
+    assert_eq!(get("#a", "color").as_deref(), Some("#9e9eff"));
+    assert_eq!(get("#i", "background-color").as_deref(), Some("#3b3b3b"));
+    assert_eq!(get("#i", "color").as_deref(), Some("#fff"));
+    assert_eq!(get("#l", "color").as_deref(), Some("#000000"));
+    let meta = Document::parse(
+        "<html><head><meta name=color-scheme content=dark></head><body><p>x</p></body></html>",
+    );
+    assert_eq!(styles_of(&meta, "p", "color"), Some("#ffffff".into()));
+    let light = Document::parse("<html><body><p>x</p><a href=#>a</a></body></html>");
+    assert_eq!(styles_of(&light, "p", "color"), Some("#000000".into()));
+    assert_eq!(styles_of(&light, "a", "color"), Some("#0000ee".into()));
+}
+
+fn styles_of(doc: &Document, selector: &str, name: &str) -> Option<String> {
+    styles(doc, 800., 600.)[element(doc, selector)]
+        .get(name)
+        .cloned()
+}
+
+#[test]
+fn style_elements_in_templates_noscript_media_and_disabled_are_skipped() {
+    let doc = Document::parse(
+        "<html><head><template><style>p{color:red}</style></template><noscript><style>p{width:1px}</style></noscript><style media=print>p{height:1px}</style><style media='(max-width:10px)'>p{order:1}</style><style media='(min-width:10px)'>p{opacity:.5}</style><style disabled>p{z-index:1}</style></head><body><p>x</p></body></html>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let p = &styles[element(&doc, "p")];
+    assert_eq!(p.get("color").map(String::as_str), Some("#000000"));
+    for name in ["width", "height", "order", "z-index"] {
+        assert_eq!(p.get(name), None, "{name}");
+    }
+    assert_eq!(p.get("opacity").map(String::as_str), Some(".5"));
+}
+
+#[test]
+fn inserted_rules_update_the_scope_in_place_and_keep_cascade_order() {
+    let mut doc = Document::parse(
+        "<html><head><style id=s>.x{color:red}.y{padding:1px}</style></head><body><p class=x id=p>a</p><p class=y id=q>b</p><i class=z id=z>c</i></body></html>",
+    );
+    let style = element(&doc, "#s");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let check = |doc: &Document,
+                 cache: &mut StyleCache,
+                 sheets: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
+                 step: &str| {
+        let cached = compute_styles(doc, 800., 600., None, sheets, cache, None);
+        cache.finish();
+        let mut baseline = StyleCache {
+            cssom: cache.cssom.clone(),
+            ..StyleCache::default()
+        };
+        let fresh = compute_styles(
+            doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut baseline,
+            None,
+        );
+        assert_eq!(cached.values, fresh.values, "{step}");
+        assert_eq!(cache.scopes.len(), 1, "{step}");
+        cache.scopes[0].id
+    };
+    let id = check(&doc, &mut cache, &mut sheets, "initial");
+    let text = doc.nodes[style].children.first().copied().unwrap_or(style);
+    doc.nodes[text].text.push_str(".z{color:blue}");
+    assert_eq!(check(&doc, &mut cache, &mut sheets, "append"), id);
+    for (index, rule) in [
+        (0, ".x{color:green}"),
+        (3, ".x{color:purple}"),
+        (1, ".z{width:1px}"),
+    ] {
+        cache
+            .edit_sheet(&doc, style, &mut sheets, Some((index, true)), |sheet, _| {
+                sheet.edit(&[index], Edit::Insert(rule))
+            })
+            .unwrap();
+        assert_eq!(check(&doc, &mut cache, &mut sheets, rule), id, "{rule}");
+    }
+    let computed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        computed.values[element(&doc, "#p")].get(Prop::COLOR),
+        Some("purple")
+    );
+    assert_eq!(
+        computed.values[element(&doc, "#z")].get(Prop::WIDTH),
+        Some("1px")
+    );
+    let head = element(&doc, "head");
+    let added = doc.nodes.len();
+    doc.nodes.push(crate::dom::Node {
+        tag: "style".into(),
+        text: ".y{color:orange}".into(),
+        parent: Some(head),
+        ..Default::default()
+    });
+    doc.nodes.get_mut(head).unwrap().children.push(added);
+    assert_eq!(check(&doc, &mut cache, &mut sheets, "new sheet"), id);
+    for (index, step) in [
+        (0, "delete first"),
+        (2, "delete middle"),
+        (3, "delete last"),
+    ] {
+        cache
+            .edit_sheet(
+                &doc,
+                style,
+                &mut sheets,
+                Some((index, false)),
+                |sheet, _| sheet.edit(&[index], Edit::Delete),
+            )
+            .unwrap();
+        assert_eq!(check(&doc, &mut cache, &mut sheets, step), id, "{step}");
+    }
+    for (top, edit) in [
+        (Some((0, true)), Edit::Insert(".y{color:teal}")),
+        (Some((1, false)), Edit::Delete),
+        (Some((0, false)), Edit::Delete),
+    ] {
+        cache
+            .edit_sheet(&doc, style, &mut sheets, top, |sheet, _| {
+                sheet.edit(&[top.unwrap().0], edit)
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        check(&doc, &mut cache, &mut sheets, "insert and delete"),
+        id
+    );
+    let computed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        computed.values[element(&doc, "#q")].get(Prop::COLOR),
+        Some("orange")
+    );
+}
+
+#[test]
+fn text_decorations_propagate_with_the_decorating_color() {
+    let doc = Document::parse(
+        "<style>a{color:blue;text-decoration:underline}.none{text-decoration:none}.badge{display:inline-block}.red{color:red}s{color:green}</style><a href=#><span class=none id=n>x</span><span class=badge id=b>b</span><span class=red id=r>r</span><s id=s>s</s></a>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(
+        get("#n", "text-decoration-line").as_deref(),
+        Some("underline")
+    );
+    assert_eq!(get("#n", "text-decoration-color").as_deref(), Some("blue"));
+    assert_eq!(get("#b", "text-decoration-line"), None);
+    assert_eq!(get("#r", "text-decoration-color").as_deref(), Some("blue"));
+    assert_eq!(get("#r", "color").as_deref(), Some("red"));
+    assert_eq!(
+        get("#s", "text-decoration-line").as_deref(),
+        Some("underline line-through")
+    );
+    assert_eq!(get("#s", "text-decoration-color").as_deref(), Some("green"));
+    let text = doc.nodes[element(&doc, "#r")].children[0];
+    assert_eq!(
+        styles[text]
+            .get("text-decoration-color")
+            .map(String::as_str),
+        Some("blue")
+    );
+}
+
+#[test]
+fn container_units_in_font_sizes_follow_the_nearest_container() {
+    let doc = Document::parse(
+        "<div id=c style='container-type:inline-size'><p id=p style='font-size:10cqw;line-height:20cqi'>x</p></div><p id=v style='font-size:1cqw'>y</p>",
+    );
+    let container = element(&doc, "#c");
+    let mut cache = StyleCache::default();
+    let compute = |cache: &mut StyleCache| {
+        let computed = compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None);
+        cache.finish();
+        computed
+    };
+    compute(&mut cache);
+    assert!(cache.set_containers(HashMap::from([(container, [500., 100.])])));
+    let computed = compute(&mut cache);
+    assert_eq!(
+        computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
+        Some("50px")
+    );
+    assert_eq!(
+        computed.values[element(&doc, "#p")].get(Prop::LINE_HEIGHT),
+        Some("100px")
+    );
+    assert_eq!(
+        computed.values[element(&doc, "#v")].get(Prop::FONT_SIZE),
+        Some("8px")
+    );
+    assert!(cache.set_containers(HashMap::from([(container, [300., 100.])])));
+    let computed = compute(&mut cache);
+    assert_eq!(
+        computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
+        Some("30px")
+    );
+}
+
+#[test]
+fn inline_logical_properties_follow_the_direction() {
+    let doc = Document::parse(
+        "<style>.m{margin-inline-start:50px;padding-inline:1px 2px;border-inline-start:3px solid red;inset-inline-end:4px;border-start-start-radius:5px}.override{margin-inline-start:50px}.override{margin-right:7px}</style><div id=l class=m></div><div dir=rtl><div id=r class=m></div><p id=o class=override></p></div><div style='direction:rtl'><span id=s class=m></span></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#l", "margin-left").as_deref(), Some("50px"));
+    assert_eq!(get("#l", "padding-left").as_deref(), Some("1px"));
+    assert_eq!(get("#l", "border-left-width").as_deref(), Some("3px"));
+    assert_eq!(get("#l", "right").as_deref(), Some("4px"));
+    assert_eq!(get("#l", "border-top-left-radius").as_deref(), Some("5px"));
+    assert_eq!(get("#r", "direction").as_deref(), Some("rtl"));
+    assert_eq!(get("#r", "margin-right").as_deref(), Some("50px"));
+    assert_eq!(get("#r", "margin-left"), None);
+    assert_eq!(get("#r", "padding-right").as_deref(), Some("1px"));
+    assert_eq!(get("#r", "padding-left").as_deref(), Some("2px"));
+    assert_eq!(get("#r", "border-right-style").as_deref(), Some("solid"));
+    assert_eq!(get("#r", "left").as_deref(), Some("4px"));
+    assert_eq!(get("#r", "border-top-right-radius").as_deref(), Some("5px"));
+    assert_eq!(get("#s", "margin-right").as_deref(), Some("50px"));
+    assert_eq!(get("#o", "margin-right").as_deref(), Some("7px"));
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let r = element(&doc, "#r");
+    assert_eq!(
+        resolved(
+            &computed.values[r],
+            &computed.lengths[r],
+            "margin-inline-start",
+            None,
+            [200., 100.],
+            &Registry::default()
+        ),
+        "50px"
+    );
+}
+
+#[test]
+fn substituted_values_the_property_rejects_are_invalid_at_computed_value_time() {
+    let doc = Document::parse(
+        "<style>@property --tw-gradient-stops{syntax:'*';inherits:false}#a{--s:;background-image:linear-gradient(var(--s))}#b{background-image:linear-gradient(var(--tw-gradient-stops))}#c{--w:red;width:var(--w);color:var(--w)}#d{--g:red,blue;background-image:linear-gradient(var(--g))}</style><div id=a></div><div id=b></div><div id=c></div><div id=d></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "background-image"), None);
+    assert_eq!(get("#b", "background-image"), None);
+    assert_eq!(get("#c", "width"), None);
+    assert_eq!(get("#c", "color").as_deref(), Some("red"));
+    assert_eq!(
+        get("#d", "background-image").as_deref(),
+        Some("linear-gradient(red,blue)")
+    );
+}
+
+#[test]
+fn scope_rules_stop_at_limits_and_scope_matches_the_root() {
+    let doc = Document::parse(
+        "<style>@scope (.card) to (.content) { img { width: 1px } :scope { height: 2px } & > p { order: 3 } } @scope (.box) { color: red }</style><div class=card id=c><img id=a><p id=p></p><div class=content><img id=b></div></div><img id=o><div class=box id=x></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "width").as_deref(), Some("1px"));
+    assert_eq!(get("#b", "width"), None);
+    assert_eq!(get("#o", "width"), None);
+    assert_eq!(get("#c", "height").as_deref(), Some("2px"));
+    assert_eq!(get("#p", "order").as_deref(), Some("3"));
+    assert_eq!(get("#x", "color").as_deref(), Some("red"));
+}
+
+#[test]
+fn counters_number_generated_content_and_list_items() {
+    let doc = Document::parse(
+        "<style>body{counter-reset:section}h2{counter-increment:section}h2::before{content:counter(section) '. '}ol.c{counter-reset:item;list-style:none}ol.c li{counter-increment:item}ol.c li::before{content:counters(item, '.') ' ' counter(item, upper-roman)}.hidden{display:none}</style><body><h2 id=a>A</h2><h2 class=hidden>H</h2><h2 id=b>B</h2><ol class=c><li id=x>x<ol class=c><li>w</li><li id=y>y</li></ol></li></ol><ol start=5><li id=l1>a</li><li id=l2 value=10>b</li><li id=l3>c</li></ol><ol reversed><li id=r1>a</li><li id=r2>b</li></ol></body>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let before = |selector| {
+        computed.pseudos[&element(&doc, selector)][0]
+            .get(Prop::CONTENT)
+            .map(str::to_owned)
+    };
+    assert_eq!(before("#a").as_deref(), Some("\"1\" '. '"));
+    assert_eq!(before("#b").as_deref(), Some("\"2\" '. '"));
+    assert_eq!(before("#x").as_deref(), Some("\"1\" ' ' \"I\""));
+    assert_eq!(before("#y").as_deref(), Some("\"1.2\" ' ' \"II\""));
+    let own = Document::parse(
+        "<style>div{counter-reset:n 5}div::before{content:counter(n);counter-increment:n 2}div::after{content:counter(n);counter-increment:n}p::after{content:counter(n);counter-reset:n 9}</style><div id=d><p id=p></p></div>",
+    );
+    let pseudo = compute_styles(
+        &own,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .pseudos;
+    let text = |selector, index: usize| {
+        pseudo[&element(&own, selector)][index]
+            .get(Prop::CONTENT)
+            .map(str::to_owned)
+    };
+    assert_eq!(text("#d", 0).as_deref(), Some("\"7\""));
+    assert_eq!(text("#p", 1).as_deref(), Some("\"9\""));
+    assert_eq!(text("#d", 1).as_deref(), Some("\"8\""));
+    let item = |selector| computed.list_items.get(&element(&doc, selector)).copied();
+    assert_eq!(
+        [item("#l1"), item("#l2"), item("#l3")],
+        [Some(5), Some(10), Some(11)]
+    );
+    assert_eq!([item("#r1"), item("#r2")], [Some(2), Some(1)]);
+}
+
+#[test]
+fn computed_values_serialize_shorthands_and_color_spaces_like_webkit() {
+    let doc = Document::parse(
+        "<style>#a{font:italic bold 14px/20px Georgia,serif;background:red url(x.png) no-repeat center / 10px 20px;border:2px solid blue;outline:1px dashed green;transition:opacity 1s ease-in 2s, color .5s;animation:spin 2s linear infinite;list-style:square inside;columns:3 100px;flex-flow:row}#g{grid-template-areas:'a b' 'c d';grid-template-rows:auto 50px;grid-template-columns:100px 1fr;grid-auto-flow:column}#gi{grid-area:a;grid-row:1 / 3;grid-column:2}#c1{color:oklch(0.6 0.2 30)}#c2{color:lab(50% 40 30)}#c3{color:color(display-p3 1 0 0 / .25)}#c4{color:hsl(120 50% 50%)}#c5{color:color-mix(in srgb, red 50%, blue)}#c6{color:color(xyz 0.5 0.2 0.1)}</style><div id=a></div><div id=g></div><div id=gi></div><p id=c1></p><p id=c2></p><p id=c3></p><p id=c4></p><p id=c5></p><p id=c6></p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (name, expected) in [
+        ("font", "italic 700 14px / 20px Georgia, serif"),
+        (
+            "background",
+            "rgb(255, 0, 0) url(x.png) no-repeat scroll 50% 50% / 10px 20px padding-box border-box",
+        ),
+        ("border", "2px solid rgb(0, 0, 255)"),
+        ("outline", "1px dashed rgb(0, 128, 0)"),
+        ("transition", "opacity 1s ease-in 2s, color 0.5s"),
+        ("animation", "2s linear infinite spin"),
+        ("list-style", "inside none square"),
+        ("columns", "100px 3"),
+        ("flex-flow", "row"),
+    ] {
+        assert_eq!(get("#a", name), expected, "{name}");
+    }
+    assert_eq!(
+        get("#g", "grid-template"),
+        "\"a b\" \"c d\" 50px / 100px 1fr"
+    );
+    assert_eq!(get("#gi", "grid-area"), "1 / 2 / 3");
+    assert_eq!(get("#gi", "grid-row"), "1 / 3");
+    for (selector, expected) in [
+        ("#c1", "oklch(0.6 0.2 30)"),
+        ("#c2", "lab(50 40 30)"),
+        ("#c3", "color(display-p3 1 0 0 / 0.25)"),
+        ("#c4", "rgb(64, 191, 64)"),
+        ("#c5", "color(srgb 0.5 0 0.5)"),
+        ("#c6", "color(xyz-d65 0.5 0.2 0.1)"),
+    ] {
+        assert_eq!(get(selector, "color"), expected, "{selector}");
+    }
+}
+
+#[test]
+fn elliptical_border_radii_keep_both_axes() {
+    let doc = Document::parse(
+        "<style>#a{border-radius:10px 60px 20px 40px / 40px 10px 30px 20px}#b{border-radius:50%/25%}#c{border-radius:calc(4px / 2) 3px}</style><p id=a></p><p id=b></p><p id=c></p>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let corners = |selector| {
+        let style = &computed[element(&doc, selector)];
+        [
+            "border-top-left-radius",
+            "border-top-right-radius",
+            "border-bottom-right-radius",
+            "border-bottom-left-radius",
+        ]
+        .map(|name| style[name].clone())
+    };
+    assert_eq!(
+        corners("#a"),
+        ["10px 40px", "60px 10px", "20px 30px", "40px 20px"]
+    );
+    assert_eq!(corners("#b")[0], "50% 25%");
+    assert_eq!(corners("#c")[..2], ["calc(4px / 2)", "3px"]);
 }

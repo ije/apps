@@ -16,6 +16,10 @@ use std::{
 };
 
 type Callback = Box<dyn FnOnce(&mut App)>;
+type WakeCallback = Rc<RefCell<dyn FnMut(&mut App)>>;
+type ReopenCallback = Box<dyn FnMut(&mut App, bool)>;
+type ShouldQuitCallback = Box<dyn FnMut(&mut App) -> bool>;
+type OpenUrlsCallback = Box<dyn FnMut(&mut App, Vec<String>)>;
 
 /// The app state, owned by the main thread.
 pub struct App {
@@ -25,12 +29,12 @@ pub struct App {
     next_window: u64,
     deferred: Vec<Callback>,
     pub(crate) propagate_event: bool,
-    on_wake: Option<Rc<RefCell<dyn FnMut(&mut App)>>>,
-    pub(crate) on_reopen: Option<Box<dyn FnMut(&mut App, bool)>>,
-    pub(crate) on_should_quit: Option<Box<dyn FnMut(&mut App) -> bool>>,
-    pub(crate) on_open_urls: Option<Box<dyn FnMut(&mut App, Vec<String>)>>,
+    on_wake: Option<WakeCallback>,
+    pub(crate) on_reopen: Option<ReopenCallback>,
+    pub(crate) on_should_quit: Option<ShouldQuitCallback>,
+    pub(crate) on_open_urls: Option<OpenUrlsCallback>,
     pending_urls: Vec<String>,
-    pub(crate) on_quit: Option<Box<dyn FnOnce(&mut App)>>,
+    pub(crate) on_quit: Option<Callback>,
     waker: Arc<AtomicBool>,
 }
 

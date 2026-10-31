@@ -1,11 +1,11 @@
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Pixels, Point, Rgba, Size,
-    black,
-    geometry::{round_stroke_to_device_pixel, round_to_device_pixel},
+    BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Pixels, Point, Radii, Rgba,
+    Size, black,
+    geometry::{round_stroke_to_device_pixel, to_layout_unit},
     point, px, size,
     text::{
         Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString, StrikethroughStyle,
-        TextAlign, TextRun, TextWrap, UnderlineStyle, WhiteSpace,
+        TextAlign, TextRun, TextWrap, UnderlineStyle, WhiteSpace, WordBreak,
     },
 };
 
@@ -29,6 +29,23 @@ pub fn relative(fraction: f32) -> Length {
     Length::Fraction(fraction)
 }
 
+impl Radii<Length> {
+    pub fn to_pixels(&self, size: Size<Pixels>) -> Radii<Pixels> {
+        let pixels = |length: Length, side: Pixels| match length {
+            Length::Px(value) => value,
+            Length::Fraction(fraction) => side * fraction,
+            Length::Auto => Pixels::ZERO,
+        };
+        Radii {
+            x: self.x.map(|length| pixels(length, size.width)),
+            y: self.y.map(|length| pixels(length, size.height)),
+        }
+    }
+    pub fn resolve(&self, size: Size<Pixels>) -> Radii<Pixels> {
+        self.to_pixels(size).clamp_radii_for_quad_size(size)
+    }
+}
+
 impl Length {
     pub fn is_auto(&self) -> bool {
         *self == Self::Auto
@@ -36,25 +53,21 @@ impl Length {
     fn dimension(self, scale: f32) -> taffy::Dimension {
         match self {
             Self::Auto => taffy::Dimension::auto(),
-            Self::Px(value) => taffy::Dimension::length(round_to_device_pixel(value.0, scale)),
+            Self::Px(value) => taffy::Dimension::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::Dimension::percent(value),
         }
     }
     fn auto(self, scale: f32) -> taffy::LengthPercentageAuto {
         match self {
             Self::Auto => taffy::LengthPercentageAuto::auto(),
-            Self::Px(value) => {
-                taffy::LengthPercentageAuto::length(round_to_device_pixel(value.0, scale))
-            }
+            Self::Px(value) => taffy::LengthPercentageAuto::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::LengthPercentageAuto::percent(value),
         }
     }
     fn definite(self, scale: f32) -> taffy::LengthPercentage {
         match self {
             Self::Auto => taffy::LengthPercentage::length(0.),
-            Self::Px(value) => {
-                taffy::LengthPercentage::length(round_to_device_pixel(value.0, scale))
-            }
+            Self::Px(value) => taffy::LengthPercentage::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::LengthPercentage::percent(value),
         }
     }
@@ -66,6 +79,24 @@ pub enum Display {
     Block,
     Flex,
     Grid,
+    None,
+}
+
+/// Where a box finds the baseline its line aligns, and the last baseline an inline-block around it uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Baseline {
+    /// Block flow: the first and the last child with a baseline, or a line's items.
+    #[default]
+    Auto,
+    /// An inline-block: its line aligns its last baseline.
+    Last,
+    /// Flex and grid boxes: the first baseline is also the last.
+    First,
+    /// Tables have no last baseline.
+    FirstOnly,
+    /// A piece of a line, like a strut: its bottom border edge is its baseline.
+    Bottom,
+    /// No baseline: the line aligns the bottom border edge.
     None,
 }
 
@@ -268,10 +299,11 @@ pub struct Style {
     pub flex_basis: Length,
     pub flex_grow: f32,
     pub flex_shrink: f32,
+    pub baseline: Baseline,
     pub background: Option<Rgba>,
     pub border_color: Option<Rgba>,
     pub border_style: BorderStyle,
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: Radii<Length>,
     pub box_shadow: Vec<BoxShadow>,
     pub text: TextStyleRefinement,
     pub mouse_cursor: Option<CursorStyle>,
@@ -304,10 +336,11 @@ impl Default for Style {
             flex_basis: Length::Auto,
             flex_grow: 0.,
             flex_shrink: 1.,
+            baseline: Baseline::Auto,
             background: None,
             border_color: None,
             border_style: BorderStyle::Solid,
-            corner_radii: Corners::default(),
+            corner_radii: Radii::default(),
             box_shadow: Vec::new(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
@@ -420,6 +453,11 @@ impl Style {
             flex_basis: self.flex_basis.dimension(scale),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
+            contain: if self.baseline == Baseline::None {
+                t::Contain::LAYOUT
+            } else {
+                t::Contain::NONE
+            },
             ..Default::default()
         }
     }
@@ -455,25 +493,18 @@ impl Style {
                 if clip_y { max.y } else { bounds.bottom() },
             ),
         );
-        let radii = self.corner_radii;
+        let radii = self.corner_radii.resolve(bounds.size);
         if radii.is_zero() {
             return Some(ContentMask::from(clip));
         }
-        let inset = |radius: Pixels, a: Pixels, b: Pixels| (radius - a.max(b)).max(Pixels::ZERO);
-        let (top, right, bottom, left) = (
-            min.y - bounds.origin.y,
-            bounds.right() - max.x,
-            bounds.bottom() - max.y,
-            min.x - bounds.origin.x,
-        );
         let mut mask = ContentMask::rounded(
             Bounds::from_corners(min, max),
-            Corners {
-                top_left: inset(radii.top_left, top, left),
-                top_right: inset(radii.top_right, top, right),
-                bottom_right: inset(radii.bottom_right, bottom, right),
-                bottom_left: inset(radii.bottom_left, bottom, left),
-            },
+            radii.inset(
+                min.y - bounds.origin.y,
+                bounds.right() - max.x,
+                bounds.bottom() - max.y,
+                min.x - bounds.origin.x,
+            ),
         );
         mask.bounds = clip;
         Some(mask)
@@ -503,6 +534,7 @@ pub struct TextStyle {
     pub word_spacing: Pixels,
     pub text_indent: Pixels,
     pub text_wrap: TextWrap,
+    pub word_break: WordBreak,
     /// Light text gets thicker strokes, like the platform's font smoothing.
     pub font_smoothing: bool,
 }
@@ -529,6 +561,7 @@ impl Default for TextStyle {
             word_spacing: Pixels::ZERO,
             text_indent: Pixels::ZERO,
             text_wrap: TextWrap::Wrap,
+            word_break: WordBreak::Normal,
             font_smoothing: true,
         }
     }
@@ -585,6 +618,7 @@ impl TextStyle {
             word_spacing,
             text_indent,
             text_wrap,
+            word_break,
             font_smoothing
         );
         if let Some(value) = &refinement.font_fallbacks {
@@ -630,6 +664,7 @@ pub struct TextStyleRefinement {
     pub word_spacing: Option<Pixels>,
     pub text_indent: Option<Pixels>,
     pub text_wrap: Option<TextWrap>,
+    pub word_break: Option<WordBreak>,
     pub font_smoothing: Option<bool>,
 }
 
@@ -704,6 +739,10 @@ pub trait Styled: Sized {
     }
     fn items_center(mut self) -> Self {
         self.style().align_items = Some(AlignItems::Center);
+        self
+    }
+    fn baseline(mut self, value: Baseline) -> Self {
+        self.style().baseline = value;
         self
     }
     fn justify_center(mut self) -> Self {
@@ -864,23 +903,27 @@ pub trait Styled: Sized {
         self
     }
     fn rounded_tl(mut self, value: Pixels) -> Self {
-        self.style().corner_radii.top_left = value;
+        let radii = &mut self.style().corner_radii;
+        (radii.x.top_left, radii.y.top_left) = (Length::Px(value), Length::Px(value));
         self
     }
     fn rounded_tr(mut self, value: Pixels) -> Self {
-        self.style().corner_radii.top_right = value;
+        let radii = &mut self.style().corner_radii;
+        (radii.x.top_right, radii.y.top_right) = (Length::Px(value), Length::Px(value));
         self
     }
     fn rounded_br(mut self, value: Pixels) -> Self {
-        self.style().corner_radii.bottom_right = value;
+        let radii = &mut self.style().corner_radii;
+        (radii.x.bottom_right, radii.y.bottom_right) = (Length::Px(value), Length::Px(value));
         self
     }
     fn rounded_bl(mut self, value: Pixels) -> Self {
-        self.style().corner_radii.bottom_left = value;
+        let radii = &mut self.style().corner_radii;
+        (radii.x.bottom_left, radii.y.bottom_left) = (Length::Px(value), Length::Px(value));
         self
     }
     fn rounded_full(mut self) -> Self {
-        self.style().corner_radii = Corners::all(px(f32::MAX / 4.));
+        self.style().corner_radii = Corners::all(Length::Px(px(f32::MAX / 4.))).into();
         self
     }
     fn bg(mut self, color: Rgba) -> Self {

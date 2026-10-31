@@ -2,6 +2,8 @@
 //! document becomes a CSS rule in `@layer utilities`, and `@apply` expands into the author rules.
 
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
+use crate::dom::Document;
+use rustc_hash::FxHashMap;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -17,7 +19,7 @@ thread_local! {
         .lines()
         .filter_map(|line| line.strip_suffix(';')?.split_once(':'))
         .collect();
-    /// Parsed once and added after the generated sheet; its layer order puts it in `base`.
+    /// Parsed once and added after the generated sheets; its layer order puts it in `base`.
     static BASE: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("@layer base{{{PREFLIGHT}}}")));
 }
 
@@ -31,18 +33,114 @@ const KEYFRAMES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Default variables that Tailwind inlines instead of emitting.
+const INLINE: &[&str] = &[
+    "--blur",
+    "--shadow",
+    "--shadow-inner",
+    "--drop-shadow",
+    "--radius",
+    "--max-width-prose",
+];
+
+/// Variables that `--name-*: initial` keeps, because they belong to another namespace.
+const KEPT: &[(&str, &[&str])] = &[
+    ("--font", &["--font-weight", "--font-size"]),
+    ("--inset", &["--inset-shadow", "--inset-ring"]),
+    (
+        "--text",
+        &[
+            "--text-color",
+            "--text-decoration-color",
+            "--text-decoration-thickness",
+            "--text-indent",
+            "--text-shadow",
+            "--text-underline-offset",
+        ],
+    ),
+    (
+        "--grid-column",
+        &["--grid-column-start", "--grid-column-end"],
+    ),
+    ("--grid-row", &["--grid-row-start", "--grid-row-end"]),
+];
+
 /// Initial values of the `--tw-*` properties. Tailwind registers them with `@property`; like its
 /// fallback for older browsers, they are set on every element so they don't inherit.
 const PROPERTIES: &[(&str, &str)] = &[
+    ("--tw-border-spacing-x", "0"),
+    ("--tw-border-spacing-y", "0"),
     ("--tw-translate-x", "0"),
     ("--tw-translate-y", "0"),
     ("--tw-translate-z", "0"),
     ("--tw-scale-x", "1"),
     ("--tw-scale-y", "1"),
     ("--tw-scale-z", "1"),
-    ("--tw-space-x-reverse", "0"),
+    ("--tw-rotate-x", "initial"),
+    ("--tw-rotate-y", "initial"),
+    ("--tw-rotate-z", "initial"),
+    ("--tw-skew-x", "initial"),
+    ("--tw-skew-y", "initial"),
+    ("--tw-pan-x", "initial"),
+    ("--tw-pan-y", "initial"),
+    ("--tw-pinch-zoom", "initial"),
+    ("--tw-scroll-snap-strictness", "proximity"),
+    ("--tw-scrollbar-thumb", "#0000"),
+    ("--tw-scrollbar-track", "#0000"),
     ("--tw-space-y-reverse", "0"),
+    ("--tw-space-x-reverse", "0"),
+    ("--tw-divide-x-reverse", "0"),
     ("--tw-border-style", "solid"),
+    ("--tw-divide-y-reverse", "0"),
+    ("--tw-gradient-position", "initial"),
+    ("--tw-gradient-from", "#0000"),
+    ("--tw-gradient-via", "#0000"),
+    ("--tw-gradient-to", "#0000"),
+    ("--tw-gradient-stops", "initial"),
+    ("--tw-gradient-via-stops", "initial"),
+    ("--tw-gradient-from-position", "0%"),
+    ("--tw-gradient-via-position", "50%"),
+    ("--tw-gradient-to-position", "100%"),
+    ("--tw-mask-linear", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-radial", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-conic", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-left", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-right", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-bottom", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-top", "linear-gradient(#fff, #fff)"),
+    ("--tw-mask-top-from-position", "0%"),
+    ("--tw-mask-top-to-position", "100%"),
+    ("--tw-mask-top-from-color", "black"),
+    ("--tw-mask-top-to-color", "transparent"),
+    ("--tw-mask-bottom-from-position", "0%"),
+    ("--tw-mask-bottom-to-position", "100%"),
+    ("--tw-mask-bottom-from-color", "black"),
+    ("--tw-mask-bottom-to-color", "transparent"),
+    ("--tw-mask-right-from-position", "0%"),
+    ("--tw-mask-right-to-position", "100%"),
+    ("--tw-mask-right-from-color", "black"),
+    ("--tw-mask-right-to-color", "transparent"),
+    ("--tw-mask-left-from-position", "0%"),
+    ("--tw-mask-left-to-position", "100%"),
+    ("--tw-mask-left-from-color", "black"),
+    ("--tw-mask-left-to-color", "transparent"),
+    ("--tw-mask-linear-position", "0deg"),
+    ("--tw-mask-linear-from-position", "0%"),
+    ("--tw-mask-linear-to-position", "100%"),
+    ("--tw-mask-linear-from-color", "black"),
+    ("--tw-mask-linear-to-color", "transparent"),
+    ("--tw-mask-radial-from-position", "0%"),
+    ("--tw-mask-radial-to-position", "100%"),
+    ("--tw-mask-radial-from-color", "black"),
+    ("--tw-mask-radial-to-color", "transparent"),
+    ("--tw-mask-radial-shape", "ellipse"),
+    ("--tw-mask-radial-size", "farthest-corner"),
+    ("--tw-mask-radial-position", "center"),
+    ("--tw-mask-conic-position", "0deg"),
+    ("--tw-mask-conic-from-position", "0%"),
+    ("--tw-mask-conic-to-position", "100%"),
+    ("--tw-mask-conic-from-color", "black"),
+    ("--tw-mask-conic-to-color", "transparent"),
     ("--tw-leading", "initial"),
     ("--tw-font-weight", "initial"),
     ("--tw-tracking", "initial"),
@@ -53,9 +151,13 @@ const PROPERTIES: &[(&str, &str)] = &[
     ("--tw-numeric-fraction", "initial"),
     ("--tw-shadow", "0 0 #0000"),
     ("--tw-shadow-color", "initial"),
+    ("--tw-shadow-alpha", "100%"),
     ("--tw-inset-shadow", "0 0 #0000"),
+    ("--tw-inset-shadow-color", "initial"),
+    ("--tw-inset-shadow-alpha", "100%"),
     ("--tw-ring-color", "initial"),
     ("--tw-ring-shadow", "0 0 #0000"),
+    ("--tw-inset-ring-color", "initial"),
     ("--tw-inset-ring-shadow", "0 0 #0000"),
     ("--tw-ring-inset", "initial"),
     ("--tw-ring-offset-width", "0px"),
@@ -68,9 +170,13 @@ const PROPERTIES: &[(&str, &str)] = &[
     ("--tw-grayscale", "initial"),
     ("--tw-hue-rotate", "initial"),
     ("--tw-invert", "initial"),
+    ("--tw-opacity", "initial"),
     ("--tw-saturate", "initial"),
     ("--tw-sepia", "initial"),
     ("--tw-drop-shadow", "initial"),
+    ("--tw-drop-shadow-color", "initial"),
+    ("--tw-drop-shadow-alpha", "100%"),
+    ("--tw-drop-shadow-size", "initial"),
     ("--tw-backdrop-blur", "initial"),
     ("--tw-backdrop-brightness", "initial"),
     ("--tw-backdrop-contrast", "initial"),
@@ -86,6 +192,8 @@ const PROPERTIES: &[(&str, &str)] = &[
     ("--tw-contain-layout", "initial"),
     ("--tw-contain-paint", "initial"),
     ("--tw-contain-style", "initial"),
+    ("--tw-text-shadow-color", "initial"),
+    ("--tw-text-shadow-alpha", "100%"),
     ("--tw-content", "\"\""),
 ];
 
@@ -100,6 +208,8 @@ const ORDER: &[&str] = &[
     "inset-block",
     "inset-inline-start",
     "inset-inline-end",
+    "inset-block-start",
+    "inset-block-end",
     "top",
     "right",
     "bottom",
@@ -115,11 +225,14 @@ const ORDER: &[&str] = &[
     "grid-row-end",
     "float",
     "clear",
+    "--tw-container-component",
     "margin",
     "margin-inline",
     "margin-block",
     "margin-inline-start",
     "margin-inline-end",
+    "margin-block-start",
+    "margin-block-end",
     "margin-top",
     "margin-right",
     "margin-bottom",
@@ -152,14 +265,31 @@ const ORDER: &[&str] = &[
     "--tw-scale-y",
     "--tw-scale-z",
     "rotate",
+    "--tw-rotate-x",
+    "--tw-rotate-y",
+    "--tw-rotate-z",
+    "--tw-skew-x",
+    "--tw-skew-y",
     "transform",
+    "zoom",
     "animation",
     "cursor",
     "touch-action",
+    "--tw-pan-x",
+    "--tw-pan-y",
+    "--tw-pinch-zoom",
     "resize",
+    "scroll-snap-type",
+    "--tw-scroll-snap-strictness",
+    "scroll-snap-align",
+    "scroll-snap-stop",
     "scroll-margin",
     "scroll-margin-inline",
     "scroll-margin-block",
+    "scroll-margin-inline-start",
+    "scroll-margin-inline-end",
+    "scroll-margin-block-start",
+    "scroll-margin-block-end",
     "scroll-margin-top",
     "scroll-margin-right",
     "scroll-margin-bottom",
@@ -167,14 +297,25 @@ const ORDER: &[&str] = &[
     "scroll-padding",
     "scroll-padding-inline",
     "scroll-padding-block",
+    "scroll-padding-inline-start",
+    "scroll-padding-inline-end",
+    "scroll-padding-block-start",
+    "scroll-padding-block-end",
     "scroll-padding-top",
     "scroll-padding-right",
     "scroll-padding-bottom",
     "scroll-padding-left",
+    "scrollbar-width",
+    "scrollbar-color",
+    "scrollbar-gutter",
     "list-style-position",
     "list-style-type",
+    "list-style-image",
     "appearance",
     "columns",
+    "break-before",
+    "break-inside",
+    "break-after",
     "grid-auto-columns",
     "grid-auto-flow",
     "grid-auto-rows",
@@ -193,6 +334,11 @@ const ORDER: &[&str] = &[
     "row-gap",
     "--tw-space-x-reverse",
     "--tw-space-y-reverse",
+    "divide-x-width",
+    "divide-y-width",
+    "--tw-divide-y-reverse",
+    "divide-style",
+    "divide-color",
     "place-self",
     "align-self",
     "justify-self",
@@ -204,6 +350,12 @@ const ORDER: &[&str] = &[
     "overscroll-behavior-y",
     "scroll-behavior",
     "border-radius",
+    "border-start-radius",
+    "border-end-radius",
+    "border-top-radius",
+    "border-right-radius",
+    "border-bottom-radius",
+    "border-left-radius",
     "border-start-start-radius",
     "border-start-end-radius",
     "border-end-end-radius",
@@ -217,6 +369,8 @@ const ORDER: &[&str] = &[
     "border-block-width",
     "border-inline-start-width",
     "border-inline-end-width",
+    "border-block-start-width",
+    "border-block-end-width",
     "border-top-width",
     "border-right-width",
     "border-bottom-width",
@@ -226,6 +380,8 @@ const ORDER: &[&str] = &[
     "border-block-style",
     "border-inline-start-style",
     "border-inline-end-style",
+    "border-block-start-style",
+    "border-block-end-style",
     "border-top-style",
     "border-right-style",
     "border-bottom-style",
@@ -235,18 +391,79 @@ const ORDER: &[&str] = &[
     "border-block-color",
     "border-inline-start-color",
     "border-inline-end-color",
+    "border-block-start-color",
+    "border-block-end-color",
     "border-top-color",
     "border-right-color",
     "border-bottom-color",
     "border-left-color",
     "background-color",
     "background-image",
+    "--tw-gradient-position",
+    "--tw-gradient-stops",
+    "--tw-gradient-via-stops",
+    "--tw-gradient-from",
+    "--tw-gradient-from-position",
+    "--tw-gradient-via",
+    "--tw-gradient-via-position",
+    "--tw-gradient-to",
+    "--tw-gradient-to-position",
+    "mask-image",
+    "--tw-mask-top",
+    "--tw-mask-top-from-color",
+    "--tw-mask-top-from-position",
+    "--tw-mask-top-to-color",
+    "--tw-mask-top-to-position",
+    "--tw-mask-right",
+    "--tw-mask-right-from-color",
+    "--tw-mask-right-from-position",
+    "--tw-mask-right-to-color",
+    "--tw-mask-right-to-position",
+    "--tw-mask-bottom",
+    "--tw-mask-bottom-from-color",
+    "--tw-mask-bottom-from-position",
+    "--tw-mask-bottom-to-color",
+    "--tw-mask-bottom-to-position",
+    "--tw-mask-left",
+    "--tw-mask-left-from-color",
+    "--tw-mask-left-from-position",
+    "--tw-mask-left-to-color",
+    "--tw-mask-left-to-position",
+    "--tw-mask-linear",
+    "--tw-mask-linear-position",
+    "--tw-mask-linear-from-color",
+    "--tw-mask-linear-from-position",
+    "--tw-mask-linear-to-color",
+    "--tw-mask-linear-to-position",
+    "--tw-mask-radial",
+    "--tw-mask-radial-shape",
+    "--tw-mask-radial-size",
+    "--tw-mask-radial-position",
+    "--tw-mask-radial-from-color",
+    "--tw-mask-radial-from-position",
+    "--tw-mask-radial-to-color",
+    "--tw-mask-radial-to-position",
+    "--tw-mask-conic",
+    "--tw-mask-conic-position",
+    "--tw-mask-conic-from-color",
+    "--tw-mask-conic-from-position",
+    "--tw-mask-conic-to-color",
+    "--tw-mask-conic-to-position",
+    "box-decoration-break",
     "background-size",
     "background-attachment",
     "background-clip",
     "background-position",
     "background-repeat",
     "background-origin",
+    "mask-composite",
+    "mask-mode",
+    "mask-type",
+    "mask-size",
+    "mask-clip",
+    "mask-position",
+    "mask-repeat",
+    "mask-origin",
     "fill",
     "stroke",
     "stroke-width",
@@ -257,6 +474,8 @@ const ORDER: &[&str] = &[
     "padding-block",
     "padding-inline-start",
     "padding-inline-end",
+    "padding-block-start",
+    "padding-block-end",
     "padding-top",
     "padding-right",
     "padding-bottom",
@@ -265,6 +484,7 @@ const ORDER: &[&str] = &[
     "text-indent",
     "vertical-align",
     "font-family",
+    "font-feature-settings",
     "font-size",
     "line-height",
     "font-weight",
@@ -275,6 +495,7 @@ const ORDER: &[&str] = &[
     "text-overflow",
     "hyphens",
     "white-space",
+    "tab-size",
     "color",
     "text-transform",
     "font-style",
@@ -286,6 +507,7 @@ const ORDER: &[&str] = &[
     "text-decoration-thickness",
     "text-underline-offset",
     "-webkit-font-smoothing",
+    "placeholder-color",
     "caret-color",
     "accent-color",
     "color-scheme",
@@ -298,7 +520,9 @@ const ORDER: &[&str] = &[
     "--tw-ring-shadow",
     "--tw-ring-color",
     "--tw-inset-shadow",
+    "--tw-inset-shadow-color",
     "--tw-inset-ring-shadow",
+    "--tw-inset-ring-color",
     "--tw-ring-offset-width",
     "--tw-ring-offset-color",
     "outline",
@@ -345,7 +569,10 @@ const VARIANTS: &[(&str, &str)] = &[
     ("peer", ""),
     ("first-letter", "&::first-letter"),
     ("first-line", "&::first-line"),
-    ("marker", "& *::marker, &::marker"),
+    (
+        "marker",
+        "& *::marker, &::marker, & *::-webkit-details-marker, &::-webkit-details-marker",
+    ),
     ("selection", "& *::selection, &::selection"),
     ("file", "&::file-selector-button"),
     ("placeholder", "&::placeholder"),
@@ -363,7 +590,7 @@ const VARIANTS: &[(&str, &str)] = &[
     ("only-of-type", "&:only-of-type"),
     ("visited", "&:visited"),
     ("target", "&:target"),
-    ("open", "&:is([open], :open)"),
+    ("open", "&:is([open], :popover-open, :open)"),
     ("default", "&:default"),
     ("checked", "&:checked"),
     ("indeterminate", "&:indeterminate"),
@@ -425,282 +652,81 @@ const VARIANTS: &[(&str, &str)] = &[
     ("noscript", "@media (scripting: none)"),
 ];
 
+/// Tailwind's keyword utilities, sorted by name.
 const STATIC: &[(&str, &str)] = &[
-    ("@container", "container-type:inline-size"),
-    (
-        "sr-only",
-        "position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border-width:0",
-    ),
-    (
-        "not-sr-only",
-        "position:static;width:auto;height:auto;padding:0;margin:0;overflow:visible;clip-path:none;white-space:normal",
-    ),
-    ("pointer-events-none", "pointer-events:none"),
-    ("pointer-events-auto", "pointer-events:auto"),
-    ("visible", "visibility:visible"),
-    ("invisible", "visibility:hidden"),
-    ("collapse", "visibility:collapse"),
-    ("static", "position:static"),
-    ("fixed", "position:fixed"),
     ("absolute", "position:absolute"),
-    ("relative", "position:relative"),
-    ("sticky", "position:sticky"),
-    ("isolate", "isolation:isolate"),
-    ("isolation-auto", "isolation:auto"),
-    ("block", "display:block"),
-    ("inline-block", "display:inline-block"),
-    ("inline", "display:inline"),
-    ("flex", "display:flex"),
-    ("inline-flex", "display:inline-flex"),
-    ("table", "display:table"),
-    ("table-row", "display:table-row"),
-    ("table-cell", "display:table-cell"),
-    ("flow-root", "display:flow-root"),
-    ("grid", "display:grid"),
-    ("inline-grid", "display:inline-grid"),
-    ("contents", "display:contents"),
-    ("list-item", "display:list-item"),
-    ("hidden", "display:none"),
-    ("flex-row", "flex-direction:row"),
-    ("flex-row-reverse", "flex-direction:row-reverse"),
-    ("flex-col", "flex-direction:column"),
-    ("flex-col-reverse", "flex-direction:column-reverse"),
-    ("flex-wrap", "flex-wrap:wrap"),
-    ("flex-nowrap", "flex-wrap:nowrap"),
-    ("flex-wrap-reverse", "flex-wrap:wrap-reverse"),
-    ("flex-auto", "flex:auto"),
-    ("flex-initial", "flex:0 auto"),
-    ("flex-none", "flex:none"),
-    ("items-start", "align-items:flex-start"),
-    ("items-end", "align-items:flex-end"),
-    ("items-center", "align-items:center"),
-    ("items-baseline", "align-items:baseline"),
-    ("items-stretch", "align-items:stretch"),
-    ("justify-normal", "justify-content:normal"),
-    ("justify-start", "justify-content:flex-start"),
-    ("justify-end", "justify-content:flex-end"),
-    ("justify-center", "justify-content:center"),
-    ("justify-between", "justify-content:space-between"),
-    ("justify-around", "justify-content:space-around"),
-    ("justify-evenly", "justify-content:space-evenly"),
-    ("justify-stretch", "justify-content:stretch"),
-    ("content-normal", "align-content:normal"),
-    ("content-start", "align-content:flex-start"),
-    ("content-end", "align-content:flex-end"),
-    ("content-center", "align-content:center"),
-    ("content-between", "align-content:space-between"),
-    ("content-around", "align-content:space-around"),
-    ("content-evenly", "align-content:space-evenly"),
-    ("content-stretch", "align-content:stretch"),
-    ("self-auto", "align-self:auto"),
-    ("self-start", "align-self:flex-start"),
-    ("self-end", "align-self:flex-end"),
-    ("self-center", "align-self:center"),
-    ("self-stretch", "align-self:stretch"),
-    ("self-baseline", "align-self:baseline"),
-    ("justify-items-start", "justify-items:start"),
-    ("justify-items-end", "justify-items:end"),
-    ("justify-items-center", "justify-items:center"),
-    ("justify-items-stretch", "justify-items:stretch"),
-    ("justify-self-auto", "justify-self:auto"),
-    ("justify-self-start", "justify-self:start"),
-    ("justify-self-end", "justify-self:end"),
-    ("justify-self-center", "justify-self:center"),
-    ("justify-self-stretch", "justify-self:stretch"),
-    ("place-content-center", "place-content:center"),
-    ("place-content-start", "place-content:start"),
-    ("place-content-end", "place-content:end"),
-    ("place-content-between", "place-content:space-between"),
-    ("place-content-stretch", "place-content:stretch"),
-    ("place-items-start", "place-items:start"),
-    ("place-items-end", "place-items:end"),
-    ("place-items-center", "place-items:center"),
-    ("place-items-stretch", "place-items:stretch"),
-    ("place-self-auto", "place-self:auto"),
-    ("place-self-start", "place-self:start"),
-    ("place-self-end", "place-self:end"),
-    ("place-self-center", "place-self:center"),
-    ("place-self-stretch", "place-self:stretch"),
-    ("grid-flow-row", "grid-auto-flow:row"),
-    ("grid-flow-col", "grid-auto-flow:column"),
-    ("grid-flow-dense", "grid-auto-flow:dense"),
-    ("grid-flow-row-dense", "grid-auto-flow:row dense"),
-    ("grid-flow-col-dense", "grid-auto-flow:column dense"),
-    (
-        "truncate",
-        "overflow:hidden;text-overflow:ellipsis;white-space:nowrap",
-    ),
-    ("text-ellipsis", "text-overflow:ellipsis"),
-    ("text-clip", "text-overflow:clip"),
-    ("overflow-auto", "overflow:auto"),
-    ("overflow-hidden", "overflow:hidden"),
-    ("overflow-clip", "overflow:clip"),
-    ("overflow-visible", "overflow:visible"),
-    ("overflow-scroll", "overflow:scroll"),
-    ("overflow-x-auto", "overflow-x:auto"),
-    ("overflow-x-hidden", "overflow-x:hidden"),
-    ("overflow-x-clip", "overflow-x:clip"),
-    ("overflow-x-visible", "overflow-x:visible"),
-    ("overflow-x-scroll", "overflow-x:scroll"),
-    ("overflow-y-auto", "overflow-y:auto"),
-    ("overflow-y-hidden", "overflow-y:hidden"),
-    ("overflow-y-clip", "overflow-y:clip"),
-    ("overflow-y-visible", "overflow-y:visible"),
-    ("overflow-y-scroll", "overflow-y:scroll"),
-    ("overscroll-auto", "overscroll-behavior:auto"),
-    ("overscroll-contain", "overscroll-behavior:contain"),
-    ("overscroll-none", "overscroll-behavior:none"),
-    ("overscroll-x-contain", "overscroll-behavior-x:contain"),
-    ("overscroll-y-contain", "overscroll-behavior-y:contain"),
-    ("scroll-auto", "scroll-behavior:auto"),
-    ("scroll-smooth", "scroll-behavior:smooth"),
-    ("whitespace-normal", "white-space:normal"),
-    ("whitespace-nowrap", "white-space:nowrap"),
-    ("whitespace-pre", "white-space:pre"),
-    ("whitespace-pre-line", "white-space:pre-line"),
-    ("whitespace-pre-wrap", "white-space:pre-wrap"),
-    ("whitespace-break-spaces", "white-space:break-spaces"),
-    ("break-normal", "overflow-wrap:normal;word-break:normal"),
-    ("break-words", "overflow-wrap:break-word"),
-    ("break-all", "word-break:break-all"),
-    ("break-keep", "word-break:keep-all"),
-    ("wrap-anywhere", "overflow-wrap:anywhere"),
-    ("wrap-break-word", "overflow-wrap:break-word"),
-    ("wrap-normal", "overflow-wrap:normal"),
-    ("text-wrap", "text-wrap:wrap"),
-    ("text-nowrap", "text-wrap:nowrap"),
-    ("text-balance", "text-wrap:balance"),
-    ("text-pretty", "text-wrap:pretty"),
-    ("text-left", "text-align:left"),
-    ("text-center", "text-align:center"),
-    ("text-right", "text-align:right"),
-    ("text-justify", "text-align:justify"),
-    ("text-start", "text-align:start"),
-    ("text-end", "text-align:end"),
+    ("accent-auto", "accent-color:auto"),
     ("align-baseline", "vertical-align:baseline"),
-    ("align-top", "vertical-align:top"),
-    ("align-middle", "vertical-align:middle"),
     ("align-bottom", "vertical-align:bottom"),
-    ("align-text-top", "vertical-align:text-top"),
-    ("align-text-bottom", "vertical-align:text-bottom"),
+    ("align-middle", "vertical-align:middle"),
     ("align-sub", "vertical-align:sub"),
     ("align-super", "vertical-align:super"),
-    ("uppercase", "text-transform:uppercase"),
-    ("lowercase", "text-transform:lowercase"),
-    ("capitalize", "text-transform:capitalize"),
-    ("normal-case", "text-transform:none"),
-    ("italic", "font-style:italic"),
-    ("not-italic", "font-style:normal"),
-    ("underline", "text-decoration-line:underline"),
-    ("overline", "text-decoration-line:overline"),
-    ("line-through", "text-decoration-line:line-through"),
-    ("no-underline", "text-decoration-line:none"),
-    ("decoration-solid", "text-decoration-style:solid"),
-    ("decoration-double", "text-decoration-style:double"),
-    ("decoration-dotted", "text-decoration-style:dotted"),
-    ("decoration-dashed", "text-decoration-style:dashed"),
-    ("decoration-wavy", "text-decoration-style:wavy"),
-    ("decoration-auto", "text-decoration-thickness:auto"),
-    (
-        "decoration-from-font",
-        "text-decoration-thickness:from-font",
-    ),
-    ("underline-offset-auto", "text-underline-offset:auto"),
+    ("align-text-bottom", "vertical-align:text-bottom"),
+    ("align-text-top", "vertical-align:text-top"),
+    ("align-top", "vertical-align:top"),
     (
         "antialiased",
         "-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale",
     ),
+    ("appearance-auto", "appearance:auto"),
+    ("appearance-none", "appearance:none"),
     (
-        "subpixel-antialiased",
-        "-webkit-font-smoothing:auto;-moz-osx-font-smoothing:auto",
+        "backdrop-filter-none",
+        "-webkit-backdrop-filter:none;backdrop-filter:none",
     ),
-    ("normal-nums", "font-variant-numeric:normal"),
-    (
-        "ordinal",
-        "--tw-ordinal:ordinal;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "slashed-zero",
-        "--tw-slashed-zero:slashed-zero;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "lining-nums",
-        "--tw-numeric-figure:lining-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "oldstyle-nums",
-        "--tw-numeric-figure:oldstyle-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "proportional-nums",
-        "--tw-numeric-spacing:proportional-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "tabular-nums",
-        "--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "diagonal-fractions",
-        "--tw-numeric-fraction:diagonal-fractions;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    (
-        "stacked-fractions",
-        "--tw-numeric-fraction:stacked-fractions;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
-    ),
-    ("select-none", "user-select:none"),
-    ("select-text", "user-select:text"),
-    ("select-all", "user-select:all"),
-    ("select-auto", "user-select:auto"),
-    ("resize", "resize:both"),
-    ("resize-none", "resize:none"),
-    ("resize-x", "resize:horizontal"),
-    ("resize-y", "resize:vertical"),
-    ("bg-clip-border", "background-clip:border-box"),
-    ("bg-clip-padding", "background-clip:padding-box"),
-    ("bg-clip-content", "background-clip:content-box"),
-    ("bg-clip-text", "background-clip:text"),
-    ("bg-fixed", "background-attachment:fixed"),
-    ("bg-local", "background-attachment:local"),
-    ("bg-scroll", "background-attachment:scroll"),
-    ("bg-repeat", "background-repeat:repeat"),
-    ("bg-no-repeat", "background-repeat:no-repeat"),
+    ("backface-hidden", "backface-visibility:hidden"),
+    ("backface-visible", "backface-visibility:visible"),
     ("bg-auto", "background-size:auto"),
-    ("bg-cover", "background-size:cover"),
-    ("bg-contain", "background-size:contain"),
+    ("bg-blend-color", "background-blend-mode:color"),
+    ("bg-blend-color-burn", "background-blend-mode:color-burn"),
+    ("bg-blend-color-dodge", "background-blend-mode:color-dodge"),
+    ("bg-blend-darken", "background-blend-mode:darken"),
+    ("bg-blend-difference", "background-blend-mode:difference"),
+    ("bg-blend-exclusion", "background-blend-mode:exclusion"),
+    ("bg-blend-hard-light", "background-blend-mode:hard-light"),
+    ("bg-blend-hue", "background-blend-mode:hue"),
+    ("bg-blend-lighten", "background-blend-mode:lighten"),
+    ("bg-blend-luminosity", "background-blend-mode:luminosity"),
+    ("bg-blend-multiply", "background-blend-mode:multiply"),
+    ("bg-blend-normal", "background-blend-mode:normal"),
+    ("bg-blend-overlay", "background-blend-mode:overlay"),
+    ("bg-blend-saturation", "background-blend-mode:saturation"),
+    ("bg-blend-screen", "background-blend-mode:screen"),
+    ("bg-blend-soft-light", "background-blend-mode:soft-light"),
+    ("bg-bottom", "background-position:bottom"),
+    ("bg-bottom-left", "background-position:left bottom"),
+    ("bg-bottom-right", "background-position:right bottom"),
     ("bg-center", "background-position:center"),
+    ("bg-clip-border", "background-clip:border-box"),
+    ("bg-clip-content", "background-clip:content-box"),
+    ("bg-clip-padding", "background-clip:padding-box"),
+    ("bg-clip-text", "background-clip:text"),
+    ("bg-contain", "background-size:contain"),
+    ("bg-cover", "background-size:cover"),
+    ("bg-fixed", "background-attachment:fixed"),
+    ("bg-left", "background-position:left"),
+    ("bg-left-bottom", "background-position:left bottom"),
+    ("bg-left-top", "background-position:0 0"),
+    ("bg-local", "background-attachment:local"),
+    ("bg-no-repeat", "background-repeat:no-repeat"),
     ("bg-none", "background-image:none"),
-    ("object-contain", "object-fit:contain"),
-    ("object-cover", "object-fit:cover"),
-    ("object-fill", "object-fit:fill"),
-    ("object-none", "object-fit:none"),
-    ("object-scale-down", "object-fit:scale-down"),
-    ("object-center", "object-position:center"),
-    ("object-top", "object-position:top"),
-    ("object-bottom", "object-position:bottom"),
-    ("object-left", "object-position:left"),
-    ("object-right", "object-position:right"),
-    ("outline-none", "--tw-outline-style:none;outline-style:none"),
-    (
-        "outline-hidden",
-        "outline:2px solid transparent;outline-offset:2px",
-    ),
-    (
-        "outline-solid",
-        "--tw-outline-style:solid;outline-style:solid",
-    ),
-    (
-        "outline-dashed",
-        "--tw-outline-style:dashed;outline-style:dashed",
-    ),
-    (
-        "outline-dotted",
-        "--tw-outline-style:dotted;outline-style:dotted",
-    ),
-    (
-        "outline-double",
-        "--tw-outline-style:double;outline-style:double",
-    ),
-    ("border-solid", "--tw-border-style:solid;border-style:solid"),
+    ("bg-origin-border", "background-origin:border-box"),
+    ("bg-origin-content", "background-origin:content-box"),
+    ("bg-origin-padding", "background-origin:padding-box"),
+    ("bg-repeat", "background-repeat:repeat"),
+    ("bg-repeat-round", "background-repeat:round"),
+    ("bg-repeat-space", "background-repeat:space"),
+    ("bg-repeat-x", "background-repeat:repeat-x"),
+    ("bg-repeat-y", "background-repeat:repeat-y"),
+    ("bg-right", "background-position:right"),
+    ("bg-right-bottom", "background-position:right bottom"),
+    ("bg-right-top", "background-position:right top"),
+    ("bg-scroll", "background-attachment:scroll"),
+    ("bg-top", "background-position:top"),
+    ("bg-top-left", "background-position:left top"),
+    ("bg-top-right", "background-position:right top"),
+    ("block", "display:block"),
+    ("border-collapse", "border-collapse:collapse"),
     (
         "border-dashed",
         "--tw-border-style:dashed;border-style:dashed",
@@ -718,21 +744,53 @@ const STATIC: &[(&str, &str)] = &[
         "--tw-border-style:hidden;border-style:hidden",
     ),
     ("border-none", "--tw-border-style:none;border-style:none"),
-    ("border-collapse", "border-collapse:collapse"),
     ("border-separate", "border-collapse:separate"),
-    ("table-auto", "table-layout:auto"),
-    ("table-fixed", "table-layout:fixed"),
-    ("will-change-auto", "will-change:auto"),
-    ("will-change-scroll", "will-change:scroll-position"),
-    ("will-change-contents", "will-change:contents"),
-    ("will-change-transform", "will-change:transform"),
-    ("contain-none", "contain:none"),
-    ("contain-content", "contain:content"),
-    ("contain-strict", "contain:strict"),
+    ("border-solid", "--tw-border-style:solid;border-style:solid"),
+    ("box-border", "box-sizing:border-box"),
+    ("box-content", "box-sizing:content-box"),
     (
-        "contain-size",
-        "--tw-contain-size:size;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
+        "box-decoration-clone",
+        "-webkit-box-decoration-break:clone;box-decoration-break:clone",
     ),
+    (
+        "box-decoration-slice",
+        "-webkit-box-decoration-break:slice;box-decoration-break:slice",
+    ),
+    ("break-after-all", "break-after:all"),
+    ("break-after-auto", "break-after:auto"),
+    ("break-after-avoid", "break-after:avoid"),
+    ("break-after-avoid-page", "break-after:avoid-page"),
+    ("break-after-column", "break-after:column"),
+    ("break-after-left", "break-after:left"),
+    ("break-after-page", "break-after:page"),
+    ("break-after-right", "break-after:right"),
+    ("break-all", "word-break:break-all"),
+    ("break-before-all", "break-before:all"),
+    ("break-before-auto", "break-before:auto"),
+    ("break-before-avoid", "break-before:avoid"),
+    ("break-before-avoid-page", "break-before:avoid-page"),
+    ("break-before-column", "break-before:column"),
+    ("break-before-left", "break-before:left"),
+    ("break-before-page", "break-before:page"),
+    ("break-before-right", "break-before:right"),
+    ("break-inside-auto", "break-inside:auto"),
+    ("break-inside-avoid", "break-inside:avoid"),
+    ("break-inside-avoid-column", "break-inside:avoid-column"),
+    ("break-inside-avoid-page", "break-inside:avoid-page"),
+    ("break-keep", "word-break:keep-all"),
+    ("break-normal", "overflow-wrap:normal;word-break:normal"),
+    ("break-words", "overflow-wrap:break-word"),
+    ("capitalize", "text-transform:capitalize"),
+    ("caption-bottom", "caption-side:bottom"),
+    ("caption-top", "caption-side:top"),
+    ("clear-both", "clear:both"),
+    ("clear-end", "clear:inline-end"),
+    ("clear-left", "clear:left"),
+    ("clear-none", "clear:none"),
+    ("clear-right", "clear:right"),
+    ("clear-start", "clear:inline-start"),
+    ("collapse", "visibility:collapse"),
+    ("contain-content", "contain:content"),
     (
         "contain-inline-size",
         "--tw-contain-size:inline-size;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
@@ -741,58 +799,687 @@ const STATIC: &[(&str, &str)] = &[
         "contain-layout",
         "--tw-contain-layout:layout;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
     ),
+    ("contain-none", "contain:none"),
     (
         "contain-paint",
         "--tw-contain-paint:paint;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
     ),
     (
+        "contain-size",
+        "--tw-contain-size:size;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
+    ),
+    ("contain-strict", "contain:strict"),
+    (
         "contain-style",
         "--tw-contain-style:style;contain:var(--tw-contain-size,) var(--tw-contain-layout,) var(--tw-contain-paint,) var(--tw-contain-style,)",
     ),
-    ("appearance-none", "appearance:none"),
-    ("appearance-auto", "appearance:auto"),
-    ("box-border", "box-sizing:border-box"),
-    ("box-content", "box-sizing:content-box"),
+    ("content-around", "align-content:space-around"),
+    ("content-baseline", "align-content:baseline"),
+    ("content-between", "align-content:space-between"),
+    ("content-center", "align-content:center"),
+    ("content-center-safe", "align-content:safe center"),
+    ("content-end", "align-content:flex-end"),
+    ("content-end-safe", "align-content:safe flex-end"),
+    ("content-evenly", "align-content:space-evenly"),
+    ("content-normal", "align-content:normal"),
+    ("content-start", "align-content:flex-start"),
+    ("content-stretch", "align-content:stretch"),
+    ("contents", "display:contents"),
+    ("cursor-alias", "cursor:alias"),
+    ("cursor-all-scroll", "cursor:all-scroll"),
+    ("cursor-auto", "cursor:auto"),
+    ("cursor-cell", "cursor:cell"),
+    ("cursor-col-resize", "cursor:col-resize"),
+    ("cursor-context-menu", "cursor:context-menu"),
+    ("cursor-copy", "cursor:copy"),
+    ("cursor-crosshair", "cursor:crosshair"),
+    ("cursor-default", "cursor:default"),
+    ("cursor-e-resize", "cursor:e-resize"),
+    ("cursor-ew-resize", "cursor:ew-resize"),
+    ("cursor-grab", "cursor:grab"),
+    ("cursor-grabbing", "cursor:grabbing"),
+    ("cursor-help", "cursor:help"),
+    ("cursor-move", "cursor:move"),
+    ("cursor-n-resize", "cursor:n-resize"),
+    ("cursor-ne-resize", "cursor:ne-resize"),
+    ("cursor-nesw-resize", "cursor:nesw-resize"),
+    ("cursor-no-drop", "cursor:no-drop"),
+    ("cursor-none", "cursor:none"),
+    ("cursor-not-allowed", "cursor:not-allowed"),
+    ("cursor-ns-resize", "cursor:ns-resize"),
+    ("cursor-nw-resize", "cursor:nw-resize"),
+    ("cursor-nwse-resize", "cursor:nwse-resize"),
+    ("cursor-pointer", "cursor:pointer"),
+    ("cursor-progress", "cursor:progress"),
+    ("cursor-row-resize", "cursor:row-resize"),
+    ("cursor-s-resize", "cursor:s-resize"),
+    ("cursor-se-resize", "cursor:se-resize"),
+    ("cursor-sw-resize", "cursor:sw-resize"),
+    ("cursor-text", "cursor:text"),
+    ("cursor-vertical-text", "cursor:vertical-text"),
+    ("cursor-w-resize", "cursor:w-resize"),
+    ("cursor-wait", "cursor:wait"),
+    ("cursor-zoom-in", "cursor:zoom-in"),
+    ("cursor-zoom-out", "cursor:zoom-out"),
+    ("decoration-auto", "text-decoration-thickness:auto"),
+    ("decoration-dashed", "text-decoration-style:dashed"),
+    ("decoration-dotted", "text-decoration-style:dotted"),
+    ("decoration-double", "text-decoration-style:double"),
     (
-        "filter",
-        "filter:var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,)",
+        "decoration-from-font",
+        "text-decoration-thickness:from-font",
     ),
-    ("filter-none", "filter:none"),
+    ("decoration-solid", "text-decoration-style:solid"),
+    ("decoration-wavy", "text-decoration-style:wavy"),
     (
-        "backdrop-filter-none",
-        "-webkit-backdrop-filter:none;backdrop-filter:none",
+        "diagonal-fractions",
+        "--tw-numeric-fraction:diagonal-fractions;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
     ),
-    ("ring-inset", "--tw-ring-inset:inset"),
     ("field-sizing-content", "field-sizing:content"),
     ("field-sizing-fixed", "field-sizing:fixed"),
-    ("list-none", "list-style-type:none"),
-    ("list-disc", "list-style-type:disc"),
-    ("list-decimal", "list-style-type:decimal"),
-    ("list-inside", "list-style-position:inside"),
-    ("list-outside", "list-style-position:outside"),
+    ("fill-none", "fill:none"),
+    ("filter-none", "filter:none"),
+    ("fixed", "position:fixed"),
+    ("flex", "display:flex"),
+    ("flex-auto", "flex:auto"),
+    ("flex-col", "flex-direction:column"),
+    ("flex-col-reverse", "flex-direction:column-reverse"),
+    ("flex-initial", "flex:0 auto"),
+    ("flex-none", "flex:none"),
+    ("flex-nowrap", "flex-wrap:nowrap"),
+    ("flex-row", "flex-direction:row"),
+    ("flex-row-reverse", "flex-direction:row-reverse"),
+    ("flex-wrap", "flex-wrap:wrap"),
+    ("flex-wrap-reverse", "flex-wrap:wrap-reverse"),
+    ("float-end", "float:inline-end"),
     ("float-left", "float:left"),
-    ("float-right", "float:right"),
     ("float-none", "float:none"),
-    ("clear-both", "clear:both"),
-    ("clear-none", "clear:none"),
-    ("backface-hidden", "backface-visibility:hidden"),
-    ("backface-visible", "backface-visibility:visible"),
+    ("float-right", "float:right"),
+    ("float-start", "float:inline-start"),
+    ("flow-root", "display:flow-root"),
+    ("font-stretch-condensed", "font-stretch:condensed"),
+    ("font-stretch-expanded", "font-stretch:expanded"),
+    (
+        "font-stretch-extra-condensed",
+        "font-stretch:extra-condensed",
+    ),
+    ("font-stretch-extra-expanded", "font-stretch:extra-expanded"),
+    ("font-stretch-normal", "font-stretch:normal"),
+    ("font-stretch-semi-condensed", "font-stretch:semi-condensed"),
+    ("font-stretch-semi-expanded", "font-stretch:semi-expanded"),
+    (
+        "font-stretch-ultra-condensed",
+        "font-stretch:ultra-condensed",
+    ),
+    ("font-stretch-ultra-expanded", "font-stretch:ultra-expanded"),
     ("forced-color-adjust-auto", "forced-color-adjust:auto"),
     ("forced-color-adjust-none", "forced-color-adjust:none"),
+    ("grid", "display:grid"),
+    ("grid-flow-col", "grid-auto-flow:column"),
+    ("grid-flow-col-dense", "grid-auto-flow:column dense"),
+    ("grid-flow-dense", "grid-auto-flow:dense"),
+    ("grid-flow-row", "grid-auto-flow:row"),
+    ("grid-flow-row-dense", "grid-auto-flow:row dense"),
+    ("hidden", "display:none"),
+    ("hyphens-auto", "-webkit-hyphens:auto;hyphens:auto"),
+    ("hyphens-manual", "-webkit-hyphens:manual;hyphens:manual"),
+    ("hyphens-none", "-webkit-hyphens:none;hyphens:none"),
+    ("inline", "display:inline"),
+    ("inline-block", "display:inline-block"),
+    ("inline-flex", "display:inline-flex"),
+    ("inline-grid", "display:inline-grid"),
+    ("inline-table", "display:inline-table"),
+    ("invisible", "visibility:hidden"),
+    ("isolate", "isolation:isolate"),
+    ("isolation-auto", "isolation:auto"),
+    ("italic", "font-style:italic"),
+    ("items-baseline", "align-items:baseline"),
+    ("items-baseline-last", "align-items:last baseline"),
+    ("items-center", "align-items:center"),
+    ("items-center-safe", "align-items:safe center"),
+    ("items-end", "align-items:flex-end"),
+    ("items-end-safe", "align-items:safe flex-end"),
+    ("items-start", "align-items:flex-start"),
+    ("items-stretch", "align-items:stretch"),
+    ("justify-around", "justify-content:space-around"),
+    ("justify-baseline", "justify-content:baseline"),
+    ("justify-between", "justify-content:space-between"),
+    ("justify-center", "justify-content:center"),
+    ("justify-center-safe", "justify-content:safe center"),
+    ("justify-end", "justify-content:flex-end"),
+    ("justify-end-safe", "justify-content:safe flex-end"),
+    ("justify-evenly", "justify-content:space-evenly"),
+    ("justify-items-center", "justify-items:center"),
+    ("justify-items-center-safe", "justify-items:safe center"),
+    ("justify-items-end", "justify-items:end"),
+    ("justify-items-end-safe", "justify-items:safe end"),
+    ("justify-items-normal", "justify-items:normal"),
+    ("justify-items-start", "justify-items:start"),
+    ("justify-items-stretch", "justify-items:stretch"),
+    ("justify-normal", "justify-content:normal"),
+    ("justify-self-auto", "justify-self:auto"),
+    ("justify-self-center", "justify-self:center"),
+    ("justify-self-center-safe", "justify-self:safe center"),
+    ("justify-self-end", "justify-self:flex-end"),
+    ("justify-self-end-safe", "justify-self:safe flex-end"),
+    ("justify-self-start", "justify-self:flex-start"),
+    ("justify-self-stretch", "justify-self:stretch"),
+    ("justify-start", "justify-content:flex-start"),
+    ("justify-stretch", "justify-content:stretch"),
+    (
+        "line-clamp-none",
+        "overflow:visible;display:block;-webkit-box-orient:horizontal;-webkit-line-clamp:unset",
+    ),
+    ("line-through", "text-decoration-line:line-through"),
+    (
+        "lining-nums",
+        "--tw-numeric-figure:lining-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    ("list-decimal", "list-style-type:decimal"),
+    ("list-disc", "list-style-type:disc"),
+    ("list-image-none", "list-style-image:none"),
+    ("list-inside", "list-style-position:inside"),
+    ("list-item", "display:list-item"),
+    ("list-none", "list-style-type:none"),
+    ("list-outside", "list-style-position:outside"),
+    ("lowercase", "text-transform:lowercase"),
+    ("mask-add", "mask-composite:add"),
+    ("mask-alpha", "mask-mode:alpha"),
+    ("mask-auto", "mask-size:auto"),
+    ("mask-bottom", "mask-position:bottom"),
+    ("mask-bottom-left", "mask-position:left bottom"),
+    ("mask-bottom-right", "mask-position:right bottom"),
+    ("mask-center", "mask-position:center"),
+    ("mask-circle", "--tw-mask-radial-shape:circle"),
+    ("mask-clip-border", "mask-clip:border-box"),
+    ("mask-clip-content", "mask-clip:content-box"),
+    ("mask-clip-fill", "mask-clip:fill-box"),
+    ("mask-clip-padding", "mask-clip:padding-box"),
+    ("mask-clip-stroke", "mask-clip:stroke-box"),
+    ("mask-clip-view", "mask-clip:view-box"),
+    ("mask-contain", "mask-size:contain"),
+    ("mask-cover", "mask-size:cover"),
+    ("mask-ellipse", "--tw-mask-radial-shape:ellipse"),
+    ("mask-exclude", "mask-composite:exclude"),
+    ("mask-intersect", "mask-composite:intersect"),
+    ("mask-left", "mask-position:left"),
+    ("mask-luminance", "mask-mode:luminance"),
+    ("mask-match", "mask-mode:match-source"),
+    ("mask-no-clip", "mask-clip:no-clip"),
+    ("mask-no-repeat", "mask-repeat:no-repeat"),
+    ("mask-none", "mask-image:none"),
+    ("mask-origin-border", "mask-origin:border-box"),
+    ("mask-origin-content", "mask-origin:content-box"),
+    ("mask-origin-fill", "mask-origin:fill-box"),
+    ("mask-origin-padding", "mask-origin:padding-box"),
+    ("mask-origin-stroke", "mask-origin:stroke-box"),
+    ("mask-origin-view", "mask-origin:view-box"),
+    ("mask-radial-at-bottom", "--tw-mask-radial-position:bottom"),
+    (
+        "mask-radial-at-bottom-left",
+        "--tw-mask-radial-position:bottom left",
+    ),
+    (
+        "mask-radial-at-bottom-right",
+        "--tw-mask-radial-position:bottom right",
+    ),
+    ("mask-radial-at-center", "--tw-mask-radial-position:center"),
+    ("mask-radial-at-left", "--tw-mask-radial-position:left"),
+    ("mask-radial-at-right", "--tw-mask-radial-position:right"),
+    ("mask-radial-at-top", "--tw-mask-radial-position:top"),
+    (
+        "mask-radial-at-top-left",
+        "--tw-mask-radial-position:top left",
+    ),
+    (
+        "mask-radial-at-top-right",
+        "--tw-mask-radial-position:top right",
+    ),
+    (
+        "mask-radial-closest-corner",
+        "--tw-mask-radial-size:closest-corner",
+    ),
+    (
+        "mask-radial-closest-side",
+        "--tw-mask-radial-size:closest-side",
+    ),
+    (
+        "mask-radial-farthest-corner",
+        "--tw-mask-radial-size:farthest-corner",
+    ),
+    (
+        "mask-radial-farthest-side",
+        "--tw-mask-radial-size:farthest-side",
+    ),
+    ("mask-repeat", "mask-repeat:repeat"),
+    ("mask-repeat-round", "mask-repeat:round"),
+    ("mask-repeat-space", "mask-repeat:space"),
+    ("mask-repeat-x", "mask-repeat:repeat-x"),
+    ("mask-repeat-y", "mask-repeat:repeat-y"),
+    ("mask-right", "mask-position:right"),
+    ("mask-subtract", "mask-composite:subtract"),
+    ("mask-top", "mask-position:top"),
+    ("mask-top-left", "mask-position:left top"),
+    ("mask-top-right", "mask-position:right top"),
+    ("mask-type-alpha", "mask-type:alpha"),
+    ("mask-type-luminance", "mask-type:luminance"),
+    ("mix-blend-color", "mix-blend-mode:color"),
+    ("mix-blend-color-burn", "mix-blend-mode:color-burn"),
+    ("mix-blend-color-dodge", "mix-blend-mode:color-dodge"),
+    ("mix-blend-darken", "mix-blend-mode:darken"),
+    ("mix-blend-difference", "mix-blend-mode:difference"),
+    ("mix-blend-exclusion", "mix-blend-mode:exclusion"),
+    ("mix-blend-hard-light", "mix-blend-mode:hard-light"),
+    ("mix-blend-hue", "mix-blend-mode:hue"),
+    ("mix-blend-lighten", "mix-blend-mode:lighten"),
+    ("mix-blend-luminosity", "mix-blend-mode:luminosity"),
+    ("mix-blend-multiply", "mix-blend-mode:multiply"),
+    ("mix-blend-normal", "mix-blend-mode:normal"),
+    ("mix-blend-overlay", "mix-blend-mode:overlay"),
+    ("mix-blend-plus-darker", "mix-blend-mode:plus-darker"),
+    ("mix-blend-plus-lighter", "mix-blend-mode:plus-lighter"),
+    ("mix-blend-saturation", "mix-blend-mode:saturation"),
+    ("mix-blend-screen", "mix-blend-mode:screen"),
+    ("mix-blend-soft-light", "mix-blend-mode:soft-light"),
+    ("no-underline", "text-decoration-line:none"),
+    ("normal-case", "text-transform:none"),
+    ("normal-nums", "font-variant-numeric:normal"),
+    ("not-italic", "font-style:normal"),
+    (
+        "not-sr-only",
+        "position:static;width:auto;height:auto;padding:0;margin:0;overflow:visible;clip-path:none;white-space:normal",
+    ),
+    ("object-bottom", "object-position:bottom"),
+    ("object-bottom-left", "object-position:left bottom"),
+    ("object-bottom-right", "object-position:right bottom"),
+    ("object-center", "object-position:center"),
+    ("object-contain", "object-fit:contain"),
+    ("object-cover", "object-fit:cover"),
+    ("object-fill", "object-fit:fill"),
+    ("object-left", "object-position:left"),
+    ("object-left-bottom", "object-position:left bottom"),
+    ("object-left-top", "object-position:left top"),
+    ("object-none", "object-fit:none"),
+    ("object-right", "object-position:right"),
+    ("object-right-bottom", "object-position:right bottom"),
+    ("object-right-top", "object-position:right top"),
+    ("object-scale-down", "object-fit:scale-down"),
+    ("object-top", "object-position:top"),
+    ("object-top-left", "object-position:left top"),
+    ("object-top-right", "object-position:right top"),
+    (
+        "oldstyle-nums",
+        "--tw-numeric-figure:oldstyle-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    (
+        "ordinal",
+        "--tw-ordinal:ordinal;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    (
+        "outline-dashed",
+        "--tw-outline-style:dashed;outline-style:dashed",
+    ),
+    (
+        "outline-dotted",
+        "--tw-outline-style:dotted;outline-style:dotted",
+    ),
+    (
+        "outline-double",
+        "--tw-outline-style:double;outline-style:double",
+    ),
+    ("outline-none", "--tw-outline-style:none;outline-style:none"),
+    (
+        "outline-solid",
+        "--tw-outline-style:solid;outline-style:solid",
+    ),
+    ("overflow-auto", "overflow:auto"),
+    ("overflow-clip", "overflow:clip"),
+    ("overflow-hidden", "overflow:hidden"),
+    ("overflow-scroll", "overflow:scroll"),
+    ("overflow-visible", "overflow:visible"),
+    ("overflow-x-auto", "overflow-x:auto"),
+    ("overflow-x-clip", "overflow-x:clip"),
+    ("overflow-x-hidden", "overflow-x:hidden"),
+    ("overflow-x-scroll", "overflow-x:scroll"),
+    ("overflow-x-visible", "overflow-x:visible"),
+    ("overflow-y-auto", "overflow-y:auto"),
+    ("overflow-y-clip", "overflow-y:clip"),
+    ("overflow-y-hidden", "overflow-y:hidden"),
+    ("overflow-y-scroll", "overflow-y:scroll"),
+    ("overflow-y-visible", "overflow-y:visible"),
+    ("overline", "text-decoration-line:overline"),
+    ("overscroll-auto", "overscroll-behavior:auto"),
+    ("overscroll-contain", "overscroll-behavior:contain"),
+    ("overscroll-none", "overscroll-behavior:none"),
+    ("overscroll-x-auto", "overscroll-behavior-x:auto"),
+    ("overscroll-x-contain", "overscroll-behavior-x:contain"),
+    ("overscroll-x-none", "overscroll-behavior-x:none"),
+    ("overscroll-y-auto", "overscroll-behavior-y:auto"),
+    ("overscroll-y-contain", "overscroll-behavior-y:contain"),
+    ("overscroll-y-none", "overscroll-behavior-y:none"),
+    ("place-content-around", "place-content:space-around"),
+    ("place-content-baseline", "place-content:baseline"),
+    ("place-content-between", "place-content:space-between"),
+    ("place-content-center", "place-content:center"),
+    ("place-content-center-safe", "place-content:safe center"),
+    ("place-content-end", "place-content:end"),
+    ("place-content-end-safe", "place-content:safe end"),
+    ("place-content-evenly", "place-content:space-evenly"),
+    ("place-content-start", "place-content:start"),
+    ("place-content-stretch", "place-content:stretch"),
+    ("place-items-baseline", "place-items:baseline"),
+    ("place-items-center", "place-items:center"),
+    ("place-items-center-safe", "place-items:safe center"),
+    ("place-items-end", "place-items:end"),
+    ("place-items-end-safe", "place-items:safe end"),
+    ("place-items-start", "place-items:start"),
+    ("place-items-stretch", "place-items:stretch"),
+    ("place-self-auto", "place-self:auto"),
+    ("place-self-center", "place-self:center"),
+    ("place-self-center-safe", "place-self:safe center"),
+    ("place-self-end", "place-self:end"),
+    ("place-self-end-safe", "place-self:safe end"),
+    ("place-self-start", "place-self:start"),
+    ("place-self-stretch", "place-self:stretch"),
+    ("pointer-events-auto", "pointer-events:auto"),
+    ("pointer-events-none", "pointer-events:none"),
+    (
+        "proportional-nums",
+        "--tw-numeric-spacing:proportional-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    ("relative", "position:relative"),
+    ("resize", "resize:both"),
+    ("resize-none", "resize:none"),
+    ("resize-x", "resize:horizontal"),
+    ("resize-y", "resize:vertical"),
+    ("ring-inset", "--tw-ring-inset:inset"),
+    ("rotate-none", "rotate:none"),
+    (
+        "scale-3d",
+        "scale:var(--tw-scale-x) var(--tw-scale-y) var(--tw-scale-z)",
+    ),
+    ("scale-none", "scale:none"),
+    ("scheme-dark", "color-scheme:dark"),
+    ("scheme-light", "color-scheme:light"),
+    ("scheme-light-dark", "color-scheme:light dark"),
+    ("scheme-normal", "color-scheme:normal"),
+    ("scheme-only-dark", "color-scheme:only dark"),
+    ("scheme-only-light", "color-scheme:only light"),
+    ("scroll-auto", "scroll-behavior:auto"),
+    ("scroll-smooth", "scroll-behavior:smooth"),
+    ("scrollbar-auto", "scrollbar-width:auto"),
+    ("scrollbar-gutter-auto", "scrollbar-gutter:auto"),
+    (
+        "scrollbar-gutter-both",
+        "scrollbar-gutter:stable both-edges",
+    ),
+    ("scrollbar-gutter-stable", "scrollbar-gutter:stable"),
+    ("scrollbar-none", "scrollbar-width:none"),
+    ("scrollbar-thin", "scrollbar-width:thin"),
+    ("select-all", "-webkit-user-select:all;user-select:all"),
+    ("select-auto", "-webkit-user-select:auto;user-select:auto"),
+    ("select-none", "-webkit-user-select:none;user-select:none"),
+    ("select-text", "-webkit-user-select:text;user-select:text"),
+    ("self-auto", "align-self:auto"),
+    ("self-baseline", "align-self:baseline"),
+    ("self-baseline-last", "align-self:last baseline"),
+    ("self-center", "align-self:center"),
+    ("self-center-safe", "align-self:safe center"),
+    ("self-end", "align-self:flex-end"),
+    ("self-end-safe", "align-self:safe flex-end"),
+    ("self-start", "align-self:flex-start"),
+    ("self-stretch", "align-self:stretch"),
+    (
+        "slashed-zero",
+        "--tw-slashed-zero:slashed-zero;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    ("snap-align-none", "scroll-snap-align:none"),
+    ("snap-always", "scroll-snap-stop:always"),
+    (
+        "snap-both",
+        "scroll-snap-type:both var(--tw-scroll-snap-strictness)",
+    ),
+    ("snap-center", "scroll-snap-align:center"),
+    ("snap-end", "scroll-snap-align:end"),
+    ("snap-mandatory", "--tw-scroll-snap-strictness:mandatory"),
+    ("snap-none", "scroll-snap-type:none"),
+    ("snap-normal", "scroll-snap-stop:normal"),
+    ("snap-proximity", "--tw-scroll-snap-strictness:proximity"),
+    ("snap-start", "scroll-snap-align:start"),
+    (
+        "snap-x",
+        "scroll-snap-type:x var(--tw-scroll-snap-strictness)",
+    ),
+    (
+        "snap-y",
+        "scroll-snap-type:y var(--tw-scroll-snap-strictness)",
+    ),
+    (
+        "sr-only",
+        "position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border-width:0",
+    ),
+    (
+        "stacked-fractions",
+        "--tw-numeric-fraction:stacked-fractions;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    ("static", "position:static"),
+    ("sticky", "position:sticky"),
+    ("stroke-none", "stroke:none"),
+    (
+        "subpixel-antialiased",
+        "-webkit-font-smoothing:auto;-moz-osx-font-smoothing:auto",
+    ),
+    ("table", "display:table"),
+    ("table-auto", "table-layout:auto"),
+    ("table-caption", "display:table-caption"),
+    ("table-cell", "display:table-cell"),
+    ("table-column", "display:table-column"),
+    ("table-column-group", "display:table-column-group"),
+    ("table-fixed", "table-layout:fixed"),
+    ("table-footer-group", "display:table-footer-group"),
+    ("table-header-group", "display:table-header-group"),
+    ("table-row", "display:table-row"),
+    ("table-row-group", "display:table-row-group"),
+    (
+        "tabular-nums",
+        "--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal,) var(--tw-slashed-zero,) var(--tw-numeric-figure,) var(--tw-numeric-spacing,) var(--tw-numeric-fraction,)",
+    ),
+    ("text-balance", "text-wrap:balance"),
+    ("text-center", "text-align:center"),
+    ("text-clip", "text-overflow:clip"),
+    ("text-ellipsis", "text-overflow:ellipsis"),
+    ("text-end", "text-align:end"),
+    ("text-justify", "text-align:justify"),
+    ("text-left", "text-align:left"),
+    ("text-nowrap", "text-wrap:nowrap"),
+    ("text-pretty", "text-wrap:pretty"),
+    ("text-right", "text-align:right"),
+    ("text-start", "text-align:start"),
+    ("text-wrap", "text-wrap:wrap"),
+    ("touch-auto", "touch-action:auto"),
+    ("touch-manipulation", "touch-action:manipulation"),
+    ("touch-none", "touch-action:none"),
+    (
+        "touch-pan-down",
+        "--tw-pan-y:pan-down;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pan-left",
+        "--tw-pan-x:pan-left;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pan-right",
+        "--tw-pan-x:pan-right;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pan-up",
+        "--tw-pan-y:pan-up;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pan-x",
+        "--tw-pan-x:pan-x;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pan-y",
+        "--tw-pan-y:pan-y;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    (
+        "touch-pinch-zoom",
+        "--tw-pinch-zoom:pinch-zoom;touch-action:var(--tw-pan-x,) var(--tw-pan-y,) var(--tw-pinch-zoom,)",
+    ),
+    ("transform-3d", "transform-style:preserve-3d"),
+    ("transform-border", "transform-box:border-box"),
+    ("transform-content", "transform-box:content-box"),
+    (
+        "transform-cpu",
+        "transform:var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,)",
+    ),
+    ("transform-fill", "transform-box:fill-box"),
+    ("transform-flat", "transform-style:flat"),
+    (
+        "transform-gpu",
+        "transform:translateZ(0) var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,)",
+    ),
+    ("transform-none", "transform:none"),
+    ("transform-stroke", "transform-box:stroke-box"),
+    ("transform-view", "transform-box:view-box"),
+    ("transition-discrete", "transition-behavior:allow-discrete"),
+    ("transition-normal", "transition-behavior:normal"),
+    (
+        "translate-3d",
+        "translate:var(--tw-translate-x) var(--tw-translate-y) var(--tw-translate-z)",
+    ),
+    (
+        "truncate",
+        "overflow:hidden;text-overflow:ellipsis;white-space:nowrap",
+    ),
+    ("underline", "text-decoration-line:underline"),
+    ("underline-offset-auto", "text-underline-offset:auto"),
+    ("uppercase", "text-transform:uppercase"),
+    ("via-none", "--tw-gradient-via-stops:initial"),
+    ("visible", "visibility:visible"),
+    ("whitespace-break-spaces", "white-space:break-spaces"),
+    ("whitespace-normal", "white-space:normal"),
+    ("whitespace-nowrap", "white-space:nowrap"),
+    ("whitespace-pre", "white-space:pre"),
+    ("whitespace-pre-line", "white-space:pre-line"),
+    ("whitespace-pre-wrap", "white-space:pre-wrap"),
+    ("will-change-auto", "will-change:auto"),
+    ("will-change-contents", "will-change:contents"),
+    ("will-change-scroll", "will-change:scroll-position"),
+    ("will-change-transform", "will-change:transform"),
+    ("wrap-anywhere", "overflow-wrap:anywhere"),
+    ("wrap-break-word", "overflow-wrap:break-word"),
+    ("wrap-normal", "overflow-wrap:normal"),
+];
+
+/// Roots whose values may be negated with a leading `-`.
+const NEGATIVE: &[&str] = &[
+    "inset",
+    "inset-x",
+    "inset-y",
+    "inset-s",
+    "inset-e",
+    "inset-bs",
+    "inset-be",
+    "start",
+    "end",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "z",
+    "order",
+    "col",
+    "col-start",
+    "col-end",
+    "row",
+    "row-start",
+    "row-end",
+    "m",
+    "mx",
+    "my",
+    "ms",
+    "me",
+    "mbs",
+    "mbe",
+    "mt",
+    "mr",
+    "mb",
+    "ml",
+    "scroll-m",
+    "scroll-mx",
+    "scroll-my",
+    "scroll-ms",
+    "scroll-me",
+    "scroll-mbs",
+    "scroll-mbe",
+    "scroll-mt",
+    "scroll-mr",
+    "scroll-mb",
+    "scroll-ml",
+    "space-x",
+    "space-y",
+    "translate",
+    "translate-x",
+    "translate-y",
+    "translate-z",
+    "scale",
+    "scale-x",
+    "scale-y",
+    "scale-z",
+    "rotate",
+    "rotate-x",
+    "rotate-y",
+    "rotate-z",
+    "skew",
+    "skew-x",
+    "skew-y",
+    "tracking",
+    "indent",
+    "outline-offset",
+    "underline-offset",
+    "hue-rotate",
+    "backdrop-hue-rotate",
+    "bg-linear",
+    "bg-conic",
+    "mask-linear",
+    "mask-conic",
+];
+
+/// Positions of `origin-*` and `perspective-origin-*`.
+const ORIGINS: &[(&str, &str)] = &[
+    ("center", "center"),
+    ("top", "top"),
+    ("top-right", "100% 0"),
+    ("right", "100%"),
+    ("bottom-right", "100% 100%"),
+    ("bottom", "bottom"),
+    ("bottom-left", "0 100%"),
+    ("left", "0"),
+    ("top-left", "0 0"),
 ];
 
 const SHADOW: &str = "var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)";
 const FILTER: &str = "var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,)";
 const BACKDROP: &str = "var(--tw-backdrop-blur,) var(--tw-backdrop-brightness,) var(--tw-backdrop-contrast,) var(--tw-backdrop-grayscale,) var(--tw-backdrop-hue-rotate,) var(--tw-backdrop-invert,) var(--tw-backdrop-opacity,) var(--tw-backdrop-saturate,) var(--tw-backdrop-sepia,)";
+const TRANSFORM: &str = "var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,)";
 const TRANSITION: &str = "transition-timing-function:var(--tw-ease, var(--default-transition-timing-function));transition-duration:var(--tw-duration, var(--default-transition-duration))";
 const COLORS: &str = "color, background-color, border-color, outline-color, text-decoration-color, fill, stroke, --tw-gradient-from, --tw-gradient-via, --tw-gradient-to";
+const STOPS: &str = "var(--tw-gradient-via-stops, var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position))";
+const MASK: &str = "mask-image:var(--tw-mask-linear), var(--tw-mask-radial), var(--tw-mask-conic);mask-composite:intersect";
+const EDGES: &str =
+    "var(--tw-mask-left), var(--tw-mask-right), var(--tw-mask-bottom), var(--tw-mask-top)";
 
 type Pairs = Vec<(String, String)>;
+/// A rule: at-rules from the outside in, a selector and its declarations.
+type Nested = (Vec<String>, String, Pairs);
 
 #[derive(Default)]
 struct Body {
     declarations: Pairs,
-    nested: Vec<(String, Pairs)>,
+    /// Rules after the declarations; their selectors use `&` for the utility's.
+    nested: Vec<Nested>,
     sort: Option<&'static str>,
 }
 
@@ -817,13 +1504,27 @@ impl Body {
             ..Self::default()
         }
     }
+
+    fn nest(mut self, at: &[&str], selector: &str, source: &str) -> Self {
+        let pairs = Self::parse(source).declarations;
+        self.nested.push((
+            at.iter().map(|&rule| rule.to_owned()).collect(),
+            selector.to_owned(),
+            pairs,
+        ));
+        self
+    }
 }
 
+/// The ways a variant applies: at-rules from the outside in, then a selector with `&`.
 #[derive(Default)]
 struct Variant {
-    selectors: Vec<String>,
-    rules: Vec<String>,
+    branches: Vec<(Vec<String>, Option<String>)>,
     content: bool,
+    /// No compound variant may wrap it, like pseudo-elements.
+    never: bool,
+    /// A relative arbitrary selector like `[>svg]`, valid only in `has-` and `in-`.
+    relative: bool,
 }
 
 type Rank = (u16, String);
@@ -838,235 +1539,494 @@ struct Sort {
 
 struct Compiled {
     sort: Sort,
-    inline: Option<Pairs>,
-    css: String,
+    rules: Vec<Nested>,
 }
 
-/// The utilities compiled for one document, kept across style passes.
+/// Generated sheets of one pass and how scopes using the previous ones can follow.
+pub(crate) struct Update<'a> {
+    /// The theme variables, also set on the document node for pages without `<html>`.
+    pub(crate) root: Rc<Style>,
+    /// Generated sheets that were replaced; scopes holding them are rebuilt.
+    pub(crate) replaced: Vec<Rc<Stylesheet>>,
+    /// Utility sheets that only gained utilities, with the sheets that replace them.
+    pub(crate) added: Vec<(Rc<Stylesheet>, Vec<Rc<Stylesheet>>)>,
+    /// The rules of the new utilities.
+    pub(crate) rules: Vec<&'a Rule>,
+    /// The cascade key of every generated rule, by the address of its selector list.
+    pub(crate) keys: &'a FxHashMap<usize, u64>,
+}
+
+/// The utilities of one Tailwind config (theme, variants and utilities), kept across passes.
 #[derive(Default)]
-pub(crate) struct Compiler {
-    sheets: Vec<*const Stylesheet>,
+struct Config {
+    /// The source of the Tailwind directives the config comes from.
+    key: String,
+    /// Sheet lists known to use this config.
+    lists: Vec<Vec<Rc<Stylesheet>>>,
     theme: BTreeMap<String, String>,
     /// Variables of `@theme inline`, which utilities use as values instead of `var()`.
     inline: BTreeSet<String>,
+    /// Variables and `--name-*` namespaces that `initial` removed.
+    cleared: Vec<String>,
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
-    preflight: bool,
-    classes: rustc_hash::FxHashMap<String, Option<(Sort, String)>>,
-    applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>, String)>,
-    sheet: Option<Rc<Stylesheet>>,
-    /// The theme variables, also set on the document node for pages without `<html>`.
-    pub(crate) root: Rc<Style>,
+    /// `Some(preflight)` when a sheet imports Tailwind, `None` with only `@reference`.
+    import: Option<bool>,
+    classes: FxHashMap<String, bool>,
+    /// The revision of each node when its attributes were read.
+    scanned: Vec<u64>,
+    applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>)>,
+    /// Compiled utilities in Tailwind's order, with their key and rules.
+    sorted: Vec<(Sort, u32, Vec<Rule>)>,
+    /// Sheets of the utilities, with the first key after each.
+    chunks: Vec<(u64, Rc<Stylesheet>)>,
+    keys: FxHashMap<usize, u64>,
+    header: Option<Rc<Stylesheet>>,
+    vars: BTreeMap<String, String>,
+    properties: BTreeSet<&'static str>,
+    keyframes: BTreeSet<&'static str>,
+    root: Rc<Style>,
 }
 
+/// Tailwind compilers by config, so a shadow root with its own theme keeps the document's utilities.
+#[derive(Default)]
+pub(crate) struct Compiler(Vec<Config>);
+
 impl Compiler {
-    /// Adds the generated sheet before the first sheet that imports Tailwind and expands `@apply`.
-    /// Returns whether Tailwind is used and the replaced sheet, so the caller can drop its scopes.
-    pub(crate) fn update<'a>(
+    /// Adds the generated sheets before the first sheet that imports Tailwind and expands `@apply`.
+    /// Returns `None` when no sheet uses Tailwind.
+    pub(crate) fn update(
         &mut self,
         sheets: &mut Vec<Rc<Stylesheet>>,
-        classes: impl Iterator<Item = &'a str>,
-    ) -> (bool, Option<Rc<Stylesheet>>) {
-        let Some(index) = sheets
+        doc: &Document,
+        order: &[usize],
+    ) -> Option<Update<'_>> {
+        let index = sheets
             .iter()
-            .position(|sheet| sheet.0.iter().any(|rule| matches!(rule, Rule::Tailwind(_))))
-        else {
-            return (false, None);
+            .position(|sheet| sheet.0.iter().any(|rule| matches!(rule, Rule::Tailwind(_))))?;
+        let same = |list: &Vec<Rc<Stylesheet>>| {
+            list.len() == sheets.len()
+                && list
+                    .iter()
+                    .zip(sheets.iter())
+                    .all(|(a, b)| Rc::ptr_eq(a, b))
         };
-        let pointers: Vec<_> = sheets.iter().map(Rc::as_ptr).collect();
-        let mut dirty = self.sheet.is_none();
-        let mut previous = None;
-        if pointers != self.sheets {
-            let mut theme = BTreeMap::new();
-            let mut inline = BTreeSet::new();
-            let mut variants = Vec::new();
-            let mut utilities = Vec::new();
-            let mut preflight = false;
-            for sheet in sheets.iter() {
-                for rule in &sheet.0 {
-                    match rule {
-                        Rule::Tailwind(included) => preflight |= included,
-                        Rule::Theme(inlined, children) => {
-                            for child in children {
-                                if let Rule::Declarations(values) = child {
-                                    for (prop, value) in values.resolve().iter() {
-                                        if *inlined {
-                                            inline.insert(prop.name().to_owned());
-                                        }
-                                        theme.insert(prop.name().to_owned(), value.to_string());
-                                    }
-                                }
+        let at = match self
+            .0
+            .iter()
+            .position(|config| config.lists.iter().any(same))
+        {
+            Some(at) => at,
+            None => {
+                let key: String = sheets
+                    .iter()
+                    .flat_map(|sheet| &sheet.0)
+                    .filter(|rule| {
+                        matches!(
+                            rule,
+                            Rule::Tailwind(_)
+                                | Rule::Theme(..)
+                                | Rule::Variant(..)
+                                | Rule::Utility(..)
+                        )
+                    })
+                    .map(Rule::source)
+                    .collect();
+                let at = self
+                    .0
+                    .iter()
+                    .position(|config| config.key == key)
+                    .unwrap_or_else(|| {
+                        if self.0.len() == 4 {
+                            self.0.remove(0);
+                        }
+                        self.0.push(Config::new(key, sheets));
+                        self.0.len() - 1
+                    });
+                let lists = &mut self.0[at].lists;
+                if lists.len() == 4 {
+                    lists.remove(0);
+                }
+                lists.push(sheets.clone());
+                at
+            }
+        };
+        let config = self.0.remove(at);
+        self.0.push(config);
+        let config = self.0.last_mut()?;
+        Some(config.update(sheets, index, doc, order))
+    }
+}
+
+impl Config {
+    fn new(key: String, sheets: &[Rc<Stylesheet>]) -> Self {
+        let mut config = Self {
+            key,
+            ..Self::default()
+        };
+        for rule in sheets.iter().flat_map(|sheet| &sheet.0) {
+            match rule {
+                Rule::Tailwind(Some(preflight)) => {
+                    config.import = Some(config.import == Some(true) || *preflight);
+                }
+                Rule::Theme(inline, children) => {
+                    for child in children {
+                        let Rule::Declarations(values) = child else {
+                            continue;
+                        };
+                        for value in &values.0 {
+                            let Declaration::Property(name, value) = value else {
+                                continue;
+                            };
+                            if name.ends_with("-*") || value == "initial" {
+                                config.theme.retain(|other, _| !removes(name, other));
+                                config.inline.retain(|other| !removes(name, other));
+                                config.cleared.push(name.clone());
+                                continue;
                             }
+                            if *inline {
+                                config.inline.insert(name.clone());
+                            } else {
+                                config.inline.remove(name);
+                            }
+                            config.theme.insert(name.clone(), value.clone());
                         }
-                        Rule::Variant(name, template) => {
-                            variants.retain(|(other, _)| other != name);
-                            variants.push((name.clone(), template.clone()));
-                        }
-                        Rule::Utility(name, body) => utilities.push((name.clone(), body.clone())),
-                        _ => {}
+                    }
+                }
+                Rule::Variant(name, template) => {
+                    config.variants.retain(|(other, _)| other != name);
+                    config.variants.push((name.clone(), template.clone()));
+                }
+                Rule::Utility(name, body) => config.utilities.push((name.clone(), body.clone())),
+                _ => {}
+            }
+        }
+        config
+    }
+
+    fn update(
+        &mut self,
+        sheets: &mut Vec<Rc<Stylesheet>>,
+        index: usize,
+        doc: &Document,
+        order: &[usize],
+    ) -> Update<'_> {
+        let mut used = String::new();
+        let first = self.header.is_none();
+        if first {
+            let theme: Vec<_> = self
+                .theme
+                .keys()
+                .filter(|name| !self.inline.contains(*name))
+                .map(|name| format!("var({name})"))
+                .collect();
+            used = theme.concat();
+            if self.import == Some(true) {
+                used.push_str(PREFLIGHT);
+            }
+        }
+        let mut fresh = Vec::new();
+        if self.scanned.len() < doc.nodes.len() {
+            self.scanned.resize(doc.nodes.len(), 0);
+        }
+        for &id in order {
+            let revision = doc.nodes.revision(id);
+            if std::mem::replace(&mut self.scanned[id], revision) == revision {
+                continue;
+            }
+            let node = &doc.nodes[id];
+            for (name, value) in node.attrs.iter() {
+                if name != "class" {
+                    if value.contains("var(--") {
+                        used.push_str(value);
+                    }
+                    continue;
+                }
+                if self.import.is_none() {
+                    continue;
+                }
+                for class in value.split_ascii_whitespace() {
+                    if self.classes.contains_key(class) {
+                        continue;
+                    }
+                    let compiled = self.compile(class, &escape(class));
+                    self.classes.insert(class.to_owned(), compiled.is_some());
+                    if let Some(compiled) = compiled {
+                        let css = css(&compiled.rules);
+                        used.push_str(&css);
+                        fresh.push((compiled.sort, Stylesheet::parse(&css).0));
                     }
                 }
             }
-            if theme != self.theme
-                || inline != self.inline
-                || variants != self.variants
-                || utilities != self.utilities
-                || preflight != self.preflight
-            {
-                previous = self.sheet.take();
-                *self = Self {
-                    theme,
-                    inline,
-                    variants,
-                    utilities,
-                    preflight,
-                    ..Self::default()
-                };
-                dirty = true;
-            }
-            self.sheets = pointers;
-            self.applied
-                .retain(|(sheet, ..)| sheets.iter().any(|other| Rc::ptr_eq(sheet, other)));
-        }
-        for class in classes {
-            if !self.classes.contains_key(class) {
-                let compiled = self.compile(class, &escape(class)).map(|compiled| {
-                    let mut css = compiled.css;
-                    if let Some(inline) = compiled.inline {
-                        let _ = write!(css, "{}{{{}}}", escape(class), join(&inline, false));
-                    }
-                    (compiled.sort, css)
-                });
-                dirty |= compiled.is_some();
-                self.classes.insert(class.to_owned(), compiled);
+            if let Some(inline) = &node.inline {
+                used.push_str(&inline.source());
             }
         }
         for sheet in sheets.iter_mut() {
-            if let Some((_, applied, _)) = self
+            if let Some((_, applied)) = self
                 .applied
                 .iter()
-                .find(|(source, ..)| Rc::ptr_eq(source, sheet))
+                .find(|(source, _)| Rc::ptr_eq(source, sheet))
             {
                 *sheet = applied.clone();
                 continue;
             }
-            let mut css = String::new();
-            let rules = self.apply(&sheet.0, None, &mut css);
-            let source: String = sheet.0.iter().map(Rule::source).collect();
-            for name in names(&source, "var(--") {
-                let _ = write!(css, "var(--{name})");
-            }
+            let rules = self.apply(&sheet.0, None, &mut used);
             let applied = rules.map_or_else(|| sheet.clone(), |rules| Rc::new(Stylesheet(rules)));
-            dirty |= !css.is_empty();
-            self.applied.push((sheet.clone(), applied.clone(), css));
+            for rule in &applied.0 {
+                used.push_str(&rule.source());
+            }
+            self.applied.push((sheet.clone(), applied.clone()));
             *sheet = applied;
         }
-        let replaced = if dirty {
-            let sheet = Rc::new(Stylesheet::parse(&self.build()));
-            self.sheet.replace(sheet).or(previous)
-        } else {
-            None
-        };
-        if let Some(sheet) = &self.sheet {
-            sheets.insert(index, sheet.clone());
-            if self.preflight {
-                sheets.insert(index + 1, BASE.with(Clone::clone));
-            }
-        }
-        (true, replaced)
-    }
-
-    fn build(&mut self) -> String {
-        let mut utilities: Vec<_> = self.classes.values().flatten().collect();
-        utilities.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut used = String::new();
-        for (_, css) in &utilities {
-            used.push_str(css);
-        }
-        for (.., css) in &self.applied {
-            used.push_str(css);
-        }
-        for value in self.theme.values() {
-            used.push_str(value);
-        }
-        if self.preflight {
-            used.push_str(PREFLIGHT);
-        }
-        let mut vars = BTreeMap::new();
-        DEFAULTS.with(|defaults| {
-            let mut pending: Vec<String> = names(&used, "var(--").map(str::to_owned).collect();
-            while let Some(name) = pending.pop() {
-                let key = format!("--{name}");
-                if self.theme.contains_key(&key) || vars.contains_key(&key) {
-                    continue;
-                }
-                let Some(&value) = defaults.get(key.as_str()) else {
-                    continue;
-                };
-                // `--theme(--name, initial)` points at another theme variable and is dropped without it.
-                let value = match value
-                    .strip_prefix("--theme(")
-                    .and_then(|value| value.strip_suffix(", initial)"))
-                {
-                    Some(name) if self.inline.contains(name) => self.theme[name].clone(),
-                    Some(name) if self.theme.contains_key(name) || defaults.contains_key(name) => {
-                        format!("var({name})")
-                    }
-                    Some(_) => continue,
-                    None => value.to_owned(),
-                };
-                pending.extend(names(&value, "var(--").map(str::to_owned));
-                vars.insert(key, value);
-            }
+        let lists = &self.lists;
+        self.applied.retain(|(source, _)| {
+            lists
+                .iter()
+                .any(|list| list.iter().any(|sheet| Rc::ptr_eq(sheet, source)))
         });
-        let mut css = String::from(
-            "@layer properties;@layer theme,base,components,utilities;@layer properties{*,::before,::after{",
-        );
-        let tw: BTreeSet<_> = names(&used, "--tw-").collect();
-        for (name, value) in PROPERTIES {
-            if tw.contains(&name[5..]) {
+        let header = self.vars(&used) || first;
+        let mut replaced = Vec::new();
+        let mut added = Vec::new();
+        let mut rules = Vec::new();
+        if header {
+            replaced.extend(self.header.take());
+            let mut css = String::from(
+                "@layer properties;@layer theme,base,components,utilities;@layer properties{*,::before,::after{",
+            );
+            for (name, value) in PROPERTIES {
+                if self.properties.contains(name) {
+                    let _ = write!(css, "{name}:{value};");
+                }
+            }
+            css.push_str("}}@layer theme{:root,:host{");
+            for (name, value) in &self.vars {
                 let _ = write!(css, "{name}:{value};");
             }
+            css.push_str("}}");
+            for (name, frames) in KEYFRAMES {
+                if self.keyframes.contains(name) {
+                    let _ = write!(css, "@keyframes {name}{{{frames}}}");
+                }
+            }
+            self.header = Some(Rc::new(Stylesheet::parse(&css)));
+            self.root = Rc::new(
+                self.vars
+                    .iter()
+                    .map(|(name, value)| (Prop::new(name), value.as_str().into()))
+                    .collect(),
+            );
         }
-        css.push_str("}}@layer theme{:root{");
-        let keyframes: Vec<_> = KEYFRAMES
-            .iter()
-            .filter(|(name, _)| vars.contains_key(&format!("--animate-{name}")))
-            .collect();
-        let mut root = vars;
-        root.extend(
-            self.theme
+        let mut new = BTreeSet::new();
+        if !fresh.is_empty() {
+            fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            // WARNING: keys keep Tailwind's order with gaps; a utility without a gap renumbers them all,
+            // which rebuilds every scope.
+            let mut renumber = false;
+            if fresh.len() <= 16 {
+                for (sort, rules) in fresh {
+                    let position = self.sorted.partition_point(|(other, ..)| *other < sort);
+                    let low = position
+                        .checked_sub(1)
+                        .map_or(0, |previous| self.sorted[previous].1);
+                    let high = self
+                        .sorted
+                        .get(position)
+                        .map_or(u32::MAX, |(_, key, _)| *key);
+                    let key = low + (high - low) / 2;
+                    renumber |= key == low;
+                    new.insert(key);
+                    self.sorted.insert(position, (sort, key, rules));
+                }
+            } else {
+                let mut merged = Vec::with_capacity(self.sorted.len() + fresh.len());
+                let mut fresh = fresh.into_iter().peekable();
+                let mut sorted = std::mem::take(&mut self.sorted).into_iter().peekable();
+                while let Some(next) = fresh.peek() {
+                    while let Some(old) = sorted.next_if(|old| old.0 < next.0) {
+                        merged.push(old);
+                    }
+                    let low = merged.last().map_or(0, |(_, key, _)| *key);
+                    let high = sorted.peek().map_or(u32::MAX, |(_, key, _)| *key);
+                    let mut run = Vec::new();
+                    while let Some(item) =
+                        fresh.next_if(|item| sorted.peek().is_none_or(|old| item.0 < old.0))
+                    {
+                        run.push(item);
+                    }
+                    let step = (high - low) / (run.len() as u32 + 1);
+                    renumber |= step == 0;
+                    for (index, (sort, rules)) in run.into_iter().enumerate() {
+                        let key = low + step * (index as u32 + 1);
+                        new.insert(key);
+                        merged.push((sort, key, rules));
+                    }
+                }
+                merged.extend(sorted);
+                self.sorted = merged;
+            }
+            if renumber {
+                let step = u32::MAX / (self.sorted.len() as u32 + 1);
+                for (index, (_, key, _)) in self.sorted.iter_mut().enumerate() {
+                    *key = step * (index as u32 + 1);
+                }
+            }
+            if renumber {
+                self.keys.clear();
+            }
+            for (_, key, rules) in &self.sorted {
+                if !renumber && !new.contains(key) {
+                    continue;
+                }
+                let mut index = 0;
+                for rule in rules {
+                    selectors(rule, &mut |list| {
+                        self.keys
+                            .insert(Rc::as_ptr(list) as usize, u64::from(*key) << 8 | index);
+                        index = (index + 1).min(255);
+                    });
+                }
+            }
+            if renumber || self.chunks.is_empty() {
+                replaced.extend(self.chunks.drain(..).map(|(_, sheet)| sheet));
+                for start in (0..self.sorted.len()).step_by(128) {
+                    let end = (start + 128).min(self.sorted.len());
+                    let next = self
+                        .sorted
+                        .get(end)
+                        .map_or(u64::MAX, |(_, key, _)| u64::from(*key));
+                    self.chunks.push((next, chunk(&self.sorted[start..end])));
+                }
+            } else {
+                let mut index = 0;
+                while index < self.chunks.len() {
+                    let low = index
+                        .checked_sub(1)
+                        .map_or(0, |previous| self.chunks[previous].0);
+                    let high = self.chunks[index].0;
+                    let start = self
+                        .sorted
+                        .partition_point(|(_, key, _)| u64::from(*key) < low);
+                    let end = self
+                        .sorted
+                        .partition_point(|(_, key, _)| u64::from(*key) < high);
+                    let range = &self.sorted[start..end];
+                    if new
+                        .range(low as u32..)
+                        .next()
+                        .is_none_or(|key| u64::from(*key) >= high)
+                    {
+                        index += 1;
+                        continue;
+                    }
+                    let parts = if range.len() > 256 {
+                        let middle = range.len() / 2;
+                        vec![
+                            (u64::from(range[middle].1), chunk(&range[..middle])),
+                            (high, chunk(&range[middle..])),
+                        ]
+                    } else {
+                        vec![(high, chunk(range))]
+                    };
+                    let count = parts.len();
+                    let sheets = parts.iter().map(|(_, sheet)| sheet.clone()).collect();
+                    added.push((self.chunks[index].1.clone(), sheets));
+                    self.chunks.splice(index..=index, parts);
+                    index += count;
+                }
+            }
+        }
+        if replaced.is_empty() {
+            rules = new
                 .iter()
-                .filter(|(name, _)| !self.inline.contains(*name))
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
-        for (name, value) in &root {
-            let _ = write!(css, "{name}:{value};");
+                .filter_map(|key| {
+                    self.sorted
+                        .binary_search_by_key(key, |(_, key, _)| *key)
+                        .ok()
+                })
+                .flat_map(|index| &self.sorted[index].2)
+                .collect();
+        } else {
+            replaced.extend(added.drain(..).map(|(old, _)| old));
         }
-        self.root = Rc::new(
-            root.into_iter()
-                .map(|(name, value)| (Prop::new(&name), value.into()))
-                .collect(),
-        );
-        css.push_str("}}@layer utilities{");
-        for (_, rule) in utilities {
-            css.push_str(rule);
+        if self.import.is_some() {
+            let generated = self
+                .header
+                .iter()
+                .chain(self.chunks.iter().map(|(_, sheet)| sheet));
+            let base = (self.import == Some(true)).then(|| BASE.with(Clone::clone));
+            sheets.splice(index..index, generated.cloned().chain(base));
         }
-        css.push('}');
-        for (name, frames) in keyframes {
-            let _ = write!(css, "@keyframes {name}{{{frames}}}");
+        Update {
+            root: self.root.clone(),
+            replaced,
+            added,
+            rules,
+            keys: &self.keys,
         }
-        css
     }
 
-    /// Expands `@apply` in `rules`; `None` when nothing changed. Generated CSS is added to `used`.
+    /// Adds the theme variables, `--tw-*` properties and keyframes that `css` uses; true when
+    /// the header changes.
+    fn vars(&mut self, css: &str) -> bool {
+        let mut changed = false;
+        let mut pending: Vec<String> = names(css, "var(--")
+            .map(|name| format!("--{name}"))
+            .collect();
+        while let Some(name) = pending.pop() {
+            if self.vars.contains_key(&name) || self.inline.contains(&name) {
+                continue;
+            }
+            let value = match self.theme.get(&name) {
+                Some(value) => value.clone(),
+                None if self.removed(&name) || INLINE.contains(&name.as_str()) => continue,
+                None => {
+                    let Some(value) =
+                        DEFAULTS.with(|defaults| defaults.get(name.as_str()).copied())
+                    else {
+                        continue;
+                    };
+                    // `--theme(--name, initial)` points at another variable and is dropped without it.
+                    match value
+                        .strip_prefix("--theme(")
+                        .and_then(|value| value.strip_suffix(", initial)"))
+                    {
+                        Some(other) if self.inline.contains(other) => self.theme[other].clone(),
+                        Some(other) if self.raw(other).is_some() => format!("var({other})"),
+                        Some(_) => continue,
+                        None => value.to_owned(),
+                    }
+                }
+            };
+            pending.extend(names(&value, "var(--").map(|name| format!("--{name}")));
+            if let Some(animation) = name.strip_prefix("--animate-")
+                && let Some((frames, _)) = KEYFRAMES.iter().find(|(frames, _)| *frames == animation)
+            {
+                self.keyframes.insert(frames);
+            }
+            self.vars.insert(name, value);
+            changed = true;
+        }
+        for name in names(css, "--tw-") {
+            if let Some((property, _)) = PROPERTIES
+                .iter()
+                .find(|(property, _)| property[5..] == *name)
+            {
+                changed |= self.properties.insert(property);
+            }
+        }
+        changed
+    }
+
+    /// Expands `@apply`, `@variant` and Tailwind's functions in `rules`; `None` when nothing
+    /// changed. Generated CSS is added to `used`.
     fn apply(&self, rules: &[Rule], parent: Option<&str>, used: &mut String) -> Option<Vec<Rule>> {
         let mut changed = false;
         let mut result = Vec::with_capacity(rules.len());
         for rule in rules {
-            match rule {
+            let rewritten = match rule {
                 Rule::Style(selectors, children) => {
-                    let base = selectors
+                    let base: Vec<_> = selectors
                         .iter()
                         .map(|selector| match parent {
                             Some(parent) => {
@@ -1074,81 +2034,99 @@ impl Compiler {
                             }
                             None => selector.source(),
                         })
-                        .collect::<Vec<_>>();
-                    let base = if base.len() == 1 {
-                        base[0].clone()
-                    } else {
-                        format!(":is({})", base.join(","))
+                        .collect();
+                    let base = match base.as_slice() {
+                        [single] => single.clone(),
+                        _ => format!(":is({})", base.join(",")),
                     };
+                    self.apply(children, Some(&base), used)
+                        .map(|children| vec![Rule::Style(selectors.clone(), children)])
+                }
+                Rule::Declarations(values)
+                    if values.0.iter().any(|value| match value {
+                        Declaration::Apply(_) => true,
+                        Declaration::Property(_, value) => calls(value),
+                    }) =>
+                {
+                    let mut declarations = Vec::new();
                     let mut extra = String::new();
-                    let mut body = Vec::with_capacity(children.len());
-                    for child in children {
-                        let Rule::Declarations(values) = child else {
-                            body.push(child.clone());
-                            continue;
-                        };
-                        if !values
-                            .0
-                            .iter()
-                            .any(|value| matches!(value, Declaration::Apply(_)))
-                        {
-                            body.push(child.clone());
-                            continue;
-                        }
-                        changed = true;
-                        let mut declarations = Vec::new();
-                        for value in &values.0 {
-                            let Declaration::Apply(classes) = value else {
-                                declarations.push(value.clone());
-                                continue;
-                            };
-                            let mut compiled: Vec<_> = classes
-                                .iter()
-                                .filter_map(|class| self.compile(class, &base))
-                                .collect();
-                            compiled.sort_unstable_by(|a, b| a.sort.cmp(&b.sort));
-                            for compiled in compiled {
-                                extra.push_str(&compiled.css);
-                                for (key, value) in compiled.inline.into_iter().flatten() {
-                                    used.push_str(&value);
-                                    declarations.push(Declaration::Property(key, value));
+                    for value in &values.0 {
+                        match value {
+                            Declaration::Property(name, value) => declarations
+                                .push(Declaration::Property(name.clone(), self.functions(value))),
+                            Declaration::Apply(classes) => {
+                                let Some(base) = parent else {
+                                    continue;
+                                };
+                                let mut compiled: Vec<_> = classes
+                                    .iter()
+                                    .filter_map(|class| self.compile(class, base))
+                                    .collect();
+                                compiled.sort_unstable_by(|a, b| a.sort.cmp(&b.sort));
+                                for (at, selector, pairs) in
+                                    compiled.into_iter().flat_map(|c| c.rules)
+                                {
+                                    if at.is_empty() && selector == base {
+                                        for (name, value) in pairs {
+                                            used.push_str(&value);
+                                            declarations.push(Declaration::Property(name, value));
+                                        }
+                                    } else {
+                                        extra.push_str(&css(&[(at, selector, pairs)]));
+                                    }
                                 }
                             }
                         }
-                        body.push(Rule::Declarations(Declarations(declarations)));
                     }
-                    let nested = self.apply(&body, Some(&base), used);
-                    changed |= nested.is_some();
-                    result.push(Rule::Style(selectors.clone(), nested.unwrap_or(body)));
-                    if !extra.is_empty() {
-                        used.push_str(&extra);
-                        result.extend(Stylesheet::parse(&extra).0);
-                    }
+                    used.push_str(&extra);
+                    let mut rules = vec![Rule::Declarations(Declarations(declarations))];
+                    rules.extend(Stylesheet::parse(&extra).0);
+                    Some(rules)
                 }
-                Rule::Media(queries, children) => match self.apply(children, parent, used) {
-                    Some(children) => {
-                        changed = true;
-                        result.push(Rule::Media(queries.clone(), children));
-                    }
-                    None => result.push(rule.clone()),
-                },
-                Rule::Layer(names, children) => match self.apply(children, parent, used) {
-                    Some(children) => {
-                        changed = true;
-                        result.push(Rule::Layer(names.clone(), children));
-                    }
-                    None => result.push(rule.clone()),
-                },
-                Rule::Supports(condition, supported, children) => {
-                    match self.apply(children, parent, used) {
-                        Some(children) => {
-                            changed = true;
-                            result.push(Rule::Supports(condition.clone(), *supported, children));
+                Rule::Variant(name, body) if parent.is_some() && body.starts_with('{') => {
+                    let base = parent.unwrap_or_default();
+                    let body = &body[1..body.len() - 1];
+                    let mut css = String::new();
+                    let branches = self.variant(name, 0).map(|(_, variant)| variant.branches);
+                    for (at, selector) in branches.into_iter().flatten() {
+                        let selector =
+                            selector.map_or_else(|| base.to_owned(), |t| t.replace('&', base));
+                        for rule in &at {
+                            let _ = write!(css, "{rule}{{");
                         }
-                        None => result.push(rule.clone()),
+                        let _ = write!(css, "{selector}{{{body}}}");
+                        css.push_str(&"}".repeat(at.len()));
                     }
+                    let parsed = Stylesheet::parse(&css).0;
+                    Some(self.apply(&parsed, None, used).unwrap_or(parsed))
                 }
-                _ => result.push(rule.clone()),
+                Rule::Media(queries, children) => self
+                    .apply(children, parent, used)
+                    .map(|children| vec![Rule::Media(queries.clone(), children)]),
+                Rule::Layer(names, children) => self
+                    .apply(children, parent, used)
+                    .map(|children| vec![Rule::Layer(names.clone(), children)]),
+                Rule::Supports(condition, supported, children) => self
+                    .apply(children, parent, used)
+                    .map(|children| vec![Rule::Supports(condition.clone(), *supported, children)]),
+                Rule::Container(name, block, query, children) => {
+                    self.apply(children, parent, used).map(|children| {
+                        vec![Rule::Container(
+                            name.clone(),
+                            *block,
+                            query.clone(),
+                            children,
+                        )]
+                    })
+                }
+                _ => None,
+            };
+            match rewritten {
+                Some(rules) => {
+                    changed = true;
+                    result.extend(rules);
+                }
+                None => result.push(rule.clone()),
             }
         }
         changed.then_some(result)
@@ -1156,35 +2134,55 @@ impl Compiler {
 
     fn compile(&self, class: &str, base: &str) -> Option<Compiled> {
         let mut parts = split(class, ':');
+        // WARNING: every variant multiplies the work, so long chains are rejected.
+        if parts.len() > 16 {
+            return None;
+        }
         let utility = parts.pop()?;
         let (utility, important) = match utility
-            .strip_prefix('!')
-            .or_else(|| utility.strip_suffix('!'))
+            .strip_suffix('!')
+            .or_else(|| utility.strip_prefix('!'))
         {
             Some(utility) => (utility, true),
             None => (utility, false),
         };
         let body = self.utility(utility)?;
-        let mut selectors = vec![base.to_owned()];
-        let mut rules = Vec::new();
+        let mut branches = vec![(Vec::<String>::new(), vec![base.to_owned()])];
         let mut ranks = Vec::new();
         let mut content = false;
         for name in parts {
-            let (rank, variant) = self.variant(name)?;
-            ranks.push(rank);
-            if !variant.selectors.is_empty() {
-                selectors = selectors
-                    .iter()
-                    .flat_map(|selector| {
-                        variant
-                            .selectors
-                            .iter()
-                            .map(move |template| template.replace('&', selector))
-                    })
-                    .collect();
+            let (rank, variant) = self.variant(name, 0)?;
+            if variant.relative {
+                return None;
             }
-            rules.extend(variant.rules);
+            ranks.push(rank);
             content |= variant.content;
+            let mut next = Vec::new();
+            for (at, selectors) in &branches {
+                for (rules, template) in &variant.branches {
+                    let mut at = at.clone();
+                    at.extend(rules.iter().cloned());
+                    let selectors = match template {
+                        None => selectors.clone(),
+                        Some(template) => {
+                            let parts = split(template, ',');
+                            selectors
+                                .iter()
+                                .flat_map(|selector| {
+                                    parts
+                                        .iter()
+                                        .map(move |part| part.trim().replace('&', selector))
+                                })
+                                .collect()
+                        }
+                    };
+                    next.push((at, selectors));
+                }
+            }
+            if next.len() > 16 {
+                return None;
+            }
+            branches = next;
         }
         ranks.sort_unstable_by(|a, b| b.cmp(a));
         ranks.dedup();
@@ -1193,7 +2191,7 @@ impl Compiler {
         for (key, _) in body
             .declarations
             .iter()
-            .chain(body.nested.iter().flat_map(|(_, values)| values))
+            .chain(body.nested.iter().flat_map(|(.., values)| values))
         {
             count += 1;
             if let Some(index) = ORDER
@@ -1203,171 +2201,224 @@ impl Compiler {
                 properties.insert(index as u16);
             }
         }
+        let mut properties: Vec<_> = properties.into_iter().collect();
+        properties.push(u16::MAX);
         let sort = Sort {
             variants: ranks,
-            properties: properties.into_iter().collect(),
+            properties,
             count: Reverse(count),
             name: class.to_owned(),
         };
-        if selectors.len() == 1
-            && selectors[0] == base
-            && rules.is_empty()
-            && body.nested.is_empty()
-        {
-            let mut inline = body.declarations;
-            if important {
-                for (_, value) in &mut inline {
-                    value.push_str(" !important");
-                }
-            }
-            return Some(Compiled {
-                sort,
-                inline: Some(inline),
-                css: String::new(),
-            });
-        }
-        let mut css = String::new();
-        let mut rule = String::new();
-        let list = selectors.join(",");
-        if !body.declarations.is_empty() {
-            let content = if content {
-                "content:var(--tw-content);"
-            } else {
-                ""
-            };
-            let _ = write!(
-                rule,
-                "{list}{{{content}{}}}",
-                join(&body.declarations, important)
-            );
-        }
-        for (template, values) in &body.nested {
-            let list = selectors
+        let suffix = if important { " !important" } else { "" };
+        let pairs = |pairs: &Pairs| -> Pairs {
+            pairs
                 .iter()
-                .map(|selector| template.replace('&', selector))
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = write!(rule, "{list}{{{}}}", join(values, important));
+                .map(|(key, value)| (key.clone(), format!("{value}{suffix}")))
+                .collect()
+        };
+        let mut rules = Vec::new();
+        for (at, selectors) in &branches {
+            if !body.declarations.is_empty() {
+                let mut declarations = pairs(&body.declarations);
+                if content && !declarations.iter().any(|(key, _)| key == "content") {
+                    declarations.insert(0, ("content".into(), "var(--tw-content)".into()));
+                }
+                rules.push((at.clone(), selectors.join(","), declarations));
+            }
+            for (nested, template, values) in &body.nested {
+                let mut at = at.clone();
+                at.extend(nested.iter().cloned());
+                let list: Vec<_> = selectors
+                    .iter()
+                    .map(|selector| template.replace('&', selector))
+                    .collect();
+                rules.push((at, list.join(","), pairs(values)));
+            }
         }
-        for at in &rules {
-            let _ = write!(css, "{at}{{");
-        }
-        css.push_str(&rule);
-        css.push_str(&"}".repeat(rules.len()));
-        Some(Compiled {
-            sort,
-            inline: None,
-            css,
-        })
+        Some(Compiled { sort, rules })
     }
 
-    fn variant(&self, name: &str) -> Option<(Rank, Variant)> {
+    fn variant(&self, name: &str, depth: u8) -> Option<(Rank, Variant)> {
+        // WARNING: compound variants nest, so their depth is capped.
+        if depth > 8 {
+            return None;
+        }
         let order = |name: &str| VARIANTS.iter().position(|(other, _)| *other == name);
-        if let Some(raw) = arbitrary(name) {
-            let value = decode(raw);
-            let source = if value.starts_with('@') || value.contains('&') {
+        let (name, modifier) = modifier(name);
+        if let Some(raw) = name.strip_prefix('[') {
+            if modifier.is_some() || raw.starts_with('@') && raw.contains('&') {
+                return None;
+            }
+            let value = self.arbitrary(name)?;
+            if value.contains(['{', '}']) {
+                return None;
+            }
+            let relative = value.starts_with(['>', '+', '~']);
+            let source = if relative {
+                format!(" {} {}", &value[..1], value[1..].trim_start())
+            } else if let Some(at) = value.strip_prefix('@') {
+                let end = at
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .unwrap_or(at.len());
+                format!("@{} {}", &at[..end], at[end..].trim_start())
+            } else if value.contains('&') {
                 value.clone()
             } else {
                 format!("&:is({value})")
             };
-            return Some(((u16::MAX, value), template(&source)));
+            let mut variant = template(&source);
+            variant.relative = relative;
+            return Some(((u16::MAX, value), variant));
         }
         if let Some(index) = self.variants.iter().position(|(other, _)| other == name) {
             let rank = order(name).unwrap_or(VARIANTS.len() + index) as u16;
-            return Some(((rank, String::new()), template(&self.variants[index].1)));
+            return modifier
+                .is_none()
+                .then(|| ((rank, String::new()), template(&self.variants[index].1)));
         }
         if let Some(index) = order(name)
             && !VARIANTS[index].1.is_empty()
         {
+            if modifier.is_some() {
+                return None;
+            }
             let mut variant = template(VARIANTS[index].1);
             if name == "hover" {
-                variant.rules.push("@media (hover: hover)".into());
+                variant.branches[0].0.push("@media (hover: hover)".into());
             }
             variant.content = matches!(name, "before" | "after");
+            variant.never |= matches!(name, "*" | "**");
             return Some(((index as u16, String::new()), variant));
         }
-        if let Some(width) = self.value("--breakpoint", name) {
+        if modifier.is_none()
+            && let Some(width) = self.raw(&format!("--breakpoint-{name}"))
+        {
             return self.media(">=", &width, "min");
         }
-        let (root, value) = [
-            "group",
-            "peer",
-            "not",
-            "has",
-            "in",
-            "aria",
-            "data",
-            "nth-last-of-type",
-            "nth-of-type",
-            "nth-last",
-            "nth",
-            "supports",
-            "min",
-            "max",
-        ]
-        .iter()
-        .find_map(|root| Some((*root, name.strip_prefix(root)?.strip_prefix('-')?)))?;
+        let (root, value) = if let Some(value) = name.strip_prefix("@min-") {
+            ("@min", value)
+        } else if let Some(value) = name.strip_prefix("@max-") {
+            ("@max", value)
+        } else if let Some(value) = name.strip_prefix('@') {
+            ("@min", value)
+        } else {
+            [
+                "group",
+                "peer",
+                "not",
+                "has",
+                "in",
+                "aria",
+                "data",
+                "nth-last-of-type",
+                "nth-of-type",
+                "nth-last",
+                "nth",
+                "supports",
+                "min",
+                "max",
+            ]
+            .iter()
+            .find_map(|root| Some((*root, name.strip_prefix(root)?.strip_prefix('-')?)))?
+        };
+        if value.is_empty() {
+            return None;
+        }
         let rank = order(root)? as u16;
         match root {
             "group" | "peer" | "not" | "has" | "in" => {
-                let (value, modifier) = modifier(value);
-                let (inner_rank, inner) = self.variant(value)?;
-                let mut variant = Variant {
-                    rules: inner.rules,
-                    ..Variant::default()
+                let named = matches!(root, "group" | "peer");
+                let inner = match modifier {
+                    Some(modifier) if !named => format!("{value}/{modifier}"),
+                    _ => value.to_owned(),
                 };
-                if inner.selectors.is_empty() {
-                    if root != "not" {
+                let (inner_rank, inner) = self.variant(&inner, depth + 1)?;
+                if inner.never || inner.relative && !matches!(root, "has" | "in") {
+                    return None;
+                }
+                let branches = if root == "not" {
+                    let [(at, selector)] = <[_; 1]>::try_from(inner.branches).ok()?;
+                    if at.len() > 1 {
                         return None;
                     }
-                    for rule in &mut variant.rules {
-                        *rule = rule.replacen("@media ", "@media not ", 1);
+                    let mut branches = Vec::new();
+                    if let Some(selector) = selector {
+                        if selector.contains("::") {
+                            return None;
+                        }
+                        let list: Vec<_> = split(&selector, ',')
+                            .into_iter()
+                            .map(|part| universal(part.trim(), true))
+                            .collect();
+                        branches.push((Vec::new(), Some(format!("&:not({})", list.join(", ")))));
                     }
+                    if let Some(rule) = at.first() {
+                        branches.push((vec![negate(rule)?], None));
+                    }
+                    branches
                 } else {
                     let marker = match modifier {
-                        Some(name) => format!(":where(.{root}\\/{})", &escape(name)[1..]),
-                        None => format!(":where(.{root})"),
+                        Some(name) if named && named_value(name) => {
+                            format!(":where(.{root}\\/{})", &escape(name)[1..])
+                        }
+                        Some(_) if named => return None,
+                        _ => format!(":where(.{root})"),
                     };
-                    let target = if matches!(root, "group" | "peer") {
-                        marker.as_str()
-                    } else {
-                        "*"
-                    };
-                    let selectors: Vec<_> = inner
-                        .selectors
-                        .iter()
-                        .map(|selector| selector.replace('&', target))
-                        .collect();
-                    let list = if selectors.len() > 1 && matches!(root, "group" | "peer") {
-                        format!(":is({})", selectors.join(", "))
-                    } else {
-                        selectors.join(", ")
-                    };
-                    variant.selectors = vec![match root {
-                        "group" => format!("&:is({list} *)"),
-                        "peer" => format!("&:is({list} ~ *)"),
-                        "not" => format!("&:not({list})"),
-                        "has" => format!("&:has({list})"),
-                        _ => format!(":where({list}) &"),
-                    }];
+                    let mut branches = Vec::new();
+                    for (at, selector) in inner.branches {
+                        let selector = selector?;
+                        let selector = match root {
+                            "has" => format!("&:has({})", universal(&selector, true)),
+                            "in" => format!(":where({}) &", universal(&selector, false)),
+                            _ => {
+                                let list = selector.replace('&', &marker);
+                                let list = if split(&list, ',').len() > 1 {
+                                    format!(":is({list})")
+                                } else {
+                                    list
+                                };
+                                let target = if root == "group" { "*" } else { "~ *" };
+                                format!("&:is({list} {target})")
+                            }
+                        };
+                        branches.push((at, Some(selector)));
+                    }
+                    branches
+                };
+                if branches.is_empty() {
+                    return None;
                 }
                 Some((
                     (rank, format!("{:05}{}", inner_rank.0, inner_rank.1)),
-                    variant,
+                    Variant {
+                        branches,
+                        ..Variant::default()
+                    },
                 ))
             }
+            _ if modifier.is_some() && !root.starts_with('@') => None,
             "aria" | "data" => {
-                let selector = match arbitrary(value) {
-                    Some(raw) => format!("&[{root}-{}]", quote(&decode(raw))),
-                    None if root == "aria" => format!("&[aria-{value}=\"true\"]"),
-                    None => format!("&[data-{value}]"),
+                let selector = if value.starts_with('[') {
+                    format!("&[{root}-{}]", quote(&self.arbitrary(value)?))
+                } else if !named_value(value) {
+                    return None;
+                } else if root == "aria" {
+                    format!("&[aria-{value}=\"true\"]")
+                } else {
+                    format!("&[data-{value}]")
                 };
                 Some(((rank, value.to_owned()), template(&selector)))
             }
             "nth" | "nth-last" | "nth-of-type" | "nth-last-of-type" => {
-                let argument = arbitrary(value)
-                    .map(decode)
-                    .or_else(|| value.parse::<u32>().ok().map(|number| number.to_string()))?;
+                let argument = if value.starts_with('[') {
+                    self.arbitrary(value)?
+                } else {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|_| integer(value))?
+                        .to_string()
+                };
                 let pseudo = match root {
                     "nth" => "nth-child",
                     "nth-last" => "nth-last-child",
@@ -1379,26 +2430,67 @@ impl Compiler {
                 ))
             }
             "supports" => {
-                let raw = decode(arbitrary(value)?);
-                let condition = if raw.starts_with('(') {
+                let raw = if value.starts_with(['[', '(']) {
+                    self.arbitrary(value)?
+                } else if named_value(value) {
+                    value.to_owned()
+                } else {
+                    return None;
+                };
+                let name_end = raw
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                    .unwrap_or(raw.len());
+                let condition = if raw[name_end..].trim_start().starts_with('(') {
                     raw.clone()
                 } else {
-                    format!("({raw})")
+                    let raw = if raw.contains(':') {
+                        raw.clone()
+                    } else {
+                        format!("{raw}: var(--tw)")
+                    };
+                    if raw.starts_with('(') && raw.ends_with(')') {
+                        raw
+                    } else {
+                        format!("({raw})")
+                    }
                 };
                 Some((
                     (rank, raw),
                     Variant {
-                        rules: vec![format!("@supports {condition}")],
+                        branches: vec![(vec![format!("@supports {condition}")], None)],
                         ..Variant::default()
                     },
                 ))
             }
-            _ => {
-                let width = match arbitrary(value) {
-                    Some(raw) => decode(raw),
-                    None => self.value("--breakpoint", value)?,
+            "min" | "max" => {
+                let width = match self.arbitrary(value) {
+                    Some(raw) => raw,
+                    None => self.raw(&format!("--breakpoint-{value}"))?,
                 };
                 self.media(if root == "min" { ">=" } else { "<" }, &width, root)
+            }
+            _ => {
+                let width = match self.arbitrary(value) {
+                    Some(raw) => raw,
+                    None => self.raw(&format!("--container-{value}"))?,
+                };
+                let name = match modifier {
+                    Some(name) if named_value(name) => format!("{name} "),
+                    Some(_) => return None,
+                    None => String::new(),
+                };
+                let operator = if root == "@max" { "<" } else { ">=" };
+                let ((_, key), _) = self.media(operator, &width, root)?;
+                Some((
+                    (rank, format!("{key}{name}")),
+                    Variant {
+                        branches: vec![(
+                            vec![format!("@container {name}(width {operator} {width})")],
+                            None,
+                        )],
+                        ..Variant::default()
+                    },
+                ))
             }
         }
     }
@@ -1411,28 +2503,53 @@ impl Compiler {
             .map(|value| value * 16.)
             .or_else(|| width.strip_suffix("px")?.parse().ok())
             .unwrap_or(0.);
-        let key = if root == "max" { 1e6 - pixels } else { pixels };
+        let key = if operator == "<" {
+            1e6 - pixels
+        } else {
+            pixels
+        };
         Some((
             (
                 VARIANTS.iter().position(|(name, _)| *name == root)? as u16,
                 format!("{key:012.3}"),
             ),
             Variant {
-                rules: vec![format!("@media (width {operator} {width})")],
+                branches: vec![(vec![format!("@media (width {operator} {width})")], None)],
                 ..Variant::default()
             },
         ))
     }
 
-    /// A theme value as `var(--name)`, from the author theme or Tailwind's defaults.
+    fn removed(&self, name: &str) -> bool {
+        self.cleared.iter().any(|cleared| removes(cleared, name))
+    }
+
+    /// The value of a theme variable, from the author theme or Tailwind's defaults.
+    fn raw(&self, name: &str) -> Option<String> {
+        if let Some(value) = self.theme.get(name) {
+            return Some(value.clone());
+        }
+        if self.removed(name) {
+            return None;
+        }
+        DEFAULTS.with(|defaults| defaults.get(name).map(|value| (*value).to_owned()))
+    }
+
+    /// A theme value as `var(--name)`, or the value itself for inline variables.
     fn theme(&self, namespace: &str, key: &str) -> Option<String> {
         let name = format!("{namespace}-{key}");
-        if self.inline.contains(&name) {
-            return self.theme.get(&name).cloned();
+        let name = if self.raw(&name).is_none() && key.contains('.') {
+            format!("{namespace}-{}", key.replace('.', "_"))
+        } else {
+            name
+        };
+        if kept(&name, namespace) {
+            return None;
         }
-        (self.theme.contains_key(&name)
-            || DEFAULTS.with(|defaults| defaults.contains_key(name.as_str())))
-        .then(|| format!("var({name})"))
+        if self.inline.contains(&name) || INLINE.contains(&name.as_str()) {
+            return self.raw(&name);
+        }
+        self.raw(&name).map(|_| format!("var({name})"))
     }
 
     /// An `@utility` from the author CSS, with `--value()` and `--modifier()` resolved.
@@ -1449,7 +2566,7 @@ impl Compiler {
                 None => return None,
             };
             let mut resolved = false;
-            let body = self.expand(body, value, modifier, &mut resolved)?;
+            let body = self.expand(body, value, modifier, &mut resolved, 0)?;
             (value.is_none() || resolved).then_some(body)
         })
     }
@@ -1460,60 +2577,70 @@ impl Compiler {
         value: Option<&str>,
         modifier: Option<&str>,
         resolved: &mut bool,
+        depth: u8,
     ) -> Option<Body> {
+        if depth > 8 {
+            return None;
+        }
         let mut body = Body::default();
-        let mut depth = 0;
-        let mut start = 0;
-        for (index, character) in source.char_indices() {
-            match character {
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth -= 1,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let item = &source[start..index];
-                        let (selector, inner) = item.split_once('{')?;
-                        let inner = self.expand(inner, value, modifier, resolved)?;
-                        body.nested
-                            .push((selector.trim().to_owned(), inner.declarations));
-                        start = index + 1;
-                    }
-                }
-                ';' if depth == 0 => {
-                    let item = &source[start..index];
-                    start = index + 1;
-                    let Some((property, raw)) = item.split_once(':') else {
-                        continue;
-                    };
-                    let mut raw = raw.trim().to_owned();
-                    let mut valid = true;
-                    for (function, input) in [("--value(", value), ("--modifier(", modifier)] {
-                        while let Some(position) = raw.find(function) {
-                            let open = position + function.len();
-                            let mut depth = 0;
-                            let close = open
-                                + raw[open..]
-                                    .find(|c| {
-                                        depth += i32::from(c == '(') - i32::from(c == ')');
-                                        depth < 0
-                                    })
-                                    .unwrap_or(raw.len() - open - 1);
-                            match input.and_then(|input| self.resolve(&raw[open..close], input)) {
-                                Some(result) => raw.replace_range(position..=close, &result),
-                                None => {
-                                    valid = false;
-                                    break;
-                                }
-                            }
-                            *resolved |= function == "--value(";
+        for (prelude, block) in statements(source) {
+            let Some(inner) = block else {
+                if let Some(classes) = prelude.strip_prefix("@apply") {
+                    let mut compiled: Vec<_> = classes
+                        .split_ascii_whitespace()
+                        .filter_map(|class| self.compile(class, "&"))
+                        .collect();
+                    compiled.sort_unstable_by(|a, b| a.sort.cmp(&b.sort));
+                    for (at, selector, pairs) in compiled.into_iter().flat_map(|c| c.rules) {
+                        if at.is_empty() && selector == "&" {
+                            body.declarations.extend(pairs);
+                        } else {
+                            body.nested.push((at, selector, pairs));
                         }
                     }
-                    if valid {
-                        body.declarations.push((property.trim().to_owned(), raw));
+                    continue;
+                }
+                let Some((property, raw)) = prelude.split_once(':') else {
+                    continue;
+                };
+                let mut raw = raw.trim().to_owned();
+                let mut valid = true;
+                for (function, input) in [("--value", value), ("--modifier", modifier)] {
+                    while let Some((start, open, close)) = call(&raw, function) {
+                        let result = (close < raw.len())
+                            .then(|| input.and_then(|input| self.resolve(&raw[open..close], input)))
+                            .flatten();
+                        let Some(result) = result else {
+                            valid = false;
+                            break;
+                        };
+                        raw.replace_range(start..=close, &result);
+                        *resolved |= function == "--value";
                     }
                 }
-                _ => {}
+                if valid {
+                    body.declarations
+                        .push((property.trim().to_owned(), self.functions(&raw)));
+                }
+                continue;
+            };
+            let inner = self.expand(inner, value, modifier, resolved, depth + 1)?;
+            let (at, selector) = if prelude.starts_with('@') {
+                (vec![prelude.to_owned()], "&".to_owned())
+            } else if prelude.contains('&') {
+                (Vec::new(), prelude.to_owned())
+            } else {
+                (Vec::new(), format!("& {prelude}"))
+            };
+            if !inner.declarations.is_empty() {
+                body.nested
+                    .push((at.clone(), selector.clone(), inner.declarations));
+            }
+            for (nested, template, pairs) in inner.nested {
+                let mut rules = at.clone();
+                rules.extend(nested);
+                body.nested
+                    .push((rules, template.replace('&', &selector), pairs));
             }
         }
         Some(body)
@@ -1529,8 +2656,7 @@ impl Compiler {
                     .strip_suffix("-*")
                     .filter(|name| name.starts_with("--"))
                 {
-                    return arbitrary(value)
-                        .is_none()
+                    return named_value(value)
                         .then(|| self.theme(namespace, value))
                         .flatten();
                 }
@@ -1538,77 +2664,249 @@ impl Compiler {
                 {
                     return (literal == value).then(|| value.to_owned());
                 }
-                match (arbitrary(argument), arbitrary(value)) {
-                    (Some(kind), Some(raw)) => {
-                        let (hint, raw) = hint(raw);
-                        let raw = decode(raw);
-                        (kind == "*" || hint == Some(kind) || hint.is_none() && is_type(kind, &raw))
-                            .then_some(raw)
+                match (
+                    argument.strip_prefix('[').and_then(|a| a.strip_suffix(']')),
+                    self.typed(value),
+                ) {
+                    (Some(kind), Some((hint, raw))) => (kind == "*"
+                        || hint.as_deref() == Some(kind)
+                        || hint.is_none() && is_type(kind, &raw))
+                    .then_some(raw),
+                    (None, None) => {
+                        (named_value(value) && is_type(argument, value)).then(|| value.to_owned())
                     }
-                    (None, None) => is_type(argument, value).then(|| value.to_owned()),
                     _ => None,
                 }
             })
     }
 
-    fn value(&self, namespace: &str, key: &str) -> Option<String> {
-        let name = format!("{namespace}-{key}");
-        self.theme.get(&name).cloned().or_else(|| {
-            DEFAULTS.with(|defaults| defaults.get(name.as_str()).map(|value| (*value).to_owned()))
-        })
+    /// The value of `[...]` or `(--name)`, decoded and checked like Tailwind does.
+    fn arbitrary(&self, value: &str) -> Option<String> {
+        let raw = match value
+            .strip_prefix('[')
+            .and_then(|raw| raw.strip_suffix(']'))
+        {
+            Some(raw) => decode(raw),
+            None => {
+                let raw = value.strip_prefix('(')?.strip_suffix(')')?;
+                let (kind, name) = match split(raw, ':').as_slice() {
+                    [kind, name] => (Some(*kind), *name),
+                    _ => (None, raw),
+                };
+                if !name.starts_with("--") || !valid(name) {
+                    return None;
+                }
+                decode(&match kind {
+                    Some(kind) => format!("{kind}:var({name})"),
+                    None => format!("var({name})"),
+                })
+            }
+        };
+        let raw = self.functions(&raw);
+        (valid(&raw) && !raw.trim().is_empty()).then_some(raw)
+    }
+
+    /// An arbitrary value with its type hint, like `length` in `[length:var(--x)]`.
+    fn typed(&self, value: &str) -> Option<(Option<String>, String)> {
+        let raw = self.arbitrary(value)?;
+        let end = raw
+            .find(|c: char| !(c == '-' || c.is_ascii_lowercase()))
+            .unwrap_or(raw.len());
+        if raw[end..].starts_with(':') {
+            let (hint, rest) = (&raw[..end], &raw[end + 1..]);
+            if hint.is_empty() || rest.trim().is_empty() {
+                return None;
+            }
+            return Some((Some(hint.to_owned()), rest.to_owned()));
+        }
+        Some((None, raw))
+    }
+
+    /// Resolves `--spacing()`, `--alpha()`, `--theme()` and the legacy `theme()`.
+    fn functions(&self, value: &str) -> String {
+        if !value.contains("theme(") && !value.contains("--spacing(") && !value.contains("--alpha(")
+        {
+            return value.to_owned();
+        }
+        let mut value = value.to_owned();
+        for function in ["--spacing", "--alpha", "--theme", "theme"] {
+            let mut from = 0;
+            while let Some((start, open, close)) = call(&value[from..], function) {
+                let (start, open, close) = (from + start, from + open, from + close);
+                // WARNING: `theme(` also matches inside `--theme(` and names like `x-theme(`.
+                if function == "theme"
+                    && value[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c == '-' || c.is_alphanumeric())
+                {
+                    from = open;
+                    continue;
+                }
+                if close == value.len() {
+                    break;
+                }
+                let arguments = self.functions(&value[open..close]);
+                let Some(result) = self.function(function, arguments.trim()) else {
+                    from = close;
+                    continue;
+                };
+                value.replace_range(start..=close, &result);
+                from = start + result.len();
+            }
+        }
+        value
+    }
+
+    fn function(&self, function: &str, arguments: &str) -> Option<String> {
+        match function {
+            "--spacing" => {
+                let base = self.raw("--spacing")?;
+                let base = match self.inline.contains("--spacing") {
+                    true => base,
+                    false => "var(--spacing)".into(),
+                };
+                Some(match arguments {
+                    "0" => "0px".into(),
+                    "1" => base,
+                    _ => format!("calc({base} * {arguments})"),
+                })
+            }
+            "--alpha" => {
+                let [color, alpha] = split(arguments, '/')[..] else {
+                    return None;
+                };
+                Some(with_alpha(color.trim(), alpha.trim()))
+            }
+            "--theme" => {
+                let (name, fallback) = match split(arguments, ',').as_slice() {
+                    [name] => (*name, None),
+                    [name, rest @ ..] => (*name, Some(rest.join(",").trim().to_owned())),
+                    _ => return None,
+                };
+                let (name, inline) = match name.trim().strip_suffix(" inline") {
+                    Some(name) => (name.trim(), true),
+                    None => (name.trim(), false),
+                };
+                match self.raw(name) {
+                    Some(value) if inline || self.inline.contains(name) => Some(value),
+                    Some(_) => Some(match fallback {
+                        Some(fallback) => format!("var({name}, {fallback})"),
+                        None => format!("var({name})"),
+                    }),
+                    None => fallback,
+                }
+            }
+            _ => {
+                // WARNING: author CSS separates `spacing` and `.4` with `/**/` when it is serialized.
+                let arguments = arguments.replace("/**/", "");
+                let (path, alpha) = match split(&arguments, '/').as_slice() {
+                    [path] => (path.trim(), None),
+                    [path, alpha] => (path.trim(), Some(alpha.trim())),
+                    _ => return None,
+                };
+                let value = if path.starts_with("--") {
+                    self.raw(path)?
+                } else {
+                    let (namespace, key) = path.split_once('.')?;
+                    if namespace == "spacing" {
+                        let base = self.raw("--spacing")?;
+                        let number: f64 = key.parse().ok()?;
+                        let unit =
+                            base.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+                        let scale: f64 = base[..base.len() - unit.len()].parse().ok()?;
+                        format!("{}{unit}", scale * number)
+                    } else {
+                        let namespace = match namespace {
+                            "colors" => "--color",
+                            "fontSize" => "--text",
+                            "fontFamily" => "--font",
+                            "fontWeight" => "--font-weight",
+                            "letterSpacing" => "--tracking",
+                            "lineHeight" => "--leading",
+                            "borderRadius" => "--radius",
+                            "boxShadow" => "--shadow",
+                            "screens" => "--breakpoint",
+                            "maxWidth" | "width" | "containers" => "--container",
+                            "blur" => "--blur",
+                            "animation" => "--animate",
+                            "transitionTimingFunction" => "--ease",
+                            _ => return None,
+                        };
+                        let key = key.replace('.', "-");
+                        self.raw(&format!("{namespace}-{key}"))
+                            .or_else(|| self.raw(&format!("--spacing-{key}")))?
+                    }
+                };
+                Some(match alpha {
+                    Some(alpha) => with_alpha(&value, alpha),
+                    None => value,
+                })
+            }
+        }
     }
 
     fn utility(&self, class: &str) -> Option<Body> {
         if let Some(body) = self.custom(class) {
             return Some(body);
         }
-        if let Some(raw) = arbitrary(class) {
+        if let Some(raw) = class
+            .strip_prefix('[')
+            .and_then(|raw| raw.strip_suffix(']'))
+        {
             let (property, value) = raw.split_once(':')?;
-            if property.is_empty()
+            if !property.starts_with(|c: char| c == '-' || c.is_ascii_lowercase())
                 || !property
                     .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                || value.is_empty()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             {
                 return None;
             }
-            return Body::new(&[(property, decode(value))]);
+            let value = self.functions(&decode(value));
+            return (valid(&value) && !value.trim().is_empty())
+                .then(|| Body::new(&[(property, value)]))
+                .flatten();
         }
-        if let Some((_, source)) = STATIC.iter().find(|(name, _)| *name == class) {
-            return Some(Body::parse(source));
+        if let Ok(index) = STATIC.binary_search_by(|(name, _)| (*name).cmp(class)) {
+            return Some(Body::parse(STATIC[index].1));
         }
         let (negative, class) = match class.strip_prefix('-') {
             Some(class) => (true, class),
             None => (false, class),
         };
         let (class, modifier) = modifier(class);
-        let mut depth = 0;
-        let mut dashes = Vec::new();
-        for (index, byte) in class.bytes().enumerate() {
-            match byte {
-                b'[' | b'(' => depth += 1,
-                b']' | b')' => depth -= 1,
-                b'-' if depth == 0 && index > 0 => dashes.push(index),
-                _ => {}
-            }
+        if modifier
+            .is_some_and(|modifier| !named_value(modifier) && !modifier.starts_with(['[', '(']))
+        {
+            return None;
         }
-        dashes
-            .iter()
-            .rev()
-            .find_map(|&index| {
-                self.functional(
-                    &class[..index],
-                    Some(&class[index + 1..]),
-                    modifier,
-                    negative,
-                )
-            })
-            .or_else(|| self.functional(class, None, modifier, negative))
+        let functional = |root: &str, value: Option<&str>| {
+            (!negative || NEGATIVE.contains(&root))
+                .then(|| self.functional(root, value, modifier, negative))
+                .flatten()
+        };
+        if class.ends_with(']') || class.ends_with(')') {
+            let open = if class.ends_with(']') { "-[" } else { "-(" };
+            let index = class.find(open)?;
+            return functional(&class[..index], Some(&class[index + 1..]));
+        }
+        functional(class, None).or_else(|| {
+            class
+                .match_indices('-')
+                .rev()
+                .filter(|(index, _)| *index > 0)
+                .find_map(|(index, _)| {
+                    let value = &class[index + 1..];
+                    named_value(value)
+                        .then(|| functional(&class[..index], Some(value)))
+                        .flatten()
+                })
+        })
     }
 
     fn spacing(&self, value: &str) -> Option<String> {
-        if let Some(raw) = arbitrary(value) {
-            return Some(decode(hint(raw).1));
+        if value.starts_with(['[', '(']) {
+            return self.typed(value).map(|(_, raw)| raw);
         }
         if value == "px" {
             return Some("1px".into());
@@ -1620,14 +2918,14 @@ impl Compiler {
         (number >= 0.
             && (number * 4.).fract() == 0.
             && value.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
-        .then(|| format!("calc(var(--spacing) * {value})"))
+        .then(|| self.function("--spacing", value))
+        .flatten()
     }
 
     fn color(&self, value: &str, modifier: Option<&str>) -> Option<String> {
-        let color = if let Some(raw) = arbitrary(value) {
-            let (kind, raw) = hint(raw);
-            let raw = decode(raw);
-            if kind.is_some_and(|kind| kind != "color")
+        let color = if value.starts_with(['[', '(']) {
+            let (kind, raw) = self.typed(value)?;
+            if kind.as_deref().is_some_and(|kind| kind != "color")
                 || kind.is_none() && !is_color(&raw) && !raw.starts_with("var(")
             {
                 return None;
@@ -1644,25 +2942,30 @@ impl Compiler {
         let Some(modifier) = modifier else {
             return Some(color);
         };
-        let alpha = match arbitrary(modifier) {
-            Some(raw) => {
-                let raw = decode(raw);
-                match raw.parse::<f32>() {
-                    Ok(number) if number <= 1. => format!("{}%", number * 100.),
-                    _ => raw,
-                }
-            }
-            None => {
-                let number: f32 = modifier.parse().ok()?;
-                if !(0. ..=100.).contains(&number) {
-                    return None;
-                }
-                format!("{modifier}%")
-            }
-        };
-        (color != "inherit").then(|| format!("color-mix(in oklab, {color} {alpha}, transparent)"))
+        let alpha = self.opacity(modifier)?;
+        (color != "inherit").then(|| with_alpha(&color, &alpha))
     }
 
+    /// An opacity modifier like `50`, `[0.5]` or `(--alpha)` as a percentage.
+    fn opacity(&self, modifier: &str) -> Option<String> {
+        if modifier.starts_with(['[', '(']) {
+            return self.arbitrary(modifier);
+        }
+        let number: f64 = modifier.parse().ok()?;
+        ((0. ..=100.).contains(&number) && (number * 4.).fract() == 0.)
+            .then(|| format!("{modifier}%"))
+    }
+
+    /// A shadow color: Tailwind mixes it with the shadow's alpha variable.
+    fn shadow(&self, value: &str, modifier: Option<&str>, alpha: &str) -> Option<String> {
+        if matches!(value, "initial" | "inherit") && modifier.is_none() {
+            return Some(value.into());
+        }
+        let color = self.color(value, modifier)?;
+        Some(format!(
+            "color-mix(in oklab, {color} var(--tw-{alpha}-alpha), transparent)"
+        ))
+    }
     fn functional(
         &self,
         root: &str,
@@ -1672,55 +2975,215 @@ impl Compiler {
     ) -> Option<Body> {
         let negate = |value: String| {
             if !negative {
-                value
-            } else if let Some(number) = value.strip_prefix("calc(var(--spacing) * ") {
-                format!("calc(var(--spacing) * -{number}")
-            } else {
-                format!("calc({value} * -1)")
+                return value;
+            }
+            if let Some(number) = value.strip_prefix("calc(var(--spacing) * ") {
+                return format!("calc(var(--spacing) * -{number}");
+            }
+            match value.as_str() {
+                "var(--spacing)" => "calc(var(--spacing) * -1)".into(),
+                _ => format!("calc({value} * -1)"),
             }
         };
-        let fraction = |value: &str| {
-            let modifier = modifier?;
-            (value.bytes().all(|b| b.is_ascii_digit())
-                && modifier.bytes().all(|b| b.is_ascii_digit())
-                && modifier != "0")
-                .then(|| format!("calc({value}/{modifier} * 100%)"))
+        let typed = value.and_then(|value| {
+            value
+                .starts_with(['[', '('])
+                .then(|| self.typed(value))
+                .flatten()
+        });
+        let raw = typed.as_ref().map(|(_, raw)| raw.clone());
+        let hint = typed.as_ref().and_then(|(hint, _)| hint.as_deref());
+        let bare = value.filter(|value| !value.starts_with(['[', '(']));
+        let spaced = |value: String| match bare {
+            Some("0") => value,
+            Some("px") if negative => "-1px".into(),
+            Some("full") if negative => "-100%".into(),
+            _ => negate(value),
         };
-        let length = |raw: &str| {
-            let (kind, raw) = hint(raw);
-            let raw = decode(raw);
-            (matches!(
-                kind,
-                Some("length" | "line-width" | "number" | "percentage")
-            ) || kind.is_none() && is_length(&raw))
-            .then_some(raw)
+        if value.is_some_and(|value| value.starts_with(['[', '('])) && typed.is_none() {
+            return None;
+        }
+        let fraction = |spaces: bool| {
+            let (value, modifier) = (bare?, modifier?);
+            (integer(value) && integer(modifier) && modifier != "0").then(|| {
+                if spaces {
+                    format!("calc({value} / {modifier} * 100%)")
+                } else {
+                    format!("calc({value}/{modifier} * 100%)")
+                }
+            })
         };
+        let number = |unit: &str| {
+            let value = bare?;
+            (integer(value)
+                || value
+                    .parse::<f64>()
+                    .is_ok_and(|n| n >= 0. && (n * 4.).fract() == 0.))
+            .then(|| format!("{value}{unit}"))
+        };
+        let width = |default: &str| match value {
+            None => Some(default.to_owned()),
+            Some(_) => match hint {
+                Some("length" | "line-width" | "number" | "percentage") => raw.clone(),
+                Some(_) => None,
+                None => match &raw {
+                    Some(raw) => is_length(raw).then(|| raw.clone()),
+                    None => bare
+                        .filter(|value| integer(value))
+                        .map(|value| format!("{value}px")),
+                },
+            },
+        };
+        let filter = |name: &str, unit: &str, default: Option<&str>| {
+            let value = match (value, &raw) {
+                (None, _) => default?.to_owned(),
+                (_, Some(raw)) => raw.clone(),
+                _ => number(unit)?,
+            };
+            let backdrop = root.starts_with("backdrop-");
+            let property = format!("--tw-{root}");
+            let value = format!("{name}({})", negate(value));
+            if backdrop {
+                return Body::new(&[
+                    (&property, value),
+                    ("-webkit-backdrop-filter", BACKDROP.into()),
+                    ("backdrop-filter", BACKDROP.into()),
+                ]);
+            }
+            Body::new(&[(&property, value), ("filter", FILTER.into())])
+        };
+        if modifier.is_some()
+            && !matches!(
+                root,
+                "w" | "min-w"
+                    | "max-w"
+                    | "h"
+                    | "min-h"
+                    | "max-h"
+                    | "size"
+                    | "inset"
+                    | "inset-x"
+                    | "inset-y"
+                    | "inset-s"
+                    | "inset-e"
+                    | "inset-bs"
+                    | "inset-be"
+                    | "start"
+                    | "end"
+                    | "top"
+                    | "right"
+                    | "bottom"
+                    | "left"
+                    | "translate"
+                    | "translate-x"
+                    | "translate-y"
+                    | "inline"
+                    | "min-inline"
+                    | "max-inline"
+                    | "block"
+                    | "min-block"
+                    | "max-block"
+                    | "basis"
+                    | "flex"
+                    | "aspect"
+                    | "text"
+                    | "bg"
+                    | "bg-linear"
+                    | "bg-radial"
+                    | "bg-conic"
+                    | "from"
+                    | "via"
+                    | "to"
+                    | "border"
+                    | "border-x"
+                    | "border-y"
+                    | "border-s"
+                    | "border-e"
+                    | "border-bs"
+                    | "border-be"
+                    | "border-t"
+                    | "border-r"
+                    | "border-b"
+                    | "border-l"
+                    | "divide"
+                    | "divide-x"
+                    | "divide-y"
+                    | "outline"
+                    | "ring"
+                    | "inset-ring"
+                    | "ring-offset"
+                    | "shadow"
+                    | "inset-shadow"
+                    | "drop-shadow"
+                    | "text-shadow"
+                    | "decoration"
+                    | "accent"
+                    | "caret"
+                    | "fill"
+                    | "stroke"
+                    | "placeholder"
+                    | "scrollbar-thumb"
+                    | "scrollbar-track"
+                    | "mask-linear-from"
+                    | "mask-linear-to"
+                    | "mask-radial-from"
+                    | "mask-radial-to"
+                    | "mask-conic-from"
+                    | "mask-conic-to"
+                    | "mask-x-from"
+                    | "mask-x-to"
+                    | "mask-y-from"
+                    | "mask-y-to"
+                    | "mask-t-from"
+                    | "mask-t-to"
+                    | "mask-r-from"
+                    | "mask-r-to"
+                    | "mask-b-from"
+                    | "mask-b-to"
+                    | "mask-l-from"
+                    | "mask-l-to"
+                    | "@container"
+            )
+        {
+            return None;
+        }
         match root {
-            "w" | "min-w" | "max-w" | "h" | "min-h" | "max-h" | "size" => {
+            "w" | "min-w" | "max-w" | "h" | "min-h" | "max-h" | "size" | "inline"
+            | "min-inline" | "max-inline" | "block" | "min-block" | "max-block" => {
                 let value = value?;
-                let horizontal = root.ends_with('w') || root == "size";
-                let resolved = match (value, modifier) {
-                    (value, Some(_)) => fraction(value)?,
-                    ("full", _) => "100%".into(),
-                    ("auto", _) if !root.starts_with("max") => "auto".into(),
-                    ("none", _) if root.starts_with("max") => "none".into(),
-                    ("screen", _) if root != "size" => {
-                        if horizontal { "100vw" } else { "100vh" }.into()
-                    }
-                    ("dvw" | "svw" | "lvw", _) if root != "size" && horizontal => {
-                        format!("100{value}")
-                    }
-                    ("dvh" | "svh" | "lvh", _) if root != "size" && !horizontal => {
-                        format!("100{value}")
-                    }
-                    ("min", _) => "min-content".into(),
-                    ("max", _) => "max-content".into(),
-                    ("fit", _) => "fit-content".into(),
-                    ("lh", _) => "1lh".into(),
-                    _ => horizontal
-                        .then(|| self.theme("--container", value))
-                        .flatten()
-                        .or_else(|| self.spacing(value))?,
+                let max = root.starts_with("max");
+                let vertical = root.ends_with("block") || root.ends_with('h');
+                let inline = root.ends_with("inline");
+                let resolved = match (&raw, modifier) {
+                    (Some(raw), None) => raw.clone(),
+                    (_, Some(_)) => fraction(false)?,
+                    _ => match value {
+                        "full" => "100%".into(),
+                        "auto" if !max => "auto".into(),
+                        "none" if max => "none".into(),
+                        "px" => "1px".into(),
+                        "screen" if root != "size" && root != "max-w" => {
+                            if vertical { "100vh" } else { "100vw" }.into()
+                        }
+                        "dvw" | "svw" | "lvw" if !root.ends_with("block") => format!("100{value}"),
+                        "dvh" | "svh" | "lvh" if !inline => format!("100{value}"),
+                        "min" => "min-content".into(),
+                        "max" => "max-content".into(),
+                        "fit" => "fit-content".into(),
+                        "lh" if vertical => "1lh".into(),
+                        "prose" if root == "max-w" => "65ch".into(),
+                        _ => (!vertical && root != "size")
+                            .then(|| self.theme("--container", value))
+                            .flatten()
+                            .or_else(|| {
+                                (root == "max-w")
+                                    .then(|| {
+                                        self.theme("--breakpoint", value.strip_prefix("screen-")?)
+                                    })
+                                    .flatten()
+                            })
+                            .or_else(|| self.spacing(value))?,
+                    },
                 };
                 let properties: &[&str] = match root {
                     "w" => &["width"],
@@ -1729,7 +3192,13 @@ impl Compiler {
                     "h" => &["height"],
                     "min-h" => &["min-height"],
                     "max-h" => &["max-height"],
-                    _ => &["width", "height"],
+                    "size" => &["width", "height"],
+                    "inline" => &["inline-size"],
+                    "min-inline" => &["min-inline-size"],
+                    "max-inline" => &["max-inline-size"],
+                    "block" => &["block-size"],
+                    "min-block" => &["min-block-size"],
+                    _ => &["max-block-size"],
                 };
                 Body::new(
                     &properties
@@ -1738,55 +3207,81 @@ impl Compiler {
                         .collect::<Vec<_>>(),
                 )
             }
-            "inset" | "inset-x" | "inset-y" | "start" | "end" | "top" | "right" | "bottom"
-            | "left" => {
+            "inset" | "inset-x" | "inset-y" | "inset-s" | "inset-e" | "inset-bs" | "inset-be"
+            | "start" | "end" | "top" | "right" | "bottom" | "left" => {
                 let value = value?;
-                let resolved = match value {
-                    "auto" if !negative => "auto".into(),
-                    "full" => "100%".into(),
-                    _ => fraction(value).or_else(|| self.spacing(value))?,
+                let resolved = match (&raw, modifier) {
+                    (Some(raw), None) => raw.clone(),
+                    (_, Some(_)) => fraction(false)?,
+                    _ => match value {
+                        "auto" if !negative => "auto".into(),
+                        "full" => "100%".into(),
+                        // WARNING: Tailwind keeps the old spacing for the deprecated `start-*` and `end-*`.
+                        _ if matches!(root, "start" | "end") && value != "px" => {
+                            let base = self.function("--spacing", "1")?;
+                            self.spacing(value)?;
+                            let sign = if negative { "-" } else { "" };
+                            return Body::new(&[(
+                                if root == "start" {
+                                    "inset-inline-start"
+                                } else {
+                                    "inset-inline-end"
+                                },
+                                format!("calc({base} * {sign}{value})"),
+                            )]);
+                        }
+                        _ => self.spacing(value)?,
+                    },
+                };
+                let resolved = if raw.is_some() || modifier.is_some() {
+                    negate(resolved)
+                } else {
+                    spaced(resolved)
                 };
                 let property = match root {
                     "inset-x" => "inset-inline",
                     "inset-y" => "inset-block",
-                    "start" => "inset-inline-start",
-                    "end" => "inset-inline-end",
+                    "start" | "inset-s" => "inset-inline-start",
+                    "end" | "inset-e" => "inset-inline-end",
+                    "inset-bs" => "inset-block-start",
+                    "inset-be" => "inset-block-end",
                     _ => root,
                 };
-                Body::new(&[(property, negate(resolved))])
+                Body::new(&[(property, resolved)])
             }
-            "m" | "mx" | "my" | "ms" | "me" | "mt" | "mr" | "mb" | "ml" | "p" | "px" | "py"
-            | "ps" | "pe" | "pt" | "pr" | "pb" | "pl" | "scroll-m" | "scroll-mx" | "scroll-my"
-            | "scroll-mt" | "scroll-mr" | "scroll-mb" | "scroll-ml" | "scroll-p" | "scroll-px"
-            | "scroll-py" | "scroll-pt" | "scroll-pr" | "scroll-pb" | "scroll-pl" => {
+            "m" | "mx" | "my" | "ms" | "me" | "mbs" | "mbe" | "mt" | "mr" | "mb" | "ml" | "p"
+            | "px" | "py" | "ps" | "pe" | "pbs" | "pbe" | "pt" | "pr" | "pb" | "pl"
+            | "scroll-m" | "scroll-mx" | "scroll-my" | "scroll-ms" | "scroll-me" | "scroll-mbs"
+            | "scroll-mbe" | "scroll-mt" | "scroll-mr" | "scroll-mb" | "scroll-ml" | "scroll-p"
+            | "scroll-px" | "scroll-py" | "scroll-ps" | "scroll-pe" | "scroll-pbs"
+            | "scroll-pbe" | "scroll-pt" | "scroll-pr" | "scroll-pb" | "scroll-pl" => {
                 let value = value?;
                 let (scroll, short) = match root.strip_prefix("scroll-") {
                     Some(short) => ("scroll-", short),
                     None => ("", root),
                 };
                 let margin = short.starts_with('m');
-                if negative && !margin {
-                    return None;
-                }
                 let resolved = match value {
-                    "auto" if margin && !negative => "auto".into(),
+                    "auto" if margin && !negative && scroll.is_empty() => "auto".into(),
                     _ => self.spacing(value)?,
                 };
                 let name = if margin { "margin" } else { "padding" };
-                let property = match &short[1..] {
-                    "" => format!("{scroll}{name}"),
-                    "x" => format!("{scroll}{name}-inline"),
-                    "y" => format!("{scroll}{name}-block"),
-                    "s" => format!("{scroll}{name}-inline-start"),
-                    "e" => format!("{scroll}{name}-inline-end"),
-                    "t" => format!("{scroll}{name}-top"),
-                    "r" => format!("{scroll}{name}-right"),
-                    "b" => format!("{scroll}{name}-bottom"),
-                    _ => format!("{scroll}{name}-left"),
+                let side = match &short[1..] {
+                    "" => "",
+                    "x" => "-inline",
+                    "y" => "-block",
+                    "s" => "-inline-start",
+                    "e" => "-inline-end",
+                    "bs" => "-block-start",
+                    "be" => "-block-end",
+                    "t" => "-top",
+                    "r" => "-right",
+                    "b" => "-bottom",
+                    _ => "-left",
                 };
-                Body::new(&[(property.as_str(), negate(resolved))])
+                Body::new(&[(&format!("{scroll}{name}{side}"), spaced(resolved))])
             }
-            "gap" | "gap-x" | "gap-y" if !negative => {
+            "gap" | "gap-x" | "gap-y" => {
                 let property = match root {
                     "gap-x" => "column-gap",
                     "gap-y" => "row-gap",
@@ -1795,7 +3290,7 @@ impl Compiler {
                 Body::new(&[(property, self.spacing(value?)?)])
             }
             "space-x" | "space-y" => {
-                let value = negate(self.spacing(value?)?);
+                let value = spaced(self.spacing(value?)?);
                 let axis = &root[6..];
                 let (start, end) = if axis == "x" {
                     ("margin-inline-start", "margin-inline-end")
@@ -1803,38 +3298,101 @@ impl Compiler {
                     ("margin-block-start", "margin-block-end")
                 };
                 let reverse = format!("--tw-space-{axis}-reverse");
+                let (start_value, end_value) = if value == "0px" {
+                    ("0".into(), "0".into())
+                } else {
+                    (
+                        format!("calc({value} * var({reverse}))"),
+                        format!("calc({value} * calc(1 - var({reverse})))"),
+                    )
+                };
                 Some(Body {
                     nested: vec![(
+                        Vec::new(),
                         ":where(& > :not(:last-child))".into(),
                         vec![
-                            (reverse.clone(), "0".into()),
-                            (start.into(), format!("calc({value} * var({reverse}))")),
-                            (
-                                end.into(),
-                                format!("calc({value} * calc(1 - var({reverse})))"),
-                            ),
+                            (reverse, "0".into()),
+                            (start.into(), start_value),
+                            (end.into(), end_value),
                         ],
                     )],
                     sort: Some(if axis == "x" { "column-gap" } else { "row-gap" }),
                     ..Body::default()
                 })
             }
+            "space-x-reverse" | "space-y-reverse" | "divide-x-reverse" | "divide-y-reverse"
+                if value.is_none() =>
+            {
+                let name = root.strip_suffix("-reverse")?;
+                Some(Body::default().nest(
+                    &[],
+                    ":where(& > :not(:last-child))",
+                    &format!("--tw-{name}-reverse:1"),
+                ))
+            }
+            "divide" | "divide-x" | "divide-y" => {
+                let nested = ":where(& > :not(:last-child))";
+                if root == "divide" {
+                    if let Some(style) = bare.filter(|style| {
+                        matches!(*style, "solid" | "dashed" | "dotted" | "double" | "none")
+                    }) {
+                        return Some(Body::default().nest(
+                            &[],
+                            nested,
+                            &format!("--tw-border-style:{style};border-style:{style}"),
+                        ));
+                    }
+                    let color = self.color(value?, modifier)?;
+                    return Some(Body::default().nest(
+                        &[],
+                        nested,
+                        &format!("border-color:{color}"),
+                    ));
+                }
+                let width = width("1px").filter(|_| modifier.is_none())?;
+                let axis = &root[7..];
+                let reverse = format!("--tw-divide-{axis}-reverse");
+                let source = if axis == "x" {
+                    format!(
+                        "{reverse}:0;border-inline-style:var(--tw-border-style);border-inline-start-width:calc({width} * var({reverse}));border-inline-end-width:calc({width} * calc(1 - var({reverse})))"
+                    )
+                } else {
+                    format!(
+                        "{reverse}:0;border-bottom-style:var(--tw-border-style);border-top-style:var(--tw-border-style);border-top-width:calc({width} * var({reverse}));border-bottom-width:calc({width} * calc(1 - var({reverse})))"
+                    )
+                };
+                let mut body = Body::default().nest(&[], nested, &source);
+                body.sort = Some(if axis == "x" {
+                    "divide-x-width"
+                } else {
+                    "divide-y-width"
+                });
+                Some(body)
+            }
             "translate" | "translate-x" | "translate-y" | "translate-z" => {
                 let value = value?;
-                if value == "none" && root == "translate" {
+                if root == "translate" && bare == Some("none") {
                     return Body::new(&[("translate", "none".into())]);
                 }
-                let resolved = negate(match value {
-                    "full" => "100%".into(),
-                    _ => fraction(value).or_else(|| self.spacing(value))?,
-                });
-                let axis = [&root[root.len().min(10)..]];
-                let axes: &[&str] = if root == "translate" {
-                    &["x", "y"]
-                } else {
-                    &axis
+                if root == "translate" && bare == Some("3d") {
+                    return Body::new(&[(
+                        "translate",
+                        "var(--tw-translate-x) var(--tw-translate-y) var(--tw-translate-z)".into(),
+                    )]);
+                }
+                let resolved = match (&raw, modifier) {
+                    (Some(raw), None) => negate(raw.clone()),
+                    (_, Some(_)) => negate(fraction(true)?),
+                    _ if value == "full" => spaced("100%".into()),
+                    _ => spaced(self.spacing(value)?),
                 };
-                let mut body: Vec<_> = axes
+                let axes: &[&str] = match root {
+                    "translate" => &["x", "y"],
+                    "translate-x" => &["x"],
+                    "translate-y" => &["y"],
+                    _ => &["z"],
+                };
+                let mut body: Pairs = axes
                     .iter()
                     .map(|axis| (format!("--tw-translate-{axis}"), resolved.clone()))
                     .collect();
@@ -1854,132 +3412,252 @@ impl Compiler {
             }
             "scale" | "scale-x" | "scale-y" | "scale-z" => {
                 let value = value?;
-                if value == "none" && root == "scale" {
-                    return Body::new(&[("scale", "none".into())]);
+                if root == "scale" {
+                    match bare {
+                        Some("none") => return Body::new(&[("scale", "none".into())]),
+                        Some("3d") => {
+                            return Body::new(&[(
+                                "scale",
+                                "var(--tw-scale-x) var(--tw-scale-y) var(--tw-scale-z)".into(),
+                            )]);
+                        }
+                        _ => {}
+                    }
+                    if let Some(raw) = &raw {
+                        return Body::new(&[("scale", negate(raw.clone()))]);
+                    }
                 }
-                let resolved = negate(match arbitrary(value) {
-                    Some(raw) => decode(raw),
-                    None => format!("{}%", value.parse::<u32>().ok()?),
+                let resolved = negate(match &raw {
+                    Some(raw) => raw.clone(),
+                    None => integer(value).then(|| format!("{value}%"))?,
                 });
-                let axis = [&root[root.len().min(6)..]];
-                let axes: &[&str] = if root == "scale" {
-                    &["x", "y", "z"]
-                } else {
-                    &axis
+                let axes: &[&str] = match root {
+                    "scale" => &["x", "y", "z"],
+                    "scale-x" => &["x"],
+                    "scale-y" => &["y"],
+                    _ => &["z"],
                 };
-                let mut body: Vec<_> = axes
+                let mut body: Pairs = axes
                     .iter()
                     .map(|axis| (format!("--tw-scale-{axis}"), resolved.clone()))
                     .collect();
-                body.push(("scale".into(), "var(--tw-scale-x) var(--tw-scale-y)".into()));
+                body.push((
+                    "scale".into(),
+                    if root == "scale-z" {
+                        "var(--tw-scale-x) var(--tw-scale-y) var(--tw-scale-z)"
+                    } else {
+                        "var(--tw-scale-x) var(--tw-scale-y)"
+                    }
+                    .into(),
+                ));
                 Some(Body {
                     declarations: body,
                     ..Body::default()
                 })
             }
-            "rotate" => {
-                let value = value?;
-                let resolved = match arbitrary(value) {
-                    Some(raw) => decode(raw),
-                    None if value == "none" => return Body::new(&[("rotate", "none".into())]),
-                    None => format!("{}deg", value.parse::<f32>().ok()?),
+            "rotate" | "rotate-x" | "rotate-y" | "rotate-z" | "skew" | "skew-x" | "skew-y" => {
+                if root == "rotate" && bare == Some("none") {
+                    return Body::new(&[("rotate", "none".into())]);
+                }
+                let resolved = negate(match &raw {
+                    Some(raw) => raw.clone(),
+                    None => number("deg")?,
+                });
+                if root == "rotate" {
+                    return Body::new(&[("rotate", resolved)]);
+                }
+                let mut body: Pairs = match root {
+                    "skew" => vec![
+                        ("--tw-skew-x".into(), format!("skewX({resolved})")),
+                        ("--tw-skew-y".into(), format!("skewY({resolved})")),
+                    ],
+                    _ => {
+                        let axis = &root[root.len() - 1..];
+                        let function = if root.starts_with("skew") {
+                            "skew"
+                        } else {
+                            "rotate"
+                        };
+                        vec![(
+                            format!("--tw-{root}"),
+                            format!("{function}{}({resolved})", axis.to_ascii_uppercase()),
+                        )]
+                    }
                 };
-                Body::new(&[("rotate", negate(resolved))])
+                body.push(("transform".into(), TRANSFORM.into()));
+                Some(Body {
+                    declarations: body,
+                    ..Body::default()
+                })
             }
-            "z" | "order" => {
-                let value = value?;
-                let resolved = match (root, value) {
-                    ("z", "auto") => "auto".into(),
-                    ("order", "first") => "-9999".into(),
-                    ("order", "last") => "9999".into(),
-                    ("order", "none") => "0".into(),
-                    _ => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| value.parse::<u32>().ok().map(|number| number.to_string()))?,
+            "transform" => match (value, &raw) {
+                (None, _) => Body::new(&[("transform", TRANSFORM.into())]),
+                (_, Some(raw)) => Body::new(&[("transform", raw.clone())]),
+                _ => None,
+            },
+            "perspective" => {
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("none"), _) => "none".into(),
+                    (Some(value), _) => self.theme("--perspective", value)?,
+                    _ => return None,
                 };
-                Body::new(&[(
-                    if root == "z" { "z-index" } else { "order" },
-                    negate(resolved),
-                )])
+                Body::new(&[("perspective", resolved)])
             }
-            "grid-cols" | "grid-rows" => {
-                let value = value?;
-                let resolved = match value {
-                    "none" | "subgrid" => value.into(),
-                    _ => arbitrary(value).map(decode).or_else(|| {
-                        value
-                            .parse::<u16>()
-                            .ok()
-                            .filter(|number| *number > 0)
-                            .map(|number| format!("repeat({number}, minmax(0, 1fr))"))
-                    })?,
+            "origin" | "perspective-origin" => {
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some(value), _) => ORIGINS
+                        .iter()
+                        .find(|(name, _)| *name == value)
+                        .map(|(_, position)| (*position).to_owned())?,
+                    _ => return None,
                 };
-                let property = if root == "grid-cols" {
-                    "grid-template-columns"
+                let property = if root == "origin" {
+                    "transform-origin"
                 } else {
-                    "grid-template-rows"
+                    root
                 };
                 Body::new(&[(property, resolved)])
             }
-            "col" | "row" | "col-span" | "row-span" | "col-start" | "col-end" | "row-start"
-            | "row-end" => {
-                let value = value?;
-                let resolved = match (root, value) {
-                    ("col-span" | "row-span", "full") => "1 / -1".into(),
-                    ("col-span" | "row-span", _) => {
-                        let number = value.parse::<u16>().ok()?;
-                        format!("span {number} / span {number}")
+            "z" | "order" | "col" | "col-start" | "col-end" | "row" | "row-start" | "row-end"
+            | "col-span" | "row-span" | "columns" | "tab" | "line-clamp" | "grow" | "shrink"
+            | "flex-grow" | "flex-shrink" => {
+                let span = root.ends_with("-span");
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) if span => format!("span {raw} / span {raw}"),
+                    (_, Some(raw)) => raw.clone(),
+                    (None, _)
+                        if matches!(root, "grow" | "shrink" | "flex-grow" | "flex-shrink") =>
+                    {
+                        "1".into()
                     }
-                    (_, "auto") => "auto".into(),
-                    _ => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| value.parse::<i32>().ok().map(|number| number.to_string()))?,
+                    (Some("auto"), _)
+                        if matches!(
+                            root,
+                            "z" | "col"
+                                | "col-start"
+                                | "col-end"
+                                | "row"
+                                | "row-start"
+                                | "row-end"
+                                | "columns"
+                        ) =>
+                    {
+                        "auto".into()
+                    }
+                    (Some("first"), _) if root == "order" => "-9999".into(),
+                    (Some("last"), _) if root == "order" => "9999".into(),
+                    (Some("none"), _) if root == "order" => "0".into(),
+                    (Some("full"), _) if span => "1 / -1".into(),
+                    (Some(value), _) if integer(value) => {
+                        if span {
+                            format!("span {value} / span {value}")
+                        } else {
+                            value.to_owned()
+                        }
+                    }
+                    (Some(value), _) if root == "columns" => self.theme("--container", value)?,
+                    _ => return None,
                 };
+                if root == "line-clamp" {
+                    if bare == Some("none") {
+                        return Body::new(&[
+                            ("overflow", "visible".into()),
+                            ("display", "block".into()),
+                            ("-webkit-box-orient", "horizontal".into()),
+                            ("-webkit-line-clamp", "unset".into()),
+                        ]);
+                    }
+                    return Body::new(&[
+                        ("overflow", "hidden".into()),
+                        ("display", "-webkit-box".into()),
+                        ("-webkit-box-orient", "vertical".into()),
+                        ("-webkit-line-clamp", resolved),
+                    ]);
+                }
                 let property = match root {
+                    "z" => "z-index",
                     "col" | "col-span" => "grid-column",
-                    "row" | "row-span" => "grid-row",
                     "col-start" => "grid-column-start",
                     "col-end" => "grid-column-end",
+                    "row" | "row-span" => "grid-row",
                     "row-start" => "grid-row-start",
-                    _ => "grid-row-end",
+                    "row-end" => "grid-row-end",
+                    "tab" => "tab-size",
+                    "grow" | "flex-grow" => "flex-grow",
+                    "shrink" | "flex-shrink" => "flex-shrink",
+                    _ => root,
                 };
                 Body::new(&[(property, negate(resolved))])
             }
-            "flex" => {
-                let value = value?;
-                let resolved = fraction(value)
-                    .or_else(|| arbitrary(value).map(decode))
-                    .or_else(|| value.parse::<u16>().ok().map(|number| number.to_string()))?;
-                Body::new(&[("flex", resolved)])
-            }
-            "grow" | "shrink" | "flex-grow" | "flex-shrink" => {
-                let resolved = match value {
-                    None => "1".into(),
-                    Some(value) => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| value.parse::<u16>().ok().map(|number| number.to_string()))?,
+            "grid-cols" | "grid-rows" | "auto-cols" | "auto-rows" => {
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("none" | "subgrid"), _) if root.starts_with("grid") => bare?.into(),
+                    (Some(value), _)
+                        if root.starts_with("grid") && integer(value) && value != "0" =>
+                    {
+                        format!("repeat({value}, minmax(0, 1fr))")
+                    }
+                    (Some("auto"), _) if root.starts_with("auto") => "auto".into(),
+                    (Some("min"), _) if root.starts_with("auto") => "min-content".into(),
+                    (Some("max"), _) if root.starts_with("auto") => "max-content".into(),
+                    (Some("fr"), _) if root.starts_with("auto") => "minmax(0, 1fr)".into(),
+                    _ => return None,
                 };
-                Body::new(&[(
-                    if root.ends_with("grow") {
-                        "flex-grow"
-                    } else {
-                        "flex-shrink"
-                    },
-                    resolved,
-                )])
+                let property = match root {
+                    "grid-cols" => "grid-template-columns",
+                    "grid-rows" => "grid-template-rows",
+                    "auto-cols" => "grid-auto-columns",
+                    _ => "grid-auto-rows",
+                };
+                Body::new(&[(property, resolved)])
+            }
+            "flex" => {
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    _ if modifier.is_some() => fraction(false)?,
+                    (Some(value), _) if integer(value) => value.to_owned(),
+                    _ => return None,
+                };
+                Body::new(&[("flex", resolved)])
             }
             "basis" => {
                 let value = value?;
-                let resolved = match value {
-                    "full" => "100%".into(),
-                    "auto" => "auto".into(),
-                    _ => fraction(value)
-                        .or_else(|| self.theme("--container", value))
-                        .or_else(|| self.spacing(value))?,
+                let resolved = match (&raw, modifier) {
+                    (Some(raw), None) => raw.clone(),
+                    (_, Some(_)) => fraction(false)?,
+                    _ => match value {
+                        "full" => "100%".into(),
+                        "auto" => "auto".into(),
+                        _ => self
+                            .theme("--container", value)
+                            .or_else(|| self.spacing(value))?,
+                    },
                 };
                 Body::new(&[("flex-basis", resolved)])
             }
-            "indent" => Body::new(&[("text-indent", negate(self.spacing(value?)?))]),
+            "border-spacing" | "border-spacing-x" | "border-spacing-y" => {
+                let resolved = self.spacing(value?)?;
+                let mut body: Pairs = match root {
+                    "border-spacing-x" => vec![("--tw-border-spacing-x".into(), resolved)],
+                    "border-spacing-y" => vec![("--tw-border-spacing-y".into(), resolved)],
+                    _ => vec![
+                        ("--tw-border-spacing-x".into(), resolved.clone()),
+                        ("--tw-border-spacing-y".into(), resolved),
+                    ],
+                };
+                body.push((
+                    "border-spacing".into(),
+                    "var(--tw-border-spacing-x) var(--tw-border-spacing-y)".into(),
+                ));
+                Some(Body {
+                    declarations: body,
+                    ..Body::default()
+                })
+            }
+            "indent" => Body::new(&[("text-indent", spaced(self.spacing(value?)?))]),
             _ if root == "rounded" || root.starts_with("rounded-") => {
                 let corners: &[&str] = match root.strip_prefix("rounded-").unwrap_or("") {
                     "" => &["border-radius"],
@@ -1999,20 +3677,13 @@ impl Compiler {
                     "es" => &["border-end-start-radius"],
                     _ => return None,
                 };
-                let resolved = match value {
-                    None => self
-                        .theme("--radius", "DEFAULT")
-                        .unwrap_or_else(|| "0.25rem".into()),
-                    Some("none") => "0".into(),
-                    Some("full") => "calc(infinity * 1px)".into(),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw) => decode(hint(raw).1),
-                        None => self.theme("--radius", value)?,
-                    },
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (None, _) => self.raw("--radius")?,
+                    (Some("none"), _) => "0".into(),
+                    (Some("full"), _) => "calc(infinity * 1px)".into(),
+                    (Some(value), _) => self.theme("--radius", value)?,
                 };
-                if negative || modifier.is_some() {
-                    return None;
-                }
                 Body::new(
                     &corners
                         .iter()
@@ -2020,104 +3691,334 @@ impl Compiler {
                         .collect::<Vec<_>>(),
                 )
             }
-            "border" | "border-x" | "border-y" | "border-t" | "border-r" | "border-b"
-            | "border-l" | "border-s" | "border-e" => {
-                let suffix = match &root[6..] {
+            "border" | "border-x" | "border-y" | "border-s" | "border-e" | "border-bs"
+            | "border-be" | "border-t" | "border-r" | "border-b" | "border-l" => {
+                let side = match &root[6..] {
                     "" => "",
                     "-x" => "-inline",
                     "-y" => "-block",
+                    "-s" => "-inline-start",
+                    "-e" => "-inline-end",
+                    "-bs" => "-block-start",
+                    "-be" => "-block-end",
                     "-t" => "-top",
                     "-r" => "-right",
                     "-b" => "-bottom",
-                    "-l" => "-left",
-                    "-s" => "-inline-start",
-                    _ => "-inline-end",
+                    _ => "-left",
                 };
-                let width = match value {
-                    None => Some("1px".into()),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw) => length(raw),
-                        None => value
-                            .parse::<u16>()
-                            .ok()
-                            .map(|number| format!("{number}px")),
-                    },
-                };
-                if let Some(width) = width.filter(|_| modifier.is_none() && !negative) {
+                if let Some(width) = width("1px").filter(|_| modifier.is_none()) {
                     return Body::new(&[
                         (
-                            format!("border{suffix}-style").as_str(),
+                            &format!("border{side}-style"),
                             "var(--tw-border-style)".into(),
                         ),
-                        (format!("border{suffix}-width").as_str(), width),
+                        (&format!("border{side}-width"), width),
                     ]);
                 }
                 Body::new(&[(
-                    format!("border{suffix}-color").as_str(),
+                    &format!("border{side}-color"),
                     self.color(value?, modifier)?,
                 )])
             }
             "bg" => {
                 let value = value?;
-                if let Some(raw) = arbitrary(value) {
-                    let (kind, raw) = hint(raw);
-                    let raw = decode(raw);
-                    if kind == Some("image")
-                        || kind == Some("url")
-                        || raw.starts_with("url(")
-                        || raw.contains("gradient(")
-                    {
-                        return Body::new(&[("background-image", raw)]);
-                    }
-                    if matches!(kind, Some("length" | "size" | "bg-size")) {
-                        return Body::new(&[("background-size", raw)]);
-                    }
-                    if kind == Some("position") || kind.is_none() && is_length(&raw) {
-                        return Body::new(&[("background-position", raw)]);
+                if let Some(raw) = &raw {
+                    let property = match hint {
+                        Some("image" | "url") => Some("background-image"),
+                        Some("length" | "size" | "bg-size") => Some("background-size"),
+                        Some("position" | "percentage") => Some("background-position"),
+                        Some("color") => None,
+                        Some(_) => return None,
+                        None if raw.starts_with("url(") || raw.contains("gradient(") => {
+                            Some("background-image")
+                        }
+                        None if is_color(raw) || raw.starts_with("var(") => None,
+                        None => Some("background-position"),
+                    };
+                    if let Some(property) = property {
+                        return Body::new(&[(property, raw.clone())]);
                     }
                 }
                 Body::new(&[("background-color", self.color(value, modifier)?)])
             }
-            "text" => {
-                let value = value?;
-                if let Some(raw) = arbitrary(value)
-                    && let Some(size) = length(raw)
-                {
-                    return Body::new(&[("font-size", size)]);
-                }
-                if let Some(size) = self.theme("--text", value) {
-                    let mut body = vec![("font-size", size)];
-                    let leading = modifier.and_then(|modifier| {
-                        arbitrary(modifier)
-                            .map(decode)
-                            .or_else(|| self.theme("--leading", modifier))
-                            .or_else(|| self.spacing(modifier))
-                    });
-                    if let Some(leading) = leading {
-                        body.push(("line-height", leading));
-                    } else if modifier.is_some() {
-                        return None;
-                    } else if let Some(height) =
-                        self.theme("--text", &format!("{value}--line-height"))
-                    {
-                        body.push(("line-height", format!("var(--tw-leading, {height})")));
-                    }
-                    return Body::new(&body);
-                }
-                Body::new(&[("color", self.color(value, modifier)?)])
+            "bg-size" | "bg-position" | "mask-size" | "mask-position" => {
+                let property = match root {
+                    "bg-size" => "background-size",
+                    "bg-position" => "background-position",
+                    _ => root,
+                };
+                Body::new(&[(property, raw?)])
             }
-            "font" => {
-                let value = value?;
-                if let Some(raw) = arbitrary(value) {
-                    let raw = decode(hint(raw).1);
-                    if raw.parse::<u16>().is_ok() || raw.starts_with("var(") {
+            "bg-linear" | "bg-gradient-to" | "bg-radial" | "bg-conic" => {
+                let interpolation = match modifier {
+                    None => None,
+                    Some(modifier) if modifier.starts_with(['[', '(']) => {
+                        Some(self.arbitrary(modifier)?)
+                    }
+                    Some(
+                        modifier @ ("srgb" | "hsl" | "oklab" | "oklch" | "longer" | "shorter"
+                        | "increasing" | "decreasing"),
+                    ) => Some(match modifier {
+                        "longer" | "shorter" | "increasing" | "decreasing" => {
+                            format!("in oklch {modifier} hue")
+                        }
+                        _ => format!("in {modifier}"),
+                    }),
+                    _ => return None,
+                };
+                let kind = match root {
+                    "bg-radial" => "radial",
+                    "bg-conic" => "conic",
+                    _ => "linear",
+                };
+                if let Some(raw) = &raw {
+                    return Body::new(&[
+                        ("--tw-gradient-position", raw.clone()),
+                        (
+                            "background-image",
+                            format!("{kind}-gradient(var(--tw-gradient-stops,{raw}))"),
+                        ),
+                    ]);
+                }
+                let position = match (root, bare) {
+                    ("bg-gradient-to", Some(side)) => {
+                        let side = direction(side)?;
                         return Body::new(&[
-                            ("--tw-font-weight", raw.clone()),
-                            ("font-weight", raw),
+                            ("--tw-gradient-position", format!("to {side} in oklab")),
+                            (
+                                "background-image",
+                                "linear-gradient(var(--tw-gradient-stops))".into(),
+                            ),
                         ]);
                     }
-                    return Body::new(&[("font-family", raw)]);
+                    ("bg-linear", Some(side)) if side.starts_with("to-") => {
+                        format!("to {}", direction(&side[3..])?)
+                    }
+                    ("bg-linear", Some(angle)) => {
+                        negate(format!("{}deg", integer(angle).then_some(angle)?))
+                    }
+                    ("bg-conic", Some(angle)) => {
+                        format!(
+                            "from {}",
+                            negate(format!("{}deg", integer(angle).then_some(angle)?))
+                        )
+                    }
+                    ("bg-radial" | "bg-conic", None) => String::new(),
+                    _ => return None,
+                };
+                let image = (
+                    "background-image",
+                    format!("{kind}-gradient(var(--tw-gradient-stops))"),
+                );
+                if kind == "linear" {
+                    let interpolation = interpolation.unwrap_or_else(|| "in oklab".into());
+                    let mut body = Body::new(&[("--tw-gradient-position", position.clone())])?;
+                    body = body.nest(
+                        &["@supports (background-image: linear-gradient(in lab, red, red))"],
+                        "&",
+                        &format!("--tw-gradient-position:{position} {interpolation}"),
+                    );
+                    body.nested
+                        .push((Vec::new(), "&".into(), vec![(image.0.into(), image.1)]));
+                    return Some(body);
                 }
+                let interpolation = interpolation.unwrap_or_else(|| "in oklab".into());
+                let position = if position.is_empty() {
+                    interpolation
+                } else {
+                    format!("{position} {interpolation}")
+                };
+                Body::new(&[("--tw-gradient-position", position), image])
+            }
+            "from" | "via" | "to" => {
+                let value = value?;
+                let position = match (bare, hint, &raw) {
+                    (Some(value), ..) if value.ends_with('%') => {
+                        let number = value.strip_suffix('%')?;
+                        integer(number).then(|| value.to_owned())
+                    }
+                    (_, Some("length" | "percentage"), Some(raw)) => Some(raw.clone()),
+                    (_, None, Some(raw)) if is_length(raw) => Some(raw.clone()),
+                    _ => None,
+                };
+                if let Some(position) = position {
+                    return Body::new(&[(&format!("--tw-gradient-{root}-position"), position)]);
+                }
+                if root == "via" && bare == Some("none") {
+                    return Body::new(&[("--tw-gradient-via-stops", "initial".into())]);
+                }
+                let color = self.color(value, modifier)?;
+                if root == "via" {
+                    return Body::new(&[
+                        ("--tw-gradient-via", color),
+                        ("--tw-gradient-via-stops", "var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-via) var(--tw-gradient-via-position), var(--tw-gradient-to) var(--tw-gradient-to-position)".into()),
+                        ("--tw-gradient-stops", "var(--tw-gradient-via-stops)".into()),
+                    ]);
+                }
+                Body::new(&[
+                    (&format!("--tw-gradient-{root}"), color),
+                    ("--tw-gradient-stops", STOPS.into()),
+                ])
+            }
+            "mask" => Body::new(&[("mask-image", raw?)]),
+            "mask-linear" | "mask-conic" | "mask-radial" => {
+                let kind = &root[5..];
+                let position = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some(angle @ ("0" | "1")), None) if kind != "radial" => {
+                        format!(
+                            "{}{angle}deg",
+                            if negative && angle == "1" { "-" } else { "" }
+                        )
+                    }
+                    (Some(angle), None) if kind != "radial" && integer(angle) => {
+                        format!("calc(1deg * {}{angle})", if negative { "-" } else { "" })
+                    }
+                    _ => return None,
+                };
+                let name = if kind == "radial" { "size" } else { "position" };
+                let mut body = Body::parse(MASK);
+                body.declarations.push((
+                    format!("--tw-mask-{kind}"),
+                    format!(
+                        "{kind}-gradient(var(--tw-mask-{kind}-stops, var(--tw-mask-{kind}-{name})))"
+                    ),
+                ));
+                body.declarations
+                    .push((format!("--tw-mask-{kind}-{name}"), position));
+                Some(body)
+            }
+            _ if root.starts_with("mask-")
+                && (root.ends_with("-from") || root.ends_with("-to")) =>
+            {
+                let (edge, end) = root[5..].rsplit_once('-')?;
+                let value = value?;
+                let position = match (bare, hint, &raw) {
+                    (_, Some("length" | "percentage"), Some(raw)) => Some(raw.clone()),
+                    (_, None, Some(raw)) if is_length(raw) => Some(raw.clone()),
+                    (Some(value), ..) if value.ends_with('%') => {
+                        integer(value.strip_suffix('%')?).then(|| value.to_owned())
+                    }
+                    (Some(value), ..) => self.spacing(value),
+                    _ => None,
+                };
+                let (field, assigned) = match position {
+                    Some(position) => ("position", position),
+                    None => ("color", self.color(value, modifier)?),
+                };
+                let mut body = Body::parse(MASK);
+                let mut push = |name: String, value: String| body.declarations.push((name, value));
+                match edge {
+                    "linear" | "radial" | "conic" => {
+                        let stops = match edge {
+                            "linear" => "var(--tw-mask-linear-position), ",
+                            "radial" => {
+                                "var(--tw-mask-radial-shape) var(--tw-mask-radial-size) at var(--tw-mask-radial-position), "
+                            }
+                            _ => "from var(--tw-mask-conic-position), ",
+                        };
+                        push(
+                            format!("--tw-mask-{edge}-stops"),
+                            format!(
+                                "{stops}var(--tw-mask-{edge}-from-color) var(--tw-mask-{edge}-from-position), var(--tw-mask-{edge}-to-color) var(--tw-mask-{edge}-to-position)"
+                            ),
+                        );
+                        push(
+                            format!("--tw-mask-{edge}"),
+                            format!("{edge}-gradient(var(--tw-mask-{edge}-stops))"),
+                        );
+                        push(format!("--tw-mask-{edge}-{end}-{field}"), assigned);
+                    }
+                    _ => {
+                        let sides: &[&str] = match edge {
+                            "x" => &["right", "left"],
+                            "y" => &["top", "bottom"],
+                            "t" => &["top"],
+                            "r" => &["right"],
+                            "b" => &["bottom"],
+                            "l" => &["left"],
+                            _ => return None,
+                        };
+                        push("--tw-mask-linear".into(), EDGES.into());
+                        for side in sides {
+                            push(
+                                format!("--tw-mask-{side}"),
+                                format!(
+                                    "linear-gradient(to {side}, var(--tw-mask-{side}-from-color) var(--tw-mask-{side}-from-position), var(--tw-mask-{side}-to-color) var(--tw-mask-{side}-to-position))"
+                                ),
+                            );
+                            push(format!("--tw-mask-{side}-{end}-{field}"), assigned.clone());
+                        }
+                    }
+                }
+                Some(body)
+            }
+            "text" => {
+                let value = value?;
+                let size = match (hint, &raw) {
+                    (
+                        Some("length" | "percentage" | "absolute-size" | "relative-size"),
+                        Some(raw),
+                    ) => Some(raw.clone()),
+                    (None, Some(raw))
+                        if is_length(raw)
+                            || matches!(
+                                raw.as_str(),
+                                "xx-small"
+                                    | "x-small"
+                                    | "small"
+                                    | "medium"
+                                    | "large"
+                                    | "x-large"
+                                    | "xx-large"
+                                    | "xxx-large"
+                                    | "larger"
+                                    | "smaller"
+                            ) =>
+                    {
+                        Some(raw.clone())
+                    }
+                    (None, None) => self.theme("--text", value),
+                    _ => None,
+                };
+                let Some(size) = size else {
+                    return Body::new(&[("color", self.color(value, modifier)?)]);
+                };
+                let mut body = vec![("font-size", size)];
+                match modifier {
+                    Some(modifier) => body.push((
+                        "line-height",
+                        self.arbitrary(modifier)
+                            .or_else(|| self.theme("--leading", modifier))
+                            .or_else(|| self.spacing(modifier))?,
+                    )),
+                    None if raw.is_none() => {
+                        if let Some(height) = self.theme("--text", &format!("{value}--line-height"))
+                        {
+                            body.push(("line-height", format!("var(--tw-leading, {height})")));
+                        }
+                    }
+                    None => {}
+                }
+                Body::new(&body)
+            }
+            "font" => {
+                if let Some(raw) = &raw {
+                    let weight = match hint {
+                        Some("number") => true,
+                        Some("family-name" | "generic-name") => false,
+                        Some(_) => return None,
+                        None => raw.parse::<u16>().is_ok() || raw.starts_with("var("),
+                    };
+                    if weight {
+                        return Body::new(&[
+                            ("--tw-font-weight", raw.clone()),
+                            ("font-weight", raw.clone()),
+                        ]);
+                    }
+                    return Body::new(&[("font-family", raw.clone())]);
+                }
+                let value = bare?;
                 if let Some(family) = self.theme("--font", value) {
                     return Body::new(&[("font-family", family)]);
                 }
@@ -2127,14 +4028,26 @@ impl Compiler {
                     ("font-weight", weight),
                 ])
             }
+            "font-stretch" => {
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some(value), _) => {
+                        let number = value.strip_suffix('%')?;
+                        let number: f64 = number.parse().ok()?;
+                        (50. ..=200.).contains(&number).then(|| value.to_owned())?
+                    }
+                    _ => return None,
+                };
+                Body::new(&[("font-stretch", resolved)])
+            }
             "leading" => {
-                let value = value?;
-                let resolved = match value {
-                    "none" => "1".into(),
-                    _ => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| self.theme("--leading", value))
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("none"), _) => "1".into(),
+                    (Some(value), _) => self
+                        .theme("--leading", value)
                         .or_else(|| self.spacing(value))?,
+                    _ => return None,
                 };
                 Body::new(&[
                     ("--tw-leading", resolved.clone()),
@@ -2142,89 +4055,139 @@ impl Compiler {
                 ])
             }
             "tracking" => {
-                let value = value?;
-                let resolved = negate(
-                    arbitrary(value)
-                        .map(decode)
-                        .or_else(|| self.theme("--tracking", value))?,
-                );
+                let resolved = negate(match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some(value), _) => self.theme("--tracking", value)?,
+                    _ => return None,
+                });
                 Body::new(&[
                     ("--tw-tracking", resolved.clone()),
                     ("letter-spacing", resolved),
                 ])
             }
-            "opacity" => {
-                let value = value?;
-                let resolved = arbitrary(value).map(decode).or_else(|| {
-                    value
-                        .parse::<f32>()
-                        .ok()
-                        .filter(|n| (0. ..=100.).contains(n))
-                        .map(|_| format!("{value}%"))
-                })?;
-                Body::new(&[("opacity", resolved)])
-            }
-            "shadow" => {
-                let shadow = match value {
+            "opacity" | "zoom" => {
+                let resolved = match &raw {
+                    Some(raw) => raw.clone(),
                     None => {
-                        Some("0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)".into())
+                        let value = bare?;
+                        let number: f64 = value.parse().ok()?;
+                        ((number >= 0. && root == "zoom" || (0. ..=100.).contains(&number))
+                            && (number * 4.).fract() == 0.)
+                            .then(|| format!("{value}%"))?
                     }
-                    Some("none") => Some("0 0 #0000".into()),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw)
-                            if !is_color(&decode(raw))
-                                && hint(raw).0.is_none_or(|kind| kind != "color") =>
-                        {
-                            Some(decode(raw))
-                        }
-                        Some(_) => None,
-                        None => self.value("--shadow", value),
-                    },
                 };
-                if let Some(shadow) = shadow.filter(|_| modifier.is_none()) {
-                    let shadow = if value == Some("none") {
-                        shadow
-                    } else {
-                        shadow_color(&shadow, "--tw-shadow-color")
-                    };
-                    return Body::new(&[("--tw-shadow", shadow), ("box-shadow", SHADOW.into())]);
-                }
-                Body::new(&[("--tw-shadow-color", self.color(value?, modifier)?)])
+                Body::new(&[(root, resolved)])
             }
-            "ring" => {
-                let width = match value {
-                    None => Some("1px".into()),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw) => length(raw),
-                        None => value
-                            .parse::<u16>()
-                            .ok()
-                            .map(|number| format!("{number}px")),
+            "shadow" | "inset-shadow" | "text-shadow" | "drop-shadow" => {
+                let shadow = match (bare, &raw) {
+                    (None, None) if value.is_none() => match root {
+                        "shadow" => self.raw("--shadow"),
+                        "drop-shadow" => self.raw("--drop-shadow"),
+                        _ => None,
                     },
+                    (Some("none"), _) => Some("none".into()),
+                    (Some("inner"), _) if root == "shadow" => self.raw("--shadow-inner"),
+                    (Some(value), _) => self.raw(&format!("--{root}-{value}")),
+                    (_, Some(raw)) if hint.is_some_and(|hint| hint != "color") => Some(raw.clone()),
+                    (_, Some(raw)) if hint.is_none() && !is_color(raw) => Some(raw.clone()),
+                    _ => None,
                 };
-                if let Some(width) = width.filter(|_| modifier.is_none()) {
+                let Some(shadow) = shadow else {
+                    let color = self.shadow(value?, modifier, root)?;
+                    if root == "drop-shadow" {
+                        return Body::new(&[
+                            ("--tw-drop-shadow-color", color),
+                            ("--tw-drop-shadow", "var(--tw-drop-shadow-size)".into()),
+                        ]);
+                    }
+                    return Body::new(&[(&format!("--tw-{root}-color"), color)]);
+                };
+                let alpha = match modifier {
+                    Some(modifier) => Some(self.opacity(modifier)?),
+                    None => None,
+                };
+                let name = format!("--tw-{root}-color");
+                let colored = |shadow: &str| shadow_color(shadow, &name, alpha.as_deref());
+                let mut body = Vec::new();
+                if let Some(alpha) = &alpha {
+                    body.push((format!("--tw-{root}-alpha"), alpha.clone()));
+                }
+                let variable = raw.is_some() && shadow.starts_with("var(");
+                match root {
+                    "shadow" | "inset-shadow" => {
+                        let value = match (root, shadow.as_str()) {
+                            ("shadow", "none") => "0 0 #0000".into(),
+                            (_, "none") => "inset 0 0 #0000".into(),
+                            ("inset-shadow", shadow) if raw.is_some() => {
+                                colored(&format!("inset {shadow}"))
+                            }
+                            (_, shadow) if variable => shadow.to_owned(),
+                            (_, shadow) => colored(shadow),
+                        };
+                        body.push((format!("--tw-{root}"), value));
+                        body.push(("box-shadow".into(), SHADOW.into()));
+                    }
+                    "text-shadow" => {
+                        let value = if shadow == "none" || variable {
+                            shadow.clone()
+                        } else {
+                            colored(&shadow)
+                        };
+                        body.push(("text-shadow".into(), value));
+                    }
+                    _ if shadow == "none" => {
+                        body.push(("--tw-drop-shadow".into(), " ".into()));
+                        body.push(("filter".into(), FILTER.into()));
+                    }
+                    _ => {
+                        let layers = |colored: &dyn Fn(&str) -> String| {
+                            split(&shadow, ',')
+                                .iter()
+                                .map(|layer| format!("drop-shadow({})", colored(layer.trim())))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        let size = if variable {
+                            format!("drop-shadow({shadow})")
+                        } else {
+                            layers(&colored)
+                        };
+                        let plain = match (bare, value) {
+                            (Some(value), _) if alpha.is_none() => {
+                                format!("drop-shadow(var(--drop-shadow-{value}))")
+                            }
+                            (None, None) => layers(&|layer: &str| layer.to_owned()),
+                            _ => "var(--tw-drop-shadow-size)".into(),
+                        };
+                        body.push(("--tw-drop-shadow-size".into(), size));
+                        body.push(("--tw-drop-shadow".into(), plain));
+                        body.push(("filter".into(), FILTER.into()));
+                    }
+                }
+                Some(Body {
+                    declarations: body,
+                    ..Body::default()
+                })
+            }
+            "ring" | "inset-ring" => {
+                if let Some(width) = width("1px").filter(|_| modifier.is_none()) {
+                    let shadow = if root == "ring" {
+                        format!(
+                            "var(--tw-ring-inset,) 0 0 0 calc({width} + var(--tw-ring-offset-width)) var(--tw-ring-color, currentcolor)"
+                        )
+                    } else {
+                        format!("inset 0 0 0 {width} var(--tw-inset-ring-color, currentcolor)")
+                    };
                     return Body::new(&[
-                        (
-                            "--tw-ring-shadow",
-                            format!(
-                                "var(--tw-ring-inset,) 0 0 0 calc({width} + var(--tw-ring-offset-width)) var(--tw-ring-color, currentcolor)"
-                            ),
-                        ),
+                        (&format!("--tw-{root}-shadow"), shadow),
                         ("box-shadow", SHADOW.into()),
                     ]);
                 }
-                Body::new(&[("--tw-ring-color", self.color(value?, modifier)?)])
+                Body::new(&[(&format!("--tw-{root}-color"), self.color(value?, modifier)?)])
             }
             "ring-offset" => {
                 let value = value?;
-                let width = match arbitrary(value) {
-                    Some(raw) => length(raw),
-                    None => value
-                        .parse::<u16>()
-                        .ok()
-                        .map(|number| format!("{number}px")),
-                };
-                if let Some(width) = width {
+                if let Some(width) = width("0px").filter(|_| modifier.is_none()) {
                     return Body::new(&[
                         ("--tw-ring-offset-width", width),
                         ("--tw-ring-offset-shadow", "var(--tw-ring-inset,) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color)".into()),
@@ -2233,17 +4196,7 @@ impl Compiler {
                 Body::new(&[("--tw-ring-offset-color", self.color(value, modifier)?)])
             }
             "outline" => {
-                let width = match value {
-                    None => Some("1px".into()),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw) => length(raw),
-                        None => value
-                            .parse::<u16>()
-                            .ok()
-                            .map(|number| format!("{number}px")),
-                    },
-                };
-                if let Some(width) = width.filter(|_| modifier.is_none()) {
+                if let Some(width) = width("1px").filter(|_| modifier.is_none()) {
                     return Body::new(&[
                         ("outline-style", "var(--tw-outline-style)".into()),
                         ("outline-width", width),
@@ -2252,30 +4205,25 @@ impl Compiler {
                 Body::new(&[("outline-color", self.color(value?, modifier)?)])
             }
             "outline-offset" | "underline-offset" => {
-                let value = value?;
-                let resolved = arbitrary(value).map(decode).or_else(|| {
-                    value
-                        .parse::<u16>()
-                        .ok()
-                        .map(|number| format!("{number}px"))
-                })?;
-                Body::new(&[(
-                    if root == "outline-offset" {
-                        "outline-offset"
-                    } else {
-                        "text-underline-offset"
-                    },
-                    negate(resolved),
-                )])
+                let resolved = match (&raw, bare) {
+                    (Some(raw), _) => raw.clone(),
+                    (_, Some(value)) if integer(value) => format!("{value}px"),
+                    _ => return None,
+                };
+                let property = if root == "outline-offset" {
+                    "outline-offset"
+                } else {
+                    "text-underline-offset"
+                };
+                Body::new(&[(property, negate(resolved))])
             }
             "decoration" => {
                 let value = value?;
-                let thickness = match arbitrary(value) {
-                    Some(raw) => length(raw),
-                    None => value
-                        .parse::<u16>()
-                        .ok()
-                        .map(|number| format!("{number}px")),
+                let thickness = match (hint, &raw, bare) {
+                    (Some("length" | "percentage"), Some(raw), _) => Some(raw.clone()),
+                    (None, Some(raw), _) if is_length(raw) => Some(raw.clone()),
+                    (_, None, Some(value)) if integer(value) => Some(format!("{value}px")),
+                    _ => None,
                 };
                 if let Some(thickness) = thickness {
                     return Body::new(&[("text-decoration-thickness", thickness)]);
@@ -2284,9 +4232,11 @@ impl Compiler {
             }
             "stroke" => {
                 let value = value?;
-                let width = match arbitrary(value) {
-                    Some(raw) => length(raw),
-                    None => value.parse::<u16>().ok().map(|number| number.to_string()),
+                let width = match (hint, &raw, bare) {
+                    (Some("length" | "number" | "percentage"), Some(raw), _) => Some(raw.clone()),
+                    (None, Some(raw), _) if is_length(raw) => Some(raw.clone()),
+                    (_, None, Some(value)) if integer(value) => Some(value.to_owned()),
+                    _ => None,
                 };
                 if let Some(width) = width {
                     return Body::new(&[("stroke-width", width)]);
@@ -2301,47 +4251,58 @@ impl Compiler {
                 };
                 Body::new(&[(property, self.color(value?, modifier)?)])
             }
-            "duration" | "delay" => {
-                let value = value?;
-                let resolved = arbitrary(value).map(decode).or_else(|| {
-                    value
-                        .parse::<u32>()
-                        .ok()
-                        .map(|number| format!("{number}ms"))
-                })?;
-                if root == "delay" {
-                    return Body::new(&[("transition-delay", resolved)]);
-                }
+            "placeholder" => {
+                let color = self.color(value?, modifier)?;
+                Some(Body::default().nest(&[], "&::placeholder", &format!("color:{color}")))
+            }
+            "scrollbar-thumb" | "scrollbar-track" => {
+                let color = self.color(value?, modifier)?;
                 Body::new(&[
-                    ("--tw-duration", resolved.clone()),
-                    ("transition-duration", resolved),
+                    (&format!("--tw-{root}"), color),
+                    (
+                        "scrollbar-color",
+                        "var(--tw-scrollbar-thumb) var(--tw-scrollbar-track)".into(),
+                    ),
                 ])
             }
-            "ease" => {
-                let value = value?;
-                let resolved = match value {
-                    "linear" | "initial" => value.into(),
-                    _ => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| self.theme("--ease", value))?,
+            "duration" | "delay" | "ease" => {
+                if bare == Some("initial") && root != "delay" {
+                    return Body::new(&[(&format!("--tw-{root}"), "initial".into())]);
+                }
+                let resolved = match (&raw, bare) {
+                    (Some(raw), _) => raw.clone(),
+                    (_, Some("linear")) if root == "ease" => "linear".into(),
+                    (_, Some(value)) if root == "ease" => self.theme("--ease", value)?,
+                    (_, Some(value)) if integer(value) => format!("{value}ms"),
+                    _ => return None,
                 };
-                Body::new(&[
-                    ("--tw-ease", resolved.clone()),
-                    ("transition-timing-function", resolved),
-                ])
+                match root {
+                    "delay" => Body::new(&[("transition-delay", resolved)]),
+                    "duration" => Body::new(&[
+                        ("--tw-duration", resolved.clone()),
+                        ("transition-duration", resolved),
+                    ]),
+                    _ => Body::new(&[
+                        ("--tw-ease", resolved.clone()),
+                        ("transition-timing-function", resolved),
+                    ]),
+                }
             }
             "transition" => {
-                let properties = match value {
-                    None => format!(
+                let properties = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (None, None) => format!(
                         "{COLORS}, opacity, box-shadow, transform, translate, scale, rotate, filter, -webkit-backdrop-filter, backdrop-filter, display, content-visibility, overlay, pointer-events"
                     ),
-                    Some("all") => "all".into(),
-                    Some("colors") => COLORS.into(),
-                    Some("opacity") => "opacity".into(),
-                    Some("shadow") => "box-shadow".into(),
-                    Some("transform") => "transform, translate, scale, rotate".into(),
-                    Some("none") => return Body::new(&[("transition-property", "none".into())]),
-                    Some(value) => decode(arbitrary(value)?),
+                    (Some("all"), _) => "all".into(),
+                    (Some("colors"), _) => COLORS.into(),
+                    (Some("opacity"), _) => "opacity".into(),
+                    (Some("shadow"), _) => "box-shadow".into(),
+                    (Some("transform"), _) => "transform, translate, scale, rotate".into(),
+                    (Some("none"), _) => {
+                        return Body::new(&[("transition-property", "none".into())]);
+                    }
+                    _ => return None,
                 };
                 let mut body = Body::parse(TRANSITION);
                 body.declarations
@@ -2349,13 +4310,12 @@ impl Compiler {
                 Some(body)
             }
             "blur" | "backdrop-blur" => {
-                let resolved = match value {
-                    None => "blur(8px)".into(),
-                    Some("none") => " ".into(),
-                    Some(value) => match arbitrary(value) {
-                        Some(raw) => format!("blur({})", decode(raw)),
-                        None => format!("blur({})", self.theme("--blur", value)?),
-                    },
+                let resolved = match (value, bare, &raw) {
+                    (None, ..) => "blur(8px)".into(),
+                    (_, Some("none"), _) => " ".into(),
+                    (_, _, Some(raw)) => format!("blur({raw})"),
+                    (_, Some(value), _) => format!("blur({})", self.theme("--blur", value)?),
+                    _ => return None,
                 };
                 if root == "blur" {
                     return Body::new(&[("--tw-blur", resolved), ("filter", FILTER.into())]);
@@ -2366,126 +4326,335 @@ impl Compiler {
                     ("backdrop-filter", BACKDROP.into()),
                 ])
             }
+            "brightness"
+            | "contrast"
+            | "saturate"
+            | "backdrop-brightness"
+            | "backdrop-contrast"
+            | "backdrop-saturate"
+            | "backdrop-opacity" => filter(root.trim_start_matches("backdrop-"), "%", None),
+            "grayscale" | "invert" | "sepia" | "backdrop-grayscale" | "backdrop-invert"
+            | "backdrop-sepia" => filter(root.trim_start_matches("backdrop-"), "%", Some("100%")),
+            "hue-rotate" | "backdrop-hue-rotate" => filter("hue-rotate", "deg", None),
+            "filter" | "backdrop-filter" if value.is_none() => {
+                if root == "filter" {
+                    return Body::new(&[("filter", FILTER.into())]);
+                }
+                Body::new(&[
+                    ("-webkit-backdrop-filter", BACKDROP.into()),
+                    ("backdrop-filter", BACKDROP.into()),
+                ])
+            }
+            "filter" | "backdrop-filter" => {
+                let raw = raw?;
+                if root == "filter" {
+                    return Body::new(&[("filter", raw)]);
+                }
+                Body::new(&[
+                    ("-webkit-backdrop-filter", raw.clone()),
+                    ("backdrop-filter", raw),
+                ])
+            }
             "animate" => {
-                let value = value?;
-                let resolved = match value {
-                    "none" => "none".into(),
-                    _ => arbitrary(value)
-                        .map(decode)
-                        .or_else(|| self.theme("--animate", value))?,
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("none"), _) => "none".into(),
+                    (Some(value), _) => self.theme("--animate", value)?,
+                    _ => return None,
                 };
                 Body::new(&[("animation", resolved)])
             }
             "content" => {
-                let value = value?;
-                let resolved = match value {
-                    "none" => "none".into(),
-                    _ => decode(arbitrary(value)?),
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("none"), _) => {
+                        return Body::new(&[
+                            ("--tw-content", "none".into()),
+                            ("content", "none".into()),
+                        ]);
+                    }
+                    _ => return None,
                 };
                 Body::new(&[
                     ("--tw-content", resolved),
                     ("content", "var(--tw-content)".into()),
                 ])
             }
-            "line-clamp" => {
-                let value = value?;
-                if value == "none" {
-                    return Body::new(&[
-                        ("overflow", "visible".into()),
-                        ("display", "block".into()),
-                        ("-webkit-box-orient", "horizontal".into()),
-                        ("-webkit-line-clamp", "unset".into()),
-                    ]);
-                }
-                let lines = arbitrary(value)
-                    .map(decode)
-                    .or_else(|| value.parse::<u16>().ok().map(|n| n.to_string()))?;
-                Body::new(&[
-                    ("overflow", "hidden".into()),
-                    ("display", "-webkit-box".into()),
-                    ("-webkit-box-orient", "vertical".into()),
-                    ("-webkit-line-clamp", lines),
-                ])
-            }
             "aspect" => {
-                let value = value?;
-                let resolved = match value {
-                    "auto" => "auto".into(),
-                    "square" => "1 / 1".into(),
-                    "video" => self.theme("--aspect", "video")?,
-                    _ => match (arbitrary(value), modifier) {
-                        (Some(raw), _) => decode(raw),
-                        (None, Some(modifier)) => format!("{value} / {modifier}"),
-                        _ => return None,
-                    },
+                let resolved = match (bare, &raw) {
+                    (_, Some(raw)) => raw.clone(),
+                    (Some("auto"), _) => "auto".into(),
+                    (Some("square"), _) => "1 / 1".into(),
+                    (Some("video"), _) => self.theme("--aspect", "video")?,
+                    (Some(value), _) if integer(value) && modifier.is_some_and(integer) => {
+                        format!("{value} / {}", modifier?)
+                    }
+                    _ => return None,
                 };
                 Body::new(&[("aspect-ratio", resolved)])
             }
-            "cursor" => {
-                let value = value?;
-                let resolved = arbitrary(value).map(decode).or_else(|| {
-                    value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
-                        .then(|| value.to_owned())
-                })?;
-                Body::new(&[("cursor", resolved)])
+            "cursor" | "will-change" | "contain" | "list" | "list-image" | "align" | "object" => {
+                let property = match root {
+                    "list" => "list-style-type",
+                    "list-image" => "list-style-image",
+                    "align" => "vertical-align",
+                    "object" => "object-position",
+                    _ => root,
+                };
+                Body::new(&[(property, raw?)])
             }
-            "origin" => {
-                let value = value?;
-                let resolved = arbitrary(value)
-                    .map(decode)
-                    .unwrap_or_else(|| value.replace('-', " "));
-                Body::new(&[("transform-origin", resolved)])
+            "@container" => {
+                let kind = match bare {
+                    None => "inline-size",
+                    Some(kind @ ("normal" | "size")) => kind,
+                    _ => return None,
+                };
+                let mut body = vec![("container-type", kind.to_owned())];
+                if let Some(name) = modifier {
+                    body.push((
+                        "container-name",
+                        named_value(name).then(|| name.to_owned())?,
+                    ));
+                }
+                Body::new(&body)
             }
-            "will-change" => Body::new(&[("will-change", decode(arbitrary(value?)?))]),
-            "columns" => {
-                let value = value?;
-                let resolved = arbitrary(value)
-                    .map(decode)
-                    .or_else(|| self.theme("--container", value))
-                    .or_else(|| value.parse::<u16>().ok().map(|n| n.to_string()))?;
-                Body::new(&[("columns", resolved)])
+            "outline-hidden" if value.is_none() => Some(
+                Body::parse("--tw-outline-style:none;outline-style:none").nest(
+                    &["@media (forced-colors: active)"],
+                    "&",
+                    "outline:2px solid transparent;outline-offset:2px",
+                ),
+            ),
+            "container" if value.is_none() => {
+                let mut breakpoints: Vec<_> = DEFAULTS.with(|defaults| {
+                    defaults
+                        .keys()
+                        .filter_map(|name| name.strip_prefix("--breakpoint-"))
+                        .map(str::to_owned)
+                        .collect()
+                });
+                breakpoints.extend(
+                    self.theme
+                        .keys()
+                        .filter_map(|name| name.strip_prefix("--breakpoint-"))
+                        .map(str::to_owned),
+                );
+                let mut widths: Vec<_> = breakpoints
+                    .into_iter()
+                    .filter_map(|name| self.raw(&format!("--breakpoint-{name}")))
+                    .collect();
+                widths.sort_by(|a, b| {
+                    let pixels = |width: &String| {
+                        let ((_, key), _) = self.media(">=", width, "min").unwrap_or_default();
+                        key
+                    };
+                    pixels(a).cmp(&pixels(b))
+                });
+                widths.dedup();
+                let mut body = Body::new(&[("width", "100%".into())])?;
+                for width in widths {
+                    body = body.nest(
+                        &[&format!("@media (width >= {width})")],
+                        "&",
+                        &format!("max-width:{width}"),
+                    );
+                }
+                Some(body)
             }
             _ => None,
         }
     }
 }
 
+/// Parses a variant template: a selector, an at-rule, or a block with `@slot`.
 fn template(source: &str) -> Variant {
-    if source.starts_with('@') {
-        return Variant {
-            rules: vec![source.to_owned()],
-            ..Variant::default()
-        };
+    let mut variant = Variant::default();
+    if source.contains("@slot") {
+        slots(source, &[], None, &mut variant.branches, 0);
+    } else if source.starts_with('@') {
+        variant.branches.push((vec![source.to_owned()], None));
+    } else {
+        variant.branches.push((Vec::new(), Some(source.to_owned())));
     }
-    Variant {
-        selectors: split(source, ',')
-            .into_iter()
-            .map(|part| part.trim().to_owned())
-            .collect(),
-        ..Variant::default()
+    variant.never = variant.branches.iter().any(|(at, selector)| {
+        selector
+            .as_ref()
+            .is_some_and(|selector| selector.contains("::"))
+            || at.iter().any(|rule| {
+                !["@media", "@supports", "@container"]
+                    .iter()
+                    .any(|name| rule.starts_with(name))
+            })
+    });
+    variant
+}
+
+/// Collects the at-rules and selector leading to each `@slot` of a block variant.
+fn slots(
+    source: &str,
+    at: &[String],
+    selector: Option<&str>,
+    out: &mut Vec<(Vec<String>, Option<String>)>,
+    depth: u8,
+) {
+    if depth > 8 || out.len() > 8 {
+        return;
+    }
+    for (prelude, block) in statements(source) {
+        match block {
+            None if prelude == "@slot" => out.push((at.to_vec(), selector.map(str::to_owned))),
+            None => {}
+            Some(inner) if prelude.starts_with('@') => {
+                let mut at = at.to_vec();
+                at.push(prelude.to_owned());
+                slots(inner, &at, selector, out, depth + 1);
+            }
+            Some(inner) => {
+                let nested = match selector {
+                    Some(outer) if prelude.contains('&') => prelude.replace('&', outer),
+                    Some(outer) => format!("{outer} {prelude}"),
+                    None if prelude.contains('&') => prelude.to_owned(),
+                    None => format!("& {prelude}"),
+                };
+                slots(inner, at, Some(&nested), out, depth + 1);
+            }
+        }
     }
 }
 
-/// Splits on `separator` outside brackets and parentheses.
-fn split(value: &str, separator: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
+/// Splits a block body into statements: `prelude;` or `prelude { block }`.
+fn statements(source: &str) -> Vec<(&str, Option<&str>)> {
+    let mut items = Vec::new();
+    let (mut start, mut open, mut depth, mut parens) = (0, 0, 0usize, 0usize);
+    let mut chars = source.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match character {
+            '\\' => {
+                chars.next();
+            }
+            '"' | '\'' => {
+                let mut escaped = false;
+                for (_, other) in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if other == '\\' {
+                        escaped = true;
+                    } else if other == character {
+                        break;
+                    }
+                }
+            }
+            '(' | '[' => parens += 1,
+            ')' | ']' => parens = parens.saturating_sub(1),
+            '{' => {
+                if depth == 0 {
+                    open = index;
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    items.push((source[start..open].trim(), Some(&source[open + 1..index])));
+                    start = index + 1;
+                }
+            }
+            ';' if depth == 0 && parens == 0 => {
+                let item = source[start..index].trim();
+                if !item.is_empty() {
+                    items.push((item, None));
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let rest = source[start..].trim();
+    if depth == 0 && !rest.is_empty() {
+        items.push((rest, None));
+    }
+    items
+}
+
+/// Finds `name(` outside strings: its start, the start of its arguments and its closing
+/// parenthesis, which is the text's length when it isn't closed.
+fn call(text: &str, name: &str) -> Option<(usize, usize, usize)> {
+    let (mut found, mut quote, mut escaped, mut depth) = (None, None, false, 0);
+    for (index, character) in text.char_indices() {
+        if let Some((_, open)) = found
+            && index < open
+        {
+            continue;
+        }
         if escaped {
             escaped = false;
             continue;
         }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(quoted) = quote {
+            if character == quoted {
+                quote = None;
+            }
+            continue;
+        }
+        match (character, found) {
+            ('"' | '\'', _) => quote = Some(character),
+            ('(', Some(_)) => depth += 1,
+            (')', Some((start, open))) if depth == 0 => return Some((start, open, index)),
+            (')', Some(_)) => depth -= 1,
+            (_, None)
+                if text[index..].starts_with(name)
+                    && text[index + name.len()..].starts_with('(') =>
+            {
+                found = Some((index, index + name.len() + 1));
+            }
+            _ => {}
+        }
+    }
+    found.map(|(start, open)| (start, open, text.len()))
+}
+
+/// Whether a value uses one of Tailwind's CSS functions.
+fn calls(value: &str) -> bool {
+    value.contains("theme(") || value.contains("--spacing(") || value.contains("--alpha(")
+}
+
+/// Splits on `separator` outside brackets, parentheses and strings, like Tailwind's `segment()`.
+fn split(value: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut stack = Vec::new();
+    let mut start = 0;
+    let mut chars = value.char_indices();
+    while let Some((index, character)) = chars.next() {
+        if character == separator && stack.is_empty() {
+            parts.push(&value[start..index]);
+            start = index + character.len_utf8();
+            continue;
+        }
         match character {
-            '\\' => escaped = true,
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            _ if character == separator && depth == 0 => {
-                parts.push(&value[start..index]);
-                start = index + 1;
+            '\\' => {
+                chars.next();
+            }
+            '"' | '\'' => {
+                let mut escaped = false;
+                for (_, other) in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if other == '\\' {
+                        escaped = true;
+                    } else if other == character {
+                        break;
+                    }
+                }
+            }
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ')' | ']' | '}' if stack.last() == Some(&character) => {
+                stack.pop();
             }
             _ => {}
         }
@@ -2495,111 +4664,282 @@ fn split(value: &str, separator: char) -> Vec<&str> {
 }
 
 fn modifier(value: &str) -> (&str, Option<&str>) {
-    let parts = split(value, '/');
-    match parts.as_slice() {
+    match split(value, '/').as_slice() {
         [value, modifier] if !value.is_empty() && !modifier.is_empty() => (value, Some(modifier)),
         _ => (value, None),
     }
 }
 
-fn arbitrary(value: &str) -> Option<&str> {
-    value
-        .strip_prefix('[')?
-        .strip_suffix(']')
-        .filter(|raw| !raw.is_empty())
-}
-
-fn hint(raw: &str) -> (Option<&str>, &str) {
-    match raw.split_once(':') {
-        Some((kind, value))
-            if matches!(
-                kind,
-                "color"
-                    | "length"
-                    | "percentage"
-                    | "number"
-                    | "integer"
-                    | "url"
-                    | "image"
-                    | "position"
-                    | "size"
-                    | "bg-size"
-                    | "line-width"
-                    | "family-name"
-                    | "absolute-size"
-                    | "relative-size"
-                    | "angle"
-                    | "ratio"
-                    | "vector"
-                    | "any"
-            ) =>
-        {
-            (Some(kind), value)
+/// Whether an arbitrary value stays inside its declaration: balanced brackets and strings, and no
+/// top-level `;` or comments.
+fn valid(value: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' if chars.next().is_none() => return false,
+            '"' | '\'' => loop {
+                match chars.next() {
+                    None | Some('\n') => return false,
+                    Some('\\') if chars.next().is_none() => return false,
+                    Some(other) if other == character => break,
+                    _ => {}
+                }
+            },
+            '(' => stack.push(')'),
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ')' | ']' | '}' if stack.pop() != Some(character) => return false,
+            ';' if stack.is_empty() => return false,
+            '/' if chars.peek() == Some(&'*') => return false,
+            _ => {}
         }
-        _ => (None, raw),
     }
+    stack.is_empty()
 }
 
-/// Decodes an arbitrary value: `_` is a space, and math operators get the spaces CSS needs.
+/// Tailwind's named values, like `red-500`, `1.5` or `50%`.
+fn named_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'%' | b'-'))
+}
+
+fn integer(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Tailwind's decoding of arbitrary values: `_` is a space, except in `url()` and `var()` names, and
+/// math operators get the spaces CSS needs.
 fn decode(raw: &str) -> String {
     let mut value = String::with_capacity(raw.len());
-    let mut escaped = false;
-    for character in raw.chars() {
-        if escaped {
+    let mut stack: Vec<bool> = Vec::new();
+    let (mut word, mut first) = (0, false);
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        if stack.last() == Some(&true) {
+            match character {
+                '(' => stack.push(true),
+                ')' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
             value.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else {
-            value.push(if character == '_' { ' ' } else { character });
+            continue;
+        }
+        match character {
+            '\\' if chars.peek() == Some(&'_') => {
+                chars.next();
+                value.push('_');
+            }
+            '\\' => {
+                value.push(character);
+                value.extend(chars.next());
+            }
+            '_' => value.push(if first { '_' } else { ' ' }),
+            '"' | '\'' => {
+                value.push(character);
+                while let Some(other) = chars.next() {
+                    match other {
+                        '\\' if chars.peek() == Some(&'_') => {
+                            chars.next();
+                            value.push('_');
+                        }
+                        '\\' => {
+                            value.push(other);
+                            value.extend(chars.next());
+                        }
+                        '_' => value.push(' '),
+                        _ => value.push(other),
+                    }
+                    if other == character {
+                        break;
+                    }
+                }
+            }
+            '(' => {
+                let name = &value[word..];
+                let url = name == "url" || name.ends_with(" url");
+                first = matches!(name, "var" | "theme")
+                    || name.ends_with(" var")
+                    || name.ends_with(" theme");
+                stack.push(url);
+                value.push(character);
+                word = value.len();
+            }
+            ')' | ':' | ',' | '=' | '>' | '<' | '\n' | ' ' | '\t' | '/' => {
+                if character == ')' {
+                    stack.pop();
+                }
+                value.push(character);
+                word = value.len();
+                first = false;
+            }
+            _ => value.push(character),
         }
     }
     if !value.contains('(') {
         return value;
     }
+    math(&value)
+}
+
+/// Tailwind's spacing around math operators inside `calc()` and the other math functions.
+fn math(value: &str) -> String {
+    const MATH: &[&str] = &[
+        "calc", "min", "max", "clamp", "mod", "rem", "sin", "cos", "tan", "asin", "acos", "atan",
+        "atan2", "pow", "sqrt", "hypot", "log", "exp", "round",
+    ];
+    if !MATH.iter().any(|name| value.contains(name)) {
+        return value.to_owned();
+    }
+    let chars: Vec<char> = value.chars().collect();
     let mut result = String::with_capacity(value.len() + 8);
-    let mut math = Vec::new();
-    let mut start = 0;
-    for (index, character) in value.char_indices() {
-        let next = index + character.len_utf8();
+    let mut stack: Vec<bool> = Vec::new();
+    let (mut number, mut previous) = (None, None);
+    for (index, &character) in chars.iter().enumerate() {
+        if character.is_ascii_digit()
+            || number.is_some() && (character == '%' || character.is_ascii_alphabetic())
+        {
+            number = Some(index);
+        } else {
+            previous = number;
+            number = None;
+        }
+        let math = stack.last() == Some(&true);
         match character {
             '(' => {
-                let name = &value[start..index];
-                math.push(
-                    matches!(
-                        name,
-                        "calc" | "min" | "max" | "clamp" | "round" | "mod" | "rem" | "abs"
-                    ) || name.is_empty() && math.last() == Some(&true),
-                );
                 result.push(character);
+                let start = chars[..index]
+                    .iter()
+                    .rposition(|c| !(c.is_ascii_digit() || c.is_ascii_lowercase()))
+                    .map_or(0, |position| position + 1);
+                let name: String = chars[start..index].iter().collect();
+                stack.push(MATH.contains(&name.as_str()) || math && name.is_empty());
             }
             ')' => {
-                math.pop();
                 result.push(character);
+                stack.pop();
             }
-            '+' | '-' | '*' | '/' if math.last() == Some(&true) => {
-                let previous = result.trim_end().chars().last();
-                if previous
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, ')' | '%' | '.'))
+            ',' if math => result.push_str(", "),
+            ' ' if math && result.ends_with(' ') => {}
+            '+' | '*' | '/' | '-' if math => {
+                let trimmed = result.trim_end();
+                let mut tail = trimmed.chars().rev();
+                let (last, before) = (tail.next(), tail.next());
+                let next = chars.get(index + 1).copied();
+                if matches!(last, Some('e' | 'E')) && before.is_some_and(|c| c.is_ascii_digit())
+                    || matches!(last, Some('+' | '*' | '/' | '-' | '(' | ','))
                 {
-                    result.truncate(result.trim_end().len());
+                    result.push(character);
+                } else if index > 0 && chars[index - 1] == ' ' {
+                    result.push(character);
+                    result.push(' ');
+                } else if last.is_some_and(|c| c.is_ascii_digit() || c == ')')
+                    || next.is_some_and(|c| {
+                        c.is_ascii_digit() || matches!(c, '(' | '+' | '*' | '/' | '-')
+                    })
+                    || index > 0 && previous == Some(index - 1)
+                {
                     result.push(' ');
                     result.push(character);
                     result.push(' ');
-                    start = next;
-                    continue;
+                } else {
+                    result.push(character);
                 }
-                result.push(character);
             }
-            ',' if math.last() == Some(&true) => result.push_str(", "),
-            ' ' if result.ends_with(' ') => {}
             _ => result.push(character),
-        }
-        if !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_')) {
-            start = next;
         }
     }
     result
+}
+
+/// Tailwind's `--alpha()`: numbers become percentages and `100%` keeps the color.
+fn with_alpha(color: &str, alpha: &str) -> String {
+    let alpha = match alpha.parse::<f64>() {
+        Ok(number) => format!("{}%", number * 100.),
+        Err(_) => alpha.to_owned(),
+    };
+    if alpha == "100%" {
+        return color.to_owned();
+    }
+    format!("color-mix(in oklab, {color} {alpha}, transparent)")
+}
+
+/// Replaces `&` with `*`, which is dropped before other simple selectors: `&:hover` is `:hover`.
+fn universal(selector: &str, all: bool) -> String {
+    let mut result = String::with_capacity(selector.len() + 2);
+    let mut chars = selector.chars().peekable();
+    let mut done = false;
+    while let Some(character) = chars.next() {
+        if character != '&' || done {
+            result.push(character);
+            continue;
+        }
+        done = !all;
+        if !matches!(chars.peek(), Some(':' | '[' | '.' | '#')) {
+            result.push('*');
+        }
+    }
+    result
+}
+
+/// The negation of a conditional at-rule for `not-*`.
+fn negate(rule: &str) -> Option<String> {
+    let (name, params) = rule.split_once(' ')?;
+    let params = params.trim();
+    if !matches!(name, "@media" | "@supports" | "@container") || split(params, ',').len() > 1 {
+        return None;
+    }
+    let words: Vec<_> = split(params, ' ')
+        .into_iter()
+        .filter(|word| !word.is_empty())
+        .collect();
+    Some(match words.as_slice() {
+        ["not", rest @ ..] => format!("{name} {}", rest.join(" ")),
+        [container, "not", rest @ ..] if name == "@container" && !container.starts_with('(') => {
+            format!("{name} {container} {}", rest.join(" "))
+        }
+        [container, rest @ ..] if name == "@container" && !container.starts_with('(') => {
+            format!("{name} {container} not {}", rest.join(" "))
+        }
+        _ => format!("{name} not {params}"),
+    })
+}
+
+/// Whether `initial` on `cleared`, a variable or a `--name-*` namespace, removes `name`.
+fn removes(cleared: &str, name: &str) -> bool {
+    match cleared.strip_suffix("-*") {
+        Some(namespace) => name.starts_with(namespace) && !kept(name, namespace),
+        None => cleared == name,
+    }
+}
+
+/// Whether `name` belongs to another namespace than `namespace`, like `--font-weight-bold`.
+fn kept(name: &str, namespace: &str) -> bool {
+    KEPT.iter().any(|(other, names)| {
+        *other == namespace
+            && names.iter().any(|kept| {
+                name.strip_prefix(kept)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            })
+    })
+}
+
+fn direction(side: &str) -> Option<&'static str> {
+    Some(match side {
+        "t" => "top",
+        "tr" => "top right",
+        "r" => "right",
+        "br" => "bottom right",
+        "b" => "bottom",
+        "bl" => "bottom left",
+        "l" => "left",
+        "tl" => "top left",
+        _ => return None,
+    })
 }
 
 fn is_color(value: &str) -> bool {
@@ -2635,7 +4975,9 @@ fn is_type(kind: &str, value: &str) -> bool {
         "length" => is_length(value) && !value.ends_with('%'),
         "duration" => {
             value.ends_with("ms")
-                || value.ends_with('s') && value[..value.len() - 1].parse::<f64>().is_ok()
+                || value
+                    .strip_suffix('s')
+                    .is_some_and(|number| number.parse::<f64>().is_ok())
         }
         "color" => is_color(value),
         _ => false,
@@ -2649,26 +4991,38 @@ fn is_length(value: &str) -> bool {
             .any(|prefix| value.starts_with(prefix))
 }
 
-/// Wraps the color of each shadow layer in `var(name, color)`, so shadow color utilities apply.
-fn shadow_color(shadow: &str, name: &str) -> String {
+/// Puts each shadow layer's color in `var(name, color)`, so shadow color utilities apply.
+fn shadow_color(shadow: &str, name: &str, alpha: Option<&str>) -> String {
+    let replacement = |color: &str| match alpha {
+        Some(alpha) => format!("var({name}, oklab(from {color} l a b / {alpha}))"),
+        None => format!("var({name}, {color})"),
+    };
     split(shadow, ',')
         .into_iter()
         .map(|layer| {
-            let parts = split(layer.trim(), ' ');
-            if parts.len() < 3 {
-                return layer.trim().to_owned();
+            let layer = layer.trim();
+            let (mut color, mut offsets) = (None, 0);
+            for part in split(layer, ' ') {
+                if part.is_empty()
+                    || matches!(part, "inset" | "inherit" | "initial" | "revert" | "unset")
+                {
+                    continue;
+                }
+                let digits = part.strip_prefix('-').unwrap_or(part);
+                if digits.starts_with(|c: char| c.is_ascii_digit())
+                    || digits.starts_with('.')
+                        && digits[1..].starts_with(|c: char| c.is_ascii_digit())
+                {
+                    offsets += 1;
+                } else if color.is_none() {
+                    color = Some(part);
+                }
             }
-            parts
-                .iter()
-                .map(|part| {
-                    if *part != "inset" && !is_length(part) && !part.is_empty() {
-                        format!("var({name}, {part})")
-                    } else {
-                        (*part).to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
+            match (offsets, color) {
+                (0 | 1, _) => layer.to_owned(),
+                (_, Some(color)) => layer.replacen(color, &replacement(color), 1),
+                _ => format!("{layer} {}", replacement("currentcolor")),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -2705,16 +5059,52 @@ fn escape(class: &str) -> String {
     selector
 }
 
-fn join(declarations: &[(String, String)], important: bool) -> String {
-    let mut source = String::new();
-    for (key, value) in declarations {
-        let _ = write!(
-            source,
-            "{key}:{value}{};",
-            if important { " !important" } else { "" }
-        );
+fn css(rules: &[Nested]) -> String {
+    let mut css = String::new();
+    for (at, selector, pairs) in rules {
+        for rule in at {
+            let _ = write!(css, "{rule}{{");
+        }
+        let _ = write!(css, "{selector}{{");
+        for (key, value) in pairs {
+            let _ = write!(css, "{key}:{value};");
+        }
+        css.push_str(&"}".repeat(at.len() + 1));
     }
-    source
+    css
+}
+
+/// A sheet with utilities in `@layer utilities`.
+fn chunk(utilities: &[(Sort, u32, Vec<Rule>)]) -> Rc<Stylesheet> {
+    let rules = utilities
+        .iter()
+        .flat_map(|(.., rules)| rules.iter().cloned())
+        .collect();
+    Rc::new(Stylesheet(vec![Rule::Layer(
+        vec!["utilities".into()],
+        rules,
+    )]))
+}
+
+/// Calls `visit` with the selector list of every style rule in `rule`, in order.
+fn selectors(rule: &Rule, visit: &mut impl FnMut(&super::SelectorList)) {
+    match rule {
+        Rule::Style(list, children) => {
+            visit(list);
+            for child in children {
+                selectors(child, visit);
+            }
+        }
+        Rule::Media(_, children)
+        | Rule::Layer(_, children)
+        | Rule::Supports(_, _, children)
+        | Rule::Container(.., children) => {
+            for child in children {
+                selectors(child, visit);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Identifiers that follow `prefix` in `text`.

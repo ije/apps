@@ -108,6 +108,8 @@ pub(super) struct DomBox {
     /// The scroll container, its borders, and the containing block of a sticky box.
     pub(super) sticky: Option<(renderer::ScrollHandle, [f32; 4], Option<usize>)>,
     pub(super) fixed: bool,
+    pub(super) block: Option<[f32; 4]>,
+    pub(super) container: Option<usize>,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
     /// The group opacity, when the box paints through an effect layer.
@@ -123,6 +125,22 @@ pub(super) struct DomBox {
     pub(super) margin: [f32; 4],
     /// The size of the grid cell the box fills, before layout snaps it to pixels.
     pub(super) cell: Option<[f32; 2]>,
+    /// The grid that aligns the box's baseline. Prepaint records the box's baselines and draws the frame again
+    /// when they change.
+    pub(super) grid: Option<usize>,
+    /// For a table, its rows with their cells, then its row groups with their rows. They have no box of their
+    /// own, so their bounds are the union of their members'.
+    pub(super) parts: Rc<[(usize, Vec<usize>)]>,
+    /// For a cell with collapsed borders, the half borders it shares with its neighbors, outside its box.
+    pub(super) shared: Option<[f32; 4]>,
+    /// For an inline box, its height on one line and the leading above and below its font's content area,
+    /// which browsers leave out of its rectangle.
+    pub(super) leading: Option<[f32; 3]>,
+    /// The box shows in place of another, like the chosen option of a closed select, and reports no box.
+    pub(super) boxless: bool,
+    /// For an inline box, its first and last text and its top and bottom padding and border. Its rectangle
+    /// spans its text's, whatever else its line holds.
+    pub(super) text: Option<([usize; 2], [f32; 2])>,
 }
 
 impl IntoElement for DomBox {
@@ -133,18 +151,24 @@ impl IntoElement for DomBox {
 }
 
 impl renderer::Element for DomBox {
-    type RequestLayoutState = AnyElement;
+    type RequestLayoutState = (renderer::LayoutId, AnyElement);
     type PrepaintState = (Bounds<Pixels>, Option<super::effects::Matrix>);
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, AnyElement) {
+    fn request_layout(
+        &mut self,
+        window: &mut Window,
+    ) -> (renderer::LayoutId, Self::RequestLayoutState) {
         let mut inner = self.inner.take().unwrap().into_any_element();
-        (inner.request_layout(window), inner)
+        let id = inner.request_layout(window);
+        (id, (id, inner))
     }
     fn prepaint(
         &mut self,
-        mut bounds: Bounds<Pixels>,
-        inner: &mut AnyElement,
+        _: Bounds<Pixels>,
+        (id, inner): &mut Self::RequestLayoutState,
         window: &mut Window,
     ) -> Self::PrepaintState {
+        // Positions keep layout units like Chrome; the inner element paints at snapped bounds.
+        let mut bounds = window.exact_layout_bounds(*id);
         let mut offset = point(px(0.), px(0.));
         if let Some((axes, block, margin)) = self.anchor
             && let Some(anchor) = {
@@ -200,6 +224,31 @@ impl renderer::Element for DomBox {
             }
             bounds.origin += offset;
         }
+        if let Some(container) = self.container
+            && let Some(block) = {
+                let view = &*self.view;
+                let host = view.host.borrow();
+                host.dom
+                    .get(&view.id)
+                    .and_then(|dom| dom.blocks.get(&container).copied())
+            }
+        {
+            let [top, right, bottom, left] = self.inset;
+            let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
+            let mut shift = point(px(0.), px(0.));
+            if let Some(left) = left {
+                shift.x = block.left() + px(left) + margin_left - bounds.left();
+            } else if let Some(right) = right {
+                shift.x = block.right() - px(right) - margin_right - bounds.right();
+            }
+            if let Some(top) = top {
+                shift.y = block.top() + px(top) + margin_top - bounds.top();
+            } else if let Some(bottom) = bottom {
+                shift.y = block.bottom() - px(bottom) - margin_bottom - bounds.bottom();
+            }
+            offset += shift;
+            bounds.origin += shift;
+        }
         if self.fixed {
             let viewport = window.viewport_size();
             if let Some(left) = self.inset[3] {
@@ -213,6 +262,22 @@ impl renderer::Element for DomBox {
                 offset.y = viewport.height - px(bottom) - bounds.bottom();
             }
             bounds.origin += offset;
+        }
+        if let Some([top, right, bottom, left]) = self.block {
+            let view = &*self.view;
+            let mut host = view.host.borrow_mut();
+            let padding = Bounds::new(
+                bounds.origin + point(px(left), px(top)),
+                renderer::size(
+                    bounds.size.width - px(left + right),
+                    bounds.size.height - px(top + bottom),
+                ),
+            );
+            host.dom
+                .entry(view.id)
+                .or_default()
+                .blocks
+                .insert(self.id, padding);
         }
         let perspective = self
             .perspective
@@ -244,20 +309,31 @@ impl renderer::Element for DomBox {
                         .zip([window_bounds.size.width, window_bounds.size.height])
                         .any(|(axis, size)| {
                             axis.is_some_and(|(used, extent)| {
-                                !((f32::from(size) - extent - used).abs() <= 0.5)
+                                let gap = (f32::from(size) - extent - used).abs();
+                                gap.is_nan() || gap > 0.5
                             })
                         })
                 {
-                    window.refresh();
+                    window.redraw();
+                }
+                let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
+                if let Some([line, above, below]) = self.leading
+                    && (f32::from(window_bounds.size.height) - line).abs() < 0.5
+                {
+                    (top, bottom) = (above, below);
                 }
                 dom.bounds.insert(
                     self.id,
-                    [
-                        window_bounds.origin.x.into(),
-                        window_bounds.origin.y.into(),
-                        window_bounds.size.width.into(),
-                        window_bounds.size.height.into(),
-                    ],
+                    if self.boxless {
+                        [0.; 4]
+                    } else {
+                        [
+                            f32::from(window_bounds.origin.x) + left,
+                            f32::from(window_bounds.origin.y) + top,
+                            f32::from(window_bounds.size.width) - left - right,
+                            f32::from(window_bounds.size.height) - top - bottom,
+                        ]
+                    },
                 );
                 let cull = &mut dom.cull;
                 let width = f32::from(bounds.size.width);
@@ -274,6 +350,13 @@ impl renderer::Element for DomBox {
                     self.margin,
                 );
                 cull.widths.insert(self.id, width - self.sides);
+                if let Some(grid) = self.grid {
+                    let baselines = window.layout_baselines(*id).map(|value| value.map(f32::from));
+                    if dom.baselines.insert(self.id, baselines) != Some(baselines) {
+                        dom.grids.remove(&grid);
+                        window.redraw();
+                    }
+                }
             }
             if let Some((browser, _)) = view.browsers.borrow().get(&self.id) {
                 let _ = browser.set_bounds([
@@ -286,6 +369,40 @@ impl renderer::Element for DomBox {
             window.with_element_offset(offset, |window| {
                 inner.prepaint(window);
             });
+            if let Some(([first, last], [above, below])) = self.text {
+                let mut host = view.host.borrow_mut();
+                let bounds = &mut host.dom.entry(view.id).or_default().bounds;
+                if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) =
+                    (bounds.get(&self.id), bounds.get(&first), bounds.get(&last))
+                    && width > 0.
+                {
+                    bounds.insert(
+                        self.id,
+                        [x, top - above, width, y + height - top + above + below],
+                    );
+                }
+            }
+            if !self.parts.is_empty() {
+                let mut host = view.host.borrow_mut();
+                let bounds = &mut host.dom.entry(view.id).or_default().bounds;
+                for (part, members) in self.parts.iter() {
+                    let union = members
+                        .iter()
+                        .filter_map(|member| bounds.get(member).copied())
+                        .reduce(|[x, y, w, h], [a, b, c, d]| {
+                            let [left, top] = [x.min(a), y.min(b)];
+                            [
+                                left,
+                                top,
+                                (x + w).max(a + c) - left,
+                                (y + h).max(b + d) - top,
+                            ]
+                        });
+                    if let Some(union) = union {
+                        bounds.insert(*part, union);
+                    }
+                }
+            }
         };
         match matrix {
             Some(matrix) => window.with_hit_transform(matrix, &mut prepaint),
@@ -296,7 +413,7 @@ impl renderer::Element for DomBox {
     fn paint(
         &mut self,
         _: Bounds<Pixels>,
-        inner: &mut AnyElement,
+        (_, inner): &mut Self::RequestLayoutState,
         (bounds, matrix): &mut Self::PrepaintState,
         window: &mut Window,
     ) {
@@ -403,28 +520,11 @@ impl DomBox {
             }
             masks.get(&self.id).map(|(_, image)| (image.clone(), bounds))
         });
-        let radii = || {
-            effects::corners(
-                [
-                    Prop::BORDER_TOP_LEFT_RADIUS,
-                    Prop::BORDER_TOP_RIGHT_RADIUS,
-                    Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-                    Prop::BORDER_BOTTOM_LEFT_RADIUS,
-                ]
-                .map(|name| {
-                    style
-                        .get(name)
-                        .and_then(|value| units.resolve(value, size[0]))
-                        .unwrap_or(0.)
-                        .max(0.)
-                }),
-            )
-        };
         let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
             .and_then(|value| effects::backdrop(value, &units))
             .map(|(blur, color_matrix)| renderer::Backdrop {
                 bounds,
-                corner_radii: radii(),
+                corner_radii: effects::radii(style, &units, || size).resolve(bounds.size),
                 blur,
                 color_matrix,
             });

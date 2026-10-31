@@ -135,6 +135,8 @@ pub struct FontMetrics {
     pub bounding_box: Bounds<f32>,
     /// `xAvgCharWidth` from the OpenType `OS/2` table; zero when missing.
     pub average_width: f32,
+    /// Browsers on macOS add 15% of the height to the ascent of Times, Helvetica and Courier.
+    pub tall_ascent: bool,
 }
 
 impl FontMetrics {
@@ -178,6 +180,20 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// Where lines may break inside a word, like CSS `word-break` and `overflow-wrap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WordBreak {
+    /// Only between words; a longer word overflows.
+    #[default]
+    Normal,
+    /// Inside a word that does not fit its line alone.
+    BreakWord,
+    /// Like `BreakWord`, and the min-content width is the widest character.
+    Anywhere,
+    /// Between any two characters.
+    BreakAll,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -445,6 +461,32 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.ascent, font_size))
     }
 
+    /// The ascent, descent and line gap rounded like browsers do for `line-height: normal`.
+    pub fn line_metrics(&self, font_id: FontId, font_size: Pixels) -> [Pixels; 3] {
+        self.read_metrics(font_id, |metrics| {
+            let scale = |value: f32| (value / metrics.units_per_em as f32 * font_size.0).round();
+            let (ascent, descent) = (scale(metrics.ascent), scale(-metrics.descent));
+            let tall = if metrics.tall_ascent {
+                ((ascent + descent) * 0.15).round()
+            } else {
+                0.
+            };
+            [px(ascent + tall), px(descent), px(scale(metrics.line_gap))]
+        })
+    }
+
+    /// The baseline in a line box, from metrics rounded to device pixels like Chrome.
+    pub fn baseline(
+        &self,
+        font_id: FontId,
+        font_size: Pixels,
+        line_height: Pixels,
+        scale: f32,
+    ) -> Pixels {
+        let [ascent, descent, _] = self.line_metrics(font_id, font_size * scale);
+        (((line_height * scale - ascent - descent) / 2.).floor() + ascent) / scale
+    }
+
     /// Below the baseline, so usually negative.
     pub fn descent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.descent, font_size))
@@ -461,6 +503,33 @@ impl TextSystem {
         }
         let (size, bytes) = self.platform.rasterize_glyph(params, bounds)?;
         Ok(Some((bounds.origin, size, bytes)))
+    }
+
+    /// Rasterizes a glyph on the CPU, for drawing outside the scene: the offset of its pixels from the glyph origin, their size, and alpha bytes, or straight-alpha BGRA for emoji.
+    pub fn glyph_pixels(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        scale_factor: f32,
+        subpixel: u8,
+        is_emoji: bool,
+    ) -> Option<(
+        Point<crate::DevicePixels>,
+        Size<crate::DevicePixels>,
+        Vec<u8>,
+    )> {
+        self.rasterize_glyph(&RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: crate::point(subpixel, 0),
+            scale_factor,
+            is_emoji,
+            dilation: 0,
+        })
+        .ok()
+        .flatten()
     }
 
     /// Drops the layouts that were not used for a while.
@@ -564,6 +633,7 @@ impl TextSystem {
         runs: &[TextRun],
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
+        word_break: WordBreak,
     ) -> Result<Vec<WrappedLine>> {
         self.shape_text_indented(
             text,
@@ -573,6 +643,7 @@ impl TextSystem {
             line_clamp,
             px(0.),
             TextWrap::Wrap,
+            word_break,
         )
     }
 
@@ -588,6 +659,7 @@ impl TextSystem {
         line_clamp: Option<usize>,
         indent: Pixels,
         wrap: TextWrap,
+        word_break: WordBreak,
     ) -> Result<Vec<WrappedLine>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).peekable();
         let mut used = 0;
@@ -624,6 +696,7 @@ impl TextSystem {
                 line_clamp.map(|max| max.saturating_sub(wrapped)),
                 if index == 0 { indent } else { px(0.) },
                 wrap,
+                word_break,
             );
             self.font_runs.set(font_runs);
             wrapped += layout.wrap_boundaries.len();

@@ -1,27 +1,47 @@
 globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
   const sockets = new Map(), servers = new Map(), { encode, decode } = globalThis.__appsBytes;
   delete globalThis.__appsBytes;
+  const fail = (code, message, Type = TypeError) => Object.assign(new Type(message), { code });
+  const port = (value, name = 'Port') => {
+    const number = typeof value === 'string' && value.trim() ? Number(value) : value;
+    if ((typeof value !== 'number' && typeof value !== 'string') || !Number.isInteger(number) || number < 0 || number > 65535) throw fail('ERR_SOCKET_BAD_PORT', `${name} should be >= 0 and < 65536. Received ${typeof value === 'string' ? `type string ('${value}')` : `type ${typeof value} (${String(value)})`}.`, RangeError);
+    return number;
+  };
+  const pipe = value => typeof value === 'string' && !(Number(value) >= 0);
+  const normalize = args => {
+    const callback = typeof args.at(-1) === 'function' ? args.at(-1) : undefined, [first, second] = args;
+    const options = first !== null && typeof first === 'object' ? { ...first } : pipe(first) ? { path: first } : { port: first, ...(typeof second === 'string' ? { host: second } : {}) };
+    return [options, callback];
+  };
+  const errno = code => { const value = globalThis.__apps?.os.constants.errno[code]; return value === undefined ? undefined : -value; };
+  const failure = event => {
+    const target = event.syscall === 'getaddrinfo' ? ` ${event.hostname}` : event.port !== undefined ? ` ${event.address}:${event.port}` : event.address !== undefined ? ` ${event.address}` : '';
+    const message = event.syscall === 'listen' ? `listen ${event.code}: ${event.description}${target}` : `${event.syscall} ${event.code}${target}`;
+    const error = Object.assign(new Error(message), { errno: event.errno ?? errno(event.code), code: event.code, syscall: event.syscall });
+    for (const name of ['address', 'port', 'hostname']) if (event[name] !== undefined) error[name] = event[name];
+    return error;
+  };
   class Socket extends streams.Duplex {
     constructor(options = {}) {
-      super(options); this.connecting = false; this.pending = true; this.bytesRead = 0; this.bytesWritten = 0; this._referenced = true; this.allowHalfOpen = !!options.allowHalfOpen;
+      super({ ...options, emitClose: false }); this.connecting = false; this.pending = true; this.bytesRead = 0; this.bytesWritten = 0; this._referenced = true; this.allowHalfOpen = !!options.allowHalfOpen;
       this._read = () => { if (this._paused && !this.destroyed) { this._paused = false; call('web.tcp.pause', this._socket, false); } };
       this._write = (chunk, _encoding, callback) => {
-        if (this._socket === undefined) { callback(new Error('Socket is not connected')); return; }
+        if (this._socket === undefined) { callback(fail('ERR_SOCKET_CLOSED', 'Socket is closed', Error)); return; }
         this._written = callback;
         try { call('web.tcp.write', this._socket, encode(chunk)); } catch (error) { this._written = null; callback(error); }
       };
       this._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
     }
-    connect(options, host, listener) {
-      if (this._socket !== undefined) throw new Error('Socket is already connected');
-      if (typeof options === 'number') options = { port: options, ...(typeof host === 'string' ? { host } : {}) };
-      else if (typeof options === 'string') options = { path: options };
-      if (typeof host === 'function') listener = host;
+    connect(...args) {
+      if (this._socket !== undefined) throw fail('ERR_SOCKET_CONNECTION', 'Socket is already connected', Error);
+      const [options, listener] = normalize(args);
+      if (options.path === undefined) options.port = port(options.port, 'Port');
       if (listener) this.once('connect', listener);
       this.connecting = true; this.pending = true;
       this._socket = call('web.tcp.connect', options); sockets.set(this._socket, this);
+      if (options.timeout) this.setTimeout(options.timeout);
       if (options.signal) {
-        const abort = () => this.destroy(options.signal.reason instanceof Error ? options.signal.reason : new Error('Socket connection aborted'));
+        const abort = () => this.destroy(Object.assign(new Error('The operation was aborted', { cause: options.signal.reason }), { name: 'AbortError', code: 'ABORT_ERR' }));
         if (options.signal.aborted) queueMicrotask(abort); else { options.signal.addEventListener('abort', abort, { once: true }); this.once('close', () => options.signal.removeEventListener('abort', abort)); }
       }
       return this;
@@ -32,28 +52,28 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
       this._server?._connections.delete(this);
       this._server?._finishClose();
       callback(error);
+      queueMicrotask(() => this.emit('close', !!error));
     }
     setNoDelay(value = true) { if (this._socket !== undefined) call('web.tcp.noDelay', this._socket, !!value); else this.once('connect', () => this.setNoDelay(value)); return this; }
     setKeepAlive(value = false, delay = 0) { if (this._socket !== undefined) call('web.tcp.keepAlive', this._socket, !!value, delay); else this.once('connect', () => this.setKeepAlive(value, delay)); return this; }
     setTimeout(delay, listener) { this._timeout = delay; if (listener) this.once('timeout', listener); this._touch(); return this; }
     _touch() { clearTimeout(this._timer); if (this._timeout > 0) this._timer = setTimeout(() => this.emit('timeout'), this._timeout); }
-    address() { return this.localAddress ? { address: this.localAddress, port: this.localPort, family: this.localAddress.includes(':') ? 'IPv6' : 'IPv4' } : {}; }
+    address() { return this.localAddress ? { address: this.localAddress, family: this.localAddress.includes(':') ? 'IPv6' : 'IPv4', port: this.localPort } : {}; }
     ref() { this._referenced = true; return this; }
     unref() { this._referenced = false; return this; }
     get readyState() { return this.destroyed ? 'closed' : this.connecting ? 'opening' : this.readable && this.writable ? 'open' : this.readable ? 'readOnly' : this.writable ? 'writeOnly' : 'closed'; }
   }
   class Server extends EventEmitter {
     constructor(options, listener) { super(); if (typeof options === 'function') { listener = options; options = {}; } this._options = options ?? {}; this._referenced = true; this._connections = new Set(); this.listening = false; if (listener) this.on('connection', listener); }
-    listen(options, ...args) {
-      if (this.listening) throw new Error('Server is already listening');
-      const callback = typeof args.at(-1) === 'function' ? args.pop() : undefined;
+    listen(...args) {
+      if (this.listening) throw fail('ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing.', Error);
+      const [options, callback] = normalize(args);
+      if (options.path === undefined) options.port = options.port == null ? 0 : port(options.port, 'options.port');
       if (callback) this.once('listening', callback);
-      if (typeof options === 'number') options = { port: options, ...(typeof args[0] === 'string' ? { host: args[0] } : {}) };
-      else if (typeof options === 'string') options = { path: options };
-      try {
-        const result = call('web.tcp.listen', options); this._server = result.id; this._address = result.address.path ?? result.address;
-        servers.set(result.id, this); this.listening = true; queueMicrotask(() => this.emit('listening'));
-      } catch (error) { queueMicrotask(() => this.emit('error', error)); }
+      const result = call('web.tcp.listen', options);
+      if (result.error) { queueMicrotask(() => this.emit('error', failure(result.error))); return this; }
+      this._server = result.id; this._address = result.address.path ?? result.address;
+      servers.set(result.id, this); this.listening = true; queueMicrotask(() => this.emit('listening'));
       return this;
     }
     address() { return this.listening ? this._address : null; }
@@ -67,25 +87,25 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
     ref() { this._referenced = true; return this; }
     unref() { this._referenced = false; return this; }
   }
-  const connect = (...args) => new Socket().connect(...args);
+  const connect = (...args) => { const [options] = normalize(args); return new Socket(options).connect(...args); };
   const api = { Socket, Server, createServer: (...args) => new Server(...args), connect, createConnection: connect,
     isIP: value => call('web.tcp.ip', String(value)), isIPv4: value => call('web.tcp.ip', String(value)) === 4, isIPv6: value => call('web.tcp.ip', String(value)) === 6 };
-  return { api,
+  return { api, normalize, port, failure,
     poll() {
       if (!sockets.size && !servers.size) return;
       for (const event of call('web.tcp.poll')) {
         if (event.server !== undefined) {
           const server = servers.get(event.server); if (!server) continue;
-          const socket = new Socket(server._options); socket._socket = event.id; socket._server = server; socket.pending = false;
+          const socket = new Socket(server._options); Object.assign(socket, event.address); socket._socket = event.id; socket._server = server; socket.pending = false;
           sockets.set(event.id, socket); server._connections.add(socket); server.emit('connection', socket); continue;
         }
         const socket = sockets.get(event.id); if (!socket) continue;
-        if (event.kind === 'connect') { Object.assign(socket, event.address); socket.connecting = socket.pending = false; socket.emit('connect'); socket.emit('ready'); }
+        if (event.kind === 'connect') { if (socket._server) continue; Object.assign(socket, event.address); socket.connecting = socket.pending = false; socket.emit('connect'); socket.emit('ready'); }
         else if (event.kind === 'data') { const data = Buffer.from(decode(event.bytes).buffer); socket.bytesRead += data.length; socket._touch(); if (!socket.push(data) && !socket._paused) { socket._paused = true; call('web.tcp.pause', event.id, true); } }
         else if (event.kind === 'written') { socket.bytesWritten += event.bytes; socket._touch(); const callback = socket._written; socket._written = null; callback?.(); }
         else if (event.kind === 'finish') { const callback = socket._finished; socket._finished = null; callback?.(); }
         else if (event.kind === 'end') { socket.push(null); if (!socket.allowHalfOpen && socket.writable) socket.end(); }
-        else if (event.kind === 'error') socket.destroy(new Error(event.message));
+        else if (event.kind === 'error') socket.destroy(failure(event));
         else if (event.kind === 'close') socket.destroy();
       }
     },

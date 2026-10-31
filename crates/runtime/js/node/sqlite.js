@@ -3,7 +3,16 @@ globalThis.__appsSQLite = native => {
   const databases = new WeakMap(), authorizers = new Map();
   let authorizing = false;
   // WARNING: SQLite state is borrowed while the authorizer runs, so native calls must not re-enter it.
-  const call = (...args) => { if (authorizing) throw new Error('SQLite cannot be used inside an authorizer'); return native(...args); };
+  const call = (...args) => {
+    if (authorizing) throw new Error('SQLite cannot be used inside an authorizer');
+    try { return native(...args); } catch (error) {
+      const [message, errcode, errstr] = String(error?.message).split('\x01');
+      if (errstr !== undefined) Object.assign(error, { message, code: 'ERR_SQLITE_ERROR', errcode: Number(errcode), errstr });
+      throw error;
+    }
+  };
+  const fail = (Type, code, message) => Object.assign(new Type(message), { code });
+  const open = database => { if (!database.isOpen) throw fail(Error, 'ERR_INVALID_STATE', 'database is not open'); };
   globalThis.__appsSqliteAuthorize = (id, action, args) => {
     const callback = authorizers.get(id);
     if (!callback) return 0;
@@ -21,23 +30,22 @@ globalThis.__appsSQLite = native => {
     return value;
   };
   // WARNING: bindings go to Rust flat as index, kind, value, so one row costs one host call without JSON.
-  const encode = value => {
-    if (value == null) return [0, null];
+  const encode = (value, index) => {
+    if (value === null) return [0, null];
     if (typeof value === 'bigint') {
-      if (value < -9223372036854775808n || value > 9223372036854775807n) throw new RangeError('SQLite integers must fit in 64 bits');
+      if (value < -9223372036854775808n || value > 9223372036854775807n) throw fail(TypeError, 'ERR_INVALID_ARG_VALUE', 'BigInt value is too large to bind.');
       return [1, String(value)];
     }
-    if (typeof value === 'boolean') return [1, value ? '1' : '0'];
     if (typeof value === 'number') return [2, Number.isFinite(value) ? value : String(value)];
     if (typeof value === 'string') return [3, value];
     if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return [4, value];
     if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return [4, new Uint8Array(value)];
-    throw new TypeError('Unsupported SQLite parameter type');
+    throw fail(TypeError, 'ERR_INVALID_ARG_TYPE', `Provided value cannot be bound to SQLite parameter ${index}.`);
   };
   const integer = (value, bigints) => {
     if (bigints) return BigInt(value);
     const number = Number(value);
-    if (!Number.isSafeInteger(number)) throw new RangeError('SQLite integer is outside the safe number range; use setReadBigInts(true)');
+    if (!Number.isSafeInteger(number)) throw fail(RangeError, 'ERR_OUT_OF_RANGE', `Value is too large to be represented as a JavaScript number: ${value}`);
     return number;
   };
   class DatabaseSync {
@@ -45,7 +53,9 @@ globalThis.__appsSQLite = native => {
     #path;
     #options;
     constructor(path, options = {}) {
-      if (typeof path !== 'string') throw new TypeError('Database path must be a string');
+      if (path instanceof URL && path.protocol === 'file:') path = decodeURIComponent(path.pathname);
+      else if (ArrayBuffer.isView(path)) path = new TextDecoder().decode(path);
+      if (typeof path !== 'string' || path.includes('\0')) throw fail(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "path" argument must be a string, Uint8Array, or URL without null bytes.');
       if (!options || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Expected database options');
       this.#path = path;
       this.#options = {};
@@ -61,30 +71,30 @@ globalThis.__appsSQLite = native => {
     get isOpen() { return this.#id !== undefined; }
     get isTransaction() { return this.isOpen && call('sqlite.isTransaction', this.#id); }
     open() {
-      if (this.isOpen) throw new Error('Database is already open');
+      if (this.isOpen) throw fail(Error, 'ERR_INVALID_STATE', 'database is already open');
       this.#id = call('sqlite.open', this.#path, this.#options);
       databases.set(this, this.#id);
       resources?.register(this, { op: 'sqlite.releaseDatabase', id: this.#id }, this);
     }
     close() {
-      if (!this.isOpen) throw new Error('Database is not open');
+      open(this);
       call('sqlite.close', this.#id);
       authorizers.delete(this.#id); databases.delete(this);
       this.#id = undefined;
       resources?.unregister(this);
     }
     exec(sql) {
-      if (!this.isOpen) throw new Error('Database is not open');
-      if (typeof sql !== 'string') throw new TypeError('SQL must be a string');
+      open(this);
+      if (typeof sql !== 'string') throw fail(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sql" argument must be a string.');
       call('sqlite.exec', this.#id, sql);
     }
     prepare(sql) {
-      if (!this.isOpen) throw new Error('Database is not open');
-      if (typeof sql !== 'string') throw new TypeError('SQL must be a string');
+      open(this);
+      if (typeof sql !== 'string') throw fail(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "sql" argument must be a string.');
       return new StatementSync(token, this, call('sqlite.prepare', this.#id, sql), this.#options);
     }
     setAuthorizer(callback) {
-      if (!this.isOpen) throw new Error('Database is not open');
+      open(this);
       if (callback !== null && typeof callback !== 'function') throw new TypeError('Authorizer must be a function or null');
       call('sqlite.authorizer', this.#id, callback !== null);
       if (callback === null) authorizers.delete(this.#id); else authorizers.set(this.#id, callback);
@@ -124,7 +134,7 @@ globalThis.__appsSQLite = native => {
       resources?.register(this, { op: 'sqlite.releaseStatement', id: this.#id }, this);
     }
     #bind(args) {
-      if (this.#id === undefined || !this.#database.isOpen) throw new Error('Statement is closed or its database is not open');
+      if (this.#id === undefined || !this.#database.isOpen) throw fail(Error, 'ERR_INVALID_STATE', 'statement has been finalized');
       if (this.#cursor?.active) {
         this.#cursor.active = false;
         this.#cursor.invalidated = true;
@@ -139,14 +149,14 @@ globalThis.__appsSQLite = native => {
           const index = this.#names.get(name) ?? (this.#bare ? this.#bareNames.get(name) : undefined);
           if (index === undefined) {
             if (this.#unknown) continue;
-            throw new Error('Unknown named parameter: ' + name);
+            throw fail(Error, 'ERR_INVALID_STATE', `Unknown named parameter '${name}'`);
           }
-          bindings.push(index, ...encode(first[name]));
+          bindings.push(index, ...encode(first[name], index));
         }
       }
-      if (args.length > this.#anonymous.length) throw new RangeError('Too many SQLite parameters');
+      if (args.length > this.#anonymous.length) throw Object.assign(fail(Error, 'ERR_SQLITE_ERROR', 'column index out of range'), { errcode: 25, errstr: 'column index out of range' });
       for (let index = 0; index < args.length; index++) {
-        bindings.push(this.#anonymous[index], ...encode(args[index]));
+        bindings.push(this.#anonymous[index], ...encode(args[index], this.#anonymous[index]));
       }
       return bindings;
     }

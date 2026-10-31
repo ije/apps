@@ -11,7 +11,10 @@ use std::{
 };
 
 /// A connection with its prepared statements, kept by SQL text.
-struct Database(*mut sql::sqlite3, RefCell<HashMap<String, *mut sql::sqlite3_stmt>>);
+struct Database(
+    *mut sql::sqlite3,
+    RefCell<HashMap<String, *mut sql::sqlite3_stmt>>,
+);
 impl Drop for Database {
     fn drop(&mut self) {
         unsafe {
@@ -361,7 +364,11 @@ impl State {
                     .flatten()
                     .next()
                     .flatten();
-                if self.keys.as_ref().is_none_or(|(cached, _)| *cached != version) {
+                if self
+                    .keys
+                    .as_ref()
+                    .is_none_or(|(cached, _)| *cached != version)
+                {
                     let keys = db
                         .query("SELECT key FROM local ORDER BY rowid", &[])?
                         .into_iter()

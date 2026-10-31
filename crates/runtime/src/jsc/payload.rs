@@ -78,12 +78,14 @@ impl Payload {
                 *value = if let Some(offset) = offset {
                     json!({"$appsBytes": index + offset as u64})
                 } else {
-                    Value::String(STANDARD.encode(
-                        self.buffers
-                            .get(index as usize)
-                            .map(Bytes::as_ref)
-                            .unwrap_or_default(),
-                    ))
+                    Value::String(
+                        STANDARD.encode(
+                            self.buffers
+                                .get(index as usize)
+                                .map(Bytes::as_ref)
+                                .unwrap_or_default(),
+                        ),
+                    )
                 };
             } else {
                 match value {
@@ -110,13 +112,11 @@ fn own(bytes: &mut Bytes) -> Bytes {
 pub(crate) fn read(value: &Value) -> Option<Result<Bytes>> {
     let index = value.get("$appsBytes")?.as_u64()?;
     Some(FRAMES.with(|frames| {
-        Ok(own(
-            frames
-                .borrow_mut()
-                .last_mut()
-                .and_then(|frame| frame.get_mut(index as usize))
-                .context("Invalid binary argument")?,
-        ))
+        Ok(own(frames
+            .borrow_mut()
+            .last_mut()
+            .and_then(|frame| frame.get_mut(index as usize))
+            .context("Invalid binary argument")?))
     }))
 }
 

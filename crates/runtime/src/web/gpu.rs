@@ -12,7 +12,7 @@ use std::{
 
 const ABI: u32 = 1;
 
-type Alloc = extern "C" fn(*mut c_void, usize) -> *mut u8;
+pub(crate) type Alloc = extern "C" fn(*mut c_void, usize) -> *mut u8;
 
 #[repr(C)]
 struct Host {
@@ -45,34 +45,34 @@ extern "C" fn write(bytes: *const u8, length: usize) -> usize {
         .map_or(usize::MAX, |index| index as usize)
 }
 
-extern "C" fn waker() -> *mut c_void {
+pub(crate) extern "C" fn waker() -> *mut c_void {
     Box::into_raw(Box::new(crate::host::Waker::current())).cast()
 }
 
-extern "C" fn wake(waker: *mut c_void) {
+pub(crate) extern "C" fn wake(waker: *mut c_void) {
     unsafe { &*waker.cast::<crate::host::Waker>() }.wake();
 }
 
-extern "C" fn drop_waker(waker: *mut c_void) {
+pub(crate) extern "C" fn drop_waker(waker: *mut c_void) {
     drop(unsafe { Box::from_raw(waker.cast::<crate::host::Waker>()) });
 }
 
 /// Bytes that the library writes. `alloc` leaves them uninitialized, and `finish` trusts that the
 /// library wrote all of them.
 #[derive(Default)]
-struct Output {
+pub(crate) struct Output {
     bytes: Vec<u8>,
     length: usize,
 }
 
 impl Output {
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         unsafe { self.bytes.set_len(self.length) };
         self.bytes
     }
 }
 
-extern "C" fn alloc(output: *mut c_void, length: usize) -> *mut u8 {
+pub(crate) extern "C" fn alloc(output: *mut c_void, length: usize) -> *mut u8 {
     let output = unsafe { &mut *output.cast::<Output>() };
     output.bytes.clear();
     output.bytes.reserve_exact(length);
@@ -225,13 +225,12 @@ impl Gpu {
             }
             1 => Ok(self.images.get(&node).cloned()),
             2 => {
-                let pixels = image::RgbaImage::from_raw(size[0], size[1], output.finish())
-                    .context("Invalid canvas pixels")?;
-                let image = Arc::new(renderer::RenderImage::new(
-                    pixels.width(),
-                    pixels.height(),
-                    pixels.into_raw(),
-                ));
+                let pixels = output.finish();
+                ensure!(
+                    pixels.len() == size[0] as usize * size[1] as usize * 4,
+                    "Invalid canvas pixels"
+                );
+                let image = Arc::new(renderer::RenderImage::new(size[0], size[1], pixels));
                 self.images.insert(node, image.clone());
                 Ok(Some(image))
             }

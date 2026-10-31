@@ -43,6 +43,8 @@ fn native_desktop_dispatches_application_events() {
             "CoreGraphics",
             "-framework",
             "ServiceManagement",
+            "-framework",
+            "UniformTypeIdentifiers",
             "-o",
         ])
         .arg(&binary)
@@ -150,6 +152,68 @@ fn oversized_windows_open_and_report_their_size() {
         output.status.success() && stdout.contains("OVERSIZED_OK"),
         "{stdout}\n{stderr}"
     );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let capture = r#"
+        const { app, BrowserWindow } = __apps;
+        app.whenReady().then(async () => {
+            setTimeout(() => process.exit(3), 8000);
+            const win = new BrowserWindow({ width: 300, height: 200 });
+            await win.loadFile('apps:///index.html');
+            for (let i = 0; i < 4; i++) if ((await win.webContents.capturePage()).isEmpty()) throw Error('empty capture');
+            console.log('CAPTURE_OK'); app.quit();
+        });
+    "#;
+    let fatal = "__apps.app.whenReady().then(() => { new __apps.BrowserWindow(); setTimeout(() => { throw Error('FATAL_IN_TIMER'); }, 50); });";
+    for (main, success, marker) in [
+        (capture, true, "CAPTURE_OK"),
+        (fatal, false, "FATAL_IN_TIMER"),
+    ] {
+        let bundle = serde_json::json!({"files": [
+            ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+            ["index.html", "<body style='background:red'>x</body>"],
+        ], "pages": []});
+        let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+            .arg("--bundle-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(bundle.to_string().as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().unwrap();
+        let text =
+            String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() == success
+                && output.status.code().is_some()
+                && text.contains(marker),
+            "{:?} {text}",
+            output.status
+        );
+    }
 }
 
 #[test]

@@ -116,3 +116,50 @@ fn engine_launch() {
     times.sort_by(f64::total_cmp);
     println!("window_engines_median_ms={:.3}", times[4]);
 }
+
+#[cfg(unix)]
+#[test]
+fn process_exit_argv_and_non_utf8_environment() {
+    let code = r#"
+        process.on('exit', code => process.stdout.write(`exit ${code} ${JSON.stringify(process.argv.slice(1))} ${process.env.APPS_BAD}\n`));
+        process.env.APPS_NUMBER = 42; process.env.APPS_UNDEFINED = undefined;
+        process.stdout.write([process.env.APPS_NUMBER, process.env.APPS_UNDEFINED, 'APPS_UNDEFINED' in process.env].join() + '\n');
+        setTimeout(() => process.stdout.write('timer\n'), 0);
+        process.exitCode = 2;
+        process.exit(3);
+        process.stdout.write('after\n');
+    "#;
+    let definition = serde_json::json!({
+        "id":0,"code":code,"imports":[],"exports":[],"stars":[],"commonjs":false
+    });
+    let bundle = apps_runtime::bundle::Bundle {
+        files: bbtree::unsync::BBTreeMap::from([(
+            "app.js".into(),
+            format!("$appsDefine({definition});"),
+        )]),
+        ..Default::default()
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .args(["--bundle-stdin", "--", "/app/main.js", "a", "--b"])
+        .env(
+            "APPS_BAD",
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"\xff"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(child.stdin.take().unwrap(), &bundle).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "42,undefined,true\nexit 3 [\"/app/main.js\",\"a\",\"--b\"] \u{fffd}\n"
+    );
+}

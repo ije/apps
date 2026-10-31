@@ -28,7 +28,7 @@ globalThis.__appsWeb = call => {
     set cancelBubble(value) { if (value) this.stopPropagation(); }
     get returnValue() { return !this.defaultPrevented; }
     set returnValue(value) { if (!value) this.preventDefault(); }
-    get isTrusted() { return false; }
+    get isTrusted() { return !!eventStates.get(this).trusted; }
     initEvent(type, bubbles = false, cancelable = false) {
       const s = eventStates.get(this); if (s.dispatching) return;
       Object.assign(s, { type: String(type), bubbles: !!bubbles, cancelable: !!cancelable, defaultPrevented: false, target: null, stopped: false, immediate: false });
@@ -337,7 +337,7 @@ globalThis.__appsWeb = call => {
     return value instanceof File && filename === undefined ? value : new File([value], filename ?? 'blob', { type: value.type });
   };
   class FormData {
-    constructor() { forms.set(this, []); }
+    constructor(form, submitter = null) { forms.set(this, []); if (form !== undefined) { if (typeof HTMLFormElement !== 'function' || !(form instanceof HTMLFormElement)) throw new TypeError('Expected a form element'); for (const [name, value] of form._entries(submitter)) this.append(name, value); } }
     append(name, value, filename) { forms.get(this).push([usv(name), formValue(value, filename)]); }
     set(name, value, filename) { name = usv(name); value = formValue(value, filename); const list = forms.get(this), first = list.findIndex(pair => pair[0] === name); if (first < 0) list.push([name, value]); else { list[first] = [name, value]; forms.set(this, list.filter((pair, i) => pair[0] !== name || i === first)); } }
     delete(name) { name = usv(name); forms.set(this, forms.get(this).filter(pair => pair[0] !== name)); }

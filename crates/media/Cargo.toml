@@ -1,0 +1,15 @@
+[package]
+name = "apps-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The runtime loads the cdylib only for apps with the video or audio feature. The rlib lets tests build it.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cpal = "0.18"
+
+[build-dependencies]
+cc = "1"

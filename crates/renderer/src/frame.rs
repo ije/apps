@@ -55,12 +55,12 @@ pub struct Composite {
     pub shadow_color: [f32; 4],
     pub bounds: [f32; 4],
     pub clip: [f32; 4],
-    pub clip_radii: [f32; 4],
+    pub clip_radii: [f32; 8],
     pub mask_rect: [f32; 4],
     pub mask_tile: [f32; 4],
     pub content_mask: [f32; 4],
     pub rounded_mask: [f32; 4],
-    pub rounded_radii: [f32; 4],
+    pub rounded_radii: [f32; 8],
     pub shadow: [f32; 4],
     pub source_rect: [f32; 4],
     pub backdrop_rect: [f32; 4],
@@ -172,12 +172,17 @@ fn rect(bounds: Bounds<ScaledPixels>) -> [f32; 4] {
     ]
 }
 
-fn radii(radii: &crate::Corners<ScaledPixels>) -> [f32; 4] {
+fn radii(radii: &crate::Radii<ScaledPixels>) -> [f32; 8] {
+    let (x, y) = (&radii.x, &radii.y);
     [
-        radii.top_left.0,
-        radii.top_right.0,
-        radii.bottom_right.0,
-        radii.bottom_left.0,
+        x.top_left.0,
+        x.top_right.0,
+        x.bottom_right.0,
+        x.bottom_left.0,
+        y.top_left.0,
+        y.top_right.0,
+        y.bottom_right.0,
+        y.bottom_left.0,
     ]
 }
 
@@ -510,7 +515,7 @@ impl RenderFrame {
             shadow_color: [0.; 4],
             bounds: [0.; 4],
             clip: [0.; 4],
-            clip_radii: [0.; 4],
+            clip_radii: [0.; 8],
             mask_rect: [0.; 4],
             mask_tile: [0.; 4],
             content_mask: rect(mask),
@@ -695,6 +700,44 @@ impl RenderFrame {
         self.release(src);
         if let Some(backdrop) = backdrop {
             self.release(backdrop);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Blur, Composite, Globals};
+    use crate::scene::{MonochromeSprite, PolychromeSprite, Quad, Shadow, Underline};
+    use std::mem::size_of;
+
+    #[test]
+    fn shaders_match_instance_layouts() {
+        let module =
+            naga::front::wgsl::parse_str(include_str!("platform/linux/shaders.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        for (name, size) in [
+            ("Globals", size_of::<Globals>()),
+            ("Quad", size_of::<Quad>()),
+            ("Shadow", size_of::<Shadow>()),
+            ("Underline", size_of::<Underline>()),
+            ("MonochromeSprite", size_of::<MonochromeSprite>()),
+            ("PolychromeSprite", size_of::<PolychromeSprite>()),
+            ("Composite", size_of::<Composite>()),
+            ("Blur", size_of::<Blur>()),
+        ] {
+            let (handle, _) = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing struct {name}"));
+            assert_eq!(layouter[handle].size as usize, size, "{name}");
         }
     }
 }

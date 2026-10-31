@@ -3,7 +3,7 @@ use crate::{
     dom::Document,
     style::{self, Lengths, Style, components, parser},
 };
-use renderer::{BlendMode, Bounds, Corners, PaintEffect, Pixels, Rgba, point, px};
+use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, Rgba, point, px};
 
 /// A 4x4 column-major matrix.
 pub(crate) type Matrix = [f32; 16];
@@ -639,6 +639,68 @@ pub(crate) fn clip(
     }
 }
 
+pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]) -> Radii<Length> {
+    let mut radii = Radii::default();
+    for (prop, x, y) in [
+        (
+            Prop::BORDER_TOP_LEFT_RADIUS,
+            &mut radii.x.top_left,
+            &mut radii.y.top_left,
+        ),
+        (
+            Prop::BORDER_TOP_RIGHT_RADIUS,
+            &mut radii.x.top_right,
+            &mut radii.y.top_right,
+        ),
+        (
+            Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+            &mut radii.x.bottom_right,
+            &mut radii.y.bottom_right,
+        ),
+        (
+            Prop::BORDER_BOTTOM_LEFT_RADIUS,
+            &mut radii.x.bottom_left,
+            &mut radii.y.bottom_left,
+        ),
+    ] {
+        let Some(value) = style.get(prop) else {
+            continue;
+        };
+        let mut depth = 0;
+        let (first, second) = match value.find(|c: char| {
+            depth += i32::from(c == '(') - i32::from(c == ')');
+            c == ' ' && depth == 0
+        }) {
+            Some(at) => (&value[..at], Some(value[at..].trim())),
+            None => (value, None),
+        };
+        let length = |part: &str, axis: usize| match part
+            .strip_suffix('%')
+            .and_then(|percent| percent.parse::<f32>().ok())
+            .filter(|percent| percent.is_finite())
+        {
+            Some(percent) => Length::Fraction(percent.max(0.) / 100.),
+            None => units
+                .resolve(
+                    part,
+                    if part.contains('%') {
+                        basis()[axis]
+                    } else {
+                        0.
+                    },
+                )
+                .map_or(Length::Auto, |length| Length::Px(px(length.max(0.)))),
+        };
+        *x = length(first, 0);
+        *y = match second {
+            Some(second) => length(second, 1),
+            None if first.contains('%') => length(first, 1),
+            None => *x,
+        };
+    }
+    radii
+}
+
 /// The corner radii of a box as render corners.
 pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     Corners {
@@ -699,10 +761,32 @@ pub(crate) fn gradient_svg(
             .filter(|v| v.is_finite())
     };
     let parts = style::components(body, ',');
-    let first = parts.first().map_or("", |part| part.trim());
+    // `in <space> [<method> hue]` picks the interpolation space and is not part of the shape.
+    let words: Vec<&str> = parts
+        .first()
+        .map_or("", |part| part.trim())
+        .split_whitespace()
+        .collect();
+    let (first, space) = match words.iter().position(|word| *word == "in") {
+        Some(index) => {
+            let end = words
+                .iter()
+                .position(|word| *word == "hue")
+                .map_or(index + 2, |hue| hue + 1)
+                .min(words.len());
+            let rest = words[..index].iter().chain(&words[end..]);
+            (
+                rest.copied().collect::<Vec<_>>().join(" "),
+                Some(words[index + 1..end].join(" ")),
+            )
+        }
+        None => (words.join(" "), None),
+    };
+    let first = first.as_str();
     let repeating = kind.starts_with("repeating-");
-    let (mut prelude, mut direction, mut center, mut radii, mut from) =
-        (false, (0f32, 0f32), (tw / 2., th / 2.), (0f32, 0f32), 0f32);
+    let prelude;
+    let (mut direction, mut center, mut radii, mut from) =
+        ((0f32, 0f32), (tw / 2., th / 2.), (0f32, 0f32), 0f32);
     let extent = match kind.trim_start_matches("repeating-") {
         "linear-gradient" => {
             let degrees = if let Some(side) = first.strip_prefix("to ") {
@@ -723,15 +807,17 @@ pub(crate) fn gradient_svg(
                 prelude = true;
                 degrees
             } else {
+                prelude = space.is_some();
                 180.
             };
             direction = (degrees.to_radians().sin(), -degrees.to_radians().cos());
             tw * direction.0.abs() + th * direction.1.abs()
         }
         "radial-gradient" => {
-            prelude = ["circle", "ellipse", "at ", "side", "corner"]
-                .iter()
-                .any(|word| first.contains(word))
+            prelude = space.is_some()
+                || ["circle", "ellipse", "at ", "side", "corner"]
+                    .iter()
+                    .any(|word| first.contains(word))
                 || first.starts_with("at")
                 || !first.is_empty()
                     && style::color(first).is_none()
@@ -807,7 +893,7 @@ pub(crate) fn gradient_svg(
             radii.0.max(0.01)
         }
         "conic-gradient" => {
-            prelude = first.starts_with("from ") || first.starts_with("at ");
+            prelude = space.is_some() || first.starts_with("from ") || first.starts_with("at ");
             if prelude {
                 let (start, at) = first
                     .split_once("at ")
@@ -879,10 +965,44 @@ pub(crate) fn gradient_svg(
         }
         index += 1;
     }
-    let offsets: Vec<(f32, (u32, u8))> = stops
+    let mut offsets: Vec<(f32, (u32, u8))> = stops
         .into_iter()
         .map(|(offset, ink)| (offset.unwrap_or(0.), ink))
         .collect();
+    // SVG gradients mix in sRGB, so other spaces get extra stops. Without `in`, colors other
+    // than the legacy ones mix in Oklab.
+    let space = space
+        .filter(|space| !space.starts_with("srgb"))
+        .or_else(|| {
+            let modern = ["oklch(", "oklab(", "lab(", "lch(", "color("];
+            modern
+                .iter()
+                .any(|name| body.contains(name))
+                .then(|| "oklab".to_owned())
+        });
+    if let Some(space) = space {
+        let mut mixed = Vec::with_capacity(offsets.len() * 8);
+        for pair in offsets.windows(2) {
+            let [(a, (ink_a, alpha_a)), (b, (ink_b, alpha_b))] = [pair[0], pair[1]];
+            mixed.push(pair[0]);
+            if (ink_a, alpha_a) == (ink_b, alpha_b) || a == b {
+                continue;
+            }
+            for step in 1..8 {
+                let t = step as f32 / 8.;
+                let mix = format!(
+                    "color-mix(in {space}, #{ink_a:06x}{alpha_a:02x} {}%, #{ink_b:06x}{alpha_b:02x})",
+                    (1. - t) * 100.
+                );
+                if let Some(ink) = style::color(&mix) {
+                    mixed.push((a + (b - a) * t, ink));
+                }
+            }
+        }
+        mixed.extend(offsets.last().copied());
+        offsets = mixed;
+    }
+    let last = offsets.len() - 1;
     let start = if repeating && !kind.contains("radial") {
         offsets[0].0
     } else {

@@ -48,13 +48,15 @@ impl ShapedLine {
         window: &mut Window,
     ) {
         paint_line(
-            origin,
-            &self.layout,
-            line_height,
-            align,
-            align_width,
-            &self.decoration_runs,
-            &[],
+            LinePaint {
+                origin,
+                layout: &self.layout,
+                line_height,
+                align,
+                align_width,
+                decoration_runs: &self.decoration_runs,
+                wrap_boundaries: &[],
+            },
             window,
         )
     }
@@ -68,13 +70,15 @@ impl ShapedLine {
         window: &mut Window,
     ) {
         paint_line_background(
-            origin,
-            &self.layout,
-            line_height,
-            align,
-            align_width,
-            &self.decoration_runs,
-            &[],
+            LinePaint {
+                origin,
+                layout: &self.layout,
+                line_height,
+                align,
+                align_width,
+                decoration_runs: &self.decoration_runs,
+                wrap_boundaries: &[],
+            },
             window,
         )
     }
@@ -113,13 +117,15 @@ impl WrappedLine {
             .map(|bounds| bounds.size.width)
             .or(self.layout.wrap_width);
         paint_line(
-            origin,
-            &self.layout.unwrapped_layout,
-            line_height,
-            align,
-            align_width,
-            &self.decoration_runs,
-            &self.wrap_boundaries,
+            LinePaint {
+                origin,
+                layout: &self.layout.unwrapped_layout,
+                line_height,
+                align,
+                align_width,
+                decoration_runs: &self.decoration_runs,
+                wrap_boundaries: &self.wrap_boundaries,
+            },
             window,
         )
     }
@@ -136,28 +142,40 @@ impl WrappedLine {
             .map(|bounds| bounds.size.width)
             .or(self.layout.wrap_width);
         paint_line_background(
-            origin,
-            &self.layout.unwrapped_layout,
-            line_height,
-            align,
-            align_width,
-            &self.decoration_runs,
-            &self.wrap_boundaries,
+            LinePaint {
+                origin,
+                layout: &self.layout.unwrapped_layout,
+                line_height,
+                align,
+                align_width,
+                decoration_runs: &self.decoration_runs,
+                wrap_boundaries: &self.wrap_boundaries,
+            },
             window,
         )
     }
 }
 
-fn paint_line(
+struct LinePaint<'a> {
     origin: Point<Pixels>,
-    layout: &LineLayout,
+    layout: &'a LineLayout,
     line_height: Pixels,
     align: TextAlign,
     align_width: Option<Pixels>,
-    decoration_runs: &[DecorationRun],
-    wrap_boundaries: &[WrapBoundary],
-    window: &mut Window,
-) {
+    decoration_runs: &'a [DecorationRun],
+    wrap_boundaries: &'a [WrapBoundary],
+}
+
+fn paint_line(line: LinePaint, window: &mut Window) {
+    let LinePaint {
+        origin,
+        layout,
+        line_height,
+        align,
+        align_width,
+        decoration_runs,
+        wrap_boundaries,
+    } = line;
     let paint_underline =
         |_: Range<usize>, origin, width, style: &UnderlineStyle, window: &mut Window| {
             window.paint_underline(origin, width, style)
@@ -424,16 +442,16 @@ fn paint_line(
     })
 }
 
-fn paint_line_background(
-    origin: Point<Pixels>,
-    layout: &LineLayout,
-    line_height: Pixels,
-    align: TextAlign,
-    align_width: Option<Pixels>,
-    decoration_runs: &[DecorationRun],
-    wrap_boundaries: &[WrapBoundary],
-    window: &mut Window,
-) {
+fn paint_line_background(line: LinePaint, window: &mut Window) {
+    let LinePaint {
+        origin,
+        layout,
+        line_height,
+        align,
+        align_width,
+        decoration_runs,
+        wrap_boundaries,
+    } = line;
     let line_bounds = line_paint_bounds(
         origin,
         layout,

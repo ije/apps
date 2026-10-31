@@ -10,8 +10,8 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use renderer::{
-    App, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, point, px,
+    App, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PlatformInput, ScrollDelta, ScrollWheelEvent, point, px,
 };
 use serde_json::{Value, json};
 use std::{
@@ -601,12 +601,7 @@ fn request(ctx: usize, method: &str, params: Value) -> Result<Value> {
 }
 
 /// Sends a request whose answer may come later, after promises settle.
-fn request_later(
-    ctx: usize,
-    method: &str,
-    params: Value,
-    done: Waiter,
-) -> Result<()> {
+fn request_later(ctx: usize, method: &str, params: Value, done: Waiter) -> Result<()> {
     let id = send(ctx, method, params)?;
     STATE.with_borrow_mut(|state| state.waiting.insert(id, done));
     pump();

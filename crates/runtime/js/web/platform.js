@@ -4,7 +4,69 @@ globalThis.__appsPlatform = call => {
   const native = globalThis.__appsNow;
   delete globalThis.__appsNow;
   const clock = call('web.platform.time'), base = native() - clock.now;
-  globalThis.performance = Object.freeze({ timeOrigin: clock.origin, now: () => native() - base, toJSON() { return { timeOrigin: this.timeOrigin }; } });
+  const timeline = [], observers = new Map(), illegal = Symbol(), types = ['mark', 'measure'];
+  class PerformanceEntry {
+    #name; #type; #start; #duration;
+    constructor(name, type, start, duration) { if (new.target === PerformanceEntry) throw new TypeError('Illegal constructor'); this.#name = String(name); this.#type = type; this.#start = start; this.#duration = duration; }
+    get name() { return this.#name; }
+    get entryType() { return this.#type; }
+    get startTime() { return this.#start; }
+    get duration() { return this.#duration; }
+    toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration, detail: this.detail }; }
+  }
+  class PerformanceMark extends PerformanceEntry {
+    #detail;
+    constructor(name, { startTime = performance.now(), detail = null } = {}) { if (!(startTime >= 0)) throw new TypeError(`${startTime} is not a valid startTime`); super(name, 'mark', +startTime, 0); this.#detail = detail; }
+    get detail() { return this.#detail; }
+  }
+  class PerformanceMeasure extends PerformanceEntry {
+    #detail;
+    constructor(token, name, start, duration, detail) { if (token !== illegal) throw new TypeError('Illegal constructor'); super(name, 'measure', start, duration); this.#detail = detail; }
+    get detail() { return this.#detail; }
+  }
+  const select = (list, name, type) => list.filter(entry => (name === undefined || entry.name === String(name)) && (type === undefined || entry.entryType === type));
+  class PerformanceObserverEntryList {
+    #entries;
+    constructor(token, entries) { if (token !== illegal) throw new TypeError('Illegal constructor'); this.#entries = entries; }
+    getEntries() { return [...this.#entries]; }
+    getEntriesByName(name, type) { return select(this.#entries, name, type); }
+    getEntriesByType(type) { return select(this.#entries, undefined, type); }
+  }
+  class PerformanceObserver {
+    #callback; #types = new Set(); #queue = []; #timer = null;
+    static get supportedEntryTypes() { return [...types]; }
+    constructor(callback) { if (typeof callback !== 'function') throw Object.assign(new TypeError('The "callback" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' }); this.#callback = callback; }
+    observe({ entryTypes, type, buffered = false } = {}) {
+      for (const name of entryTypes ?? [type]) if (types.includes(name)) this.#types.add(name);
+      observers.set(this, entry => { if (!this.#types.has(entry.entryType)) return; this.#queue.push(entry); this.#timer ??= setTimeout(() => { this.#timer = null; const list = this.takeRecords(); if (list.length) this.#callback(new PerformanceObserverEntryList(illegal, list), this); }, 0); });
+      if (buffered && type) for (const entry of select(timeline, undefined, type)) observers.get(this)(entry);
+    }
+    disconnect() { observers.delete(this); this.#types.clear(); this.#queue = []; }
+    takeRecords() { const list = this.#queue; this.#queue = []; return list; }
+  }
+  const record = entry => { timeline.push(entry); for (const notify of observers.values()) notify(entry); return entry; };
+  const at = value => {
+    if (typeof value === 'number') return value;
+    const mark = timeline.findLast(entry => entry.entryType === 'mark' && entry.name === String(value));
+    if (!mark) throw new DOMException(`The "${value}" performance mark has not been set`, 'SyntaxError');
+    return mark.startTime;
+  };
+  const clear = (type, name) => { for (let i = timeline.length - 1; i >= 0; i--) if (timeline[i].entryType === type && (name === undefined || timeline[i].name === String(name))) timeline.splice(i, 1); };
+  globalThis.performance = Object.freeze({ timeOrigin: clock.origin, now: () => native() - base, toJSON() { return { timeOrigin: this.timeOrigin }; },
+    mark: (name, options) => record(new PerformanceMark(name, options)),
+    measure(name, start, end) {
+      let duration, detail = null;
+      if (start !== null && typeof start === 'object') ({ start, end, duration, detail = null } = start);
+      const to = end !== undefined ? at(end) : start !== undefined && duration !== undefined ? at(start) + duration : performance.now();
+      const from = start !== undefined ? at(start) : duration !== undefined ? to - duration : 0;
+      return record(new PerformanceMeasure(illegal, name, from, to - from, detail));
+    },
+    clearMarks: name => clear('mark', name), clearMeasures: name => clear('measure', name),
+    getEntries: () => [...timeline].sort((a, b) => a.startTime - b.startTime),
+    getEntriesByName: (name, type) => select(timeline, name, type).sort((a, b) => a.startTime - b.startTime),
+    getEntriesByType: type => select(timeline, undefined, type).sort((a, b) => a.startTime - b.startTime),
+  });
+  Object.assign(globalThis, { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
   globalThis.scheduler = Object.freeze({
     wait(delay, options = {}) {
       return new Promise((resolve, reject) => {

@@ -12,7 +12,7 @@ pub(super) fn css_background(
     units: style::Lengths,
     id: usize,
     slot: usize,
-    radius: [f32; 4],
+    radius: renderer::Radii<renderer::Length>,
     view: Rc<super::ViewData>,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
@@ -33,12 +33,6 @@ pub(super) fn css_background(
             .get(index % values.len().max(1))
             .cloned()
             .unwrap_or_default()
-    };
-    let corners = renderer::Corners {
-        top_left: px(radius[0]),
-        top_right: px(radius[1]),
-        bottom_right: px(radius[2]),
-        bottom_left: px(radius[3]),
     };
     let mut layers = Vec::new();
     let mut indexes = Vec::new();
@@ -112,29 +106,18 @@ pub(super) fn css_background(
                                             != raster
                             }) {
                                 let bitmap = decoded(backgrounds).unwrap_or_else(|| {
-                                    let pixels = (|| -> anyhow::Result<_> {
-                                        anyhow::ensure!(
-                                            std::fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
-                                            "Image is too large"
-                                        );
-                                        let mut limits = ::image::Limits::default();
-                                        limits.max_image_width = Some(16384);
-                                        limits.max_image_height = Some(16384);
-                                        limits.max_alloc = Some(256 * 1024 * 1024);
-                                        let bytes = std::fs::read(&path)?;
-                                        let mut pixels =
-                                            super::image::decode(&bytes, limits)?.into_rgba8();
-                                        for pixel in pixels.pixels_mut() {
-                                            pixel.0.swap(0, 2);
-                                        }
-                                        Ok(pixels)
-                                    })()
-                                    .unwrap_or_default();
-                                    let image = Arc::new(renderer::RenderImage::new(
-                                        pixels.width(),
-                                        pixels.height(),
-                                        pixels.into_raw(),
-                                    ));
+                                    let image = Arc::new(
+                                        (|| -> anyhow::Result<_> {
+                                            anyhow::ensure!(
+                                                std::fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
+                                                "Image is too large"
+                                            );
+                                            super::image::decode(&std::fs::read(&path)?)
+                                        })()
+                                        .unwrap_or_else(|_| {
+                                            renderer::RenderImage::new(0, 0, Vec::new())
+                                        }),
+                                    );
                                     backgrounds.insert(shared, (file.clone(), image.clone()));
                                     image
                                 });
@@ -263,7 +246,13 @@ pub(super) fn css_background(
                         window.drop_image(old);
                     }
                     if let Some((_, image)) = backgrounds.get(&key) {
-                        window.paint_image(bounds, bounds, corners, image.clone(), false);
+                        window.paint_image(
+                            bounds,
+                            bounds,
+                            radius.resolve(bounds.size),
+                            image.clone(),
+                            false,
+                        );
                     }
                 },
             )
@@ -285,16 +274,12 @@ pub(super) fn css_background(
     // Blended layers mix with the layers and color below them, inside an isolated group.
     let mut group = div().absolute().top_0().left_0().size_full();
     if let Some((ink, alpha)) = style.get(Prop::BACKGROUND_COLOR).and_then(style::color) {
-        group = group.child(
-            div()
-                .absolute()
-                .size_full()
-                .rounded_tl(px(radius[0]))
-                .rounded_tr(px(radius[1]))
-                .rounded_br(px(radius[2]))
-                .rounded_bl(px(radius[3]))
-                .bg(rgba(ink << 8 | alpha as u32)),
-        );
+        let mut color = div()
+            .absolute()
+            .size_full()
+            .bg(rgba(ink << 8 | alpha as u32));
+        color.style().corner_radii = radius;
+        group = group.child(color);
     }
     for (layer, index) in layers.into_iter().zip(indexes) {
         let blend_mode = super::effects::blend_mode(&pick(&modes, index));

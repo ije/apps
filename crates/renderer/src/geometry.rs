@@ -672,11 +672,6 @@ impl Corners<Pixels> {
     pub fn scale(&self, factor: f32) -> Corners<ScaledPixels> {
         self.map(|value| value.scale(factor))
     }
-    /// Shrinks the radii so that adjacent corners fit the quad, like CSS.
-    pub fn clamp_radii_for_quad_size(self, size: Size<Pixels>) -> Self {
-        let max = size.width.min(size.height) / 2.;
-        self.map(|radius| radius.min(max).max(Pixels::ZERO))
-    }
 }
 
 impl<T: Copy + PartialEq + Default> Corners<T> {
@@ -697,6 +692,85 @@ impl From<Pixels> for Corners<Pixels> {
         Self::all(value)
     }
 }
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct Radii<T> {
+    pub x: Corners<T>,
+    pub y: Corners<T>,
+}
+
+impl<T: Copy> From<Corners<T>> for Radii<T> {
+    fn from(x: Corners<T>) -> Self {
+        Self { x, y: x }
+    }
+}
+
+impl From<Pixels> for Radii<Pixels> {
+    fn from(value: Pixels) -> Self {
+        Corners::all(value).into()
+    }
+}
+
+impl<T: Copy + PartialEq + Default> Radii<T> {
+    pub fn is_zero(&self) -> bool {
+        self.x.is_zero() && self.y.is_zero()
+    }
+}
+
+impl Radii<Pixels> {
+    pub fn scale(&self, factor: f32) -> Radii<ScaledPixels> {
+        Radii {
+            x: self.x.scale(factor),
+            y: self.y.scale(factor),
+        }
+    }
+    /// Squares corners with a zero radius and scales all radii down until adjacent corners fit
+    /// the box, like CSS.
+    pub fn clamp_radii_for_quad_size(self, size: Size<Pixels>) -> Self {
+        let (mut x, mut y) = (self.x, self.y);
+        for (x, y) in [
+            (&mut x.top_left, &mut y.top_left),
+            (&mut x.top_right, &mut y.top_right),
+            (&mut x.bottom_right, &mut y.bottom_right),
+            (&mut x.bottom_left, &mut y.bottom_left),
+        ] {
+            if *x <= Pixels::ZERO || *y <= Pixels::ZERO {
+                (*x, *y) = (Pixels::ZERO, Pixels::ZERO);
+            }
+        }
+        let fit = |side: Pixels, a: Pixels, b: Pixels| {
+            let sum = a + b;
+            if sum > side { side / sum } else { 1. }
+        };
+        let factor = fit(size.width, x.top_left, x.top_right)
+            .min(fit(size.width, x.bottom_left, x.bottom_right))
+            .min(fit(size.height, y.top_left, y.bottom_left))
+            .min(fit(size.height, y.top_right, y.bottom_right))
+            .max(0.);
+        if factor < 1. {
+            (x, y) = (x.map(|r| r * factor), y.map(|r| r * factor));
+        }
+        Self { x, y }
+    }
+    pub fn inset(self, top: Pixels, right: Pixels, bottom: Pixels, left: Pixels) -> Self {
+        let shrink = |radius: Pixels, by: Pixels| (radius - by).max(Pixels::ZERO);
+        Self {
+            x: Corners {
+                top_left: shrink(self.x.top_left, left),
+                top_right: shrink(self.x.top_right, right),
+                bottom_right: shrink(self.x.bottom_right, right),
+                bottom_left: shrink(self.x.bottom_left, left),
+            },
+            y: Corners {
+                top_left: shrink(self.y.top_left, top),
+                top_right: shrink(self.y.top_right, top),
+                bottom_right: shrink(self.y.bottom_right, bottom),
+                bottom_left: shrink(self.y.bottom_left, bottom),
+            },
+        }
+    }
+}
 impl From<Pixels> for Edges<Pixels> {
     fn from(value: Pixels) -> Self {
         Self::all(value)
@@ -709,15 +783,15 @@ impl From<Pixels> for Edges<Pixels> {
 pub struct ContentMask<P> {
     pub bounds: Bounds<P>,
     pub rounded: Bounds<P>,
-    pub corner_radii: Corners<P>,
+    pub corner_radii: Radii<P>,
 }
 
 impl ContentMask<Pixels> {
-    pub fn rounded(bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) -> Self {
+    pub fn rounded(bounds: Bounds<Pixels>, corner_radii: impl Into<Radii<Pixels>>) -> Self {
         Self {
             bounds,
             rounded: bounds,
-            corner_radii: corner_radii.clamp_radii_for_quad_size(bounds.size),
+            corner_radii: corner_radii.into().clamp_radii_for_quad_size(bounds.size),
         }
     }
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
@@ -747,7 +821,7 @@ impl<P: Default> From<Bounds<P>> for ContentMask<P> {
         Self {
             bounds,
             rounded: Bounds::default(),
-            corner_radii: Corners::default(),
+            corner_radii: Radii::default(),
         }
     }
 }
@@ -759,6 +833,12 @@ pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
 
 pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
+}
+
+/// Truncates to 1/64 of a device pixel, like Chrome's `LayoutUnit`. The tiny bias keeps a size
+/// that is already in layout units from losing one to float error.
+pub fn to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
+    (logical * scale_factor * 64. * (1. + 1e-6)).trunc() / 64.
 }
 
 pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {

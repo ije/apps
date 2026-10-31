@@ -39,13 +39,15 @@ tempfile = "3"
 url.workspace = true
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
-# Puts the WebGPU library next to test executables.
+# Puts the WebGPU and media libraries next to test executables.
 [dev-dependencies]
+apps-media = { path = "crates/media" }
 apps-webgpu = { path = "crates/webgpu" }
 oxc_sourcemap = "=9.0.0"
 
 [build-dependencies]
 cc = "1"
+miniz_oxide = "0.8"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -133,7 +135,7 @@ calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee
 khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
@@ -141,7 +143,7 @@ panic = "abort"
 [profile.release.package.apps-runtime]
 opt-level = 2
 
-# WARNING: these crates build for size to keep the runtime under 15 MB. None of them runs per frame.
+# WARNING: these crates build for size to keep the runtime under 10 MB. None of them runs per frame.
 
 [profile.release.package.apps-webview]
 opt-level = "s"
@@ -180,6 +182,12 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.tungstenite]
+opt-level = "s"
+
+[profile.release.package.rav1d]
+opt-level = "s"
+
+[profile.release.package.rustybuzz]
 opt-level = "s"
 
 # avif-parse asserts on truncated input before returning its decoding error.

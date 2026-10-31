@@ -198,6 +198,7 @@ impl TextSystem {
                     ),
                 ),
                 average_width,
+                tall_ascent: false,
             }
         }
     }

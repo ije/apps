@@ -40,30 +40,57 @@ impl Transport for tokio::net::UnixStream {
     }
 }
 
+type Failure = (std::io::Error, &'static str, Value);
+
+fn failure((error, syscall, mut details): Failure) -> Value {
+    let (code, errno) = if syscall == "getaddrinfo" {
+        ("ENOTFOUND", Some(-3008))
+    } else {
+        (
+            crate::node::code(&error),
+            error.raw_os_error().map(|code| -code.abs()),
+        )
+    };
+    let mut text = error.to_string();
+    text.truncate(text.find(" (os error").unwrap_or(text.len()));
+    if let Some(first) = text.get_mut(..1) {
+        first.make_ascii_lowercase();
+    }
+    details["kind"] = "error".into();
+    details["code"] = code.into();
+    details["errno"] = errno.into();
+    details["syscall"] = syscall.into();
+    details["description"] = text.into();
+    details
+}
+
 async fn run<T: Transport>(
     stream: T,
     mut commands: mpsc::UnboundedReceiver<Command>,
     output: mpsc::Sender<Payload>,
     wake: &crate::host::Waker,
-) -> Result<()> {
+) -> Result<(), Failure> {
     let events = async |event: Payload| {
-        output.send(event).await?;
+        let sent = output.send(event).await.is_ok();
         wake.wake();
-        Ok::<_, anyhow::Error>(())
+        sent
     };
-    events(json!({"kind":"connect","address":stream.address()}).into()).await?;
+    let io = |syscall| move |error| (error, syscall, json!({}));
+    if !events(json!({"kind":"connect","address":stream.address()}).into()).await {
+        return Ok(());
+    }
     let mut paused = false;
     let mut reading = true;
     let mut ended = false;
     let mut bytes = [0; 16384];
-    let control = stream.control()?;
+    let control = stream.control().map_err(io("connect"))?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     loop {
         tokio::select! {
             command = commands.recv() => {
                 match command {
-                    Some(Command::Write(data)) => { writer.write_all(&data).await?; events(json!({"kind":"written","bytes":data.len()}).into()).await?; }
-                    Some(Command::End) => { writer.shutdown().await?; ended=true; events(json!({"kind":"finish"}).into()).await?; if !reading {break;} }
+                    Some(Command::Write(data)) => { writer.write_all(&data).await.map_err(io("write"))?; if !events(json!({"kind":"written","bytes":data.len()}).into()).await { break; } }
+                    Some(Command::End) => { writer.shutdown().await.map_err(io("shutdown"))?; ended=true; if !events(json!({"kind":"finish"}).into()).await || !reading { break; } }
                     Some(Command::Pause(value)) => paused=value,
                     Some(Command::NoDelay(value)) => { let _ = control.set_tcp_nodelay(value); }
                     Some(Command::KeepAlive(value, delay)) => {
@@ -74,9 +101,9 @@ async fn run<T: Transport>(
                 }
             }
             result = reader.read(&mut bytes), if !paused && reading => {
-                let size = result?;
-                if size == 0 { reading=false; events(json!({"kind":"end"}).into()).await?; if ended {break;} }
-                else { events(Payload::with_bytes(json!({"kind":"data"}), "bytes", bytes[..size].to_vec())).await?; }
+                let size = result.map_err(io("read"))?;
+                if size == 0 { reading=false; if !events(json!({"kind":"end"}).into()).await || ended { break; } }
+                else if !events(Payload::with_bytes(json!({"kind":"data"}), "bytes", bytes[..size].to_vec())).await { break; }
             }
         }
     }
@@ -117,7 +144,7 @@ pub(crate) struct State {
 impl State {
     fn start(
         &mut self,
-        future: impl std::future::Future<Output = Result<Accepted>> + Send + 'static,
+        future: impl std::future::Future<Output = Result<Accepted, Failure>> + Send + 'static,
     ) -> Result<u64> {
         let (commands, incoming) = mpsc::unbounded_channel();
         let (output, events) = mpsc::channel(64);
@@ -131,13 +158,12 @@ impl State {
                 }
             }
             .await;
-            if let Err(error) = &result {
-                let _ = output
-                    .send(json!({"kind":"error","message":format!("{error:#}")}).into())
-                    .await;
+            let failed = result.is_err();
+            if let Err(error) = result {
+                let _ = output.send(failure(error).into()).await;
             }
             let _ = output
-                .send(json!({"kind":"close","hadError":result.is_err()}).into())
+                .send(json!({"kind":"close","hadError":failed}).into())
                 .await;
             wake.wake();
         });
@@ -154,31 +180,65 @@ impl State {
     }
     pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         match op {
-            "ip" => Ok(json!(
-                args[0]
-                    .as_str()
-                    .and_then(|value| value.parse::<std::net::IpAddr>().ok())
-                    .map_or(0, |ip| if ip.is_ipv4() { 4 } else { 6 })
-            )),
+            "ip" => Ok(json!(args[0].as_str().map_or(0, |value| {
+                match value.split_once('%') {
+                    Some((ip, zone)) => {
+                        if !zone.is_empty() && ip.parse::<std::net::Ipv6Addr>().is_ok() {
+                            6
+                        } else {
+                            0
+                        }
+                    }
+                    None => value
+                        .parse::<std::net::IpAddr>()
+                        .map_or(0, |ip| if ip.is_ipv4() { 4 } else { 6 }),
+                }
+            }))),
             "connect" => {
                 let options = args[0].clone();
                 let id = self.start(async move {
                     if let Some(path) = options["path"].as_str() {
                         #[cfg(unix)]
-                        {
-                            return Ok(Accepted::Unix(
-                                tokio::net::UnixStream::connect(path).await?,
-                            ));
-                        }
+                        return tokio::net::UnixStream::connect(path)
+                            .await
+                            .map(Accepted::Unix)
+                            .map_err(|error| (error, "connect", json!({"address":path})));
                         #[cfg(not(unix))]
-                        {
-                            let _ = path;
-                            bail!("Unix sockets are unavailable");
+                        return Err((
+                            std::io::Error::from(std::io::ErrorKind::Unsupported),
+                            "connect",
+                            json!({"address":path}),
+                        ));
+                    }
+                    let host = options["host"].as_str().unwrap_or("localhost");
+                    let port = options["port"]
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok())
+                        .unwrap_or(0);
+                    let lookup = || {
+                        (
+                            std::io::Error::from(std::io::ErrorKind::NotFound),
+                            "getaddrinfo",
+                            json!({"hostname":host}),
+                        )
+                    };
+                    let mut last = lookup();
+                    for address in tokio::net::lookup_host((host, port))
+                        .await
+                        .map_err(|_| lookup())?
+                    {
+                        match TcpStream::connect(address).await {
+                            Ok(stream) => return Ok(Accepted::Tcp(stream)),
+                            Err(error) => {
+                                last = (
+                                    error,
+                                    "connect",
+                                    json!({"address":address.ip().to_string(),"port":port}),
+                                )
+                            }
                         }
                     }
-                    let host = options["host"].as_str().unwrap_or("127.0.0.1");
-                    let port = u16::try_from(options["port"].as_u64().context("Expected port")?)?;
-                    Ok(Accepted::Tcp(TcpStream::connect((host, port)).await?))
+                    Err(last)
                 })?;
                 Ok(json!(id))
             }
@@ -191,7 +251,14 @@ impl State {
                 let (address, task) = if let Some(path) = options["path"].as_str() {
                     #[cfg(unix)]
                     {
-                        let listener = tokio::net::UnixListener::bind(path)?;
+                        let listener = match tokio::net::UnixListener::bind(path) {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                return Ok(
+                                    json!({"error":failure((error, "listen", json!({"address":path})))}),
+                                );
+                            }
+                        };
                         let path = path.to_owned();
                         (
                             json!({"path":path}),
@@ -220,12 +287,19 @@ impl State {
                 } else {
                     let host = options["host"].as_str().unwrap_or("0.0.0.0");
                     let port = u16::try_from(options["port"].as_u64().unwrap_or(0))?;
-                    let listener = std::net::TcpListener::bind((host, port))?;
+                    let listener = match std::net::TcpListener::bind((host, port)) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            return Ok(
+                                json!({"error":failure((error, "listen", json!({"address":host,"port":port})))}),
+                            );
+                        }
+                    };
                     let address = listener.local_addr()?;
                     listener.set_nonblocking(true)?;
                     let listener = tokio::net::TcpListener::from_std(listener)?;
                     (
-                        json!({"address":address.ip().to_string(),"port":address.port(),"family":if address.is_ipv4(){"IPv4"}else{"IPv6"}}),
+                        json!({"address":address.ip().to_string(),"family":if address.is_ipv4(){"IPv4"}else{"IPv6"},"port":address.port()}),
                         runtime.spawn(async move {
                             loop {
                                 match listener.accept().await {
@@ -285,8 +359,15 @@ impl State {
                     }
                 }
                 for (server, stream) in accepted {
+                    let address = match &stream {
+                        Accepted::Tcp(stream) => stream.address(),
+                        #[cfg(unix)]
+                        Accepted::Unix(stream) => stream.address(),
+                    };
                     let socket = self.start(async { Ok(stream) })?;
-                    events.push(json!({"server":server,"id":socket,"kind":"connection"}));
+                    events.push(
+                        json!({"server":server,"id":socket,"kind":"connection","address":address}),
+                    );
                 }
                 self.connections.retain(|id, socket| {
                     for _ in 0..64 {

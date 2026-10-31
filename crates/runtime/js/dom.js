@@ -6,6 +6,8 @@
   const records = [], texts = [], orphans = [];
   // WARNING: `changed` marks writes that can detach or create nodes since the last `dom.release`, so idle sweeps skip it.
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
+  // WARNING: `stale` marks writes since the last layout, so the next geometry read lays the page out first, like a browser's forced reflow.
+  let stale = false, version = 0;
   const flush = () => {
     if (!size) return;
     let errors;
@@ -15,18 +17,29 @@
   const drain = () => { scheduled = false; flush(); };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
-    changed = true; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(b), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(c), c.length) : c; size += 4;
+    changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(b), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(c), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') changed = true; return host(name, ...args); };
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') changed = true; if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0; geometry[0] = 1;
   const layout = () => {
+    if (stale) { stale = false; call('dom.reflow'); }
     if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
     return geometry;
   };
-  const metric = (node, k) => { const m = layout(), i = 4 + node._id * 8 + k; return i < limit ? m[i] : 0; };
+  // WARNING: removed and display:none nodes keep their last mirror values, but have no box.
+  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._linked !== version) { if (!node.isConnected) return -1; node._linked = version; } return i; };
+  const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
+  // WARNING: client boxes are cached until the page writes or Rust counts a new layout in the mirror header.
+  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
+  const offset = (node, axis) => {
+    if (slot(node) < 0 || node === document.body) return 0;
+    const start = node.getBoundingClientRect()[axis ? 'top' : 'left'], parent = node.offsetParent;
+    if (!parent || parent.localName === 'body' && !(marks[parent._id] & 8)) return Math.round(start + metric(document, 4 + axis));
+    return Math.round(start - parent.getBoundingClientRect()[axis ? 'top' : 'left'] - client(parent)[axis]);
+  };
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
   const pageScroller = node => { layout(); return rootElement(node) && !(marks[node._id] & 2); };
   const create = (tag, text = '') => {
@@ -53,7 +66,7 @@
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
   const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
-  let active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null;
+  let readyState = 'loading', active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
   const selectionPending = new Set();
   const selectionChanged = (target = document) => {
     if (selectionPending.has(target)) return;
@@ -70,7 +83,7 @@
   };
   const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
   const change = record => {
-    if (!observers.size) return;
+    if (!observers.size || quiet) return;
     for (const observer of observers) for (const [target, options] of observer.targets) {
       if (target !== record.target && !(options.subtree && target.contains(record.target))) continue;
       if (!options[record.type] || (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName))) continue;
@@ -103,44 +116,121 @@
         try { if (typeof item.fn === 'function') item.fn.call(node, event); else item.fn.handleEvent(event); } catch (error) { console.error(error); }
         state.passive = false;
       }
-      if (!capture && !state.immediate && typeof node['on' + event.type] === 'function') try { node['on' + event.type](event); } catch (error) { console.error(error); }
     };
     try {
       for (let index = ancestors.length; index-- && !state.stopped;) invoke(index, true);
       for (let index = 0; index < ancestors.length && !state.stopped; index++) if (event.bubbles || (targets?.[index] ?? target) === ancestors[index]) invoke(index, false);
-    } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
+    } finally { Object.assign(state, { target: shadow && target.getRootNode() instanceof ShadowRoot ? null : target, currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
     return !event.defaultPrevented;
   };
-  const activate = target => {
-    const label = path(target).find(node => node.localName === 'label');
-    const control = target.localName === 'input' ? target : label && (label.getAttribute('for') ? document.getElementById(label.getAttribute('for')) : label.querySelector('input'));
-    const kind = control?.localName === 'input' ? control.type : '';
-    if ((kind === 'checkbox' || kind === 'radio') && !control.disabled && !(kind === 'radio' && control.checked)) {
-      if (kind === 'radio' && control.getAttribute('name')) for (const other of control.getRootNode().querySelectorAll('input[type=radio]')) if (other.getAttribute('name') === control.getAttribute('name')) other.checked = false;
-      control.checked = kind === 'radio' || !control.checked;
-      dispatch(control, new Event('input', { bubbles: true, composed: true }));
-      dispatch(control, new Event('change', { bubbles: true }));
+  const trusted = event => { eventState(event).trusted = true; return event; };
+  const labelable = rec => /^(button|meter|output|progress|select|textarea)$/.test(rec.tag) || rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() !== 'hidden';
+  const labelControl = label => { const id = label.getAttribute('for'), control = id === null ? find(label._m, labelable) : id && label.getRootNode().getElementById?.(id); return control && labelable(control._m) ? control : null; };
+  const disabled = node => {
+    if (!/^(button|input|select|textarea|optgroup|option|fieldset)$/.test(node.localName)) return false;
+    for (let rec = node._m, child = null; rec && rec.tag[0] !== '#'; child = rec, rec = rec.up) if (rec.attrs.has('disabled') && (rec === node._m || rec.tag === 'fieldset' && rec.kids.find(kid => kid.tag === 'legend') !== child || rec.tag === 'optgroup' && node.localName === 'option')) return true;
+    return false;
+  };
+  const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
+  const group = radio => { const name = radio.name, form = radio.form; return name ? [...radio.getRootNode().querySelectorAll('input')].filter(other => other.type === 'radio' && other.name === name && other.form === form) : [radio]; };
+  const focusable = node => {
+    if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
+    layout();
+    if (marks[node._id] & 16) return false;
+    const rec = node._m, tag = rec.tag;
+    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
+  };
+  const commit = node => { if (node._edited) { node._edited = false; dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
+  const selectors = (name, id, selector, first) => { try { return call(name, id, String(selector), first); } catch (error) { if (/^SyntaxError/.test(error?.message)) throw new DOMException(error.message.replace(/^SyntaxError: /, ''), 'SyntaxError'); throw error; } };
+  const toggles = new Map();
+  const attributeChanged = (element, name, oldValue, value) => {
+    if (shadows && name === 'slot') { signal(element.parentNode, element, oldValue ?? ''); signal(element.parentNode, element); }
+    else if (shadows && name === 'name' && element.localName === 'slot') { const root = element.getRootNode(); if (root instanceof ShadowRoot && (slotted(root.host, oldValue ?? '') || slotted(root.host, value ?? ''))) queueSlot(element); }
+    else if (name === 'open' && element.localName === 'details' && (oldValue === null) !== (value === null)) {
+      const pending = toggles.get(element), newState = value === null ? 'closed' : 'open';
+      if (pending) pending.newState = newState;
+      else { toggles.set(element, { oldState: value === null ? 'open' : 'closed', newState }); setTimeout(() => { const state = toggles.get(element); toggles.delete(element); if (state.oldState !== state.newState) dispatch(element, new ToggleEvent('toggle', state)); }, 0); }
     }
   };
+  // WARNING: a click toggles checkboxes and radios before its listeners run and restores them when it is canceled, like the HTML legacy-pre-activation behavior.
+  const fireClick = (target, init = {}, native = false) => {
+    const event = new PointerEvent('click', { bubbles: true, cancelable: true, composed: true, pointerId: native ? 1 : -1, pointerType: native ? 'mouse' : '', ...init });
+    if (native) trusted(event);
+    const activator = path(target).find(node => node.nodeType === 1 && activation(node)), kind = activator?.localName === 'input' ? activator.type : '';
+    if (activator && disabled(activator)) return dispatch(target, event);
+    const checked = node => node._checked ?? node.hasAttribute('checked');
+    const previous = kind === 'checkbox' ? checked(activator) : kind === 'radio' ? group(activator).find(checked) ?? null : undefined;
+    if (kind === 'checkbox') { setChecked(activator, !previous); activator._indeterminate = false; } else if (kind === 'radio') setChecked(activator, true);
+    const allowed = dispatch(target, event);
+    if (kind === 'checkbox' || kind === 'radio') {
+      if (!allowed) { if (kind === 'checkbox') setChecked(activator, previous); else if (previous) setChecked(previous, true); else setChecked(activator, false); }
+      else if (kind === 'checkbox' || previous !== activator) { dispatch(activator, new Event('input', { bubbles: true, composed: true })); dispatch(activator, new Event('change', { bubbles: true })); }
+    } else if (allowed && activator) {
+      const tag = activator.localName, type = tag === 'button' ? activator.type : kind;
+      if (tag === 'label') { const control = labelControl(activator); if (control && !control.contains(target) && !disabled(control)) { if (focusable(control)) control.focus(); fireClick(control, { ...init, detail: 0 }, native); } }
+      else if (tag === 'summary') activator.parentElement.open = !activator.parentElement.open;
+      else if ((type === 'submit' || type === 'image') && activator.form) activator.form.requestSubmit(activator);
+      else if (type === 'reset' && activator.form) activator.form.reset();
+    }
+    return allowed;
+  };
+  const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
   const serialize = rec => {
-    if (rec.tag === '#text') return rec.text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    if (rec.tag === '#text') return rec.up && rawText.test(rec.up.tag) ? own(rec) : own(rec).replace(/[&<>\u00a0]/g, c => escapes[c]);
     if (rec.tag === '#comment') return '<!--' + rec.text + '-->';
     if (rec.tag[0] === '#') return rec.kids.map(serialize).join('');
     let attrs = '';
-    for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replaceAll('&', '&amp;').replaceAll('"', '&quot;') + '"';
-    return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'].includes(rec.tag) ? '' : '</' + rec.tag + '>');
+    for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
+    return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (voids.test(rec.tag) ? '' : '</' + rec.tag + '>');
   };
-  const setHTML = (node, value, inert = false) => {
-    const observed = observers.size > 0, removedNodes = observed ? node.childNodes : [], list = call('dom.html', node._id, String(value));
-    release(node);
-    detach(node._m); load(list);
+  // WARNING: custom element callbacks run in tree order after the change, like CEReactions.
+  const reactions = (root, name) => { const stack = [root]; while (stack.length) { const rec = stack.pop(), node = rec.ref?.deref(); if (node) { if (name === 'connectedMoveCallback' && !node[name]) { node.disconnectedCallback?.(); node.connectedCallback?.(); } else node[name]?.(); } if (rec.shadow) stack.push(rec.shadow); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } };
+  const slotChanges = new Set();
+  const queueSlot = slot => { if (!slotChanges.size) queueMicrotask(() => { const slots = [...slotChanges]; slotChanges.clear(); for (const slot of slots) dispatch(slot, new Event('slotchange', { bubbles: true })); }); slotChanges.add(slot); };
+  const slotted = (host, name) => host._m.kids.some(kid => (kid.attrs?.get('slot') ?? '') === name && (kid.tag[0] !== '#' || kid.tag === '#text'));
+  const signal = (host, child, name = child._m.attrs?.get('slot') ?? '') => {
+    if (!host?._shadow || child._m.tag[0] === '#' && child._m.tag !== '#text') return;
+    const slot = find(host._shadow._m, slot => slot.tag === 'slot' && (slot.attrs.get('name') ?? '') === name);
+    if (slot) queueSlot(slot);
+  };
+  const slotsIn = (root, rec, self = false) => {
+    if (!(root instanceof ShadowRoot) || !root.host._m.kids.length) return;
+    const test = slot => { if (slot.tag === 'slot' && slotted(root.host, slot.attrs.get('name') ?? '')) queueSlot(of(slot)); return false; };
+    if (self) test(rec);
+    find(rec, test);
+  };
+  // WARNING: ranges are live, so every mutation moves their boundary points; dead ranges leave the set when a walk meets them.
+  const ranges = new Set();
+  let rangeSync = false;
+  const live = fn => { for (const ref of ranges) { const range = ref.deref(); if (!range) { ranges.delete(ref); continue; } if (fn(range) && selection?.ranges[0] === range && !rangeSync) { rangeSync = true; queueMicrotask(() => { rangeSync = false; if (selection.ranges[0]?.startContainer.isConnected) selection._setRange(selection.ranges[0], selection.direction, true); }); } } };
+  const moved = (range, side, test, node, offset) => { const key = side + 'Container', at = side + 'Offset'; if (!test(range[key], range[at])) return false; range[key] = node; range[at] = offset(range[at]); return true; };
+  const rangesRemove = (parent, child, index) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, node => child.contains(node), parent, () => index) || moved(range, side, (node, at) => node === parent && at > index, parent, at => at - 1)).includes(true)); };
+  const rangesInsert = (parent, index, count) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, at) => node === parent && at > index, parent, at => at + count)).includes(true)); };
+  const rangesClear = node => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (other, at) => other === node ? at > 0 : node.contains(other), node, () => 0)).includes(true)); };
+  const blurRemoved = () => { if (!active || active.isConnected) return; const previous = active; active = null; call('dom.focus', []); dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true })); };
+  // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it.
+  const replaceAll = (node, replace) => {
+    const rec = node._m, observed = observers.size > 0;
+    if (!rec.kids.length && !observed && !shadows) { replace(); return; }
+    const connected = definitions.size > 0 && node.isConnected, old = rec.kids.length && (observed || connected) ? rec.kids.map(of) : [];
+    if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); rangesClear(node); }
+    replace();
+    if (connected) for (const child of old) reactions(child._m, 'disconnectedCallback');
+    blurRemoved();
+    if (shadows) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); slotsIn(node.getRootNode(), rec); }
+    if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: node.childNodes });
+  };
+  const parseFragment = (source, context) => { const fragment = document.createDocumentFragment(); load(call('dom.html', fragment._id, String(source), context)); __appsImages(fragment); if (definitions.size) customElements.upgrade(fragment); return fragment; };
+  const setHTML = (node, value, inert = false) => replaceAll(node, () => {
+    const list = call('dom.html', node._id, String(value));
+    release(node); detach(node._m); load(list);
     if (!inert) { __appsImages(node); if (definitions.size) customElements.upgrade(node); }
-    if (observed) change({ type: 'childList', target: node, removedNodes, addedNodes: node.childNodes });
-  };
+  });
   class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
   class NodeList extends List {}
   class HTMLCollection extends List { namedItem(name) { return this.find(element => element.id === name || element.getAttribute('name') === name) ?? null; } }
   class NamedNodeMap extends List { getNamedItem(name) { return this.find(attr => attr.name === name) ?? null; } }
+  class DOMRectList extends List {}
   class Attr {
     constructor(ownerElement, name, value) { Object.assign(this, { ownerElement, name, localName: name, nodeName: name, nodeType: 2, namespaceURI: null, prefix: null, specified: true }); this._value = value; }
     get value() { return this._value; } set value(value) { this._value = String(value); this.ownerElement?.setAttribute(this.name, this._value); }
@@ -177,37 +267,68 @@
     get isConnected() { let rec = this._m; while (rec.up ?? rec.host) rec = rec.up ?? rec.host; return rec.tag === '#document'; }
     get textContent() { return text(this._m); }
     set textContent(value) {
-      const rec = this._m, data = this.nodeType === 3 || this.nodeType === 8, observed = observers.size > 0, oldValue = observed ? this.textContent : null, removedNodes = observed && !data ? this.childNodes : [], addedNodes = [];
-      value = String(value ?? ''); release(this); detach(rec); rec.text = data ? value : ''; op(1, this._id, rec.text);
-      if (!data && value) { const text = document.createTextNode(value); op(2, this._id, text._id, -1); text._m.up = rec; rec.kids.push(text._m); hold(this, text); addedNodes.push(text); }
-      if (observed) change({ type: data ? 'characterData' : 'childList', target: this, oldValue, removedNodes, addedNodes });
+      value = String(value ?? '');
+      if (this.nodeType === 3 || this.nodeType === 8) { this.data = value; return; }
+      replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); if (value) { const text = document.createTextNode(value); op(2, this._id, text._id, -1); text._m.up = this._m; text._m.i = 0; this._m.kids.push(text._m); hold(this, text); } });
     }
     get nodeValue() { return this.nodeType === 3 || this.nodeType === 8 ? this.textContent : null; }
     set nodeValue(value) { if (this.nodeType === 3 || this.nodeType === 8) this.textContent = value; }
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, before) {
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
-      if (child.nodeType === 11) { for (const node of child.childNodes) this.insertBefore(node, before); return child; }
+      before ??= null;
+      if (child.nodeType === 11) {
+        const nodes = child._m.kids.map(of), observed = observers.size > 0 && !quiet;
+        if (!nodes.length) return child;
+        quiet++;
+        try { for (const node of nodes) this.insertBefore(node, before); } finally { quiet--; }
+        if (observed) { change({ type: 'childList', target: child, removedNodes: listOf(NodeList, nodes) }); change({ type: 'childList', target: this, addedNodes: listOf(NodeList, nodes), previousSibling: nodes[0].previousSibling, nextSibling: before }); }
+        return child;
+      }
       const rec = this._m, kid = child._m, ref = before?._m ?? null;
       if (child.nodeType === 9 || this.nodeType !== 1 && this.nodeType !== 11 && this._id !== 0) throw new DOMException(child.nodeType === 9 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
       if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
       for (let up = rec; up; up = up.up ?? up.host) if (up === kid) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
-      const observed = observers.size > 0, oldParent = observed ? child.parentNode : null, previousSibling = observed ? before?.previousSibling ?? this.lastChild : null;
+      const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected;
+      let removal = null;
+      if (kid.up && (observed || shadows || ranges.size)) {
+        const from = of(kid.up);
+        if (observed) removal = { type: 'childList', target: from, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling };
+        if (from._shadow) signal(from, child);
+        rangesRemove(from, child, index(kid));
+      }
       op(2, this._id, child._id, ref ? ref.id : -1);
       if (ref !== kid) { if (kid.up) kid.up.kids.splice(index(kid), 1); kid.up = rec; if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1; }
       hold(this, child);
-      if (definitions.size && child.isConnected) { const stack=[kid];while(stack.length){const rec=stack.pop();rec.ref?.deref()?.connectedCallback?.();stack.push(...rec.kids);if(rec.shadow)stack.push(rec.shadow);} }
-      if (oldParent && oldParent !== this) change({ type: 'childList', target: oldParent, removedNodes: [child] });
-      if (observed) change({ type: 'childList', target: this, addedNodes: [child], previousSibling, nextSibling: before }); return child;
+      if (ref) rangesInsert(this, index(kid), 1);
+      if (connected && moving && child.isConnected) reactions(kid, 'connectedMoveCallback');
+      else { if (connected) reactions(kid, 'disconnectedCallback'); if (definitions.size && child.isConnected) reactions(kid, 'connectedCallback'); }
+      if (shadows) { if (this._shadow) signal(this, child); slotsIn(this.getRootNode(), kid, true); }
+      if (removal) change(removal);
+      if (observed) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling });
+      return child;
     }
     removeChild(child) {
       if (!(child instanceof Node) || child._m.up !== this._m) throw new DOMException('Node is not a child', 'NotFoundError');
-      const observed = observers.size > 0, connected = definitions.size > 0 && child.isConnected, previousSibling = observed ? child.previousSibling : null, nextSibling = observed ? child.nextSibling : null, kid = child._m;
-      const i = index(kid); op(3, this._id, child._id, i); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
-      if(connected){const stack=[kid];while(stack.length){const rec=stack.pop();rec.ref?.deref()?.disconnectedCallback?.();stack.push(...rec.kids);if(rec.shadow)stack.push(rec.shadow);}}
-      if (observed) change({ type: 'childList', target: this, removedNodes: [child], previousSibling, nextSibling }); return child;
+      const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected, kid = child._m, i = index(kid);
+      const record = observed ? { type: 'childList', target: this, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling } : null;
+      if (this._shadow) signal(this, child);
+      rangesRemove(this, child, i);
+      op(3, this._id, child._id, i); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
+      if (connected) reactions(kid, 'disconnectedCallback');
+      blurRemoved();
+      if (record) change(record);
+      return child;
     }
-    replaceChild(child, old) { if (child !== old) { this.insertBefore(child, old); this.removeChild(old); } return old; }
+    replaceChild(child, old) {
+      if (!(old instanceof Node) || old._m.up !== this._m) throw new DOMException('Node is not a child', 'NotFoundError');
+      if (child === old) return old;
+      const observed = observers.size > 0 && !quiet, previousSibling = observed ? old.previousSibling : null, nextSibling = observed ? old.nextSibling === child ? child.nextSibling : old.nextSibling : null, addedNodes = observed ? child.nodeType === 11 ? child.childNodes : listOf(NodeList, [child]) : null;
+      quiet++;
+      try { this.insertBefore(child, old); this.removeChild(old); } finally { quiet--; }
+      if (observed) change({ type: 'childList', target: this, addedNodes, removedNodes: listOf(NodeList, [old]), previousSibling, nextSibling });
+      return old;
+    }
     before(...children) { for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), this); }
     after(...children) { const before = this.nextSibling; for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
     replaceWith(...children) { this.before(...children); this.remove(); }
@@ -220,38 +341,140 @@
     isEqualNode(other) { return other?.nodeType === this.nodeType && serialize(this._m) === serialize(other._m); }
     compareDocumentPosition(other) { if (this === other) return 0; const [a, b] = [this._m, other._m].map(rec => { const chain = []; for (; rec; rec = rec.up) chain.push(rec); return chain.reverse(); }); if (a[0] !== b[0]) return 1 | 32; let i = 0; while (a[i] && a[i] === b[i]) i++; if (i === a.length) return 4 | 16; if (i === b.length) return 2 | 8; return index(a[i]) < index(b[i]) ? 4 : 2; }
     normalize() { for (const child of this.childNodes) { if (child.nodeType === 3) { while (child.nextSibling?.nodeType === 3) { child.data += child.nextSibling.data; child.nextSibling.remove(); } if (!child.length) child.remove(); } else child.normalize(); } }
-    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; list.push({ fn, capture, once: !!options?.once, passive: !!options?.passive }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
+    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; const scroll = name === 'wheel' || name === 'mousewheel' || name === 'touchstart' || name === 'touchmove'; if (name === 'wheel' && !wheeling) { wheeling = true; call('dom.wheel'); } list.push({ fn, capture, once: !!options?.once, passive: !!(options?.passive ?? (scroll && (this === globalThis || this === document || this === document.documentElement || this === document.body))) }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
     removeEventListener(name, fn, options = false) { const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this); listeners?.set(String(name), (listeners.get(String(name)) ?? []).filter(item => item.fn !== fn || item.capture !== capture)); }
     dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); return dispatch(this, event); }
   }
   Object.setPrototypeOf(Node.prototype, EventTarget.prototype); Object.setPrototypeOf(Node, EventTarget);
   for (const [name, value] of Object.entries({ ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32 })) { Node[name] = value; Node.prototype[name] = value; }
   class CharacterData extends Node {
-    get data() { return this._m.text; } set data(value) { this.textContent = value; }
+    get data() { return own(this._m); } set data(value) { this.replaceData(0, this.length, String(value ?? '')); }
     get length() { return this.data.length; }
-    substringData(offset, count) { return this.data.slice(offset, offset + count); }
-    appendData(data) { this.data += data; }
+    substringData(offset, count) { offset >>>= 0; const value = this.data; if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError'); return value.slice(offset, offset + (count >>> 0)); }
+    appendData(data) { this.replaceData(this.length, 0, data); }
     deleteData(offset, count) { this.replaceData(offset, count, ''); }
     insertData(offset, data) { this.replaceData(offset, 0, data); }
-    replaceData(offset, count, data) { const value = this.data; if (offset < 0 || offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError'); this.data = value.slice(0, offset) + data + value.slice(offset + count); }
+    replaceData(offset, count, data) {
+      const rec = this._m, value = own(rec); offset >>>= 0; data = String(data);
+      if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError');
+      count = Math.min(count >>> 0, value.length - offset);
+      rec.text = value.slice(0, offset) + data + value.slice(offset + count); op(1, this._id, rec.text);
+      if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, at) => node === this && at > offset && at <= offset + count, this, () => offset) || moved(range, side, (node, at) => node === this && at > offset + count, this, at => at + data.length - count)).includes(true));
+      if (observers.size) change({ type: 'characterData', target: this, oldValue: value });
+    }
   }
   class Text extends CharacterData {
     constructor(data = '', tag) { super(tag ? data : create('#text', String(data)), '#text'); }
-    splitText(offset) { const value = this.data; if (offset < 0 || offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError'); const other = document.createTextNode(value.slice(offset)); this.data = value.slice(0, offset); this.parentNode?.insertBefore(other, this.nextSibling); return other; }
+    splitText(offset) {
+      offset >>>= 0; const value = this.data;
+      if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError');
+      const other = document.createTextNode(value.slice(offset)), parent = this.parentNode;
+      if (parent) {
+        parent.insertBefore(other, this.nextSibling);
+        const at = index(this._m);
+        if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, o) => node === this && o > offset, other, o => o - offset) || moved(range, side, (node, o) => node === parent && o === at + 1, parent, o => o + 1)).includes(true));
+      }
+      this.replaceData(offset, value.length - offset, '');
+      return other;
+    }
     get wholeText() { let node = this, text = ''; while (node.previousSibling?.nodeType === 3) node = node.previousSibling; for (; node?.nodeType === 3; node = node.nextSibling) text += node.data; return text; }
   }
   class Comment extends CharacterData { constructor(data = '', tag) { super(tag ? data : create('#comment', String(data)), '#comment'); } }
   const cssName = name => String(name).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
-  const declarations = text => (text.match(/(?:[^;"'(]|"[^"]*"?|'[^']*'?|\([^)]*\)?)+/g) ?? []).flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim()]] : []; });
-  const styleObject = (read, write) => new Proxy({
-    get cssText() { return read(); }, set cssText(value) { write(String(value)); },
-    get length() { return declarations(read()).length; },
-    item(index) { return declarations(read())[index]?.[0] ?? ''; },
-    getPropertyValue(name) { return declarations(read()).findLast(([key]) => key === name)?.[1].replace(/\s*!important$/i, '') ?? ''; },
-    getPropertyPriority(name) { return /!important$/i.test(declarations(read()).findLast(([key]) => key === name)?.[1]) ? 'important' : ''; },
-    setProperty(name, value, priority = '') { const list = declarations(read()).filter(([key]) => key !== name).map(([key, value]) => key + ':' + value); if (value !== '' && value != null) list.push(name + ':' + value + (priority === 'important' ? ' !important' : '')); write(list.join(';')); },
-    removeProperty(name) { const old = this.getPropertyValue(name); this.setProperty(name, ''); return old; },
-  }, { get: (target, name) => name in target ? Reflect.get(target, name) : /^\d+$/.test(String(name)) ? target.item(Number(name)) : target.getPropertyValue(name === 'cssFloat' ? 'float' : cssName(name)), set(target, name, value) { if (name === 'cssText') target.cssText = value; else target.setProperty(name === 'cssFloat' ? 'float' : cssName(name), value); return true; } });
+  const styleName = name => { name = String(name); if (name.startsWith('--')) return name; if (name === 'cssFloat') return 'float'; return name.replace(/^(webkit|moz|ms)(?=[A-Z])/, '-$1').replace(/^(Webkit|Moz|Ms)(?=[A-Z])/, prefix => '-' + prefix.toLowerCase()).replace(/[A-Z]/g, c => '-' + c.toLowerCase()); };
+  let cssProperties = null;
+  const cssProperty = name => (cssProperties ??= new Set(call('dom.properties'))).has(name) || name === 'float';
+  const cssKeys = () => { const names = [...(cssProperties ??= new Set(call('dom.properties')))]; return [...new Set([...names, ...names.map(name => name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, c) => c.toUpperCase()))])]; };
+  const declared = new Map();
+  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); declared.set(text, list = /\S/.test(text) ? call('dom.declare', text) : []); } return list.map(entry => entry.slice()); };
+  const sides = (prefix, suffix = '') => ['top', 'right', 'bottom', 'left'].map(side => prefix + side + suffix);
+  const shorthands = Object.entries({
+    border: [...sides('border-', '-width'), ...sides('border-', '-style'), ...sides('border-', '-color')], 'border-width': sides('border-', '-width'), 'border-style': sides('border-', '-style'), 'border-color': sides('border-', '-color'),
+    'border-top': ['border-top-width', 'border-top-style', 'border-top-color'], 'border-right': ['border-right-width', 'border-right-style', 'border-right-color'], 'border-bottom': ['border-bottom-width', 'border-bottom-style', 'border-bottom-color'], 'border-left': ['border-left-width', 'border-left-style', 'border-left-color'],
+    margin: sides('margin-'), padding: sides('padding-'), inset: sides(''), 'scroll-margin': sides('scroll-margin-'), 'scroll-padding': sides('scroll-padding-'), 'border-radius': ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius'],
+    gap: ['row-gap', 'column-gap'], overflow: ['overflow-x', 'overflow-y'], 'flex-flow': ['flex-direction', 'flex-wrap'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'], 'place-content': ['align-content', 'justify-content'], 'place-items': ['align-items', 'justify-items'], 'place-self': ['align-self', 'justify-self'],
+    'text-decoration': ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'], 'list-style': ['list-style-type', 'list-style-position', 'list-style-image'], outline: ['outline-width', 'outline-style', 'outline-color'], container: ['container-name', 'container-type'],
+  });
+  const shorthandValue = (name, values) => {
+    if (name === 'border') { const groups = [0, 1, 2, 3].map(side => [values[side], values[side + 4], values[side + 8]]); return groups.every(group => group.join() === groups[0].join()) ? shorthandValue('border-top', groups[0]) : ''; }
+    if (values.length === 4 && name !== 'text-decoration') { const [top, right, bottom, left] = values; return left !== right ? values.join(' ') : top !== bottom ? `${top} ${right} ${bottom}` : top !== right ? `${top} ${right}` : top; }
+    if (values.length === 2 && !['flex-flow', 'container'].includes(name)) return values[0] === values[1] ? values[0] : values.join(' ');
+    if (name === 'container') return values[1] === 'normal' ? values[0] : values.join(' / ');
+    const defaults = { 'text-decoration': ['solid', 'currentcolor', 'auto'], 'list-style': ['outside', 'none'], flex: [] }[name] ?? ['currentcolor'], kept = values.filter((value, index) => index === 0 && name !== 'list-style' || !defaults.includes(value));
+    return (kept.length ? kept : values.slice(0, 1)).join(' ');
+  };
+  const declarationText = list => {
+    const out = [], done = new Set();
+    for (const [name, value, priority] of list) {
+      if (done.has(name)) continue;
+      let text = '';
+      for (const [shorthand, parts] of shorthands) {
+        if (!parts.includes(name) || parts.some(part => done.has(part))) continue;
+        const entries = parts.map(part => list.findLast(entry => entry[0] === part));
+        if (entries.some(entry => !entry || entry[2] !== priority)) continue;
+        const merged = shorthandValue(shorthand, entries.map(entry => entry[1]));
+        if (!merged) continue;
+        for (const part of parts) done.add(part);
+        text = shorthand + ': ' + merged;
+        break;
+      }
+      if (!text) { done.add(name); text = name + ': ' + list.findLast(entry => entry[0] === name)[1]; }
+      out.push(text + (priority ? ' !important' : '') + ';');
+    }
+    return out.join(' ');
+  };
+  const readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
+  let keyboardFocus = true;
+  const focusVisible = node => keyboardFocus || node.isContentEditable || node.localName === 'textarea' || node.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(node.getAttribute('type') ?? '');
+  class CSSStyleDeclaration {
+    constructor(owner) { this._owner = owner; }
+    get _list() { return this._owner.read(); }
+    get length() { return this._owner.computed ? this._owner.names().length : this._list.length; }
+    item(index) { return (this._owner.computed ? this._owner.names()[index] : this._list[index]?.[0]) ?? ''; }
+    get parentRule() { return this._owner.rule ?? null; }
+    getPropertyValue(name) {
+      name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
+      if (this._owner.computed) return this._owner.computed(name);
+      const list = this._list, found = list.findLast(entry => entry[0] === name);
+      if (found) return found[1];
+      const parts = shorthands.find(([shorthand]) => shorthand === name)?.[1], entries = parts?.map(part => list.findLast(entry => entry[0] === part));
+      return entries && entries.every(entry => entry && entry[2] === entries[0][2]) ? shorthandValue(name, entries.map(entry => entry[1])) : '';
+    }
+    getPropertyPriority(name) {
+      name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
+      if (this._owner.computed) return '';
+      const list = this._list, parts = shorthands.find(([shorthand]) => shorthand === name)?.[1] ?? [name];
+      return parts.every(part => list.findLast(entry => entry[0] === part)?.[2] === 'important') ? 'important' : '';
+    }
+    setProperty(name, value, priority = '') {
+      if (this._owner.computed) readOnly();
+      name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
+      value = value == null ? '' : String(value).trim(); priority = String(priority ?? '').toLowerCase();
+      if (value === '') { this.removeProperty(name); return; }
+      if (priority && priority !== 'important') return;
+      const added = this._owner.raw || name.startsWith('--') ? [[name, value, priority]] : declare(name + ':' + value + (priority ? ' !important' : ''));
+      if (!added.length) return;
+      const names = new Set(added.map(entry => entry[0]));
+      this._owner.write([...this._list.filter(entry => !names.has(entry[0])), ...added]);
+    }
+    removeProperty(name) {
+      if (this._owner.computed) readOnly();
+      name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
+      const old = this.getPropertyValue(name), parts = new Set(shorthands.find(([shorthand]) => shorthand === name)?.[1] ?? [name]), list = this._list, kept = list.filter(entry => !parts.has(entry[0]));
+      if (kept.length !== list.length) this._owner.write(kept);
+      return old;
+    }
+    get cssText() { return this._owner.computed ? '' : declarationText(this._list); }
+    set cssText(value) { if (this._owner.computed) readOnly(); this._owner.write(this._owner.raw ? String(value).split(';').flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim(), '']] : []; }) : declare(String(value))); }
+  }
+  const styleKey = key => typeof key === 'string' && !/^\d+$/.test(key);
+  const declaration = owner => new Proxy(new CSSStyleDeclaration(owner), {
+    get: (target, key) => typeof key !== 'string' || key in target ? Reflect.get(target, key) : /^\d+$/.test(key) ? target.item(Number(key)) : target.getPropertyValue(styleName(key)),
+    set: (target, key, value) => { if (typeof key !== 'string' || key in target) return Reflect.set(target, key, value); if (styleKey(key)) target.setProperty(styleName(key), value); return true; },
+    has: (target, key) => key in target || typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length),
+    ownKeys: target => [...new Set([...Reflect.ownKeys(target), ...Array.from({ length: target.length }, (_, index) => String(index)), ...cssKeys()])],
+    getOwnPropertyDescriptor: (target, key) => Reflect.getOwnPropertyDescriptor(target, key) ?? (typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length) ? { value: styleKey(key) ? target.getPropertyValue(styleName(key)) : target.item(Number(key)), writable: true, enumerable: true, configurable: true } : undefined),
+  });
   const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
   class Element extends Node {
     constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??[...definitions].find(([,ctor])=>ctor===new.target)?.[0];if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; }
@@ -268,30 +491,28 @@
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); attrs.set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); attrs.set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open')) attributeChanged(this, name, oldValue, value); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); }
+    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (name === 'slot' || name === 'name' || name === 'open') attributeChanged(this, name, oldValue, null); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
-    get style() { return this._style ??= styleObject(() => this.getAttribute('style') ?? '', value => this.setAttribute('style', value)); }
+    get style() { return this._style ??= declaration({ read: () => declare(this.getAttribute('style') ?? ''), write: list => { const value = declarationText(list); declared.set(value, list.map(entry => entry.slice())); this.setAttribute('style', value); } }); }
+    set style(value) { this.style.cssText = value; }
     get innerHTML() { return this._m.kids.map(serialize).join('') || own(this._m); }
     set innerHTML(value) { setHTML(this, value); }
     get outerHTML() { return serialize(this._m); }
-    set outerHTML(value) { const container = document.createElement('div'); container.innerHTML = value; this.replaceWith(...container.childNodes); }
-    get innerText() { return this.textContent; } set innerText(value) { this.textContent = value; }
-    matches(selector) { return call('dom.matches', this._id, String(selector)); }
+    set outerHTML(value) { const parent = this.parentNode; if (!parent) return; if (parent.nodeType === 9) throw new DOMException('Cannot replace the document element', 'NoModificationAllowedError'); this.replaceWith(parseFragment(value, parent.nodeType === 1 ? parent.localName : 'body')); }
+    get innerText() { return slot(this) < 0 ? this.textContent : call('dom.innerText', this._id); }
+    set innerText(value) { const parts = String(value ?? '').split(/\r\n|\r|\n/); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); }); quiet++; try { parts.forEach((part, index) => { if (index) this.append(document.createElement('br')); if (part) this.append(part); }); } finally { quiet--; } if (observers.size && this._m.kids.length) change({ type: 'childList', target: this, addedNodes: this.childNodes }); }
+    matches(selector) { return selectors('dom.matches', this._id, selector); }
     closest(selector) { for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node; return null; }
-    getBoundingClientRect() { const m = layout(), i = 4 + this._id * 8; return i < limit ? new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]) : new DOMRect(); }
-    getClientRects() { return this.isConnected ? [this.getBoundingClientRect()] : []; }
-    get clientWidth() { return rootElement(this) ? innerWidth : metric(this, 2); } get clientHeight() { return rootElement(this) ? innerHeight : metric(this, 3); }
-    get clientLeft() { return parseFloat(getComputedStyle(this).borderLeftWidth) || 0; } get clientTop() { return parseFloat(getComputedStyle(this).borderTopWidth) || 0; }
-    get offsetWidth() { return this.clientWidth; } get offsetHeight() { return this.clientHeight; }
-    get offsetParent() { call('dom.layout', false, true); layout(); let node = this.parentElement; while (node && !(marks[node._id] & 8)) node = node.parentElement; return node ?? document.body; }
-    get offsetLeft() { return this.getBoundingClientRect().left - (this.offsetParent?.getBoundingClientRect().left ?? 0); }
-    get offsetTop() { return this.getBoundingClientRect().top - (this.offsetParent?.getBoundingClientRect().top ?? 0); }
+    getBoundingClientRect() { const i = slot(this), m = geometry; return i < 0 ? new DOMRect() : new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]); }
+    getClientRects() { return slot(this) < 0 ? listOf(DOMRectList, []) : listOf(DOMRectList, [this.getBoundingClientRect()]); }
+    get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
+    get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
     get scrollTop() { return metric(pageScroller(this) ? document : this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
     get scrollLeft() { return metric(pageScroller(this) ? document : this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
-    get scrollWidth() { return pageScroller(this) ? innerWidth + metric(document, 6) : metric(this, 2) + metric(this, 6); } get scrollHeight() { return pageScroller(this) ? innerHeight + metric(document, 7) : metric(this, 3) + metric(this, 7); }
+    get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : Math.round(client(this)[2] + metric(this, 6)); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : Math.round(client(this)[3] + metric(this, 7)); }
     scrollTo(left, top) { if (typeof left === 'object') { top = left.top; left = left.left; } call('dom.scroll', this._id, left ?? null, top ?? null); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { if (typeof left === 'object') { top = left.top; left = left.left; } this.scrollTo(this.scrollLeft + (left ?? 0), this.scrollTop + (top ?? 0)); }
@@ -317,35 +538,112 @@
         if (scrollable && options.container === 'nearest') break;
       }
     }
-    focus() { if (active === this || this.disabled) return; const previous = active; active = this; call('dom.focus', path(this).map(node => node._id)); if (previous) { dispatch(previous, new FocusEvent('blur', { composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })); } dispatch(this, new FocusEvent('focus', { composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })); }
-    blur() { if (active !== this) return; active = null; call('dom.focus', []); dispatch(this, new FocusEvent('blur', { composed: true })); dispatch(this, new FocusEvent('focusout', { bubbles: true, composed: true })); }
-    click() { if (!this.disabled && dispatch(this, new MouseEvent('click', { bubbles: true, cancelable: true, composed: true }))) activate(this); }
+    focus() {
+      if (active === this || !focusable(this)) return;
+      const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), focusVisible(this));
+      const mark = native ? trusted : event => event;
+      if (previous) { commit(previous); dispatch(previous, mark(new FocusEvent('blur', { composed: true, relatedTarget: this }))); dispatch(previous, mark(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }))); }
+      if (active === this) { dispatch(this, mark(new FocusEvent('focus', { composed: true, relatedTarget: previous }))); dispatch(this, mark(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous }))); }
+    }
+    blur() { if (active !== this) return; const mark = native ? trusted : event => event; active = null; call('dom.focus', []); commit(this); dispatch(this, mark(new FocusEvent('blur', { composed: true }))); dispatch(this, mark(new FocusEvent('focusout', { bubbles: true, composed: true }))); }
+    click() { if (disabled(this) || this._clicking) return; this._clicking = true; try { fireClick(this); } finally { this._clicking = false; } }
     get contentEditable() { return this.getAttribute('contenteditable') ?? 'inherit'; } set contentEditable(value) { this.setAttribute('contenteditable', value); }
     get isContentEditable() { const value = this.contentEditable.toLowerCase(); return ['true','plaintext-only',''].includes(value) || (value !== 'false' && !!this.parentElement?.isContentEditable); }
-    get tabIndex() { return Number(this.getAttribute('tabindex') ?? (['input','textarea','button','select'].includes(this.localName) ? 0 : -1)); } set tabIndex(value) { this.setAttribute('tabindex', value); }
-    attachShadow(options) { if (this._shadow) throw new DOMException('Shadow root already exists', 'NotSupportedError'); if(!['open','closed'].includes(options.mode))throw new TypeError('Invalid shadow mode');const root = document.createDocumentFragment(); Object.setPrototypeOf(root,ShadowRoot.prototype);root.host=this;root.mode=options.mode;this._shadow=root;root._m.host=this._m;this._m.shadow=root._m;op(6,this._id,root._id);return root; }
+    get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe)$/.test(tag) || (tag === 'a' || tag === 'area') && this.hasAttribute('href') || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', value); }
+    attachShadow(options) { if (this._shadow) throw new DOMException('Shadow root already exists', 'NotSupportedError'); if(!['open','closed'].includes(options.mode))throw new TypeError('Invalid shadow mode');const root = document.createDocumentFragment(); shadows++; Object.setPrototypeOf(root,ShadowRoot.prototype);root.host=this;root.mode=options.mode;this._shadow=root;root._m.host=this._m;this._m.shadow=root._m;op(6,this._id,root._id);return root; }
     get shadowRoot() { return this._shadow?.mode === 'open' ? this._shadow : null; }
     setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
     hasPointerCapture(id) { return captures.get(id) === this; }
     releasePointerCapture(id) { if (captures.get(id) === this) { captures.delete(id); dispatch(this, new PointerEvent('lostpointercapture', { pointerId: id })); } }
     insertAdjacentElement(position, node) { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!this.parentNode) return null; if (position === 'beforebegin') this.before(node); else this.after(node); } else if (position === 'afterbegin') this.prepend(node); else if (position === 'beforeend') this.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; }
     insertAdjacentText(position, text) { this.insertAdjacentElement(position, document.createTextNode(String(text))); }
-    insertAdjacentHTML(position, source) { const wrapper = document.createElement('div'), fragment = new DocumentFragment(); wrapper.innerHTML = source; fragment.append(...wrapper.childNodes); this.insertAdjacentElement(position, fragment); }
+    insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.insertAdjacentElement(position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context.localName : 'body')); }
   }
-  class HTMLElement extends Element {}
-  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI='http://www.w3.org/2000/svg';this.nodeName=this.tagName=tag;}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
+  class HTMLElement extends Element {
+    get offsetWidth() { return Math.round(metric(this, 2)); } get offsetHeight() { return Math.round(metric(this, 3)); }
+    get offsetParent() {
+      if (this.localName === 'body' || rootElement(this) || slot(this) < 0) return null;
+      call('dom.layout', false, true); layout();
+      if (marks[this._id] & 32) return null;
+      const positioned = marks[this._id] & 8;
+      for (let node = this.parentElement; node; node = node.parentElement) if (marks[node._id] & 8 || node.localName === 'body' || !positioned && /^(td|th|table)$/.test(node.localName)) return node;
+      return null;
+    }
+    get offsetLeft() { return offset(this, 0); }
+    get offsetTop() { return offset(this, 1); }
+  }
+  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI='http://www.w3.org/2000/svg';this.nodeName=this.tagName=tag;}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
   class SVGSVGElement extends SVGElement {}
-  for (const attr of ['title','name','type','src','href','placeholder','role','dir','lang','slot']) Object.defineProperty(Element.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
-  for (const attr of ['hidden','disabled','readOnly','multiple','checked','selected','autofocus']) Object.defineProperty(Element.prototype, attr, { get() { return this.hasAttribute(attr.toLowerCase()); }, set(value) { this.toggleAttribute(attr.toLowerCase(), !!value); } });
+  for (const attr of ['title','name','type','placeholder','role','dir','lang','slot']) Object.defineProperty(Element.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
+  for (const attr of ['hidden','disabled','readOnly','multiple','autofocus','required','noValidate','formNoValidate','inert']) Object.defineProperty(Element.prototype, attr, { get() { return this.hasAttribute(attr.toLowerCase()); }, set(value) { this.toggleAttribute(attr.toLowerCase(), !!value); } });
   class HTMLSlotElement extends HTMLElement {
     assignedNodes(options = {}) { return call('dom.assignedNodes', this._id, !!options.flatten).map(wrap); }
     assignedElements(options = {}) { return this.assignedNodes(options).filter(node => node.nodeType === 1); }
   }
+  // WARNING: form controls keep their current value and checkedness apart from the content attributes; Rust gets them through ops 7 (value) and 8 (checked, modal).
+  const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
+  const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
+  const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); };
+  const formState = (node, bits) => { if (node._bits !== bits) { node._bits = bits; op(8, node._id, bits); } };
+  // WARNING: user edits change the internal value and checkedness, never the page-visible `value` and `checked` properties, which frameworks wrap to tell their own writes apart.
+  const setChecked = (node, value) => { node._checked = value; formState(node, value ? 3 : 2); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, 2); } };
+  const formOf = node => { const id = node.getAttribute('form'); if (id !== null) { const form = id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; };
+  const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
+  const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
+  const emailPattern = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+  class ValidityState {}
+  for (const name of ['valueMissing','typeMismatch','patternMismatch','tooLong','tooShort','rangeUnderflow','rangeOverflow','stepMismatch','badInput','customError','valid']) Object.defineProperty(ValidityState.prototype, name, { get() { return this['_' + name]; }, enumerable: true });
+  const messages = { valueMissing: 'Please fill out this field.', typeMismatch: 'Please enter a valid value.', patternMismatch: 'Please match the requested format.', tooLong: 'Please shorten this text.', tooShort: 'Please lengthen this text.', rangeUnderflow: 'Value is too low.', rangeOverflow: 'Value is too high.', stepMismatch: 'Please enter a valid value.', badInput: 'Please enter a number.' };
+  const validity = node => {
+    const flags = { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: !!node._custom };
+    const tag = node.localName, type = node.type, required = node.hasAttribute('required');
+    if (tag === 'select') flags.valueMissing = required && !node.selectedOptions.some(option => option.value !== '' || option.index !== 0 || node.multiple || node.size > 1);
+    else if (type === 'checkbox') flags.valueMissing = required && !node.checked;
+    else if (type === 'radio') flags.valueMissing = group(node).some(radio => radio.hasAttribute('required')) && !group(node).some(radio => radio.checked);
+    else if (tag === 'textarea' || tag === 'input' && !/^(hidden|submit|image|reset|button|file)$/.test(type)) {
+      const value = node.value, length = value.length, attr = name => node.getAttribute(name);
+      flags.valueMissing = required && !value;
+      if (value) {
+        if (type === 'email') flags.typeMismatch = !(node.hasAttribute('multiple') ? value.split(',') : [value]).every(part => emailPattern.test(part.trim()));
+        if (type === 'url') flags.typeMismatch = !URL.canParse(value);
+        if (attr('pattern') !== null && tag === 'input') try { flags.patternMismatch = !(node.hasAttribute('multiple') && type === 'email' ? value.split(',') : [value]).every(part => new RegExp('^(?:' + attr('pattern') + ')$', 'v').test(part)); } catch {}
+        if (node._edited !== undefined && attr('maxlength') !== null) flags.tooLong = length > Number(attr('maxlength'));
+        if (node._edited !== undefined && attr('minlength') !== null) flags.tooShort = length < Number(attr('minlength'));
+        if (type === 'number' || type === 'range') {
+          const number = Number(value), min = parseFloat(attr('min')), max = parseFloat(attr('max')), step = attr('step') === 'any' ? NaN : parseFloat(attr('step') ?? '1');
+          flags.badInput = Number.isNaN(number);
+          if (!flags.badInput) { flags.rangeUnderflow = number < min; flags.rangeOverflow = number > max; flags.stepMismatch = step > 0 && Math.abs(Math.round((number - (Number.isNaN(min) ? 0 : min)) / step) * step - (number - (Number.isNaN(min) ? 0 : min))) > 1e-7; }
+        }
+      }
+    }
+    const state = Object.create(ValidityState.prototype);
+    for (const [name, value] of Object.entries(flags)) state['_' + name] = value;
+    state._valid = !Object.values(flags).includes(true);
+    return state;
+  };
+  const constraints = {
+    get willValidate() { return candidate(this); },
+    get validity() { return validity(this); },
+    get validationMessage() { if (!candidate(this)) return ''; const state = validity(this); return state.customError ? this._custom : Object.keys(messages).map(name => state[name] && messages[name]).find(Boolean) ?? ''; },
+    setCustomValidity(message) { this._custom = String(message); },
+    checkValidity() { if (!candidate(this) || validity(this).valid) return true; dispatch(this, new Event('invalid', { cancelable: true })); return false; },
+    reportValidity() { if (this.checkValidity()) return true; this.focus(); return false; },
+    get form() { return formOf(this); },
+    get labels() { const result = []; find(document._m, rec => { if (rec.tag === 'label' && labelControl(of(rec)) === this) result.push(of(rec)); return false; }); return listOf(NodeList, result); },
+    get name() { return this.getAttribute('name') ?? ''; }, set name(value) { this.setAttribute('name', value); },
+  };
   class HTMLInputElement extends HTMLElement {
-    get type() { return this.localName === 'textarea' ? 'textarea' : (this.getAttribute('type') ?? 'text').toLowerCase(); } set type(value) { this.setAttribute('type', value); }
-    get value() { return this._value ?? this.getAttribute('value') ?? (this.localName === 'textarea' ? this.textContent : ''); }
-    set value(value) { this._value = String(value); if (this._m.attrs.get('value') !== this._value) op(4, this._id, 'value', this._value); this._m.attrs.set('value', this._value); const length = this._value.length; this._start = Math.min(this._start ?? length, length); this._end = Math.min(this._end ?? length, length); }
+    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
+    get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : this._value ?? this.getAttribute('value')?.replace(/[\r\n]/g, '') ?? ''; }
+    set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) setValue(this, value); }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
+    get checked() { return this._checked ?? this.hasAttribute('checked'); }
+    set checked(value) { setChecked(this, !!value); }
+    get defaultChecked() { return this.hasAttribute('checked'); } set defaultChecked(value) { this.toggleAttribute('checked', !!value); }
+    get indeterminate() { return !!this._indeterminate; } set indeterminate(value) { this._indeterminate = !!value; }
+    get valueAsNumber() { return /^(number|range)$/.test(this.type) && this.value !== '' ? Number(this.value) : NaN; } set valueAsNumber(value) { this.value = Number.isNaN(value) ? '' : String(value); }
+    get files() { return this.type === 'file' ? this._files ?? [] : null; }
+    get list() { const id = this.getAttribute('list'); return id ? document.getElementById(id) : null; }
     get selectionStart() { return this._start ?? 0; } set selectionStart(value) { this.setSelectionRange(value, Math.max(value, this.selectionEnd)); }
     get selectionEnd() { return this._end ?? 0; } set selectionEnd(value) { this.setSelectionRange(Math.min(value, this.selectionStart), value); }
     get selectionDirection() { return this._direction ?? 'none'; } set selectionDirection(value) { this.setSelectionRange(this.selectionStart, this.selectionEnd, value); }
@@ -371,13 +669,140 @@
         mode === 'select' || mode === 'end' ? after : mode === 'start' ? start : oldEnd > end ? oldEnd + delta : oldEnd > start ? after : oldEnd);
     }
   }
+  class HTMLTextAreaElement extends HTMLElement {
+    get type() { return 'textarea'; }
+    get value() { return this._value ?? this.textContent.replace(/\r\n?/g, '\n'); } set value(value) { setValue(this, String(value ?? '').replace(/\r\n?/g, '\n')); }
+    get defaultValue() { return this.textContent; } set defaultValue(value) { this.textContent = value; }
+    get textLength() { return this.value.length; }
+  }
+  for (const name of ['selectionStart', 'selectionEnd', 'selectionDirection', 'setSelectionRange', 'select', 'setRangeText']) Object.defineProperty(HTMLTextAreaElement.prototype, name, Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, name));
+  const options = select => { const result = []; for (const kid of select._m.kids) { if (kid.tag === 'option') result.push(of(kid)); else if (kid.tag === 'optgroup') for (const sub of kid.kids) if (sub.tag === 'option') result.push(of(sub)); } return result; };
+  // WARNING: a single select shows one option, the last selected one or else the first enabled one, unless `selectedIndex = -1` emptied it.
+  const selectedness = select => {
+    const list = options(select);
+    if (select.multiple || select.size > 1) for (const option of list) option._current = option._selected ?? option.hasAttribute('selected');
+    else {
+      let chosen = null;
+      for (const option of list) if (option._selected ?? option.hasAttribute('selected')) chosen = option;
+      if (!chosen && !select._none) chosen = list.find(option => !disabled(option)) ?? null;
+      for (const option of list) option._current = option === chosen;
+    }
+    for (const option of list) formState(option, option._current ? 3 : 2);
+    return list;
+  };
+  class HTMLOptionsCollection extends List {
+    get selectedIndex() { return this._select.selectedIndex; } set selectedIndex(value) { this._select.selectedIndex = value; }
+    add(element, before) { this._select.add(element, before); }
+    remove(index) { this._select.remove(index); }
+    namedItem(name) { return this.find(option => option.id === name || option.getAttribute('name') === name) ?? null; }
+  }
+  class HTMLSelectElement extends HTMLElement {
+    get type() { return this.multiple ? 'select-multiple' : 'select-one'; }
+    get options() { const list = listOf(HTMLOptionsCollection, options(this)); list._select = this; return list; }
+    get length() { return options(this).length; }
+    set length(value) { const list = options(this); value >>>= 0; for (let i = list.length; i < value; i++) this.append(document.createElement('option')); for (const option of list.slice(value)) option.remove(); }
+    get size() { return Math.max(0, parseInt(this.getAttribute('size'), 10) || 0); } set size(value) { this.setAttribute('size', value >>> 0); }
+    get selectedOptions() { return listOf(HTMLCollection, selectedness(this).filter(option => option._current)); }
+    get selectedIndex() { return selectedness(this).findIndex(option => option._current); }
+    set selectedIndex(value) { value = Number(value); const list = options(this); this._none = !list[value]; for (const [index, option] of list.entries()) option._selected = index === value; selectedness(this); }
+    get value() { return selectedness(this).find(option => option._current)?.value ?? ''; }
+    set value(value) { value = String(value); const list = options(this); let found = false; for (const option of list) option._selected = !found && option.value === value && (found = true); this._none = !found; selectedness(this); }
+    item(index) { return options(this)[index] ?? null; }
+    namedItem(name) { return this.options.namedItem(name); }
+    add(element, before = null) { const reference = typeof before === 'number' ? options(this)[before] ?? null : before; if (reference) reference.parentNode.insertBefore(element, reference); else this.append(element); }
+    remove(index) { if (!arguments.length) super.remove(); else options(this)[index]?.remove(); }
+  }
+  class HTMLOptionElement extends HTMLElement {
+    get select() { for (let rec = this._m.up, depth = 0; rec && depth < 2; rec = rec.up, depth++) { if (rec.tag === 'select') return of(rec); if (rec.tag !== 'optgroup') return null; } return null; }
+    get value() { return this.getAttribute('value') ?? this.text; } set value(value) { this.setAttribute('value', value); }
+    get text() { return this.textContent.replace(/[\t\n\f\r ]+/g, ' ').trim(); } set text(value) { this.textContent = value; }
+    get label() { return this.getAttribute('label') ?? this.text; } set label(value) { this.setAttribute('label', value); }
+    get selected() { const select = this.select; if (select) selectedness(select); return this._current ?? this._selected ?? this.hasAttribute('selected'); }
+    set selected(value) { const select = this.select; this._selected = !!value; if (select) { if (value && !select.multiple) for (const option of options(select)) if (option !== this) option._selected = false; select._none = false; selectedness(select); } else this._current = !!value; }
+    get defaultSelected() { return this.hasAttribute('selected'); } set defaultSelected(value) { this.toggleAttribute('selected', !!value); }
+    get index() { const select = this.select; return select ? options(select).indexOf(this) : 0; }
+    get form() { return this.select?.form ?? null; }
+  }
+  class HTMLOptGroupElement extends HTMLElement { get label() { return this.getAttribute('label') ?? ''; } set label(value) { this.setAttribute('label', value); } }
+  class HTMLButtonElement extends HTMLElement {
+    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return type === 'reset' || type === 'button' ? type : 'submit'; } set type(value) { this.setAttribute('type', value); }
+    get value() { return this.getAttribute('value') ?? ''; } set value(value) { this.setAttribute('value', value); }
+  }
+  class HTMLFieldSetElement extends HTMLElement { get elements() { const result = []; find(this._m, rec => { if (listed.test(rec.tag)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); } get type() { return 'fieldset'; } }
+  class HTMLOutputElement extends HTMLElement { get value() { return this.textContent; } set value(value) { this.textContent = value; } get defaultValue() { return this._default ?? this.textContent; } set defaultValue(value) { this._default = String(value); } get type() { return 'output'; } }
+  for (const Type of [HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement]) for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(constraints))) if (!Object.hasOwn(Type.prototype, name)) Object.defineProperty(Type.prototype, name, descriptor);
+  class HTMLFormControlsCollection extends HTMLCollection {}
+  // WARNING: there is no navigation, so a submit that is not canceled does nothing more, except `method=dialog`, which closes its dialog.
+  const submitForm = (form, submitter) => {
+    if (form._submitting || !form.isConnected) return;
+    if (!form.noValidate && !submitter?.formNoValidate) { const invalid = [...form.elements].filter(control => !control.checkValidity()); if (invalid.length) { invalid[0].focus(); return; } }
+    form._submitting = true;
+    let allowed;
+    try { allowed = dispatch(form, new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter })); } finally { form._submitting = false; }
+    if (allowed && (submitter?.getAttribute('formmethod') ?? form.method) === 'dialog') form.closest('dialog')?.close(submitter?.value);
+  };
+  class HTMLFormElement extends HTMLElement {
+    get elements() { const id = this.id, result = []; find(document._m, rec => { if (listed.test(rec.tag) && !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && of(rec).form === this) result.push(of(rec)); return false; }); if (!this.isConnected || !id) find(this._m, rec => { if (listed.test(rec.tag) && !result.includes(of(rec)) && of(rec).form === this) result.push(of(rec)); return false; }); const list = listOf(HTMLFormControlsCollection, result); for (const control of result) for (const key of [control.id, control.getAttribute('name')]) if (key && !(key in list)) list[key] = control; return list; }
+    get length() { return this.elements.length; }
+    get method() { const value = (this.getAttribute('method') ?? '').toLowerCase(); return value === 'post' || value === 'dialog' ? value : 'get'; } set method(value) { this.setAttribute('method', value); }
+    get action() { const value = this.getAttribute('action'); return value ? resolved(value) : document.URL; } set action(value) { this.setAttribute('action', value); }
+    get enctype() { return this.getAttribute('enctype') ?? 'application/x-www-form-urlencoded'; } set enctype(value) { this.setAttribute('enctype', value); }
+    get target() { return this.getAttribute('target') ?? ''; } set target(value) { this.setAttribute('target', value); }
+    submit() { if ((this.method) === 'dialog') this.closest('dialog')?.close(); }
+    requestSubmit(submitter = null) { if (submitter !== null && (!(submitter instanceof HTMLElement) || submitter.form !== this || !(submitter.localName === 'button' ? submitter.type === 'submit' : /^(submit|image)$/.test(submitter.type)))) throw submitter?.form !== this ? new DOMException('The submitter is not owned by this form', 'NotFoundError') : new TypeError('The submitter is not a submit button'); submitForm(this, submitter); }
+    reset() {
+      if (!dispatch(this, new Event('reset', { bubbles: true, cancelable: true }))) return;
+      for (const control of this.elements) {
+        if (control.localName === 'select') { for (const option of options(control)) option._selected = undefined; control._none = false; selectedness(control); }
+        else if (control.localName === 'input' || control.localName === 'textarea') { control._value = undefined; control._checked = undefined; control._edited = undefined; op(7, control._id, '', 1); formState(control, 0); }
+        else if (control.localName === 'output') control.textContent = control.defaultValue;
+      }
+    }
+    checkValidity() { return [...this.elements].map(control => control.checkValidity?.() ?? true).every(Boolean); }
+    reportValidity() { const invalid = [...this.elements].filter(control => !(control.checkValidity?.() ?? true)); invalid[0]?.focus(); return !invalid.length; }
+    _entries(submitter) {
+      const entries = [];
+      for (const control of this.elements) {
+        const tag = control.localName, type = control.type, name = control.getAttribute('name');
+        if (!name || disabled(control) || control.closest('datalist') || tag === 'button' && control !== submitter || tag === 'input' && /^(submit|image|reset|button)$/.test(type) && control !== submitter || /^(checkbox|radio)$/.test(type) && !control.checked || tag === 'object' || tag === 'output' || tag === 'fieldset') continue;
+        if (tag === 'select') for (const option of control.selectedOptions) entries.push([name, option.value]);
+        else if (type === 'file') for (const file of control.files.length ? control.files : [new File([], '', { type: 'application/octet-stream' })]) entries.push([name, file]);
+        else entries.push([name, control.value]);
+      }
+      return entries;
+    }
+  }
+  const modals = [];
+  class HTMLDialogElement extends HTMLElement {
+    get open() { return this.hasAttribute('open'); } set open(value) { this.toggleAttribute('open', !!value); }
+    get returnValue() { return this._returnValue ?? ''; } set returnValue(value) { this._returnValue = String(value); }
+    show() { if (this.open) { if (this._modal) throw new DOMException('The dialog is modal', 'InvalidStateError'); return; } this._focus = active; this.setAttribute('open', ''); (this.querySelector('[autofocus]') ?? [...this.querySelectorAll('*')].find(focusable))?.focus(); }
+    showModal() {
+      if (this.open) { if (this._modal) return; throw new DOMException('The dialog is already open', 'InvalidStateError'); }
+      if (!this.isConnected) throw new DOMException('The dialog is not connected', 'InvalidStateError');
+      this._modal = true; this._focus = active; modals.push(this); formState(this, 4); this.setAttribute('open', '');
+      (this.querySelector('[autofocus]') ?? [...this.querySelectorAll('*')].find(focusable))?.focus();
+    }
+    close(result) {
+      if (!this.open) return;
+      this.removeAttribute('open');
+      if (result !== undefined) this.returnValue = result;
+      if (this._modal) { this._modal = false; modals.splice(modals.indexOf(this), 1); formState(this, 0); }
+      const previous = this._focus; this._focus = null;
+      if (previous?.isConnected && active && this.contains(active)) previous.focus();
+      setTimeout(() => dispatch(this, new Event('close')), 0);
+    }
+    requestClose(result) { if (this.open && dispatch(this, new Event('cancel', { cancelable: true }))) this.close(result); }
+  }
+  class HTMLDetailsElement extends HTMLElement { get open() { return this.hasAttribute('open'); } set open(value) { this.toggleAttribute('open', !!value); } }
+  class HTMLLabelElement extends HTMLElement { get htmlFor() { return this.getAttribute('for') ?? ''; } set htmlFor(value) { this.setAttribute('for', value); } get control() { return labelControl(this); } get form() { return this.control?.form ?? null; } }
+  const resolved = value => { try { return new URL(value, document.baseURI).href; } catch { return value; } };
   class HTMLTemplateElement extends HTMLElement {
     get content() { if (!this._content) { this._content = new DocumentFragment(); this._content.append(...this.childNodes); } return this._content; }
     get innerHTML() { return this.content._m.kids.map(serialize).join(''); } set innerHTML(value) { setHTML(this.content, value, true); }
     cloneNode(deep = false) { const clone = super.cloneNode(false); if (deep) clone.content.append(this.content.cloneNode(true)); return clone; }
   }
   class HTMLImageElement extends HTMLElement {
-    get src() { return this.getAttribute('src') ?? ''; } set src(value) { this.setAttribute('src',value); }
     get naturalWidth() { return this._dimensions?.[0] ?? 0; } get naturalHeight() { return this._dimensions?.[1] ?? 0; }
     get width() { return Number(this.getAttribute('width') ?? this.naturalWidth); } set width(value) { this.setAttribute('width',value); }
     get height() { return Number(this.getAttribute('height') ?? this.naturalHeight); } set height(value) { this.setAttribute('height',value); }
@@ -386,12 +811,9 @@
     _loadImage() {
       const source = this.src, load = this._load = {}, current = () => this._load === load && this.src === source; this._complete = false;
       this._loading = (async () => {
-        let data;
-        if (source.startsWith('data:')) { const comma=source.indexOf(','); const payload=source.slice(comma+1); data=source.slice(0,comma).endsWith(';base64') ? Uint8Array.from(atob(payload),c=>c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(payload)); }
-        else if (/^(apps|file):$/.test(new URL(source, globalThis.location?.href).protocol)) data = source;
-        else { const response=await fetch(source); if (!response.ok) throw new Error('Image request failed: '+response.status); data=new Uint8Array(await response.arrayBuffer()); }
+        const data = await resource(source, 'Image');
         if (!current()) return;
-        const result = await new Promise(resolve => decodes.set(call(typeof data === 'string' ? 'dom.imageURL' : 'dom.image',this._id,data), resolve));
+        const result = await decode(this, data);
         if (!current()) return;
         if (typeof result === 'string') throw new Error(result);
         this._dimensions=result; this._complete=true; this.dispatchEvent(new Event('load'));
@@ -400,15 +822,162 @@
     }
     decode() { if (!this._loading && this.src) this._loadImage(); return this._loading ?? Promise.resolve(); }
   }
+  // Bundled and local files load in Rust by URL, other sources as bytes.
+  const resource = async (source, kind) => {
+    if (source.startsWith('data:')) { const comma = source.indexOf(','), payload = source.slice(comma + 1); return source.slice(0, comma).endsWith(';base64') ? Uint8Array.from(atob(payload), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(payload)); }
+    if (/^(apps|file):$/.test(new URL(source, globalThis.location?.href).protocol)) return source;
+    const response = await fetch(source); if (!response.ok) throw new Error(`${kind} request failed: ${response.status}`); return new Uint8Array(await response.arrayBuffer());
+  };
+  const decode = (node, data) => new Promise(resolve => decodes.set(call(typeof data === 'string' ? 'dom.imageURL' : 'dom.image', node._id, data), resolve));
   // WARNING: decodes finish on workers that wake the loop, so the tick drains them only while one is pending.
   const decodes = new Map();
   globalThis.__appsDecoded = () => { if (decodes.size) for (const [request, result] of host('dom.decoded')) { decodes.get(request)?.(result); decodes.delete(request); } };
-  globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } return false; }); };
+  globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
+  // WARNING: media elements play in the library of the video and audio features. Its threads wake the loop, and the tick polls their events while one is open. Playing elements stay alive, like in browsers.
+  const players = new Map(), playing = new Set(), mediaFeatures = globalThis.__appsMedia ?? {};
+  delete globalThis.__appsMedia;
+  const [PLAY, PAUSE, SEEK, VOLUME, MUTED, SPEED] = [0, 1, 2, 3, 4, 5];
+  const control = (el, op, value = 0) => { if (el._open) call('media.control', el._id, op, +value); };
+  const mediaTypes = /^(video|audio)\/(mp4|webm|ogg|quicktime|x-matroska|mpeg|mp3|x-m4a|aac|flac|x-flac|wav|wave|x-wav)$/, mediaCodecs = /^(avc[13]|hvc1|hev1|vp8|vp9|vp09|av01|mp4a|mp3|opus|vorbis|flac|alac|1)(\.|$)/;
+  globalThis.__appsMediaPoll = () => {
+    if (!players.size) return;
+    for (const el of playing) if (el._connected && !el.isConnected) el.pause();
+    for (const [id, kind, ...values] of call('media.poll')) { const el = players.get(id)?.deref(); if (el?._open) el._event(kind, values); else players.delete(id); }
+  };
+  class TimeRanges { constructor(ranges = []) { this._ranges = ranges; } get length() { return this._ranges.length; } start(i) { return this._range(i)[0]; } end(i) { return this._range(i)[1]; } _range(i) { const range = this._ranges[i]; if (!range) throw new DOMException('Index out of range', 'IndexSizeError'); return range; } }
+  class MediaError { constructor(code, message) { this.code = code; this.message = message; } }
+  Object.assign(MediaError, { MEDIA_ERR_ABORTED: 1, MEDIA_ERR_NETWORK: 2, MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 });
+  class HTMLMediaElement extends HTMLElement {
+    get paused() { return this._paused ?? true; } get ended() { return !!this._ended; } get seeking() { return !!this._seeking; }
+    get readyState() { return this._ready ?? 0; } get networkState() { return this._network ?? 0; } get error() { return this._error ?? null; }
+    get duration() { return this._duration ?? NaN; } get currentSrc() { return this._source ?? ''; }
+    get currentTime() { if (!this._open || !this._ready) return this._time ?? 0; const time = call('media.time', this._id); return this._duration < time ? this._duration : time; }
+    set currentTime(value) { value = +value; if (!Number.isFinite(value)) throw new TypeError('The provided double value is non-finite.'); this._seek(value); }
+    fastSeek(time) { this.currentTime = time; }
+    get volume() { return this._volume ?? 1; }
+    set volume(value) { value = +value; if (!(value >= 0 && value <= 1)) throw new DOMException('The volume must be between 0 and 1', 'IndexSizeError'); if (value === this.volume) return; this._volume = value; control(this, VOLUME, value); this._fire('volumechange'); }
+    get muted() { return this._muted ?? this.hasAttribute('muted'); }
+    set muted(value) { value = !!value; if (value === this.muted) return; this._muted = value; control(this, MUTED, value); this._fire('volumechange'); }
+    get playbackRate() { return this._rate ?? 1; }
+    set playbackRate(value) { value = +value; if (!(value >= 0.0625 && value <= 16)) throw new DOMException('The playback rate is not supported', 'NotSupportedError'); if (value === this.playbackRate) return; this._rate = value; control(this, SPEED, value); this._fire('ratechange'); }
+    get defaultPlaybackRate() { return this._defaultRate ?? 1; } set defaultPlaybackRate(value) { this._defaultRate = +value; this._fire('ratechange'); }
+    get preservesPitch() { return false; } set preservesPitch(value) {}
+    get preload() { const value = this.getAttribute('preload')?.toLowerCase(); return value === 'none' || value === 'metadata' ? value : 'auto'; } set preload(value) { this.setAttribute('preload', value); }
+    get buffered() { return new TimeRanges(this._ready ? [[0, this.duration]] : []); } get seekable() { return this.buffered; } get played() { return new TimeRanges(); }
+    get srcObject() { return null; } set srcObject(value) { if (value !== null) throw new DOMException('Media streams are not supported', 'NotSupportedError'); }
+    canPlayType(type) {
+      if (!mediaFeatures[this._feature]) return '';
+      const [mime, ...params] = String(type).toLowerCase().split(';').map(part => part.trim()), codecs = params.find(part => part.startsWith('codecs='))?.slice(7).replace(/"/g, '');
+      return !mediaTypes.test(mime) ? '' : codecs === undefined ? 'maybe' : codecs.split(',').every(codec => mediaCodecs.test(codec.trim())) ? 'probably' : '';
+    }
+    get _feature() { return this.localName === 'video' ? 'video' : 'audio'; }
+    setAttribute(name, value) { super.setAttribute(name, value); if (name === 'src') this._select(); else if (name === 'poster') this._poster(); }
+    insertBefore(child, before) { const node = super.insertBefore(child, before); if (!this._network) this._select(); return node; }
+    load() { this._select(true); }
+    play() {
+      if (this._error?.code === 4) return Promise.reject(new DOMException(this._error.message, 'NotSupportedError'));
+      if (!this._open && this._network !== 2) this._select(true);
+      if (this._ended) this._seek(0);
+      const promise = new Promise((resolve, reject) => (this._plays ??= []).push([resolve, reject]));
+      if (this.paused) { this._paused = false; this._connected = this.isConnected; playing.add(this); control(this, PLAY); this._fire('play'); if (this._ready > 2) this._fire('playing'); }
+      if (this._ready > 2) this._settle();
+      return promise;
+    }
+    pause() {
+      if (this.paused) return;
+      this._paused = true; playing.delete(this); control(this, PAUSE);
+      this._fire('timeupdate'); this._fire('pause'); this._settle(new DOMException('The play() request was interrupted by a call to pause()', 'AbortError'));
+    }
+    _fire(type) { setTimeout(() => this.dispatchEvent(new Event(type)), 0); }
+    _settle(error) { const plays = this._plays ?? []; this._plays = []; for (const [resolve, reject] of plays) error ? reject(error) : resolve(); }
+    _fail(code, message) {
+      this._error = new MediaError(code, message); if (code === 4) this._network = 3;
+      playing.delete(this); this._fire('error'); this._settle(new DOMException(message, 'NotSupportedError'));
+    }
+    _seek(time) {
+      if (!this._open || !this._ready) { this._time = time; return; }
+      time = Math.max(0, Math.min(time, this._duration));
+      this._seeking = true; this._ended = false; control(this, SEEK, time); this._fire('seeking');
+    }
+    _poster() {
+      const source = this.getAttribute('poster'), token = this._posterToken = {};
+      if (this.localName === 'video' && source && !(this._ready > 1)) resource(resolved(source), 'Poster').then(data => this._posterToken === token && decode(this, data)).catch(() => {});
+    }
+    // Picks the src attribute or the first playable <source> child, then loads it unless preload is none.
+    _select(force = false) {
+      const element = this.getAttribute('src') === null ? [...this.children].find(child => child.localName === 'source' && child.hasAttribute('src') && (!child.type || this.canPlayType(child.type))) : this;
+      if (!element && !this._network) return;
+      const token = this._token = {};
+      if (this._network) this._fire('emptied');
+      if (this._open) { this._open = false; call('media.close', this._id); }
+      if (!this.paused) { this._paused = true; playing.delete(this); this._fire('pause'); }
+      this._settle(new DOMException('The play() request was interrupted by a new load request', 'AbortError'));
+      Object.assign(this, { _ready: 0, _time: 0, _seeking: false, _ended: false, _error: null, _duration: NaN, _size: null, _source: element?.src ?? '', _network: element ? 2 : 0 });
+      this._poster();
+      if (!element) return;
+      this._fire('loadstart');
+      if (!mediaFeatures[this._feature]) return this._fail(4, `The ${this._feature} feature is disabled. Add "${this._feature}" to "features" in package.json`);
+      if (!this._source) return this._fail(4, 'The media has no source');
+      if (this.preload === 'none' && !this.autoplay && !force) { this._network = 1; this._fire('suspend'); return; }
+      resource(this._source, 'Media').then(data => {
+        if (this._token !== token) return;
+        call('media.open', this._id, data, this.localName === 'video');
+        this._open = true; players.set(this._id, new WeakRef(this));
+        if (this.volume !== 1) control(this, VOLUME, this.volume);
+        if (this.muted) control(this, MUTED, 1);
+        if (this.playbackRate !== 1) control(this, SPEED, this.playbackRate);
+        if (this.autoplay && this.paused) this.play().catch(() => {});
+        else if (!this.paused) control(this, PLAY);
+      }).catch(error => { if (this._token === token) this._fail(4, error.message); });
+    }
+    _event(kind, values) {
+      if (kind === 'meta') {
+        const [duration, width, height] = values; this._duration = duration ?? Infinity; this._size = [width, height]; this._ready = 1;
+        this._fire('durationchange'); if (width) this._fire('resize'); this._fire('loadedmetadata');
+        if (this._time) { const time = this._time; this._time = 0; this._seek(time); }
+      } else if (kind === 'loaded' || kind === 'seeked') {
+        const first = this._ready < 2; this._ready = 4; this._network = 1;
+        if (this._seeking) { this._seeking = false; this._fire('timeupdate'); this._fire('seeked'); }
+        if (first) { this._fire('loadeddata'); this._fire('canplay'); this._fire('canplaythrough'); if (!this.paused) this._fire('playing'); }
+        if (!this.paused) this._settle();
+      } else if (kind === 'time') this._fire('timeupdate');
+      else if (kind === 'ended') {
+        if (this.loop) { this._seek(0); control(this, PLAY); return; }
+        this._ended = true; this._paused = true; playing.delete(this);
+        this._fire('timeupdate'); this._fire('pause'); this._fire('ended');
+      } else if (kind === 'error') this._fail(values[0], values[1]);
+    }
+  }
+  for (const [key, value] of Object.entries({ NETWORK_EMPTY: 0, NETWORK_IDLE: 1, NETWORK_LOADING: 2, NETWORK_NO_SOURCE: 3, HAVE_NOTHING: 0, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3, HAVE_ENOUGH_DATA: 4 })) HTMLMediaElement[key] = HTMLMediaElement.prototype[key] = value;
+  for (const [name, attribute] of [['autoplay', 'autoplay'], ['controls', 'controls'], ['loop', 'loop'], ['defaultMuted', 'muted']]) Object.defineProperty(HTMLMediaElement.prototype, name, { configurable: true, get() { return this.hasAttribute(attribute); }, set(value) { this.toggleAttribute(attribute, !!value); } });
+  class HTMLVideoElement extends HTMLMediaElement {
+    get videoWidth() { return this._size?.[0] ?? 0; } get videoHeight() { return this._size?.[1] ?? 0; }
+    get width() { return Number(this.getAttribute('width') ?? 0); } set width(value) { this.setAttribute('width', value); }
+    get height() { return Number(this.getAttribute('height') ?? 0); } set height(value) { this.setAttribute('height', value); }
+    get poster() { const value = this.getAttribute('poster'); return value ? resolved(value) : ''; } set poster(value) { this.setAttribute('poster', value); }
+    get playsInline() { return this.hasAttribute('playsinline'); } set playsInline(value) { this.toggleAttribute('playsinline', !!value); }
+  }
+  class HTMLAudioElement extends HTMLMediaElement {}
+  function Audio(src) { const audio = document.createElement('audio'); audio.preload = 'auto'; if (src !== undefined) audio.src = src; return audio; }
+  Audio.prototype = HTMLAudioElement.prototype;
   class DOMRect { constructor(x = 0, y = 0, width = 0, height = 0) { this.x = x; this.y = y; this.width = width; this.height = height; } get left() { return Math.min(this.x, this.x + this.width); } get right() { return Math.max(this.x, this.x + this.width); } get top() { return Math.min(this.y, this.y + this.height); } get bottom() { return Math.max(this.y, this.y + this.height); } toJSON() { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; } static fromRect(r = {}) { return new this(r.x, r.y, r.width, r.height); } }
   class UIEvent extends Event { constructor(type, options = {}) { super(type, options); this.view = options.view ?? window; this.detail = options.detail ?? 0; } }
-  class MouseEvent extends UIEvent { constructor(type, options = {}) { super(type, options); const { bubbles, cancelable, composed, ...fields } = options; Object.assign(this, { clientX: 0, clientY: 0, screenX: 0, screenY: 0, button: 0, buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, relatedTarget: null }, fields); } }
+  const mouseFields = { screenX: 0, screenY: 0, clientX: 0, clientY: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, button: 0, buttons: 0, relatedTarget: null, movementX: 0, movementY: 0 };
+  class MouseEvent extends UIEvent {
+    constructor(type, options = {}) { super(type, options); for (const key in mouseFields) this[key] = options[key] ?? mouseFields[key]; }
+    get x() { return this.clientX; } get y() { return this.clientY; }
+    get pageX() { return this.clientX + scrollX; } get pageY() { return this.clientY + scrollY; }
+    get offsetX() { const target = this.target; return target?.getBoundingClientRect ? this.clientX - target.getBoundingClientRect().left - target.clientLeft : this.clientX; }
+    get offsetY() { const target = this.target; return target?.getBoundingClientRect ? this.clientY - target.getBoundingClientRect().top - target.clientTop : this.clientY; }
+    get which() { return this.button + 1; }
+    getModifierState(key) { return !!this[({ Control: 'ctrlKey', Meta: 'metaKey', Alt: 'altKey', Shift: 'shiftKey' })[key]]; }
+  }
+  class WheelEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); this.deltaX = options.deltaX ?? 0; this.deltaY = options.deltaY ?? 0; this.deltaZ = options.deltaZ ?? 0; this.deltaMode = options.deltaMode ?? 0; } }
+  for (const [name, value] of Object.entries({ DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 })) { WheelEvent[name] = value; WheelEvent.prototype[name] = value; }
+  class ToggleEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldState = options.oldState ?? ''; this.newState = options.newState ?? ''; } }
+  class SubmitEvent extends Event { constructor(type, options = {}) { super(type, options); this.submitter = options.submitter ?? null; } }
   class KeyboardEvent extends UIEvent { constructor(type, options = {}) { super(type, options); const { bubbles, cancelable, composed, ...fields } = options; Object.assign(this, { key: '', code: '', keyCode: 0, charCode: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, repeat: false, isComposing: false }, fields); } getModifierState(key) { return !!this[({ Control: 'ctrlKey', Meta: 'metaKey', Alt: 'altKey', Shift: 'shiftKey' })[key]]; } }
-  class PointerEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); this.pointerId = options.pointerId ?? 0; this.pointerType = options.pointerType ?? ''; this.isPrimary = options.isPrimary ?? false; } }
+  class PointerEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); Object.assign(this, { pointerId: options.pointerId ?? 0, width: options.width ?? 1, height: options.height ?? 1, pressure: options.pressure ?? (this.buttons ? 0.5 : 0), tangentialPressure: options.tangentialPressure ?? 0, tiltX: options.tiltX ?? 0, tiltY: options.tiltY ?? 0, twist: options.twist ?? 0, altitudeAngle: options.altitudeAngle ?? Math.PI / 2, azimuthAngle: options.azimuthAngle ?? 0, pointerType: options.pointerType ?? '', isPrimary: options.isPrimary ?? false }); } getCoalescedEvents() { return []; } getPredictedEvents() { return []; } }
   class FocusEvent extends UIEvent { constructor(type, options = {}) { super(type, options); this.relatedTarget = options.relatedTarget ?? null; } }
   class InputEvent extends UIEvent {
     constructor(type, options = {}) { super(type, options); this.data = options.data ?? null; this.inputType = options.inputType ?? ''; this.isComposing = !!options.isComposing; this.dataTransfer = options.dataTransfer ?? null; this._targetRanges = Array.from(options.targetRanges ?? []); }
@@ -422,18 +991,158 @@
   class DragEvent extends MouseEvent {constructor(type,options={}){super(type,options);this.dataTransfer=options.dataTransfer??null;}}
   class CompositionEvent extends UIEvent { constructor(type, options = {}) { super(type, options); this.data = options.data ?? ''; } }
   class DocumentFragment extends Node { constructor(id, tag) { super(tag ? id : create('#fragment'), '#fragment'); } }
-  class CSSStyleSheet {
-    constructor(){this._text='';this._owners=new Map();}
-    replaceSync(text){this._text=String(text);for(const node of this._owners.values())node.textContent=this._text;}
-    replace(text){this.replaceSync(text);return Promise.resolve(this);}
-    get cssRules(){return this._text.split(/(?<=})/).filter(v=>v.trim()).map(cssText=>({cssText}));}
-    insertRule(rule,index=this.cssRules.length){const rules=this.cssRules.map(rule=>rule.cssText);if(index<0||index>rules.length)throw new DOMException('Invalid rule index','IndexSizeError');rules.splice(index,0,rule);this.replaceSync(rules.join(''));return index;}
-    deleteRule(index){const rules=this.cssRules.map(rule=>rule.cssText);if(index<0||index>=rules.length)throw new DOMException('Invalid rule index','IndexSizeError');rules.splice(index,1);this.replaceSync(rules.join(''));}
+  const ruleText = data => {
+    const block = list => list.length ? ' ' + list.map(ruleText).join(' ') : '', declarations = list => list.map(([name, value, priority]) => `${name}: ${value}${priority ? ' !important' : ''};`).join(' ');
+    switch (data[0]) {
+      case 'style': return `${data[1]} { ${declarations(data[2])}${block(data[3])} }`.replace('{  }', '{ }');
+      case 'media': return `@media ${data[1].join(', ')} {${block(data[2])} }`;
+      case 'supports': return `@supports ${data[1]} {${block(data[2])} }`;
+      case 'layer': return `@layer ${data[1]} {${block(data[2])} }`;
+      case 'layers': return `@layer ${data[1].join(', ')};`;
+      case 'container': return `@container ${data[1]} {${block(data[2])} }`;
+      case 'keyframes': return `@keyframes ${data[1]} {${data[2].map(frame => ` ${frame[0]} { ${declarations(frame[1])} }`).join('')} }`;
+      case 'font-face': return `@font-face { ${declarations(data[1])} }`;
+      case 'property': return `@property ${data[1]} { syntax: ${JSON.stringify(data[2])}; inherits: ${data[3]};${data[4] == null ? '' : ` initial-value: ${data[4]};`} }`;
+      case 'import': return `@import url("${data[1]}");`;
+      default: return data[1];
+    }
+  };
+  class CSSRuleList extends List {}
+  class StyleSheetList extends List {}
+  class MediaList {
+    constructor(read, write) { this._read = read; this._write = write; }
+    get mediaText() { return this._read().join(', '); } set mediaText(value) { this._write?.(String(value)); }
+    get length() { return this._read().length; } item(index) { return this._read()[index] ?? null; }
+    appendMedium(medium) { if (!this._read().includes(medium)) this.mediaText = [...this._read(), medium].join(', '); }
+    deleteMedium(medium) { const list = this._read(); if (!list.includes(medium)) throw new DOMException('Medium not found', 'NotFoundError'); this.mediaText = list.filter(item => item !== medium).join(', '); }
+    toString() { return this.mediaText; }
   }
+  const mediaList = text => text ? text.split(',').map(item => item.trim()).filter(Boolean) : [];
+  class CSSRule {
+    constructor(sheet, parent, data) { this._sheet = sheet; this._parent = parent; this._data = data; }
+    get parentStyleSheet() { return this._sheet; }
+    get parentRule() { return this._parent === this._sheet ? null : this._parent; }
+    get type() { return { style: 1, import: 3, media: 4, 'font-face': 5, keyframes: 7, keyframe: 8, supports: 12 }[this._data[0]] ?? 0; }
+    get cssText() { return ruleText(this._data); } set cssText(_) {}
+    _path() { const index = this._parent.cssRules.indexOf(this); return this._parent === this._sheet ? [index] : [...this._parent._path(), index]; }
+  }
+  class CSSGroupingRule extends CSSRule {
+    get _children() { return this._data[this._data[0] === 'style' ? 3 : 2]; }
+    get cssRules() { return this._rules ??= CSSRuleList.from(this._children, data => makeRule(this._sheet, this, data)); }
+    insertRule(rule, index = 0) { index = Number(index) >>> 0; if (index > this._children.length) throw new DOMException('Invalid rule index', 'IndexSizeError'); const data = this._sheet._edit('insert', [...this._path(), index], String(rule)); this._children.splice(index, 0, data); this.cssRules.splice(index, 0, makeRule(this._sheet, this, data)); return index; }
+    deleteRule(index) { index = Number(index) >>> 0; if (index >= this._children.length) throw new DOMException('Invalid rule index', 'IndexSizeError'); this._sheet._edit('delete', [...this._path(), index]); this._children.splice(index, 1); this.cssRules.splice(index, 1); }
+  }
+  class CSSStyleRule extends CSSGroupingRule {
+    get selectorText() { return this._data[1]; }
+    set selectorText(value) { value = String(value).trim(); if (!value || value === this._data[1]) return; this._sheet._edit('selector', this._path(), value); this._data[1] = value; }
+    get style() { return this._style ??= declaration({ rule: this, read: () => this._list ??= declare(this._data[2].map(([name, value, priority]) => `${name}:${value}${priority ? ' !important' : ''}`).join(';')), write: list => { this._list = list; this._data[2] = list; this._sheet._edit('style', this._path(), declarationText(list)); } }); }
+    set style(value) { this.style.cssText = value; }
+  }
+  class CSSMediaRule extends CSSGroupingRule { get media() { return this._media ??= new MediaList(() => this._data[1]); } get conditionText() { return this._data[1].join(', '); } }
+  class CSSSupportsRule extends CSSGroupingRule { get conditionText() { return this._data[1]; } }
+  class CSSContainerRule extends CSSGroupingRule { get conditionText() { return this._data[1]; } get containerQuery() { return this._data[1].replace(/^(?!not\b|\()[\w-]+\s+/, ''); } get containerName() { return /^(?!not\b|\()([\w-]+)\s/.exec(this._data[1])?.[1] ?? ''; } }
+  class CSSLayerBlockRule extends CSSGroupingRule { get name() { return this._data[1]; } }
+  class CSSLayerStatementRule extends CSSRule { get nameList() { return Object.freeze(this._data[1].slice()); } }
+  class CSSKeyframeRule extends CSSRule {
+    get keyText() { return this._data[0]; } set keyText(value) { this._data[0] = String(value); }
+    get type() { return 8; } get cssText() { return `${this._data[0]} { ${declarationText(this._data[1])} }`; }
+    get style() { return this._style ??= declaration({ rule: this, raw: true, read: () => this._data[1], write: list => { this._data[1] = list; } }); }
+  }
+  const keyText = key => String(key).trim().toLowerCase().replace(/^from$/, '0%').replace(/^to$/, '100%');
+  class CSSKeyframesRule extends CSSRule {
+    get name() { return this._data[1]; } set name(value) { this._data[1] = String(value); }
+    get cssRules() { return this._rules ??= CSSRuleList.from(this._data[2], data => new CSSKeyframeRule(this._sheet, this, data)); }
+    get length() { return this.cssRules.length; }
+    findRule(key) { key = keyText(key); return this.cssRules.findLast(rule => rule._data[0] === key) ?? null; }
+    appendRule(text) { const frames = this._sheet._edit('keyframe', this._path(), String(text)); for (const data of frames ?? []) { this._data[2].push(data); this.cssRules.push(new CSSKeyframeRule(this._sheet, this, data)); } }
+    deleteRule(key) { const rule = this.findRule(key); if (!rule) return; const index = this.cssRules.indexOf(rule); this._sheet._edit('keyframe', this._path(), String(index)); this._data[2].splice(index, 1); this.cssRules.splice(index, 1); }
+  }
+  class CSSFontFaceRule extends CSSRule { get style() { return this._style ??= declaration({ rule: this, raw: true, read: () => this._data[1], write: list => { this._data[1] = list; } }); } }
+  class CSSPropertyRule extends CSSRule { get name() { return this._data[1]; } get syntax() { return this._data[2]; } get inherits() { return this._data[3]; } get initialValue() { return this._data[4] ?? null; } }
+  class CSSImportRule extends CSSRule { get href() { return this._data[1]; } get media() { return this._media ??= new MediaList(() => []); } get styleSheet() { return null; } get layerName() { return null; } get supportsText() { return null; } }
+  const ruleTypes = { style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule, container: CSSContainerRule, layer: CSSLayerBlockRule, layers: CSSLayerStatementRule, keyframes: CSSKeyframesRule, 'font-face': CSSFontFaceRule, property: CSSPropertyRule, import: CSSImportRule };
+  const makeRule = (sheet, parent, data) => new (ruleTypes[data[0]] ?? CSSRule)(sheet, parent, data);
+  let sheetIds = 1;
+  class StyleSheet {
+    get type() { return 'text/css'; } get href() { return null; } get parentStyleSheet() { return null; } get ownerRule() { return null; }
+    get ownerNode() { return this._node; } get title() { return this._node?.getAttribute('title') ?? null; }
+    get media() { return this._media ??= new MediaList(() => mediaList(this._node ? this._node.getAttribute('media') : this._mediaText), value => { if (this._node) this._node.setAttribute('media', value); else this._mediaText = value; }); }
+    get disabled() { return this._disabled; }
+    set disabled(value) { value = !!value; if (value === this._disabled) return; this._disabled = value; if (this._node) call('dom.sheet', this._node._id, 'disabled', value); else for (const root of this._owners) adopt(root); }
+  }
+  class CSSStyleSheet extends StyleSheet {
+    constructor(options = {}, node = null) { super(); this._id = sheetIds++; this._node = node; this._text = null; this._data = []; this._rules = null; this._owners = new Set(); this._live = false; this._disabled = !!options.disabled; this._mediaText = typeof options.media === 'string' ? options.media : Array.from(options.media ?? []).join(', '); }
+    _sync() {
+      if (!this._node) return;
+      const value = text(this._node._m);
+      if (value === this._text) return;
+      this._text = value; this._data = call('dom.css', this._node._id);
+      if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data)));
+    }
+    _edit(kind, path, value = '') {
+      let result = null;
+      if (this._node) result = call('dom.sheet', this._node._id, kind, value, path);
+      else if (this._live) result = call('dom.constructed', this._id, kind, value, path);
+      else if (kind === 'insert') { const parsed = call('dom.constructed', 0, 'parse', value); result = parsed.length === 1 && parsed[0][0] !== 'other' ? parsed[0] : { error: 'SyntaxError' }; }
+      else if (kind === 'keyframe' && value.includes('{')) result = call('dom.constructed', 0, 'parse', `@keyframes x{${value}}`)[0]?.[2] ?? { error: 'SyntaxError' };
+      if (result?.error) throw new DOMException(`Failed to ${kind} the CSS rule`, result.error);
+      return result;
+    }
+    get cssRules() { this._sync(); return this._rules ??= CSSRuleList.from(this._data, data => makeRule(this, this, data)); }
+    get rules() { return this.cssRules; }
+    insertRule(rule, index = 0) { const rules = this.cssRules; index = Number(index) >>> 0; if (index > rules.length) throw new DOMException('Invalid rule index', 'IndexSizeError'); const data = this._edit('insert', [index], String(rule)); this._data.splice(index, 0, data); rules.splice(index, 0, makeRule(this, this, data)); return index; }
+    deleteRule(index) { const rules = this.cssRules; index = Number(index) >>> 0; if (index >= rules.length) throw new DOMException('Invalid rule index', 'IndexSizeError'); this._edit('delete', [index]); this._data.splice(index, 1); rules.splice(index, 1); }
+    addRule(selector = 'undefined', style = 'undefined', index) { this.insertRule(`${selector}{${style}}`, index ?? this.cssRules.length); return -1; }
+    removeRule(index = 0) { this.deleteRule(index); }
+    replaceSync(value) { if (this._node) throw new DOMException('Only constructed sheets can be replaced', 'NotAllowedError'); value = String(value).replace(/@import\s[^;]*;?/g, ''); this._data = call('dom.constructed', this._live ? this._id : 0, this._live ? 'replace' : 'parse', value); if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data))); }
+    replace(value) { try { this.replaceSync(value); return Promise.resolve(this); } catch (error) { return Promise.reject(error); } }
+  }
+  const sheetText = sheet => sheet._data.map(ruleText).join('\n');
+  const adopt = root => call('dom.adopt', root === document ? 0 : root._id, (root._adopted ?? []).filter(sheet => !sheet._disabled).map(sheet => sheet._id));
+  const adoptedSheets = root => {
+    const apply = list => {
+      for (const sheet of list) if (!(sheet instanceof CSSStyleSheet) || sheet._node) throw new DOMException('Only constructed sheets can be adopted', 'NotAllowedError');
+      const previous = root._adopted ?? [];
+      root._adopted = list;
+      for (const sheet of previous) if (!list.includes(sheet)) sheet._owners.delete(root);
+      for (const sheet of list) { sheet._owners.add(root); if (!sheet._live) { sheet._live = true; call('dom.constructed', sheet._id, 'replace', sheetText(sheet)); } }
+      for (const sheet of previous) if (!sheet._owners.size && sheet._live) { sheet._live = false; call('dom.constructed', sheet._id, 'drop'); }
+      adopt(root);
+    };
+    const list = [];
+    return { list, proxy: new Proxy(list, { set(target, key, value) { const next = target.slice(); next[key] = value; if (key !== 'length' && !(value instanceof CSSStyleSheet)) throw new TypeError('Expected a CSSStyleSheet'); Reflect.set(target, key, value); apply(target.filter(Boolean)); return true; }, deleteProperty(target, key) { Reflect.deleteProperty(target, key); apply(target.filter(Boolean)); return true; } }), apply };
+  };
+  const adoptedProperty = { configurable: true, get() { return (this._adoption ??= adoptedSheets(this)).proxy; }, set(sheets) { const adoption = this._adoption ??= adoptedSheets(this), list = Array.from(sheets); adoption.apply(list); adoption.list.splice(0, adoption.list.length, ...list); } };
+  const styleSheetsOf = root => {
+    const sheets = new StyleSheetList(), stack = [...root._m.kids].reverse();
+    while (stack.length) { const rec = stack.pop(); if (rec.tag === 'style') { const sheet = of(rec).sheet; if (sheet) sheets.push(sheet); } if (rec.tag !== 'template' && rec.tag !== 'noscript') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); }
+    return sheets;
+  };
+  const cssEscape = value => {
+    value = String(value); let out = '';
+    for (let i = 0; i < value.length; i++) {
+      const c = value.charCodeAt(i);
+      if (c === 0) out += '�';
+      else if (c <= 31 || c === 127 || (i === 0 || i === 1 && value.charCodeAt(0) === 45) && c >= 48 && c <= 57) out += '\\' + c.toString(16) + ' ';
+      else if (i === 0 && c === 45 && value.length === 1) out += '\\-';
+      else if (c >= 128 || c === 45 || c === 95 || c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122) out += value[i];
+      else out += '\\' + value[i];
+    }
+    return out;
+  };
+  const CSS = {
+    supports(name, value) { return call('dom.supports', String(name), arguments.length > 1 ? String(value) : null); },
+    escape: cssEscape,
+    registerProperty(definition) {
+      if (definition?.name === undefined || definition.inherits === undefined) throw new TypeError('Expected a name and inherits');
+      const result = call('dom.registerProperty', String(definition.name), String(definition.syntax ?? '*'), !!definition.inherits, definition.initialValue === undefined ? null : String(definition.initialValue));
+      if (result?.error) throw new DOMException('Invalid property registration', result.error);
+    },
+  };
   class ShadowRoot extends DocumentFragment {
     get innerHTML(){return this._m.kids.map(serialize).join('');} set innerHTML(value){setHTML(this,value);}
-    get activeElement() { return active && this.contains(active) ? active : null; }
-    get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;this.prepend(style);sheet._owners.set(this,style);}}
+    get activeElement() { for (let node = active; node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
+    get styleSheets() { return styleSheetsOf(this); }
   }
   const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root._m];while(stack.length){const rec=stack.pop(),Type=definitions.get(rec.tag),node=Type&&of(rec);if(Type&&!(node instanceof Type)){constructing={node};try{new Type();}finally{constructing=null;}for(const attr of Type.observedAttributes??[])if(node.hasAttribute(attr))node.attributeChangedCallback?.(attr,null,node.getAttribute(attr));if(node.isConnected)node.connectedCallback?.();}if(rec.tag!=='template')stack.push(...rec.kids);if(rec.shadow)stack.push(rec.shadow);}}};
   const filterNode = (walker, node) => !(walker.whatToShow & (1 << (node.nodeType - 1))) ? 3 : walker.filter == null ? 1 : typeof walker.filter === 'function' ? walker.filter(node) : walker.filter.acceptNode(node);
@@ -526,14 +1235,15 @@
     createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return node.cloneNode(deep); }
     adoptNode(node) { node.remove(); return node; }
+    get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;(this.head??this.documentElement).append(style);sheet._owners.set(this,style);}}
     getElementById(id) { id = String(id); return id ? find(this._m, rec => rec.attrs?.get('id') === id) : null; }
     getElementsByName(name) { return this.querySelectorAll('[name=' + quote(name) + ']'); }
-    addEventListener(name, fn, options) { if (name === 'DOMContentLoaded') queueMicrotask(() => fn(new Event(name))); else super.addEventListener(name, fn, options); }
     get body() { return find(this._m, rec => rec.tag === 'body'); } get head() { return find(this._m, rec => rec.tag === 'head'); } get documentElement() { return find(this._m, rec => rec.tag === 'html'); }
-    get activeElement() { return active ?? this.body; } get defaultView() { return globalThis; }
+    get activeElement() { let node = active; while (node && node.getRootNode() !== this) node = node.getRootNode().host ?? null; return node ?? this.body ?? this.documentElement; } get defaultView() { return globalThis; }
+    get baseURI() { const base = find(this._m, rec => rec.tag === 'base' && rec.attrs.has('href')); try { return base ? new URL(base.getAttribute('href'), location.href).href : location.href; } catch { return location.href; } }
     get URL() { return location.href; } get documentURI() { return location.href; } get location() { return this === document ? location : null; }
     get characterSet() { return 'UTF-8'; } get contentType() { return 'text/html'; } get scrollingElement() { return this.documentElement; }
-    get readyState() { return 'complete'; } get compatMode() { return 'CSS1Compat'; } get visibilityState() { return 'visible'; } get hidden() { return false; }
+    get readyState() { return this === document ? readyState : 'complete'; } get compatMode() { return 'CSS1Compat'; } get visibilityState() { return 'visible'; } get hidden() { return false; }
     get title() { return (find(this._m, rec => rec.tag === 'title')?.textContent ?? '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
     set title(value) {
       let title = find(this._m, rec => rec.tag === 'title');
@@ -563,24 +1273,25 @@
     get lastElementChild() { return of(this._m.kids.findLast(rec => rec.tag[0] !== '#')); }
     append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : document.createTextNode(String(child))); }
     prepend(...children) { const before = this.firstChild; for (const child of children) this.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
-    replaceChildren(...children) { if (observers.size || definitions.size) for (const child of this.childNodes) this.removeChild(child); else release(this); detach(this._m); op(1, this._id, ''); this.append(...children); }
-    querySelector(selector) { return wrap(call('dom.queryWithin', this._id, String(selector), true)); }
-    querySelectorAll(selector) { return listOf(NodeList, call('dom.queryWithin', this._id, String(selector)).map(wrap)); }
-    getElementsByTagName(name) { return listOf(HTMLCollection, this.querySelectorAll(name)); }
+    replaceChildren(...children) { const nodes = children.map(child => child instanceof Node ? child : document.createTextNode(String(child))); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); quiet++; try { for (const node of nodes) this.insertBefore(node, null); } finally { quiet--; } }); }
+    moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); moving = true; try { this.insertBefore(node, child); } finally { moving = false; } }
+    querySelector(selector) { return wrap(selectors('dom.queryWithin', this._id, selector, true)); }
+    querySelectorAll(selector) { return listOf(NodeList, selectors('dom.queryWithin', this._id, selector).map(wrap)); }
+    getElementsByTagName(name) { name = String(name); const lower = name.toLowerCase(), result = []; find(this._m, rec => { if (rec.tag[0] !== '#' && (name === '*' || rec.tag === lower || rec.tag === name)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); }
     getElementsByClassName(names) { names = String(names).split(/[\t\n\f\r ]+/).filter(Boolean); return listOf(HTMLCollection, names.length ? this.querySelectorAll(names.map(name => '[class~=' + quote(name) + ']').join('')) : []); }
   }
   const { constructor: _, ...parentNode } = Object.getOwnPropertyDescriptors(ParentNode.prototype);
   for (const Type of [Element, Document, DocumentFragment]) Object.defineProperties(Type.prototype, parentNode);
   class XMLSerializer { serializeToString(node) { if (!(node instanceof Node)) throw new TypeError('Expected a Node'); const source = serialize(node._m); return node.nodeType === 1 && node.namespaceURI && !node.hasAttribute('xmlns') ? source.replace(/^<[^\s>]+/, tag => tag + ' xmlns=' + quote(node.namespaceURI)) : source; } }
   class DOMParser {
-    parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));source=String(source);if(!/<html[\s>]/i.test(source))source=/<body[\s>]/i.test(source)?'<html><head></head>'+source+'</html>':'<html><head></head><body>'+source+'</body></html>';load(call('dom.html',doc._id,source));return doc;}
+    parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(call('dom.html',doc._id,String(source)));return doc;}
   }
   const comparePoints=(a,start,b,end)=>{if(a===b)return Math.sign(start-end);if(a.contains(b)){let child=b;while(child.parentNode!==a)child=child.parentNode;return start<=a.childNodes.indexOf(child)?-1:1;}if(b.contains(a))return -comparePoints(b,end,a,start);return a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1;};
   const rangeNodes=range=>call('dom.rangeNodes',range.startContainer._id,range.startOffset,range.endContainer._id,range.endOffset).map(([id,start,end])=>({node:wrap(id),start,end}));
   const textPoint=(root,offset)=>{const [id,index]=call('dom.textPoint',root._id,offset);return [wrap(id),index];};
   const textOffset=(root,node,offset)=>call('dom.textOffset',root._id,node?._id,offset);
   class Range {
-    constructor() { this.startContainer = this.endContainer = document; this.startOffset = this.endOffset = 0; }
+    constructor() { this.startContainer = this.endContainer = document; this.startOffset = this.endOffset = 0; ranges.add(new WeakRef(this)); }
     get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
     get commonAncestorContainer() { return path(this.startContainer).find(node => node.contains(this.endContainer)) ?? document; }
     setStart(node, offset) {
@@ -628,7 +1339,7 @@
     extractContents() { const result = this.cloneContents(); this.deleteContents(); return result; }
     insertNode(node) { const start = this.startContainer; if (start.nodeType === 3) start.parentNode.insertBefore(node, start.splitText(this.startOffset)); else start.insertBefore(node, start.childNodes[this.startOffset] ?? null); }
     surroundContents(node) { const contents = this.extractContents(); node.append(contents); this.insertNode(node); this.selectNode(node); }
-    createContextualFragment(html) { const div = document.createElement('div'); div.innerHTML = html; const fragment = document.createDocumentFragment(); fragment.append(...div.childNodes); return fragment; }
+    createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node.localName : 'body'); }
     getBoundingClientRect() {const rects=this.getClientRects();if(!rects.length)return new DOMRect();const left=Math.min(...rects.map(rect=>rect.left)),top=Math.min(...rects.map(rect=>rect.top));return new DOMRect(left,top,Math.max(...rects.map(rect=>rect.right))-left,Math.max(...rects.map(rect=>rect.bottom))-top);}
     getClientRects() {return rangeNodes(this).flatMap(({node,start,end})=>call('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
     compareBoundaryPoints(how,range){return how===0?comparePoints(this.startContainer,this.startOffset,range.startContainer,range.startOffset):how===1?comparePoints(this.endContainer,this.endOffset,range.startContainer,range.startOffset):how===2?comparePoints(this.endContainer,this.endOffset,range.endContainer,range.endOffset):comparePoints(this.startContainer,this.startOffset,range.endContainer,range.endOffset);}
@@ -704,7 +1415,17 @@
     deleteFromDocument() { for (const range of this.ranges) range.deleteContents(); }
     toString() { return call('dom.selectionText', 0, this.ranges.flatMap(range => rangeNodes(range).map(({node,start,end}) => [node._id,start,end]))); }
   }
-  class MutationObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this.records = []; } observe(target, options) { if (!options) throw new TypeError('Observer options required'); this.targets.set(target, { ...options, attributes: options.attributes ?? !!(options.attributeOldValue || options.attributeFilter), characterData: options.characterData ?? !!options.characterDataOldValue }); observers.add(this); } disconnect() { this.targets.clear(); this.records = []; observers.delete(this); } takeRecords() { return this.records.splice(0); } }
+  class MutationObserver {
+    constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this.records = []; }
+    observe(target, options = {}) {
+      if (!(target instanceof Node)) throw new TypeError('Expected a Node');
+      const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined), characterData = options.characterData ?? options.characterDataOldValue !== undefined;
+      if (!options.childList && !attributes && !characterData) throw new TypeError('The options must set childList, attributes or characterData');
+      if (!attributes && (options.attributeOldValue || options.attributeFilter) || !characterData && options.characterDataOldValue) throw new TypeError('Old values and filters need their kind of record');
+      this.targets.set(target, { ...options, attributes, characterData, attributeFilter: options.attributeFilter === undefined ? undefined : Array.from(options.attributeFilter, String) }); observers.add(this);
+    }
+    disconnect() { this.targets.clear(); this.records = []; observers.delete(this); } takeRecords() { return this.records.splice(0); }
+  }
   const intersectionObservers=new Set();
   class IntersectionObserver {
     constructor(callback,options={}){this.callback=callback;this.root=options.root??null;this.rootMargin=options.rootMargin??'0px';this.thresholds=[...new Set(Array.isArray(options.threshold)?options.threshold:[options.threshold??0])].sort((a,b)=>a-b);if(this.thresholds.some(v=>v<0||v>1))throw new RangeError('Invalid intersection threshold');this.targets=new Map();this.records=[];}
@@ -741,33 +1462,41 @@
     }
   };
 
+  // WARNING: drawing queues `code, ...args` floats that `Canvas::draw` in `render/canvas.rs` runs with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.
   class CanvasRenderingContext2D {
-    constructor(canvas) { this.canvas = canvas; this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, transform: [1,0,0,1,0,0], clip: [] }; this._stack = []; this._path = []; this._pending = []; }
-    _draw(op, data) { this._pending.push({ op, ...this._state, ...data }); if (this._pending.length === 1) queueMicrotask(() => { if (this._pending.length) call('dom.canvas', this.canvas._id, this._pending.splice(0)); }); }
-    _resize() { this._pending = []; call('dom.canvas', this.canvas._id, null); this._state.transform = [1,0,0,1,0,0]; this._state.clip = []; }
-    save() { this._stack.push({ ...this._state, transform: [...this._state.transform], clip: this._state.clip ? [...this._state.clip] : null }); } restore() { if (this._stack.length) this._state = this._stack.pop(); }
-    setTransform(a, b, c, d, e, f) { this._state.transform = typeof a === 'object' ? [a.a,a.b,a.c,a.d,a.e,a.f] : [a,b,c,d,e,f]; }
-    resetTransform() { this.setTransform(1,0,0,1,0,0); }
-    transform(a,b,c,d,e,f) { const [u,v,w,x,y,z] = this._state.transform; this.setTransform(u*a+w*b,v*a+x*b,u*c+w*d,v*c+x*d,u*e+w*f+y,v*e+x*f+z); }
-    scale(x,y) { this.transform(x,0,0,y,0,0); } translate(x,y) { this.transform(1,0,0,1,x,y); } rotate(a) { this.transform(Math.cos(a),Math.sin(a),-Math.sin(a),Math.cos(a),0,0); }
-    fillRect(x,y,width,height) { this._draw('fillRect', { x,y,width,height,reset: x === 0 && y === 0 && width >= this.canvas.width && height >= this.canvas.height && !this._state.clip && this.globalAlpha === 1 }); }
-    clearRect(x,y,width,height) { this._draw('clearRect',{x,y,width,height}); }
-    strokeRect(x,y,width,height) { this._draw('strokeRect', { x,y,width,height }); }
-    fillText(text,x,y,maxWidth) { this._draw('fillText', { text: String(text),x,y,maxWidth }); }
+    constructor(canvas) { this.canvas = canvas; this._ops = new Float32Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
+    _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1 }; this._stack = []; }
+    _op(code, ...args) {
+      const size = this._size;
+      if (size + args.length >= this._ops.length) { const grown = new Float32Array(this._ops.length * 2 + args.length); grown.set(this._ops); this._ops = grown; }
+      this._ops[size] = code; for (let i = 0; i < args.length; i++) this._ops[size + 1 + i] = args[i];
+      this._size = size + 1 + args.length;
+      if (!size) queueMicrotask(() => this._flush()); else if (this._size > 1 << 18) this._flush();
+    }
+    _flush() { if (!this._size) return; const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; call('dom.canvas', this.canvas._id, ops, text, ...data); }
+    _resize() { this._size = 0; this._texts.length = 0; this._data = []; this._reset(); call('dom.canvas', this.canvas._id, null); }
+    save() { this._stack.push({ ...this._state }); this._op(0); } restore() { if (this._stack.length) { this._state = this._stack.pop(); this._op(1); } }
+    setTransform(a = {}, b, c, d, e, f) { if (typeof a === 'object') ({ a = 1, b = 0, c = 0, d = 1, e = 0, f = 0 } = a); this._op(3, a, b, c, d, e, f); }
+    resetTransform() { this._op(3, 1, 0, 0, 1, 0, 0); } transform(a, b, c, d, e, f) { this._op(2, a, b, c, d, e, f); }
+    scale(x, y) { this._op(2, x, 0, 0, y, 0, 0); } translate(x, y) { this._op(2, 1, 0, 0, 1, x, y); } rotate(a) { const cos = Math.cos(a), sin = Math.sin(a); this._op(2, cos, sin, -sin, cos, 0, 0); }
+    fillRect(x, y, width, height) { this._op(21, x, y, width, height); } strokeRect(x, y, width, height) { this._op(22, x, y, width, height); } clearRect(x, y, width, height) { this._op(23, x, y, width, height); }
+    fillText(text, x, y) { text = String(text); this._texts.push(text); this._op(24, text.length, x, y); }
     measureText(text) { return call('dom.measureText', this.canvas._id, String(text), this.font); }
-    _flush() { if (this._pending.length) call('dom.canvas',this.canvas._id,this._pending.splice(0)); }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
     getImageData(x,y,width,height) { this._flush(); if (!width || !height) throw new DOMException('Image dimensions must be nonzero','IndexSizeError'); return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels',this.canvas._id,x,y,Math.abs(width),Math.abs(height))),Math.abs(width),Math.abs(height)); }
-    putImageData(data,x,y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._draw('putImageData',{data:data.data,width:data.width,height:data.height,x,y}); }
-    drawImage(image,...args) { if (!(image instanceof HTMLImageElement) && !(image instanceof HTMLCanvasElement)) throw new TypeError('Expected an image or canvas'); image._context?._flush?.(); const iw=image.naturalWidth ?? image.width,ih=image.naturalHeight ?? image.height; if (!iw||!ih) throw new DOMException('Image is not loaded','InvalidStateError'); let sx=0,sy=0,sw=iw,sh=ih,dx,dy,dw=iw,dh=ih; if(args.length===2) [dx,dy]=args; else if(args.length===4) [dx,dy,dw,dh]=args; else if(args.length===8) [sx,sy,sw,sh,dx,dy,dw,dh]=args; else throw new TypeError('Invalid drawImage arguments'); this._draw('image',{url:call('dom.canvasURL',image._id),iw,ih,sx,sy,sw,sh,dx,dy,dw,dh}); }
+    putImageData(data, x, y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._data.push(data.data.slice()); this._op(26, this._data.length - 1, x, y, data.width, data.height); }
+    drawImage(image,...args) { const video = image instanceof HTMLVideoElement; if (!(image instanceof HTMLImageElement) && !(image instanceof HTMLCanvasElement) && !video) throw new TypeError('Expected an image, canvas or video'); if (video && image.readyState < 2) return; image._context?._flush?.(); const iw=image.videoWidth ?? image.naturalWidth ?? image.width,ih=image.videoHeight ?? image.naturalHeight ?? image.height; if (!iw||!ih) throw new DOMException('Image is not loaded','InvalidStateError'); let sx=0,sy=0,sw=iw,sh=ih,dx,dy,dw=iw,dh=ih; if(args.length===2) [dx,dy]=args; else if(args.length===4) [dx,dy,dw,dh]=args; else if(args.length===8) [sx,sy,sw,sh,dx,dy,dw,dh]=args; else throw new TypeError('Invalid drawImage arguments'); this._op(25,image===this.canvas?-1:image._id,iw,ih,sx,sy,sw,sh,dx,dy,dw,dh); if (image._context && image!==this.canvas) this._flush(); }
 
-    beginPath() { this._path = []; } closePath() { this._path.push(['close']); } moveTo(x,y) { this._path.push(['move',x,y]); } lineTo(x,y) { this._path.push(['line',x,y]); }
-    rect(x,y,width,height) { this._path.push(['move',x,y],['line',x+width,y],['line',x+width,y+height],['line',x,y+height],['close']); }
-    quadraticCurveTo(x1,y1,x,y) { this._path.push(['quadratic',x1,y1,x,y]); } bezierCurveTo(x1,y1,x2,y2,x,y) { this._path.push(['bezier',x1,y1,x2,y2,x,y]); }
-    fill() { this._draw('fill', { path: this._path.map(p => [...p]) }); } stroke() { this._draw('stroke', { path: this._path.map(p => [...p]) }); }
-    clip(rule='nonzero') { if (!['nonzero','evenodd'].includes(rule)) throw new TypeError('Invalid fill rule'); this._state.clip=[...this._state.clip,{path:this._path.map(p=>[...p]),transform:[...this._state.transform],rule}]; }
+    beginPath() { this._op(11); } closePath() { this._op(12); } moveTo(x, y) { this._op(13, x, y); } lineTo(x, y) { this._op(14, x, y); } rect(x, y, width, height) { this._op(17, x, y, width, height); }
+    quadraticCurveTo(x1, y1, x, y) { this._op(15, x1, y1, x, y); } bezierCurveTo(x1, y1, x2, y2, x, y) { this._op(16, x1, y1, x2, y2, x, y); }
+    fill(rule = 'nonzero') { this._op(18, rule === 'evenodd' ? 1 : 0); } stroke() { this._op(19); }
+    clip(rule = 'nonzero') { if (!['nonzero','evenodd'].includes(rule)) throw new TypeError('Invalid fill rule'); this._op(20, rule === 'evenodd' ? 1 : 0); }
   }
-  for (const name of ['fillStyle','strokeStyle','font','textAlign','textBaseline','globalAlpha','lineWidth']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
+  for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
+    if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
+    if (this._state[name] === value) return;
+    this._state[name] = value; if (code < 9) { this._texts.push(value); this._op(code, value.length); } else this._op(code, value);
+  } });
   class ImageData {
     constructor(data,width,height) { if (typeof data==='number') {height=width;width=data;data=new Uint8ClampedArray(width*height*4);} else {if (!(data instanceof Uint8ClampedArray)) throw new TypeError('Expected Uint8ClampedArray');height??=data.length/(width*4);} if(!Number.isInteger(width)||!Number.isInteger(height)||width<=0||height<=0||data.length!==width*height*4) throw new DOMException('Invalid image dimensions','IndexSizeError');Object.assign(this,{data,width,height,colorSpace:'srgb'}); }
   }
@@ -781,18 +1510,90 @@
     toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.from(atob(data),c=>c.charCodeAt(0))],{type:'image/png'}))); }
     getContext(type) { if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); if (this._contextType && this._contextType !== type) return null; if (!['webgpu','2d'].includes(type)) return null; this._contextType = type; return this._context ??= type === '2d' ? new CanvasRenderingContext2D(this) : new GPUCanvasContext(this, this._id); }
   }
-  const htmlTypes = new Map([['canvas', HTMLCanvasElement], ['img', HTMLImageElement], ['slot', HTMLSlotElement], ['input', HTMLInputElement], ['textarea', HTMLInputElement], ['template', HTMLTemplateElement]]);
-  for (const [name, tags] of Object.entries({ Anchor: 'a', Body: 'body', BR: 'br', Button: 'button', Details: 'details', Dialog: 'dialog', Div: 'div', DList: 'dl', FieldSet: 'fieldset', Form: 'form', Head: 'head', Heading: 'h1 h2 h3 h4 h5 h6', HR: 'hr', Html: 'html', IFrame: 'iframe', Label: 'label', Legend: 'legend', LI: 'li', Link: 'link', Meta: 'meta', Meter: 'meter', OList: 'ol', OptGroup: 'optgroup', Option: 'option', Output: 'output', Paragraph: 'p', Pre: 'pre', Progress: 'progress', Quote: 'blockquote q', Script: 'script', Select: 'select', Span: 'span', Style: 'style', Table: 'table', TableCaption: 'caption', TableCell: 'td th', TableCol: 'col colgroup', TableRow: 'tr', TableSection: 'tbody tfoot thead', Time: 'time', Title: 'title', UList: 'ul' })) {
+  const htmlTypes = new Map([['canvas', HTMLCanvasElement], ['img', HTMLImageElement], ['video', HTMLVideoElement], ['audio', HTMLAudioElement], ['slot', HTMLSlotElement], ['input', HTMLInputElement], ['textarea', HTMLTextAreaElement], ['template', HTMLTemplateElement], ['select', HTMLSelectElement], ['option', HTMLOptionElement], ['optgroup', HTMLOptGroupElement], ['button', HTMLButtonElement], ['fieldset', HTMLFieldSetElement], ['output', HTMLOutputElement], ['form', HTMLFormElement], ['dialog', HTMLDialogElement], ['details', HTMLDetailsElement], ['label', HTMLLabelElement]]);
+  for (const [name, tags] of Object.entries({ Anchor: 'a', Area: 'area', Base: 'base', Body: 'body', BR: 'br', Data: 'data', DataList: 'datalist', Div: 'div', DList: 'dl', Embed: 'embed', Head: 'head', Heading: 'h1 h2 h3 h4 h5 h6', HR: 'hr', Html: 'html', IFrame: 'iframe', Legend: 'legend', LI: 'li', Link: 'link', Menu: 'menu', Meta: 'meta', Meter: 'meter', Mod: 'ins del', Object: 'object', OList: 'ol', Paragraph: 'p', Picture: 'picture', Pre: 'pre', Progress: 'progress', Quote: 'blockquote q', Script: 'script', Source: 'source', Span: 'span', Style: 'style', Table: 'table', TableCaption: 'caption', TableCell: 'td th', TableCol: 'col colgroup', TableRow: 'tr', TableSection: 'tbody tfoot thead', Time: 'time', Title: 'title', Track: 'track', UList: 'ul', Unknown: '' })) {
     const key = 'HTML' + name + 'Element', Type = globalThis[key] = { [key]: class extends HTMLElement {} }[key];
-    for (const tag of tags.split(' ')) htmlTypes.set(tag, Type);
+    for (const tag of tags.split(' ')) if (tag) htmlTypes.set(tag, Type);
+  }
+  for (const [tags, name] of [['a area link base', 'href'], ['img script iframe embed source track audio video input', 'src'], ['object', 'data'], ['blockquote q ins del', 'cite']]) for (const tag of tags.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { const value = this.getAttribute(name); return value === null ? '' : resolved(value); }, set(value) { this.setAttribute(name, value); } });
+  for (const key of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password']) for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, key, { configurable: true, get() { try { return new URL(this.href)[key]; } catch { return key === 'origin' ? 'null' : ''; } }, set(value) { try { const url = new URL(this.href); url[key] = value; this.href = url.href; } catch {} } });
+  for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, 'toString', { configurable: true, writable: true, value() { return this.href; } });
+  for (const tag of ['a', 'area', 'link']) Object.defineProperty(htmlTypes.get(tag).prototype, 'relList', { configurable: true, get() { return this._relList ??= new DOMTokenList(this, 'rel'); } });
+  {
+    const kids = (el, ...tags) => [...el.children].filter(child => tags.includes(child.localName));
+    const rows = el => kids(el, 'tr', 'thead', 'tbody', 'tfoot').flatMap(child => child.localName === 'tr' ? [child] : kids(child, 'tr'));
+    const insertRow = (section, index, all = kids(section, 'tr')) => { if (index < -1 || index > all.length) throw new DOMException('Row index out of range', 'IndexSizeError'); const row = document.createElement('tr'); return index === -1 || index === all.length ? (all.at(-1)?.parentNode ?? section).appendChild(row) : all[index].before(row) ?? row; };
+    const remove = (list, index) => { const item = list.at(index); if (!item || index < -1 || index >= list.length) throw new DOMException('Index out of range', 'IndexSizeError'); item.remove(); };
+    const section = (table, tag, before) => kids(table, tag)[0] ?? table.insertBefore(document.createElement(tag), before?.() ?? null);
+    Object.defineProperties(HTMLTableElement.prototype, Object.getOwnPropertyDescriptors({
+      get caption() { return kids(this, 'caption')[0] ?? null; },
+      get tHead() { return kids(this, 'thead')[0] ?? null; },
+      get tFoot() { return kids(this, 'tfoot')[0] ?? null; },
+      get tBodies() { return listOf(HTMLCollection, kids(this, 'tbody')); },
+      get rows() { return listOf(HTMLCollection, rows(this)); },
+      createCaption() { return section(this, 'caption', () => this.firstChild); },
+      createTHead() { return section(this, 'thead', () => kids(this, 'tbody', 'tfoot', 'tr')[0]); },
+      createTFoot() { return section(this, 'tfoot'); },
+      createTBody() { return this.insertBefore(document.createElement('tbody'), kids(this, 'tbody').at(-1)?.nextSibling ?? null); },
+      deleteCaption() { this.caption?.remove(); }, deleteTHead() { this.tHead?.remove(); }, deleteTFoot() { this.tFoot?.remove(); },
+      insertRow(index = -1) { const all = rows(this); return all.length || kids(this, 'tbody').length ? insertRow(kids(this, 'tbody').at(-1) ?? this, index, all) : this.appendChild(document.createElement('tbody')).appendChild(document.createElement('tr')); },
+      deleteRow(index) { remove(rows(this), index); },
+    }));
+    Object.defineProperties(HTMLTableSectionElement.prototype, Object.getOwnPropertyDescriptors({
+      get rows() { return listOf(HTMLCollection, kids(this, 'tr')); },
+      insertRow(index = -1) { return insertRow(this, index); },
+      deleteRow(index) { remove(kids(this, 'tr'), index); },
+    }));
+    Object.defineProperties(HTMLTableRowElement.prototype, Object.getOwnPropertyDescriptors({
+      get cells() { return listOf(HTMLCollection, kids(this, 'td', 'th')); },
+      get rowIndex() { const table = this.closest('table'); return table ? rows(table).indexOf(this) : -1; },
+      get sectionRowIndex() { return this.parentNode ? kids(this.parentNode, 'tr').indexOf(this) : -1; },
+      insertCell(index = -1) { const cells = kids(this, 'td', 'th'); if (index < -1 || index > cells.length) throw new DOMException('Cell index out of range', 'IndexSizeError'); const cell = document.createElement('td'); return index === -1 || index === cells.length ? this.appendChild(cell) : this.insertBefore(cell, cells[index]); },
+      deleteCell(index) { remove(kids(this, 'td', 'th'), index); },
+    }));
+    Object.defineProperty(HTMLTableCellElement.prototype, 'cellIndex', { get() { return this.parentNode ? kids(this.parentNode, 'td', 'th').indexOf(this) : -1; }, configurable: true });
   }
   load(call('dom.tree', 0));
   const document = globalThis.document = wrap(0);
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { Node, CharacterData, Text, Comment, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, HTMLImageElement, HTMLCanvasElement, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
+  Object.assign(globalThis, { Node, CharacterData, Text, Comment, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
   Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
+  Object.assign(globalThis, { CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
+  Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
+  Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
+  Object.defineProperty(HTMLStyleElement.prototype, 'sheet', { configurable: true, get() { let inert = !this.isConnected; for (let rec = this._m.up; rec && !inert; rec = rec.up) inert = rec.tag === 'template' || rec.tag === 'noscript'; return inert ? this._sheet = null : this._sheet ??= new CSSStyleSheet({}, this); } });
+  Object.defineProperty(HTMLLinkElement.prototype, 'sheet', { configurable: true, get() { return null; } });
+  Object.defineProperty(Node.prototype, 'baseURI', { configurable: true, get() { return document.baseURI; } });
+  globalThis.Option = function Option(text = '', value, defaultSelected = false, selected = false) { const option = document.createElement('option'); if (text !== '') option.text = text; if (value !== undefined) option.value = value; option.defaultSelected = defaultSelected; if (selected) option.selected = true; return option; };
+  // WARNING: `on*` properties add one listener on first set, where it keeps its place among the others, and remove it when set to null, like browser event handlers.
+  const handlers = new WeakMap();
+  const handler = (target, name) => Object.defineProperty(target, 'on' + name, { configurable: true, enumerable: true,
+    get() { return handlers.get(this)?.[name]?.value ?? null; },
+    set(value) {
+      let own = handlers.get(this); if (!own) handlers.set(this, own = { __proto__: null });
+      value = typeof value === 'function' || value !== null && typeof value === 'object' ? value : null;
+      const entry = own[name];
+      if (entry && value) { entry.value = value; return; }
+      if (entry) { this.removeEventListener(name, entry.listener); delete own[name]; }
+      if (!value) return;
+      const created = own[name] = { value, listener(event) { const fn = created.value; if (typeof fn !== 'function') return; const result = fn.call(this, event); if (result === false) event.preventDefault(); } };
+      this.addEventListener(name, created.listener);
+    } });
+  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
+  for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
+  handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange'); handler(Document.prototype, 'fullscreenchange');
+  for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Submit)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
+  globalThis.__appsLoaded = () => {
+    readyState = 'interactive'; dispatch(document, trusted(new Event('readystatechange')));
+    dispatch(document, trusted(new Event('DOMContentLoaded', { bubbles: true })));
+    const images = []; find(document._m, rec => { if (rec.tag === 'img') { const loading = rec.ref?.deref()?._loading; if (loading) images.push(loading.catch(() => {})); } return false; });
+    Promise.all(images).then(() => setTimeout(() => { readyState = 'complete'; dispatch(document, trusted(new Event('readystatechange'))); dispatchEvent(trusted(new Event('load'))); }, 0));
+  };
   globalThis.Image = function Image(width,height) { const image=document.createElement('img'); if(width!==undefined) image.width=width; if(height!==undefined) image.height=height; return image; };
   class FontFace {
     constructor(family,source,descriptors={}) { Object.assign(this,{family:String(family),style:'normal',weight:'normal',stretch:'normal',status:'unloaded'},descriptors); this._source=source;this.loaded=new Promise((resolve,reject)=>{this._resolve=resolve;this._reject=reject;});this.loaded.catch(()=>{}); }
@@ -812,10 +1613,11 @@
   globalThis.scrollTo = globalThis.scroll = (left, top) => document.documentElement?.scrollTo(left, top);
   globalThis.scrollBy = (left, top) => document.documentElement?.scrollBy(left, top);
   globalThis.getSelection = () => selection;
-  globalThis.getComputedStyle = node => {
-    const values = Object.setPrototypeOf(call('dom.style', node._id), null), keys = Object.keys(values), readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
-    return new Proxy({ get cssText() { return keys.map(key => key + ':' + values[key]).join(';'); }, set cssText(_) { readOnly(); }, length: keys.length, item: index => keys[index] ?? '', getPropertyValue: name => values[name] ?? '', getPropertyPriority: () => '', setProperty: readOnly, removeProperty: readOnly },
-      { get: (target, name) => name in target ? Reflect.get(target, name) : /^\d+$/.test(String(name)) ? target.item(Number(name)) : values[name === 'cssFloat' ? 'float' : cssName(name)] ?? '', set: readOnly });
+  globalThis.getComputedStyle = (node, pseudo = null) => {
+    if (!(node instanceof Element)) throw new TypeError('Expected an element');
+    const id = node._id, kind = pseudo == null ? '' : String(pseudo);
+    let names = null;
+    return declaration({ computed: name => { if (/^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin)/.test(name)) layout(); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
   };
   const animationFrames = new Map(); let animationFrameId = 0, animationTimer;
   globalThis.__appsAnimationFrame = () => {
@@ -846,7 +1648,7 @@
     removeListener(callback) { this.removeEventListener('change', callback); }
   }
   Object.assign(globalThis, { MediaQueryList, MediaQueryListEvent, matchMedia: query => new MediaQueryList(query) });
-  globalThis.__appsLayout = () => { for (const observer of resizeObservers) { const entries = []; for (const [target, previous] of observer.targets) { const rect = target.getBoundingClientRect(), value = rect.width + ':' + rect.height; if (value !== previous) { observer.targets.set(target, value); entries.push({ target, contentRect: new DOMRect(0,0,rect.width,rect.height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], devicePixelContentBoxSize: [{ inlineSize: rect.width * devicePixelRatio, blockSize: rect.height * devicePixelRatio }] }); } } if (entries.length) observer.callback(entries, observer); } }; 
+  globalThis.__appsLayout = () => { for (const observer of resizeObservers) { const entries = []; for (const [target, previous] of observer.targets) { const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(target, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } if (entries.length) observer.callback(entries, observer); } }; 
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -876,7 +1678,7 @@
       const [top,right=top,bottom=top,left=right]=margins,stop=observer.root?._m;
       const rootBounds=new DOMRect(root.x-left,root.y-top,root.width+left+right,root.height+top+bottom),rl=rootBounds.left,rt=rootBounds.top,rr=rootBounds.right,rb=rootBounds.bottom;
       for(const [target,previous]of observer.targets){
-        const i=4+target._id*8,inside=i<limit,bx=inside?m[i]:0,by=inside?m[i+1]:0,bw=inside?m[i+2]:0,bh=inside?m[i+3]:0;
+        const i=4+target._id*8,inside=i<limit&&!(marks[target._id]&16),bx=inside?m[i]:0,by=inside?m[i+1]:0,bw=inside?m[i+2]:0,bh=inside?m[i+3]:0;
         let x=Math.max(bx,rl),y=Math.max(by,rt),r=Math.min(bx+bw,rr),b=Math.min(by+bh,rb);
         for(let rec=target._m.up;rec&&rec.tag[0]!=='#'&&rec!==stop;rec=rec.up){if(marks[rec.id]&4){const j=4+rec.id*8;x=Math.max(x,m[j]);y=Math.max(y,m[j+1]);r=Math.min(r,m[j]+m[j+2]);b=Math.min(b,m[j+1]+m[j+3]);}}
         const isIntersecting=target.isConnected&&r>=x&&b>=y,area=bw*bh,ratio=isIntersecting?(area?Math.max(0,r-x)*Math.max(0,b-y)/area:1):0;
@@ -889,21 +1691,51 @@
     }
   };
 
-  globalThis.__appsEditing = () => active instanceof HTMLInputElement ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), marked: composing } : null;
+  globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), marked: composing } : null;
+  const blockOf = (host, node) => { let block = node.nodeType === 3 ? node.parentNode : node; while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode; return block; };
+  // WARNING: like Chromium, Enter in a contenteditable splits the paragraph into a new `div` (or the block's own tag), and an empty line holds a `br`.
+  const paragraph = (host, range) => {
+    const block = blockOf(host, range.startContainer), tail = document.createRange();
+    tail.setStart(range.startContainer, range.startOffset);
+    if (block === host) {
+      let top = range.startContainer; while (top.parentNode !== host) top = top.parentNode;
+      let next = top === host ? null : top.nextSibling; while (next && !/^(div|p|li|h[1-6]|blockquote|pre|ul|ol|table)$/.test(next.localName)) next = next.nextSibling;
+      if (next) tail.setEndBefore(next); else tail.setEnd(host, host.childNodes.length);
+      const line = document.createElement('div'); line.append(tail.extractContents());
+      if (!line.textContent) line.replaceChildren(document.createElement('br'));
+      if (!host.textContent && !host.querySelector('br')) host.prepend(document.createElement('br'));
+      host.insertBefore(line, next); return line;
+    }
+    tail.setEndAfter(block.lastChild ?? block);
+    const line = document.createElement(/^(li|p)$/.test(block.localName) ? block.localName : 'div'); line.append(tail.extractContents());
+    if (!line.textContent && !line.querySelector('br')) line.replaceChildren(document.createElement('br'));
+    if (!block.textContent && !block.querySelector('br')) block.append(document.createElement('br'));
+    block.after(line); return line;
+  };
+  const insertText = (range, text) => {
+    const node = range.startContainer, at = range.startOffset;
+    if (node.nodeType === 3) { node.insertData(at, text); return [node, at]; }
+    const before = node.childNodes[at - 1], after = node.childNodes[at], created = document.createTextNode(text);
+    if (before?.nodeType === 3) { const length = before.length; before.appendData(text); return [before, length]; }
+    if (after?.nodeType === 3) { after.insertData(0, text); return [after, 0]; }
+    const placeholder = [after, before].find(br => br?.localName === 'br' && !br.nextSibling && !br.previousSibling);
+    if (placeholder) node.replaceChild(created, placeholder); else node.insertBefore(created, after ?? null);
+    return [created, 0];
+  };
   globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null) => {
     const target = active;
-    if (!target || target.disabled || target.readOnly) return;
+    if (!target || disabled(target) || target.readOnly) return;
     const state = __appsEditing(); if (!state) return;
     text = String(text);
     start ??= composing?.[0] ?? Math.min(state.start,state.end); end ??= composing?.[1] ?? Math.max(state.start,state.end);
     start = Math.max(0, Math.min(start, state.text.length)); end = Math.max(start, Math.min(end, state.text.length));
-    const isComposing = mark || composing !== null, control = target instanceof HTMLInputElement;
+    const isComposing = mark || composing !== null, control = editable(target);
     inputType ??= isComposing ? 'insertCompositionText' : text ? 'insertText' : 'deleteContentBackward';
     if (mark && !composing) {
       composing = [start,end];
-      dispatch(target, new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' }));
+      dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
-    if (isComposing) dispatch(target, new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text }));
+    if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
     const targetRanges = [];
     if (!control) {
       const [startContainer,startOffset] = textPoint(target,start), [endContainer,endOffset] = textPoint(target,end);
@@ -911,29 +1743,36 @@
     }
     const data = inputType.startsWith('delete') || ['insertParagraph','insertLineBreak','historyUndo','historyRedo'].includes(inputType) || (inputType === 'insertFromPaste' && !control) ? null : text;
     const options = { bubbles: true, composed: true, data, inputType, isComposing, dataTransfer: control ? null : dataTransfer };
-    if (!dispatch(target, new InputEvent('beforeinput', { ...options, cancelable: !isComposing, targetRanges }))) return;
+    if (!dispatch(target, trusted(new InputEvent('beforeinput', { ...options, cancelable: !isComposing, targetRanges })))) return;
     if (active !== target || !target.isConnected) { if (isComposing) composing = null; return; }
     if (control) {
-      target.value = state.text.slice(0,start) + text + state.text.slice(end);
+      setValue(target, state.text.slice(0,start) + text + state.text.slice(end));
+      target._edited = true;
       target.setSelectionRange(start + (selected?.[0] ?? text.length), start + (selected?.[1] ?? text.length));
     } else {
-      const range = document.createRange(); range.setStart(...textPoint(target,start)); range.setEnd(...textPoint(target,end));
-      range.deleteContents();
-      if (text) range.insertNode(document.createTextNode(text));
-      selection.setBaseAndExtent(...textPoint(target,start + (selected?.[0] ?? text.length)), ...textPoint(target,start + (selected?.[1] ?? text.length)));
+      const current = !composing && selection.rangeCount && start === Math.min(state.start,state.end) && end === Math.max(state.start,state.end) && target.contains(selection.getRangeAt(0).startContainer);
+      const range = current ? selection.getRangeAt(0).cloneRange() : document.createRange();
+      if (!current) { range.setStart(...textPoint(target,start)); range.setEnd(...textPoint(target,end)); }
+      if (!range.collapsed) range.deleteContents();
+      const plain = target.getAttribute('contenteditable')?.toLowerCase() === 'plaintext-only';
+      if (inputType === 'insertParagraph' && !plain) { const line = paragraph(target, range), first = line.firstChild; selection.collapse(first?.nodeType === 3 ? first : line, 0); }
+      else if (inputType === 'insertLineBreak' && !plain) { const br = document.createElement('br'); range.insertNode(br); if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.data && !br.nextSibling.nextSibling) br.after(document.createElement('br')); selection.collapse(br.parentNode, br.parentNode.childNodes.indexOf(br) + 1); }
+      else { const [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset]; if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at); }
     }
     if (isComposing) composing = [start,start+text.length];
-    dispatch(target, new InputEvent('input', options));
+    dispatch(target, trusted(new InputEvent('input', options)));
     if (isComposing && !mark) {
       composing = null;
-      dispatch(target, new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text }));
+      dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
     }
   };
   globalThis.__appsFrameEvent=(id,event)=>{const target=wrap(id);if(event.type==='did-finish-load')dispatch(target,new Event('load'));else if(event.type==='did-fail-load')dispatch(target,new Event('error'));else if(event.type==='message')dispatch(target,new MessageEvent('message',{data:event.data,origin:'null'}));};
   globalThis.__appsClipboard = (type, text = '') => {
     const target = active ?? document.body, data = new DataTransfer();
+    // Like browsers, a password field neither copies nor cuts its text.
+    if (type !== 'paste' && target.localName === 'input' && target.type === 'password') return '';
     if (type === 'paste') data.setData('text/plain', text);
-    if (dispatch(target, new ClipboardEvent(type, { bubbles: true, cancelable: true, composed: true, clipboardData: data }))) {
+    if (dispatch(target, trusted(new ClipboardEvent(type, { bubbles: true, cancelable: true, composed: true, clipboardData: data })))) {
       const state = __appsEditing();
       if (type === 'paste') { if (state) __appsInput(text, undefined, undefined, false, null, 'insertFromPaste', data); }
       else {
@@ -943,7 +1782,7 @@
     }
     return data.getData('text/plain');
   };
-  globalThis.__appsDrop=(files,x,y)=>{const data=new DataTransfer();for(const value of files){const file=new File([new Uint8Array(value.bytes)],value.name,{lastModified:value.lastModified,type:({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf'})[value.name.split('.').at(-1).toLowerCase()]??'application/octet-stream'});file.path=value.path;data.items.add(file);}const target=document.elementFromPoint(x,y)??document.body;dispatch(target,new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,dataTransfer:data}));};
+  globalThis.__appsDrop=(files,x,y)=>{const data=new DataTransfer();for(const value of files){const file=new File([new Uint8Array(value.bytes)],value.name,{lastModified:value.lastModified,type:({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf'})[value.name.split('.').at(-1).toLowerCase()]??'application/octet-stream'});file.path=value.path;data.items.add(file);}const target=document.elementFromPoint(x,y)??document.body;dispatch(target,trusted(new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,dataTransfer:data})));};
   const nativeKeys = { backspace:'Backspace', delete:'Delete', enter:'Enter', escape:'Escape', tab:'Tab', left:'ArrowLeft', right:'ArrowRight', up:'ArrowUp', down:'ArrowDown', home:'Home', end:'End', pageup:'PageUp', pagedown:'PageDown', insert:'Insert', space:' ', shift:'Shift', control:'Control', ctrl:'Control', alt:'Alt', command:'Meta', super:'Meta' };
   const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91 };
   let modifiers = {}, graphemes, words;
@@ -983,25 +1822,35 @@
     hovered = target;
     call('dom.hover', to.map(node => node._id));
     for (const [kind, Type] of [['pointer', PointerEvent], ['mouse', MouseEvent]]) {
-      const fire = (node, type, ancestors, relatedTarget, bubbles) => dispatch(node, new Type(kind + type, { ...data, bubbles, cancelable: bubbles, composed: bubbles, relatedTarget }), ancestors);
+      const fire = (node, type, ancestors, relatedTarget, bubbles) => dispatch(node, trusted(new Type(kind + type, { ...data, bubbles, cancelable: bubbles, composed: bubbles, relatedTarget })), ancestors);
       if (previous) fire(previous, 'out', from.slice(), target, true);
       from.forEach((node, index) => { if (node.nodeType !== 11 && !to.includes(node)) fire(node, 'leave', from.slice(index), target, false); });
       if (target) fire(target, 'over', to.slice(), previous, true);
       for (let index = to.length; index--;) if (to[index].nodeType !== 11 && !from.includes(to[index])) fire(to[index], 'enter', to.slice(index), previous, false);
     }
   };
-  globalThis.__appsDispatch = (name, ids, data = {}) => {
-    if (name === 'pointerexit') { hover(null, data); return true; }
-    if (name.startsWith('window:')) return dispatchEvent(new Event(name.slice(7)));
-    if (name === 'animationend' || name === 'transitionend') { const target = wrap(ids[0]); return !!target && dispatch(target, Object.assign(new Event(name, { bubbles: true, composed: true }), data, { pseudoElement: '' })); }
+  const tabOrder = () => {
+    const list = [], stack = [document];
+    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
+    return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
+  };
+  // WARNING: native presses follow the browser order: pointerdown, mousedown, focus and selection, contextmenu; a canceled pointerdown drops the mouse events of the press, and a canceled mousedown keeps focus and selection.
+  let press = null, last = null;
+  const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
+  globalThis.__appsDispatch = (name, ids, data = {}) => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } };
+  const nativeEvent = (name, ids, data) => {
+    if (name === 'pointerexit') { hover(null, data); last = null; return true; }
+    if (name.startsWith('window:')) return dispatchEvent(trusted(new Event(name.slice(7))));
+    if (/^(animation|transition)(start|end|run|cancel|iteration)$/.test(name)) { const target = wrap(ids[0]); return !!target && dispatch(target, trusted(Object.assign(new Event(name, { bubbles: true, composed: true }), data, { pseudoElement: '' }))); }
     if (name === 'modifiers') {
       const previous = modifiers; modifiers = data;
       for (const [field,key] of Object.entries({ shiftKey:'Shift', ctrlKey:'Control', altKey:'Alt', metaKey:'Meta' })) {
-        if (!!previous[field] !== !!data[field]) __appsDispatch(data[field] ? 'keydown' : 'keyup', [], { ...data, key, code: key + 'Left', keyCode: keyCodes[key] });
+        if (!!previous[field] !== !!data[field]) nativeEvent(data[field] ? 'keydown' : 'keyup', [], { ...data, key, code: key + 'Left', keyCode: keyCodes[key] });
       }
       return true;
     }
     if (name === 'keydown' || name === 'keyup') {
+      if (name === 'keydown' && !keyboardFocus && !data.metaKey && !data.ctrlKey && !data.altKey) { keyboardFocus = true; if (active) call('dom.focus', path(active).map(node => node._id), true); }
       const target = active ?? document.body; if (!target) return false;
       if (data.nativeKey !== undefined) {
         const raw = data.nativeKey, upper = raw.toUpperCase(), named = nativeKeys[raw] ?? (/^f\d{1,2}$/.test(raw) ? upper : null);
@@ -1009,14 +1858,19 @@
         const key = named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
         data = { ...data, key, code, keyCode: keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }
-      const event = new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data });
+      const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data }));
       if (!dispatch(target, event)) return false;
-      if (name === 'keyup' || event.isComposing || event.keyCode === 229) return true;
+      if (event.isComposing || event.keyCode === 229) return true;
+      const plain = !event.metaKey && !event.ctrlKey && !event.altKey, tag = target.localName, type = tag === 'input' ? target.type : '';
+      if (name === 'keyup') {
+        if (event.key === ' ' && plain && (tag === 'button' || /^(button|submit|reset|image|checkbox|radio)$/.test(type) || tag === 'summary') && !disabled(target)) fireClick(target, { detail: 0 }, true);
+        return true;
+      }
       const state = __appsEditing(), mac = navigator.platform.includes('Mac'), primary = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
       if (state) {
         const start = Math.min(state.start,state.end), end = Math.max(state.start,state.end);
         if (primary && !event.altKey && event.key.toLowerCase() === 'a') {
-          if (target instanceof HTMLInputElement) target.select(); else selection.selectAllChildren(target);
+          if (editable(target)) target.select(); else selection.selectAllChildren(target);
           return false;
         }
         const backward = event.key === 'Backspace' || (mac && event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'h');
@@ -1031,8 +1885,8 @@
             return false;
           }
         }
-        if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey && !event.altKey && (target.localName === 'textarea' || target.isContentEditable)) {
-          __appsInput('\n', start, end, false, null, target.localName === 'textarea' || event.shiftKey ? 'insertLineBreak' : 'insertParagraph');
+        if (event.key === 'Enter' && plain && (tag === 'textarea' || target.isContentEditable)) {
+          __appsInput('\n', start, end, false, null, tag === 'textarea' || event.shiftKey ? 'insertLineBreak' : 'insertParagraph');
           return false;
         }
         if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)) {
@@ -1050,10 +1904,24 @@
             else { const previousStart = state.text.lastIndexOf('\n',lineStart - 2) + 1; next = lineStart === 0 ? 0 : Math.min(previousStart + column,lineStart - 1); }
           }
           const anchor = event.shiftKey ? state.start : next;
-          if (target instanceof HTMLInputElement) target.setSelectionRange(Math.min(anchor,next), Math.max(anchor,next), next < anchor ? 'backward' : 'forward');
+          if (editable(target)) target.setSelectionRange(Math.min(anchor,next), Math.max(anchor,next), next < anchor ? 'backward' : 'forward');
           else selection.setBaseAndExtent(...textPoint(target,anchor), ...textPoint(target,next));
           return false;
         }
+      }
+      if (event.key === 'Enter' && plain && tag === 'input') {
+        commit(target);
+        const form = target.form;
+        if (form && active === target) { const submit = [...form.elements].find(control => control.localName === 'button' ? control.type === 'submit' : /^(submit|image)$/.test(control.type)); if (submit) { if (!disabled(submit)) fireClick(submit, { detail: 0 }, true); } else if ([...form.elements].filter(control => editable(control) && control.localName === 'input').length === 1) submitForm(form, null); }
+        return false;
+      }
+      if (event.key === 'Enter' && plain && (tag === 'button' || /^(button|submit|reset|image)$/.test(type) || (tag === 'a' || tag === 'area') && target.hasAttribute('href') || tag === 'summary') && !disabled(target)) { fireClick(target, { detail: 0 }, true); return false; }
+      if (event.key === 'Escape' && modals.length && dispatch(modals.at(-1), trusted(new Event('cancel', { cancelable: true })))) { modals.at(-1).close(); return false; }
+      if (tag === 'select' && plain && !disabled(target) && /^(ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(event.key) || tag === 'select' && plain && event.key.length === 1 && event.key !== ' ') {
+        const list = options(target).filter(option => !disabled(option)), index = list.indexOf(target.selectedOptions[0]);
+        const next = event.key.length === 1 ? list.find((option, i) => i > index && option.text.toLowerCase().startsWith(event.key.toLowerCase())) ?? list.find(option => option.text.toLowerCase().startsWith(event.key.toLowerCase())) : list[event.key === 'Home' || event.key === 'PageUp' ? 0 : event.key === 'End' || event.key === 'PageDown' ? list.length - 1 : Math.max(0, Math.min(list.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))];
+        if (next && !next._current) { for (const option of options(target)) option._selected = option === next; target._none = false; selectedness(target); dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); dispatch(target, trusted(new Event('change', { bubbles: true }))); }
+        return false;
       }
       if (!state && primary && !event.altKey && event.key.toLowerCase() === 'a') {
         const root = selection.anchorNode?.getRootNode();
@@ -1061,55 +1929,67 @@
         return false;
       }
       if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) {
-        const focusable = [], stack = [document];
-        while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && !node.disabled && !node.hidden && (node.tabIndex >= 0 || node.isContentEditable && !node.parentElement?.isContentEditable)) focusable.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
-        focusable.sort((a,b) => (a.tabIndex > 0 ? a.tabIndex : Infinity) - (b.tabIndex > 0 ? b.tabIndex : Infinity));
-        const index = focusable.indexOf(active), next = (index + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length;
-        focusable[next]?.focus();
+        const list = tabOrder(), index = list.indexOf(active), next = index < 0 ? (event.shiftKey ? list.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + list.length) % list.length;
+        list[next]?.focus();
         return false;
       }
       return true;
     }
-    const hit = captures.get(data.pointerId) ?? wrap(ids[0]) ?? (Number.isFinite(data.clientX) && Number.isFinite(data.clientY) ? document.elementFromPoint(data.clientX,data.clientY) : null);
-    if (name === 'pointermove' || name === 'pointerdown' || name === 'pointerup') hover(hit?.nodeType === 3 ? hit.parentElement : hit, data);
-    const target = hit ?? (selectionDrag?.id === data.pointerId ? selectionDrag.host : null);
-    if (name === 'pointerdown' && target && (data.button ?? 0) === 0) call('dom.active', path(target).map(node => node._id));
-    if (name === 'pointerup' || name === 'pointercancel') call('dom.active', []);
+    const located = Number.isFinite(data.clientX) && Number.isFinite(data.clientY);
+    const hit = captures.get(1) ?? wrap(ids[0]) ?? (located ? document.elementFromPoint(data.clientX, data.clientY) : null), element = hit?.nodeType === 3 ? hit.parentElement : hit;
+    if (!located) data = { ...data, clientX: Number.isFinite(data.clientX) ? data.clientX : last?.[0] ?? 0, clientY: Number.isFinite(data.clientY) ? data.clientY : last?.[1] ?? 0 };
+    if (name === 'click') { if (element) { fireClick(element, mouseInit(data), true); if (data.detail === 2) dispatch(element, trusted(new MouseEvent('dblclick', mouseInit(data)))); } return !!element; }
+    if (name === 'wheel') {
+      const target = element ?? document.body, result = !target || dispatch(target, trusted(new WheelEvent('wheel', mouseInit(data, { deltaX: data.deltaX ?? 0, deltaY: data.deltaY ?? 0, deltaMode: data.deltaMode ?? 0 }))));
+      last = [data.clientX, data.clientY];
+      return result;
+    }
+    if (name !== 'pointermove' && name !== 'pointerdown' && name !== 'pointerup') return false;
+    if (!captures.has(1)) hover(element, mouseInit(data));
+    const target = element ?? (selectionDrag ? selectionDrag.host : null), button = data.button ?? 0, init = mouseInit(data, name === 'pointermove' ? { button: -1 } : {});
+    last = [data.clientX, data.clientY];
+    if (name === 'pointerdown' && target) call('dom.active', path(target).map(node => node._id));
+    if (name === 'pointerup' && !data.buttons) call('dom.active', []);
     if (!target) return false;
-    if (name === 'pointerup' && selectionDrag?.id === data.pointerId && Number.isFinite(data.clientX) && Number.isFinite(data.clientY)) __appsDispatch('pointermove', ids, { ...data, buttons: 1 });
-    if (name === 'pointerdown') pointers.add(data.pointerId);
-    const event = new (name.startsWith('pointer') ? PointerEvent : MouseEvent)(name, { bubbles: true, cancelable: true, composed: true, ...data });
-    const result = dispatch(target,event);
-    if (name === 'pointerdown' && result && (data.button ?? 0) === 0) {
-      selectionDrag = null;
-      const focusable = path(target).find(n => n.nodeType === 1 && (n.tabIndex >= 0 || n.isContentEditable && !n.parentElement?.isContentEditable));
-      focusable?.focus();
-      if (focusable instanceof HTMLInputElement) {
-        const offset = call('dom.textIndex',focusable._id,data.clientX,data.clientY), anchor = data.shiftKey ? (__appsEditing()?.start ?? offset) : offset;
+    if (name === 'pointerup' && selectionDrag && !data.buttons) __appsDispatch('pointermove', ids, { ...data, buttons: 1 << [0, 2, 1, 3, 4][button] });
+    const first = name === 'pointerdown' && (!press || press.button === button), ended = name === 'pointerup' && !data.buttons;
+    if (first) { pointers.add(1); press = { target, button, detail: data.detail ?? 1, mouse: true }; }
+    if (name === 'pointerdown') keyboardFocus = false;
+    const result = dispatch(target, trusted(new PointerEvent(first ? 'pointerdown' : ended ? 'pointerup' : 'pointermove', init)));
+    if (first && !result) press.mouse = false;
+    const blocked = path(target).some(node => node.nodeType === 1 && /^(button|input|select|textarea)$/.test(node.localName) && disabled(node));
+    const mouse = !blocked && (press?.mouse ?? true) && dispatch(target, trusted(new MouseEvent(name === 'pointerdown' ? 'mousedown' : name === 'pointerup' ? 'mouseup' : 'mousemove', init)));
+    if (name === 'pointerdown' && mouse) {
+      if (button === 0) selectionDrag = null;
+      const focus = path(target).find(node => focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable));
+      const offset = editable(focus) && button === 0 ? call('dom.textIndex', focus._id, data.clientX, data.clientY) : 0;
+      if (focus) focus.focus(); else if (button === 0) active?.blur();
+      if (button === 0 && editable(focus)) {
+        const anchor = data.shiftKey ? (__appsEditing()?.start ?? offset) : offset;
         const granularity = data.shiftKey ? 1 : Math.min(3,data.detail ?? 1);
-        const [start,end] = granularity > 1 ? selectionExtent(focusable.value,offset,granularity) : [anchor,offset];
-        focusable.setSelectionRange(Math.min(start,end),Math.max(start,end),end < start ? 'backward' : 'forward');
-        selectionDrag = { id: data.pointerId, host: focusable, offset: start, endOffset: end, granularity, x: data.clientX, y: data.clientY };
-      } else if (call('dom.userSelect',target._id)[0] !== 'none') {
-        const host = focusable?.isContentEditable ? focusable : target.getRootNode();
-        const point = Number.isFinite(data.clientX) && Number.isFinite(data.clientY) ? document.caretRangeFromPoint(data.clientX,data.clientY) : null;
+        const [start,end] = granularity > 1 ? selectionExtent(focus.value,offset,granularity) : [anchor,offset];
+        focus.setSelectionRange(Math.min(start,end),Math.max(start,end),end < start ? 'backward' : 'forward');
+        selectionDrag = { host: focus, offset: start, endOffset: end, granularity, x: data.clientX, y: data.clientY };
+      } else if (button === 0 && call('dom.userSelect',target._id)[0] !== 'none') {
+        const host = focus?.isContentEditable ? focus : target.getRootNode();
+        const point = document.caretRangeFromPoint(data.clientX,data.clientY);
         if (point && host.contains(point.startContainer)) {
           const [mode,boundary] = call('dom.userSelect',point.startContainer._id);
-          if (mode !== 'none' && dispatch(target, new Event('selectstart', { bubbles: true, cancelable: true }))) {
-            if (!focusable) active?.blur();
+          if (mode !== 'none' && dispatch(target, trusted(new Event('selectstart', { bubbles: true, cancelable: true })))) {
             const granularity = data.shiftKey ? 1 : Math.min(3,data.detail ?? 1);
             const range = selectionRange(point.startContainer,point.startOffset,granularity,mode,boundary);
             if (data.shiftKey && host.contains(selection.anchorNode)) selection.extend(range.endContainer,range.endOffset);
             else selection.setBaseAndExtent(range.startContainer,range.startOffset,range.endContainer,range.endOffset);
-            selectionDrag = { id:data.pointerId, host, node:selection.anchorNode, offset:selection.anchorOffset, endNode:selection.focusNode, endOffset:selection.focusOffset, granularity, x:data.clientX, y:data.clientY };
+            selectionDrag = { host, node:selection.anchorNode, offset:selection.anchorOffset, endNode:selection.focusNode, endOffset:selection.focusOffset, granularity, x:data.clientX, y:data.clientY };
           }
         }
       }
     }
-    if (name === 'pointermove' && result && selectionDrag?.id === data.pointerId && (selectionDrag.x !== data.clientX || selectionDrag.y !== data.clientY)) {
+    if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac'))) dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })));
+    if (name === 'pointermove' && result && selectionDrag && (selectionDrag.x !== data.clientX || selectionDrag.y !== data.clientY)) {
       const { host, node, offset, endNode, endOffset, granularity } = selectionDrag;
       selectionDrag.x = data.clientX; selectionDrag.y = data.clientY;
-      if (host instanceof HTMLInputElement) {
+      if (editable(host)) {
         let end = call('dom.textIndex',host._id,data.clientX,data.clientY), start = offset;
         if (granularity > 1) {
           const extent = selectionExtent(host.value,end,granularity);
@@ -1117,7 +1997,7 @@
         }
         host.setSelectionRange(Math.min(start,end),Math.max(start,end),end < start ? 'backward' : 'forward');
       } else {
-        const point = Number.isFinite(data.clientX) && Number.isFinite(data.clientY) ? document.caretRangeFromPoint(data.clientX,data.clientY) : null;
+        const point = document.caretRangeFromPoint(data.clientX,data.clientY);
         if (point && host.contains(point.startContainer)) {
           const [mode,boundary] = call('dom.userSelect',point.startContainer._id);
           const range = selectionRange(point.startContainer,point.startOffset,granularity,mode,boundary);
@@ -1127,9 +2007,11 @@
         }
       }
     }
-    if (name === 'pointerup' || name === 'pointercancel') { if (selectionDrag?.id === data.pointerId) selectionDrag = null; pointers.delete(data.pointerId); captures.get(data.pointerId)?.releasePointerCapture(data.pointerId); }
-    if (name === 'click' && result) activate(target);
-    if (name === 'click' && data.detail === 2) dispatch(target, new MouseEvent('dblclick', { bubbles: true, cancelable: true, composed: true, ...data }));
+    if (name === 'pointerup' && press?.button === button) {
+      const down = path(press.target), common = path(target).find(node => node.nodeType === 1 && down.includes(node)), detail = press.detail;
+      if (!blocked && common?.isConnected) { if (button === 0) { fireClick(common, { ...init, detail }, true); if (detail === 2) dispatch(common, trusted(new MouseEvent('dblclick', { ...init, detail }))); } else dispatch(common, trusted(new PointerEvent('auxclick', { ...init, detail }))); }
+    }
+    if (ended) { selectionDrag = null; press = null; pointers.delete(1); captures.get(1)?.releasePointerCapture(1); }
     return result;
   };
 })();

@@ -25,6 +25,7 @@ pub fn run(
     watch: bool,
     devtools: bool,
     mcp: Option<u16>,
+    args: &[String],
 ) -> Result<i32> {
     let root = entry.parent().context("Missing project directory")?;
     let public = root.join("public");
@@ -123,6 +124,9 @@ pub fn run(
                         .arg("--bundle-stdin")
                         .args(devtools.then_some("--devtools"))
                         .args(mcp.map(|port| format!("--devtools-mcp={port}")))
+                        .arg("--")
+                        .arg(entry)
+                        .args(args)
                         .env("APPS_JSC_LIBRARY", &library)
                         .current_dir(root)
                         .stdin(Stdio::piped())

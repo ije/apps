@@ -3,9 +3,11 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import <UserNotifications/UserNotifications.h>
 #import <Carbon/Carbon.h>
+#import <ImageIO/ImageIO.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -31,6 +33,35 @@ static uint32_t AppsReadTheme(void) {
         | (workspace.accessibilityDisplayShouldReduceTransparency << 3)
         | (workspace.accessibilityDisplayShouldDifferentiateWithoutColor << 4)
         | (workspace.accessibilityDisplayShouldReduceMotion << 5);
+}
+
+bool apps_display_p3(void) {
+    static int p3 = -1;
+    if (p3 < 0) p3 = [NSScreen.mainScreen canRepresentDisplayGamut:NSDisplayGamutP3];
+    return p3;
+}
+
+bool apps_image_decode(const uint8_t *bytes, size_t length, uint8_t *(*allocate)(void *, size_t, size_t), void *context) {
+    @autoreleasepool {
+        CFDataRef data = CFDataCreateWithBytesNoCopy(NULL, bytes, length, kCFAllocatorNull);
+        CGImageSourceRef source = CGImageSourceCreateWithData(data, NULL);
+        CFRelease(data);
+        if (!source) return false;
+        // WARNING: only these web formats decode, so a file that works on macOS also works with the other platforms' decoders.
+        NSString *type = (__bridge NSString *)CGImageSourceGetType(source);
+        CGImageRef image = type && [@[@"org.webmproject.webp", @"com.microsoft.bmp", @"com.microsoft.ico", @"public.avif"] containsObject:type] ? CGImageSourceCreateImageAtIndex(source, 0, NULL) : NULL;
+        CFRelease(source);
+        if (!image) return false;
+        size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+        uint8_t *pixels = allocate(context, width, height);
+        CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef bitmap = pixels ? CGBitmapContextCreate(pixels, width, height, 8, width * 4, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+        CGColorSpaceRelease(space);
+        if (bitmap) CGContextDrawImage(bitmap, CGRectMake(0, 0, width, height), image);
+        CGContextRelease(bitmap);
+        CGImageRelease(image);
+        return bitmap;
+    }
 }
 
 uint32_t apps_theme_state(void) {
@@ -92,6 +123,7 @@ static void AppsNativeEmit(NSDictionary *event) {
 @property(nonatomic, copy) NSString *instanceNotice;
 @property(nonatomic) uint32_t themeState;
 - (void)menuAction:(NSMenuItem *)item;
+- (void)screensChanged:(NSNotification *)notification;
 - (void)keyAction:(NSMenuItem *)item;
 - (void)themeChanged:(NSNotification *)notification;
 - (void)powerChanged:(NSNotification *)notification;
@@ -111,7 +143,18 @@ static void AppsNativeEmit(NSDictionary *event) {
 }
 - (void)menuAction:(NSMenuItem *)item {
     if ([item.representedObject isEqual:@"checkbox"]) item.state = item.state == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn;
-    AppsNativeEmit(@{ @"type": @"menu", @"id": @(item.tag), @"checked": @(item.state == NSControlStateValueOn) });
+    if ([item.representedObject isEqual:@"radio"]) {
+        NSArray *items = item.menu.itemArray;
+        NSInteger start = [items indexOfObject:item], end = start;
+        while (start > 0 && [[items[start - 1] representedObject] isEqual:@"radio"]) start--;
+        while (end + 1 < (NSInteger)items.count && [[items[end + 1] representedObject] isEqual:@"radio"]) end++;
+        for (NSInteger i = start; i <= end; i++) [items[i] setState:items[i] == item ? NSControlStateValueOn : NSControlStateValueOff];
+    }
+    NSEventModifierFlags flags = NSEvent.modifierFlags;
+    AppsNativeEmit(@{ @"type": @"menu", @"id": @(item.tag), @"checked": @(item.state == NSControlStateValueOn), @"shift": @((flags & NSEventModifierFlagShift) != 0), @"control": @((flags & NSEventModifierFlagControl) != 0), @"alt": @((flags & NSEventModifierFlagOption) != 0), @"meta": @((flags & NSEventModifierFlagCommand) != 0), @"accelerator": @(NSApp.currentEvent.type == NSEventTypeKeyDown) });
+}
+- (void)screensChanged:(NSNotification *)notification {
+    AppsNativeEmit(@{ @"type": @"screen" });
 }
 - (void)keyAction:(NSMenuItem *)item {
     NSArray *command = item.representedObject;
@@ -120,7 +163,7 @@ static void AppsNativeEmit(NSDictionary *event) {
     NSResponder *responder = [command[2] boolValue] ? window.contentView : window.firstResponder;
     if (![responder isKindOfClass:NSClassFromString(@"AppsView")]) return;
     NSArray *key = command[1];
-    NSString *text = [key[0] isEqual:@"backspace"] ? @"\177" : key[0];
+    NSString *text = [key[2] intValue] == kVK_Delete ? @"\177" : key[0];
     NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:[key[1] unsignedIntegerValue] timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:[key[2] unsignedShortValue]];
     [responder performKeyEquivalent:event];
 }
@@ -168,6 +211,7 @@ static AppsNative *AppsNativeOwner(void) {
         [NSWorkspace.sharedWorkspace.notificationCenter addObserver:owner selector:@selector(themeChanged:) name:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification object:nil];
         for (NSString *name in @[NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification, NSWorkspaceWillPowerOffNotification]) [[NSWorkspace sharedWorkspace].notificationCenter addObserver:owner selector:@selector(powerChanged:) name:name object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:owner selector:@selector(powerChanged:) name:NSProcessInfoThermalStateDidChangeNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:owner selector:@selector(screensChanged:) name:NSApplicationDidChangeScreenParametersNotification object:nil];
         EventTypeSpec type = { kEventClassKeyboard, kEventHotKeyPressed };
         InstallApplicationEventHandler(AppsHotkey, 1, &type, NULL, NULL);
     });
@@ -184,71 +228,72 @@ void apps_theme_observe(void (*wake)(void)) {
 }
 
 static NSArray *AppsAccelerator(NSString *accelerator) {
+    static NSDictionary *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *map = [NSMutableDictionary new];
+        const char *plain = "abcdefghijklmnopqrstuvwxyz0123456789-=,./[];'`\\", *shifted = ")!@#$%^&*(_+<>?{}:\"~|", *base = "0123456789-=,./[];'`\\";
+        const int codes[] = { kVK_ANSI_A, kVK_ANSI_B, kVK_ANSI_C, kVK_ANSI_D, kVK_ANSI_E, kVK_ANSI_F, kVK_ANSI_G, kVK_ANSI_H, kVK_ANSI_I, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_L, kVK_ANSI_M, kVK_ANSI_N, kVK_ANSI_O, kVK_ANSI_P, kVK_ANSI_Q, kVK_ANSI_R, kVK_ANSI_S, kVK_ANSI_T, kVK_ANSI_U, kVK_ANSI_V, kVK_ANSI_W, kVK_ANSI_X, kVK_ANSI_Y, kVK_ANSI_Z, kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9, kVK_ANSI_Minus, kVK_ANSI_Equal, kVK_ANSI_Comma, kVK_ANSI_Period, kVK_ANSI_Slash, kVK_ANSI_LeftBracket, kVK_ANSI_RightBracket, kVK_ANSI_Semicolon, kVK_ANSI_Quote, kVK_ANSI_Grave, kVK_ANSI_Backslash };
+        const int keypad[] = { kVK_ANSI_Keypad0, kVK_ANSI_Keypad1, kVK_ANSI_Keypad2, kVK_ANSI_Keypad3, kVK_ANSI_Keypad4, kVK_ANSI_Keypad5, kVK_ANSI_Keypad6, kVK_ANSI_Keypad7, kVK_ANSI_Keypad8, kVK_ANSI_Keypad9 };
+        const int functions[] = { kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12, kVK_F13, kVK_F14, kVK_F15, kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20 };
+        for (size_t i = 0; plain[i]; i++) map[[NSString stringWithFormat:@"%c", plain[i]]] = @[[NSString stringWithFormat:@"%c", plain[i]], @(codes[i]), @NO];
+        for (size_t i = 0; shifted[i]; i++) map[[NSString stringWithFormat:@"%c", shifted[i]]] = @[[NSString stringWithFormat:@"%c", shifted[i]], map[[NSString stringWithFormat:@"%c", base[i]]][1], @YES];
+        for (int i = 0; i < 10; i++) map[[NSString stringWithFormat:@"num%d", i]] = @[[NSString stringWithFormat:@"%d", i], @(keypad[i]), @NO];
+        for (int i = 0; i < 24; i++) { unichar key = NSF1FunctionKey + i; map[[NSString stringWithFormat:@"f%d", i + 1]] = @[[NSString stringWithCharacters:&key length:1], @(i < 20 ? functions[i] : -1), @NO]; }
+        NSString *(^function)(unichar) = ^NSString *(unichar key) { return [NSString stringWithCharacters:&key length:1]; };
+        [map addEntriesFromDictionary:@{ @"plus": @[@"+", @(kVK_ANSI_Equal), @YES], @"space": @[@" ", @(kVK_Space), @NO], @"tab": @[@"\t", @(kVK_Tab), @NO], @"backspace": @[@"\b", @(kVK_Delete), @NO], @"delete": @[function(NSDeleteFunctionKey), @(kVK_ForwardDelete), @NO], @"insert": @[function(NSInsertFunctionKey), @(kVK_Help), @NO], @"return": @[@"\r", @(kVK_Return), @NO], @"enter": @[@"\r", @(kVK_Return), @NO], @"escape": @[@"\e", @(kVK_Escape), @NO], @"esc": @[@"\e", @(kVK_Escape), @NO],
+            @"up": @[function(NSUpArrowFunctionKey), @(kVK_UpArrow), @NO], @"down": @[function(NSDownArrowFunctionKey), @(kVK_DownArrow), @NO], @"left": @[function(NSLeftArrowFunctionKey), @(kVK_LeftArrow), @NO], @"right": @[function(NSRightArrowFunctionKey), @(kVK_RightArrow), @NO], @"home": @[function(NSHomeFunctionKey), @(kVK_Home), @NO], @"end": @[function(NSEndFunctionKey), @(kVK_End), @NO], @"pageup": @[function(NSPageUpFunctionKey), @(kVK_PageUp), @NO], @"pagedown": @[function(NSPageDownFunctionKey), @(kVK_PageDown), @NO], @"printscreen": @[function(NSPrintScreenFunctionKey), @-1, @NO],
+            @"numdec": @[@".", @(kVK_ANSI_KeypadDecimal), @NO], @"numadd": @[@"+", @(kVK_ANSI_KeypadPlus), @NO], @"numsub": @[@"-", @(kVK_ANSI_KeypadMinus), @NO], @"nummult": @[@"*", @(kVK_ANSI_KeypadMultiply), @NO], @"numdiv": @[@"/", @(kVK_ANSI_KeypadDivide), @NO],
+            @"volumeup": @[@"", @(kVK_VolumeUp), @NO], @"volumedown": @[@"", @(kVK_VolumeDown), @NO], @"volumemute": @[@"", @(kVK_Mute), @NO], @"capslock": @[@"", @(kVK_CapsLock), @NO], @"numlock": @[@"", @-1, @NO], @"scrolllock": @[@"", @-1, @NO], @"mediaplaypause": @[@"", @-1, @NO], @"medianexttrack": @[@"", @-1, @NO], @"mediaprevioustrack": @[@"", @-1, @NO], @"mediastop": @[@"", @-1, @NO] }];
+        keys = map;
+    });
     NSArray *parts = [accelerator componentsSeparatedByString:@"+"];
-    NSString *key = [parts.lastObject lowercaseString];
+    NSArray *key = keys[[parts.lastObject lowercaseString]];
     NSUInteger modifiers = 0;
     for (NSUInteger i = 0; i + 1 < parts.count; i++) {
         NSString *part = [parts[i] lowercaseString];
-        if ([@[@"command", @"cmd", @"commandorcontrol", @"cmdorctrl", @"super"] containsObject:part]) modifiers |= NSEventModifierFlagCommand;
+        if ([@[@"command", @"cmd", @"commandorcontrol", @"cmdorctrl", @"super", @"meta"] containsObject:part]) modifiers |= NSEventModifierFlagCommand;
         else if ([@[@"control", @"ctrl"] containsObject:part]) modifiers |= NSEventModifierFlagControl;
-        else if ([@[@"alt", @"option"] containsObject:part]) modifiers |= NSEventModifierFlagOption;
+        else if ([@[@"alt", @"option", @"altgr"] containsObject:part]) modifiers |= NSEventModifierFlagOption;
         else if ([part isEqual:@"shift"]) modifiers |= NSEventModifierFlagShift;
         else return nil;
     }
-    NSDictionary *keys = @{ @"plus": @(kVK_ANSI_Equal), @"num0": @(kVK_ANSI_Keypad0), @"numadd": @(kVK_ANSI_KeypadPlus), @"numsub": @(kVK_ANSI_KeypadMinus), @"a": @(kVK_ANSI_A), @"b": @(kVK_ANSI_B), @"c": @(kVK_ANSI_C), @"d": @(kVK_ANSI_D), @"e": @(kVK_ANSI_E), @"f": @(kVK_ANSI_F), @"g": @(kVK_ANSI_G), @"h": @(kVK_ANSI_H), @"i": @(kVK_ANSI_I), @"j": @(kVK_ANSI_J), @"k": @(kVK_ANSI_K), @"l": @(kVK_ANSI_L), @"m": @(kVK_ANSI_M), @"n": @(kVK_ANSI_N), @"o": @(kVK_ANSI_O), @"p": @(kVK_ANSI_P), @"q": @(kVK_ANSI_Q), @"r": @(kVK_ANSI_R), @"s": @(kVK_ANSI_S), @"t": @(kVK_ANSI_T), @"u": @(kVK_ANSI_U), @"v": @(kVK_ANSI_V), @"w": @(kVK_ANSI_W), @"x": @(kVK_ANSI_X), @"y": @(kVK_ANSI_Y), @"z": @(kVK_ANSI_Z), @"0": @(kVK_ANSI_0), @"1": @(kVK_ANSI_1), @"2": @(kVK_ANSI_2), @"3": @(kVK_ANSI_3), @"4": @(kVK_ANSI_4), @"5": @(kVK_ANSI_5), @"6": @(kVK_ANSI_6), @"7": @(kVK_ANSI_7), @"8": @(kVK_ANSI_8), @"9": @(kVK_ANSI_9), @"space": @(kVK_Space), @"enter": @(kVK_Return), @"return": @(kVK_Return), @"escape": @(kVK_Escape), @"esc": @(kVK_Escape), @"tab": @(kVK_Tab), @"backspace": @(kVK_Delete), @"delete": @(kVK_ForwardDelete), @"up": @(kVK_UpArrow), @"down": @(kVK_DownArrow), @"left": @(kVK_LeftArrow), @"right": @(kVK_RightArrow), @"f1": @(kVK_F1), @"f2": @(kVK_F2), @"f3": @(kVK_F3), @"f4": @(kVK_F4), @"f5": @(kVK_F5), @"f6": @(kVK_F6), @"f7": @(kVK_F7), @"f8": @(kVK_F8), @"f9": @(kVK_F9), @"f10": @(kVK_F10), @"f11": @(kVK_F11), @"f12": @(kVK_F12), @"-": @(kVK_ANSI_Minus), @"=": @(kVK_ANSI_Equal), @",": @(kVK_ANSI_Comma), @".": @(kVK_ANSI_Period), @"/": @(kVK_ANSI_Slash), @"[": @(kVK_ANSI_LeftBracket), @"]": @(kVK_ANSI_RightBracket), @";": @(kVK_ANSI_Semicolon) };
-    if (!keys[key]) return nil;
-    return @[key, @(modifiers), keys[key]];
+    return key ? @[key[0], @(modifiers), key[1], key[2]] : nil;
 }
 
 static NSMenu *AppsMenu(NSArray *template) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
     menu.autoenablesItems = NO;
-    NSDictionary *roles = @{ @"about": @"orderFrontStandardAboutPanel:", @"hide": @"hide:", @"hideOthers": @"hideOtherApplications:", @"unhide": @"unhideAllApplications:", @"delete": @"delete:", @"startSpeaking": @"startSpeaking:", @"stopSpeaking": @"stopSpeaking:", @"front": @"arrangeInFront:", @"quit": @"terminate:", @"copy": @"copy:", @"paste": @"paste:", @"pasteAndMatchStyle": @"pasteAsPlainText:", @"cut": @"cut:", @"selectAll": @"selectAll:", @"undo": @"undo:", @"redo": @"redo:", @"minimize": @"performMiniaturize:", @"zoom": @"performZoom:", @"close": @"performClose:", @"togglefullscreen": @"toggleFullScreen:", @"toggleDevTools": @"keyAction:" };
-    NSDictionary *keys = @{ @"copy": @"Command+C", @"cut": @"Command+X", @"paste": @"Command+V", @"pasteAndMatchStyle": @"Command+V", @"selectAll": @"Command+A", @"undo": @"Command+Z", @"redo": @"Command+Shift+Z", @"delete": @"Backspace", @"toggleDevTools": @"Command+Alt+I" };
-    for (NSDictionary *__strong description in template) {
+    NSDictionary *roles = @{ @"about": @"about:", @"hide": @"hide:", @"hideothers": @"hideOtherApplications:", @"unhide": @"unhideAllApplications:", @"delete": @"delete:", @"startspeaking": @"startSpeaking:", @"stopspeaking": @"stopSpeaking:", @"front": @"arrangeInFront:", @"quit": @"terminate:", @"copy": @"copy:", @"paste": @"paste:", @"pasteandmatchstyle": @"pasteAsPlainText:", @"cut": @"cut:", @"selectall": @"selectAll:", @"undo": @"undo:", @"redo": @"redo:", @"minimize": @"performMiniaturize:", @"zoom": @"performZoom:", @"close": @"performClose:", @"togglefullscreen": @"toggleFullScreen:", @"toggledevtools": @"",
+        @"toggletabbar": @"toggleTabBar:", @"selectnexttab": @"selectNextTab:", @"selectprevioustab": @"selectPreviousTab:", @"showalltabs": @"toggleTabOverview:", @"mergeallwindows": @"mergeAllWindows:", @"movetabtonewwindow": @"moveTabToNewWindow:", @"showsubstitutions": @"orderFrontSubstitutionsPanel:", @"togglesmartquotes": @"toggleAutomaticQuoteSubstitution:", @"togglesmartdashes": @"toggleAutomaticDashSubstitution:", @"toggletextreplacement": @"toggleAutomaticTextReplacement:", @"togglespellchecker": @"toggleContinuousSpellChecking:", @"clearrecentdocuments": @"clearRecentDocuments:" };
+    NSDictionary *keys = @{ @"copy": @"Command+C", @"cut": @"Command+X", @"paste": @"Command+V", @"pasteandmatchstyle": @"Command+V", @"selectall": @"Command+A", @"undo": @"Command+Z", @"redo": @"Command+Shift+Z", @"delete": @"Backspace", @"toggledevtools": @"Command+Alt+I" };
+    AppsNative *owner = AppsNativeOwner();
+    for (NSDictionary *description in template) {
         if ([description[@"type"] isEqual:@"separator"]) { [menu addItem:[NSMenuItem separatorItem]]; continue; }
-        NSString *role = description[@"role"];
-        BOOL windows = [role isEqual:@"windowMenu"], help = [role isEqual:@"help"];
-        if (windows) {
-            if (!description[@"submenu"]) description = @{ @"label": @"Window", @"submenu": @[@{ @"label": @"Minimize", @"role": @"minimize", @"accelerator": @"Command+M" }, @{ @"label": @"Zoom", @"role": @"zoom" }, @{ @"type": @"separator" }, @{ @"label": @"Bring All to Front", @"role": @"front" }] };
-            role = nil;
-        }
-        BOOL services = [role isEqual:@"services"];
-        if ([role isEqual:@"help"] && description[@"submenu"]) role = nil;
-        if (role && !services && !roles[role] && !description[@"click"]) return nil;
-        if (role && !roles[role]) role = nil;
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:description[@"label"] ?: description[@"role"] ?: @"" action:role ? NSSelectorFromString(roles[role]) : @selector(menuAction:) keyEquivalent:@""];
-        if (!role) { item.target = AppsNativeOwner(); item.tag = [description[@"click"] integerValue]; }
-        if ([role isEqual:@"about"]) { item.target = AppsNativeOwner(); item.action = @selector(about:); }
-        if (description[@"accelerator"]) {
-            NSArray *accelerator = AppsAccelerator(description[@"accelerator"]);
-            if (!accelerator) return nil;
-            NSString *key = accelerator[0];
-            if ([key isEqual:@"space"]) key = @" ";
-            if ([key isEqual:@"enter"] || [key isEqual:@"return"]) key = @"\r";
-            if ([key isEqual:@"plus"] || [key isEqual:@"numadd"]) key = @"+";
-            if ([key isEqual:@"numsub"]) key = @"-";
-            if ([key isEqual:@"num0"]) key = @"0";
-            if ([key hasPrefix:@"f"] && key.length > 1 && [[key substringFromIndex:1] integerValue] > 0) { unichar value = NSF1FunctionKey + [[key substringFromIndex:1] intValue] - 1; key = [NSString stringWithCharacters:&value length:1]; }
-            item.keyEquivalent = key;
+        NSString *role = description[@"role"], *selector = description[@"submenu"] ? nil : roles[role];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:description[@"label"] ?: @"" action:selector.length ? NSSelectorFromString(selector) : @selector(menuAction:) keyEquivalent:@""];
+        if (!selector || [role isEqual:@"about"]) { item.target = owner; item.tag = [description[@"click"] integerValue]; }
+        NSArray *accelerator = description[@"accelerator"] ? AppsAccelerator(description[@"accelerator"]) : nil;
+        if ([accelerator[0] length]) {
+            item.keyEquivalent = accelerator[0];
             item.keyEquivalentModifierMask = [accelerator[1] unsignedIntegerValue];
         }
         item.enabled = description[@"enabled"] ? [description[@"enabled"] boolValue] : YES;
         item.hidden = description[@"visible"] ? ![description[@"visible"] boolValue] : NO;
         item.state = [description[@"checked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
         item.representedObject = description[@"type"];
-        if (role && keys[role]) {
-            item.target = AppsNativeOwner();
+        if (description[@"toolTip"]) item.toolTip = description[@"toolTip"];
+        if (selector && keys[role]) {
+            item.target = owner;
             item.action = @selector(keyAction:);
-            item.representedObject = @[[role isEqual:@"toggleDevTools"] ? @"" : roles[role], AppsAccelerator(keys[role]), @([role isEqual:@"toggleDevTools"])];
+            item.representedObject = @[selector, AppsAccelerator(keys[role]), @([role isEqual:@"toggledevtools"])];
         }
-        if (services) { item.submenu = [[NSMenu alloc] initWithTitle:@"Services"]; NSApp.servicesMenu = item.submenu; }
+        if ([role isEqual:@"services"] && !description[@"submenu"]) { item.submenu = [[NSMenu alloc] initWithTitle:@"Services"]; NSApp.servicesMenu = item.submenu; }
         if (description[@"submenu"]) {
             item.submenu = AppsMenu(description[@"submenu"]);
-            if (!item.submenu) return nil;
             item.submenu.title = item.title;
-            if (windows) NSApp.windowsMenu = item.submenu;
-            if (help) NSApp.helpMenu = item.submenu;
+            if ([role isEqual:@"windowmenu"] || [role isEqual:@"window"]) NSApp.windowsMenu = item.submenu;
+            if ([role isEqual:@"help"]) NSApp.helpMenu = item.submenu;
         }
         [menu addItem:item];
     }
@@ -297,13 +342,9 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         result = @(info && CFEqual(IOPSGetProvidingPowerSourceType(info), CFSTR(kIOPSBatteryPowerValue)));
         if (info) CFRelease(info);
     }
-    else if ([op isEqualToString:@"menu.set"]) {
-        NSMenu *menu = args == [NSNull null] ? nil : AppsMenu(args);
-        if (args != [NSNull null] && !menu) return strdup("{\"error\":\"Unsupported menu role or accelerator\"}");
-        NSApp.mainMenu = menu;
-    } else if ([op isEqualToString:@"menu.popup"]) {
+    else if ([op isEqualToString:@"menu.set"]) NSApp.mainMenu = args == [NSNull null] ? nil : AppsMenu(args);
+    else if ([op isEqualToString:@"menu.popup"]) {
         NSMenu *menu = AppsMenu(args[@"template"]);
-        if (!menu) return strdup("{\"error\":\"Unsupported menu role or accelerator\"}");
         NSView *view = NSApp.keyWindow.contentView;
         NSPoint point = args[@"x"] && args[@"y"] ? NSMakePoint([args[@"x"] doubleValue], [args[@"y"] doubleValue]) : [view convertPoint:NSApp.keyWindow.mouseLocationOutsideOfEventStream fromView:nil];
         if (view && !view.isFlipped && args[@"y"]) point.y = view.bounds.size.height - point.y;
@@ -311,7 +352,8 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     } else if ([op isEqualToString:@"shortcut.register"]) {
         NSArray *accelerator = AppsAccelerator(args[@"accelerator"]);
         if (!accelerator) return strdup("{\"error\":\"Unsupported shortcut accelerator\"}");
-        NSUInteger flags = [accelerator[1] unsignedIntegerValue];
+        if ([accelerator[2] intValue] < 0) return strdup("{\"value\":false}");
+        NSUInteger flags = [accelerator[1] unsignedIntegerValue] | ([accelerator[3] boolValue] ? NSEventModifierFlagShift : 0);
         UInt32 modifiers = (flags & NSEventModifierFlagCommand ? cmdKey : 0) | (flags & NSEventModifierFlagControl ? controlKey : 0) | (flags & NSEventModifierFlagOption ? optionKey : 0) | (flags & NSEventModifierFlagShift ? shiftKey : 0);
         EventHotKeyRef hotkey = NULL;
         EventHotKeyID key = { 'apps', [args[@"id"] unsignedIntValue] };
@@ -403,13 +445,28 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         if (![args[@"silent"] boolValue]) content.sound = [UNNotificationSound defaultSound];
         NSString *identifier = args[@"id"] ?: NSUUID.UUID.UUIDString;
         [center requestAuthorizationWithOptions:UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge completionHandler:^(BOOL granted, NSError *error) {
-            if (!granted || error) { AppsNativeEmit(@{ @"type": @"notification", @"id": identifier, @"event": @"error", @"error": error.localizedDescription ?: @"Notification permission denied" }); return; }
+            if (!granted || error) { AppsNativeEmit(@{ @"type": @"notification", @"id": identifier, @"event": @"failed", @"error": error.localizedDescription ?: @"Notification permission denied" }); return; }
             [center addNotificationRequest:[UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil] withCompletionHandler:^(NSError *failure) {
-                AppsNativeEmit(failure ? @{ @"type": @"notification", @"id": identifier, @"event": @"error", @"error": failure.localizedDescription } : @{ @"type": @"notification", @"id": identifier, @"event": @"show" });
+                AppsNativeEmit(failure ? @{ @"type": @"notification", @"id": identifier, @"event": @"failed", @"error": failure.localizedDescription } : @{ @"type": @"notification", @"id": identifier, @"event": @"show" });
             }];
         }];
         result = identifier;
     } else if ([op isEqualToString:@"notification.close"]) [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[args]];
+    else if ([op isEqualToString:@"screen.displays"]) {
+        NSMutableArray *displays = [NSMutableArray new];
+        CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
+        NSDictionary *(^rect)(NSRect) = ^NSDictionary *(NSRect frame) { return @{ @"x": @(frame.origin.x), @"y": @(top - NSMaxY(frame)), @"width": @(frame.size.width), @"height": @(frame.size.height) }; };
+        for (NSScreen *screen in NSScreen.screens) {
+            CGDirectDisplayID display = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+            NSInteger frequency = 0;
+            if (@available(macOS 12.0, *)) frequency = screen.maximumFramesPerSecond;
+            [displays addObject:@{ @"id": @(display), @"label": screen.localizedName ?: @"", @"bounds": rect(screen.frame), @"workArea": rect(screen.visibleFrame), @"size": @{ @"width": @(screen.frame.size.width), @"height": @(screen.frame.size.height) }, @"workAreaSize": @{ @"width": @(screen.visibleFrame.size.width), @"height": @(screen.visibleFrame.size.height) }, @"scaleFactor": @(screen.backingScaleFactor), @"rotation": @((NSInteger)CGDisplayRotation(display)), @"internal": @((BOOL)CGDisplayIsBuiltin(display)), @"monochrome": @NO, @"accelerometerSupport": @"unknown", @"touchSupport": @"unknown", @"colorDepth": @(NSBitsPerPixelFromDepth(screen.depth)), @"depthPerComponent": @(NSBitsPerSampleFromDepth(screen.depth)), @"colorSpace": screen.colorSpace.localizedName ?: @"", @"displayFrequency": @(frequency), @"detected": @YES }];
+        }
+        result = displays;
+    } else if ([op isEqualToString:@"screen.cursor"]) {
+        NSPoint point = NSEvent.mouseLocation;
+        result = @{ @"x": @(floor(point.x)), @"y": @(floor(NSMaxY(NSScreen.screens.firstObject.frame) - point.y)) };
+    }
     else if ([op isEqualToString:@"app.badge"]) NSApp.dockTile.badgeLabel = [args length] ? args : nil;
     else if ([op isEqualToString:@"app.locale"]) result = @{ @"system": [[NSLocale.currentLocale.localeIdentifier componentsSeparatedByString:@"@"][0] stringByReplacingOccurrencesOfString:@"_" withString:@"-"], @"languages": NSLocale.preferredLanguages };
     else if ([op isEqualToString:@"app.hidden"]) { if ([args boolValue]) [NSApp hide:nil]; else [NSApp unhide:nil]; }
@@ -456,6 +513,16 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             BOOL open = [op isEqualToString:@"dialog.open"];
             NSSavePanel *panel = open ? [NSOpenPanel openPanel] : [NSSavePanel savePanel];
             panel.title = args[@"title"] ?: (open ? @"Open" : @"Save");
+            if (args[@"buttonLabel"]) panel.prompt = args[@"buttonLabel"];
+            if (args[@"message"]) panel.message = args[@"message"];
+            if (args[@"nameFieldLabel"] && !open) panel.nameFieldLabel = args[@"nameFieldLabel"];
+            NSMutableArray *types = [NSMutableArray new];
+            BOOL any = NO;
+            for (NSDictionary *filter in args[@"filters"] ?: @[]) for (NSString *extension in filter[@"extensions"]) {
+                if ([extension isEqual:@"*"]) any = YES;
+                else if (@available(macOS 11.0, *)) { UTType *type = [UTType typeWithFilenameExtension:extension]; if (type) [types addObject:type]; }
+            }
+            if (@available(macOS 11.0, *)) if (types.count && !any) panel.allowedContentTypes = types;
             if (open) {
                 NSOpenPanel *chooser = (NSOpenPanel *)panel;
                 NSArray *properties = args[@"properties"] ?: @[@"openFile"];
@@ -482,7 +549,13 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             NSAlert *alert = [NSAlert new];
             alert.messageText = args[@"message"] ?: @"";
             alert.informativeText = args[@"detail"] ?: @"";
-            for (NSString *button in args[@"buttons"] ?: @[@"OK"]) [alert addButtonWithTitle:button];
+            alert.alertStyle = [args[@"type"] isEqual:@"warning"] || [args[@"type"] isEqual:@"error"] ? NSAlertStyleCritical : NSAlertStyleInformational;
+            NSArray *buttons = [args[@"buttons"] count] ? args[@"buttons"] : @[@"OK"];
+            NSInteger defaultId = args[@"defaultId"] ? [args[@"defaultId"] integerValue] : 0, cancelId = args[@"cancelId"] ? [args[@"cancelId"] integerValue] : -1;
+            for (NSUInteger i = 0; i < buttons.count; i++) {
+                NSButton *button = [alert addButtonWithTitle:buttons[i]];
+                button.keyEquivalent = (NSInteger)i == defaultId ? @"\r" : (NSInteger)i == cancelId ? @"\033" : @"";
+            }
             if (args[@"checkboxLabel"]) {
                 alert.showsSuppressionButton = YES;
                 alert.suppressionButton.title = args[@"checkboxLabel"];

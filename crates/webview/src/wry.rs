@@ -174,13 +174,16 @@ impl Browser {
                 if request.body().len() > 4 * 1024 * 1024 { return; }
                 let Ok(data) = serde_json::from_str::<Value>(request.body()) else { return; };
                 if data["type"] == "evaluation" { ipc_events.evaluation(&ipc_token, &ipc_waiting, data); }
+                else if data["message"]["kind"] == "dom-ready" {
+                    if data["mainFrame"] == true { ipc_events.push(json!({"type":"dom-ready"})); }
+                }
                 else if data["message"].is_object() {
                     // WARNING: the page writes the body, so the URL comes from the request and the frame is unknown.
                     ipc_events.push(json!({"type":"message", "data":data["message"], "url":request.uri().to_string(), "mainFrame":null}));
                 }
             })
             .with_new_window_req_handler(move |url, _| {
-                popup_events.push(json!({"type":"new-window", "url":url}));
+                popup_events.push(json!({"type":"window-open", "url":url}));
                 ::wry::NewWindowResponse::Deny
             });
         if options["javascript"] == false {
@@ -211,6 +214,7 @@ impl Browser {
     pub fn command(&self, operation: &str, arguments: &Value) -> Result<Value> {
         match operation {
             "visible" => self.window.set_visible(arguments.as_bool().unwrap())?,
+            "decide" => {}
             "loadURL" => {
                 let url = arguments.as_str().unwrap();
                 ensure!(
@@ -228,7 +232,7 @@ impl Browser {
                     self.waiting.borrow_mut().insert(id),
                     "Evaluation ID is already pending"
                 );
-                let result = self.view.evaluate_script(&format!(r#"(()=>{{const send=result=>{{let text;try{{text=JSON.stringify({{type:'evaluation',id:{id},token:{token},...result}});if(new TextEncoder().encode(text).length>4*1024*1024)throw Error('Browser result exceeds 4 MiB')}}catch(error){{text=JSON.stringify({{type:'evaluation',id:{id},token:{token},error:String(error.message||error)}})}}window.ipc.postMessage(text)}};Promise.resolve().then(()=>(0,eval)({script})).then(value=>send({{value:value===undefined?null:value}}),error=>send({{error:String(error?.message||error)}}))}})()"#, id=arguments["id"], token=json!(self.token), script=arguments["script"]));
+                let result = self.view.evaluate_script(&format!(r#"(()=>{{const send=result=>{{let text;try{{text=JSON.stringify({{type:'evaluation',id:{id},token:{token},...result}});if(new TextEncoder().encode(text).length>4*1024*1024)throw Error('Browser result exceeds 4 MiB')}}catch(error){{text=JSON.stringify({{type:'evaluation',id:{id},token:{token},error:String(error.message||error)}})}}window.ipc.postMessage(text)}};Promise.resolve().then(()=>(0,eval)({script})).then(value=>send(value===undefined?{{}}:{{value}}),error=>send({{error:String(error)}}))}})()"#, id=arguments["id"], token=json!(self.token), script=arguments["script"]));
                 if result.is_err() {
                     self.waiting.borrow_mut().remove(&id);
                 }
@@ -410,7 +414,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             wait(&browser, |event| event["id"] == 2)["error"],
-            "expected failure"
+            "Error: expected failure"
         );
         browser
             .command(

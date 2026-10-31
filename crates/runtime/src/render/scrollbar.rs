@@ -98,7 +98,7 @@ impl Part {
 }
 
 /// How a box draws its bars.
-pub(super) struct Look {
+pub(crate) struct Look {
     /// Light knobs, for dark color schemes.
     dark: bool,
     thin: bool,
@@ -113,7 +113,7 @@ pub(super) struct Look {
 impl Look {
     /// `None` when `scrollbar-width: none` or `::-webkit-scrollbar { display: none }` hides the bars.
     /// `backdrop` is the nearest opaque background color behind the bars.
-    pub(super) fn new(
+    pub(crate) fn new(
         style: &Style,
         parts: Option<&[Option<Style>; 5]>,
         units: &style::Lengths,
@@ -183,7 +183,7 @@ impl Look {
     }
 
     /// The axes, x then y, whose bar shows for a box that scrolls on `axes` by up to `max`.
-    pub(super) fn shown(&self, axes: [bool; 2], max: Point<Pixels>) -> [bool; 2] {
+    pub(crate) fn shown(&self, axes: [bool; 2], max: Point<Pixels>) -> [bool; 2] {
         let max = [max.x, max.y];
         [0, 1].map(|axis| {
             axes[axis]
@@ -197,7 +197,7 @@ impl Look {
     }
 
     /// The layout space of shown custom bars: x is the height at the bottom, y the width at the right.
-    pub(super) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
+    pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
         self.custom.as_ref().map_or([0.; 2], |(size, _)| {
             [0, 1].map(|axis| if shown[axis] { size[axis] } else { 0. })
         })

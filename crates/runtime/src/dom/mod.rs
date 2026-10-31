@@ -1,9 +1,10 @@
 mod document;
+mod entities;
 mod selector;
 
 pub use document::{Attrs, Document, Node, decode, escape};
 pub(crate) use selector::{
-    ACTIVE, FOCUS, FOCUS_WITHIN, HOVER, Selector, SelectorCache, SelectorList,
+    ACTIVE, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache, SelectorList,
 };
 
 use crate::style;
@@ -27,11 +28,21 @@ pub(crate) struct Row {
     pub right: renderer::Pixels,
     pub gap: renderer::Pixels,
     pub start: usize,
-    /// How far the row moves down, when the first row is taller.
+    /// How far the row moves down: the extra height of the rows above, and its own extra space above.
     pub drop: renderer::Pixels,
+    /// The extra space above the row, when its fonts or line heights need more than the paragraph's.
+    pub above: renderer::Pixels,
 }
 
 pub(crate) type Rows = Rc<[Row]>;
+
+pub(crate) type SvgBoxes = (
+    String,
+    Vec<(String, usize)>,
+    [f32; 2],
+    Vec<(usize, [f32; 4], [f32; 4])>,
+    [f32; 4],
+);
 
 /// A decoded raster, or SVG text and its size.
 type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
@@ -52,7 +63,7 @@ pub(crate) struct LayoutNode {
 }
 
 /// Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
-/// floats (stale, capacity), 8 floats per node (x, y, width, height, scroll left, scroll top,
+/// floats (stale, capacity, layout count), 8 floats per node (x, y, width, height, scroll left, scroll top,
 /// scroll range x, scroll range y), then one byte of `MIRROR_*` flags per node.
 #[derive(Default)]
 pub struct LayoutMirror {
@@ -72,10 +83,54 @@ impl Drop for MirrorMemory {
     }
 }
 
+/// Node states that scripts set: a checked checkbox, radio or option, whether that replaces the
+/// attribute, and an open modal dialog.
+pub(crate) const CHECKED: u8 = 16;
+pub(crate) const DIRTY: u8 = 32;
+pub(crate) const MODAL: u8 = 64;
+
+impl Node {
+    /// Whether a checkbox, radio or option is checked, by script state or else by its attribute.
+    pub(crate) fn checked(&self) -> bool {
+        if self.state & DIRTY != 0 {
+            self.state & CHECKED != 0
+        } else {
+            self.attrs.contains_key(if self.tag == "option" {
+                "selected"
+            } else {
+                "checked"
+            })
+        }
+    }
+
+    /// The text a field shows: a password shows a bullet for each UTF-16 unit, so text offsets stay the same.
+    pub(crate) fn shown_text(&self, text: String) -> String {
+        if self.tag == "input"
+            && self
+                .attrs
+                .get("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+        {
+            "\u{2022}".repeat(text.encode_utf16().count())
+        } else {
+            text
+        }
+    }
+
+    /// The current value of an `input`, or `None` for a `textarea` that shows its text.
+    pub(crate) fn current_value(&self) -> Option<&str> {
+        self.value.as_deref().or_else(|| {
+            (self.tag == "input").then(|| self.attrs.get("value").map_or("", String::as_str))
+        })
+    }
+}
+
 pub(crate) const MIRROR_BOUNDS: u8 = 1;
 pub(crate) const MIRROR_SCROLLER: u8 = 2;
 pub(crate) const MIRROR_CLIP: u8 = 4;
 pub(crate) const MIRROR_POSITIONED: u8 = 8;
+pub(crate) const MIRROR_HIDDEN: u8 = 16;
+pub(crate) const MIRROR_FIXED: u8 = 32;
 
 impl LayoutMirror {
     fn slot(&self, id: usize) -> *mut f32 {
@@ -113,6 +168,7 @@ impl LayoutMirror {
                     memory.as_ptr().add(4 + capacity * 8).cast::<u8>(),
                     self.capacity,
                 );
+                *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
                 // WARNING: pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.0.as_ptr() = 1.;
             }
@@ -144,6 +200,29 @@ impl LayoutMirror {
             unsafe {
                 *self.slot(*id).cast::<[f32; 8]>() = [0.; 8];
                 *self.flags(*id) = 0;
+            }
+        }
+    }
+
+    /// Counts a layout in the third header float, so pages know when cached box sizes are old.
+    pub(crate) fn touch(&mut self) {
+        self.reserve(0);
+        if let Some(memory) = &self.memory {
+            unsafe { *memory.0.as_ptr().add(2) += 1. };
+        }
+    }
+
+    /// Marks the nodes that have no box, where `visible` differs from last time's `old`.
+    pub(crate) fn hide(&mut self, visible: &[bool], old: &[bool]) {
+        if let Some(last) = visible.len().checked_sub(1) {
+            self.reserve(last);
+        }
+        for (id, &shown) in visible.iter().enumerate() {
+            if old.get(id).copied().unwrap_or(true) != shown {
+                unsafe {
+                    let flags = self.flags(id);
+                    *flags = *flags & !MIRROR_HIDDEN | if shown { 0 } else { MIRROR_HIDDEN };
+                }
             }
         }
     }
@@ -216,6 +295,7 @@ pub struct State {
     /// Grids sized by a flex layout: per axis, the content size their tracks used and the
     /// padding and borders. Prepaint renders again when the laid-out size differs.
     pub(crate) flexed_grids: HashMap<usize, [Option<(f32, f32)>; 2]>,
+    pub(crate) baselines: crate::render::grid::Baselines,
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
     pub(crate) inline_text: std::collections::HashMap<usize, Option<Rc<style::InlineText>>>,
@@ -227,7 +307,7 @@ pub struct State {
     pub(crate) sheets: HashMap<Rc<str>, Rc<style::Stylesheet>>,
     style_cache: style::StyleCache,
     style_viewport: [f32; 2],
-    style_metrics: bool,
+    style_metrics: Option<f32>,
     style_reduced_motion: bool,
     style_theme: u32,
     pub focus: Option<usize>,
@@ -236,6 +316,8 @@ pub struct State {
     pub selection_caret: Option<usize>,
     pub dirty: bool,
     pub frame_requested: bool,
+    /// The page listens to wheel events, so native wheel events go to it first.
+    pub(crate) wheel: bool,
     pub canvases: HashMap<usize, crate::render::canvas::Canvas>,
     pub images: HashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
@@ -243,8 +325,8 @@ pub struct State {
     pub(crate) hosts: HashMap<usize, usize>,
     /// Replaced or removed images whose GPU atlas tiles the renderer must drop.
     pub retired: Vec<Arc<renderer::RenderImage>>,
-    /// Canvases with a redrawn image in `retired`.
-    retired_canvases: HashSet<usize>,
+    /// Canvases and videos with a replaced image in `retired`.
+    pub(crate) retired_canvases: HashSet<usize>,
     /// Images that workers decoded, by node and request.
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     /// The latest decode request by node.
@@ -252,6 +334,9 @@ pub struct State {
     /// Empty nodes that the page reserved for `dom.batch` creates.
     pub(crate) reserved: HashSet<usize>,
     pub(crate) svg_sources: HashMap<usize, ([f32; 2], String, String)>,
+    /// Inline SVG geometry by `<svg>` node: the source it came from, the nodes of elements with their own
+    /// ids, the SVG's size, and each element's node with its canvas box and object box.
+    pub(crate) svg_boxes: HashMap<usize, SvgBoxes>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
     pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
@@ -268,9 +353,12 @@ pub struct State {
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
     pub(crate) motion: style::Motion,
+    pub(crate) animated: HashMap<usize, style::Style>,
+    pub(crate) animating: HashMap<usize, Rc<style::Style>>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
+    pub(crate) blocks: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
 }
 
@@ -365,6 +453,47 @@ fn slots(
     slots
 }
 
+fn pixmap(image: &renderer::RenderImage) -> Option<resvg::tiny_skia::Pixmap> {
+    let size = image.size();
+    let mut pixels = resvg::tiny_skia::Pixmap::new(size.width.into(), size.height.into())?;
+    for (out, pixel) in pixels
+        .pixels_mut()
+        .iter_mut()
+        .zip(image.bytes().as_chunks::<4>().0)
+    {
+        *out = resvg::tiny_skia::ColorU8::from_rgba(pixel[2], pixel[1], pixel[0], pixel[3])
+            .premultiply();
+    }
+    Some(pixels)
+}
+
+/// Shows a new frame of video `id`, or none.
+pub(crate) fn show_frame(state: &mut State, id: usize, image: Option<Arc<renderer::RenderImage>>) {
+    if state.retired.is_empty() {
+        state.retired_canvases.clear();
+    }
+    // WARNING: a poster that decodes later must not replace the frame.
+    state.decoding.remove(&id);
+    let size = image.as_ref().map(|image| image.size());
+    let old = match image {
+        Some(image) => state.images.insert(id, image),
+        None => state.images.remove(&id),
+    };
+    if old.as_ref().map(|old| old.size()) != size
+        && let Some(node) = state.layout_nodes.get_mut(id)
+    {
+        *node = None;
+        state.cull.seen = None;
+    }
+    // WARNING: only the first frame replaced since the renderer drained `retired` can be on the GPU; later ones are dropped so unrendered windows do not grow it.
+    if let Some(old) = old
+        && state.retired_canvases.insert(id)
+    {
+        state.retired.push(old);
+    }
+    state.dirty = true;
+}
+
 pub(crate) fn load_image(
     state: &mut State,
     id: usize,
@@ -380,23 +509,9 @@ pub(crate) fn load_image(
     jobs.0.push_back(Box::new(move || {
         let result = read().and_then(|bytes| {
             ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(16384);
-            limits.max_image_height = Some(16384);
-            limits.max_alloc = Some(256 * 1024 * 1024);
-            Ok(match crate::render::image::decode(&bytes, limits) {
-                Ok(image) => {
-                    let mut pixels = image.into_rgba8();
-                    for pixel in pixels.pixels_mut() {
-                        pixel.0.swap(0, 2);
-                    }
-                    Ok(renderer::RenderImage::new(
-                        pixels.width(),
-                        pixels.height(),
-                        pixels.into_raw(),
-                    ))
-                }
-                Err(error) => {
+            crate::render::image::decode(&bytes)
+                .map(Ok)
+                .or_else(|error| {
                     let size = resvg::usvg::Tree::from_data(&bytes, &Default::default())
                         .map_err(|_| error)?
                         .size();
@@ -405,12 +520,11 @@ pub(crate) fn load_image(
                     } else {
                         bytes
                     };
-                    Err((
+                    Ok(Err((
                         String::from_utf8_lossy(&text).into_owned(),
                         [size.width(), size.height()],
-                    ))
-                }
-            })
+                    )))
+                })
         });
         decoded
             .lock()
@@ -476,11 +590,24 @@ pub fn call(
             | "dom.measureText"
             | "dom.textRect"
             | "dom.textIndex"
+            | "dom.svgBox"
             | "dom.textOffset"
             | "dom.textPoint"
             | "dom.font"
             | "dom.fontCheck"
             | "dom.hitTest"
+            | "dom.css"
+            | "dom.sheet"
+            | "dom.constructed"
+            | "dom.adopt"
+            | "dom.supports"
+            | "dom.registerProperty"
+            | "dom.computed"
+            | "dom.declare"
+            | "dom.properties"
+            | "dom.client"
+            | "dom.innerText"
+            | "dom.wheel"
     ) {
         return None;
     }
@@ -540,6 +667,10 @@ pub fn call(
             }
             return Ok(json!(results));
         }
+        if op == "dom.wheel" {
+            state.wheel = true;
+            return Ok(Value::Null);
+        }
         if op == "dom.requestFrame" {
             state.frame_requested = true;
             state.dirty = true;
@@ -552,7 +683,97 @@ pub fn call(
                 .sheets
                 .entry(source.as_str().into())
                 .or_insert_with(|| Rc::new(style::Stylesheet::parse(&source)));
-            return Ok(sheet.matches_media(viewport[0], viewport[1]).into());
+            let theme = crate::desktop::native::theme_state()
+                | ((state.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16;
+            return Ok(sheet.matches_media(viewport[0], viewport[1], theme).into());
+        }
+        if op == "dom.properties" {
+            return Ok(json!(style::Prop::names()));
+        }
+        if op == "dom.declare" {
+            return Ok(json!(style::declare(args[0].as_str().unwrap_or_default())));
+        }
+        if matches!(
+            op,
+            "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty"
+        ) {
+            let text = args[2].as_str().unwrap_or_default();
+            let result = match op {
+                "dom.supports" => {
+                    let name = args[0].as_str().context("Expected CSS text")?;
+                    return Ok(json!(match args[1].as_str() {
+                        Some(value) =>
+                            style::supports(&name.to_ascii_lowercase(), value) == Some(true),
+                        None => style::supports_condition(name),
+                    }));
+                }
+                "dom.registerProperty" => {
+                    let name = args[0].as_str().context("Expected a name")?;
+                    let syntax = args[1].as_str().unwrap_or("*");
+                    let initial = args[3].as_str();
+                    let rule = format!(
+                        "@property {name}{{syntax:{};inherits:{};{}}}",
+                        json!(syntax),
+                        args[2].as_bool().unwrap_or(false),
+                        initial.map_or(String::new(), |value| format!("initial-value:{value}"))
+                    );
+                    let prop = style::Prop::new(name);
+                    let registered = style::Stylesheet::parse(&rule).property();
+                    match registered {
+                        _ if !name.starts_with("--") => Err("SyntaxError"),
+                        _ if state.style_cache.scripted.contains_key(&prop) => {
+                            Err("InvalidModificationError")
+                        }
+                        Some(value) => {
+                            state.style_cache.scripted.insert(prop, value);
+                            Ok(Value::Null)
+                        }
+                        None => Err("SyntaxError"),
+                    }
+                }
+                "dom.adopt" => {
+                    let root = args[0].as_u64().context("Expected a root")? as usize;
+                    let ids = args[1]
+                        .as_array()
+                        .context("Expected sheets")?
+                        .iter()
+                        .filter_map(|id| Some(id.as_u64()? as u32))
+                        .collect::<Vec<_>>();
+                    if ids.is_empty() {
+                        state.style_cache.adopted.remove(&root);
+                    } else {
+                        state.style_cache.adopted.insert(root, ids);
+                    }
+                    Ok(Value::Null)
+                }
+                _ => {
+                    let id = args[0].as_u64().context("Expected a sheet")? as u32;
+                    match args[1].as_str().unwrap_or_default() {
+                        "parse" => return Ok(style::Stylesheet::parse(text).cssom()),
+                        "replace" => {
+                            let sheet = style::Stylesheet::parse(text);
+                            let tree = sheet.cssom();
+                            state.style_cache.constructed.insert(id, Rc::new(sheet));
+                            Ok(tree)
+                        }
+                        "drop" => {
+                            state.style_cache.constructed.remove(&id);
+                            Ok(Value::Null)
+                        }
+                        kind => {
+                            let path = path(&args[3]);
+                            let top = (matches!(kind, "insert" | "delete") && path.len() == 1)
+                                .then(|| (path[0], kind == "insert"));
+                            state.style_cache.edit_constructed(id, top, |sheet| {
+                                sheet.edit(&path, edit(kind, text))
+                            })
+                        }
+                    }
+                }
+            };
+            state.computed = None;
+            state.dirty = true;
+            return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
         }
         if op == "dom.release" {
             for value in args[1].as_array().context("Expected live nodes")? {
@@ -603,7 +824,7 @@ pub fn call(
                     continue;
                 }
                 for id in subtree {
-                    if doc.nodes[id].tag == "canvas" {
+                    if matches!(doc.nodes[id].tag.as_str(), "canvas" | "video" | "audio") {
                         canvases.push(id);
                     }
                     doc.nodes[id] = Node::default();
@@ -614,6 +835,7 @@ pub fn call(
                     state.scroll_offsets.remove(&id);
                     state.cull.offsets.remove(&id);
                     state.grids.remove(&id);
+                    state.baselines.remove(&id);
                     if let Some(node) = state.layout_nodes.get_mut(id) {
                         *node = None;
                     }
@@ -632,6 +854,7 @@ pub fn call(
                         .retired
                         .extend(state.image_crops.remove(&id).map(|(_, image)| image));
                     state.svg_sources.remove(&id);
+                    state.svg_boxes.remove(&id);
                     state.svg_images.remove(&id);
                     state.decoding.remove(&id);
                     if let Some(root) = state.shadows.remove(&id) {
@@ -735,7 +958,12 @@ pub fn call(
             let x = args[0].as_f64().context("Expected x")? as f32;
             let y = args[1].as_f64().context("Expected y")? as f32;
             let system = state.text_system.clone();
-            let computed = styles(doc, state, viewport, system.as_deref());
+            let computed = styles(
+                doc,
+                state,
+                viewport,
+                system.as_deref().map(|system| (system, state.pixel_ratio)),
+            );
             let first = args[2].as_bool().unwrap_or(false);
             let caret = args[3].as_bool().unwrap_or(false);
             let mut nearest = Vec::new();
@@ -866,13 +1094,28 @@ pub fn call(
             };
             let focus = if op == "dom.focus" { FOCUS } else { 0 };
             let used = state.style_cache.states & (flag | focus) != 0;
+            // Form controls draw their own hover and pressed looks.
+            let control = |id: &usize| {
+                doc.nodes.get(*id).is_some_and(|node| {
+                    matches!(
+                        node.tag.as_str(),
+                        "button" | "input" | "select" | "textarea"
+                    )
+                })
+            };
+            let repaint = focus == 0
+                && (ids.iter().any(control) || state.interaction[index].iter().any(control));
             if op == "dom.focus" {
                 if let Some(node) = state.focus.and_then(|id| doc.nodes.get_mut(id)) {
-                    node.state &= !FOCUS;
+                    node.state &= !(FOCUS | FOCUS_VISIBLE);
                 }
                 state.focus = ids.first().copied();
                 if let Some(id) = state.focus {
-                    doc.nodes[id].state |= FOCUS;
+                    doc.nodes[id].state |= if args[1].as_bool() == Some(false) {
+                        FOCUS
+                    } else {
+                        FOCUS | FOCUS_VISIBLE
+                    };
                 }
             }
             for &id in &state.interaction[index] {
@@ -887,7 +1130,7 @@ pub fn call(
             if used {
                 state.computed = None;
             }
-            state.dirty |= used || focus != 0;
+            state.dirty |= used || focus != 0 || repaint;
             return Ok(Value::Null);
         }
         if op == "dom.reserve" {
@@ -955,13 +1198,13 @@ pub fn call(
                 )))
             }
             "dom.matches" => Ok(json!(
-                Selector::parse(args[1].as_str().context("Expected selector")?, None)
+                Selector::try_parse(args[1].as_str().context("Expected selector")?)?
                     .iter()
                     .any(|s| s.matches_cached(doc, id, Some(id), &mut SelectorCache::default()))
             )),
             "dom.queryWithin" => {
                 let selectors =
-                    Selector::parse(args[1].as_str().context("Expected selector")?, None);
+                    Selector::try_parse(args[1].as_str().context("Expected selector")?)?;
                 let first = args[2].as_bool().unwrap_or(false);
                 let mut pending: Vec<_> = doc.nodes[id].children.iter().rev().copied().collect();
                 let mut found = Vec::new();
@@ -983,7 +1226,28 @@ pub fn call(
                 Ok(if first { Value::Null } else { json!(found) })
             }
             "dom.html" => {
-                let parsed = Document::parse(args[1].as_str().context("Expected HTML")?);
+                let source = args[1].as_str().context("Expected HTML")?;
+                let tag = doc.nodes[id].tag.as_str();
+                let mut svg = tag == "svg";
+                let mut up = doc.nodes[id].parent;
+                while let Some(node) = up.filter(|_| !svg) {
+                    if doc.nodes[node].tag.eq_ignore_ascii_case("foreignobject") {
+                        break;
+                    }
+                    svg = doc.nodes[node].tag == "svg";
+                    up = doc.nodes[node].parent;
+                }
+                let parsed = match args[2].as_str() {
+                    _ if tag == "#document" => Document::parse(source),
+                    Some(context) => Document::fragment(source, context),
+                    None if svg && !matches!(tag, "foreignObject" | "desc" | "title") => {
+                        Document::fragment(source, "svg")
+                    }
+                    None if svg => Document::fragment(source, "body"),
+                    // WARNING: template contents and shadow roots are the only fragments with markup, and template rules keep `<tr>` rows that Lit renders.
+                    None if tag.starts_with('#') => Document::fragment(source, "template"),
+                    None => Document::fragment(source, tag),
+                };
                 for child in std::mem::take(&mut doc.nodes[id].children) {
                     doc.nodes[child].parent = None;
                     state.detached.push(child);
@@ -1008,9 +1272,139 @@ pub fn call(
                 state.dirty = true;
                 Ok(tree(doc, id, false))
             }
+            "dom.computed" => {
+                let system = state.text_system.clone();
+                let styles = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
+                let style = match pseudo {
+                    "" => Some(
+                        &**state
+                            .animating
+                            .get(&id)
+                            .or_else(|| styles.authored.get(&id))
+                            .unwrap_or(&styles.values[id]),
+                    ),
+                    "before" | "after" => styles
+                        .pseudos
+                        .get(&id)
+                        .map(|values| &values[usize::from(pseudo == "after")]),
+                    _ => None,
+                };
+                let Some(style) = style.filter(|style| !style.is_empty()) else {
+                    return Ok(json!(if args[1].is_string() {
+                        json!("")
+                    } else {
+                        json!([])
+                    }));
+                };
+                let units = styles.lengths[id];
+                let size = (pseudo.is_empty())
+                    .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
+                    .flatten();
+                let container = doc.nodes[id]
+                    .parent
+                    .and_then(|parent| {
+                        let rect = state.bounds.get(&parent)?;
+                        let (style, units) = (&styles.values[parent], styles.lengths[parent]);
+                        let padding = units.edges(style, style::PADDING, rect[2]);
+                        Some([
+                            rect[2] - padding[1] - padding[3],
+                            rect[3] - padding[0] - padding[2],
+                        ])
+                    })
+                    .unwrap_or(viewport);
+                let registry = state.style_cache.registry();
+                let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
+                Ok(match args[1].as_str() {
+                    Some(name) => {
+                        let value =
+                            style::resolved(style, &units, name, size, container, &registry);
+                        let tag = doc.nodes[id].tag.as_str();
+                        // Tables lay out as grids, but report their table display like browsers.
+                        json!(match (name, value.as_str()) {
+                            ("display", "grid") if tag == "table" => "table".to_owned(),
+                            ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
+                                "normal".to_owned(),
+                            ("display", "contents")
+                                if matches!(tag, "thead" | "tbody" | "tfoot" | "tr") =>
+                            {
+                                match tag {
+                                    "thead" => "table-header-group",
+                                    "tbody" => "table-row-group",
+                                    "tfoot" => "table-footer-group",
+                                    _ => "table-row",
+                                }
+                                .to_owned()
+                            }
+                            ("display", "block") if matches!(tag, "td" | "th") =>
+                                "table-cell".to_owned(),
+                            ("display", "block") if tag == "caption" => "table-caption".to_owned(),
+                            // `auto` minimum sizes are 0 outside flex and grid containers.
+                            ("min-width" | "min-height", "auto")
+                                if parent.is_none_or(|parent| {
+                                    parent.get(Prop::DISPLAY).is_none_or(|display| {
+                                        !display.ends_with("flex") && !display.ends_with("grid")
+                                    })
+                                }) =>
+                            {
+                                "0px".to_owned()
+                            }
+                            // A relatively positioned box with `auto` offsets doesn't move.
+                            ("top" | "right" | "bottom" | "left", "auto")
+                                if style.get(Prop::POSITION) == Some("relative") =>
+                            {
+                                "0px".to_owned()
+                            }
+                            _ => value,
+                        })
+                    }
+                    None => json!(
+                        style::computed_names()
+                            .chain(style.vars().iter().map(|(prop, _)| prop.name()))
+                            .collect::<Vec<_>>()
+                    ),
+                })
+            }
+            "dom.css" => {
+                let sheet = state.style_cache.sheet(doc, id, &mut state.sheets);
+                Ok(sheet.map_or_else(|| json!([]), |sheet| sheet.cssom()))
+            }
+            "dom.sheet" => {
+                let kind = args[1].as_str().unwrap_or_default();
+                let text = args[2].as_str().unwrap_or_default();
+                let path = path(&args[3]);
+                let top = (matches!(kind, "insert" | "delete") && path.len() == 1)
+                    .then(|| (path[0], kind == "insert"));
+                let result = state.style_cache.edit_sheet(
+                    doc,
+                    id,
+                    &mut state.sheets,
+                    top,
+                    |sheet, disabled| {
+                        if kind == "disabled" {
+                            *disabled = args[2].as_bool().unwrap_or(false);
+                            return Ok(Value::Null);
+                        }
+                        sheet.edit(&path, edit(kind, text))
+                    },
+                );
+                state.computed = None;
+                state.dirty = true;
+                Ok(result.unwrap_or_else(|error| json!({ "error": error })))
+            }
             "dom.style" => {
                 let system = state.text_system.clone();
-                let styles = styles(doc, state, viewport, system.as_deref());
+                let styles = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
                 let style = &styles.values[id];
                 Ok(match args[1].as_array() {
                     Some(names) => json!(
@@ -1060,7 +1454,12 @@ pub fn call(
             }
             "dom.userSelect" | "dom.selectionText" => {
                 let system = state.text_system.clone();
-                let computed = styles(doc, state, viewport, system.as_deref());
+                let computed = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
                 if op == "dom.userSelect" {
                     return Ok(json!(computed.user_select[id]));
                 }
@@ -1105,29 +1504,53 @@ pub fn call(
                 Ok(Value::Null)
             }
             "dom.canvas" => {
-                if args[1].is_null() {
-                    state
-                        .retired
-                        .extend(state.canvases.remove(&id).map(|canvas| canvas.image));
-                } else {
-                    let width = doc.nodes[id]
-                        .attrs
-                        .get("width")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(300);
-                    let height = doc.nodes[id]
-                        .attrs
-                        .get("height")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(150);
-                    let canvas = match state.canvases.entry(id) {
-                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(crate::render::canvas::Canvas::new(width, height)?)
-                        }
+                if let Some(ops) = crate::jsc::payload::slice(&args[1]) {
+                    let ops: Vec<f32> = ops?
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| f32::from_ne_bytes(*bytes))
+                        .collect();
+                    let data = args
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .skip(3)
+                        .map(|value| {
+                            crate::jsc::payload::slice(value).context("Expected image data")?
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut canvas = match state.canvases.remove(&id) {
+                        Some(canvas) => canvas,
+                        None => crate::render::canvas::Canvas::new(
+                            doc.nodes[id]
+                                .attrs
+                                .get("width")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(300),
+                            doc.nodes[id]
+                                .attrs
+                                .get("height")
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(150),
+                        )?,
                     };
                     let old = canvas.image.clone();
-                    canvas.draw(args[1].as_array().context("Expected canvas commands")?)?;
+                    let result = canvas.draw(
+                        &ops,
+                        args[2].as_str().unwrap_or(""),
+                        &data,
+                        &|source| match state.canvases.get(&source) {
+                            Some(canvas) => Some(canvas.pixels.clone()),
+                            None => pixmap(state.images.get(&source)?),
+                        },
+                        state
+                            .text_system
+                            .as_deref()
+                            .map(|system| (system, &state.font_aliases)),
+                    );
+                    let canvas = state.canvases.entry(id).insert_entry(canvas).into_mut();
+                    result?;
                     if state.retired.is_empty() {
                         state.retired_canvases.clear();
                     }
@@ -1135,6 +1558,10 @@ pub fn call(
                     if !Arc::ptr_eq(&old, &canvas.image) && state.retired_canvases.insert(id) {
                         state.retired.push(old);
                     }
+                } else {
+                    state
+                        .retired
+                        .extend(state.canvases.remove(&id).map(|canvas| canvas.image));
                 }
                 state.dirty = true;
                 Ok(Value::Null)
@@ -1144,17 +1571,9 @@ pub fn call(
                 let bytes = if let Some(canvas) = state.canvases.get(&id) {
                     canvas.pixels.encode_png()?
                 } else if let Some(image) = state.images.get(&id) {
-                    let size = image.size();
-                    let mut bytes = image.bytes().to_vec();
-                    for pixel in bytes.as_chunks_mut::<4>().0 {
-                        pixel.swap(0, 2);
-                    }
-                    let pixels =
-                        image::RgbaImage::from_raw(size.width.into(), size.height.into(), bytes)
-                            .context("Invalid image pixels")?;
-                    let mut out = std::io::Cursor::new(Vec::new());
-                    pixels.write_to(&mut out, image::ImageFormat::Png)?;
-                    out.into_inner()
+                    pixmap(image)
+                        .context("Invalid image pixels")?
+                        .encode_png()?
                 } else {
                     let width = doc.nodes[id]
                         .attrs
@@ -1246,14 +1665,10 @@ pub fn call(
                     .unwrap_or(family);
                 Ok(json!(
                     matches!(family, "serif" | "sans-serif" | "monospace" | "system-ui")
-                        || crate::render::canvas::fonts()
-                            .lock()
-                            .unwrap()
-                            .faces()
-                            .any(|face| face
-                                .families
-                                .iter()
-                                .any(|(name, _)| name.eq_ignore_ascii_case(family)))
+                        || crate::render::canvas::fonts(true).0.faces().any(|face| face
+                            .families
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case(family)))
                 ))
             }
             "dom.textOffset" | "dom.textPoint" => {
@@ -1291,6 +1706,23 @@ pub fn call(
                 } else {
                     json!([id, doc.nodes[id].children.len()])
                 })
+            }
+            "dom.svgBox" => {
+                // An SVG element's box in its own coordinates; the root's covers its content.
+                let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
+                    .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
+                Ok(json!(
+                    boxes
+                        .and_then(|(root, (.., boxes, content))| if root == id {
+                            Some(*content)
+                        } else {
+                            boxes
+                                .iter()
+                                .find(|(node, ..)| *node == id)
+                                .map(|(.., object)| *object)
+                        })
+                        .unwrap_or_default()
+                ))
             }
             "dom.textRect" | "dom.textIndex" => {
                 let Some(bounds) = state.bounds.get(&id) else {
@@ -1339,28 +1771,17 @@ pub fn call(
                 }
                 let system = state
                     .text_system
-                    .as_ref()
+                    .clone()
                     .context("Text geometry requires a displayed window")?;
-                let Some(style) = state
-                    .computed
-                    .as_ref()
-                    .and_then(|styles| styles.values.get(id))
-                else {
-                    return Ok(if op == "dom.textRect" {
-                        json!([])
-                    } else {
-                        json!(0)
-                    });
-                };
-                let text = if matches!(doc.nodes[id].tag.as_str(), "input" | "textarea") {
+                let bounds = *bounds;
+                // WARNING: a focus change just before a click can drop the cached styles, so they are computed again here.
+                let computed = styles(doc, state, viewport, Some((&system, state.pixel_ratio)));
+                let style = &computed.values[id];
+                let text = doc.nodes[id].shown_text(
                     doc.nodes[id]
-                        .attrs
-                        .get("value")
-                        .cloned()
-                        .unwrap_or_else(|| doc.text(id))
-                } else {
-                    doc.text(id)
-                };
+                        .current_value()
+                        .map_or_else(|| doc.text(id), str::to_owned),
+                );
                 let font_size = style::length(
                     style.get(Prop::FONT_SIZE).unwrap_or("16px"),
                     16.,
@@ -1397,6 +1818,7 @@ pub fn call(
                     &[run],
                     wrap,
                     None,
+                    crate::style::word_break(style),
                 )?;
                 let mut top = 0.;
                 let mut offset = 0;
@@ -1459,48 +1881,202 @@ pub fn call(
                     .text_system
                     .as_ref()
                     .context("Text measurement requires a displayed window")?;
-                let text = args[1]
-                    .as_str()
-                    .context("Expected text")?
-                    .replace(['\n', '\r', '\t'], " ");
-                let font = args[2].as_str().unwrap_or("10px sans-serif");
-                let (size, family) = font.split_once("px").unwrap_or(("10", "sans-serif"));
-                let font_size = size
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(10.);
-                let mut face = style::font(&style::Style::from_iter([
-                    (Prop::FONT_FAMILY, family.trim().into()),
-                    (
-                        Prop::FONT_WEIGHT,
-                        size.split_whitespace()
-                            .rev()
-                            .skip(1)
-                            .find(|part| *part == "bold" || part.parse::<u16>().is_ok())
-                            .unwrap_or("400")
-                            .into(),
-                    ),
-                ]));
-                if let Some(family) = state.font_aliases.get(face.family.as_ref()) {
-                    face.family = family.clone().into();
-                }
-                let run = renderer::TextRun {
-                    len: text.len(),
-                    font: face,
-                    color: renderer::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                    letter_spacing: renderer::px(0.),
-                    word_spacing: renderer::px(0.),
-                    font_size: None,
-                };
-                let line =
-                    system.shape_line(text.to_owned().into(), renderer::px(font_size), &[run], None);
+                let line = crate::render::canvas::line(
+                    system,
+                    &state.font_aliases,
+                    args[2].as_str().unwrap_or("10px sans-serif"),
+                    args[1].as_str().context("Expected text")?,
+                );
                 Ok(
                     json!({"width":f32::from(line.width),"actualBoundingBoxLeft":0,"actualBoundingBoxRight":f32::from(line.width),"actualBoundingBoxAscent":f32::from(line.ascent),"actualBoundingBoxDescent":f32::from(line.descent),"fontBoundingBoxAscent":f32::from(line.ascent),"fontBoundingBoxDescent":f32::from(line.descent)}),
                 )
+            }
+            "dom.client" => {
+                let rect = state.bounds.get(&id).copied().unwrap_or_default();
+                let system = state.text_system.clone();
+                let computed = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                let (style, units) = (&computed.values[id], &computed.lengths[id]);
+                let tag = doc.nodes[id].tag.as_str();
+                // Table rows and row groups have the box of their cells, without borders or padding.
+                if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
+                    && style.get(Prop::DISPLAY) == Some("contents")
+                {
+                    return Ok(json!([0., 0., rect[2], rect[3], 0., 0., 0., 0.]));
+                }
+                if tag.starts_with('#')
+                    || style
+                        .get(Prop::DISPLAY)
+                        .is_none_or(|value| matches!(value, "inline" | "contents"))
+                {
+                    return Ok(json!([0.; 8].as_slice()));
+                }
+                // A cell of a collapsed table owns half of each border it shares.
+                let shared = matches!(tag, "td" | "th")
+                    && std::iter::successors(doc.nodes[id].parent, |&parent| {
+                        doc.nodes[parent].parent
+                    })
+                    .find(|&parent| doc.nodes[parent].tag == "table")
+                    .is_some_and(|table| {
+                        computed.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse")
+                    });
+                let base = doc.nodes[id]
+                    .parent
+                    .and_then(|parent| state.bounds.get(&parent))
+                    .map_or(viewport[0], |rect| rect[2]);
+                let borders = style::BORDERS.map(|[width, kind, _]| {
+                    if style
+                        .get(kind)
+                        .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                    {
+                        return 0.;
+                    }
+                    style
+                        .get(width)
+                        .map_or(Some(3.), |width| units.resolve(width, base))
+                        .unwrap_or(0.)
+                        .max(0.)
+                        / if shared { 2. } else { 1. }
+                });
+                let padding = units
+                    .edges(style, style::PADDING, base)
+                    .map(|value| value.max(0.));
+                let bars = state
+                    .scroll
+                    .get(&id)
+                    .and_then(|handle| {
+                        let look = crate::render::scrollbar::Look::new(
+                            style,
+                            computed.scrollbars.get(&id).map(|parts| &**parts),
+                            units,
+                            None,
+                        )?;
+                        let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
+                            style
+                                .get(prop)
+                                .or_else(|| style.get(Prop::OVERFLOW))
+                                .is_some_and(|value| matches!(value, "auto" | "scroll"))
+                        });
+                        Some(look.space(look.shown(scrolls, handle.max_offset())))
+                    })
+                    .unwrap_or_default();
+                Ok(json!([
+                    borders[3],
+                    borders[0],
+                    (rect[2] - borders[1] - borders[3] - bars[1]).max(0.),
+                    (rect[3] - borders[0] - borders[2] - bars[0]).max(0.),
+                    padding[0],
+                    padding[1],
+                    padding[2],
+                    padding[3]
+                ]))
+            }
+            "dom.innerText" => {
+                let system = state.text_system.clone();
+                let computed = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                let mut text = String::new();
+                let (mut breaks, mut collapsed) = (0, false);
+                let mut pending = vec![(id, false)];
+                while let Some((node, close)) = pending.pop() {
+                    let current = &doc.nodes[node];
+                    let style = &computed.values[node];
+                    let display = style.get(Prop::DISPLAY).unwrap_or("inline");
+                    let required = if current.tag == "p" {
+                        2
+                    } else if display.starts_with("inline")
+                        || matches!(display, "contents" | "table-cell" | "ruby" | "none")
+                    {
+                        0
+                    } else {
+                        1
+                    };
+                    if close {
+                        if display == "table-cell" {
+                            text.push('\t');
+                        } else if display == "table-row" && text.ends_with('\t') {
+                            text.pop();
+                        }
+                        breaks = breaks.max(required);
+                        continue;
+                    }
+                    if node != id && display == "none" || current.tag == "#comment" {
+                        continue;
+                    }
+                    if current.tag == "br" {
+                        text.push('\n');
+                        (breaks, collapsed) = (0, false);
+                        continue;
+                    }
+                    if current.tag == "#text" {
+                        let parent = current
+                            .parent
+                            .map_or(style, |parent| &computed.values[parent]);
+                        if parent
+                            .get(Prop::VISIBILITY)
+                            .is_some_and(|value| matches!(value, "hidden" | "collapse"))
+                        {
+                            continue;
+                        }
+                        let space = parent.get(Prop::WHITE_SPACE).unwrap_or("normal");
+                        let keep = matches!(space, "pre" | "pre-wrap" | "break-spaces");
+                        let mut chunk = String::with_capacity(current.text.len());
+                        for character in current.text.chars() {
+                            if keep || character == '\n' && space == "pre-line" {
+                                chunk.push(character);
+                            } else if matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c') {
+                                if !chunk.ends_with(' ') {
+                                    chunk.push(' ');
+                                }
+                            } else {
+                                chunk.push(character);
+                            }
+                        }
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        if breaks > 0 && !text.is_empty() {
+                            if collapsed {
+                                text.truncate(text.trim_end_matches(' ').len());
+                            }
+                            text.extend(std::iter::repeat_n('\n', breaks));
+                        }
+                        breaks = 0;
+                        let chunk = if !keep && (text.is_empty() || text.ends_with([' ', '\n'])) {
+                            chunk.trim_start_matches(' ')
+                        } else {
+                            &chunk
+                        };
+                        text.push_str(chunk);
+                        collapsed = !keep;
+                        continue;
+                    }
+                    if node != id {
+                        breaks = breaks.max(required);
+                    }
+                    pending.push((node, true));
+                    pending.extend(
+                        computed
+                            .children
+                            .get(&node)
+                            .unwrap_or(&current.children)
+                            .iter()
+                            .rev()
+                            .map(|&child| (child, false)),
+                    );
+                }
+                if collapsed {
+                    text.truncate(text.trim_end_matches(' ').len());
+                }
+                Ok(json!(text))
             }
             _ => unreachable!(),
         }
@@ -1519,8 +2095,11 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
         let node = &doc.nodes[id];
         let inline = node.inline.as_ref().map(|inline| inline.source());
         // WARNING: script and style sources can be large, so pages read them with `dom.source` when needed.
-        let lazy = matches!(node.tag.as_str(), "script" | "style")
-            && (node.stylesheet.is_some() || !node.text.is_empty());
+        let lazy = node.stylesheet.is_some()
+            || !node.text.is_empty()
+                && node.parent.is_some_and(|parent| {
+                    matches!(doc.nodes[parent].tag.as_str(), "script" | "style")
+                });
         list.extend([
             json!(id),
             json!(node.parent),
@@ -1557,8 +2136,8 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
         .as_ref()
         .context("Font loading requires a displayed window")?;
     ensure!(bytes.len() <= 32 * 1024 * 1024, "Font exceeds 32 MB limit");
-    let mut database = crate::render::canvas::fonts().lock().unwrap();
-    let database = std::sync::Arc::make_mut(&mut database);
+    let mut fonts = crate::render::canvas::fonts(false);
+    let database = std::sync::Arc::make_mut(&mut fonts.0);
     let ids = database.load_font_source(resvg::usvg::fontdb::Source::Binary(std::sync::Arc::new(
         bytes.clone(),
     )));
@@ -1590,7 +2169,12 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
 /// Writes the overflow clip and positioned flags of current styles into the layout mirror.
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
     let system = state.text_system.clone();
-    let computed = styles(doc, state, viewport, system.as_deref());
+    let computed = styles(
+        doc,
+        state,
+        viewport,
+        system.as_deref().map(|system| (system, state.pixel_ratio)),
+    );
     if state.layout_epoch == state.style_epoch {
         return;
     }
@@ -1605,15 +2189,20 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
                         .get(prop)
                         .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
                 });
-            let positioned = style
-                .get(Prop::POSITION)
-                .is_some_and(|value| value != "static");
-            (if clip { MIRROR_CLIP } else { 0 }) | if positioned { MIRROR_POSITIONED } else { 0 }
+            let position = style.get(Prop::POSITION).unwrap_or("static");
+            // WARNING: like CSSOM `offsetParent`, a transformed or filtered box contains its positioned descendants too.
+            let positioned = position != "static"
+                || [Prop::TRANSFORM, Prop::FILTER]
+                    .into_iter()
+                    .any(|prop| style.get(prop).is_some_and(|value| value != "none"));
+            (if clip { MIRROR_CLIP } else { 0 })
+                | if positioned { MIRROR_POSITIONED } else { 0 }
+                | if position == "fixed" { MIRROR_FIXED } else { 0 }
         });
         state.bounds.reserve(id);
         unsafe {
             let flags = state.bounds.flags(id);
-            *flags = (*flags & (MIRROR_BOUNDS | MIRROR_SCROLLER)) | bits;
+            *flags = (*flags & (MIRROR_BOUNDS | MIRROR_SCROLLER | MIRROR_HIDDEN)) | bits;
         }
     }
 }
@@ -1622,25 +2211,33 @@ pub(crate) fn styles(
     doc: &mut Document,
     state: &mut State,
     viewport: [f32; 2],
-    system: Option<&renderer::TextSystem>,
+    system: Option<(&renderer::TextSystem, f32)>,
 ) -> Rc<style::ComputedStyles> {
+    let (system, scale) = (system.map(|system| system.0), system.map(|system| system.1));
     let reduced_motion = style::reduced_motion();
-    let theme = crate::desktop::native::theme_state();
-    if state.style_viewport == viewport
+    let theme = crate::desktop::native::theme_state()
+        | ((state.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16;
+    let animated = std::mem::take(&mut state.animated);
+    let animating = !animated.is_empty();
+    if !animating
+        && state.style_viewport == viewport
         && state.style_reduced_motion == reduced_motion
         && state.style_theme == theme
-        && state.style_metrics == system.is_some()
+        && state.style_metrics == scale
         && let Some(computed) = &state.computed
         && computed.values.len() == doc.nodes.len()
     {
         return computed.clone();
     }
     state.svg_sources.clear();
+    state.svg_boxes.clear();
     let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
     let mut context = style::StyleContext {
         reduced_motion,
         theme,
+        scale: scale.unwrap_or(1.),
         aliases: state.font_aliases.clone(),
+        animated,
         ..Default::default()
     };
     if !state.shadows.is_empty() {
@@ -1678,6 +2275,9 @@ pub(crate) fn styles(
             result.scrollbars.clear();
             result.selections.clear();
             result.animations.clear();
+            result.slotted.clear();
+            result.parts.clear();
+            result.starting.clear();
             style::cascade(
                 doc,
                 viewport,
@@ -1689,8 +2289,66 @@ pub(crate) fn styles(
             );
         }
         let mut pending = vec![0];
+        context.parts.clear();
         while let Some(id) = pending.pop() {
             if let Some(&root) = state.shadows.get(&id) {
+                if let Some(rules) = result.parts.get(&id).cloned() {
+                    let mut batch: HashMap<usize, Vec<_>> = HashMap::new();
+                    type Exported = Option<Rc<HashMap<String, String>>>;
+                    let mut stack: Vec<(usize, Exported)> = vec![(root, None)];
+                    while let Some((node, mapping)) = stack.pop() {
+                        let names: Vec<String> = doc.nodes[node]
+                            .attrs
+                            .get("part")
+                            .into_iter()
+                            .flat_map(|names| names.split_ascii_whitespace())
+                            .filter_map(|name| match &mapping {
+                                Some(mapping) => mapping.get(name).cloned(),
+                                None => Some(name.to_owned()),
+                            })
+                            .collect();
+                        for (name, declarations) in rules.iter() {
+                            if names.iter().any(|part| **part == **name) {
+                                batch
+                                    .entry(node)
+                                    .or_default()
+                                    .extend(declarations.iter().cloned());
+                            }
+                        }
+                        stack.extend(
+                            doc.nodes[node]
+                                .children
+                                .iter()
+                                .map(|&child| (child, mapping.clone())),
+                        );
+                        if let (Some(&inner), Some(exported)) = (
+                            state.shadows.get(&node),
+                            doc.nodes[node].attrs.get("exportparts"),
+                        ) {
+                            let exported: HashMap<String, String> = exported
+                                .split(',')
+                                .filter_map(|item| {
+                                    let (inner, outer) =
+                                        item.split_once(':').unwrap_or((item, item));
+                                    let outer = outer.trim();
+                                    let outer = match &mapping {
+                                        Some(mapping) => mapping.get(outer)?.clone(),
+                                        None => outer.to_owned(),
+                                    };
+                                    Some((inner.trim().to_owned(), outer))
+                                })
+                                .collect();
+                            stack.push((inner, Some(Rc::new(exported))));
+                        }
+                    }
+                    for (node, declarations) in batch {
+                        context
+                            .parts
+                            .entry(node)
+                            .or_default()
+                            .splice(0..0, declarations);
+                    }
+                }
                 let mut scoped_root = doc.nodes[root].clone();
                 scoped_root.parent = Some(0);
                 scoped_root.tag = "apps-shadow-root".into();
@@ -1740,6 +2398,27 @@ pub(crate) fn styles(
                         .inherited
                         .insert(child, (result.values[slot].clone(), result.lengths[slot]));
                 }
+                let Some(rules) = result.slotted.get(&slot).cloned() else {
+                    continue;
+                };
+                for (compound, declarations) in rules.iter() {
+                    let selectors = Selector::parse(compound, None);
+                    for &child in assigned {
+                        if selectors
+                            .iter()
+                            .any(|selector| selector.matches(doc, child))
+                        {
+                            context
+                                .slotted
+                                .entry(child)
+                                .or_default()
+                                .extend(declarations.iter().cloned());
+                        }
+                    }
+                }
+            }
+            for declarations in context.slotted.values_mut() {
+                declarations.sort_by_key(|(_, _, important)| *important);
             }
         }
     }
@@ -1813,15 +2492,41 @@ pub(crate) fn styles(
             result.children.insert(id, flattened);
         }
     }
+    if animating {
+        return Rc::new(result);
+    }
+    state.animating.clear();
     state.style_epoch += 1;
     state.style_viewport = viewport;
-    state.style_metrics = system.is_some();
+    state.style_metrics = scale;
     state.style_reduced_motion = reduced_motion;
     state.style_theme = theme;
     let result = Rc::new(result);
     state.linted = false;
     state.computed = Some(result.clone());
     result
+}
+
+fn path(value: &Value) -> Vec<usize> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| Some(item.as_u64()? as usize))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
+    match kind {
+        "insert" => style::Edit::Insert(text),
+        "style" => style::Edit::Declarations(text),
+        "selector" => style::Edit::Selector(text),
+        "keyframe" => style::Edit::Keyframe(text),
+        _ => style::Edit::Delete,
+    }
 }
 
 pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
@@ -1860,7 +2565,7 @@ mod tests {
         let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
         engine
             .eval(
-                "const editor=document.getElementById('editor');getComputedStyle(editor);",
+                "const editor=document.getElementById('editor');getComputedStyle(editor).color;",
                 "test",
             )
             .unwrap();
@@ -1885,7 +2590,7 @@ mod tests {
                 overlay.dataset.selectionRange='';
                 overlay.textContent='selection';
                 fragment.append(overlay);
-                if(getComputedStyle(editor).color!=='red')throw Error('Connected style changed');
+                if(getComputedStyle(editor).color!=='rgb(255, 0, 0)')throw Error('Connected style changed');
             }
         "#,
                 "test",
@@ -1897,16 +2602,16 @@ mod tests {
         );
         engine.eval(r#"
             editor.append(fragment);
-            if(getComputedStyle(editor.firstChild).color!=='blue')throw Error('Inserted style was stale');
+            if(getComputedStyle(editor.firstChild).color!=='rgb(0, 0, 255)')throw Error('Inserted style was stale');
             fragment.append(editor.firstChild);
         "#, "test").unwrap();
         assert!(host.borrow().dom[&1].computed.is_none());
         engine.eval(r#"
             const root=editor.attachShadow({mode:'open'});
             root.innerHTML='<span style="color:green">text</span>';
-            if(getComputedStyle(root.firstChild).color!=='green')throw Error('Shadow style');
+            if(getComputedStyle(root.firstChild).color!=='rgb(0, 128, 0)')throw Error('Shadow style');
             root.firstChild.style.color='purple';
-            if(getComputedStyle(root.firstChild).color!=='purple')throw Error('Shadow mutation was stale');
+            if(getComputedStyle(root.firstChild).color!=='rgb(128, 0, 128)')throw Error('Shadow mutation was stale');
         "#, "test").unwrap();
     }
 
@@ -1945,7 +2650,7 @@ mod tests {
         };
         engine
             .eval(
-                "const p=document.getElementById('p');getComputedStyle(p);",
+                "const p=document.getElementById('p');getComputedStyle(p).color;",
                 "test",
             )
             .unwrap();
@@ -1971,11 +2676,11 @@ mod tests {
             .eval(
                 r#"
             p.firstChild.data='';
-            if(getComputedStyle(p).color!=='red')throw Error('Empty text was stale');
+            if(getComputedStyle(p).color!=='rgb(255, 0, 0)')throw Error('Empty text was stale');
             const sheet=document.getElementById('s');
             sheet.textContent='p:hover{color:blue}';
             sheet.firstChild.data='p:hover{color:green}';
-            if(getComputedStyle(p).color==='green')throw Error('Hover without state');
+            if(getComputedStyle(p).color==='rgb(0, 128, 0)')throw Error('Hover without state');
         "#,
                 "test",
             )
@@ -1984,7 +2689,7 @@ mod tests {
         assert!(computed().is_none());
         engine
             .eval(
-                "if(getComputedStyle(p).color!=='green')throw Error('Hover state was stale')",
+                "if(getComputedStyle(p).color!=='rgb(0, 128, 0)')throw Error('Hover state was stale')",
                 "test",
             )
             .unwrap();
@@ -1999,7 +2704,7 @@ mod tests {
             .unwrap();
         let first = host.borrow().dom[&1].computed.as_ref().unwrap().values[p].clone();
         host.borrow_mut().dom.get_mut(&1).unwrap().computed = None;
-        engine.eval("getComputedStyle(p)", "test").unwrap();
+        engine.eval("getComputedStyle(p).color", "test").unwrap();
         assert!(Rc::ptr_eq(
             &first,
             &host.borrow().dom[&1].computed.as_ref().unwrap().values[p]
@@ -2027,12 +2732,14 @@ mod tests {
             .iter()
             .position(|node| node.tag == "style")
             .unwrap();
-        doc.nodes[sheet].text = ".replacement{color:blue}".into();
+        let text = doc.nodes[sheet].children[0];
+        doc.nodes[text].text = ".replacement{color:blue}".into();
         state.computed = None;
         styles(&mut doc, &mut state, [800., 600.], None);
         assert_eq!(state.sheets.len(), 200);
         assert!(!state.sheets.contains_key(".item0{color:red}"));
-        doc.nodes[0].children.retain(|id| *id != sheet);
+        let head = doc.nodes[sheet].parent.unwrap();
+        doc.nodes[head].children.retain(|id| *id != sheet);
         doc.nodes[sheet].parent = None;
         state.computed = None;
         styles(&mut doc, &mut state, [800., 600.], None);

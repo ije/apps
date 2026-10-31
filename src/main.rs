@@ -28,7 +28,10 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .peekable();
     let command = args.next().unwrap_or_else(|| "--help".into());
     if matches!(command.as_str(), "--help" | "-h")
         || matches!(command.as_str(), "run" | "build")
@@ -37,7 +40,7 @@ fn run() -> Result<i32> {
                 .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\napps skill\n\nRun and build default to main.ts, then main.js. Watching is off by default.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
+            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>] [--] [app arguments]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\napps skill\n\nRun and build default to main.ts, then main.js. Watching is off by default.\nOther arguments after the entry, and all arguments after --, go to the app in process.argv.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
@@ -63,8 +66,13 @@ fn run() -> Result<i32> {
     let mut devtools = false;
     let mut mcp = false;
     let mut mcp_port = 19876;
+    let mut app_args = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--" if command == "run" => {
+                app_args.extend(args.by_ref());
+                break;
+            }
             "--watch" | "-W" if command == "run" => watch = true,
             "--devtools" | "-D" if command == "run" => devtools = true,
             "--enable-devtools-mcp" if command == "run" => mcp = true,
@@ -91,6 +99,7 @@ fn run() -> Result<i32> {
                 )?;
                 explicit_target = true;
             }
+            _ if command == "run" && entry.is_some() => app_args.push(arg),
             _ if !arg.starts_with('-') => {
                 ensure!(entry.is_none(), "Unexpected argument: {arg}");
                 entry = Some(PathBuf::from(arg));
@@ -128,10 +137,14 @@ fn run() -> Result<i32> {
             // Port 0 picks a free port once, so `--watch` restarts keep it.
             let mcp = match (mcp, mcp_port) {
                 (false, _) => None,
-                (true, 0) => Some(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port()),
+                (true, 0) => Some(
+                    std::net::TcpListener::bind(("127.0.0.1", 0))?
+                        .local_addr()?
+                        .port(),
+                ),
                 (true, port) => Some(port),
             };
-            run::run(&entry, &runtime, watch, devtools, mcp)
+            run::run(&entry, &runtime, watch, devtools, mcp, &app_args)
         }
         "build" => {
             let out = out.unwrap_or_else(|| {

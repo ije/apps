@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 const HEADER: &[u8; 8] = b"H2O\0\x01\0\0\0";
 
@@ -19,6 +19,8 @@ pub struct Bundle {
     pub files: BBTreeMap<String, String>,
     #[serde(with = "map")]
     pub pages: BBTreeMap<String, Document>,
+    #[serde(skip)]
+    pub scripts: HashMap<String, bytes::Bytes>,
 }
 
 pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)> {
@@ -85,7 +87,7 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)
 }
 
 /// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
-pub const FEATURES: [(&str, bool); 1] = [("webgpu", false)];
+pub const FEATURES: [(&str, bool); 3] = [("webgpu", false), ("video", false), ("audio", false)];
 
 /// The bit of `feature` in a set returned by `disabled_features`.
 pub fn feature_bit(feature: &str) -> u32 {
@@ -146,11 +148,15 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     for (name, source) in files {
         if name.ends_with(".html") {
             let mut doc = Document::parse(source);
-            for node in &mut doc.nodes {
-                if node.tag == "style" {
+            for id in 0..doc.nodes.len() {
+                if doc.nodes[id].tag == "style"
+                    && let [text] = doc.nodes[id].children[..]
+                {
+                    let node = &mut doc.nodes[text];
                     node.stylesheet = Some(std::rc::Rc::new(Stylesheet::parse(&node.text)));
                     node.text.clear();
                 }
+                let node = &mut doc.nodes[id];
                 if let Some(source) = node.attrs.remove("style") {
                     node.inline = Some(Declarations::parse(&source));
                 }
@@ -176,7 +182,11 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     }
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
-    fs::write(path, &bytes).with_context(|| format!("Cannot write {}", path.display()))?;
+    // WARNING: running apps map app.h2o, so a new bundle replaces the file instead of rewriting it.
+    let temporary = path.with_extension("h2o.tmp");
+    fs::write(&temporary, &bytes)
+        .and_then(|()| fs::rename(&temporary, path))
+        .with_context(|| format!("Cannot write {}", path.display()))?;
     Ok(bytes.len())
 }
 
@@ -206,14 +216,42 @@ pub fn read(directory: &Path) -> Result<Bundle> {
         .context("Cannot resolve bundle directory")?;
     let path = directory.join("app.h2o");
     let mut bundle = if path.try_exists()? {
-        let bytes = fs::read(&path).context("Cannot read app.h2o")?;
+        #[derive(Deserialize)]
+        struct Mapped<'a> {
+            #[serde(borrow)]
+            files: Vec<(String, &'a [u8])>,
+            #[serde(with = "map")]
+            pages: BBTreeMap<String, Document>,
+        }
+        let file = fs::File::open(&path).context("Cannot read app.h2o")?;
+        // WARNING: script chunks stay in the mapped file until they run, so app.h2o must not change
+        // while the app runs.
+        let bytes = bytes::Bytes::from_owner(
+            unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.h2o")?,
+        );
         ensure!(
             bytes.starts_with(HEADER),
             "Invalid or unsupported app.h2o format"
         );
-        let (mut bundle, rest): (Bundle, _) =
+        let (mapped, rest): (Mapped, _) =
             postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.h2o data")?;
         ensure!(rest.is_empty(), "Trailing app.h2o data");
+        let mut bundle = Bundle {
+            pages: mapped.pages,
+            ..Bundle::default()
+        };
+        for (name, source) in mapped.files {
+            let duplicate = if name.starts_with("script-") {
+                bundle
+                    .scripts
+                    .insert(name, bytes.slice_ref(source))
+                    .is_some()
+            } else {
+                let source = String::from_utf8(source.to_vec()).context("Invalid app.h2o data")?;
+                bundle.files.insert(name, source).is_some()
+            };
+            ensure!(!duplicate, "Duplicate bundle key");
+        }
         for (_, doc) in &mut bundle.pages {
             ensure!(!doc.nodes.is_empty(), "Missing document root");
             ensure!(
@@ -490,14 +528,16 @@ mod tests {
     #[test]
     fn package_features_enable_and_disable_in_order() {
         for (features, disabled) in [
-            (None, 1),
-            (Some(json!([])), 1),
-            (Some(json!(["webgpu"])), 0),
+            (None, 7),
+            (Some(json!([])), 7),
+            (Some(json!(["webgpu"])), 6),
             (Some(json!(["*"])), 0),
-            (Some(json!(["-*"])), 1),
+            (Some(json!(["-*"])), 7),
             (Some(json!(["*", "-webgpu"])), 1),
-            (Some(json!(["-*", "webgpu"])), 0),
-            (Some(json!(["webgpu", "-webgpu"])), 1),
+            (Some(json!(["-*", "webgpu"])), 6),
+            (Some(json!(["webgpu", "-webgpu"])), 7),
+            (Some(json!(["video", "audio"])), 1),
+            (Some(json!(["*", "-audio"])), 4),
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(
@@ -600,7 +640,7 @@ mod tests {
         assert_eq!(bundle.files.len(), 1);
         let doc = bundle.pages.remove("page-0.html").unwrap();
         let raw = Document::parse(html);
-        let sheet = doc.nodes.iter().position(|n| n.tag == "style").unwrap();
+        let sheet = doc.nodes[doc.nodes.iter().position(|n| n.tag == "style").unwrap()].children[0];
         let card = doc
             .nodes
             .iter()
@@ -676,6 +716,28 @@ mod tests {
                 .last()
                 .unwrap()["width"],
             "1px"
+        );
+    }
+
+    #[test]
+    fn script_chunks_stay_in_the_mapped_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.h2o");
+        let files = BBTreeMap::from([
+            ("app.js".into(), "$appsDefine({id:0});".into()),
+            ("script-0.js".into(), "globalThis.chunk = '你好';".into()),
+        ]);
+        write(&path, &files).unwrap();
+        let bundle = read(dir.path()).unwrap();
+        assert_eq!(bundle.files.keys().collect::<Vec<_>>(), ["app.js"]);
+        assert_eq!(
+            &bundle.scripts["script-0.js"][..],
+            files["script-0.js"].as_bytes()
+        );
+        write(&path, &BBTreeMap::from([("app.js".into(), String::new())])).unwrap();
+        assert_eq!(
+            &bundle.scripts["script-0.js"][..],
+            files["script-0.js"].as_bytes()
         );
     }
 

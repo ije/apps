@@ -21,7 +21,13 @@ impl State {
                     .as_object()
                     .cloned()
                     .context("Expected browser options")?;
-                for name in ["persistent", "inspectable", "javascript", "show"] {
+                for name in [
+                    "persistent",
+                    "inspectable",
+                    "javascript",
+                    "show",
+                    "navigation",
+                ] {
                     ensure!(
                         options.get(name).is_none_or(Value::is_boolean),
                         "Expected boolean browser option: {name}"
@@ -40,6 +46,10 @@ impl State {
                 let browser = Browser::detached(&Value::Object(options))?;
                 self.next_id += 1;
                 self.views.insert(self.next_id, browser);
+                Ok(self.next_id.into())
+            }
+            "reserve" => {
+                self.next_id += 1;
                 Ok(self.next_id.into())
             }
             "poll" => {
@@ -120,6 +130,8 @@ mod tests {
     #[test]
     fn closing_parent_detaches_and_destroy_is_idempotent() {
         let mut state = State::default();
+        assert_eq!(state.call("reserve", &Value::Null).unwrap(), 1);
+        assert_eq!(state.call("reserve", &Value::Null).unwrap(), 2);
         state.parents.insert(2, 1);
         state.attaches.push((2, 1));
         state.close_window(1).unwrap();

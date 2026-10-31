@@ -103,12 +103,14 @@
     refresh() { const timer = timers.get(this.#id); if (timer) { timer.at = Date.now() + timer.delay; stale = true; } return this; }
     close() { clearTimeout(this.#id); return this; }
     [Symbol.toPrimitive]() { return this.#id; }
+    [Symbol.dispose]() { clearTimeout(this.#id); }
   }
   globalThis.setTimeout = (fn, delay = 0, ...args) => {
     if (typeof fn !== 'function') throw new TypeError('Expected a timer function');
     const id = ++timerID;
     delay = Number(delay);
     delay = delay >= 0 && delay <= 2147483647 ? delay : delay > 0 ? 1 : 0;
+    if (nodeRole && delay < 1) delay = 1;
     const at = Date.now() + delay;
     timers.set(id, { fn, args, delay, at, ref: true });
     if (at < next) next = at;
@@ -122,6 +124,14 @@
   };
   globalThis.clearInterval = clearTimeout;
   globalThis.queueMicrotask = fn => Promise.resolve().then(fn);
+  // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs; __appsTick returns -2 after each one, so the engine drains microtasks and calls it again.
+  const ticks = [], immediates = new Map();
+  let phase = 0, now = 0, due = [], checks = [];
+  const fail = error => { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } };
+  const runTicks = () => {
+    for (let i = 0; i < ticks.length; i++) { const [fn, args] = ticks[i]; try { fn(...args); } catch (error) { ticks.splice(0, i + 1); i = -1; fail(error); } }
+    ticks.length = 0;
+  };
   const pollWeb = globalThis.__appsWeb(call);
   delete globalThis.__appsWeb;
   globalThis.__appsPlatform(call);
@@ -137,57 +147,103 @@
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call);
   delete globalThis.__appsBrowserEnvironment;
-  const bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter);
+  const hooks = {}, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
   delete globalThis.__appsBridge;
   __appsSyncBridge();
   globalThis.__appsPending = () => modulesPending > 0 || moduleErrors.length > 0 || (children?.pending() ?? false) || (node?.poll.pending() ?? false) || (pty?.poll.pending() ?? false) || bridge.poll.pending() || workers.pending() || (net?.pending() ?? false);
+  // WARNING: one call runs one macrotask: pending ticks, one due timer, the I/O polls or one immediate (timers, poll and check phases, like Node).
   globalThis.__appsTick = () => {
     if (moduleErrors.length) throw moduleErrors.shift();
-    try {
-      // WARNING: WeakRef targets only die in a GC, so sweep only after the canary is collected.
-      if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); } }
-      globalThis.__appsDomSweep?.();
-      globalThis.__appsDecoded?.();
-      globalThis.__appsGPUPoll?.();
-      pollWeb();
-      children?.poll();
-      servers?.poll();
-      node?.poll();
-      pty?.poll();
-      browsers?.poll();
-      workers.poll();
-      net?.poll();
-      nativeShell?.poll?.();
-    } catch (error) { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } }
-    const now = Date.now();
-    if (now >= earliest()) {
-      stale = true;
-      for (const [id, timer] of [...timers]) {
-        if (timer.at > now || !timers.has(id)) continue;
-        if (timer.interval) timer.at = now + timer.interval;
-        else timers.delete(id);
-        try { timer.fn(...timer.args); } catch (error) { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } }
-      }
+    if (ticks.length) { runTicks(); return -2; }
+    if (phase === 0) {
+      phase = 1; now = Date.now();
+      if (now >= earliest()) { stale = true; due = [...timers].filter(([, timer]) => timer.at <= now).sort((a, b) => a[1].at - b[1].at); }
     }
+    while (phase === 1 && due.length) {
+      const [id, timer] = due.shift();
+      if (timers.get(id) !== timer || timer.at > now) continue;
+      if (timer.interval) timer.at = Date.now() + timer.interval;
+      else timers.delete(id);
+      try { timer.fn(...timer.args); } catch (error) { fail(error); }
+      runTicks();
+      return -2;
+    }
+    if (phase === 1) {
+      phase = 2;
+      try {
+        // WARNING: WeakRef targets only die in a GC, so sweep only after the canary is collected.
+        if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); } }
+        globalThis.__appsDomSweep?.();
+        globalThis.__appsDecoded?.();
+        globalThis.__appsGPUPoll?.();
+        globalThis.__appsMediaPoll?.();
+        bridge.poll();
+        pollWeb();
+        children?.poll();
+        servers?.poll();
+        node?.poll();
+        pty?.poll();
+        browsers?.poll();
+        workers.poll();
+        net?.poll();
+        nativeShell?.poll?.();
+      } catch (error) { fail(error); }
+      runTicks();
+      checks = [...immediates];
+      return -2;
+    }
+    while (checks.length) {
+      const [immediate, [fn, args]] = checks.shift();
+      if (!immediates.delete(immediate)) continue;
+      try { fn(...args); } catch (error) { fail(error); }
+      runTicks();
+      return -2;
+    }
+    phase = 0;
     return __appsDelay();
   };
   globalThis.__appsDelay = () => {
+    if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
     const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - Date.now());
     // WARNING: native producers wake the loop when they queue events and bridge replies arrive in a call, so only module errors poll here.
     return moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
-  globalThis.__appsAlive = () => timers.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
+  globalThis.__appsAlive = () => timers.size > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
+    const executed = (id, data) => call('dom.executed', id, stringify(data));
+    Object.defineProperty(globalThis, '__appsExecuted', { value: (id, value, failed) => (failed ? Promise.reject(value) : Promise.resolve(value)).then(value => executed(id, { value })).catch(error => executed(id, { error: String(error?.message ?? error) })) });
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
     else { globalThis.navigator.gpu = feature('webgpu'); globalThis.GPUCanvasContext = feature('webgpu'); }
+    globalThis.__appsMedia = { video: !disabled.has('video'), audio: !disabled.has('audio') };
     return;
   }
   const info = call('info');
   globalThis.global = globalThis;
-  globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 0, ...args);
-  globalThis.clearImmediate = clearTimeout;
+  // WARNING: V8 call sites are parsed from JSC's stack text, so getThis(), getFunction() and getTypeName() know nothing.
+  const capture = Error.captureStackTrace;
+  if (capture) Error.captureStackTrace = function captureStackTrace(object, constructor) {
+    capture(object, constructor ?? captureStackTrace);
+    const prepare = Error.prepareStackTrace;
+    if (typeof prepare !== 'function') return;
+    const sites = String(object.stack).split('\n').filter(Boolean).map(line => {
+      const [, name = '', file, row, column] = /^(?:(.*?)@)?(.*?)(?::(\d+):(\d+))?$/.exec(line), native = file === '[native code]', top = !name || / code$/.test(name);
+      return { getThis: () => undefined, getTypeName: () => null, getFunction: () => undefined, getFunctionName: () => top ? null : name, getMethodName: () => null, getFileName: () => native ? undefined : file, getScriptNameOrSourceURL: () => native ? undefined : file,
+        getLineNumber: () => row ? +row : null, getColumnNumber: () => column ? +column : null, getEvalOrigin: () => undefined, isToplevel: () => top, isEval: () => name === 'eval code', isNative: () => native, isConstructor: () => false, isAsync: () => false, isPromiseAll: () => false, getPromiseIndex: () => null, toString: () => line };
+    });
+    Object.defineProperty(object, 'stack', { value: prepare(object, sites), writable: true, configurable: true });
+  };
+  const callable = (fn, name) => { if (typeof fn !== 'function') throw Object.assign(new TypeError(`The "${name}" argument must be of type function. Received ${fn === null ? 'null' : typeof fn}`), { code: 'ERR_INVALID_ARG_TYPE' }); };
+  class Immediate {
+    #ref = true;
+    ref() { this.#ref = true; return this; }
+    unref() { this.#ref = false; return this; }
+    hasRef() { return this.#ref; }
+    [Symbol.dispose]() { clearImmediate(this); }
+  }
+  globalThis.setImmediate = (fn, ...args) => { callable(fn, 'callback'); const immediate = new Immediate(); immediates.set(immediate, [fn, args]); return immediate; };
+  globalThis.clearImmediate = immediate => { immediates.delete(immediate); };
   const ffi = globalThis.__appsFFI(globalThis.__appsFFINative);
   delete globalThis.__appsFFI;
   delete globalThis.__appsFFINative;
@@ -195,19 +251,19 @@
   delete globalThis.__appsSQLite;
   const events = globalThis.__appsEvents;
   delete globalThis.__appsEvents;
-  children = globalThis.__appsChildProcess(call, events.EventEmitter);
-  delete globalThis.__appsChildProcess;
   servers = globalThis.__appsServe(call);
   delete globalThis.__appsServe;
   node = globalThis.__appsNode(call, events.EventEmitter, inspector, info);
   delete globalThis.__appsNode;
   const stream = globalThis.__appsNodeStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder);
   delete globalThis.__appsNodeStreams;
+  children = globalThis.__appsChildProcess(call, events.EventEmitter, stream);
+  delete globalThis.__appsChildProcess;
   const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto });
   delete globalThis.__appsNodeIO;
   net = globalThis.__appsNet(call, events.EventEmitter, stream, node.Buffer);
   delete globalThis.__appsNet;
-  const http = globalThis.__appsHTTP(servers.serve, stream, events.EventEmitter);
+  const http = globalThis.__appsHTTP(servers.serve, stream, events.EventEmitter, net);
   delete globalThis.__appsHTTP;
   pty = globalThis.__appsPty(call);
   delete globalThis.__appsPty;
@@ -215,22 +271,33 @@
   delete globalThis.__appsBrowser;
   nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter);
   delete globalThis.__appsNativeShell;
-  // WARNING: process.version reports the Node.js API level that the node: modules follow.
-  const nodeVersion = '24.0.0';
+  // WARNING: process.version reports the Node.js API level that the node: modules follow, and versions.electron the Electron release that uses it.
+  const nodeVersion = '24.0.0', electronVersion = '40.0.0';
   let exiting = false;
-  const exit = code => {
+  const finish = code => {
     if (code !== undefined) process.exitCode = code;
     if (!exiting) { exiting = true; process.emit('exit', Number(process.exitCode ?? 0) | 0); }
-    call('quit', Number(process.exitCode ?? 0) | 0);
+    return Number(process.exitCode ?? 0) | 0;
   };
+  const quitApp = code => call('quit', finish(code));
+  // WARNING: a worker keeps running until the watchdog sees its stop flag, so the loop keeps code after exit() from running.
+  const exit = code => { call('process.exit', finish(code)); for (;;); };
+  const env = new Proxy(info.env, {
+    set: (target, name, value) => { target[name] = String(value); return true; },
+    defineProperty: (target, name, descriptor) => {
+      if (descriptor.configurable !== true || descriptor.writable !== true || descriptor.enumerable !== true || !('value' in descriptor)) throw Object.assign(new TypeError("'process.env' only accepts a configurable, writable, and enumerable data descriptor"), { code: 'ERR_INVALID_OBJECT_DEFINE_PROPERTY' });
+      target[name] = String(descriptor.value);
+      return true;
+    },
+  });
   const memoryUsage = () => ({ rss: memoryUsage.rss(), heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
   memoryUsage.rss = () => call('node.process.memory');
   const process = globalThis.process = Object.assign(new events.EventEmitter(), {
-    platform: info.platform, arch: info.arch, pid: info.pid, title: info.appName,
-    version: 'v' + nodeVersion, versions: Object.freeze({ node: nodeVersion, apps: info.version, javascriptcore: info.javascriptcore, napi: '8' }), release: Object.freeze({ name: 'node' }),
-    argv: info.argv, argv0: info.argv[0], execArgv: [], env: info.env, execPath: info.execPath, exitCode: undefined,
+    platform: info.platform, arch: info.arch, pid: info.pid, title: info.appName, type: role === 'main' ? 'browser' : 'renderer',
+    version: 'v' + nodeVersion, versions: Object.freeze({ node: nodeVersion, electron: electronVersion, apps: info.version, javascriptcore: info.javascriptcore, napi: '8' }), release: Object.freeze({ name: 'node' }),
+    argv: [info.execPath ?? info.argv[0], ...info.argv.slice(1)], argv0: info.argv[0], execArgv: [], env, execPath: info.execPath, exitCode: undefined,
     cwd: () => call('cwd'), chdir: path => call('chdir', path),
-    nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+    nextTick: (fn, ...args) => { callable(fn, 'callback'); ticks.push([fn, args]); },
     exit, kill: (pid, signal = 'SIGTERM') => { call('process.kill', pid, signal); return true; },
     hrtime: previous => { const now = performance.now() * 1e6, value = [Math.floor(now / 1e9), Math.floor(now % 1e9)]; if (previous) { value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1e9; } } return value; },
     uptime: () => performance.now() / 1000,
@@ -254,56 +321,159 @@
     process.emit('uncaughtException', error, 'uncaughtException');
     return true;
   };
+  hooks.report = error => { if (!uncaught(error)) console.error(error); };
   addEventListener('unhandledrejection', event => { if (!process.listenerCount('unhandledRejection')) return; event.preventDefault(); process.emit('unhandledRejection', event.reason, event.promise); });
   const output = fd => {
     let tty;
     const writable = new stream.Writable({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
     // WARNING: Writes stay synchronous so they keep their order with console output.
     writable.write = (data, encoding, callback) => { if (typeof encoding === 'function') { callback = encoding; encoding = undefined; } call('process.write', fd, typeof data === 'string' && !encoding ? data : Buffer.from(data, encoding)); if (callback) queueMicrotask(callback); return true; };
-    return Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { get: () => tty ??= node.tty.isatty(fd), enumerable: true } });
+    return Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { get: () => (tty ??= node.tty.isatty(fd)) || undefined, enumerable: true } });
   };
   process.stdout = output(1);
   process.stderr = output(2);
   const fs = node.fs;
-  const handles = () => { let closed = false; return handle => { if (closed) return; closed = true; return handle.close(); }; };
-  fs.createReadStream = (file, options = {}) => {
-    if (typeof options === 'string') options = { encoding: options };
-    const opening = fs.promises.open(file, options.flags ?? 'r'), close = handles();
-    let offset = options.start ?? (options.end == null ? null : 0);
-    const readable = new stream.Readable({ highWaterMark: options.highWaterMark ?? 65536, encoding: options.encoding,
-      read(size) {
-        opening.then(async handle => {
-          const length = options.end == null ? size : Math.min(size, options.end - offset + 1);
-          const { bytesRead, buffer } = length > 0 ? await handle.read(Buffer.allocUnsafe(length), 0, length, offset) : { bytesRead: 0 };
-          if (offset !== null) offset += bytesRead;
-          readable.bytesRead += bytesRead;
-          readable.push(bytesRead ? buffer.subarray(0, bytesRead) : null);
-        }).catch(error => readable.destroy(error));
-      },
-      destroy(error, done) { opening.then(close, () => {}).then(() => done(error), done); },
-    });
-    Object.assign(readable, { path: file, bytesRead: 0, pending: true, close(callback) { if (callback) this.once('close', callback); this.destroy(); } });
-    opening.then(handle => { readable.pending = false; readable.fd = handle.fd; readable.emit('open', handle.fd); readable.emit('ready'); }, error => readable.destroy(error));
-    return readable;
+  const fileStream = (self, file, o, flags) => {
+    const handle = typeof o.fd === 'object' && o.fd !== null ? o.fd : null;
+    if (o.start !== undefined && o.end !== undefined && o.start > o.end) throw Object.assign(new RangeError(`The value of "start" is out of range. It must be <= "end" (here: ${o.end}). Received ${o.start}`), { code: 'ERR_OUT_OF_RANGE' });
+    Object.assign(self, { path: file instanceof URL ? node.url.fileURLToPath(file) : file ?? undefined, fd: handle ? handle.fd : o.fd ?? null, flags: o.flags ?? flags, mode: o.mode ?? 0o666, start: o.start, autoClose: o.autoClose !== false, pos: o.start });
+    self.opening = self.fd !== null ? Promise.resolve(self.fd) : new Promise((resolve, reject) => fs.open(self.path, self.flags, self.mode, (error, fd) => error ? reject(error) : resolve(fd)));
+    if (self.fd === null) self.opening.then(fd => { self.fd = fd; self.emit('open', fd); self.emit('ready'); }, error => self.destroy(error));
+    self._destroy = (error, done) => self.opening.then(fd => self.autoClose && new Promise(resolve => { self.fd = null; if (handle) handle.close().then(resolve, resolve); else fs.close(fd, resolve); }), () => {}).then(() => done(error));
   };
-  fs.createWriteStream = (file, options = {}) => {
-    if (typeof options === 'string') options = { encoding: options };
-    const opening = fs.promises.open(file, options.flags ?? 'w', options.mode), close = handles();
-    const writable = new stream.Writable({ highWaterMark: options.highWaterMark, defaultEncoding: options.encoding,
-      write(data, _encoding, done) { opening.then(handle => handle.writeFile(data)).then(() => { writable.bytesWritten += data.length; done(); }, done); },
-      final(done) { opening.then(close).then(() => done(), done); },
-      destroy(error, done) { opening.then(close, () => {}).then(() => done(error), done); },
-    });
-    Object.assign(writable, { path: file, bytesWritten: 0, pending: true, close(callback) { if (callback) this.once('close', callback); this.end(); } });
-    opening.then(handle => { writable.pending = false; writable.fd = handle.fd; writable.emit('open', handle.fd); writable.emit('ready'); }, error => writable.destroy(error));
-    return writable;
-  };
+  class ReadStream extends stream.Readable {
+    get pending() { return this.fd === null; }
+    constructor(file, o) {
+      o = typeof o === 'string' ? { encoding: o } : o ?? {};
+      super({ highWaterMark: o.highWaterMark ?? 65536, encoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
+      this.bytesRead = 0; this.end = o.end ?? Infinity;
+      fileStream(this, file, { ...o, start: o.start ?? (o.end === undefined ? undefined : 0) }, 'r');
+    }
+    _read(size) {
+      this.opening.then(fd => {
+        const length = Math.min(size, this.end - (this.pos ?? 0) + 1);
+        if (length <= 0) return this.push(null);
+        fs.read(fd, Buffer.allocUnsafe(length), 0, length, this.pos ?? null, (error, bytesRead, buffer) => {
+          if (error) return this.destroy(error);
+          if (this.pos !== undefined) this.pos += bytesRead;
+          this.bytesRead += bytesRead;
+          this.push(bytesRead ? buffer.subarray(0, bytesRead) : null);
+        });
+      }, () => {});
+    }
+    close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } this.destroy(); }
+  }
+  class WriteStream extends stream.Writable {
+    get pending() { return this.fd === null; }
+    constructor(file, o) {
+      o = typeof o === 'string' ? { encoding: o } : o ?? {};
+      super({ highWaterMark: o.highWaterMark, defaultEncoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
+      this.bytesWritten = 0; this.flush = !!o.flush;
+      fileStream(this, file, o, 'w');
+    }
+    _write(data, _encoding, done) {
+      this.opening.then(fd => {
+        const step = at => fs.write(fd, data, at, data.length - at, this.pos ?? null, (error, written) => {
+          if (error) return done(error);
+          this.bytesWritten += written;
+          if (this.pos !== undefined) this.pos += written;
+          if (at + written < data.length) step(at + written); else done();
+        });
+        step(0);
+      }, done);
+    }
+    _final(done) { this.opening.then(fd => this.flush ? fs.fsync(fd, done) : done(), done); }
+    close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } if (this.writable) this.end(); else this.destroy(); }
+    destroySoon() { this.end(); }
+  }
+  Object.assign(fs, { ReadStream, WriteStream, createReadStream: (file, o) => new ReadStream(file, o), createWriteStream: (file, o) => new WriteStream(file, o) });
   const { path, os } = node;
   let ready = false, nextWindow = 0, resolveReady;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-  const windows = new Map(), captures = new Map(), states = new WeakMap();
-  let nextCapture = 0;
-  const state = win => { if (win.isDestroyed()) throw Error('Window is closed'); return states.get(win); };
+  const windows = new Map(), captures = new Map(), states = new WeakMap(), pages = new WeakMap();
+  let nextCapture = 0, nextLoad = 0;
+  const destroyed = () => Error('Object has been destroyed');
+  const state = win => { if (win.isDestroyed()) throw destroyed(); return states.get(win); };
+  const loadError = (code, description, url) => Object.assign(new Error(`${description} (${code}) loading '${url}'`), { code: description, errno: code, url });
+  const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win }); call('window', op, win, id, ...args); });
+  class WebContents extends events.EventEmitter {
+    constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null }); }
+    #page() { const page = pages.get(this); if (!windows.has(page.win)) throw destroyed(); return page; }
+    _load(op, target, url) {
+      const page = this.#page(), request = ++nextLoad;
+      call('window', op, page.win, target, request);
+      page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
+      Object.assign(page, { loading: true, html: op === 'load' ? target : page.html });
+      return new Promise((resolve, reject) => { page.load = { request, url, resolve, reject }; });
+    }
+    _event(name, data) {
+      const page = pages.get(this), load = page.load?.request === data?.request ? page.load : null;
+      if (name === 'title') { page.title = data; return; }
+      if (load) page.load = null;
+      page.loading = false;
+      if (name === 'failed') {
+        this.emit('did-fail-load', event(), data.code, data.description, data.url, true, info.pid, 1);
+        this.emit('did-stop-loading');
+        return load?.reject(loadError(data.code, data.description, data.url));
+      }
+      page.url = data.url;
+      this.emit('did-start-loading');
+      this.emit('did-navigate', event(), data.url, -1, '');
+      this.emit('dom-ready', event());
+      this.emit('did-finish-load', event());
+      this.emit('did-stop-loading');
+      load?.resolve();
+    }
+    loadFile(file, options = {}) {
+      let target = String(file);
+      const local = /^(apps|file):/.test(target);
+      const url = local ? new URL(target) : node.url.pathToFileURL(path.resolve(info.appPath, target));
+      if (options.query || options.search !== undefined || options.hash !== undefined) {
+        if (options.query) url.search = new URLSearchParams(options.query).toString();
+        if (options.search !== undefined) url.search = options.search;
+        if (options.hash !== undefined) url.hash = options.hash;
+        target = url.href;
+      }
+      return this._load('loadFile', target, url.href);
+    }
+    loadURL() { throw Error('loadURL is not allowed, use WebContentsView to load webpage'); }
+    reload() { const page = this.#page(), html = page.url === 'apps://app/'; if (page.url) this._load(html ? 'load' : 'loadFile', html ? page.html : page.url, page.url).catch(() => {}); }
+    reloadIgnoringCache() { this.reload(); }
+    send(channel, ...args) { bridge.send(this.#page().win, channel, ...args); }
+    executeJavaScript(code) { return pending(this.#page().win, 'execute', String(code)); }
+    capturePage(rect) { return pending(this.#page().win, 'capture', rect ?? null); }
+    openDevTools() { call('window', 'devtools', this.#page().win); }
+    toggleDevTools() { this.openDevTools(); }
+    focus() { BrowserWindow.fromId(this.#page().win).focus(); }
+    getURL() { return pages.get(this).url; }
+    getTitle() { return pages.get(this).title; }
+    isLoading() { return pages.get(this).loading; }
+    isDestroyed() { return !windows.has(pages.get(this).win); }
+    getOSProcessId() { return info.pid; }
+    getProcessId() { return info.pid; }
+  }
+  const webContents = Object.freeze({
+    getAllWebContents: () => [...[...windows.values()].map(win => win.webContents), ...browsers.all()],
+    fromId: id => webContents.getAllWebContents().find(contents => contents.id === id),
+    getFocusedWebContents: () => BrowserWindow.getFocusedWindow()?.webContents ?? null,
+  });
+  const closed = win => {
+    const closing = quitting;
+    windows.delete(win.id);
+    for (const child of win.contentView.children) win.contentView.removeChildView(child);
+    const page = pages.get(win.webContents);
+    page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
+    for (const [id, request] of captures) if (request.win === win.id) { captures.delete(id); request.reject(destroyed()); }
+    win.webContents.emit('destroyed');
+    win.emit('closed');
+    app.emit('window-close');
+    if (windows.size) return;
+    if (closing) willQuit();
+    else if (quitting) return;
+    else if (app.listenerCount('window-all-closed') || app.listenerCount('window-close')) app.emit('window-all-closed');
+    else quit();
+  };
+  hooks.contents = id => windows.get(id)?.webContents ?? null;
   const int = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return Math.round(value); };
   // WARNING: Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
   const argb = color => /^#([\da-f]{4}|[\da-f]{8})$/i.test(color) ? '#' + color.slice(color.length === 5 ? 2 : 3) + color.slice(1, color.length === 5 ? 2 : 3) : color;
@@ -326,15 +496,8 @@
       options = { ...options, title: String(options.title ?? name) };
       if (typeof options.backgroundColor === 'string') options.backgroundColor = argb(options.backgroundColor);
       this.id = ++nextWindow;
-      this.webContents = new events.EventEmitter();
-      Object.assign(this.webContents, { id: this.id, send: (channel, ...args) => bridge.send(this.id, channel, ...args), openDevTools: () => call('window', 'devtools', this.id), toggleDevTools: () => call('window', 'devtools', this.id),
-        capturePage: rect => new Promise((resolve, reject) => {
-          if (this.isDestroyed()) throw Error('Window is closed');
-          const id = ++nextCapture;
-          captures.set(id, { resolve, reject });
-          call('window', 'capture', this.id, id, rect ?? null);
-        }) });
       call('window', 'create', this.id, options);
+      Object.defineProperty(this, 'webContents', { value: new WebContents(this.id), enumerable: true });
       const { x = 0, y = 0, width = 800, height = 600 } = options;
       states.set(this, { bounds: { x, y, width, height }, content: { x, y, width, height }, minimized: false, maximized: false, fullscreen: false, visible: options.show !== false, focused: false,
         title: options.title, min: [options.minWidth ?? 0, options.minHeight ?? 0], max: [options.maxWidth ?? 0, options.maxHeight ?? 0], alwaysOnTop: options.alwaysOnTop === true,
@@ -344,30 +507,20 @@
       app.emit('web-contents-created', event(), this.webContents);
       app.emit('browser-window-created', event(), this);
     }
-    load(html) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'load', this.id, String(html)); }
-    loadFile(file, options = {}) {
-      if (this.isDestroyed()) throw Error('Window is closed');
-      let target = String(file);
-      if (options.query || options.search !== undefined || options.hash !== undefined) {
-        const url = /^(apps|file):/.test(target) ? new URL(target) : __apps.url.pathToFileURL(__apps.path.resolve(target));
-        if (options.query) url.search = new URLSearchParams(options.query).toString();
-        if (options.search !== undefined) url.search = options.search;
-        if (options.hash !== undefined) url.hash = options.hash;
-        target = url.href;
-      }
-      call('window', 'loadFile', this.id, target);
-    }
+    load(html) { return this.webContents._load('load', String(html), 'apps://app/'); }
+    loadFile(file, options) { return this.webContents.loadFile(file, options); }
     loadURL() { throw Error('loadURL is not allowed, use WebContentsView to load webpage'); }
+    reload() { this.webContents.reload(); }
     close() {
-      if (this.isDestroyed() || states.get(this).closing) return;
+      if (state(this).closing) return;
       const close = event();
       this.emit('close', close);
       if (close.defaultPrevented) { quitting = false; return; }
       states.get(this).closing = true;
       call('window', 'close', this.id);
     }
-    destroy() { if (!this.isDestroyed()) call('window', 'close', this.id); }
-    setWindowButtonVisibility(visible) { if (this.isDestroyed()) throw Error('Window is closed'); call('window', 'buttons', this.id, !!visible); }
+    destroy() { if (this.isDestroyed()) return; call('window', 'close', this.id); closed(this); }
+    setWindowButtonVisibility(visible) { state(this); call('window', 'buttons', this.id, !!visible); }
     isDestroyed() { return !windows.has(this.id); }
     getTitle() { return state(this).title; }
     setTitle(title) { const s = state(this); s.title = String(title); call('window', 'title', this.id, s.title); }
@@ -433,7 +586,7 @@
     app.emit('will-quit', will);
     if (will.defaultPrevented) { quitting = false; return; }
     app.emit('quit', event(), Number(process.exitCode ?? 0) | 0);
-    exit();
+    quitApp();
   };
   const quit = () => {
     if (quitting) return;
@@ -446,7 +599,7 @@
   };
   Object.assign(app, {
     whenReady: () => readyPromise, isReady: () => ready, quit,
-    exit: (code = 0) => exit(code),
+    exit: (code = 0) => quitApp(code),
     relaunch: ({ args = info.argv.slice(1), execPath = info.execPath } = {}) => call('app.relaunch', [String(execPath), ...args.map(String)]),
     focus: ({ steal = false } = {}) => call('focus', !!steal),
     getAppPath: () => info.appPath,
@@ -472,7 +625,7 @@
   });
   Object.defineProperty(app, 'name', { get: () => name, set: app.setName, enumerable: true });
   Object.defineProperty(app, 'hasWindows', { get: () => windows.size > 0, enumerable: true });
-  nativeShell.bindApp(app,info.appName);
+  nativeShell.bindApp(app, info.appName, () => BrowserWindow.getFocusedWindow());
   if (role === 'main' && workers.api.isMainThread) globalThis.__appsStart = options => {
     if (!options || typeof options !== 'object') return;
     const handlers = [['ready', 'ready'], ['activate', 'activate'], ['windowClose', 'window-close']];
@@ -497,20 +650,8 @@
   };
   globalThis.__appsEvent = (name, id, data) => {
     const win = windows.get(id);
-    if (name === 'ready') { app.emit('will-finish-launching'); ready = true; app.emit('ready'); resolveReady(); }
-    else if (name === 'closed') {
-      if (!win) return;
-      const closing = quitting;
-      windows.delete(id);
-      for (const child of win.contentView.children) win.contentView.removeChildView(child);
-      win.emit('closed');
-      app.emit('window-close');
-      if (windows.size) return;
-      if (closing) willQuit();
-      else if (quitting) return;
-      else if (app.listenerCount('window-all-closed') || app.listenerCount('window-close')) app.emit('window-all-closed');
-      else quit();
-    }
+    if (name === 'ready') { app.emit('will-finish-launching'); ready = true; app.emit('ready', event(), {}); resolveReady(); }
+    else if (name === 'closed') { if (win) closed(win); }
     else if (name === 'resize') win?.contentView.setBounds({ x: 0, y: 0, ...data });
     else if (name === 'state') {
       const s = win && states.get(win);
@@ -532,14 +673,20 @@
     else if (name === 'title') {
       if (!win) return true;
       const updated = event();
+      win.webContents._event('title', data);
       win.emit('page-title-updated', updated, data, true);
       if (!updated.defaultPrevented) states.get(win).title = data;
       return !updated.defaultPrevented;
     }
-    else if (name === 'loaded') win?.emit('ready-to-show');
+    else if (name === 'loaded' || name === 'failed') { win?.webContents._event(name, data); if (name === 'loaded') win?.emit('ready-to-show'); }
     else if (name === 'activate') app.emit('activate', event(), !!data);
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
+    else if (name === 'executed') {
+      const request = captures.get(data.request), result = parse(data.data);
+      captures.delete(data.request);
+      if (result.error !== undefined) request?.reject(new Error(result.error)); else request?.resolve(result.value);
+    }
     else if (name === 'captured') {
       const request = captures.get(data.id);
       captures.delete(data.id);
@@ -548,28 +695,94 @@
       request?.resolve(Object.freeze({ toPNG: () => bytes.slice(), toDataURL: () => 'data:image/png;base64,' + data.png, getSize: () => ({ width: data.width, height: data.height }), isEmpty: () => !data.width || !data.height }));
     }
   };
+  const abortError = signal => Object.assign(new Error('The operation was aborted', { cause: signal.reason }), { name: 'AbortError', code: 'ABORT_ERR' });
+  const later = (schedule, cancel, value, { signal } = {}) => new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError(signal));
+    const abort = () => { cancel(handle); reject(abortError(signal)); };
+    const handle = schedule(() => { signal?.removeEventListener('abort', abort); resolve(value); });
+    signal?.addEventListener('abort', abort, { once: true });
+  });
   const timerModule = { setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate, promises: {
-    setTimeout: (delay, value, options) => scheduler.wait(delay, options).then(() => value),
-    setImmediate: (value, options) => scheduler.wait(0, options).then(() => value),
+    setTimeout: (delay, value, options) => later(fn => setTimeout(fn, delay), clearTimeout, value, options),
+    setImmediate: (value, options) => later(setImmediate, clearImmediate, value, options),
     async *setInterval(delay = 1, value, { signal } = {}) {
-      signal?.throwIfAborted();
+      if (signal?.aborted) throw abortError(signal);
       let ticks = 0, wake = null;
       const abort = () => wake?.(), id = setInterval(() => { ticks++; wake?.(); }, delay);
       signal?.addEventListener('abort', abort, { once: true });
-      try { for (;;) { if (!ticks) await new Promise(resolve => { wake = resolve; }); wake = null; signal?.throwIfAborted(); ticks--; yield value; } }
+      try { for (;;) { if (!ticks) await new Promise(resolve => { wake = resolve; }); wake = null; if (signal?.aborted) throw abortError(signal); ticks--; yield value; } }
       finally { clearInterval(id); signal?.removeEventListener('abort', abort); }
     },
     scheduler,
   } };
   setTimeout[node.util.promisify.custom] = timerModule.promises.setTimeout;
   setImmediate[node.util.promisify.custom] = timerModule.promises.setImmediate;
-  const modules = { fs, path, os, process, events, stream, util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring, dns: node.dns, tty: node.tty, zlib: io.zlib, readline: io.readline, crypto: { ...globalThis.__appsNodeCrypto, ...io.crypto }, child_process: children.api, net: net.api, http: http.http, https: http.https, worker_threads: workers.api, perf_hooks: { performance }, timers: timerModule, sqlite, ffi };
-  const builtins = { ...modules, module: null, 'fs/promises': fs.promises, 'stream/promises': stream.promises, 'stream/consumers': stream.consumers, 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict, 'readline/promises': io.readline.promises, 'dns/promises': node.dns.promises };
-  builtins.module = { builtinModules: Object.keys(builtins), isBuiltin: name => Object.hasOwn(builtins, String(name).replace(/^node:/, '')), createRequire: () => name => {
+  const outOfRange = (name, value) => Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 1 && <= 9007199254740991. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
+  // WARNING: values are counted in buckets of about 3 significant digits, so percentiles are approximate like HdrHistogram's.
+  class RecordableHistogram {
+    #counts = new Map(); #count = 0; #min = 9223372036854776000; #max = 0; #sum = 0; #squares = 0; #last;
+    get count() { return this.#count; }
+    get min() { return this.#min; }
+    get max() { return this.#max; }
+    get mean() { return this.#count ? this.#sum / this.#count : NaN; }
+    get stddev() { return this.#count ? Math.sqrt(Math.max(0, this.#squares / this.#count - (this.#sum / this.#count) ** 2)) : NaN; }
+    get exceeds() { return 0; }
+    get countBigInt() { return BigInt(this.#count); }
+    get minBigInt() { return BigInt(this.#min); }
+    get maxBigInt() { return BigInt(this.#max); }
+    get exceedsBigInt() { return 0n; }
+    percentile(percentile) {
+      if (!(percentile > 0 && percentile <= 100)) throw Object.assign(new RangeError(`The value of "percentile" is out of range. It must be > 0 && <= 100. Received ${percentile}`), { code: 'ERR_OUT_OF_RANGE' });
+      let seen = 0;
+      for (const value of [...this.#counts.keys()].sort((a, b) => a - b)) if ((seen += this.#counts.get(value)) >= percentile / 100 * this.#count) return Math.max(this.#min, Math.min(value, this.#max));
+      return 0;
+    }
+    percentileBigInt(percentile) { return BigInt(this.percentile(percentile)); }
+    get percentiles() {
+      if (!this.#count) return new Map([[100, 0]]);
+      const map = new Map([[0, this.#min]]);
+      for (let i = 1; i < 64; i++) { const percentile = 100 - 100 / 2 ** i, value = this.percentile(percentile); map.set(percentile, value); if (value >= this.#max) break; }
+      return map.set(100, this.#max);
+    }
+    get percentilesBigInt() { return new Map([...this.percentiles].map(([percentile, value]) => [percentile, BigInt(value)])); }
+    record(value) {
+      if (typeof value !== 'number' && typeof value !== 'bigint') throw Object.assign(new TypeError(`The "val" argument must be of type number or bigint. Received ${value === null ? 'null' : typeof value}`), { code: 'ERR_INVALID_ARG_TYPE' });
+      value = Number(value);
+      if (!Number.isSafeInteger(value) || value < 1) throw outOfRange('val', value);
+      const step = value < 2048 ? 1 : 2 ** (Math.floor(Math.log2(value)) - 10), key = Math.round(value / step) * step;
+      this.#counts.set(key, (this.#counts.get(key) ?? 0) + 1);
+      this.#count++; this.#sum += value; this.#squares += value * value;
+      if (value < this.#min) this.#min = value;
+      if (value > this.#max) this.#max = value;
+    }
+    recordDelta() { const now = process.hrtime.bigint(); if (this.#last !== undefined) this.record(Number(now - this.#last) || 1); this.#last = now; }
+    add(other) {
+      for (const [value, count] of other.#counts) this.#counts.set(value, (this.#counts.get(value) ?? 0) + count);
+      this.#count += other.#count; this.#sum += other.#sum; this.#squares += other.#squares; this.#min = Math.min(this.#min, other.#min); this.#max = Math.max(this.#max, other.#max);
+    }
+    reset() { this.#counts.clear(); this.#count = this.#sum = this.#squares = this.#max = 0; this.#min = 9223372036854776000; this.#last = undefined; }
+  }
+  const monitorEventLoopDelay = ({ resolution = 10 } = {}) => {
+    if (!Number.isSafeInteger(resolution) || resolution < 1) throw outOfRange('options.resolution', resolution);
+    const histogram = new RecordableHistogram();
+    let timer = null, last = 0;
+    return Object.assign(histogram, {
+      enable() { if (timer) return false; last = performance.now(); timer = setInterval(() => { const now = performance.now(); histogram.record(Math.max(1, Math.round((now - last - resolution) * 1e6))); last = now; }, resolution); return true; },
+      disable() { if (!timer) return false; clearInterval(timer); timer = null; return true; },
+    });
+  };
+  const perf_hooks = { performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList, createHistogram: () => new RecordableHistogram(), monitorEventLoopDelay };
+  const modules = { fs, path, os, process, events, stream, util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring, dns: node.dns, tty: node.tty, zlib: io.zlib, readline: io.readline, crypto: { ...globalThis.__appsNodeCrypto, ...io.crypto }, child_process: children.api, net: net.api, http: http.http, https: http.https, worker_threads: workers.api, perf_hooks, timers: timerModule, sqlite, ffi };
+  modules.constants = Object.assign({}, os.constants.errno, os.constants.priority, os.constants.signals, fs.constants, modules.crypto.constants);
+  const builtins = { ...modules, module: null, sys: node.util, 'fs/promises': fs.promises, 'stream/promises': stream.promises, 'stream/consumers': stream.consumers, 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest, ReadableStreamDefaultController, ReadableByteStreamController, WritableStreamDefaultWriter, WritableStreamDefaultController, TransformStreamDefaultController }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict, 'readline/promises': io.readline.promises, 'dns/promises': node.dns.promises };
+  // WARNING: like Node, prefixed modules are built in only with `node:`.
+  const prefixed = new Set(['sqlite', 'ffi']), isBuiltin = name => { name = String(name); const key = name.replace(/^node:/, ''); return Object.hasOwn(builtins, key) && (key !== name || !prefixed.has(key)); };
+  const missingModule = name => Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
+  builtins.module = { builtinModules: Object.keys(builtins).map(name => prefixed.has(name) ? 'node:' + name : name), isBuiltin, createRequire: () => Object.assign(name => {
     const key = String(name).replace(/^node:/, '');
-    const value = key === 'electron' || key === '@pierre/apps' ? globalThis.__apps : key === 'node-pty' ? pty.api : key === 'ws' ? http.ws : Object.hasOwn(builtins, key) ? builtins[key] : undefined;
-    if (value === undefined) throw Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
+    const value = key === 'electron' || key === '@pierre/apps' ? globalThis.__apps : key === 'node-pty' ? pty.api : key === 'ws' ? http.ws : isBuiltin(name) ? builtins[key] : undefined;
+    if (value === undefined) throw missingModule(name);
     return value;
-  } };
-  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, ...nativeShell, ...bridge, serve: servers.serve, ...modules, module: builtins.module, pty: pty.api, ws: http.ws });
+  }, { resolve: name => { if (isBuiltin(name)) return String(name); throw missingModule(name); } }) };
+  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, ...nativeShell, ...bridge, serve: servers.serve, ...modules, module: builtins.module, pty: pty.api, ws: http.ws });
 })();

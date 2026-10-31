@@ -38,14 +38,15 @@ impl ViewData {
         let start = range.as_ref().map(|r| r.start);
         let end = range.as_ref().map(|r| r.end);
         let selected = selected.map(|r| [r.start, r.end]);
-        if let Err(error) = self.evaluate(&format!(
+        let script = format!(
             "__appsInput({},{},{},{},{})",
             serde_json::json!(text),
             serde_json::json!(start),
             serde_json::json!(end),
             marked,
             serde_json::json!(selected)
-        )) {
+        );
+        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
             eprintln!("apps: {error}");
         }
         self.drive(cx);
@@ -87,7 +88,7 @@ impl ViewData {
             f32::from(position.x),
             f32::from(position.y)
         );
-        if let Err(error) = self.evaluate(&script) {
+        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
             eprintln!("apps: {error}");
         }
         self.drive(cx);
@@ -144,6 +145,7 @@ impl renderer::View for WebView {
                     "keydown",
                     &[],
                     serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"repeat":event.is_held}),
+                    Some(window),
                     cx,
                 );
                 if !allowed {
@@ -177,11 +179,12 @@ impl renderer::View for WebView {
                         "x" => "cut",
                         _ => "paste",
                     };
-                    match self.evaluate(&format!(
+                    let script = format!(
                         "JSON.stringify(__appsClipboard({},{}))",
                         serde_json::json!(action),
                         serde_json::json!(text)
-                    )) {
+                    );
+                    match super::scripted(cx, Some(window), || self.evaluate(&script)) {
                         Ok(value) => {
                             if key != "v"
                                 && let Ok(text) = serde_json::from_str::<String>(&value)
@@ -203,6 +206,7 @@ impl renderer::View for WebView {
                     "keyup",
                     &[],
                     serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift}),
+                    Some(window),
                     cx,
                 );
             }
@@ -214,6 +218,7 @@ impl renderer::View for WebView {
                     "modifiers",
                     &[],
                     serde_json::json!({"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift}),
+                    Some(window),
                     cx,
                 );
             }

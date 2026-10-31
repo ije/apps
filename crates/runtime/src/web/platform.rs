@@ -152,7 +152,9 @@ impl State {
                     "Incomplete compressed data"
                 );
                 output.truncate(written as usize);
-                Ok(json!({"read": read, "bytes": crate::jsc::payload::write(output), "done": *ended}))
+                Ok(
+                    json!({"read": read, "bytes": crate::jsc::payload::write(output), "done": *ended}),
+                )
             }
             "compression.close" => {
                 self.codecs

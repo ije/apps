@@ -65,15 +65,28 @@ pub fn write_bundle(
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version) = apps_runtime::bundle::package_metadata(package)?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
-    let webgpu = match apps_runtime::gpu::library_name(target.platform) {
-        Some(name)
-            if apps_runtime::bundle::disabled_features(package)?
-                & apps_runtime::bundle::feature_bit("webgpu")
-                == 0 =>
-        {
-            Some(name)
+    let disabled = apps_runtime::bundle::disabled_features(package)?;
+    let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
+    let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
+    // WARNING: FFmpeg is LGPL, so it ships as its own libraries with its license, which users can replace.
+    let media = if enabled("video") || enabled("audio") {
+        let folder = runtime.canonicalize()?;
+        let folder = folder.parent().context("Missing runtime directory")?;
+        let mut names = vec![
+            apps_runtime::media::library_name(target.platform).to_owned(),
+            "FFmpeg.LICENSE".to_owned(),
+        ];
+        for stem in apps_runtime::media::FFMPEG {
+            names.push(
+                fs::read_dir(folder)?
+                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                    .find(|name| apps_runtime::media::is_ffmpeg(target.platform, stem, name))
+                    .context("The video and audio features need FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release.")?,
+            );
         }
-        _ => None,
+        names
+    } else {
+        Vec::new()
     };
     if target.platform == "windows" {
         for value in [&name, &product_name] {
@@ -219,6 +232,18 @@ pub fn write_bundle(
         ensure!(!destination.exists(), "WebGPU conflicts with a build file");
         bytes += fs::copy(source, destination)? as usize;
     }
+    let folder = runtime.canonicalize()?;
+    for name in &media {
+        let source = folder.with_file_name(name);
+        if name != "FFmpeg.LICENSE" {
+            target.validate(&source).context(
+                "The video and audio features need the media library next to the runtime. Build the workspace first with cargo build --workspace --release.",
+            )?;
+        }
+        let destination = libraries.join(name);
+        ensure!(!destination.exists(), "{name} conflicts with a build file");
+        bytes += fs::copy(source, destination)? as usize;
+    }
     if let Some(public) = public {
         let mut directories = vec![public.clone()];
         while let Some(directory) = directories.pop() {
@@ -247,7 +272,9 @@ pub fn write_bundle(
                             && relative.to_str().is_some_and(|name| {
                                 name.eq_ignore_ascii_case(library_name)
                                     || name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
-                                    || webgpu.is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
+                                    || webgpu
+                                        .is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
+                                    || media.iter().any(|media| name.eq_ignore_ascii_case(media))
                             }))
                         && relative != Path::new(&executable_name)
                         && !matches!(
@@ -554,6 +581,64 @@ mod tests {
     }
 
     #[test]
+    fn media_libraries_ship_only_with_the_features() {
+        let target = Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::write(&runtime, b"runtime").unwrap();
+        let out = dir.path().join("dist");
+        let libraries = if cfg!(target_os = "macos") {
+            out.join("App.app/Contents/Frameworks")
+        } else {
+            out.clone()
+        };
+        let build = |features: &str| {
+            let files = BBTreeMap::from([
+                ("app.js".into(), String::new()),
+                (
+                    "package.json".into(),
+                    format!(r#"{{"features":{features}}}"#),
+                ),
+            ]);
+            write_bundle(&out, &files, &runtime, &dir.path().join("public"), true, target)
+        };
+        let error = build(r#"["video"]"#).unwrap_err();
+        assert!(error.to_string().contains("FFmpeg"), "{error}");
+        let mut names = vec![
+            apps_runtime::media::library_name(target.platform).to_owned(),
+            "FFmpeg.LICENSE".to_owned(),
+        ];
+        for entry in fs::read_dir(std::env::current_exe().unwrap().parent().unwrap()).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if apps_runtime::media::FFMPEG
+                .iter()
+                .any(|stem| apps_runtime::media::is_ffmpeg(target.platform, stem, &name))
+            {
+                names.push(name);
+            }
+        }
+        assert_eq!(names.len(), 7, "{names:?}");
+        for name in &names {
+            fs::copy(
+                std::env::current_exe().unwrap().with_file_name(name),
+                dir.path().join(name),
+            )
+            .unwrap();
+        }
+        for (features, shipped) in [
+            ("[]", false),
+            (r#"["audio"]"#, true),
+            (r#"["video","-audio"]"#, true),
+            (r#"["video","-video"]"#, false),
+        ] {
+            build(features).unwrap();
+            for name in &names {
+                assert_eq!(libraries.join(name).is_file(), shipped, "{features} {name}");
+            }
+        }
+    }
+
+    #[test]
     fn webgpu_library_ships_only_with_the_feature() {
         let target = Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
         let Some(name) = apps_runtime::gpu::library_name(target.platform) else {
@@ -571,9 +656,19 @@ mod tests {
         let build = |features: &str| {
             let files = BBTreeMap::from([
                 ("app.js".into(), String::new()),
-                ("package.json".into(), format!(r#"{{"features":{features}}}"#)),
+                (
+                    "package.json".into(),
+                    format!(r#"{{"features":{features}}}"#),
+                ),
             ]);
-            write_bundle(&out, &files, &runtime, &dir.path().join("public"), true, target)
+            write_bundle(
+                &out,
+                &files,
+                &runtime,
+                &dir.path().join("public"),
+                true,
+                target,
+            )
         };
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
@@ -585,7 +680,7 @@ mod tests {
         for (features, shipped) in [
             ("[]", false),
             (r#"["webgpu"]"#, true),
-            (r#"["*","-webgpu"]"#, false),
+            (r#"["*","-webgpu","-video","-audio"]"#, false),
         ] {
             build(features).unwrap();
             assert_eq!(libraries.join(name).is_file(), shipped, "{features}");

@@ -477,6 +477,10 @@ impl Prop {
         self.0 & CUSTOM != 0
     }
 
+    pub(crate) fn names() -> &'static [&'static str] {
+        &NAMES
+    }
+
     pub(crate) fn inherited(self) -> bool {
         INHERITED.get(self.0 as usize).copied().unwrap_or(false)
     }
@@ -488,13 +492,71 @@ impl std::fmt::Debug for Prop {
     }
 }
 
-/// Property values, sorted by property.
+pub(crate) type Vars = Rc<Vec<(Prop, Rc<str>)>>;
+
+const WORDS: usize = (Known::Count as usize).div_ceil(64);
+
+/// Property values, sorted by property, so known properties come first. Custom properties are
+/// kept apart, shared between styles.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
-pub struct Style(Vec<(Prop, Rc<str>)>);
+pub struct Style {
+    entries: Vec<(Prop, Rc<str>)>,
+    vars: Vars,
+    /// Which known properties are set, and how many are set in the words before each word, so
+    /// a known property finds its entry with one popcount.
+    known: [u64; WORDS],
+    before: [u16; WORDS],
+}
 
 impl Style {
     pub(crate) fn new() -> Self {
-        Self(Vec::new())
+        Self::default()
+    }
+
+    /// The index of the property's entry, or where it goes.
+    fn position(&self, prop: Prop) -> Result<usize, usize> {
+        let id = prop.0 as usize;
+        if prop.is_custom() {
+            return self.vars.binary_search_by_key(&prop, |entry| entry.0);
+        }
+        if id >= NAMES.len() {
+            return self.entries.binary_search_by_key(&prop, |entry| entry.0);
+        }
+        let (word, bit) = (id / 64, id % 64);
+        let index = self.before[word] as usize
+            + (self.known[word] & ((1 << bit) - 1)).count_ones() as usize;
+        if self.known[word] >> bit & 1 == 1 {
+            Ok(index)
+        } else {
+            Err(index)
+        }
+    }
+
+    /// Updates the known set for `prop`, by `delta` entries.
+    fn count(&mut self, prop: Prop, delta: i16) {
+        let id = prop.0 as usize;
+        if id < NAMES.len() {
+            self.known[id / 64] ^= 1 << (id % 64);
+            for before in &mut self.before[id / 64 + 1..] {
+                *before = before.wrapping_add_signed(delta);
+            }
+        }
+    }
+
+    fn index(&mut self) {
+        self.known = [0; WORDS];
+        for (prop, _) in &self.entries {
+            if let Some(word) = self.known.get_mut(prop.0 as usize / 64)
+                && (prop.0 as usize) < NAMES.len()
+            {
+                *word |= 1 << (prop.0 % 64);
+            }
+        }
+        let mut count = 0;
+        for (before, word) in self.before.iter_mut().zip(self.known) {
+            *before = count;
+            count += word.count_ones() as u16;
+        }
     }
 
     pub(crate) fn get(&self, prop: Prop) -> Option<&str> {
@@ -502,45 +564,75 @@ impl Style {
     }
 
     pub(crate) fn value(&self, prop: Prop) -> Option<&Rc<str>> {
-        self.0
-            .binary_search_by_key(&prop, |entry| entry.0)
-            .ok()
-            .map(|index| &self.0[index].1)
+        let index = self.position(prop).ok()?;
+        Some(if prop.is_custom() {
+            &self.vars[index].1
+        } else {
+            &self.entries[index].1
+        })
     }
 
     pub(crate) fn contains(&self, prop: Prop) -> bool {
-        self.0.binary_search_by_key(&prop, |entry| entry.0).is_ok()
+        self.position(prop).is_ok()
     }
 
     pub(crate) fn insert(&mut self, prop: Prop, value: impl Into<Rc<str>>) {
         let value = value.into();
-        match self.0.binary_search_by_key(&prop, |entry| entry.0) {
-            Ok(index) => self.0[index].1 = value,
-            Err(index) => self.0.insert(index, (prop, value)),
+        match (self.position(prop), prop.is_custom()) {
+            (Ok(index), true) => Rc::make_mut(&mut self.vars)[index].1 = value,
+            (Err(index), true) => Rc::make_mut(&mut self.vars).insert(index, (prop, value)),
+            (Ok(index), false) => self.entries[index].1 = value,
+            (Err(index), false) => {
+                self.entries.insert(index, (prop, value));
+                self.count(prop, 1);
+            }
         }
     }
 
     pub(crate) fn remove(&mut self, prop: Prop) -> Option<Rc<str>> {
-        let index = self.0.binary_search_by_key(&prop, |entry| entry.0).ok()?;
-        Some(self.0.remove(index).1)
+        let index = self.position(prop).ok()?;
+        if prop.is_custom() {
+            return Some(Rc::make_mut(&mut self.vars).remove(index).1);
+        }
+        self.count(prop, -1);
+        Some(self.entries.remove(index).1)
     }
 
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prop, &mut Rc<str>) -> bool) {
-        self.0.retain_mut(|(prop, value)| keep(*prop, value));
+        let len = self.entries.len();
+        self.entries.retain_mut(|(prop, value)| keep(*prop, value));
+        if self.entries.len() != len {
+            self.index();
+        }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
-        self.0.iter().map(|(prop, value)| (*prop, value))
+        self.entries
+            .iter()
+            .chain(self.vars.iter())
+            .map(|(prop, value)| (*prop, value))
+    }
+
+    pub(crate) fn own(&self) -> impl Iterator<Item = (Prop, &Rc<str>)> {
+        self.entries.iter().map(|(prop, value)| (*prop, value))
+    }
+
+    pub(crate) fn vars(&self) -> &Vars {
+        &self.vars
+    }
+
+    pub(crate) fn set_vars(&mut self, vars: Vars) {
+        self.vars = vars;
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty() && self.vars.is_empty()
     }
 }
 
 impl FromIterator<(Prop, Rc<str>)> for Style {
     fn from_iter<I: IntoIterator<Item = (Prop, Rc<str>)>>(entries: I) -> Self {
-        let mut style = Self(Vec::new());
+        let mut style = Self::default();
         style.extend(entries);
         style
     }
@@ -548,22 +640,42 @@ impl FromIterator<(Prop, Rc<str>)> for Style {
 
 impl Extend<(Prop, Rc<str>)> for Style {
     fn extend<I: IntoIterator<Item = (Prop, Rc<str>)>>(&mut self, entries: I) {
-        let start = self.0.len();
-        self.0.extend(entries);
-        if self.0[start..].is_sorted_by(|a, b| a.0 < b.0)
-            && self.0[..start]
-                .last()
-                .zip(self.0.get(start))
-                .is_none_or(|(a, b)| a.0 < b.0)
-        {
-            return;
+        let start = self.entries.len();
+        let mut custom = Vec::new();
+        for entry in entries {
+            if entry.0.is_custom() {
+                custom.push(entry);
+            } else {
+                self.entries.push(entry);
+            }
         }
-        // WARNING: the stable sort keeps the later of two values for the same property.
-        self.0.sort_by_key(|entry| entry.0);
-        self.0.reverse();
-        self.0.dedup_by_key(|entry| entry.0);
-        self.0.reverse();
+        if self.entries.len() != start {
+            merge(&mut self.entries, start);
+            self.index();
+        }
+        if !custom.is_empty() {
+            let list = Rc::make_mut(&mut self.vars);
+            let start = list.len();
+            list.extend(custom);
+            merge(list, start);
+        }
     }
+}
+
+fn merge(list: &mut Vec<(Prop, Rc<str>)>, start: usize) {
+    if list[start..].is_sorted_by(|a, b| a.0 < b.0)
+        && list[..start]
+            .last()
+            .zip(list.get(start))
+            .is_none_or(|(a, b)| a.0 < b.0)
+    {
+        return;
+    }
+    // WARNING: the stable sort keeps the later of two values for the same property.
+    list.sort_by_key(|entry| entry.0);
+    list.reverse();
+    list.dedup_by_key(|entry| entry.0);
+    list.reverse();
 }
 
 impl std::fmt::Debug for Style {

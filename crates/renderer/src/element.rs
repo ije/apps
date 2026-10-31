@@ -372,10 +372,7 @@ impl Element for Img {
 
     fn paint(&mut self, bounds: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
         let shown = self.fit.get_bounds(bounds, self.image.size());
-        let corners = self
-            .style
-            .corner_radii
-            .clamp_radii_for_quad_size(bounds.size);
+        let corners = self.style.corner_radii.resolve(bounds.size);
         let mask = self.style.overflow_mask(bounds);
         window.with_content_mask(mask, |window| {
             window.paint_image(shown, bounds, corners, self.image.clone(), false)

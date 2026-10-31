@@ -1,5 +1,6 @@
 mod background;
 pub mod canvas;
+mod control;
 pub(crate) mod cull;
 pub(crate) mod effects;
 mod element;
@@ -8,14 +9,15 @@ pub(crate) mod grid;
 pub mod image;
 mod input;
 mod paint;
-mod scrollbar;
+pub(crate) mod scrollbar;
 pub(crate) mod text;
 
 use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 use element::{Build, element};
 use renderer::{
-    App, MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Window, div, prelude::*, rgba,
+    App, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
+    ScrollWheelEvent, Window, WindowId, div, prelude::*, rgba,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -36,6 +38,104 @@ pub(crate) struct ViewData {
     pub(crate) moving: Cell<bool>,
     /// The files dragged over the window.
     pub(crate) dropped: RefCell<Vec<PathBuf>>,
+    /// The pressed mouse buttons, as DOM `buttons` bits.
+    buttons: Cell<u8>,
+    window: WindowId,
+    /// A script read geometry, so this build only lays the page out.
+    reflowing: Cell<bool>,
+}
+
+thread_local! {
+    /// The app and the window of the page scripts that run now.
+    static SCRIPTS: Cell<Option<(*mut App, Option<*mut Window>)>> = const { Cell::new(None) };
+    static VIEWS: RefCell<HashMap<u64, std::rc::Weak<ViewData>>> = RefCell::default();
+}
+
+/// Runs page script `f`, which may lay out its page with `cx` and `window`, see [`reflow`].
+// WARNING: `f` must not use `cx` or `window`: a reflow reaches them through pointers while it runs.
+pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
+    crate::jsc::REFLOW.set(Some(reflow));
+    let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
+    let result = f();
+    SCRIPTS.set(previous);
+    result
+}
+
+/// Lays page `id` out now when it changed since its last layout, like a browser's forced reflow.
+pub(crate) fn reflow(id: u64) {
+    let Some((cx, window)) = SCRIPTS.get() else {
+        return;
+    };
+    let Some(view) = VIEWS.with_borrow(|views| views.get(&id).and_then(std::rc::Weak::upgrade))
+    else {
+        return;
+    };
+    if view.host.try_borrow_mut().map_or(true, |host| {
+        !host.pages.get(&id).is_some_and(|page| page.dirty)
+    }) {
+        return;
+    }
+    let run = |window: &mut Window, cx: &mut App| {
+        view.reflowing.set(true);
+        window.layout(cx, |window, cx| {
+            WebView(view.clone()).render_page(window, cx)
+        });
+        view.reflowing.set(false);
+        window.refresh();
+    };
+    // WARNING: the pointers come from `scripted`, whose caller does not touch them until the script returns.
+    let cx = unsafe { &mut *cx };
+    match window.map(|window| unsafe { &mut *window }) {
+        Some(window) if window.id() == view.window => run(window, cx),
+        _ => {
+            cx.update_window(view.window, run);
+        }
+    }
+}
+
+/// Runs the page's animation frame callbacks before the frame lays out, and again on the next
+/// frame while the page asks for one.
+pub(crate) fn animation_frame(view: Rc<ViewData>, window: &mut Window, cx: &mut App) {
+    let renderer = view.runtime.try_borrow().ok().and_then(|app| {
+        app.views
+            .get(&view.id)
+            .and_then(|view| view.renderer.clone())
+    });
+    if let Some(renderer) = renderer
+        && let Err(error) = scripted(cx, Some(window), || {
+            renderer.eval("__appsAnimationFrame()", "apps:frame")
+        })
+    {
+        eprintln!("apps: {error}");
+    }
+    window.refresh();
+    if view
+        .host
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut host| {
+            host.dom
+                .get_mut(&view.id)
+                .map(|dom| std::mem::take(&mut dom.frame_requested))
+        })
+        .unwrap_or(false)
+    {
+        let view = view.clone();
+        window.on_next_frame(move |window, cx| animation_frame(view, window, cx));
+    }
+    let runtime = view.runtime.clone();
+    cx.defer(move |cx| Desktop::drive(runtime, cx));
+}
+
+/// The DOM `button` of a mouse button.
+fn button(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::Navigate(renderer::NavigationDirection::Back) => 3,
+        MouseButton::Navigate(_) => 4,
+    }
 }
 
 /// The view of a window.
@@ -49,8 +149,13 @@ impl std::ops::Deref for WebView {
 }
 
 impl WebView {
-    pub(crate) fn new(id: u64, runtime: Rc<RefCell<Desktop>>, host: Rc<RefCell<Host>>) -> Self {
-        Self(Rc::new(ViewData {
+    pub(crate) fn new(
+        id: u64,
+        runtime: Rc<RefCell<Desktop>>,
+        host: Rc<RefCell<Host>>,
+        window: WindowId,
+    ) -> Self {
+        let view = Rc::new(ViewData {
             id,
             runtime,
             host,
@@ -58,56 +163,71 @@ impl WebView {
             browsers: RefCell::default(),
             moving: Cell::new(false),
             dropped: RefCell::default(),
-        }))
+            buttons: Cell::new(0),
+            window,
+            reflowing: Cell::new(false),
+        });
+        VIEWS.with_borrow_mut(|views| {
+            views.retain(|_, view| view.strong_count() > 0);
+            views.insert(id, Rc::downgrade(&view));
+        });
+        Self(view)
     }
 
     fn render_page(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
         let started = std::time::Instant::now();
-        let runtime = self.runtime.clone();
-        let id = self.id;
-        let frame_requested = {
+        {
             let mut host = self.host.borrow_mut();
-            let state = host.dom.entry(id).or_default();
+            let state = host.dom.entry(self.id).or_default();
             state.text_system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
             state.sync_scroll();
-            // WARNING: a redraw replaces a frame that already ran the animation frame callbacks.
-            !state.container_pass
-                && !window.redrawing()
-                && std::mem::take(&mut state.frame_requested)
-        };
-        if frame_requested && let Err(error) = self.evaluate("__appsAnimationFrame()") {
-            eprintln!("apps: {error}");
+            state.bounds.touch();
         }
-        if self
-            .host
-            .borrow()
-            .dom
-            .get(&id)
-            .is_some_and(|state| state.frame_requested)
-        {
-            window.on_next_frame(|window, _| window.refresh());
-        }
+        let data = self.0.clone();
+        // WARNING: presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
         let pointer_events = renderer::canvas(|_, _| (), move |_, _, window| {
-        let exit_runtime = runtime.clone();
-        window.on_mouse_event(move |event: &MouseExitEvent, phase, _, cx| {
-            if phase.capture() {
-                Desktop::dispatch(exit_runtime.clone(), id, "pointerexit", &[], serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y)}), cx);
-            }
-        });
-        let up_runtime = runtime.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-            if phase.capture() {
-                let data = serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":-1,"buttons":u8::from(event.dragging()),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift});
-                Desktop::dispatch(runtime.clone(), id, "pointermove", &[], data, cx);
-            }
-        });
-        let runtime = up_runtime;
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-            if phase.capture() && event.button == MouseButton::Left {
-                Desktop::dispatch(runtime.clone(), id, "pointerup", &[], serde_json::json!({"pointerId":1,"pointerType":"mouse","isPrimary":true,"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":0,"buttons":0,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), cx);
-            }
-        });
+            let view = data.clone();
+            window.on_mouse_event(move |event: &MouseExitEvent, phase, window, cx| {
+                if phase.capture() {
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y)}), Some(window), cx);
+                }
+            });
+            let view = data.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase.capture() {
+                    if event.pressed_button.is_none() {
+                        view.buttons.set(0);
+                    }
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointermove", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                }
+            });
+            let view = data.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase.bubble() {
+                    let button = button(event.button);
+                    view.buttons.set(view.buttons.get() | 1 << [0, 2, 1, 3, 4][usize::from(button)]);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":button,"buttons":view.buttons.get(),"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                }
+            });
+            let view = data.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                if phase.capture() {
+                    let button = button(event.button);
+                    view.buttons.set(view.buttons.get() & !(1 << [0, 2, 1, 3, 4][usize::from(button)]));
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerup", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":button,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                }
+            });
+            let view = data.clone();
+            // WARNING: wheel events reach the page only once it listens to them, and a canceled one does not scroll.
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase.capture() && view.host.try_borrow().is_ok_and(|host| host.dom.get(&view.id).is_some_and(|dom| dom.wheel)) {
+                    let delta = event.delta.pixel_delta(renderer::px(16.));
+                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
+                        cx.stop_propagation();
+                    }
+                }
+            });
         }).absolute().size_full();
         let mut host = self.host.borrow_mut();
         let size = window.viewport_size();
@@ -166,13 +286,23 @@ impl WebView {
         for image in dom.retired.drain(..) {
             window.drop_image(image);
         }
+        dom.retired_canvases.clear();
         let cached = dom.computed.clone();
-        let mut styles =
-            crate::dom::styles(&mut doc, dom, [width, height], Some(window.text_system()));
+        let mut styles = crate::dom::styles(
+            &mut doc,
+            dom,
+            [width, height],
+            Some((window.text_system(), window.scale_factor())),
+        );
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
             && fonts::load(&doc, dom, &state.assets)
         {
-            styles = crate::dom::styles(&mut doc, dom, [width, height], Some(window.text_system()));
+            styles = crate::dom::styles(
+                &mut doc,
+                dom,
+                [width, height],
+                Some((window.text_system(), window.scale_factor())),
+            );
         }
         let children: Vec<_> = styles
             .children
@@ -183,6 +313,7 @@ impl WebView {
         if dom.cull.seen.as_ref().is_none_or(|(latest, _, computed)| {
             *latest != doc.nodes.latest() || !Rc::ptr_eq(computed, &styles)
         }) {
+            let mut shown = std::mem::take(&mut visible);
             visible.clear();
             visible.resize(doc.nodes.len(), false);
             let mut pending = vec![0];
@@ -198,10 +329,28 @@ impl WebView {
                     pending.extend(&doc.nodes[node].children);
                 }
             }
+            // Table rows and row groups are flattened out of the tree above; they show when their cells do.
+            for node in 0..visible.len() {
+                if visible[node] && matches!(doc.nodes[node].tag.as_str(), "td" | "th") {
+                    let mut parent = doc.nodes[node].parent;
+                    while let Some(id) = parent.filter(|&id| {
+                        !visible[id]
+                            && matches!(
+                                doc.nodes[id].tag.as_str(),
+                                "tr" | "thead" | "tbody" | "tfoot"
+                            )
+                    }) {
+                        visible[id] = true;
+                        parent = doc.nodes[id].parent;
+                    }
+                }
+            }
+            dom.bounds.hide(&visible, &shown);
+            shown.clear();
         }
         let mut events = Vec::new();
         let now = std::time::Instant::now();
-        let (animated, next) = dom.motion.update(
+        let (mut animated, next) = dom.motion.update(
             &doc,
             &styles,
             &visible,
@@ -209,6 +358,22 @@ impl WebView {
             dom.container_pass,
             &mut events,
         );
+        // WARNING: an animated custom property can change any value that uses it, so the frame cascades the animated values again.
+        if !dom.motion.custom.is_empty() {
+            dom.animated = std::mem::take(&mut dom.motion.custom);
+            let base = dom.computed.take();
+            let restyled = crate::dom::styles(
+                &mut doc,
+                dom,
+                [width, height],
+                Some((window.text_system(), window.scale_factor())),
+            );
+            dom.computed = base;
+            animated = (0..styles.values.len())
+                .filter(|&id| !Rc::ptr_eq(&restyled.values[id], &styles.values[id]))
+                .map(|id| (id, restyled.values[id].clone(), true))
+                .collect();
+        }
         match next {
             Some(at) if at <= now + std::time::Duration::from_millis(8) => {
                 dom.motion.wake = None;
@@ -239,7 +404,7 @@ impl WebView {
                     .get(&id)
                     .and_then(|view| view.renderer.clone());
                 for (node, kind, name, elapsed) in events {
-                    let data = if kind == "animationend" {
+                    let data = if kind.starts_with("animation") {
                         serde_json::json!({"animationName": name, "elapsedTime": elapsed})
                     } else {
                         serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
@@ -326,17 +491,37 @@ impl WebView {
             let _ = browser.set_bounds(bounds.map(f64::from));
         }
         drop(browsers);
-        let background = doc
-            .nodes
+        let root = doc.nodes[0]
+            .children
             .iter()
-            .position(|n| n.tag == "body")
-            .and_then(|id| {
-                styles.values[id]
-                    .get(Prop::BACKGROUND_COLOR)
-                    .or_else(|| styles.values[id].get(Prop::BACKGROUND))
+            .copied()
+            .find(|&id| doc.nodes[id].tag == "html");
+        let canvas = |id: usize| {
+            styles.values[id]
+                .get(Prop::BACKGROUND_COLOR)
+                .and_then(style::color)
+                .filter(|color| color.1 > 0)
+        };
+        let dark = root
+            .and_then(|id| styles.values[id].get(Prop::COLOR_SCHEME))
+            .is_some_and(|scheme| {
+                scheme.contains("dark")
+                    && (!scheme.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
+            });
+        let background = root
+            .and_then(canvas)
+            .or_else(|| {
+                doc.nodes
+                    .iter()
+                    .position(|n| n.tag == "body")
+                    .and_then(canvas)
             })
-            .and_then(style::color)
-            .or_else(|| state.backgrounds.get(&self.id).copied())
+            // Like Chromium, a dark color scheme paints the canvas dark unless the window is transparent.
+            .or_else(|| match state.backgrounds.get(&self.id).copied() {
+                Some(color) if color.1 == 0 => Some(color),
+                _ if dark => Some((0x121212, 255)),
+                color => color,
+            })
             .unwrap_or((0xffffff, 255));
         dom.layout_nodes.resize_with(doc.nodes.len(), || None);
         let frame = [width, height, window.scale_factor(), dom.font_loads as f32];
@@ -423,8 +608,16 @@ impl WebView {
                 let revision = doc.nodes.revision(id);
                 let old = dom.layout_nodes[id].as_ref();
                 let same = old.is_some_and(|old| old.seen == revision);
+                // WARNING: a form control's value and checked state draw like its text.
+                let form = |old: &crate::dom::Node| {
+                    old.value != node.value
+                        || (old.state ^ node.state) & (crate::dom::CHECKED | crate::dom::DIRTY) != 0
+                };
                 let edited = old.is_some_and(|old| {
-                    !same && (old.node.text != node.text || old.node.attrs != node.attrs)
+                    !same
+                        && (old.node.text != node.text
+                            || old.node.attrs != node.attrs
+                            || form(&old.node))
                 });
                 debug_assert!(
                     !same
@@ -441,6 +634,7 @@ impl WebView {
                     !same
                         && (old.node.tag != node.tag
                             || old.node.text != node.text
+                            || form(&old.node)
                             || old.node.attrs != node.attrs
                                 && !cull::cosmetic_attrs(&old.node.attrs, &node.attrs))
                         || !Rc::ptr_eq(&old.style, style)
@@ -509,7 +703,9 @@ impl WebView {
                                 | (u16::from(reshaped) * cull::CHANGED)
                                 | (u16::from(relisted) * cull::RELISTED)
                                 | (u16::from(dom.focus == Some(id)) * cull::BLOCKED),
-                            |flags, &child| flags | info[child].flags & cull::BLOCKED,
+                            |flags, &child| {
+                                flags | info[child].flags & (cull::BLOCKED | cull::VIEWPORT)
+                            },
                         )
                     },
                 };
@@ -548,6 +744,13 @@ impl WebView {
         let mut warnings = Vec::new();
         if inspectable && !dom.linted {
             dom.linted = true;
+            for name in style::DROPPED.take() {
+                if dom.warned.insert(format!("@{name}")) {
+                    warnings.push(format!(
+                        "Unsupported CSS at-rule `@{name}`: its rules are ignored."
+                    ));
+                }
+            }
             for &id in &changed {
                 let (node, style) = (&doc.nodes[id], &styles.values[id]);
                 if node.tag.starts_with('#') {
@@ -566,19 +769,11 @@ impl WebView {
                     ),
                 ] {
                     let Some(values) = values else { continue };
-                    for (key, value) in [
-                        Prop::LINE_HEIGHT,
-                        Prop::VERTICAL_ALIGN,
-                        Prop::TRANSFORM_STYLE,
-                        Prop::CLIP_PATH,
-                        Prop::FILTER,
-                    ]
-                    .into_iter()
-                    .filter_map(|key| Some((key, values.get(key)?)))
-                    {
-                        if !pseudo.is_empty() && style.get(key) == Some(value) {
+                    for (key, value) in values.own() {
+                        if !pseudo.is_empty() && style.value(key) == Some(value) {
                             continue;
                         }
+                        let (value, name) = (&**value, key.name());
                         let reason = match key {
                             Prop::LINE_HEIGHT | Prop::VERTICAL_ALIGN if !pseudo.is_empty() => {
                                 "line height and baseline can't change inside a line of text"
@@ -592,12 +787,37 @@ impl WebView {
                             Prop::FILTER if value.contains("url(") && !value.contains("url(#") => {
                                 "only filters defined in the page are supported"
                             }
-                            _ => continue,
+                            // WARNING: these change nothing in a desktop window, so they are not reported.
+                            _ if name.ends_with("text-size-adjust")
+                                || name.ends_with("print-color-adjust")
+                                || name.starts_with("page-break-")
+                                || name.starts_with("break-")
+                                || matches!(
+                                    name,
+                                    "orphans"
+                                        | "widows"
+                                        | "speak"
+                                        | "forced-color-adjust"
+                                        | "touch-action"
+                                ) =>
+                            {
+                                continue;
+                            }
+                            _ => match style::supports(name, value) {
+                                None => "the property is not supported",
+                                Some(false) => "the value is not supported",
+                                Some(true) => continue,
+                            },
                         };
-                        if dom.warned.insert(format!("{pseudo}{reason}")) {
-                            let mut name = node.tag.clone();
+                        let unknown = reason == "the property is not supported";
+                        if dom.warned.insert(if unknown {
+                            format!("{pseudo}{name}")
+                        } else {
+                            format!("{pseudo}{name}:{value}")
+                        }) {
+                            let mut element = node.tag.clone();
                             if let Some(value) = node.attrs.get("id") {
-                                name = format!("{name}#{value}");
+                                element = format!("{element}#{value}");
                             }
                             for class in node
                                 .attrs
@@ -606,11 +826,10 @@ impl WebView {
                                 .flat_map(|value| value.split_whitespace())
                                 .take(3)
                             {
-                                name = format!("{name}.{class}");
+                                element = format!("{element}.{class}");
                             }
                             warnings.push(format!(
-                                "Unsupported CSS `{}: {value}` on <{name}>{pseudo}: {reason}.",
-                                key.name()
+                                "Unsupported CSS `{name}: {value}` on <{element}>{pseudo}: {reason}."
                             ));
                         }
                     }
@@ -672,9 +891,12 @@ impl WebView {
                 let last = dom.cull.offsets.insert(id, offset).unwrap_or(offset);
                 moved += f32::from((offset.x - last.x).abs() + (offset.y - last.y).abs());
             }
-            // WARNING: a scroll farther than the overscan could bring culled boxes into view.
+            // WARNING: a scroll farther than the overscan could bring culled boxes into view. A new
+            // viewport size keeps culling: spacers whose parent changed width lay out again, and
+            // `cull::VIEWPORT` subtrees are not culled.
+            dom.cull.resized = dom.cull.frame[..2] != frame[..2];
             dom.cull.enabled = !std::mem::take(&mut dom.cull.off)
-                && dom.cull.frame == frame
+                && dom.cull.frame[2..] == frame[2..]
                 && moved < height / 2.;
             dom.cull.frame = frame;
         }
@@ -683,9 +905,11 @@ impl WebView {
                 top: 0.,
                 bottom: height,
                 clips: Vec::new(),
+                resized: dom.cull.resized,
             })
         });
         dom.containers.clear();
+        dom.blocks.clear();
         dom.flexed_grids.clear();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
@@ -712,6 +936,7 @@ impl WebView {
                 inline_text: &inline_text,
                 perspective: None,
                 siblings: &RefCell::default(),
+                margins: &RefCell::default(),
                 ids: &Rc::default(),
                 info: &info,
                 zone,
@@ -734,10 +959,12 @@ impl WebView {
             dom.cull.visible = visible;
             dom.measurements = measured.into_inner();
             dom.inline_text = inline_text.into_inner();
+            dom.animating.clear();
             if !restore.is_empty() {
                 let values = &mut Rc::make_mut(&mut styles).values;
                 for (id, style) in restore {
-                    values[id] = style;
+                    dom.animating
+                        .insert(id, std::mem::replace(&mut values[id], style));
                 }
                 dom.computed = Some(styles);
             }
@@ -752,15 +979,17 @@ impl WebView {
         }
         let runtime = self.runtime.clone();
         let id = self.id;
-        if !window.redrawing() {
-            window.on_next_frame(move |_, cx| {
+        if !window.redrawing() && !self.reflowing.get() {
+            window.on_next_frame(move |window, cx| {
                 let renderer = runtime
                     .borrow()
                     .views
                     .get(&id)
                     .and_then(|v| v.renderer.clone());
                 if let Some(renderer) = renderer
-                    && let Err(error) = renderer.eval("__appsLayout()", "apps:layout")
+                    && let Err(error) = scripted(cx, Some(window), || {
+                        renderer.eval("__appsLayout()", "apps:layout")
+                    })
                 {
                     eprintln!("apps: {error}");
                 }
@@ -840,6 +1069,8 @@ fn retire(
     dom.backgrounds.retain(|&(id, layer), (_, image)| {
         let keep = if id == usize::MAX {
             Arc::strong_count(image) > 1
+        } else if layer == usize::MAX {
+            visible.get(id) == Some(&true)
         } else {
             visible.get(id) == Some(&true)
                 && match layer / 64 {
@@ -881,7 +1112,13 @@ mod tests {
         let styles = crate::dom::styles(&mut doc, &mut dom, [800., 600.], None);
         let mut drawn = canvas::Canvas::new(2, 2).unwrap();
         drawn
-            .draw(&[serde_json::json!({"op":"fillRect","x":0,"y":0,"width":2,"height":2,"fillStyle":"#ff0000"})])
+            .draw(
+                &[4., 7., 21., 0., 0., 2., 2.],
+                "#ff0000",
+                &[],
+                &|_| None,
+                None,
+            )
             .unwrap();
         dom.canvases.insert(canvas, drawn);
         let image = |size: u32| {

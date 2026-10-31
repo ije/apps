@@ -68,9 +68,12 @@ impl Database {
         if matches!(code, ffi::SQLITE_OK | ffi::SQLITE_ROW | ffi::SQLITE_DONE) {
             return Ok(());
         }
+        // WARNING: sqlite.js splits the message at U+0001 into message, errcode and errstr.
+        let code = unsafe { ffi::sqlite3_extended_errcode(self.0) };
         bail!(
-            "{}",
-            unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy()
+            "{}\u{1}{code}\u{1}{}",
+            unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(self.0)) }.to_string_lossy(),
+            unsafe { CStr::from_ptr(ffi::sqlite3_errstr(code)) }.to_string_lossy()
         )
     }
 }

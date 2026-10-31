@@ -310,6 +310,9 @@ fn html_and_css_images_become_bundled_assets() {
     fs::create_dir_all(dir.path().join("img")).unwrap();
     fs::write(dir.path().join("img/logo.png"), b"png").unwrap();
     fs::write(dir.path().join("img/icon.svg"), b"<svg/>").unwrap();
+    for name in ["clip.mp4", "clip.webm", "tone.mp3"] {
+        fs::write(dir.path().join("img").join(name), b"media").unwrap();
+    }
     fs::write(
         dir.path().join("web/css/style.css"),
         ".a { background: url(\"../../img/icon.svg\") }",
@@ -317,13 +320,13 @@ fn html_and_css_images_become_bundled_assets() {
     .unwrap();
     fs::write(
             dir.path().join("web/index.html"),
-            r#"<link rel="stylesheet" href="css/style.css"><style>.b{background:url(../img/logo.png)}.c{background:url(data:image/png;base64,AA==)}</style><img src="../img/logo.png"><img src="https://example.com/x.png"><div style="background-image:url('../img/missing.png')"></div>"#,
+            r#"<link rel="stylesheet" href="css/style.css"><style>.b{background:url(../img/logo.png)}.c{background:url(data:image/png;base64,AA==)}</style><img src="../img/logo.png"><img src="https://example.com/x.png"><div style="background-image:url('../img/missing.png')"></div><video src="../img/clip.mp4" poster="../img/logo.png"><source src="../img/clip.webm"></video><audio src="../img/tone.mp3"></audio>"#,
         )
         .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
     let assets: std::collections::BTreeMap<String, PathBuf> =
         serde_json::from_str(&files["assets.json"]).unwrap();
-    assert_eq!(assets.len(), 2);
+    assert_eq!(assets.len(), 5);
     let logo = asset_name(&dir.path().join("img/logo.png").canonicalize().unwrap()).unwrap();
     let icon = asset_name(&dir.path().join("img/icon.svg").canonicalize().unwrap()).unwrap();
     assert!(logo.starts_with("assets/") && logo.ends_with(".png"));
@@ -332,7 +335,11 @@ fn html_and_css_images_become_bundled_assets() {
         dir.path().join("img/icon.svg").canonicalize().unwrap()
     );
     let page = &files["page-0.html"];
-    assert_eq!(page.matches(&format!("apps:///{logo}")).count(), 2);
+    assert_eq!(page.matches(&format!("apps:///{logo}")).count(), 3);
+    for name in ["clip.mp4", "clip.webm", "tone.mp3"] {
+        let media = asset_name(&dir.path().join("img").join(name).canonicalize().unwrap()).unwrap();
+        assert!(page.contains(&format!("src=\"apps:///{media}\"")), "{page}");
+    }
     assert!(page.contains(&format!("url(\"apps:///{icon}\")")));
     assert!(
         page.contains("https://example.com/x.png") && page.contains("data:image/png;base64,AA==")
@@ -427,7 +434,7 @@ fn declarative_lifecycle() {
             assert!(
                 host.commands
                     .iter()
-                    .any(|command| command["args"] == json!(["loadFile", 1, "index.html"]))
+                    .any(|command| command["args"] == json!(["loadFile", 1, "index.html", 1]))
             );
         }
     }
@@ -760,35 +767,112 @@ fn jsx_tsx_and_commonjs_packages() {
                 .unwrap(),
             "fragment:true"
         );
-        fs::write(package.join("index.js"), "module.exports = require(name);").unwrap();
-        assert!(
-            compile(
+        for source in [
+            "module.exports = require(name);",
+            "module.exports = require('node:fs');",
+        ] {
+            fs::write(package.join("index.js"), source).unwrap();
+            let files = compile(
                 &entry,
                 Realm::Renderer,
                 None,
                 Rc::default(),
                 production,
-                None
+                None,
             )
-            .unwrap_err()
-            .to_string()
-            .contains("string literal")
-        );
+            .unwrap();
+            let engine = apps_runtime::jsc::Engine::new(
+                apps_runtime::jsc::Api::load().unwrap(),
+                Rc::default(),
+                apps_runtime::host::Role::Main,
+            )
+            .unwrap();
+            engine.eval("delete globalThis.__apps", "test").unwrap();
+            assert!(engine.bundle(&files, "test").is_err());
+        }
+    }
+}
+
+#[test]
+fn commonjs_interop_patterns_of_express_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join("node_modules/legacy");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("package.json"), "{}").unwrap();
+    fs::write(package.join("index.js"), r#"
+        function stack() { var prepare = Error.prepareStackTrace, holder = {}; Error.prepareStackTrace = function (_, sites) { return sites; }; Error.captureStackTrace(holder); var sites = holder.stack.slice(1); Error.prepareStackTrace = prepare; return sites; }
+        var EventEmitter = require('events').EventEmitter, app = function () {};
+        Object.getOwnPropertyNames(EventEmitter.prototype).forEach(function (name) { if (name !== 'constructor') Object.defineProperty(app, name, Object.getOwnPropertyDescriptor(EventEmitter.prototype, name)); });
+        app.on('ping', function (value) { app.seen = value; }); app.emit('ping', 1);
+        var safe = {}; for (var key in require('buffer').Buffer) safe[key] = require('buffer').Buffer[key];
+        var http = require('http'), request = Object.create(http.IncomingMessage.prototype), response = Object.create(http.ServerResponse.prototype);
+        module.exports = [typeof (function caller() { return stack(); })()[0].getFileName(), app.seen, typeof safe.isBuffer, typeof request.on, typeof response.setHeader, require('util').inherits.length].join();
+    "#).unwrap();
+    let entry = dir.path().join("main.js");
+    fs::write(
+        &entry,
+        "import result from 'legacy'; globalThis.result = result;",
+    )
+    .unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    let engine = apps_runtime::jsc::Engine::new(
+        apps_runtime::jsc::Api::load().unwrap(),
+        Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    engine.bundle(&files, "app.js").unwrap();
+    assert_eq!(
+        engine.eval("result", "test").unwrap(),
+        "string,1,function,function,function,2"
+    );
+}
+
+#[test]
+fn commonjs_require_runtime_semantics() {
+    for production in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("node_modules/pkg");
+        fs::create_dir_all(package.join("lib")).unwrap();
         fs::write(
-            package.join("index.js"),
-            "module.exports = require('node:fs');",
+            package.join("package.json"),
+            r#"{"name":"pkg","main":"lib/main.js","module":"lib/esm.js"}"#,
         )
         .unwrap();
-        assert!(
-            compile(
-                &entry,
-                Realm::Renderer,
-                None,
-                Rc::default(),
-                production,
-                None
-            )
-            .is_err()
+        fs::write(package.join("lib/esm.js"), "export default 'esm';").unwrap();
+        fs::write(package.join("lib/bad.js"), "exports.partial = 1; globalThis.runs = (globalThis.runs || 0) + 1; throw new Error('bad');").unwrap();
+        fs::write(package.join("lib/main.js"), r#"
+            const result = [];
+            try { require('does-not-exist'); } catch (error) { result.push(error.code); }
+            try { require('vm'); } catch (error) { result.push(error.code); }
+            const name = 'pa' + 'th';
+            result.push(typeof require(name).join, typeof require('events'), require('events') === require('events').EventEmitter, typeof require('assert'), require('fs') === require('node:fs'));
+            Object.defineProperty(require('fs'), Symbol.for('patched'), { value: 1 });
+            result.push(require('node:fs')[Symbol.for('patched')], typeof require('constants').O_RDONLY, require('sys') === require('util'));
+            for (let i = 0; i < 2; i++) try { require('./bad.js'); } catch (error) { result.push(error.message + globalThis.runs); }
+            result.push(__filename.endsWith('main.js'), __dirname === require('path').dirname(__filename), module.filename === __filename, module.id === __filename, require.main, typeof module.require);
+            result.push(require.resolve('./bad.js') === require('path').join(__dirname, 'bad.js'), require.resolve('fs'), require.cache[__filename] === module);
+            try { require.resolve('nope'); } catch (error) { result.push(error.code); }
+            module.exports = result.join();
+        "#).unwrap();
+        let entry = dir.path().join("main.js");
+        fs::write(
+            &entry,
+            "import result from 'pkg'; globalThis.result = result;",
+        )
+        .unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        let engine = apps_runtime::jsc::Engine::new(
+            apps_runtime::jsc::Api::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.bundle(&files, "app.js").unwrap();
+        assert_eq!(
+            engine.eval("result", "test").unwrap(),
+            "MODULE_NOT_FOUND,MODULE_NOT_FOUND,function,function,true,function,true,1,number,true,bad1,bad2,true,true,true,true,,function,true,fs,true,MODULE_NOT_FOUND",
+            "production={production}"
         );
     }
 }
@@ -872,7 +956,7 @@ fn react_counter() {
                 &format!("{{ const ids = []; for (let node = document.getElementById('{button}'); node; node = node.parentNode) ids.push(node._id); __appsDispatch('click', ids); }}"),
                 "test",
             ).unwrap();
-            engine.eval("__appsTick()", "test").unwrap();
+            engine.tick().unwrap();
             assert_eq!(
                 engine
                     .eval("document.getElementById('count').textContent", "test")
@@ -954,8 +1038,14 @@ fn three_webgpu_renders_a_cube() {
         // Each `image` call starts a readback when the canvas changed, so a new frame shows up a call later.
         let present = |old: Option<*const ()>| {
             for _ in 0..5000 {
-                engine.eval("__appsTick()", "three-animation").unwrap();
-                let image = host.borrow_mut().graphics.get_mut(&1).unwrap().image(node).unwrap();
+                engine.tick().unwrap();
+                let image = host
+                    .borrow_mut()
+                    .graphics
+                    .get_mut(&1)
+                    .unwrap()
+                    .image(node)
+                    .unwrap();
                 if let Some(image) =
                     image.filter(|image| Some(std::sync::Arc::as_ptr(image).cast()) != old)
                 {
@@ -975,11 +1065,7 @@ fn three_webgpu_renders_a_cube() {
             "Cube is too dark"
         );
         let frame = present(Some(std::sync::Arc::as_ptr(&image).cast()));
-        assert_ne!(
-            pixels,
-            frame.bytes(),
-            "Animation did not update the canvas"
-        );
+        assert_ne!(pixels, frame.bytes(), "Animation did not update the canvas");
         engine
             .eval("threeRenderer.dispose()", "three-test")
             .unwrap();
@@ -1114,11 +1200,17 @@ fn tailwind_parts_keep_their_imports() {
     )
     .unwrap();
     let path = dir.path().join("index.html");
-    fs::write(&path, "<link rel='stylesheet' href='./style.css'><ul class='flex'></ul>").unwrap();
+    fs::write(
+        &path,
+        "<link rel='stylesheet' href='./style.css'><ul class='flex'></ul>",
+    )
+    .unwrap();
     let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
     assert!(source.contains("@import \"tailwindcss/theme.css\";"));
     assert!(source.contains("@import \"tailwindcss/utilities\";"));
-    let style = apps_runtime::style::styles(&Document::parse(&source), 800., 600.).pop().unwrap();
+    let style = apps_runtime::style::styles(&Document::parse(&source), 800., 600.)
+        .pop()
+        .unwrap();
     assert_eq!(style["display"], "flex");
     assert_eq!(style["list-style-type"], "disc");
 }
@@ -1132,10 +1224,10 @@ fn html_bundles_css_scripts_and_preload() {
         "@import './base.css'; body { margin: 0 }",
     )
     .unwrap();
-    fs::write(dir.path().join("page.ts"),r#"const end: string = "</script>"; if (end !== '<' + '/script>') throw Error('escape'); document.querySelector('h1').textContent = end; if(typeof process !== 'undefined') throw Error('privilege leak');"#).unwrap();
-    fs::write(dir.path().join("index.html"),"<html><head><link rel='stylesheet' href='./style.css'><script type='preload'>if(!process.versions.apps) throw Error('preload')</script></head><body><h1>Hello</h1><script type='module' src='./page.ts'></script></body></html>").unwrap();
+    fs::write(dir.path().join("page.ts"),r#"const end: string = "</script>"; if (end !== '<' + '/script>') throw Error('escape'); document.querySelector('h1').textContent = end; if(typeof process !== 'undefined') throw Error('privilege leak'); if (!(globalThis as any).preloaded) throw Error('preload');"#).unwrap();
+    fs::write(dir.path().join("index.html"),"<html><head><link rel='stylesheet' href='./style.css'><script type='preload'>__apps.contextBridge.exposeInMainWorld('preloaded', process.versions.apps)</script></head><body><h1>Hello</h1><script type='module' src='./page.ts'></script></body></html>").unwrap();
     let entry = dir.path().join("app.ts");
-    fs::write(&entry,"import {app,BrowserWindow} from '@pierre/apps';import html from './index.html' with {type:'text'};if(!html.includes('#123456')) throw Error('css');app.whenReady().then(()=>new BrowserWindow().load(html));").unwrap();
+    fs::write(&entry,"import {app,BrowserWindow} from '@pierre/apps';import html from './index.html' with {type:'text'};if(!html.includes('#123456')) throw Error('css');app.whenReady().then(()=>new BrowserWindow().loadFile('index.html'));").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
     assert_eq!(
         apps_runtime::desktop::Desktop::new(&files)
@@ -1144,6 +1236,62 @@ fn html_bundles_css_scripts_and_preload() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn load_file_literals_bundle_plain_electron_pages() {
+    for production in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("styles.css"),
+            "#color { color: rgb(1, 2, 3) }",
+        )
+        .unwrap();
+        fs::write(dir.path().join("preload.js"), "import {contextBridge} from 'electron'; contextBridge.exposeInMainWorld('versions', {electron: process.versions.electron});").unwrap();
+        fs::write(dir.path().join("renderer.js"), "if (versions.electron !== '40.0.0' || getComputedStyle(document.getElementById('color')).color !== 'rgb(1, 2, 3)' || document.querySelector('script[type=\"application/json\"]').textContent !== '{}') throw Error('renderer');").unwrap();
+        fs::write(dir.path().join("index.html"), "<link rel='stylesheet' href='styles.css'><script type='preload' src='./preload.js'></script><p id='color'>x</p><script type='application/json'>{}</script><script type='text/javascript' src='renderer.js'></script>").unwrap();
+        let entry = dir.path().join("main.js");
+        fs::write(&entry, "import {app, BrowserWindow} from 'electron'; const page = 'missing.html'; app.whenReady().then(() => { new BrowserWindow().loadFile('index.html', {hash: 'top'}); new BrowserWindow().webContents.loadFile('./index.html'); globalThis.missing = new BrowserWindow().loadFile(page).catch(() => {}); });").unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        assert!(files.contains_key("page-0.html") && !files.contains_key("page-1.html"));
+        let app = apps_runtime::bundle_source(&files, false);
+        assert!(app.matches("apps:///page-0.html").count() == 2 && app.contains("missing.html"));
+        assert_eq!(
+            apps_runtime::desktop::Desktop::new(&files)
+                .unwrap()
+                .check()
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn unsupported_electron_exports_fail_at_build_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.js");
+    for (source, error) in [
+        (
+            "import {app, Tray} from 'electron'; app.quit();",
+            "electron.Tray is not supported",
+        ),
+        (
+            "import {protocol} from '@pierre/apps';",
+            "@pierre/apps.protocol is not supported",
+        ),
+    ] {
+        fs::write(&entry, source).unwrap();
+        for production in [false, true] {
+            let message = compile(&entry, Realm::Main, None, Rc::default(), production, None)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(error), "{message}");
+        }
+    }
+    let entry = dir.path().join("main.ts");
+    fs::write(&entry, "import electron, {screen, MenuItem, webContents} from 'electron'; import type {Tray} from 'electron'; const tray: Tray | null = null; if (tray || electron.screen !== screen || typeof MenuItem !== 'function' || typeof webContents.fromId !== 'function') throw Error('exports');").unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+    apps_runtime::desktop::Desktop::new(&files).unwrap();
 }
 
 #[test]
@@ -1522,7 +1670,7 @@ fn node_file_roundtrip() {
 }
 
 #[test]
-fn node_builtin_exports_exist() {
+fn node_builtin_exports_match_runtime_objects() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("app.ts");
     let modules = [
@@ -1530,6 +1678,7 @@ fn node_builtin_exports_exist() {
         "assert/strict",
         "buffer",
         "child_process",
+        "constants",
         "crypto",
         "dns",
         "dns/promises",
@@ -1553,7 +1702,9 @@ fn node_builtin_exports_exist() {
         "stream/consumers",
         "stream/promises",
         "stream/web",
+        "sqlite",
         "string_decoder",
+        "sys",
         "timers",
         "timers/promises",
         "tty",
@@ -1567,13 +1718,14 @@ fn node_builtin_exports_exist() {
     for (index, name) in modules.iter().enumerate() {
         source += &format!("import * as m{index} from 'node:{name}';");
     }
-    source += "const missing=[";
+    // WARNING: both directions: every listed export exists at runtime, and every runtime name can be imported by name.
+    source += "const require=__apps.module.createRequire(),problems=[];";
     for (index, name) in modules.iter().enumerate() {
         source += &format!(
-            "...Object.keys(m{index}).filter(key=>m{index}[key]===undefined).map(key=>'{name}.'+key),"
+            "{{const object=require('node:{name}'),names=Object.keys(m{index}).filter(key=>key!=='default'&&key!=='module.exports');if(object!==m{index}.default)problems.push('{name}: default');for(const key of names)if(!(key in object))problems.push('{name}: missing '+key);if('{name}'!=='constants')for(const key of Object.keys(object))if(!key.startsWith('_')&&!names.includes(key))problems.push('{name}: not importable '+key);}}"
         );
     }
-    source += "];globalThis.result=missing.join(', ')||'ok';";
+    source += "globalThis.result=problems.join(', ')||'ok';";
     fs::write(&entry, source).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
     let engine = apps_runtime::jsc::Engine::new(
@@ -1667,25 +1819,53 @@ fn package_features_reach_the_runtime() {
     let entry = dir.path().join("app.js");
     fs::write(&entry, "").unwrap();
     for features in [r#"["webgpu"]"#, r#"["*","-webgpu"]"#] {
-        fs::write(dir.path().join("package.json"), format!(r#"{{"features":{features}}}"#)).unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"features":{features}}}"#),
+        )
+        .unwrap();
         for production in [false, true] {
-            let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+            let files =
+                compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
             let package: Value = serde_json::from_str(&files["package.json"]).unwrap();
-            assert_eq!(package["features"], serde_json::from_str::<Value>(features).unwrap());
+            assert_eq!(
+                package["features"],
+                serde_json::from_str::<Value>(features).unwrap()
+            );
         }
     }
     let gpu = |disabled| {
-        let host = Rc::new(RefCell::new(apps_runtime::host::Host { disabled, ..Default::default() }));
-        host.borrow_mut().pages.insert(1, apps_runtime::host::Page { doc: Document::parse("<html><body><canvas></canvas></body></html>"), dirty: false });
-        let engine = apps_runtime::jsc::Engine::new(apps_runtime::jsc::Api::load().unwrap(), host, apps_runtime::host::Role::Renderer(1)).unwrap();
+        let host = Rc::new(RefCell::new(apps_runtime::host::Host {
+            disabled,
+            ..Default::default()
+        }));
+        host.borrow_mut().pages.insert(
+            1,
+            apps_runtime::host::Page {
+                doc: Document::parse("<html><body><canvas></canvas></body></html>"),
+                dirty: false,
+            },
+        );
+        let engine = apps_runtime::jsc::Engine::new(
+            apps_runtime::jsc::Api::load().unwrap(),
+            host,
+            apps_runtime::host::Role::Renderer(1),
+        )
+        .unwrap();
         engine.eval("const message = run => { try { run(); } catch (error) { return error.message; } }; [typeof __appsGPU, typeof GPUDevice, message(() => navigator.gpu.requestAdapter()), message(() => document.querySelector('canvas').getContext('webgpu'))].join()", "gpu-test").unwrap()
     };
     let error = r#"The webgpu feature is disabled. Add "webgpu" to "features" in package.json"#;
-    assert_eq!(gpu(apps_runtime::bundle::disabled_features(None).unwrap()), format!("undefined,undefined,{error},{error}"));
+    assert_eq!(
+        gpu(apps_runtime::bundle::disabled_features(None).unwrap()),
+        format!("undefined,undefined,{error},{error}")
+    );
     assert!(gpu(0).starts_with("undefined,function,,"));
     fs::write(dir.path().join("package.json"), r#"{"features":["webgl"]}"#).unwrap();
     let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
-    assert!(format!("{error:#}").contains(r#"Unknown feature "webgl""#), "{error:#}");
+    assert!(
+        format!("{error:#}").contains(r#"Unknown feature "webgl""#),
+        "{error:#}"
+    );
 }
 
 #[cfg(unix)]
@@ -2084,15 +2264,14 @@ fn stylesheets_cannot_close_style_or_read_other_files() {
     fs::write(&page, "<style>@import './node_modules/theme/screen.css'; body { margin: 0 }</style><link rel='stylesheet' media='print' href='./node_modules/theme/base.css'>").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
     let doc = Document::parse(&files["page-0.html"]);
-    let styles: Vec<_> = doc
-        .nodes
-        .iter()
-        .filter(|node| node.tag == "style")
+    let styles: Vec<_> = (0..doc.nodes.len())
+        .filter(|&id| doc.nodes[id].tag == "style")
+        .map(|id| doc.text(id))
         .collect();
     assert_eq!(styles.len(), 2, "{}", files["page-0.html"]);
-    assert!(styles[0].text.contains("#123456") && styles[0].text.contains("#654321"));
-    assert!(!styles[0].text.contains("@IMPORT"));
-    assert!(styles[1].text.starts_with("@media print{") && styles[1].text.contains("#123456"));
+    assert!(styles[0].contains("#123456") && styles[0].contains("#654321"));
+    assert!(!styles[0].contains("@IMPORT"));
+    assert!(styles[1].starts_with("@media print{") && styles[1].contains("#123456"));
     for (html, message) in [
         (
             "<link rel='stylesheet' href='./node_modules/theme/evil.css'>",
@@ -2377,11 +2556,14 @@ fn page_scripts_share_one_module_graph_per_realm() {
             2
         );
         let page = Document::parse(&files["page-0.html"]);
-        let sources: Vec<_> = page
-            .nodes
-            .iter()
-            .filter(|node| node.tag == "script")
-            .map(|node| (node.attrs.get("src").cloned(), node.text.is_empty()))
+        let sources: Vec<_> = (0..page.nodes.len())
+            .filter(|&id| page.nodes[id].tag == "script")
+            .map(|id| {
+                (
+                    page.nodes[id].attrs.get("src").cloned(),
+                    page.text(id).is_empty(),
+                )
+            })
             .collect();
         assert_eq!(
             sources,
@@ -2626,5 +2808,42 @@ fn page_workers_and_chunks_load_from_bundled_scripts() {
             "84",
             "production={production}"
         );
+    }
+}
+
+#[test]
+fn css_imports_keep_layer_supports_and_media_conditions() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, rule) in [
+        ("a.css", ".a{}"),
+        ("b.css", ".b{}"),
+        ("c.css", ".c{}"),
+        ("d.css", ".d{}"),
+        ("e.css", ".e{}"),
+    ] {
+        fs::write(dir.path().join(name), rule).unwrap();
+    }
+    fs::write(
+        dir.path().join("style.css"),
+        "@import \"./a.css\" layer(base);@import url(./b.css) layer;@import './c.css' supports(display: grid) screen and (min-width: 1px);@import url('./d.css') print;@import './e.css' layer(x.y) supports(not (display: nonsense));",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("index.html"),
+        "<link rel='stylesheet' href='./style.css'>",
+    )
+    .unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, "console.log(import.meta.resolve('./index.html'));").unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    let page = &files["page-0.html"];
+    for expected in [
+        "@layer base{.a{}}",
+        "@layer{.b{}}",
+        "@media screen and (min-width: 1px){@supports (display: grid){.c{}}}",
+        "@media print{.d{}}",
+        "@supports (not (display: nonsense)){@layer x.y{.e{}}}",
+    ] {
+        assert!(page.contains(expected), "{expected} in {page}");
     }
 }

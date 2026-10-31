@@ -1,5 +1,6 @@
 pub(crate) mod crypto;
 pub mod gpu;
+pub mod media;
 pub(crate) mod platform;
 pub(crate) mod serve;
 pub(crate) mod storage;

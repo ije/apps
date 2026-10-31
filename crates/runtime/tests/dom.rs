@@ -35,7 +35,8 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
     let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().dom[&1].scroll[&id].set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
+    host.borrow().dom[&1].scroll[&id]
+        .set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
     engine.eval(r#"
         __appsLayout(); __appsLayout();
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
@@ -70,7 +71,8 @@ fn window_scroll_moves_the_page() {
         if (JSON.stringify(received) !== '[[true,true,0,50]]') throw Error(JSON.stringify(received));
         if (document.documentElement.clientHeight !== innerHeight) throw Error('Root client height is not the viewport');
     "#, "test").unwrap();
-    host.borrow().dom[&1].scroll[&0].set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
+    host.borrow().dom[&1].scroll[&0]
+        .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
     engine
         .eval(
             "__appsLayout(); if (scrollY !== 120) throw Error(String(scrollY));",
@@ -252,7 +254,7 @@ fn editing_fragments_observers_and_layout() {
         range.deleteContents();
         if (message.firstChild.data !== 'ho ') throw Error('Range deletion');
         globalThis.observed = [];
-        const resize = new ResizeObserver(entries => observed.push(entries[0].contentRect.width)); resize.observe(input);
+        const resize = new ResizeObserver(entries => observed.push(entries[0].contentRect.width, entries[0].borderBoxSize[0].inlineSize)); resize.observe(input);
         globalThis.editorId = input._id;
     "#, "test").unwrap();
     let id: usize = engine.eval("editorId", "test").unwrap().parse().unwrap();
@@ -262,7 +264,7 @@ fn editing_fragments_observers_and_layout() {
         .or_default()
         .bounds
         .insert(id, [20., 30., 200., 80.]);
-    engine.eval("__appsLayout(); __appsLayout(); if (observed.join() !== '200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 80) throw Error('Layout observation');", "test").unwrap();
+    engine.eval("__appsLayout(); __appsLayout(); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
 }
 
 #[test]
@@ -278,7 +280,7 @@ fn media_queries_follow_viewport_changes() {
         if (!(query instanceof MediaQueryList) || !query.matches || query.media !== '(min-width:40em)') throw Error('Media query result');
         if (!matchMedia('screen and (max-height:600px)').matches || !matchMedia('print, (pointer:fine)').matches) throw Error('Media query list');
         if (matchMedia('print').matches || matchMedia('(unknown:yes)').matches) throw Error('Unsupported media query');
-        if (getComputedStyle(document.getElementById('target')).color !== 'red') throw Error('CSS media query disagrees');
+        if (getComputedStyle(document.getElementById('target')).color !== 'rgb(255, 0, 0)') throw Error('CSS media query disagrees');
         const changes = [];
         const listener = event => changes.push([event instanceof MediaQueryListEvent, event.media, event.matches]);
         query.addListener(listener);
@@ -291,7 +293,7 @@ fn media_queries_follow_viewport_changes() {
         if (query.matches) throw Error('Media query did not resize');
         __appsLayout(); __appsLayout();
         if (JSON.stringify(changes) !== '[[true,"(min-width:40em)",false],false]') throw Error('Media change event');
-        if (getComputedStyle(document.getElementById('target')).color === 'red') throw Error('CSS media query did not resize');
+        if (getComputedStyle(document.getElementById('target')).color === 'rgb(255, 0, 0)') throw Error('CSS media query did not resize');
         query.removeListener(listener);
         query.onchange = null;
     "#, "test").unwrap();
@@ -346,13 +348,13 @@ fn custom_elements_shadow_styles_and_lifecycle() {
       const existing=document.querySelector('test-existing');if(!(existing instanceof Example)||connected!==1)throw Error('Upgrade failed');
       const inside=existing.shadowRoot.getElementById('inside');if(document.getElementById('inside')||existing.querySelector('#inside'))throw Error('Shadow tree leaked');
       if(!inside.isConnected||inside.getRootNode()!==existing.shadowRoot||inside.getRootNode({composed:true})!==document)throw Error('Wrong shadow roots');
-      if(getComputedStyle(inside).color!=='#123456'||getComputedStyle(document.getElementById('outside')).color==='#123456')throw Error('Shadow styles leaked');
+      if(getComputedStyle(inside).color!=='rgb(18, 52, 86)'||getComputedStyle(document.getElementById('outside')).color==='rgb(18, 52, 86)')throw Error('Shadow styles leaked');
       existing.style.whiteSpace='pre';inside.innerHTML='<span>  const value = 1</span>';
       if(getComputedStyle(inside.firstChild).whiteSpace!=='pre')throw Error('Shadow whitespace inheritance failed');
       inside.firstChild.style.whiteSpace='normal';
-      if(getComputedStyle(inside.firstChild.firstChild).whiteSpace!=='normal')throw Error('Text whitespace override failed');
+      if(getComputedStyle(inside.firstChild).whiteSpace!=='normal')throw Error('Text whitespace override failed');let threw=false;try{getComputedStyle(inside.firstChild.firstChild);}catch{threw=true;}if(!threw)throw Error('Text nodes have no computed style');
       const sheet=new CSSStyleSheet();sheet.replaceSync('#inside {color:#654321}');existing.shadowRoot.adoptedStyleSheets=[sheet];
-      if(getComputedStyle(inside).color!=='#654321')throw Error('Adopted sheet did not apply');
+      if(getComputedStyle(inside).color!=='rgb(101, 67, 33)')throw Error('Adopted sheet did not apply');
       existing.setAttribute('data-value','a');existing.remove();if(disconnected!==1||attributes!==1||inside.isConnected)throw Error('Lifecycle failed');
       let delivered=0;existing.addEventListener('private',()=>delivered++);inside.dispatchEvent(new Event('private',{bubbles:true}));if(delivered)throw Error('Non-composed event crossed shadow');
       inside.dispatchEvent(new Event('private',{bubbles:true,composed:true}));if(delivered!==1)throw Error('Composed event did not cross shadow');
@@ -379,13 +381,13 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
         if (root.getElementById('duplicate').assignedNodes().length) throw Error('Duplicate slot received nodes');
         if (root.querySelector('slot:not([name])').assignedNodes()[0].textContent !== 'text') throw Error('Default slot');
         if (edit.parentNode !== host || edit.getRootNode() !== document || root.querySelector('#edit')) throw Error('Slot changed the DOM tree');
-        if (getComputedStyle(edit).color !== '#123456' || getComputedStyle(slot).display !== 'contents') throw Error('Slot styles');
-        if (getComputedStyle(host).backgroundColor !== 'white' || getComputedStyle(host).color !== '#445566') throw Error('Host styles');
-        if (getComputedStyle(host.querySelector('em')).color !== '#987654') throw Error('Slotted inheritance');
+        if (getComputedStyle(edit).color !== 'rgb(18, 52, 86)' || getComputedStyle(slot).display !== 'contents') throw Error('Slot styles');
+        if (getComputedStyle(host).backgroundColor !== 'rgb(255, 255, 255)' || getComputedStyle(host).color !== 'rgb(68, 85, 102)') throw Error('Host styles');
+        if (getComputedStyle(host.querySelector('em')).color !== 'rgb(152, 118, 84)') throw Error('Slotted inheritance');
         host.style.color = 'orange';
-        if (getComputedStyle(host).color !== 'orange' || getComputedStyle(root.querySelector('header')).color !== 'orange') throw Error('Outer host cascade');
+        if (getComputedStyle(host).color !== 'rgb(255, 165, 0)' || getComputedStyle(root.querySelector('header')).color !== 'rgb(255, 165, 0)') throw Error('Outer host cascade');
         root.querySelector('style').textContent += ':host {color:purple!important}';
-        if (getComputedStyle(host).color !== 'purple') throw Error('Important host cascade');
+        if (getComputedStyle(host).color !== 'rgb(128, 0, 128)') throw Error('Important host cascade');
         const events = [];
         edit.addEventListener('click', () => events.push('edit'));
         slot.addEventListener('click', () => events.push('slot'));
@@ -453,8 +455,7 @@ fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
         if (__appsEditing()?.id !== editor._id) throw Error('Click focused an inline child');
         __appsDispatch('pointerup', [text._id], {pointerId:1,pointerType:'mouse'});
         __appsDispatch('keydown', [], {key:'ArrowRight'});
-        __appsDispatch('click', [text._id]);
-        if (events.join() !== 'pointerdown,pointerup,keydown,click') throw Error('Native event stopped at shadow root');
+        if (events.join() !== 'pointerdown,pointerup,click,keydown') throw Error('Native event stopped at shadow root');
     "#, "test").unwrap();
 }
 
@@ -516,23 +517,23 @@ fn computed_styles_follow_mutations_and_resize() {
         dirty: false,
     });
     let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
-    engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='red')throw Error('Initial style');", "test").unwrap();
+    engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
     host.borrow_mut().viewports.insert(1, [1000., 600.]);
     engine.eval(r#"
-        if(getComputedStyle(item).color!=='blue')throw Error('Viewport change');
+        if(getComputedStyle(item).color!=='rgb(0, 0, 255)')throw Error('Viewport change');
         document.querySelector('style').textContent='.item {color:green}';
-        if(getComputedStyle(item).color!=='green')throw Error('Stylesheet mutation');
+        if(getComputedStyle(item).color!=='rgb(0, 128, 0)')throw Error('Stylesheet mutation');
         item.style.color='purple';
-        if(getComputedStyle(item).color!=='purple')throw Error('Inline mutation');
+        if(getComputedStyle(item).color!=='rgb(128, 0, 128)')throw Error('Inline mutation');
         item.removeAttribute('style');
-        if(getComputedStyle(item).color!=='green')throw Error('Attribute removal');
+        if(getComputedStyle(item).color!=='rgb(0, 128, 0)')throw Error('Attribute removal');
         item.className='';
-        if(getComputedStyle(item).color==='green')throw Error('Class removal');
+        if(getComputedStyle(item).color==='rgb(0, 128, 0)')throw Error('Class removal');
         const root=item.attachShadow({mode:'open'});root.innerHTML='<span style="color:var(--ink)">text</span>';
         item.style.setProperty('--ink','red');
-        if(getComputedStyle(root.firstChild).color!=='red')throw Error('Shadow inheritance');
+        if(getComputedStyle(root.firstChild).color!=='rgb(255, 0, 0)')throw Error('Shadow inheritance');
         item.style.setProperty('--ink','blue');
-        if(getComputedStyle(root.firstChild).color!=='blue')throw Error('Shadow invalidation');
+        if(getComputedStyle(root.firstChild).color!=='rgb(0, 0, 255)')throw Error('Shadow invalidation');
     "#, "test").unwrap();
 }
 
@@ -568,7 +569,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
 fn pointer_hover_tracks_boundary_events_and_interaction_states() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top-width:3px}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
+        doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
         dirty: false,
     });
     let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
@@ -602,32 +603,32 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
         const move = (x, y) => __appsDispatch('pointermove', [], {pointerId:1, pointerType:'mouse', clientX:x, clientY:y});
         move(10, 10);
         check('pointerover:inner,pointerenter:outer,pointerenter:inner,mouseover:inner,mouseenter:outer,mouseenter:inner', 'enter');
-        if (getComputedStyle(outer).color !== 'red' || getComputedStyle(inner).color !== 'blue') throw Error('Hover styles');
+        if (getComputedStyle(outer).color !== 'rgb(255, 0, 0)' || getComputedStyle(inner).color !== 'rgb(0, 0, 255)') throw Error('Hover styles');
         move(12, 12);
         check('', 'same target');
         move(80, 80);
         check('pointerout:inner>outer,pointerleave:inner>outer,pointerover:outer>inner,mouseout:inner>outer,mouseleave:inner>outer,mouseover:outer>inner', 'leave child');
-        if (getComputedStyle(inner).color !== 'red') throw Error('Inner hover was not cleared');
+        if (getComputedStyle(inner).color !== 'rgb(255, 0, 0)') throw Error('Inner hover was not cleared');
         move(10, 150);
         check('pointerout:outer>other,pointerleave:outer>other,pointerover:other>outer,pointerenter:other>outer,mouseout:outer>other,mouseleave:outer>other,mouseover:other>outer,mouseenter:other>outer', 'sibling');
-        if (getComputedStyle(outer).color === 'red') throw Error('Outer hover was not cleared');
+        if (getComputedStyle(outer).color === 'rgb(255, 0, 0)') throw Error('Outer hover was not cleared');
         move(10, 210);
-        if (getComputedStyle(card).color !== 'purple') throw Error('Shadow host is not hovered');
+        if (getComputedStyle(card).color !== 'rgb(128, 0, 128)') throw Error('Shadow host is not hovered');
         move(400, 400);
-        if (getComputedStyle(card).color === 'purple') throw Error('Shadow host hover was not cleared');
+        if (getComputedStyle(card).color === 'rgb(128, 0, 128)') throw Error('Shadow host hover was not cleared');
         log.length = 0;
         __appsDispatch('pointerdown', [inner._id], {pointerId:1, pointerType:'mouse', clientX:10, clientY:10, button:0});
-        if (getComputedStyle(inner).fontWeight !== '700' || getComputedStyle(outer).backgroundColor !== 'green' || getComputedStyle(inner).borderTopWidth !== '3px') throw Error('Active or focus styles');
+        if (getComputedStyle(inner).fontWeight !== '700' || getComputedStyle(outer).backgroundColor !== 'rgb(0, 128, 0)' || getComputedStyle(inner).borderTopWidth !== '3px') throw Error('Active or focus styles');
         if (inner.attributes.length !== 2 || inner.outerHTML.includes('apps') || inner.hasAttribute('data-apps-focus')) throw Error('Interaction state leaked into attributes');
         __appsDispatch('pointerup', [], {pointerId:1, pointerType:'mouse', clientX:600, clientY:10});
         if (getComputedStyle(inner).fontWeight === '700') throw Error('Active was not cleared');
         inner.blur();
-        if (getComputedStyle(outer).backgroundColor === 'green') throw Error('Focus within was not cleared');
+        if (getComputedStyle(outer).backgroundColor === 'rgb(0, 128, 0)') throw Error('Focus within was not cleared');
         move(10, 10);
         log.length = 0;
         __appsDispatch('pointerexit', [], {pointerId:1, pointerType:'mouse', clientX:10, clientY:10});
         check('pointerout:inner,pointerleave:inner,pointerleave:outer,mouseout:inner,mouseleave:inner,mouseleave:outer', 'exit');
-        if (getComputedStyle(outer).color === 'red' || document.querySelector(':hover')) throw Error('Exit kept hover');
+        if (getComputedStyle(outer).color === 'rgb(255, 0, 0)' || document.querySelector(':hover')) throw Error('Exit kept hover');
         if (document.querySelector('#outer:scope') || outer.querySelector(':scope > div') !== inner || !outer.matches(':scope')) throw Error('Scope');
     "#, "test").unwrap();
 }
@@ -742,7 +743,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
         if (a.parentNode || list.firstChild !== b || list.childNodes.length !== 2 || list.lastChild.data !== 'c') throw Error('replaceChildren');
         el.style.cssText = 'content: "a;b"; color: red';
         const style = getComputedStyle(el);
-        if (style.content !== '"a;b"' || style.color !== 'red' || style.getPropertyValue('constructor') !== '' || style[0] !== style.item(0) || !style.cssText.includes('color:red')) throw Error('Computed style');
+        if (style.content !== '"a;b"' || style.color !== 'rgb(255, 0, 0)' || style.getPropertyValue('constructor') !== '' || style[0] !== style.item(0) || !style.length || el.style.cssText !== 'content: "a;b"; color: red;') throw Error('Computed style');
         let threw = false; try { style.color = 'blue'; } catch { threw = true; }
         if (!threw) throw Error('Computed style is writable');
         const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 4; document.body.append(canvas);
@@ -1039,7 +1040,7 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         if (document.getElementById('a').offsetParent !== document.body) throw Error('Static offset parent');
         document.getElementById('rel').style.position = 'static';
         if (c.offsetParent !== document.body) throw Error('Offset parent ignores a style change');
-        if (c.getBoundingClientRect().right !== 50 || c.clientWidth !== 20 || c.offsetHeight !== 10) throw Error('Rect');
+        if (c.getBoundingClientRect().right !== 50 || c.offsetWidth !== 20 || c.clientWidth !== 0 || c.offsetHeight !== 10) throw Error('Rect');
         clip.scrollTop = 30;
         if (clip.scrollTop !== 30 || clip.scrollLeft !== 0 || clip.scrollHeight !== 100 || document.documentElement.scrollTop !== 0) throw Error('Scroll');
         globalThis.late = []; for (let i = 0; i < 3000; i++) late.push(document.body.appendChild(document.createElement('i')));
@@ -1050,5 +1051,817 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         __appsLayout();
         if (seen.join(';') !== 'a,true,1,0,100') throw Error(seen.join(';'));
         if (late.at(-1).getBoundingClientRect().height !== 4 || document.getElementById('c').getBoundingClientRect().x !== 30) throw Error('Grown mirror');
+    "#, "test").unwrap();
+}
+
+fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, Engine) {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse(html),
+            dirty: false,
+        },
+    );
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let result = engine
+        .eval(
+            &format!(
+                "(() => {{ const fails = []; const check = (name, fn) => {{ try {{ if (!fn()) fails.push(name); }} catch (e) {{ fails.push(name + ': ' + e.message); }} }}; {script}; return fails.join('\\n'); }})()"
+            ),
+            "test",
+        )
+        .unwrap();
+    assert_eq!(result, "");
+    (host, engine)
+}
+
+#[test]
+fn event_handler_properties_are_listeners_in_order() {
+    checked_page(
+        "<html><body><div id='d' onclick='throw Error(1)'></div><svg id='s'></svg></body></html>",
+        r#"
+        const d = document.getElementById('d');
+        check('feature detection', () => 'oninput' in document && 'onclick' in d && 'onmousedown' in window && 'onclick' in document.getElementById('s') && !('onclick' in new Text('')));
+        check('default null', () => d.onclick === null && document.oninput === null && window.onload === null);
+        const order = [];
+        d.addEventListener('click', () => order.push(1));
+        d.onclick = () => order.push(2);
+        d.addEventListener('click', () => order.push(3));
+        d.onclick = () => order.push(4);
+        d.dispatchEvent(new Event('click'));
+        check('handler keeps its first place', () => order.join() === '1,4,3');
+        d.onclick = null; order.length = 0; d.dispatchEvent(new Event('click'));
+        check('null removes the handler', () => order.join() === '1,3' && d.onclick === null);
+        d.onclick = () => false;
+        const event = new Event('click', { cancelable: true });
+        check('false return cancels', () => !d.dispatchEvent(event) && event.defaultPrevented);
+        let windowCalls = 0; window.onresize = () => windowCalls++;
+        __appsDispatch('window:resize', []);
+        check('window handler', () => windowCalls === 1);
+        check('preact style names', () => 'onclick' in d && !('onClick' in d));
+        "#,
+    );
+}
+
+#[test]
+fn select_options_follow_selection_and_keyboard() {
+    let (host, _) = checked_page(
+        "<html><body><form id='f'><select id='s' name='fruit'><option value='a'>Apple</option><option>  Banana  split </option><optgroup label='g'><option value='c' disabled>Cherry</option><option value='d'>Date</option></optgroup></select><select id='m' multiple><option selected>x</option><option selected>y</option></select></form></body></html>",
+        r#"
+        const s = document.getElementById('s'), m = document.getElementById('m');
+        check('classes', () => s instanceof HTMLSelectElement && s.options[0] instanceof HTMLOptionElement && s.querySelector('optgroup') instanceof HTMLOptGroupElement && Object.prototype.toString.call(s) === '[object HTMLSelectElement]');
+        check('default first option', () => s.selectedIndex === 0 && s.value === 'a' && s.type === 'select-one' && s.length === 4 && s.options.length === 4);
+        check('option fields', () => s.options[1].value === 'Banana split' && s.options[1].text === 'Banana split' && s.options[3].index === 3 && s.options[2].disabled && s.options[0].form === document.getElementById('f') && s.options[0].label === 'Apple');
+        check(':checked default', () => document.querySelector('#s :checked') === s.options[0]);
+        s.value = 'd';
+        check('value setter', () => s.selectedIndex === 3 && s.options[3].selected && !s.options[0].selected && document.querySelector('#s :checked') === s.options[3]);
+        s.selectedIndex = -1;
+        check('selectedIndex -1', () => s.value === '' && s.selectedOptions.length === 0);
+        s.options[1].selected = true;
+        check('option.selected', () => s.value === 'Banana split' && s.selectedOptions[0] === s.options[1]);
+        check('multiple', () => m.type === 'select-multiple' && m.selectedOptions.length === 2 && m.options.selectedIndex === 0);
+        const extra = document.createElement('option'); extra.value = 'e'; extra.text = 'Egg';
+        s.add(extra, 0);
+        check('add before index', () => s.options[0] === extra && s.length === 5);
+        s.remove(0);
+        check('remove index', () => s.length === 4 && !extra.parentNode);
+        check('Option constructor', () => { const o = new Option('Fig', 'f', true, true); return o.value === 'f' && o.text === 'Fig' && o.defaultSelected && o.selected; });
+        s.value = 'a'; s.focus();
+        const events = [];
+        s.addEventListener('input', e => events.push('input:' + e.isTrusted + ':' + s.value));
+        s.addEventListener('change', e => events.push('change:' + e.isTrusted + ':' + s.value));
+        __appsDispatch('keydown', [], { key: 'ArrowDown' });
+        __appsDispatch('keydown', [], { key: 'ArrowDown' });
+        check('keyboard skips disabled options', () => events.join() === 'input:true:Banana split,change:true:Banana split,input:true:d,change:true:d');
+        globalThis.selectId = s.options[3]._id;
+        "#,
+    );
+    let host = host.borrow();
+    let doc = &host.pages[&1].doc;
+    let option = doc
+        .nodes
+        .iter()
+        .position(|node| {
+            node.tag == "option" && node.attrs.get("value").map(String::as_str) == Some("d")
+        })
+        .unwrap();
+    assert!(apps_runtime::dom::Document::matches(
+        doc,
+        option,
+        "select option:checked"
+    ));
+}
+
+#[test]
+fn native_presses_follow_the_browser_event_sequence() {
+    checked_page(
+        "<html><body><div id='a' tabindex='0'>a</div><input id='i'><div id='b'>b</div></body></html>",
+        r#"
+        const a = document.getElementById('a'), i = document.getElementById('i'), b = document.getElementById('b');
+        const log = [];
+        for (const type of ['pointerdown','mousedown','pointerup','mouseup','click','auxclick','contextmenu','dblclick','wheel']) a.addEventListener(type, e => log.push(type + ':' + e.button + ':' + e.buttons + ':' + e.detail + ':' + e.isTrusted + (e instanceof MouseEvent ? '' : '!')));
+        const press = (target, button, detail = 1) => { __appsDispatch('pointerdown', [target._id], { clientX: 5, clientY: 6, button, buttons: 1 << [0, 2, 1][button], detail }); __appsDispatch('pointerup', [target._id], { clientX: 7, clientY: 9, button, buttons: 0 }); };
+        press(a, 0);
+        check('primary sequence', () => log.join() === 'pointerdown:0:1:1:true,mousedown:0:1:1:true,pointerup:0:0:0:true,mouseup:0:0:0:true,click:0:0:1:true');
+        check('primary press focuses', () => document.activeElement === a);
+        log.length = 0; press(a, 2);
+        check('secondary sequence', () => log.join() === 'pointerdown:2:2:1:true,mousedown:2:2:1:true,contextmenu:2:2:1:true,pointerup:2:0:0:true,mouseup:2:0:0:true,auxclick:2:0:1:true');
+        log.length = 0; press(a, 1);
+        check('middle sequence', () => log.join().endsWith('mouseup:1:0:0:true,auxclick:1:0:1:true') && !log.join().includes('click:1:0:1:true,') && !log.join().includes('contextmenu'));
+        log.length = 0; press(a, 0, 2);
+        check('dblclick', () => log.at(-1) === 'dblclick:0:0:2:true');
+        let fields;
+        a.addEventListener('mousemove', e => fields = [e.pageX, e.offsetX, e.movementX, e.x, e.screenX, e instanceof MouseEvent]);
+        __appsDispatch('pointermove', [a._id], { clientX: 10, clientY: 10, buttons: 0 });
+        __appsDispatch('pointermove', [a._id], { clientX: 14, clientY: 10, buttons: 0 });
+        check('mouse fields', () => fields.join() === '14,14,4,14,14,true');
+        let cancel = false; a.addEventListener('wheel', e => { e.preventDefault(); cancel = e.defaultPrevented; });
+        check('wheel', () => __appsDispatch('wheel', [a._id], { clientX: 1, clientY: 1, deltaY: 30 }) === false && cancel && log.at(-1).startsWith('wheel:') && log.at(-1).endsWith('!') === false);
+        let passive = null; document.addEventListener('wheel', e => { e.preventDefault(); passive = e.defaultPrevented; });
+        __appsDispatch('wheel', [b._id], { clientX: 1, clientY: 1, deltaY: 30 });
+        check('document wheel listeners are passive', () => passive === false);
+        i.focus();
+        b.addEventListener('mousedown', e => e.preventDefault(), { once: true });
+        press(b, 0);
+        check('canceled mousedown keeps focus', () => document.activeElement === i);
+        press(b, 0);
+        check('press on plain content blurs', () => document.activeElement === document.body);
+        check('script events are untrusted', () => !new MouseEvent('click').isTrusted);
+        let late = null; const e = new Event('ping'); a.addEventListener('ping', ev => late = ev.currentTarget); a.dispatchEvent(e);
+        check('currentTarget cleared after dispatch', () => late === a && e.currentTarget === null && e.target === a && e.eventPhase === 0);
+        const host = document.createElement('div'); document.body.append(host); const inner = host.attachShadow({ mode: 'open' }).appendChild(document.createElement('span'));
+        const shadowEvent = new Event('x', { bubbles: true, composed: true }); inner.dispatchEvent(shadowEvent);
+        check('shadow target cleared after dispatch', () => shadowEvent.target === null);
+        "#,
+    );
+}
+
+#[test]
+fn checkbox_and_radio_activation_runs_before_listeners() {
+    checked_page(
+        "<html><body><input id='c' type='checkbox'><input id='r1' type='radio' name='g' checked><input id='r2' type='radio' name='g'><label id='l'>Label <input id='lc' type='checkbox'></label><label for='t' id='lt'>Text</label><input id='t'></body></html>",
+        r#"
+        const c = document.getElementById('c'), r1 = document.getElementById('r1'), r2 = document.getElementById('r2');
+        const seen = [];
+        c.addEventListener('click', () => seen.push('click:' + c.checked));
+        c.addEventListener('input', e => seen.push('input:' + c.checked + ':' + e.bubbles));
+        c.addEventListener('change', () => seen.push('change:' + c.checked));
+        c.click();
+        check('checked before listeners, then input and change', () => seen.join() === 'click:true,input:true:true,change:true' && c.checked);
+        seen.length = 0;
+        c.addEventListener('click', e => e.preventDefault(), { once: true });
+        c.click();
+        check('canceled click restores', () => seen.join() === 'click:false' && c.checked);
+        check('checked does not write the attribute', () => !c.hasAttribute('checked') && !c.defaultChecked);
+        r2.click();
+        check('radio group', () => r2.checked && !r1.checked && r1.defaultChecked);
+        r1.addEventListener('click', e => e.preventDefault(), { once: true });
+        r1.click();
+        check('canceled radio restores the group', () => r2.checked && !r1.checked);
+        document.getElementById('l').click();
+        check('label clicks its control', () => document.getElementById('lc').checked);
+        document.getElementById('lt').click();
+        check('label focuses a text control', () => document.activeElement === document.getElementById('t'));
+        let tracked = null, writes = 0;
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+        Object.defineProperty(c, 'checked', { configurable: true, get() { return descriptor.get.call(this); }, set(value) { writes++; descriptor.set.call(this, value); } });
+        c.addEventListener('click', () => tracked = c.checked, { once: true });
+        c.click();
+        check('user toggles skip page setters, like React tracks', () => writes === 0 && tracked === false);
+        "#,
+    );
+}
+
+#[test]
+fn parser_raw_text_tables_and_document_structure() {
+    checked_page(
+        "<!doctype html><title>x &amp; y</title><style>a>b{}</style><p>one<p>two<table><tr><td>cell</table>a &lt; b &notin; &#x80;",
+        r#"
+        check('implied structure', () => document.head && document.body && document.documentElement && document.head.firstChild.localName === 'title' && document.title === 'x & y');
+        const style = document.querySelector('style');
+        check('style text child', () => style.firstChild?.nodeType === 3 && style.firstChild.data === 'a>b{}' && style.childNodes.length === 1);
+        check('raw text serialization', () => style.outerHTML === '<style>a>b{}</style>');
+        check('implied p end', () => document.querySelectorAll('p').length === 2 && document.querySelectorAll('p')[1].textContent === 'two');
+        check('implied tbody', () => document.querySelector('table > tbody > tr > td')?.textContent === 'cell');
+        check('entities', () => document.body.lastChild.data === 'a < b ∉ €');
+        const tbody = document.querySelector('tbody'); tbody.innerHTML = '<tr><td>1</td></tr>';
+        check('tbody fragment context', () => tbody.firstChild.localName === 'tr');
+        const tr = document.querySelector('tr'); tr.insertAdjacentHTML('afterend', '<tr><td>2</td></tr>');
+        check('insertAdjacentHTML context', () => tbody.children.length === 2 && tbody.lastChild.localName === 'tr');
+        const parsed = new DOMParser().parseFromString('<title>t</title><p>x', 'text/html');
+        check('DOMParser', () => parsed.head.firstChild.localName === 'title' && parsed.body.firstChild.localName === 'p' && parsed.title === 't');
+        const svg = document.createElement('div'); svg.innerHTML = '<svg viewbox="0 0 1 1"><lineargradient id="g"/><foreignObject><p>x</p></foreignObject></svg>';
+        check('svg case', () => svg.querySelector('linearGradient')?.id === 'g' && svg.firstChild.getAttribute('viewBox') === '0 0 1 1' && svg.querySelector('foreignObject p') !== null);
+        "#,
+    );
+}
+
+#[test]
+fn created_svg_keeps_qualified_name_case() {
+    let (host, _) = checked_page(
+        "<html><body><svg id='s'></svg></body></html>",
+        r#"
+        const NS = 'http://www.w3.org/2000/svg', s = document.getElementById('s');
+        const g = document.createElementNS(NS, 'linearGradient'); g.id = 'grad'; s.append(g);
+        s.append(document.createElementNS(NS, 'feGaussianBlur'));
+        check('tag names', () => g.tagName === 'linearGradient' && g.localName === 'linearGradient' && g instanceof SVGElement);
+        check('serialization', () => s.innerHTML === '<linearGradient id="grad"></linearGradient><feGaussianBlur></feGaussianBlur>');
+        "#,
+    );
+    let host = host.borrow();
+    let tags: Vec<_> = host.pages[&1]
+        .doc
+        .nodes
+        .iter()
+        .map(|node| node.tag.as_str())
+        .collect();
+    assert!(tags.contains(&"linearGradient") && tags.contains(&"feGaussianBlur"));
+}
+
+#[test]
+fn focus_follows_focusability_removal_and_shadow_roots() {
+    checked_page(
+        "<html><body><div id='plain'>x</div><a id='link' href='#x'>l</a><a id='nolink'>n</a><button id='b'>b</button><div id='tab' tabindex='2'></div><div id='host'></div><input id='first' tabindex='1'></body></html>",
+        r#"
+        const $ = id => document.getElementById(id);
+        $('plain').focus();
+        check('non-focusable ignored', () => document.activeElement === document.body);
+        check('link tabIndex', () => $('link').tabIndex === 0 && $('nolink').tabIndex === -1 && $('b').tabIndex === 0);
+        $('link').focus();
+        check('link focus', () => document.activeElement === $('link'));
+        const detached = document.createElement('button'); detached.focus();
+        check('detached ignored', () => document.activeElement === $('link'));
+        const events = [];
+        $('b').focus();
+        $('b').addEventListener('blur', () => events.push('blur'));
+        $('b').addEventListener('focusout', () => events.push('focusout'));
+        $('b').remove();
+        check('removal blurs to body', () => document.activeElement === document.body && events.join() === 'blur,focusout');
+        let key = false; document.addEventListener('keydown', () => key = true);
+        __appsDispatch('keydown', [], { key: 'x' });
+        check('document keydown after removal', () => key);
+        const root = $('host').attachShadow({ mode: 'open' }); root.innerHTML = '<input id="inner">';
+        root.firstChild.focus();
+        check('activeElement retargets to the host', () => document.activeElement === $('host') && root.activeElement === root.firstChild);
+        $('host').remove();
+        check('removing a host blurs', () => document.activeElement === document.body);
+        const order = [];
+        for (let n = 0; n < 4; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); }
+        check('tab order', () => order.join() === 'first,tab,link,first');
+        __appsDispatch('keydown', [], { key: 'Tab', shiftKey: true });
+        check('shift tab', () => document.activeElement.id === 'link');
+        "#,
+    );
+}
+
+#[test]
+fn every_dom_interface_has_its_string_tag() {
+    checked_page(
+        "<html><body><div id='d'>t</div></body></html>",
+        r#"
+        const tag = value => Object.prototype.toString.call(value);
+        const d = document.getElementById('d');
+        check('element', () => tag(d) === '[object HTMLDivElement]');
+        check('text', () => tag(d.firstChild) === '[object Text]');
+        check('document', () => tag(document) === '[object Document]');
+        check('window', () => tag(window) === '[object Window]');
+        check('collections', () => tag(d.childNodes) === '[object NodeList]' && tag(document.body.children) === '[object HTMLCollection]');
+        check('others', () => tag(document.createRange()) === '[object Range]' && tag(document.createDocumentFragment()) === '[object DocumentFragment]' && tag(new MouseEvent('x')) === '[object MouseEvent]' && tag(document.createElementNS('http://www.w3.org/2000/svg', 'svg')) === '[object SVGSVGElement]');
+        "#,
+    );
+}
+
+#[test]
+fn text_controls_commit_change_on_blur_and_enter_and_forms_submit() {
+    checked_page(
+        "<html><body><form id='f'><input id='i' name='q' value='start' required pattern='[a-z]+'><textarea id='t' name='t'>hello</textarea><input type='email' id='e' name='e'><button id='go'>Go</button><button id='clear' type='reset'>Reset</button></form><input id='other'></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), i = $('i'), t = $('t'), f = $('f');
+        check('textarea class', () => t instanceof HTMLTextAreaElement && !(t instanceof HTMLInputElement) && !(i instanceof HTMLTextAreaElement) && t.type === 'textarea');
+        i.value = 'abc';
+        check('value is not the attribute', () => i.getAttribute('value') === 'start' && i.defaultValue === 'start' && i.value === 'abc');
+        check('textarea default value', () => t.value === 'hello' && t.defaultValue === 'hello');
+        const changes = [];
+        i.addEventListener('change', e => changes.push('i:' + i.value + ':' + e.isTrusted));
+        t.addEventListener('change', () => changes.push('t:' + t.value));
+        i.focus(); __appsInput('x');
+        check('no change while editing', () => changes.length === 0);
+        $('other').focus();
+        check('change on blur', () => changes.join() === 'i:abcx:true');
+        $('other').focus(); t.focus(); t.setSelectionRange(5, 5); __appsInput('!'); t.blur();
+        check('textarea change on blur ' + changes, () => changes.at(-1) === 't:hello!');
+        const submits = [];
+        f.addEventListener('submit', e => { submits.push(e.submitter?.id ?? null); e.preventDefault(); });
+        i.focus(); i.value = 'abcy'; i._edited = true;
+        __appsDispatch('keydown', [], { key: 'Enter' });
+        check('enter commits and submits with the default button', () => changes.at(-1) === 'i:abcy:true' && submits.join() === 'go');
+        check('validity', () => i.validity.valid && i.willValidate && i.checkValidity());
+        i.value = 'ABC';
+        check('pattern', () => i.validity.patternMismatch && !i.checkValidity() && i.validationMessage !== '');
+        i.value = '';
+        check('required', () => i.validity.valueMissing && !f.checkValidity());
+        $('e').value = 'nope';
+        check('email', () => $('e').validity.typeMismatch);
+        i.setCustomValidity('custom');
+        check('custom validity', () => i.validity.customError && i.validationMessage === 'custom');
+        i.setCustomValidity(''); i.value = 'ok'; $('e').value = 'a@b.co';
+        let invalid = 0; i.addEventListener('invalid', () => invalid++);
+        submits.length = 0; f.requestSubmit();
+        check('requestSubmit fires submit', () => submits.join() === '' && submits.length === 1);
+        i.value = ''; submits.length = 0; f.requestSubmit();
+        check('invalid forms do not submit', () => submits.length === 0 && invalid === 1);
+        i.value = 'ok'; submits.length = 0; $('go').click();
+        check('button submits', () => submits.join() === 'go');
+        submits.length = 0; f.submit();
+        check('submit() skips the event', () => submits.length === 0);
+        $('clear').click();
+        check('reset button restores defaults', () => i.value === 'start' && t.value === 'hello' && $('e').value === '');
+        check('form data', () => { i.value = 'q1'; const data = new FormData(f); return data.get('q') === 'q1' && data.get('t') === 'hello' && !data.has('go'); });
+        "#,
+    );
+}
+
+#[test]
+fn load_events_and_ready_state_follow_the_page_lifecycle() {
+    let (_, engine) = checked_page(
+        "<html><body></body></html>",
+        r#"
+        globalThis.lifecycle = [document.readyState];
+        document.addEventListener('readystatechange', () => lifecycle.push(document.readyState));
+        document.addEventListener('DOMContentLoaded', e => lifecycle.push('DOMContentLoaded:' + e.isTrusted));
+        window.onload = () => lifecycle.push('load');
+        __appsLoaded();
+        check('interactive first', () => lifecycle.join() === 'loading,interactive,DOMContentLoaded:true');
+        "#,
+    );
+    for _ in 0..20 {
+        engine.tick().unwrap();
+    }
+    assert_eq!(
+        engine.eval("lifecycle.join()", "test").unwrap(),
+        "loading,interactive,DOMContentLoaded:true,complete,load"
+    );
+}
+
+#[test]
+fn offset_parent_follows_cssom_view() {
+    let (host, engine) = checked_page(
+        "<html><body><div id='rel' style='position:relative'><span id='in'>x</span><b id='fixed' style='position:fixed'>f</b><i id='gone' style='display:none'>g</i></div><table><tr><td><em id='cell'>c</em></td></tr></table></body></html>",
+        "",
+    );
+    {
+        let mut host = host.borrow_mut();
+        let host = &mut *host;
+        let doc = &host.pages[&1].doc;
+        let state = host.dom.entry(1).or_default();
+        for (name, rect) in [
+            ("rel", [10., 20., 100., 50.]),
+            ("in", [15., 30., 10., 10.]),
+            ("fixed", [0., 0., 5., 5.]),
+            ("cell", [3., 70., 5., 5.]),
+        ] {
+            let id = doc
+                .nodes
+                .iter()
+                .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
+                .unwrap();
+            state.bounds.insert(id, rect);
+        }
+    }
+    engine.eval(r#"
+        const fails = [];
+        const $ = id => document.getElementById(id);
+        if (document.body.offsetParent !== null || document.documentElement.offsetParent !== null) fails.push('root');
+        if ($('in').offsetParent !== $('rel') || $('in').offsetTop !== 10 || $('in').offsetLeft !== 5) fails.push('positioned');
+        if ($('fixed').offsetParent !== null) fails.push('fixed');
+        if (document.createElement('div').offsetParent !== null) fails.push('detached');
+        if ($('cell').offsetParent?.localName !== 'td') fails.push('cell');
+        let steps = 0; for (let node = $('in'); node; node = node.offsetParent) steps++;
+        if (steps !== 3) fails.push('loop ' + steps);
+        const removed = $('in'); removed.remove();
+        if (removed.getBoundingClientRect().width !== 0 || removed.getClientRects().length !== 0 || removed.offsetWidth !== 0) fails.push('removed');
+        if (fails.length) throw Error(fails.join());
+    "#, "test").unwrap();
+}
+
+fn css_page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse(html),
+            dirty: false,
+        },
+    );
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    (host, engine)
+}
+
+#[test]
+fn cssom_rule_lists_insert_delete_and_nest() {
+    let (_, engine) = css_page(
+        "<html><head><style id=s>.a{color:red} @media (min-width:1px){.b{color:blue}}</style><template><style>.t{}</style></template></head><body><p id=p class='a'>x</p><i id=i class=c>y</i></body></html>",
+    );
+    engine.eval(r#"
+        const style = document.getElementById('s'), sheet = style.sheet, p = document.getElementById('p'), i = document.getElementById('i');
+        if (sheet !== style.sheet || document.styleSheets.length !== 1 || document.styleSheets[0] !== sheet || sheet.ownerNode !== style) throw Error('styleSheets');
+        if (sheet.cssRules.length !== 2 || !(sheet.cssRules[0] instanceof CSSStyleRule) || sheet.cssRules[0].selectorText !== '.a' || sheet.cssRules[0].style.color !== 'red') throw Error('rules ' + sheet.cssRules.length);
+        const media = sheet.cssRules[1];
+        if (!(media instanceof CSSMediaRule) || media.conditionText !== '(width>=1px)' || media.cssRules[0].selectorText !== '.b' || media.cssRules[0].parentRule !== media) throw Error('media ' + media.conditionText);
+        if (sheet.insertRule('.c{color:green}', 2) !== 2 || getComputedStyle(i).color !== 'rgb(0, 128, 0)') throw Error('insertRule');
+        for (const [rule, name] of [['garbage', 'SyntaxError'], ['.e{} .f{}', 'SyntaxError']]) { let error; try { sheet.insertRule(rule); } catch (e) { error = e.name; } if (error !== name) throw Error(rule + ' ' + error); }
+        let index; try { sheet.insertRule('.g{}', 9); } catch (e) { index = e.name; } if (index !== 'IndexSizeError') throw Error('index');
+        sheet.cssRules[0].style.setProperty('color', 'orange');
+        if (getComputedStyle(p).color !== 'rgb(255, 165, 0)' || !sheet.cssRules[0].cssText.includes('color: orange')) throw Error('rule style ' + sheet.cssRules[0].cssText);
+        sheet.cssRules[0].selectorText = '.missing';
+        if (getComputedStyle(p).color === 'rgb(255, 165, 0)') throw Error('selectorText');
+        media.insertRule('.a{color:purple}', 1);
+        if (getComputedStyle(p).color !== 'rgb(128, 0, 128)' || media.cssRules.length !== 2) throw Error('nested insert');
+        sheet.deleteRule(0);
+        if (sheet.cssRules.length !== 2 || sheet.cssRules[0] !== media) throw Error('deleteRule');
+        if (style.textContent.includes('purple')) throw Error('CSSOM changed the text');
+        style.textContent = '.a{color:teal}';
+        if (sheet.cssRules.length !== 1 || getComputedStyle(p).color !== 'rgb(0, 128, 128)') throw Error('text reset');
+        const constructed = new CSSStyleSheet();
+        constructed.replaceSync('@media(x){.a{}} .b{}');
+        if (constructed.cssRules.length !== 2 || constructed.cssRules[0].cssRules.length !== 1) throw Error('replaceSync');
+        constructed.deleteRule(0);
+        if (constructed.cssRules.length !== 1 || constructed.cssRules[0].selectorText !== '.b') throw Error('constructed delete');
+        let allowed; try { sheet.replaceSync(''); } catch (e) { allowed = e.name; } if (allowed !== 'NotAllowedError') throw Error('replaceSync on owned sheet');
+        constructed.replaceSync('@keyframes k{from{opacity:0}to{opacity:1}} @font-face{font-family:x;src:url(a.ttf)} @layer a,b; @layer a{.z{}} @supports (display:grid){.y{}} @property --p{syntax:"<length>";inherits:false;initial-value:1px}');
+        const [keys, face, layers, layer, supports, property] = constructed.cssRules;
+        if (!(keys instanceof CSSKeyframesRule) || keys.name !== 'k' || keys.cssRules.length !== 2 || keys.findRule('to').style.opacity !== '1') throw Error('keyframes');
+        keys.appendRule('50%{opacity:.5}');
+        if (keys.cssRules.length !== 3) throw Error('appendRule');
+        if (!(face instanceof CSSFontFaceRule) || face.style.getPropertyValue('font-family') !== 'x') throw Error('font-face');
+        if (!(layers instanceof CSSLayerStatementRule) || layers.nameList.join() !== 'a,b' || !(layer instanceof CSSLayerBlockRule) || layer.name !== 'a') throw Error('layers');
+        if (!(supports instanceof CSSSupportsRule) || supports.conditionText !== '(display:grid)') throw Error('supports');
+        if (!(property instanceof CSSPropertyRule) || property.syntax !== '<length>' || property.inherits || property.initialValue !== '1px') throw Error('property');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn css_in_js_libraries_insert_rules_through_style_tags() {
+    let (_, engine) =
+        css_page("<html><head></head><body><div id=a>a</div><div id=b>b</div></body></html>");
+    engine.eval(r#"
+        const a = document.getElementById('a'), b = document.getElementById('b');
+        const emotion = { tags: [], ctr: 0, insert(rule) {
+            if (this.ctr % 65000 === 0) { const tag = document.createElement('style'); tag.setAttribute('data-emotion', 'css'); tag.appendChild(document.createTextNode('')); tag.setAttribute('data-s', ''); document.head.insertBefore(tag, this.tags.length ? this.tags.at(-1).nextSibling : null); this.tags.push(tag); }
+            const tag = this.tags.at(-1);
+            let sheet = tag.sheet; if (!sheet) for (let i = 0; i < document.styleSheets.length; i++) if (document.styleSheets[i].ownerNode === tag) sheet = document.styleSheets[i];
+            sheet.insertRule(rule, sheet.cssRules.length); this.ctr++;
+        } };
+        emotion.insert('.css-1{color:red}'); emotion.insert('.css-2{color:blue;padding:2px}');
+        a.className = 'css-1'; b.className = 'css-2';
+        if (getComputedStyle(a).color !== 'rgb(255, 0, 0)' || getComputedStyle(b).paddingTop !== '2px') throw Error('emotion ' + getComputedStyle(a).color);
+        class CSSOMTag {
+            constructor() { const style = document.createElement('style'); style.setAttribute('data-styled', 'active'); document.head.appendChild(style); this.element = style; style.appendChild(document.createTextNode('')); this.sheet = style.sheet; this.length = 0; }
+            insertRule(index, rule) { try { this.sheet.insertRule(rule, index); this.length++; return true; } catch { return false; } }
+            deleteRule(index) { this.sheet.deleteRule(index); this.length--; }
+            getRule(index) { const rule = this.sheet.cssRules[index]; return rule && rule.cssText ? rule.cssText : ''; }
+        }
+        const tag = new CSSOMTag();
+        if (!tag.insertRule(0, '.sc-b{color:green}') || !tag.insertRule(0, '.sc-a{color:purple}') || tag.insertRule(0, 'garbage')) throw Error('styled insert');
+        if (tag.getRule(1) !== '.sc-b { color: green; }' || tag.length !== 2) throw Error('getRule ' + tag.getRule(1));
+        b.className = 'sc-b';
+        if (getComputedStyle(b).color !== 'rgb(0, 128, 0)') throw Error('styled apply');
+        tag.deleteRule(1);
+        if (getComputedStyle(b).color === 'rgb(0, 128, 0)') throw Error('styled delete');
+        for (const tag of emotion.tags) tag.remove();
+        if (getComputedStyle(a).color === 'rgb(255, 0, 0)' || document.styleSheets.length !== 1) throw Error('flush');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn adopted_style_sheets_keep_order_and_stay_out_of_the_tree() {
+    let (_, engine) = css_page("<html><body><p id=p>p</p><x-card id=card></x-card></body></html>");
+    engine.eval(r#"
+        const base = new CSSStyleSheet(), override = new CSSStyleSheet();
+        base.replaceSync('span{color:red;padding:1px}'); override.replaceSync('span{color:blue}');
+        const root = document.getElementById('card').attachShadow({ mode: 'open' });
+        root.innerHTML = '<span>x</span>';
+        root.adoptedStyleSheets = [base, override];
+        const span = root.firstChild;
+        if (getComputedStyle(span).color !== 'rgb(0, 0, 255)' || getComputedStyle(span).paddingTop !== '1px') throw Error('Lit overrides ' + getComputedStyle(span).color);
+        if (root.childNodes.length !== 1 || root.innerHTML !== '<span>x</span>') throw Error('Adopted sheets in the tree');
+        root.innerHTML = '<span>y</span>';
+        if (getComputedStyle(root.firstChild).color !== 'rgb(0, 0, 255)') throw Error('innerHTML removed adopted sheets');
+        override.replaceSync('span{color:green}');
+        if (getComputedStyle(root.firstChild).color !== 'rgb(0, 128, 0)') throw Error('Live sheet update');
+        override.insertRule('span{color:orange}', 1);
+        if (getComputedStyle(root.firstChild).color !== 'rgb(255, 165, 0)') throw Error('Live insertRule');
+        const page = new CSSStyleSheet(); page.replaceSync('p{color:purple}');
+        document.adoptedStyleSheets.push(page);
+        if (getComputedStyle(document.getElementById('p')).color !== 'rgb(128, 0, 128)' || document.adoptedStyleSheets.length !== 1) throw Error('document push');
+        page.disabled = true;
+        if (getComputedStyle(document.getElementById('p')).color === 'rgb(128, 0, 128)') throw Error('disabled');
+        document.adoptedStyleSheets = [];
+        let error; try { document.adoptedStyleSheets = [document.createElement('style').sheet ?? {}]; } catch (e) { error = e.name; }
+        if (!error) throw Error('Adopted a non-constructed sheet');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn css_global_supports_escape_and_register_property() {
+    let (_, engine) = css_page(
+        "<html><head><style>.x{width:var(--w)}</style></head><body><div class=x id=x><p id=c></p></div></body></html>",
+    );
+    engine.eval(r#"
+        if (!CSS.supports('display', 'grid') || CSS.supports('width', 'bogus') || !CSS.supports('(filter: blur(1px)) and (not (display: nonsense))') || !CSS.supports('display: flex') || CSS.supports('hyphens', 'auto') || !CSS.supports('word-break', 'break-all')) throw Error('supports');
+        if (!CSS.supports('selector(:has(a))') || CSS.supports('selector(::nonsense(')) throw Error('selector()');
+        if (CSS.escape('1a b') !== '\\31 a\\ b' || CSS.escape('-') !== '\\-' || CSS.escape('a#b') !== 'a\\#b') throw Error('escape ' + CSS.escape('1a b'));
+        CSS.registerProperty({ name: '--w', syntax: '<length>', inherits: false, initialValue: '12px' });
+        const x = document.getElementById('x'), c = document.getElementById('c');
+        if (getComputedStyle(x).width !== '12px' && getComputedStyle(x).getPropertyValue('--w') !== '12px') throw Error('registered initial ' + getComputedStyle(x).getPropertyValue('--w'));
+        x.style.setProperty('--w', '20px');
+        if (getComputedStyle(c).getPropertyValue('--w') !== '12px' || getComputedStyle(x).getPropertyValue('--w') !== '20px') throw Error('inherits false');
+        let error; try { CSS.registerProperty({ name: '--w', syntax: '<length>', inherits: false, initialValue: '1px' }); } catch (e) { error = e.name; }
+        if (error !== 'InvalidModificationError') throw Error('re-register ' + error);
+        try { CSS.registerProperty({ name: '--bad', syntax: '<length>', inherits: false, initialValue: 'red' }); error = ''; } catch (e) { error = e.name; }
+        if (error !== 'SyntaxError') throw Error('bad initial');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
+    let (host, engine) = css_page(
+        "<html><head><style>:root{font-size:16px} #a{padding:calc(0.25rem * 2) 1em;margin:5%;color:#ff000080;border:2px solid;animation:fade 2s ease-in 1s infinite;line-height:1.5;opacity:50%;box-sizing:border-box;width:100px;height:40px} #a::before{content:'x';font-weight:700} #h{display:none}</style></head><body><div id=a>a</div><span id=s>s</span><div id=h></div></body></html>",
+    );
+    {
+        let mut host = host.borrow_mut();
+        let state = host.dom.entry(1).or_default();
+        let ids: Vec<usize> = (0..64).collect();
+        state
+            .bounds
+            .extend(ids.into_iter().map(|id| (id, [0., 0., 200., 100.])));
+    }
+    engine.eval(r#"
+        const a = document.getElementById('a'), s = getComputedStyle(a), span = getComputedStyle(document.getElementById('s'));
+        const expect = (style, name, value) => { if (style[name] !== value) throw Error(name + ': ' + style[name] + ' != ' + value); };
+        expect(s, 'paddingTop', '8px'); expect(s, 'paddingLeft', '16px'); expect(s, 'marginTop', '10px');
+        expect(s, 'color', 'rgba(255, 0, 0, 0.5)'); expect(s, 'borderTopColor', 'rgba(255, 0, 0, 0.5)'); expect(s, 'borderTopWidth', '2px');
+        expect(s, 'animationName', 'fade'); expect(s, 'animationDuration', '2s'); expect(s, 'animationDelay', '1s'); expect(s, 'animationIterationCount', 'infinite'); expect(s, 'animationTimingFunction', 'ease-in');
+        expect(s, 'lineHeight', '24px'); expect(s, 'opacity', '0.5'); expect(s, 'boxSizing', 'border-box'); expect(s, 'width', '200px');
+        expect(s, 'padding', '8px 16px'); expect(s, 'position', 'static'); expect(s, 'zIndex', 'auto'); expect(s, 'transform', 'none'); expect(s, 'fontWeight', '400');
+        expect(span, 'display', 'inline'); expect(span, 'boxSizing', 'content-box'); expect(span, 'borderTopWidth', '0px'); expect(span, 'backgroundColor', 'rgba(0, 0, 0, 0)'); expect(span, 'color', 'rgb(0, 0, 0)');
+        if (parseFloat(s.marginTop) !== 10) throw Error('parseFloat');
+        const before = getComputedStyle(a, '::before');
+        expect(before, 'content', "'x'"); expect(before, 'fontWeight', '700'); expect(before, 'color', 'rgba(255, 0, 0, 0.5)');
+        if (getComputedStyle(a, '::after').content !== '') throw Error('missing ::after');
+        a.style.transform = 'translate(10px, 5px)';
+        expect(getComputedStyle(a), 'transform', 'matrix(1, 0, 0, 1, 10, 5)');
+        expect(getComputedStyle(document.getElementById('h')), 'display', 'none');
+        if (!s.length || !s.item(0)) throw Error('length');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn custom_element_reactions_and_slot_changes() {
+    let (_, engine) = checked_page(
+        "<html><body><div id='box'></div><div id='host'><span>a</span></div></body></html>",
+        r#"
+        globalThis.log = [];
+        customElements.define('x-item', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); } disconnectedCallback() { log.push('out:' + this.id); } });
+        customElements.define('x-mover', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); } connectedMoveCallback() { log.push('move:' + this.id); } });
+        const box = document.getElementById('box');
+        box.innerHTML = '<x-item id="a"></x-item>';
+        box.innerHTML = '';
+        check('innerHTML disconnects', () => log.join() === 'in:a,out:a');
+        log.length = 0; box.innerHTML = '<x-item id="b"></x-item>'; box.textContent = 'x';
+        check('textContent disconnects', () => log.join() === 'in:b,out:b');
+        log.length = 0; box.innerHTML = '<x-item id="c"></x-item>'; box.replaceChildren();
+        check('replaceChildren disconnects', () => log.join() === 'in:c,out:c');
+        log.length = 0; box.innerHTML = '<x-item id="d"></x-item><p></p>'; box.lastChild.append(box.firstChild);
+        check('move disconnects then connects', () => log.join() === 'in:d,out:d,in:d');
+        log.length = 0; const mover = document.createElement('x-mover'); mover.id = 'm'; box.append(mover); box.moveBefore(mover, box.firstChild);
+        check('moveBefore', () => log.join() === 'in:m,move:m' && box.firstChild === mover);
+        const host = document.getElementById('host'), root = host.attachShadow({ mode: 'open' });
+        root.innerHTML = '<slot id="main"></slot><slot name="side" id="side"></slot>';
+        globalThis.slots = [];
+        for (const slot of root.querySelectorAll('slot')) slot.addEventListener('slotchange', () => slots.push(slot.id));
+        host.append(document.createElement('i'), document.createElement('i'));
+        const side = document.createElement('b'); side.slot = 'side'; host.append(side);
+        check('slotchange is async', () => slots.length === 0);
+        "#,
+    );
+    engine.tick().unwrap();
+    assert_eq!(engine.eval("slots.join()", "test").unwrap(), "main,side");
+    engine
+        .eval(
+            "slots.length = 0; document.querySelector('#host b').slot = ''",
+            "test",
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.eval("slots.sort().join()", "test").unwrap(),
+        "main,side"
+    );
+}
+
+#[test]
+fn invalid_selectors_throw_and_html_names_ignore_case() {
+    checked_page(
+        "<html><body><ul><li data-v='1'>x</li></ul><svg><linearGradient id='g'></linearGradient><rect id='r'></rect></svg></body></html>",
+        r#"
+        for (const bad of ['div[', 'li,', 'li >', ':foo', '::foo', ':has(:has(a))']) check('throws ' + bad, () => { try { document.querySelector(bad); return false; } catch (e) { return e instanceof DOMException && e.name === 'SyntaxError'; } });
+        check('matches throws', () => { try { document.body.matches('['); return false; } catch (e) { return e.name === 'SyntaxError'; } });
+        check('closest throws', () => { try { document.querySelector('li').closest(':foo'); return false; } catch (e) { return e.name === 'SyntaxError'; } });
+        check('type case', () => document.querySelectorAll('LI').length === 1 && document.getElementsByTagName('LI').length === 1 && document.getElementsByTagName('*').length > 5);
+        check('attribute case', () => document.querySelector('[DATA-V]') !== null);
+        check('svg case', () => document.querySelector('linearGradient')?.id === 'g' && document.querySelector('lineargradient') === null && document.getElementsByTagName('linearGradient').length === 1);
+        check('namespaces', () => document.querySelector('*|rect')?.id === 'r' && document.querySelector('|rect') === null);
+        "#,
+    );
+}
+
+#[test]
+fn contenteditable_typing_edits_text_nodes_and_splits_paragraphs() {
+    checked_page(
+        "<html><body><div id='e' contenteditable='true'>ab</div></body></html>",
+        r#"
+        const e = document.getElementById('e'), text = e.firstChild;
+        e.focus(); getSelection().collapse(text, 2);
+        const types = [];
+        e.addEventListener('beforeinput', ev => types.push('before:' + ev.inputType));
+        e.addEventListener('input', ev => types.push(ev.inputType));
+        __appsInput('c');
+        check('typing extends the text node', () => e.firstChild === text && text.data === 'abc' && e.childNodes.length === 1 && getSelection().focusNode === text && getSelection().focusOffset === 3);
+        __appsDispatch('keydown', [], { key: 'Enter' });
+        check('enter adds a div line', () => e.innerHTML === 'abc<div><br></div>' && types.includes('insertParagraph'));
+        __appsInput('d');
+        check('typing fills the new line', () => e.innerHTML === 'abc<div>d</div>');
+        getSelection().collapse(text, 1);
+        __appsDispatch('keydown', [], { key: 'Enter' });
+        check('enter splits text ' + e.innerHTML, () => e.innerHTML === 'a<div>bc</div><div>d</div>');
+        "#,
+    );
+}
+
+#[test]
+fn mutation_records_and_live_ranges_follow_the_dom_standard() {
+    let (_, engine) = checked_page(
+        "<html><body><div id='p'><i id='a'>a</i><b id='b'>b</b><span id='t'>hello</span></div></body></html>",
+        r#"
+        const p = document.getElementById('p'), a = document.getElementById('a'), b = document.getElementById('b');
+        check('observe needs a kind', () => { try { new MutationObserver(() => {}).observe(p, {}); return false; } catch (e) { return e instanceof TypeError; } });
+        const observer = new MutationObserver(() => {});
+        observer.observe(p, { childList: true });
+        p.insertBefore(b, a);
+        const moved = observer.takeRecords();
+        check('move gives removal then insertion', () => moved.length === 2 && moved[0].removedNodes[0] === b && moved[0].previousSibling === a && moved[1].addedNodes[0] === b && moved[1].previousSibling === null && moved[1].nextSibling === a);
+        const fragment = document.createDocumentFragment(); fragment.append(document.createElement('u'), document.createElement('s'));
+        p.append(fragment);
+        const inserted = observer.takeRecords();
+        check('fragment insert is one record', () => inserted.length === 1 && inserted[0].addedNodes.length === 2);
+        observer.disconnect();
+        const text = document.getElementById('t').firstChild, range = document.createRange();
+        range.setStart(text, 4); range.setEnd(text, 5);
+        text.data = 'hi';
+        check('data change clamps', () => range.startOffset === 0 && range.endOffset === 0 && range.startContainer === text);
+        text.data = 'hello'; range.setStart(text, 1); range.setEnd(text, 4);
+        text.insertData(0, 'xx');
+        check('insertData shifts', () => range.startOffset === 3 && range.endOffset === 6);
+        const tail = text.splitText(4);
+        check('splitText moves the end', () => range.startContainer === text && range.startOffset === 3 && range.endContainer === tail && range.endOffset === 2);
+        const parentRange = document.createRange(); parentRange.setStart(p, 2); parentRange.setEnd(p, 3);
+        p.insertBefore(document.createElement('hr'), p.firstChild);
+        check('insert shifts parent offsets', () => parentRange.startOffset === 3 && parentRange.endOffset === 4);
+        p.firstChild.remove();
+        check('remove shifts back', () => parentRange.startOffset === 2 && parentRange.endOffset === 3);
+        const inner = document.createRange(); inner.selectNodeContents(a); a.remove();
+        check('removed container moves to the parent', () => inner.startContainer === p && inner.endContainer === p);
+        "#,
+    );
+    engine.tick().unwrap();
+}
+
+#[test]
+fn inner_text_client_box_urls_dialog_and_details() {
+    let (host, engine) = checked_page(
+        "<html><head><base href='apps://app/sub/'></head><body><div id='t'>a  b<br>c<p>para</p><span style='display:none'>hidden</span>end</div><div id='box' style='border:3px solid;padding:5px'></div><a id='a' href='x.html#h'>x</a><img id='i' src='img.png'><dialog id='d'><form method='dialog'><button id='ok' value='yes'>ok</button></form></dialog><details id='det'><summary id='sum'>s</summary>body</details></body></html>",
+        r#"
+        check('innerText', () => document.getElementById('t').innerText === 'a b\nc\n\npara\n\nend');
+        const t = document.getElementById('t'); t.innerText = 'x\ny';
+        check('innerText setter', () => t.innerHTML === 'x<br>y');
+        check('absolute urls', () => document.getElementById('a').href === 'apps://app/sub/x.html#h' && document.getElementById('a').hash === '#h' && document.getElementById('i').src === 'apps://app/sub/img.png' && document.getElementById('a').getAttribute('href') === 'x.html#h');
+        const d = document.getElementById('d'), events = [];
+        d.addEventListener('close', () => events.push('close:' + d.returnValue));
+        d.addEventListener('cancel', () => events.push('cancel'));
+        d.showModal();
+        check('modal open', () => d.open && document.querySelector('dialog:modal') === d && document.activeElement === document.getElementById('ok'));
+        __appsDispatch('keydown', [], { key: 'Escape' });
+        check('escape cancels', () => !d.open && events.join() === 'cancel');
+        d.show(); document.getElementById('ok').click();
+        check('form method=dialog closes', () => !d.open && d.returnValue === 'yes');
+        globalThis.dialogEvents = events;
+        const det = document.getElementById('det'), toggles = [];
+        det.addEventListener('toggle', e => toggles.push(e.newState));
+        globalThis.toggles = toggles;
+        document.getElementById('sum').click();
+        check('summary opens details', () => det.open && det.hasAttribute('open'));
+        "#,
+    );
+    let id = {
+        let mut host = host.borrow_mut();
+        let host = &mut *host;
+        let doc = &host.pages[&1].doc;
+        let id = doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").map(String::as_str) == Some("box"))
+            .unwrap();
+        host.dom
+            .entry(1)
+            .or_default()
+            .bounds
+            .insert(id, [0., 0., 116., 40.]);
+        id
+    };
+    let _ = id;
+    for _ in 0..10 {
+        engine.tick().unwrap();
+    }
+    engine.eval(r#"
+        const box = document.getElementById('box');
+        if (box.clientWidth !== 110 || box.clientHeight !== 34 || box.clientLeft !== 3 || box.offsetWidth !== 116) throw Error('client box ' + [box.clientWidth, box.clientHeight, box.clientLeft]);
+        if (dialogEvents.join() !== 'cancel,close:yes,close:yes') throw Error('dialog events ' + dialogEvents.join());
+        if (toggles.join() !== 'open') throw Error('toggle ' + toggles.join());
+    "#, "test").unwrap();
+}
+
+#[test]
+fn inline_style_declarations_validate_expand_and_serialize() {
+    let (_, engine) = css_page("<html><body><div id=a></div></body></html>");
+    engine.eval(r#"
+        const a = document.getElementById('a'), style = a.style;
+        style.width = '10px'; style.width = 'bogus';
+        if (style.width !== '10px') throw Error('invalid value replaced ' + style.width);
+        style.margin = '1px 2px';
+        if (style.marginTop !== '1px' || style.marginLeft !== '2px' || style.margin !== '1px 2px' || style.getPropertyValue('margin') !== '1px 2px') throw Error('margin ' + style.margin);
+        if (style.cssText !== 'width: 10px; margin: 1px 2px;') throw Error('cssText ' + style.cssText);
+        style.marginTop = '3px';
+        if (style.margin !== '3px 2px 1px') throw Error('margin longhand ' + style.margin);
+        if (!('transform' in style) || !('webkitLineClamp' in style) || 'nonsense' in style) throw Error('has');
+        if (!Object.keys(style).includes('marginTop') || !Object.keys(style).includes('margin-top')) throw Error('keys');
+        style.setProperty('color', 'red', 'important');
+        if (style.getPropertyPriority('color') !== 'important' || !a.getAttribute('style').includes('color: red !important')) throw Error('priority ' + a.getAttribute('style'));
+        style.webkitLineClamp = '2';
+        if (style.getPropertyValue('-webkit-line-clamp') !== '2' || style.WebkitLineClamp !== '2') throw Error('vendor ' + a.getAttribute('style'));
+        style.removeProperty('margin');
+        if (style.marginTop || style.margin) throw Error('removeProperty');
+        style.cssText = 'border: 1px solid red; --x: 1';
+        if (style.borderTopColor !== 'red' || style.border !== '1px solid red' || style.getPropertyValue('--x') !== '1') throw Error('border ' + style.cssText);
+        a.style = 'padding: 4px';
+        if (style.paddingRight !== '4px' || style.length !== 4) throw Error('assign');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn focus_visible_follows_the_input_modality() {
+    let (_, engine) = css_page(
+        "<html><head><style>:focus-visible{color:red}</style></head><body><button id=b>b</button><input id=i><button id=c>c</button></body></html>",
+    );
+    engine.eval(r#"
+        const b = document.getElementById('b'), i = document.getElementById('i'), c = document.getElementById('c');
+        const down = node => __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
+        const up = node => __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
+        b.focus();
+        if (!b.matches(':focus-visible') || getComputedStyle(b).color !== 'rgb(255, 0, 0)') throw Error('Script focus before any input');
+        down(c); up(c);
+        if (document.activeElement !== c || c.matches(':focus-visible') || !c.matches(':focus') || getComputedStyle(c).color === 'rgb(255, 0, 0)') throw Error('Mouse focus on a button');
+        b.focus();
+        if (b.matches(':focus-visible')) throw Error('Script focus after a click');
+        down(i); up(i);
+        if (!i.matches(':focus-visible')) throw Error('Text inputs always show focus');
+        down(c); up(c);
+        __appsDispatch('keydown', [], { key: 'a', code: 'KeyA' });
+        if (!c.matches(':focus-visible')) throw Error('A key shows the focus');
+        b.focus();
+        if (!b.matches(':focus-visible') || c.matches(':focus-visible')) throw Error('Script focus after a key');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn slotted_and_part_rules_cross_the_shadow_boundary() {
+    let (_, engine) = css_page(
+        "<html><head><style>#host::part(label){color:blue}#host::part(other){color:purple}#host::part(deep){color:orange}#b{font-weight:300}</style></head><body><div id=host></div></body></html>",
+    );
+    engine.eval(r#"
+        const host = document.getElementById('host'), root = host.attachShadow({ mode: 'open' });
+        root.innerHTML = '<style>::slotted(span){color:red}::slotted(.b){font-weight:700}slot[name=x]::slotted(*){padding-top:3px}.lbl{color:green}</style><slot></slot><slot name=x></slot><p part="label" class=lbl id=p>p</p><i part=other id=i>i</i><div id=inner exportparts="core: deep"></div>';
+        const inner = root.getElementById('inner').attachShadow({ mode: 'open' });
+        inner.innerHTML = '<b part=core id=core>c</b><u part=label id=u>u</u>';
+        host.innerHTML = '<span id=s>s</span><b class=b id=b>b</b><em slot=x id=e>e</em>';
+        const style = (node, name) => getComputedStyle(node)[name];
+        if (style(document.getElementById('s'), 'color') !== 'rgb(255, 0, 0)') throw Error('::slotted ' + style(document.getElementById('s'), 'color'));
+        if (style(document.getElementById('b'), 'fontWeight') !== '300') throw Error('outer rules beat ::slotted');
+        if (style(document.getElementById('e'), 'paddingTop') !== '3px') throw Error('slot selector');
+        if (style(root.getElementById('p'), 'color') !== 'rgb(0, 0, 255)') throw Error('::part ' + style(root.getElementById('p'), 'color'));
+        if (style(root.getElementById('i'), 'color') !== 'rgb(128, 0, 128)') throw Error('::part other');
+        if (style(inner.getElementById('core'), 'color') !== 'rgb(255, 165, 0)') throw Error('exportparts ' + style(inner.getElementById('core'), 'color'));
+        if (style(inner.getElementById('u'), 'color') === 'rgb(0, 0, 255)') throw Error('unexported part');
     "#, "test").unwrap();
 }

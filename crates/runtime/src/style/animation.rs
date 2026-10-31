@@ -1,6 +1,6 @@
 use super::{
-    ComputedStyles, Declarations, Prop, Style, color, components, expand, resolve_keywords,
-    resolve_style,
+    ComputedStyles, Declarations, Prop, Registry, Style, color, components, expand,
+    resolve_keywords, resolve_style,
 };
 use crate::dom::Document;
 use std::{
@@ -54,6 +54,7 @@ impl Animation {
     pub fn parse(
         style: &Style,
         keyframes: &HashMap<String, Vec<(f32, Declarations)>>,
+        registry: &Registry,
     ) -> Vec<Self> {
         let shorthand = components(style.get(Prop::ANIMATION).unwrap_or("none"), ',');
         if shorthand.is_empty() {
@@ -124,19 +125,26 @@ impl Animation {
                         .map(str::to_owned)
                         .unwrap_or_default();
                     let mut frame = style.clone();
+                    let mut custom = Vec::new();
                     frame.extend(
                         declarations
                             .iter()
                             .filter(|(_, value)| !value.ends_with("!important"))
-                            .map(|(key, value)| (key, value.clone())),
+                            .filter_map(|(key, value)| {
+                                if key.is_custom() {
+                                    custom.push((key, value.clone()));
+                                    return None;
+                                }
+                                Some((key, value.clone()))
+                            }),
                     );
-                    resolve_style(&mut frame, Some(style));
+                    resolve_style(&mut frame, Some(style), &custom, registry);
                     resolve_keywords(&mut frame, Some(style));
                     for (key, value) in declarations.iter() {
-                        if value.ends_with("!important") || !animatable(key) {
+                        if value.ends_with("!important") || !animatable(key, registry) {
                             continue;
                         }
-                        let Some(value) = computed(&frame, key) else {
+                        let Some(value) = computed(&frame, key, registry) else {
                             continue;
                         };
                         let frame = (f64::from(*offset), value.to_owned(), timing.clone());
@@ -178,7 +186,13 @@ impl Animation {
     /// Writes the animated values into `out`. Returns the seconds until the values can change
     /// next (0 while they change continuously, `None` when they never change), and whether the
     /// animation has ended.
-    pub fn sample(&self, elapsed: f64, base: &Style, out: &mut Style) -> (Option<f64>, bool) {
+    pub fn sample(
+        &self,
+        elapsed: f64,
+        base: &Style,
+        registry: &Registry,
+        out: &mut Style,
+    ) -> (Option<f64>, bool) {
         let time = elapsed - self.delay;
         let end = if self.duration == 0. {
             0.
@@ -224,7 +238,7 @@ impl Animation {
                 .iter()
                 .map(|(at, value, timing)| (*at, value.as_str(), timing.as_str()))
                 .collect();
-            if let Some(value) = computed(base, *property) {
+            if let Some(value) = computed(base, *property, registry) {
                 if keys[0].0 > 0. {
                     keys.insert(0, (0., value, ""));
                 }
@@ -288,6 +302,9 @@ struct Clock {
     elapsed: std::time::Duration,
     last: Instant,
     ended: bool,
+    started: bool,
+    iteration: f64,
+    delay: f64,
 }
 
 #[derive(Clone)]
@@ -301,6 +318,7 @@ struct Transition {
     timing: String,
     reverse: String,
     shortening: f64,
+    started: bool,
 }
 
 impl Transition {
@@ -317,6 +335,7 @@ pub(crate) struct Motion {
     transitions: HashMap<usize, Vec<Transition>>,
     /// The last animated style of each node, with its base style and animated values.
     styled: HashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
+    pub custom: HashMap<usize, Style>,
     /// The timer that wakes the view for the next animation change.
     pub wake: Option<(Instant, renderer::Timer)>,
 }
@@ -339,6 +358,7 @@ impl Motion {
         repass: bool,
         events: &mut Vec<(usize, &'static str, String, f64)>,
     ) -> (Animated, Option<Instant>) {
+        let registry = &*styles.registry;
         self.previous
             .resize_with(styles.values.len(), Default::default);
         for (id, new) in styles.values.iter().enumerate() {
@@ -351,11 +371,40 @@ impl Motion {
                 continue;
             }
             let running = self.transitions.remove(&id).unwrap_or_default();
+            let cancel =
+                |kept: &[Transition], events: &mut Vec<(usize, &'static str, String, f64)>| {
+                    for transition in &running {
+                        if !kept.iter().any(|next| {
+                            next.property == transition.property && next.start == transition.start
+                        }) {
+                            let time = now
+                                .saturating_duration_since(transition.start)
+                                .as_secs_f64()
+                                - transition.delay;
+                            events.push((
+                                id,
+                                "transitioncancel",
+                                transition.property.name().to_owned(),
+                                time.clamp(0., transition.duration),
+                            ));
+                        }
+                    }
+                };
+            let old = match styles.starting.get(&id) {
+                Some(starting)
+                    if old.is_empty()
+                        || old.get(Prop::DISPLAY).is_some_and(|value| value == "none") =>
+                {
+                    starting.clone()
+                }
+                _ => old,
+            };
             if old.is_empty()
                 || !visible.get(id).copied().unwrap_or(false)
                 || old.get(Prop::DISPLAY).is_some_and(|value| value == "none")
                 || !new.contains(Prop::TRANSITION) && !new.contains(Prop::TRANSITION_PROPERTY)
             {
+                cancel(&[], events);
                 continue;
             }
             let mut properties: Vec<(Prop, f64, f64, String)> = Vec::new();
@@ -366,7 +415,7 @@ impl Motion {
                         .iter()
                         .chain(new.iter())
                         .map(|(key, _)| key)
-                        .filter(|&key| animatable(key) && old.get(key) != new.get(key))
+                        .filter(|&key| animatable(key, registry) && old.get(key) != new.get(key))
                         .chain(running.iter().map(|transition| transition.property))
                         .collect(),
                     _ => {
@@ -387,9 +436,12 @@ impl Motion {
             }
             let mut next = Vec::new();
             for (property, duration, delay, timing) in properties {
-                let Some(after) = computed(new, property) else {
+                let Some(after) = computed(new, property, registry) else {
                     continue;
                 };
+                if property.is_custom() && !animatable(property, registry) {
+                    continue;
+                }
                 if duration.max(0.) + delay <= 0. {
                     continue;
                 }
@@ -416,7 +468,7 @@ impl Motion {
                             (current.clone(), current, 1.)
                         }
                     }
-                    None => match computed(&old, property) {
+                    None => match computed(&old, property, registry) {
                         Some(before) => (before.to_owned(), before.to_owned(), 1.),
                         None => continue,
                     },
@@ -434,16 +486,59 @@ impl Motion {
                     timing,
                     reverse,
                     shortening: factor,
+                    started: false,
                 });
+                let delay = next.last().map_or(0., |transition| transition.delay);
+                events.push((
+                    id,
+                    "transitionrun",
+                    property.name().to_owned(),
+                    (-delay).max(0.),
+                ));
             }
+            cancel(&next, events);
             if !next.is_empty() {
                 self.transitions.insert(id, next);
             }
         }
-        self.clocks
-            .retain(|&id, _| visible.get(id) == Some(&true) && styles.animations.contains_key(&id));
-        self.transitions
-            .retain(|&id, _| visible.get(id) == Some(&true));
+        let cancel =
+            |id: usize, clock: &Clock, events: &mut Vec<(usize, &'static str, String, f64)>| {
+                if clock.started && !clock.ended {
+                    events.push((
+                        id,
+                        "animationcancel",
+                        clock.name.clone(),
+                        (clock.elapsed.as_secs_f64() - clock.delay).max(0.),
+                    ));
+                }
+            };
+        self.clocks.retain(|&id, clocks| {
+            let kept = visible.get(id) == Some(&true) && styles.animations.contains_key(&id);
+            if !kept {
+                for clock in clocks.iter() {
+                    cancel(id, clock, events);
+                }
+            }
+            kept
+        });
+        self.transitions.retain(|&id, list| {
+            let kept = visible.get(id) == Some(&true);
+            if !kept {
+                for transition in list.iter() {
+                    let time = now
+                        .saturating_duration_since(transition.start)
+                        .as_secs_f64()
+                        - transition.delay;
+                    events.push((
+                        id,
+                        "transitioncancel",
+                        transition.property.name().to_owned(),
+                        time.clamp(0., transition.duration),
+                    ));
+                }
+            }
+            kept
+        });
         let mut animated: HashMap<usize, Style> = HashMap::new();
         let mut wakes: Vec<(usize, bool, f64, f64)> = Vec::new();
         for (&id, effects) in &styles.animations {
@@ -451,6 +546,9 @@ impl Motion {
                 continue;
             }
             let clocks = self.clocks.entry(id).or_default();
+            for clock in clocks.iter().skip(effects.len()) {
+                cancel(id, clock, events);
+            }
             clocks.truncate(effects.len());
             let out = animated.entry(id).or_default();
             for (index, effect) in effects.iter().enumerate() {
@@ -463,10 +561,14 @@ impl Motion {
                         elapsed: Default::default(),
                         last: now,
                         ended: false,
+                        started: false,
+                        iteration: 0.,
+                        delay: effect.delay,
                     };
                     if index == clocks.len() {
                         clocks.push(clock);
                     } else {
+                        cancel(id, &clocks[index], events);
                         clocks[index] = clock;
                     }
                 }
@@ -476,7 +578,29 @@ impl Motion {
                 }
                 clock.last = now;
                 let elapsed = clock.elapsed.as_secs_f64();
-                let (wake, ended) = effect.sample(elapsed, &styles.values[id], out);
+                let (wake, ended) = effect.sample(elapsed, &styles.values[id], registry, out);
+                let active = elapsed - effect.delay;
+                if !clock.started && active >= 0. {
+                    clock.started = true;
+                    events.push((
+                        id,
+                        "animationstart",
+                        effect.name.clone(),
+                        (-effect.delay).max(0.),
+                    ));
+                }
+                if clock.started && effect.duration > 0. && !ended {
+                    let iteration = (active / effect.duration).floor().max(0.);
+                    if iteration > clock.iteration {
+                        events.push((
+                            id,
+                            "animationiteration",
+                            effect.name.clone(),
+                            iteration * effect.duration,
+                        ));
+                    }
+                    clock.iteration = iteration;
+                }
                 if ended && !clock.ended {
                     events.push((
                         id,
@@ -511,8 +635,22 @@ impl Motion {
         }
         for (&id, list) in &mut self.transitions {
             let out = animated.entry(id).or_default();
-            list.retain(|transition| match transition.progress(now) {
+            list.retain_mut(|transition| match transition.progress(now) {
                 Some(progress) => {
+                    if !transition.started
+                        && now
+                            .saturating_duration_since(transition.start)
+                            .as_secs_f64()
+                            >= transition.delay
+                    {
+                        transition.started = true;
+                        events.push((
+                            id,
+                            "transitionstart",
+                            transition.property.name().to_owned(),
+                            (-transition.delay).max(0.),
+                        ));
+                    }
                     if let Some(value) = interpolate(
                         transition.property.name(),
                         &transition.from,
@@ -546,6 +684,10 @@ impl Motion {
         }
         self.transitions.retain(|_, list| !list.is_empty());
         animated.retain(|_, values| !values.is_empty());
+        self.custom.clear();
+        if animated.values().any(|values| !values.vars().is_empty()) {
+            self.custom.clone_from(&animated);
+        }
         let mut inherited = Vec::new();
         for (&id, values) in &animated {
             for (key, value) in values.iter() {
@@ -651,10 +793,25 @@ impl Motion {
     }
 }
 
-fn animatable(prop: Prop) -> bool {
+fn animatable(prop: Prop, registry: &Registry) -> bool {
     let key = prop.name();
-    !prop.is_custom()
-        && !key.starts_with("animation")
+    if prop.is_custom() {
+        return registry.get(&prop).is_some_and(|(syntax, ..)| {
+            syntax.split('|').all(|kind| {
+                matches!(
+                    kind.trim().trim_end_matches(['+', '#']),
+                    "<length>"
+                        | "<number>"
+                        | "<percentage>"
+                        | "<length-percentage>"
+                        | "<color>"
+                        | "<angle>"
+                        | "<time>"
+                )
+            })
+        });
+    }
+    !key.starts_with("animation")
         && !key.starts_with("transition")
         && !key.starts_with("container")
         && !matches!(
@@ -663,8 +820,13 @@ fn animatable(prop: Prop) -> bool {
         )
 }
 
-fn computed(style: &Style, prop: Prop) -> Option<&str> {
+fn computed<'a>(style: &'a Style, prop: Prop, registry: &'a Registry) -> Option<&'a str> {
     let key = prop.name();
+    if prop.is_custom() {
+        return style
+            .get(prop)
+            .or_else(|| registry.get(&prop)?.2.as_deref());
+    }
     style.get(prop).or(match key {
         "opacity" | "flex-shrink" => Some("1"),
         "flex-grow" => Some("0"),
@@ -1068,7 +1230,7 @@ mod tests {
         let base = styles.values[id].clone();
         let sample = |effect: &Animation, elapsed: f64| {
             let mut out = Style::new();
-            let (wake, _) = effect.sample(elapsed, &base, &mut out);
+            let (wake, _) = effect.sample(elapsed, &base, &Default::default(), &mut out);
             (
                 out.get(Prop::OPACITY)
                     .map(|value| value.parse::<f64>().unwrap()),
@@ -1106,15 +1268,15 @@ mod tests {
         let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
         let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let mut out = Style::new();
-        styles.animations[&div][0].sample(1., &styles.values[div], &mut out);
+        styles.animations[&div][0].sample(1., &styles.values[div], &Default::default(), &mut out);
         assert_eq!(&out["transform"], "translateX(50px) rotate(45deg)");
         assert_eq!(&out["background-color"], "#800080ff");
         assert_eq!(&out["width"], "50%");
         out = Style::new();
-        styles.animations[&div][0].sample(0.5, &styles.values[div], &mut out);
+        styles.animations[&div][0].sample(0.5, &styles.values[div], &Default::default(), &mut out);
         assert_eq!(&out["width"], "calc(10px * 0.5 + 50% * 0.5)");
         out = Style::new();
-        styles.animations[&p][0].sample(0.25, &styles.values[p], &mut out);
+        styles.animations[&p][0].sample(0.25, &styles.values[p], &Default::default(), &mut out);
         assert_eq!(&out["transform"], "rotate(90deg)");
     }
 
@@ -1210,6 +1372,169 @@ mod tests {
         motion.forget(id);
         let (values, ..) = update(&mut motion, &doc, &off, 1.);
         assert!(!values.contains_key(&id));
+    }
+
+    #[test]
+    fn registered_custom_properties_animate_and_transition() {
+        let mut doc = Document::parse(
+            "<style>@property --w{syntax:'<length>';inherits:true;initial-value:0px}@property --c{syntax:'<color>';inherits:false;initial-value:red}@keyframes grow{to{--w:100px}}div{animation:grow 1s linear;width:var(--w)}span{display:block;width:var(--w)}p{--c:blue;--u:1px;transition:--c 1s linear,--u 1s;color:var(--c)}p.on{--c:lime;--u:9px}</style><div><span></span></div><p>x</p>",
+        );
+        let find =
+            |doc: &Document, tag: &str| doc.nodes.iter().position(|node| node.tag == tag).unwrap();
+        let (div, span, p) = (find(&doc, "div"), find(&doc, "span"), find(&doc, "p"));
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let styles = computed_styles(&doc);
+        motion.update(&doc, &styles, &visible, start, false, &mut Vec::new());
+        let at = start + Duration::from_millis(500);
+        motion.update(&doc, &styles, &visible, at, false, &mut Vec::new());
+        assert_eq!(motion.custom[&div].get(Prop::new("--w")), Some("50px"));
+        let restyle = |doc: &Document, animated: HashMap<usize, Style>| {
+            super::super::compute_styles(
+                doc,
+                800.,
+                600.,
+                None,
+                &mut HashMap::new(),
+                &mut super::super::StyleCache::default(),
+                Some(&super::super::StyleContext {
+                    animated,
+                    ..Default::default()
+                }),
+            )
+        };
+        let restyled = restyle(&doc, motion.custom.clone());
+        assert_eq!(restyled.values[div].get(Prop::WIDTH), Some("50px"));
+        assert_eq!(restyled.values[span].get(Prop::WIDTH), Some("50px"));
+        assert_eq!(styles.values[div].get(Prop::WIDTH), Some("0px"));
+        doc.nodes[p].attrs.insert("class".into(), "on".into());
+        let on = computed_styles(&doc);
+        motion.update(&doc, &on, &visible, at, false, &mut Vec::new());
+        motion.update(
+            &doc,
+            &on,
+            &visible,
+            at + Duration::from_millis(500),
+            false,
+            &mut Vec::new(),
+        );
+        let values = &motion.custom[&p];
+        assert_eq!(values.get(Prop::new("--c")), Some("#008080ff"));
+        assert_eq!(values.get(Prop::new("--u")), None);
+        let restyled = restyle(&doc, motion.custom.clone());
+        assert_eq!(restyled.values[p].get(Prop::COLOR), Some("#008080ff"));
+    }
+
+    #[test]
+    fn starting_styles_transition_new_and_shown_elements() {
+        let mut doc = Document::parse(
+            "<style>p{opacity:1;transition:opacity 1s linear;@starting-style{opacity:0}}</style><p>a</p>",
+        );
+        let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut events = Vec::new();
+        let styles = computed_styles(&doc);
+        assert_eq!(styles.starting[&p].get(Prop::OPACITY), Some("0"));
+        motion.update(&doc, &styles, &visible, start, false, &mut events);
+        let (animated, _) = motion.update(
+            &doc,
+            &styles,
+            &visible,
+            start + Duration::from_millis(500),
+            false,
+            &mut events,
+        );
+        let value = animated
+            .iter()
+            .find(|(id, ..)| *id == p)
+            .map(|(_, style, _)| style.get(Prop::OPACITY).unwrap_or("").to_owned());
+        assert_eq!(value.as_deref(), Some("0.5"), "{events:?}");
+        doc.nodes[p]
+            .attrs
+            .insert("style".into(), "display:none".into());
+        motion.update(
+            &doc,
+            &computed_styles(&doc),
+            &visible,
+            start + Duration::from_secs(2),
+            false,
+            &mut events,
+        );
+        doc.nodes[p].attrs.remove("style");
+        motion.update(
+            &doc,
+            &computed_styles(&doc),
+            &visible,
+            start + Duration::from_secs(3),
+            false,
+            &mut events,
+        );
+        let (animated, _) = motion.update(
+            &doc,
+            &computed_styles(&doc),
+            &visible,
+            start + Duration::from_millis(3250),
+            false,
+            &mut events,
+        );
+        let value = animated
+            .iter()
+            .find(|(id, ..)| *id == p)
+            .map(|(_, style, _)| style.get(Prop::OPACITY).unwrap_or("").to_owned());
+        assert_eq!(value.as_deref(), Some("0.25"));
+    }
+
+    #[test]
+    fn lifecycle_events_follow_delays_iterations_and_cancels() {
+        let mut doc = Document::parse(
+            "<style>@keyframes pulse{to{opacity:0}}div{width:10px;transition:width 1s .5s}div.on{width:20px}p{animation:pulse 1s 3 .25s}</style><div>t</div><p>p</p>",
+        );
+        let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut events = Vec::new();
+        let mut run = |motion: &mut Motion, doc: &Document, time: f64| {
+            events.clear();
+            motion.update(
+                doc,
+                &computed_styles(doc),
+                &visible,
+                start + Duration::from_secs_f64(time),
+                false,
+                &mut events,
+            );
+            events
+                .iter()
+                .map(|event| (event.1, event.3))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&mut motion, &doc, 0.), []);
+        doc.nodes[div].attrs.insert("class".into(), "on".into());
+        assert_eq!(run(&mut motion, &doc, 0.1), [("transitionrun", 0.)]);
+        assert_eq!(run(&mut motion, &doc, 0.3), [("animationstart", 0.)]);
+        assert_eq!(run(&mut motion, &doc, 0.7), [("transitionstart", 0.)]);
+        assert_eq!(run(&mut motion, &doc, 1.3), [("animationiteration", 1.)]);
+        doc.nodes[div].attrs.remove("class");
+        let events = run(&mut motion, &doc, 1.4);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.0 == "transitioncancel" && (event.1 - 0.8).abs() < 1e-6),
+            "{events:?}"
+        );
+        let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        doc.nodes[p]
+            .attrs
+            .insert("style".into(), "animation:none".into());
+        assert!(
+            run(&mut motion, &doc, 1.5)
+                .iter()
+                .any(|event| event.0 == "animationcancel")
+        );
     }
 
     /// Runs a page like the view does: a frame at each requested wake, on the next 120 Hz
@@ -1316,7 +1641,8 @@ mod tests {
                     (Prop::new("animation"), "".into()),
                     (Prop::new("animation-name"), "pulse".into())
                 ]),
-                &frames
+                &frames,
+                &Default::default()
             )
             .is_empty()
         );
@@ -1326,7 +1652,8 @@ mod tests {
                     (Prop::new("animation"), "1s pulse".into()),
                     (Prop::new("animation-iteration-count"), "NaN".into())
                 ]),
-                &frames
+                &frames,
+                &Default::default()
             )
             .is_empty()
         );

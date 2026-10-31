@@ -35,7 +35,7 @@ globalThis.testStep = 'base64';
   let globals = 0; const globalListener = () => globals++;
   addEventListener('custom', globalListener); dispatchEvent(new CustomEvent('custom', { detail: 42 })); removeEventListener('custom', globalListener); dispatchEvent(new Event('custom'));
   assert(globals === 1, 'global event target');
-  if (typeof window !== 'undefined') { let resized = false; addEventListener('resize', () => { resized = true; }, { once: true }); __appsDispatch('window:resize', {}); assert(resized, 'window resize event'); }
+  if (typeof __appsDispatch !== 'undefined') { let resized = false; addEventListener('resize', () => { resized = true; }, { once: true }); __appsDispatch('window:resize', {}); assert(resized, 'window resize event'); }
   testStep = 'Intl';
   assert(new Intl.NumberFormat('en-US').format(1234.5) === '1,234.5', 'native number formatting');
   assert(new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', year: 'numeric' }).format(new Date('2020-01-01')) === '2020', 'native date formatting');

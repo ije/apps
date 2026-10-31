@@ -1,5 +1,5 @@
 use crate::{
-    Bounds, ContentMask, Corners, DevicePixels, Edges, Pixels, Point, Rgba, ScaledPixels, Size,
+    Bounds, ContentMask, DevicePixels, Edges, Pixels, Point, Radii, Rgba, ScaledPixels, Size,
     bounds_tree::BoundsTree, point,
 };
 
@@ -341,7 +341,7 @@ pub struct PaintEffect {
     pub shadow: Option<(Point<Pixels>, Pixels, Rgba)>,
     pub blend_mode: BlendMode,
     /// A rounded rectangle that clips the group.
-    pub clip: Option<(Bounds<Pixels>, Corners<Pixels>)>,
+    pub clip: Option<(Bounds<Pixels>, Radii<Pixels>)>,
     /// An image whose alpha masks the group, stretched over the bounds.
     pub mask: Option<(std::sync::Arc<RenderImage>, Bounds<Pixels>)>,
     /// A filter for the content below the given rounded rectangle.
@@ -368,7 +368,7 @@ impl Default for PaintEffect {
 #[derive(Clone, Debug)]
 pub struct Backdrop {
     pub bounds: Bounds<Pixels>,
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: Radii<Pixels>,
     /// The standard deviation of a gaussian blur.
     pub blur: Pixels,
     /// A 4x5 row-major color matrix, like SVG `feColorMatrix`.
@@ -378,7 +378,7 @@ pub struct Backdrop {
 #[derive(Clone, Debug)]
 pub(crate) struct BackdropState {
     pub bounds: Bounds<ScaledPixels>,
-    pub corner_radii: Corners<ScaledPixels>,
+    pub corner_radii: Radii<ScaledPixels>,
     pub blur: f32,
     pub color_matrix: Option<[f32; 20]>,
 }
@@ -392,7 +392,7 @@ pub(crate) struct EffectState {
     pub blur: f32,
     pub shadow: Option<(Point<f32>, f32, Rgba)>,
     pub blend_mode: BlendMode,
-    pub clip: Option<(Bounds<ScaledPixels>, Corners<ScaledPixels>)>,
+    pub clip: Option<(Bounds<ScaledPixels>, Radii<ScaledPixels>)>,
     pub mask: Option<(AtlasTile, Bounds<ScaledPixels>)>,
     pub backdrop: Option<BackdropState>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -429,7 +429,7 @@ pub(crate) struct Quad {
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Rgba,
     pub border_color: Rgba,
-    pub corner_radii: Corners<ScaledPixels>,
+    pub corner_radii: Radii<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
 }
 
@@ -451,11 +451,11 @@ pub(crate) struct Shadow {
     pub order: DrawOrder,
     pub blur_radius: ScaledPixels,
     pub bounds: Bounds<ScaledPixels>,
-    pub corner_radii: Corners<ScaledPixels>,
+    pub corner_radii: Radii<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Rgba,
     pub element_bounds: Bounds<ScaledPixels>,
-    pub element_corner_radii: Corners<ScaledPixels>,
+    pub element_corner_radii: Radii<ScaledPixels>,
     /// 0 is a drop shadow outside the element, 1 an inset shadow inside it.
     pub inset: u32,
     pub pad: u32,
@@ -482,7 +482,7 @@ pub(crate) struct PolychromeSprite {
     pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub corner_radii: Corners<ScaledPixels>,
+    pub corner_radii: Radii<ScaledPixels>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

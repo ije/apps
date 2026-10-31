@@ -67,6 +67,18 @@ fn stat(meta: &fs::Metadata) -> Value {
 pub(super) struct Files(Mutex<(u64, HashMap<u64, Arc<File>>)>);
 
 impl Files {
+    fn file(&self, id: &Value) -> Result<Arc<File>> {
+        let id = id.as_u64().context("Expected descriptor")?;
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .1
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?)
+    }
+
     pub(super) fn call(&self, op: &str, args: &Value) -> Result<Value> {
         let path =
             || -> Result<PathBuf> { Ok(PathBuf::from(args[0].as_str().context("Expected path")?)) };
@@ -76,14 +88,25 @@ impl Files {
                 let errno: HashMap<_, _> = super::ERRNO.iter().copied().collect();
                 #[cfg(not(unix))]
                 let errno = HashMap::<&str, i32>::new();
+                #[cfg(unix)]
+                let dlopen = json!({"RTLD_LAZY":libc::RTLD_LAZY,"RTLD_NOW":libc::RTLD_NOW,"RTLD_GLOBAL":libc::RTLD_GLOBAL,"RTLD_LOCAL":libc::RTLD_LOCAL});
+                #[cfg(not(unix))]
+                let dlopen = json!({});
                 Ok(json!({
                     "fs":{"F_OK":0,"R_OK":4,"W_OK":2,"X_OK":1,"COPYFILE_EXCL":1,"COPYFILE_FICLONE":2,"COPYFILE_FICLONE_FORCE":4,"O_RDONLY":libc::O_RDONLY,"O_WRONLY":libc::O_WRONLY,"O_RDWR":libc::O_RDWR,"O_CREAT":libc::O_CREAT,"O_TRUNC":libc::O_TRUNC,"O_APPEND":libc::O_APPEND,"O_EXCL":libc::O_EXCL,"S_IFMT":0o170000,"S_IFREG":0o100000,"S_IFDIR":0o040000,"S_IFCHR":0o020000,"S_IFBLK":0o060000,"S_IFIFO":0o010000,"S_IFLNK":0o120000,"S_IFSOCK":0o140000},
                     "errno":errno,
                     "signals":SIGNALS.iter().copied().collect::<HashMap<_, _>>(),
+                    "dlopen":dlopen,
                 }))
             }
             "readFile" => {
-                let data = fs::read(path()?)?;
+                let data = if args[0].is_u64() {
+                    let mut data = Vec::new();
+                    (&*self.file(&args[0])?).read_to_end(&mut data)?;
+                    data
+                } else {
+                    fs::read(path()?)?
+                };
                 Ok(
                     if args[1]["encoding"].as_str().is_some_and(|encoding| {
                         encoding.eq_ignore_ascii_case("utf8")
@@ -98,6 +121,10 @@ impl Files {
                 )
             }
             "writeFile" | "appendFile" => {
+                if args[0].is_u64() {
+                    (&*self.file(&args[0])?).write_all(bytes(&args[1])?)?;
+                    return Ok(Value::Null);
+                }
                 let mut options = OpenOptions::new();
                 options
                     .write(true)
@@ -121,12 +148,18 @@ impl Files {
                 Ok(Value::Null)
             }
             "mkdir" => {
-                if args[1]["recursive"] == true {
-                    fs::create_dir_all(path()?)?;
-                } else {
-                    fs::create_dir(path()?)?;
+                let path = path()?;
+                if args[1]["recursive"] != true {
+                    fs::create_dir(path)?;
+                    return Ok(Value::Null);
                 }
-                Ok(Value::Null)
+                let first = path
+                    .ancestors()
+                    .take_while(|p| !p.as_os_str().is_empty() && fs::symlink_metadata(p).is_err())
+                    .last()
+                    .map(|p| p.to_string_lossy().into_owned());
+                fs::create_dir_all(&path)?;
+                Ok(json!(first))
             }
             "readdir" => {
                 let root = path()?;
@@ -320,35 +353,54 @@ impl Files {
                 }
                 Ok(Value::Null)
             }
-            "unlink" | "rm" | "rmdir" => {
+            "unlink" => {
+                fs::remove_file(path()?)?;
+                Ok(Value::Null)
+            }
+            "rmdir" => {
                 let p = path()?;
-                let result = if op == "unlink" {
-                    fs::remove_file(p)
+                if args[1]["recursive"] == true && fs::symlink_metadata(&p)?.is_dir() {
+                    fs::remove_dir_all(p)?;
                 } else {
-                    match fs::symlink_metadata(&p) {
-                        Ok(meta) if meta.is_dir() => {
-                            if args[1]["recursive"] == true {
-                                fs::remove_dir_all(p)
-                            } else {
-                                fs::remove_dir(p)
-                            }
-                        }
-                        Ok(_) => fs::remove_file(p),
-                        Err(error) => Err(error),
-                    }
-                };
-                if let Err(error) = result
-                    && !(args[1]["force"] == true && error.kind() == std::io::ErrorKind::NotFound)
-                {
-                    return Err(error.into());
+                    fs::remove_dir(p)?;
                 }
                 Ok(Value::Null)
             }
+            "rm" => {
+                let p = path()?;
+                let result = fs::symlink_metadata(&p).and_then(|meta| {
+                    if !meta.is_dir() {
+                        fs::remove_file(&p)
+                    } else if args[1]["recursive"] == true {
+                        fs::remove_dir_all(&p)
+                    } else {
+                        Err(std::io::ErrorKind::IsADirectory.into())
+                    }
+                });
+                match result {
+                    Err(error)
+                        if !(args[1]["force"] == true
+                            && error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        Err(error.into())
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
             "mkdtemp" => {
+                const CHARS: &[u8] =
+                    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 for _ in 0..100 {
-                    let mut random = [0u8; 8];
+                    let mut random = [0u8; 6];
                     getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let p = format!("{}{:016x}", path()?.display(), u64::from_ne_bytes(random));
+                    let p = format!(
+                        "{}{}",
+                        path()?.display(),
+                        random
+                            .iter()
+                            .map(|b| CHARS[*b as usize % CHARS.len()] as char)
+                            .collect::<String>()
+                    );
                     match fs::create_dir(&p) {
                         Ok(()) => return Ok(json!(p)),
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -399,22 +451,14 @@ impl Files {
             }
             "close" => {
                 let id = args[0].as_u64().context("Expected descriptor")?;
-                ensure!(
-                    self.0.lock().unwrap().1.remove(&id).is_some(),
-                    "Bad file descriptor"
-                );
+                if self.0.lock().unwrap().1.remove(&id).is_none() {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF).into());
+                }
                 Ok(Value::Null)
             }
-            "read" | "write" | "fsync" | "ftruncate" | "fstat" => {
-                let id = args[0].as_u64().context("Expected descriptor")?;
-                let file = self
-                    .0
-                    .lock()
-                    .unwrap()
-                    .1
-                    .get(&id)
-                    .cloned()
-                    .context("Bad file descriptor")?;
+            "read" | "write" | "fsync" | "fdatasync" | "ftruncate" | "fstat" | "fchmod"
+            | "fchown" | "futimes" => {
+                let file = self.file(&args[0])?;
                 match op {
                     "read" => {
                         let size = args[1].as_u64().context("Expected read size")?;
@@ -456,6 +500,55 @@ impl Files {
                     }
                     "fsync" => {
                         file.sync_all()?;
+                        Ok(Value::Null)
+                    }
+                    "fdatasync" => {
+                        file.sync_data()?;
+                        Ok(Value::Null)
+                    }
+                    "fchmod" => {
+                        let mode = args[1].as_u64().context("Expected mode")? as u32;
+                        let mut permissions = file.metadata()?.permissions();
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            permissions.set_mode(mode);
+                        }
+                        #[cfg(not(unix))]
+                        permissions.set_readonly(mode & 0o200 == 0);
+                        file.set_permissions(permissions)?;
+                        Ok(Value::Null)
+                    }
+                    "fchown" => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::fd::AsRawFd;
+                            let id =
+                                |value: &Value| value.as_i64().map_or(u32::MAX, |id| id as u32);
+                            if unsafe { libc::fchown(file.as_raw_fd(), id(&args[1]), id(&args[2])) }
+                                != 0
+                            {
+                                return Err(std::io::Error::last_os_error().into());
+                            }
+                        }
+                        Ok(Value::Null)
+                    }
+                    "futimes" => {
+                        let time = |value: &Value| -> Result<SystemTime> {
+                            let seconds = value.as_f64().context("Expected time")?;
+                            let offset = std::time::Duration::try_from_secs_f64(seconds.abs())?;
+                            if seconds < 0. {
+                                UNIX_EPOCH.checked_sub(offset)
+                            } else {
+                                UNIX_EPOCH.checked_add(offset)
+                            }
+                            .context("Time is out of range")
+                        };
+                        file.set_times(
+                            fs::FileTimes::new()
+                                .set_accessed(time(&args[1])?)
+                                .set_modified(time(&args[2])?),
+                        )?;
                         Ok(Value::Null)
                     }
                     "fstat" => Ok(stat(&file.metadata()?)),

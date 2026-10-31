@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, ElementId, Pixels, Point, Size, Style, Window, geometry::round_half_toward_zero, point,
-    size,
+    Baseline, Bounds, ElementId, Pixels, Point, Size, Style, Window,
+    geometry::round_half_toward_zero, point, size,
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use std::{
@@ -8,7 +8,11 @@ use std::{
     hash::{Hash, Hasher},
     rc::Rc,
 };
-use taffy::{TaffyTree, TraversePartialTree as _, tree::NodeId};
+use taffy::{
+    AlignItemsKeyword, Baselines, BlockContext, Cache, CacheTree, Display, FlexDirection, Layout,
+    LayoutBlockContainer, LayoutContainingBlock, LayoutFlexboxContainer, LayoutGridContainer,
+    LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, Position, RunMode, TraversePartialTree,
+};
 
 /// The space a measured node can take along one axis.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -42,32 +46,48 @@ impl From<Pixels> for AvailableSpace {
     }
 }
 
-pub type MeasureFn =
-    dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window) -> Size<Pixels>;
+/// Measures a leaf: its size and its first and last baselines from its top, if it has them.
+pub type MeasureFn = dyn FnMut(
+    Size<Option<Pixels>>,
+    Size<AvailableSpace>,
+    &mut Window,
+) -> (Size<Pixels>, Option<[Pixels; 2]>);
 
 /// A node in this frame's layout tree.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(transparent)]
 pub struct LayoutId(NodeId);
 
+struct Node {
+    style: taffy::Style,
+    baseline: Baseline,
+    children: Vec<NodeId>,
+    cache: Cache,
+    /// The unrounded layout, relative to the parent.
+    layout: Layout,
+    /// The baselines of the last full layout.
+    baselines: Baselines,
+    measure: Option<Box<MeasureFn>>,
+    /// The inputs and results of a measured node.
+    state: Option<Rc<dyn Any>>,
+}
+
 /// The layout tree, kept across frames. A node requested again with the same identity, style,
-/// children and measure inputs keeps its taffy node, so taffy's caches skip its subtree.
+/// children and measure inputs keeps its node, so taffy's caches skip its subtree.
 pub(crate) struct LayoutEngine {
-    taffy: TaffyTree<Box<MeasureFn>>,
-    /// This frame's and the last frame's nodes by identity and occurrence, with the order they
-    /// were made in.
-    nodes: [FxHashMap<(u64, u32), (NodeId, u64)>; 2],
-    made: u64,
+    tree: Vec<Node>,
+    /// Slots of freed nodes.
+    free: Vec<usize>,
+    /// This frame's and the last frame's nodes by identity and occurrence.
+    nodes: [FxHashMap<(u64, u32), NodeId>; 2],
     /// The scale and font generation the kept nodes were measured with.
     measured_with: (f32, usize),
     /// Nodes that no request took again, freed when the next frame begins.
-    dead: Vec<(u64, NodeId)>,
+    dead: Vec<NodeId>,
     /// How often each identity was requested in this frame.
     occurrences: FxHashMap<u64, u32>,
     /// Identities of the elements with an id around the request, for nodes without one.
     pub(crate) scopes: Vec<u64>,
-    /// The inputs and results of measured nodes.
-    measured: FxHashMap<NodeId, Rc<dyn Any>>,
     /// The parent of each node in this frame's tree.
     parents: FxHashMap<NodeId, NodeId>,
     bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -78,17 +98,14 @@ pub(crate) struct LayoutEngine {
 
 impl Default for LayoutEngine {
     fn default() -> Self {
-        let mut taffy = TaffyTree::new();
-        taffy.disable_rounding();
         Self {
-            taffy,
+            tree: Vec::new(),
+            free: Vec::new(),
             nodes: Default::default(),
-            made: 0,
             measured_with: (0., 0),
             dead: Vec::new(),
             occurrences: FxHashMap::default(),
             scopes: Vec::new(),
-            measured: FxHashMap::default(),
             parents: FxHashMap::default(),
             bounds: FxHashMap::default(),
             origins: FxHashMap::default(),
@@ -104,27 +121,23 @@ pub(crate) fn identity(id: Option<ElementId>, scope: u64) -> u64 {
     hasher.finish()
 }
 
-// WARNING: taffy only fails on unknown node ids, which this engine never hands out, so its
-// errors are ignored instead of unwrapped (a panic aborts the app).
 impl LayoutEngine {
     /// Frees the nodes the last frame did not request again, or all of them when the scale or
     /// the fonts changed.
     pub fn begin_frame(&mut self, scale: f32, fonts: usize) {
         let [current, previous] = &mut self.nodes;
-        self.dead
-            .extend(previous.drain().map(|(_, (node, made))| (made, node)));
+        self.dead.extend(previous.drain().map(|(_, node)| node));
         std::mem::swap(current, previous);
         if std::mem::replace(&mut self.measured_with, (scale, fonts)) != (scale, fonts) {
-            self.dead
-                .extend(previous.drain().map(|(_, (node, made))| (made, node)));
+            self.dead.extend(previous.drain().map(|(_, node)| node));
         }
-        // WARNING: taffy's `remove` clears the parent link of each child, so parents, which are
-        // made after their children, go first and no removal follows a stale link.
-        self.dead
-            .sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-        for (_, node) in self.dead.drain(..) {
-            let _ = self.taffy.remove(node);
-            self.measured.remove(&node);
+        for node in self.dead.drain(..) {
+            let index = usize::from(node);
+            let node = &mut self.tree[index];
+            node.children.clear();
+            node.measure = None;
+            node.state = None;
+            self.free.push(index);
         }
         self.occurrences.clear();
         self.parents.clear();
@@ -136,31 +149,53 @@ impl LayoutEngine {
     fn node(
         &mut self,
         id: Option<ElementId>,
-        style: taffy::Style,
+        style: &Style,
+        scale: f32,
         same: impl Fn(Option<&Rc<dyn Any>>) -> bool,
-        make: impl FnOnce(&mut TaffyTree<Box<MeasureFn>>, taffy::Style, &[NodeId]) -> NodeId,
+        measure: impl FnOnce() -> Option<Box<MeasureFn>>,
     ) -> NodeId {
         let identity = identity(id, self.scopes.last().copied().unwrap_or_default());
         let occurrence = self.occurrences.entry(identity).or_default();
         let key = (identity, *occurrence);
         *occurrence += 1;
+        let taffy = style.to_taffy(scale);
         let node = match self.nodes[1].remove(&key) {
-            Some((node, made))
-                if self.taffy.style(node).is_ok_and(|old| *old == style)
-                    && self.taffy.child_ids(node).eq(self.children.iter().copied())
-                    && same(self.measured.get(&node)) =>
+            Some(node)
+                if {
+                    let old = &self.tree[usize::from(node)];
+                    old.style == taffy
+                        && old.baseline == style.baseline
+                        && old.children == self.children
+                        && same(old.state.as_ref())
+                } =>
             {
-                self.nodes[0].insert(key, (node, made));
                 node
             }
             old => {
-                self.dead.extend(old.map(|(node, made)| (made, node)));
-                let node = make(&mut self.taffy, style, &self.children);
-                self.made += 1;
-                self.nodes[0].insert(key, (node, self.made));
-                node
+                self.dead.extend(old);
+                let node = Node {
+                    style: taffy,
+                    baseline: style.baseline,
+                    children: self.children.clone(),
+                    cache: Cache::new(),
+                    layout: Layout::new(),
+                    baselines: Baselines::NONE,
+                    measure: measure(),
+                    state: None,
+                };
+                match self.free.pop() {
+                    Some(index) => {
+                        self.tree[index] = node;
+                        NodeId::from(index)
+                    }
+                    None => {
+                        self.tree.push(node);
+                        NodeId::from(self.tree.len() - 1)
+                    }
+                }
             }
         };
+        self.nodes[0].insert(key, node);
         for &child in &self.children {
             self.parents.insert(child, node);
         }
@@ -176,16 +211,7 @@ impl LayoutEngine {
     ) -> LayoutId {
         self.children.clear();
         self.children.extend(children.into_iter().map(|id| id.0));
-        LayoutId(self.node(
-            id,
-            style.to_taffy(scale),
-            |measured| measured.is_none(),
-            |taffy, style, children| {
-                taffy
-                    .new_with_children(style, children)
-                    .unwrap_or_else(|_| NodeId::from(u64::MAX))
-            },
-        ))
+        LayoutId(self.node(id, style, scale, |state| state.is_none(), || None))
     }
 
     /// A leaf sized by `measure`. While `state` compares equal to last frame's, the node and
@@ -200,57 +226,53 @@ impl LayoutEngine {
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
             &mut Window,
-        ) -> Size<Pixels>
+        ) -> (Size<Pixels>, Option<[Pixels; 2]>)
         + 'static,
     ) -> (LayoutId, Rc<S>) {
         self.children.clear();
         let state = Rc::new(state);
-        let node = self.node(
+        let id = self.node(
             None,
-            style.to_taffy(scale),
+            style,
+            scale,
             |old| {
                 old.and_then(|old| old.downcast_ref::<S>())
                     .is_some_and(|old| *old == *state)
             },
-            |taffy, style, _| {
+            || {
                 let captured = state.clone();
-                let measure: Box<MeasureFn> = Box::new(move |known, available, window| {
+                Some(Box::new(move |known, available, window: &mut Window| {
                     measure(&captured, known, available, window)
-                });
-                taffy
-                    .new_leaf_with_context(style, measure)
-                    .unwrap_or_else(|_| NodeId::from(u64::MAX))
+                }))
             },
         );
-        let state = match self.measured.get(&node).cloned().map(Rc::downcast::<S>) {
+        let node = &mut self.tree[usize::from(id)];
+        let state = match node.state.clone().map(Rc::downcast::<S>) {
             Some(Ok(kept)) => kept,
             _ => {
-                self.measured.insert(node, state.clone());
+                node.state = Some(state.clone());
                 state
             }
         };
-        (LayoutId(node), state)
+        (LayoutId(id), state)
     }
 
     /// Makes `auto` sizes of the root fill the viewport, like the root element of a page.
     pub fn stretch(&mut self, id: LayoutId, viewport: Size<Pixels>, scale: f32) {
-        let Ok(style) = self.taffy.style(id.0) else {
-            return;
-        };
-        let mut style = style.clone();
+        let node = &mut self.tree[usize::from(id.0)];
+        let mut style = node.style.clone();
         if style.size.width.is_auto() {
-            style.size.width = taffy::Dimension::length(crate::geometry::round_to_device_pixel(
-                viewport.width.0,
-                scale,
-            ));
+            style.size.width =
+                taffy::Dimension::length(crate::geometry::to_layout_unit(viewport.width.0, scale));
         }
         if style.size.height.is_auto() {
-            style.size.height = taffy::Dimension::length(crate::geometry::round_to_device_pixel(
-                viewport.height.0,
-                scale,
-            ));
+            style.size.height =
+                taffy::Dimension::length(crate::geometry::to_layout_unit(viewport.height.0, scale));
         }
-        let _ = self.taffy.set_style(id.0, style);
+        if style != node.style {
+            node.style = style;
+            node.cache.clear();
+        }
     }
 
     pub fn compute_layout(
@@ -268,7 +290,7 @@ impl LayoutEngine {
                 if self.bounds.remove(&LayoutId(node)).is_some() {
                     self.origins.remove(&LayoutId(node));
                 }
-                stack.extend(self.taffy.child_ids(node));
+                stack.extend_from_slice(&self.tree[usize::from(node)].children);
             }
             self.children = stack;
         }
@@ -277,34 +299,21 @@ impl LayoutEngine {
             width: space.width.scaled(scale),
             height: space.height.scaled(scale),
         };
-        let _ = self
-            .taffy
-            .compute_layout_with_measure(id.0, space, |input, _, measure, style| {
-                taffy::compute_leaf_layout(
-                    input,
-                    style,
-                    |_, _| 0.,
-                    |known, available| {
-                        let Some(measure) = measure else {
-                            return taffy::Size::ZERO;
-                        };
-                        let known = size(
-                            known.width.map(|value| Pixels(value / scale)),
-                            known.height.map(|value| Pixels(value / scale)),
-                        );
-                        let available = size(
-                            AvailableSpace::unscaled(available.width, scale),
-                            AvailableSpace::unscaled(available.height, scale),
-                        );
-                        let measured = measure(known, available, window);
-                        // Measured sizes round up to whole device pixels.
-                        taffy::Size {
-                            width: (measured.width.0.max(0.) * scale).ceil(),
-                            height: (measured.height.0.max(0.) * scale).ceil(),
-                        }
-                    },
-                )
-            });
+        taffy::compute_root_layout(
+            &mut Tree {
+                nodes: &mut self.tree,
+                window,
+                scale,
+            },
+            id.0,
+            space,
+        );
+    }
+
+    /// The first and last baselines of a node's border box, from its last layout.
+    pub fn baselines(&self, id: LayoutId, scale: f32) -> [Option<Pixels>; 2] {
+        let Baselines { first, last } = self.tree[usize::from(id.0)].baselines;
+        [first, last].map(|value| value.map(|value| Pixels(value / scale)))
     }
 
     /// The bounds of a node in window coordinates. Edges snap to device pixels in absolute
@@ -313,9 +322,7 @@ impl LayoutEngine {
         if let Some(bounds) = self.bounds.get(&id) {
             return *bounds;
         }
-        let Ok(layout) = self.taffy.layout(id.0) else {
-            return Bounds::default();
-        };
+        let layout = self.tree[usize::from(id.0)].layout;
         let (location, layout_size) = (layout.location, layout.size);
         let origin = match self.parents.get(&id.0).copied() {
             Some(parent) => {
@@ -338,5 +345,313 @@ impl LayoutEngine {
         let bounds = (bounds / scale).map(Pixels);
         self.bounds.insert(id, bounds);
         bounds
+    }
+
+    /// The bounds of a node in window coordinates before edges snap to device pixels.
+    pub fn exact_bounds(&mut self, id: LayoutId, scale: f32) -> Bounds<Pixels> {
+        self.layout_bounds(id, scale);
+        let Some(origin) = self.origins.get(&id) else {
+            return Bounds::default();
+        };
+        let layout = &self.tree[usize::from(id.0)].layout;
+        Bounds::new(
+            origin.map(|value| Pixels(value / scale)),
+            size(
+                Pixels(layout.size.width / scale),
+                Pixels(layout.size.height / scale),
+            ),
+        )
+    }
+}
+
+/// The nodes and the window while taffy lays them out.
+struct Tree<'a> {
+    nodes: &'a mut [Node],
+    window: &'a mut Window,
+    scale: f32,
+}
+
+impl Tree<'_> {
+    fn compute(
+        &mut self,
+        node: NodeId,
+        inputs: LayoutInput,
+        block: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        if inputs.run_mode == RunMode::PerformHiddenLayout {
+            return taffy::compute_hidden_layout(self, node);
+        }
+        let output = taffy::compute_cached_layout(self, node, inputs, |tree, node, inputs| {
+            let index = usize::from(node);
+            let leaf = tree.nodes[index].children.is_empty();
+            let mut output = match tree.nodes[index].style.display {
+                Display::None => taffy::compute_hidden_layout(tree, node),
+                _ if leaf => tree.measure(index, inputs),
+                Display::Flex => taffy::compute_flexbox_layout(tree, node, inputs),
+                Display::Grid => taffy::compute_grid_layout(tree, node, inputs),
+                _ => taffy::compute_block_layout(tree, node, inputs, block),
+            };
+            if inputs.run_mode == RunMode::PerformLayout {
+                taffy::compute_oof_layout(tree, node, &mut output);
+                output.baselines = tree.baselines(index, &output);
+            }
+            output
+        });
+        if inputs.run_mode == RunMode::PerformLayout {
+            self.nodes[usize::from(node)].baselines = output.baselines;
+        }
+        output
+    }
+
+    fn measure(&mut self, index: usize, inputs: LayoutInput) -> LayoutOutput {
+        let scale = self.scale;
+        let window = &mut *self.window;
+        let Node {
+            style,
+            measure,
+            baseline,
+            ..
+        } = &mut self.nodes[index];
+        let mut baselines = None;
+        let mut output = taffy::compute_leaf_layout(
+            inputs,
+            &*style,
+            |_, _| 0.,
+            |known, available| {
+                let Some(measure) = measure else {
+                    return taffy::Size::ZERO;
+                };
+                let known = size(
+                    known.width.map(|value| Pixels(value / scale)),
+                    known.height.map(|value| Pixels(value / scale)),
+                );
+                let available = size(
+                    AvailableSpace::unscaled(available.width, scale),
+                    AvailableSpace::unscaled(available.height, scale),
+                );
+                let (measured, lines) = measure(known, available, window);
+                baselines = lines;
+                // Measured sizes round up to 1/64 device pixel, like Chrome's `LayoutUnit`.
+                taffy::Size {
+                    width: (measured.width.0.max(0.) * scale * 64.).ceil() / 64.,
+                    height: (measured.height.0.max(0.) * scale * 64.).ceil() / 64.,
+                }
+            },
+        );
+        if let Some([first, last]) = baselines.filter(|_| *baseline != Baseline::None) {
+            output.baselines = Baselines {
+                first: Some(first.0 * scale),
+                last: Some(last.0 * scale),
+            };
+        }
+        output
+    }
+
+    /// A box's baselines from its laid out children, like Chrome: a block's are its first and last child's
+    /// with one, a line's last is its last item that aligns baselines.
+    fn baselines(&self, index: usize, output: &LayoutOutput) -> Baselines {
+        let node = &self.nodes[index];
+        let style = &node.style;
+        let first = output.baselines.first;
+        if node.baseline == Baseline::Bottom {
+            let bottom = Some(output.size.height);
+            return Baselines {
+                first: bottom,
+                last: bottom,
+            };
+        }
+        if node.children.is_empty() {
+            return output.baselines;
+        }
+        let children = node
+            .children
+            .iter()
+            .map(|&child| &self.nodes[usize::from(child)])
+            .filter(|child| {
+                child.style.position != Position::Absolute && child.style.display != Display::None
+            });
+        let at = |child: &Node, value: f32| child.layout.location.y + value;
+        let row = style.display == Display::Flex
+            && matches!(
+                style.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            );
+        let (first, last) = match node.baseline {
+            _ if style.contain.suppresses_baseline() => (None, None),
+            Baseline::First => (first, first),
+            Baseline::FirstOnly => (first, None),
+            _ if row => {
+                let last = children
+                    .rev()
+                    .find(|child| {
+                        child.style.align_self.unwrap_or(style.align_items).keyword
+                            == AlignItemsKeyword::Baseline
+                    })
+                    .map(|child| {
+                        let baselines = child.baselines;
+                        at(
+                            child,
+                            baselines
+                                .last
+                                .or(baselines.first)
+                                .unwrap_or(child.layout.size.height),
+                        )
+                    })
+                    .or(first);
+                (first, last)
+            }
+            _ => (
+                children
+                    .clone()
+                    .find_map(|child| Some(at(child, child.baselines.first?))),
+                children
+                    .rev()
+                    .find_map(|child| Some(at(child, child.baselines.last?))),
+            ),
+        };
+        Baselines {
+            first: if node.baseline == Baseline::Last {
+                last
+            } else {
+                first
+            },
+            last,
+        }
+    }
+}
+
+impl TraversePartialTree for Tree<'_> {
+    type ChildIter<'a>
+        = std::iter::Copied<std::slice::Iter<'a, NodeId>>
+    where
+        Self: 'a;
+
+    fn child_ids(&self, node: NodeId) -> Self::ChildIter<'_> {
+        self.nodes[usize::from(node)].children.iter().copied()
+    }
+
+    fn child_count(&self, node: NodeId) -> usize {
+        self.nodes[usize::from(node)].children.len()
+    }
+
+    fn get_child_id(&self, node: NodeId, index: usize) -> NodeId {
+        self.nodes[usize::from(node)].children[index]
+    }
+}
+
+impl LayoutPartialTree for Tree<'_> {
+    type CoreContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type CustomIdent = String;
+
+    fn get_core_container_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
+        self.nodes[usize::from(node)].layout = *layout;
+    }
+
+    fn compute_child_layout(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        self.compute(node, inputs, None)
+    }
+}
+
+// Out-of-flow boxes are positioned by their parent, which is always their containing block, and
+// layout is never rounded, so the hoisted lists are not kept.
+impl LayoutContainingBlock for Tree<'_> {
+    type OofItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_oof_item_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn clear_hoisted_children(&mut self, _: NodeId) {}
+
+    fn add_hoisted_children(&mut self, _: NodeId, _: &[NodeId]) {}
+}
+
+impl CacheTree for Tree<'_> {
+    fn cache_get(&mut self, node: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
+        self.nodes[usize::from(node)].cache.get(input)
+    }
+
+    fn cache_store(&mut self, node: NodeId, input: &LayoutInput, output: LayoutOutput) {
+        self.nodes[usize::from(node)].cache.store(input, output);
+    }
+
+    fn cache_clear(&mut self, node: NodeId) {
+        self.nodes[usize::from(node)].cache.clear();
+    }
+}
+
+impl LayoutBlockContainer for Tree<'_> {
+    type BlockContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type BlockItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_block_container_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn get_block_child_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn compute_block_child_layout(
+        &mut self,
+        node: NodeId,
+        inputs: LayoutInput,
+        block: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        self.compute(node, inputs, block)
+    }
+}
+
+impl LayoutFlexboxContainer for Tree<'_> {
+    type FlexboxContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type FlexboxItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_flexbox_container_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn get_flexbox_child_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+}
+
+impl LayoutGridContainer for Tree<'_> {
+    type GridContainerStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+    type GridItemStyle<'a>
+        = &'a taffy::Style
+    where
+        Self: 'a;
+
+    fn get_grid_container_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
+    }
+
+    fn get_grid_child_style(&self, node: NodeId) -> &taffy::Style {
+        &self.nodes[usize::from(node)].style
     }
 }

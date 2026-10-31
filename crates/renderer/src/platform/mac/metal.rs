@@ -120,11 +120,16 @@ impl Pipelines {
             )
             .context("building Metal library")?;
         #[cfg(renderer_shaders)]
-        let library = device
-            .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(include_bytes!(
-                concat!(env!("OUT_DIR"), "/shaders.metallib")
-            )))
-            .context("loading Metal library")?;
+        let library = {
+            let compressed: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
+            let mut data = Vec::with_capacity(compressed.len() * 3);
+            std::io::Read::read_to_end(
+                &mut flate2::read::DeflateDecoder::new(compressed),
+                &mut data,
+            )?;
+            device.newLibraryWithData_error(&dispatch2::DispatchData::from_boxed(data.into()))
+        }
+        .context("loading Metal library")?;
         let pipeline = |name: &str, blend: Blend| -> Result<_> {
             let function = |stage: &str| {
                 let name = format!("{name}_{stage}");

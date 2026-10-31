@@ -13,6 +13,10 @@ typedef void (*AppsCallback)(void *, const char *);
 @property(nonatomic) void *context;
 @property(nonatomic) BOOL closed;
 @property(nonatomic) BOOL visible;
+@property(nonatomic) BOOL gated;
+@property(nonatomic) BOOL programmatic;
+@property(nonatomic) NSInteger nextDecision;
+@property(nonatomic, strong) NSMutableDictionary *decisions;
 @end
 
 static NSString *AppsString(const char *text) { return text ? [NSString stringWithUTF8String:text] : @""; }
@@ -59,10 +63,20 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
 - (void)windowWillClose:(NSNotification *)notification { self.closed = YES; AppsEmit(self, @{ @"type": @"closed" }); }
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
     if (![message.body isKindOfClass:[NSDictionary class]]) return;
+    if ([message.body[@"kind"] isEqual:@"dom-ready"]) { if (message.frameInfo.mainFrame) AppsEmit(self, @{ @"type": @"dom-ready" }); return; }
     AppsEmit(self, @{ @"type": @"message", @"data": message.body, @"url": message.frameInfo.request.URL.absoluteString ?: @"", @"mainFrame": @(message.frameInfo.mainFrame) });
+}
+- (void)webView:(WKWebView *)view decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    if (!self.gated || self.programmatic || !action.targetFrame.isMainFrame || action.navigationType == WKNavigationTypeBackForward || action.navigationType == WKNavigationTypeReload || !self.callback) { decisionHandler(WKNavigationActionPolicyAllow); return; }
+    NSNumber *decision = @(++self.nextDecision);
+    self.decisions[decision] = [decisionHandler copy];
+    AppsEmit(self, @{ @"type": @"will-navigate", @"id": decision, @"url": action.request.URL.absoluteString ?: @"" });
 }
 - (void)webView:(WKWebView *)view didStartProvisionalNavigation:(WKNavigation *)navigation {
     AppsEmit(self, @{ @"type": @"did-start-loading", @"url": view.URL.absoluteString ?: @"" });
+}
+- (void)webView:(WKWebView *)view didCommitNavigation:(WKNavigation *)navigation {
+    self.programmatic = NO;
 }
 - (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
     AppsEmit(self, @{ @"type": @"did-finish-load", @"url": view.URL.absoluteString ?: @"", @"title": view.title ?: @"", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
@@ -71,13 +85,14 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
     AppsEmit(self, @{ @"type": @"did-fail-load", @"error": error.localizedDescription, @"code": @(error.code) });
 }
 - (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    self.programmatic = NO;
     [self webView:view didFailNavigation:navigation withError:error];
 }
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)view {
     AppsEmit(self, @{ @"type": @"render-process-gone" });
 }
 - (WKWebView *)webView:(WKWebView *)view createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
-    AppsEmit(self, @{ @"type": @"new-window", @"url": action.request.URL.absoluteString ?: @"" });
+    AppsEmit(self, @{ @"type": @"window-open", @"url": action.request.URL.absoluteString ?: @"", @"frameName": action.targetFrame ? @"" : @"_blank" });
     return nil;
 }
 @end
@@ -87,6 +102,8 @@ void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback ca
     NSDictionary *options = AppsValue(optionsJSON) ?: @{};
     AppsBrowser *owner = [AppsBrowser new];
     owner.visible = YES;
+    owner.gated = [options[@"navigation"] boolValue];
+    owner.decisions = [NSMutableDictionary new];
     owner.callback = callback;
     owner.context = context;
     WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
@@ -97,7 +114,7 @@ void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback ca
     preferences.allowsContentJavaScript = options[@"javascript"] ? [options[@"javascript"] boolValue] : YES;
     configuration.defaultWebpagePreferences = preferences;
     [configuration.userContentController addScriptMessageHandler:owner name:@"apps"];
-    NSString *source = @"(()=>{const send=data=>window.webkit.messageHandlers.apps.postMessage(data);Object.defineProperty(window,'apps',{value:Object.freeze({postMessage:data=>send({kind:'message',data})})});for(const level of ['log','info','warn','error','debug']){const original=console[level];console[level]=(...args)=>{original.apply(console,args);send({kind:'console',level,args:args.map(v=>{try{return typeof v==='string'?v:JSON.stringify(v)}catch{return String(v)}})})}};addEventListener('error',e=>send({kind:'error',message:e.message,source:e.filename,line:e.lineno}));addEventListener('unhandledrejection',e=>send({kind:'error',message:String(e.reason)}));})();";
+    NSString *source = @"(()=>{const send=data=>window.webkit.messageHandlers.apps.postMessage(data);if(window===window.top)addEventListener('DOMContentLoaded',()=>send({kind:'dom-ready'}),{once:true});Object.defineProperty(window,'apps',{value:Object.freeze({postMessage:data=>send({kind:'message',data})})});for(const level of ['log','info','warn','error','debug']){const original=console[level];console[level]=(...args)=>{original.apply(console,args);send({kind:'console',level,args:args.map(v=>{try{return typeof v==='string'?v:JSON.stringify(v)}catch{return String(v)}})})}};addEventListener('error',e=>send({kind:'error',message:e.message,source:e.filename,line:e.lineno}));addEventListener('unhandledrejection',e=>send({kind:'error',message:String(e.reason)}));})();";
     [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:source injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
     owner.view = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600) configuration:configuration];
     owner.view.navigationDelegate = owner;
@@ -122,6 +139,8 @@ void apps_browser_destroy(void *handle) {
     AppsBrowser *owner = (__bridge_transfer AppsBrowser *)handle;
     owner.callback = NULL;
     owner.context = NULL;
+    for (void (^decide)(WKNavigationActionPolicy) in owner.decisions.allValues) decide(WKNavigationActionPolicyCancel);
+    [owner.decisions removeAllObjects];
     [owner.view stopLoading];
     owner.view.navigationDelegate = nil;
     owner.view.UIDelegate = nil;
@@ -161,10 +180,16 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
     if ([op isEqualToString:@"loadURL"]) {
         NSURL *url = [NSURL URLWithString:args];
         if (!url || ![@[@"https", @"http", @"file", @"about", @"data"] containsObject:url.scheme.lowercaseString]) return strdup("{\"error\":\"Unsupported browser URL scheme\"}");
+        owner.programmatic = YES;
         if (url.isFileURL) [view loadFileURL:url allowingReadAccessToURL:[url URLByDeletingLastPathComponent]];
         else [view loadRequest:[NSURLRequest requestWithURL:url]];
     } else if ([op isEqualToString:@"loadHTML"]) {
+        owner.programmatic = YES;
         [view loadHTMLString:args[@"html"] baseURL:[NSURL URLWithString:args[@"baseURL"] ?: @"about:blank"]];
+    } else if ([op isEqualToString:@"decide"]) {
+        void (^decide)(WKNavigationActionPolicy) = owner.decisions[args[@"id"]];
+        [owner.decisions removeObjectForKey:args[@"id"]];
+        if (decide) decide([args[@"allow"] boolValue] ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
     } else if ([op isEqualToString:@"back"]) [view goBack];
     else if ([op isEqualToString:@"forward"]) [view goForward];
     else if ([op isEqualToString:@"reload"]) [view reload];
@@ -180,9 +205,18 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
         view.pageZoom = zoom;
     } else if ([op isEqualToString:@"evaluate"]) {
         NSNumber *request = args[@"id"];
-        [view callAsyncJavaScript:@"return (0,eval)(source)" arguments:@{ @"source": args[@"script"] } inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:^(id value, NSError *error) {
+        NSDictionary *arguments = @{ @"source": args[@"script"] };
+        void (^done)(id, NSError *) = ^(id value, NSError *error) {
             if (!owner.callback) return;
-            AppsEmit(owner, error ? @{ @"type": @"evaluation", @"id": request, @"error": error.localizedDescription } : @{ @"type": @"evaluation", @"id": request, @"value": value ?: [NSNull null] });
+            NSMutableDictionary *event = [@{ @"type": @"evaluation", @"id": request } mutableCopy];
+            if (error) event[@"error"] = error.userInfo[@"WKJavaScriptExceptionMessage"] ?: error.localizedDescription;
+            else if (value) event[@"value"] = value;
+            AppsEmit(owner, event);
+        };
+        // WARNING: page CSP blocks eval in the page world, so those pages run the script in an isolated world, which has its own globals.
+        [view callAsyncJavaScript:@"return await (0,eval)(source)" arguments:arguments inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:^(id value, NSError *error) {
+            if ([error.userInfo[@"WKJavaScriptExceptionMessage"] hasPrefix:@"EvalError: Refused to evaluate"]) [owner.view callAsyncJavaScript:@"return await (0,eval)(source)" arguments:arguments inFrame:nil inContentWorld:[WKContentWorld worldWithName:@"apps"] completionHandler:done];
+            else done(value, error);
         }];
     } else if ([op hasPrefix:@"cookies."]) {
         NSNumber *request = args[@"id"];

@@ -270,6 +270,10 @@ impl Browser {
                 );
             }
             "visible" => ensure!(arguments.is_boolean(), "Expected visibility boolean"),
+            "decide" => ensure!(
+                arguments["id"].is_u64() && arguments["allow"].is_boolean(),
+                "Expected navigation decision"
+            ),
             "back" | "forward" | "reload" | "stop" | "focus" | "inspect" | "state" => {}
             _ => bail!("Unknown browser command: {operation}"),
         }

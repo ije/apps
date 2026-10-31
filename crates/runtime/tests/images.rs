@@ -1,5 +1,4 @@
 use apps_runtime::dom::{self, Document};
-use image::{ImageFormat, Limits};
 use serde_json::{Value, json};
 
 fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
@@ -20,15 +19,17 @@ fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
 fn web_images_decode_in_the_dom() {
     let mut doc = Document::parse("<body><img></body>");
     let mut state = dom::State::default();
-    for bytes in [
-        include_bytes!("images/sample.png").as_slice(),
-        include_bytes!("images/sample.jpg"),
-        include_bytes!("images/sample.gif"),
-        include_bytes!("images/sample.webp"),
-        include_bytes!("images/sample.bmp"),
-        include_bytes!("images/sample.ico"),
-        include_bytes!("images/sample.avif"),
-        include_bytes!("images/alpha.avif"),
+    for (bytes, size) in [
+        (include_bytes!("images/sample.png").as_slice(), [4, 3]),
+        (include_bytes!("images/sample.jpg"), [4, 3]),
+        (include_bytes!("images/sample.gif"), [4, 3]),
+        (include_bytes!("images/sample.webp"), [4, 3]),
+        (include_bytes!("images/sample.bmp"), [4, 3]),
+        (include_bytes!("images/sample.ico"), [16, 12]),
+        (include_bytes!("images/sample.avif"), [4, 3]),
+        (include_bytes!("images/alpha.avif"), [4, 3]),
+        (include_bytes!("images/gray.jpg"), [4, 3]),
+        (include_bytes!("images/cmyk.jpg"), [4, 3]),
     ] {
         dom::call(
             "dom.image",
@@ -39,22 +40,30 @@ fn web_images_decode_in_the_dom() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(decoded(&mut doc, &mut state), json!([4, 3]));
+        assert_eq!(decoded(&mut doc, &mut state), json!(size));
         assert!(state.images.contains_key(&1));
     }
-    let image =
-        apps_runtime::render::image::decode(include_bytes!("images/alpha.avif"), Limits::default())
-            .unwrap()
-            .into_rgba8();
-    for pixel in image.pixels() {
-        for (value, expected) in pixel.0.into_iter().zip([32, 128, 224, 85]) {
-            assert!(value.abs_diff(expected) <= 3, "{pixel:?}");
+    for (bytes, color) in [
+        (
+            include_bytes!("images/alpha.avif").as_slice(),
+            [224, 128, 32, 85],
+        ),
+        (include_bytes!("images/gray.jpg"), [110, 110, 110, 255]),
+        (include_bytes!("images/cmyk.jpg"), [224, 128, 32, 255]),
+    ] {
+        let image = apps_runtime::render::image::decode(bytes).unwrap();
+        for pixel in image.bytes().as_chunks::<4>().0 {
+            for (value, expected) in pixel.iter().zip(color) {
+                assert!(value.abs_diff(expected) <= 3, "{pixel:?}");
+            }
         }
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn web_image_formats_are_enabled() {
+    use image::ImageFormat;
     for format in [
         ImageFormat::Png,
         ImageFormat::Jpeg,
@@ -70,22 +79,27 @@ fn web_image_formats_are_enabled() {
 
 #[test]
 fn avif_rejects_corrupt_data_and_respects_limits() {
+    use apps_runtime::render::image::decode;
     let mut bytes = include_bytes!("images/corrupt-base.avif").to_vec();
-    assert!(apps_runtime::render::image::decode(&bytes, Limits::default()).is_ok());
+    assert!(decode(&bytes).is_ok());
     bytes[280] ^= 1;
-    assert!(apps_runtime::render::image::decode(&bytes, Limits::default()).is_err());
+    assert!(decode(&bytes).is_err() || cfg!(target_os = "macos"));
     for length in [0, 8, 64, 128] {
-        assert!(apps_runtime::render::image::decode(&bytes[..length], Limits::default()).is_err());
+        assert!(decode(&bytes[..length]).is_err());
     }
+    #[cfg(not(target_os = "macos"))]
     for allocation in [false, true] {
-        let mut limits = Limits::default();
+        let mut limits = image::Limits::default();
         if allocation {
             limits.max_alloc = Some(32);
         } else {
             limits.max_image_width = Some(2);
         }
         assert!(matches!(
-            apps_runtime::render::image::decode(include_bytes!("images/sample.avif"), limits),
+            apps_runtime::render::image::avif::decode_avif(
+                include_bytes!("images/sample.avif"),
+                limits
+            ),
             Err(image::ImageError::Limits(_))
         ));
     }

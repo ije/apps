@@ -12,6 +12,7 @@ use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::CFString,
 };
@@ -52,6 +53,36 @@ use core_foundation::base::CFType;
 use std::sync::OnceLock;
 
 use super::open_type::apply_features_and_fallbacks;
+
+/// The `wght` variation axis tag.
+const WGHT: i64 = 0x77676874;
+
+unsafe extern "C" {
+    static kCTFontVariationAttribute: core_foundation::string::CFStringRef;
+    fn CTFontCopyVariation(
+        font: core_text::font::CTFontRef,
+    ) -> core_foundation::dictionary::CFDictionaryRef;
+    fn CTFontCreateCopyWithAttributes(
+        font: core_text::font::CTFontRef,
+        size: CGFloat,
+        matrix: *const core_graphics::geometry::CGAffineTransform,
+        attributes: core_text::font_descriptor::CTFontDescriptorRef,
+    ) -> core_text::font::CTFontRef;
+}
+
+/// The `wght` axis value of a variable font instance.
+fn variation_weight(font: &CTFont) -> Option<f32> {
+    let variations = unsafe { CTFontCopyVariation(font.as_concrete_TypeRef()) };
+    if variations.is_null() {
+        return None;
+    }
+    let variations: CFDictionary<CFNumber, CFNumber> =
+        unsafe { CFDictionary::wrap_under_create_rule(variations) };
+    variations
+        .find(CFNumber::from(WGHT))
+        .and_then(|weight| weight.to_f64())
+        .map(|weight| weight as f32)
+}
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
@@ -141,9 +172,30 @@ impl TextSystem {
                 font_ids
             }
         };
+        // font-kit puts Medium (0.23) at weight 530, so 500 picked Regular. Apple's weight
+        // constants are CSS weights 100 to 900, as in browsers.
         let properties = candidates
             .iter()
-            .map(|font_id| state.fonts[font_id.0].properties())
+            .map(|font_id| {
+                let font = &state.fonts[font_id.0];
+                let mut properties = font.properties();
+                if let Some(weight) = font
+                    .native_font()
+                    .all_traits()
+                    .get(unsafe { kCTFontWeightTrait })
+                    .downcast::<CFNumber>()
+                    .and_then(|weight| weight.to_f32())
+                {
+                    let knots = [-0.8, -0.6, -0.4, 0., 0.23, 0.3, 0.4, 0.56, 0.62];
+                    let index = knots.iter().rposition(|&knot| weight >= knot).unwrap_or(0);
+                    let next = knots.get(index + 1).filter(|_| weight >= knots[0]);
+                    let fraction =
+                        next.map_or(0., |next| (weight - knots[index]) / (next - knots[index]));
+                    properties.weight =
+                        font_kit::properties::Weight(100. * (index as f32 + 1. + fraction));
+                }
+                properties
+            })
             .collect::<SmallVec<[_; 4]>>();
         let index = font_kit::matching::find_best_match(
             &properties,
@@ -153,7 +205,12 @@ impl TextSystem {
                 stretch: Default::default(),
             },
         )?;
-        let font_id = candidates[index];
+        let mut font_id = candidates[index];
+        // Like Chrome, the system font's weight axis takes the exact CSS weight, which differs from its
+        // named faces for weights like 500 and 600.
+        if &*font.family == ".SystemUIFont" && font.weight.0 != 400. {
+            font_id = state.weighted(font_id, font.weight.0);
+        }
         state.font_selections.insert(font.clone(), font_id);
         Ok(font_id)
     }
@@ -166,6 +223,10 @@ impl TextSystem {
                 .load_font_table(u32::from_be_bytes(*b"OS/2"))
                 .filter(|table| table.len() >= 4)
                 .map_or(0., |table| i16::from_be_bytes([table[2], table[3]]) as f32),
+            tall_ascent: matches!(
+                font.family_name().as_str(),
+                "Times" | "Helvetica" | "Courier"
+            ),
             ..font_kit_metrics_to_metrics(font.metrics())
         }
     }
@@ -360,9 +421,51 @@ impl AppleTextSystemState {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
     }
 
+    /// The face with its `wght` axis at `weight`, created once.
+    fn weighted(&mut self, font_id: FontId, weight: f32) -> FontId {
+        let base = self.fonts[font_id.0].native_font();
+        let variations = CFDictionary::from_CFType_pairs(&[(
+            CFNumber::from(WGHT).as_CFType(),
+            CFNumber::from(f64::from(weight)).as_CFType(),
+        )]);
+        let attributes = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) },
+            variations.as_CFType(),
+        )]);
+        let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
+        let font = unsafe {
+            CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+                base.as_concrete_TypeRef(),
+                base.pt_size(),
+                std::ptr::null(),
+                descriptor.as_concrete_TypeRef(),
+            ))
+        };
+        let Some(name) = variation_weight(&font)
+            .map(|weight| format!("{}#wght{weight}", font.postscript_name()))
+        else {
+            return font_id;
+        };
+        if let Some(&id) = self.font_ids_by_postscript_name.get(&name) {
+            return id;
+        }
+        let id = FontId(self.fonts.len());
+        self.font_ids_by_postscript_name.insert(name.clone(), id);
+        self.postscript_names_by_font_id.insert(id, name);
+        self.fonts
+            .push(unsafe { font_kit::font::Font::from_native_font(&font) });
+        id
+    }
+
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
         let postscript_name = requested_font.postscript_name();
-        if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
+        if let Some(font_id) = variation_weight(&requested_font)
+            .and_then(|weight| {
+                self.font_ids_by_postscript_name
+                    .get(&format!("{postscript_name}#wght{weight}"))
+            })
+            .or_else(|| self.font_ids_by_postscript_name.get(&postscript_name))
+        {
             *font_id
         } else {
             let font_id = FontId(self.fonts.len());
@@ -665,6 +768,7 @@ fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
         cap_height: metrics.cap_height,
         x_height: metrics.x_height,
         average_width: 0.,
+        tall_ascent: false,
         bounding_box: bounds_from_rect(metrics.bounding_box),
     }
 }

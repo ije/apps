@@ -23,7 +23,7 @@ fn reports_defaults_and_rejects_invalid_arguments() {
         (vec!["check"], "Unknown command: check"),
         (vec!["check", "--help"], "Unknown command: check"),
         (
-            vec!["run", "one.js", "two.js"],
+            vec!["build", "one.js", "two.js"],
             "Unexpected argument: two.js",
         ),
     ] {
@@ -169,6 +169,7 @@ mod process {
             vec!["-D"],
             vec!["--devtools", "main.js"],
             vec!["main.js", "-D"],
+            vec!["main.js", "a", "--flag", "--", "-W"],
         ] {
             let output = app
                 .command()
@@ -183,9 +184,13 @@ mod process {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        let (ts, js) = (app.root.join("main.ts"), app.root.join("main.js"));
+        let (ts, js) = (ts.display(), js.display());
         assert_eq!(
             app.launches(),
-            "--bundle-stdin\n--bundle-stdin --devtools\n--bundle-stdin --devtools\n--bundle-stdin --devtools\n"
+            format!(
+                "--bundle-stdin -- {ts}\n--bundle-stdin --devtools -- {js}\n--bundle-stdin --devtools -- {js}\n--bundle-stdin --devtools -- {js}\n--bundle-stdin -- {js} a --flag -W\n"
+            )
         );
     }
 
@@ -276,7 +281,7 @@ mod process {
         assert!(
             app.launches()
                 .lines()
-                .all(|line| line == "--bundle-stdin --devtools")
+                .all(|line| line.starts_with("--bundle-stdin --devtools -- "))
         );
         assert!(!app.root.join(".apps").exists());
     }
@@ -316,7 +321,8 @@ mod process {
         app.wait(1);
         fs::write(&entry, "console.log(2);").unwrap();
         app.wait(2);
-        assert_eq!(app.launches(), "--bundle-stdin\n--bundle-stdin\n");
+        let line = format!("--bundle-stdin -- {}\n", entry.display());
+        assert_eq!(app.launches(), line.repeat(2));
     }
 
     #[test]

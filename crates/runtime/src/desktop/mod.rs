@@ -11,14 +11,15 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
+use renderer::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     rc::{Rc, Weak},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use renderer::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 
 pub(crate) struct View {
     pub(crate) handle: Option<WindowId>,
@@ -46,7 +47,8 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn from_bundle(bundle: crate::bundle::Bundle) -> Result<Self> {
-        let mut desktop = Self::create(&bundle.files, bundle.packaged, bundle.root)?;
+        let mut desktop =
+            Self::create(&bundle.files, bundle.scripts, bundle.packaged, bundle.root)?;
         desktop.pages = bundle.pages;
         Ok(desktop)
     }
@@ -57,6 +59,7 @@ impl Desktop {
         name: &str,
         path: &[usize],
         data: serde_json::Value,
+        window: Option<&mut renderer::Window>,
         cx: &mut App,
     ) -> bool {
         let renderer = runtime
@@ -67,14 +70,16 @@ impl Desktop {
         let Some(renderer) = renderer else {
             return false;
         };
-        let result = renderer.call(
-            "__appsDispatch",
-            &[
-                &serde_json::json!(name).to_string(),
-                &serde_json::json!(path).to_string(),
-                &data.to_string(),
-            ],
-        );
+        let result = crate::render::scripted(cx, window, || {
+            renderer.call(
+                "__appsDispatch",
+                &[
+                    &serde_json::json!(name).to_string(),
+                    &serde_json::json!(path).to_string(),
+                    &data.to_string(),
+                ],
+            )
+        });
         let allowed = result.as_ref().is_ok_and(|value| value == "true");
         if let Err(error) = result {
             eprintln!("apps: {error}");
@@ -94,11 +99,12 @@ impl Desktop {
     }
 
     pub fn new(files: &BBTreeMap<String, String>) -> Result<Self> {
-        Self::create(files, false, std::path::PathBuf::new())
+        Self::create(files, HashMap::new(), false, std::path::PathBuf::new())
     }
 
     fn create(
         files: &BBTreeMap<String, String>,
+        scripts: HashMap<String, bytes::Bytes>,
         packaged: bool,
         root: std::path::PathBuf,
     ) -> Result<Self> {
@@ -125,6 +131,7 @@ impl Desktop {
                 root
             },
             packaged,
+            scripts: Arc::new(scripts),
             assets: files
                 .get("assets.json")
                 .map(|source| serde_json::from_str(source))
@@ -237,11 +244,12 @@ impl Desktop {
                             let style = options["titleBarStyle"].as_str().unwrap_or("default");
                             let hidden = !frame || style != "default";
                             let lights = &options["trafficLightPosition"];
-                            let traffic_light_position = match (lights["x"].as_f64(), lights["y"].as_f64()) {
-                                (Some(x), Some(y)) => Some(point(px(x as f32), px(y as f32))),
-                                _ => (style == "hiddenInset").then(|| point(px(20.), px(18.))),
-                            }
-                            .filter(|_| frame && hidden);
+                            let traffic_light_position =
+                                match (lights["x"].as_f64(), lights["y"].as_f64()) {
+                                    (Some(x), Some(y)) => Some(point(px(x as f32), px(y as f32))),
+                                    _ => (style == "hiddenInset").then(|| point(px(20.), px(18.))),
+                                }
+                                .filter(|_| frame && hidden);
                             let outer = size(px(width), px(height));
                             let origin = match (options["x"].as_f64(), options["y"].as_f64()) {
                                 (Some(x), Some(y)) => point(px(x as f32), px(y as f32)),
@@ -260,8 +268,8 @@ impl Desktop {
                                 minimizable: options["minimizable"] != false,
                                 movable: options["movable"] != false,
                             };
-                            let handle = cx.open_window(window_options, |_, _| {
-                                let view = WebView::new(id, runtime, host);
+                            let handle = cx.open_window(window_options, |window, _| {
+                                let view = WebView::new(id, runtime, host, window.id());
                                 data = Rc::downgrade(&view.0);
                                 Box::new(view)
                             })?;
@@ -274,10 +282,21 @@ impl Desktop {
                                             size(px(max[0]), px(max[1])),
                                         ),
                                     ),
-                                    (options["alwaysOnTop"] == true, WindowChange::AlwaysOnTop(true)),
-                                    (options["maximizable"] == false, WindowChange::Maximizable(false)),
+                                    (
+                                        options["alwaysOnTop"] == true,
+                                        WindowChange::AlwaysOnTop(true),
+                                    ),
+                                    (
+                                        options["maximizable"] == false,
+                                        WindowChange::Maximizable(false),
+                                    ),
                                     (options["closable"] == false, WindowChange::Closable(false)),
-                                    (true, WindowChange::Background(renderer::rgba((background.0 << 8) | background.1 as u32))),
+                                    (
+                                        true,
+                                        WindowChange::Background(renderer::rgba(
+                                            (background.0 << 8) | background.1 as u32,
+                                        )),
+                                    ),
                                 ] {
                                     if apply {
                                         window.change_window(change);
@@ -318,60 +337,99 @@ impl Desktop {
                     "load" | "loadFile" => {
                         let value = args[2].as_str().context("Expected HTML text or path")?;
                         let page = args[3] == "page";
-                        let doc = (|| -> Result<Document> {
+                        let request = args[3].as_u64();
+                        let root = self.host.borrow().app_path.clone();
+                        let mut file = None;
+                        let location = if action == "load" {
+                            Ok("apps://app/".to_owned())
+                        } else if value.starts_with("apps:///") {
+                            Ok(value.to_owned())
+                        } else if value.starts_with("apps:") {
+                            Err((-300, "ERR_INVALID_URL"))
+                        } else if value.starts_with("file:") {
+                            url::Url::parse(value)
+                                .ok()
+                                .filter(|url| url.host_str().is_none_or(str::is_empty))
+                                .and_then(|url| url.to_file_path().ok())
+                                .map(|path| {
+                                    file = Some(path);
+                                    value.to_owned()
+                                })
+                                .ok_or((-300, "ERR_INVALID_URL"))
+                        } else {
+                            let path = root.join(value);
+                            let url = url::Url::from_file_path(&path)
+                                .map(String::from)
+                                .map_err(|_| (-300, "ERR_INVALID_URL"));
+                            file = Some(path);
+                            url
+                        };
+                        let read = || {
+                            let missing = (-6, "ERR_FILE_NOT_FOUND");
                             if action == "load" {
                                 return Ok(Document::parse(value));
                             }
                             if let Some(name) = value.strip_prefix("apps:///") {
                                 let name = name.split(['?', '#']).next().unwrap();
-                                return Ok(match self.pages.get(name) {
-                                    Some(doc) => doc.clone(),
-                                    None => Document::parse(
-                                        self.files
-                                            .get(name)
-                                            .context("Missing bundled HTML file")?,
-                                    ),
-                                });
+                                return match (self.pages.get(name), self.files.get(name)) {
+                                    (Some(doc), _) => Ok(doc.clone()),
+                                    (_, Some(source)) => Ok(Document::parse(source)),
+                                    _ => Err(missing),
+                                };
                             }
-                            ensure!(!value.starts_with("apps:"), "Invalid bundled page URL");
-                            let path = if value.starts_with("file:") {
-                                let url = url::Url::parse(value)?;
-                                ensure!(
-                                    url.host_str().is_none_or(str::is_empty),
-                                    "Remote file URLs are not allowed"
-                                );
-                                url.to_file_path()
-                                    .map_err(|_| anyhow::anyhow!("Invalid file URL"))?
-                            } else {
-                                value.into()
-                            };
-                            let metadata = std::fs::metadata(&path)
-                                .with_context(|| format!("Cannot read {}", path.display()))?;
-                            ensure!(
-                                metadata.is_file() && metadata.len() <= 64 << 20,
-                                "Page is not a file or is too large: {}",
-                                path.display()
-                            );
-                            Ok(Document::parse(
-                                &std::fs::read_to_string(&path)
-                                    .with_context(|| format!("Cannot read {}", path.display()))?,
-                            ))
-                        })();
-                        let doc = match doc {
-                            Ok(doc) => doc,
-                            Err(error) if page => {
-                                eprintln!("apps: navigation: {error:#}");
+                            let path = file.as_deref().unwrap();
+                            match std::fs::metadata(path) {
+                                Ok(metadata)
+                                    if metadata.is_file() && metadata.len() <= 64 << 20 =>
+                                {
+                                    std::fs::read_to_string(path)
+                                        .map(|source| Document::parse(&source))
+                                        .map_err(|_| (-2, "ERR_FAILED"))
+                                }
+                                Ok(_) => Err((-2, "ERR_FAILED")),
+                                Err(_) => Err(missing),
+                            }
+                        };
+                        let loaded = location
+                            .clone()
+                            .and_then(|location| read().map(|doc| (location, doc)));
+                        let (location, doc) = match loaded {
+                            Ok(loaded) => loaded,
+                            Err((code, description)) => {
+                                let url = location.unwrap_or_else(|_| value.to_owned());
+                                if page {
+                                    eprintln!(
+                                        "apps: navigation: {description} ({code}) loading '{url}'"
+                                    );
+                                }
+                                let event = serde_json::json!({"request":request,"url":url,"code":code,"description":description});
+                                if let Err(error) = self.main.eval(
+                                    &format!("__appsEvent('failed',{id},{event})"),
+                                    "apps:failed",
+                                ) {
+                                    eprintln!("apps: {error}");
+                                }
                                 continue;
                             }
-                            Err(error) => return Err(error),
                         };
+                        // WARNING: only pages that ship with the app run `<script type="preload">` with Node; user files and HTML strings never do.
+                        let trusted = location.starts_with("apps:///")
+                            || !page
+                                && file.as_ref().is_some_and(|path| {
+                                    std::fs::canonicalize(path).is_ok_and(|path| {
+                                        std::fs::canonicalize(&root)
+                                            .is_ok_and(|root| path.starts_with(root))
+                                    })
+                                });
                         self.host.borrow_mut().graphics.remove(&id);
+                        self.host.borrow_mut().media.remove(&id);
                         let bundled = self.host.borrow().scripts.clone();
                         let scripts = doc
                             .nodes
                             .iter()
-                            .filter(|n| n.tag == "script")
-                            .filter_map(|n| {
+                            .enumerate()
+                            .filter(|(_, n)| n.tag == "script")
+                            .filter_map(|(id, n)| {
                                 let kind = match n
                                     .attrs
                                     .get("type")
@@ -393,11 +451,12 @@ impl Desktop {
                                     .get("src")
                                     .and_then(|src| src.strip_prefix("apps:///"))
                                 else {
-                                    return Some((kind, n.text.as_str().into()));
+                                    return Some((kind, Cow::Owned(doc.text(id))));
                                 };
                                 let source = bundled
                                     .get(name)
-                                    .map(|source: &std::sync::Arc<str>| (kind, source.clone()));
+                                    .and_then(|source| std::str::from_utf8(source).ok())
+                                    .map(|source| (kind, Cow::Borrowed(source)));
                                 if source.is_none() {
                                     eprintln!("apps: missing bundled script {name}");
                                 }
@@ -421,7 +480,6 @@ impl Desktop {
                         view.preload = None;
                         view.renderer = None;
                         self.host.borrow_mut().bridge.remove(&id);
-                        let trusted = !page || value.starts_with("apps:///");
                         let preload = (trusted
                             && scripts.iter().any(|(kind, _)| *kind == "preload"))
                         .then(|| {
@@ -445,18 +503,6 @@ impl Desktop {
                                 eprintln!("apps: preload script: {error:#}");
                             }
                         }
-                        let location = if action == "load" {
-                            "apps://app/".to_owned()
-                        } else if ["apps:", "file:", "http:", "https:"]
-                            .iter()
-                            .any(|scheme| value.starts_with(scheme))
-                        {
-                            value.to_owned()
-                        } else {
-                            url::Url::from_file_path(std::path::absolute(value)?)
-                                .map_err(|_| anyhow::anyhow!("Invalid page path"))?
-                                .to_string()
-                        };
                         renderer.eval(
                             &format!("__appsSetLocation({})", serde_json::json!(location)),
                             "apps:location",
@@ -467,15 +513,34 @@ impl Desktop {
                         if let Err(error) = renderer.eval("__appsImages(document)", "apps:images") {
                             eprintln!("apps: {error}");
                         }
-                        for (kind, script) in &scripts {
-                            if *kind == "module"
-                                && let Err(error) = renderer.eval_page(script, "apps:page")
-                            {
+                        let page = |source: &str, url: &str| {
+                            if source == "__appsLoaded()" {
+                                renderer.eval(source, url)
+                            } else {
+                                renderer.eval_page(source, url)
+                            }
+                        };
+                        for (source, url) in scripts
+                            .iter()
+                            .filter(|(kind, _)| *kind == "module")
+                            .map(|(_, script)| (&**script, "apps:page"))
+                            .chain([("__appsLoaded()", "apps:loaded")])
+                        {
+                            if let Err(error) = match cx.as_deref_mut() {
+                                Some(cx) => crate::render::scripted(cx, None, || page(source, url)),
+                                None => page(source, url),
+                            } {
                                 if cx.is_none() {
                                     return Err(error);
                                 }
                                 eprintln!("apps: page script: {error:#}");
                             }
+                        }
+                        if let Some(preload) = &preload
+                            && let Err(error) = preload
+                                .eval("dispatchEvent(new Event('DOMContentLoaded'))", "apps:ready")
+                        {
+                            eprintln!("apps: preload script: {error:#}");
                         }
                         view.preload = preload;
                         view.renderer = Some(renderer);
@@ -484,8 +549,13 @@ impl Desktop {
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                             cx.refresh_window(handle);
                         }
-                        self.main
-                            .eval(&format!("__appsEvent('loaded',{id})"), "apps:loaded")?;
+                        let event = serde_json::json!({"request":request,"url":location});
+                        if let Err(error) = self.main.eval(
+                            &format!("__appsEvent('loaded',{id},{event})"),
+                            "apps:loaded",
+                        ) {
+                            eprintln!("apps: {error}");
+                        }
                     }
                     "devtools" => {
                         if self.host.borrow().packaged {
@@ -509,6 +579,7 @@ impl Desktop {
                             }
                             self.host.borrow_mut().pages.remove(&id);
                             self.host.borrow_mut().graphics.remove(&id);
+                            self.host.borrow_mut().media.remove(&id);
                             self.host.borrow_mut().viewports.remove(&id);
                             self.host.borrow_mut().backgrounds.remove(&id);
                             self.host.borrow_mut().dom.remove(&id);
@@ -533,14 +604,45 @@ impl Desktop {
                                         Ok(([width, height], bytes)) => serde_json::json!({"id":request,"width":width,"height":height,"png":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}),
                                         Err(error) => serde_json::json!({"id":request,"error":error.to_string()}),
                                     };
-                                    if let Ok(app) = runtime.try_borrow()
-                                        && let Err(error) = app.main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
-                                    {
-                                        eprintln!("apps: {error}");
-                                    }
-                                    Desktop::drive(runtime, cx);
+                                    // WARNING: the window is busy drawing here, so a capture requested by the reply must wait for the next drive.
+                                    cx.defer(move |cx| {
+                                        if let Ok(app) = runtime.try_borrow()
+                                            && let Err(error) = app.main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
+                                        {
+                                            eprintln!("apps: {error}");
+                                        }
+                                        Desktop::drive(runtime, cx);
+                                    });
                                 });
                             });
+                        }
+                    }
+                    "execute" | "executed" => {
+                        let request = &args[2];
+                        let result = match (action, self.views[&id].renderer.as_ref()) {
+                            ("executed", _) => Some(args[3].clone()),
+                            (_, None) => Some(serde_json::json!({"error":"The window has no page"}).to_string().into()),
+                            (_, Some(renderer)) => {
+                                let source = format!("(s=>{{try{{__appsExecuted({request},s.__appsCompile({},'apps:execute'),false)}}catch(e){{__appsExecuted({request},e,true)}}}})(this)", args[3]);
+                                let run = || renderer.eval_page(&source, "apps:execute");
+                                match cx.as_deref_mut() {
+                                    Some(cx) => crate::render::scripted(cx, None, run),
+                                    None => run(),
+                                }
+                                .err()
+                            }
+                                .map(|error| serde_json::json!({"error":error.to_string()}).to_string().into()),
+                        };
+                        if let Some(data) = result
+                            && let Err(error) = self.main.eval(
+                                &format!(
+                                    "__appsEvent('executed',{id},{})",
+                                    serde_json::json!({"request":request,"data":data})
+                                ),
+                                "apps:executed",
+                            )
+                        {
+                            eprintln!("apps: {error}");
                         }
                     }
                     "closing" => {
@@ -713,8 +815,9 @@ impl Desktop {
                     eprintln!("apps: {error}");
                 }
                 if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
-                    && let Err(error) =
+                    && let Err(error) = crate::render::scripted(cx, None, || {
                         renderer.eval("__appsDispatch('window:resize',[0])", "apps:resize")
+                    })
                 {
                     eprintln!("apps: {error}");
                 }
@@ -739,7 +842,7 @@ impl Desktop {
                         .map(|engine| (false, engine.as_ref()))
                 }))
             {
-                let next = match engine.tick() {
+                let next = match crate::render::scripted(cx, None, || engine.tick()) {
                     Ok(next) => next,
                     Err(error) if !fatal => {
                         eprintln!("apps: page script: {error:#}");
@@ -751,6 +854,23 @@ impl Desktop {
                     delay = delay.min(next);
                 }
             }
+            // WARNING: IPC listeners run in a later task than their sender, so queued messages are delivered here in rounds, for at most 4 ms; the rest waits for the next wake.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(4) {
+                let mut busy = false;
+                for engine in std::iter::once(&app.main).chain(
+                    app.views
+                        .values()
+                        .filter_map(|view| view.preload.as_deref()),
+                ) {
+                    busy |=
+                        crate::render::scripted(cx, None, || engine.call("__appsBridgeDrain", &[]))
+                            .is_ok_and(|drained| drained == "true");
+                }
+                if !busy {
+                    break;
+                }
+            }
             app.pump(Some(cx), Some(&runtime))?;
             if app.quit {
                 return Ok(None);
@@ -759,7 +879,9 @@ impl Desktop {
                 delay = delay.min(0);
                 for view in app.views.values() {
                     if let Some(renderer) = &view.renderer
-                        && let Err(error) = renderer.eval("__appsMediaChanged()", "apps:theme")
+                        && let Err(error) = crate::render::scripted(cx, None, || {
+                            renderer.eval("__appsMediaChanged()", "apps:theme")
+                        })
                     {
                         eprintln!("apps: page script: {error:#}");
                     }
@@ -808,7 +930,9 @@ impl Desktop {
                     let active = !browsers.is_empty();
                     let events = browsers
                         .iter()
-                        .flat_map(|(&node, (browser, _))| browser.poll().into_iter().map(move |event| (node, event)))
+                        .flat_map(|(&node, (browser, _))| {
+                            browser.poll().into_iter().map(move |event| (node, event))
+                        })
                         .collect::<Vec<_>>();
                     drop(browsers);
                     if active && cfg!(target_os = "linux") {
@@ -848,11 +972,28 @@ impl Desktop {
                 }
             }
             for (&id, view) in &app.views {
-                let dirty = {
+                let (dirty, frame) = {
                     let host = app.host.borrow();
-                    host.pages.get(&id).is_some_and(|p| p.dirty)
-                        || host.graphics.get(&id).is_some_and(|gpu| gpu.presented())
+                    (
+                        host.pages.get(&id).is_some_and(|p| p.dirty)
+                            || host.graphics.get(&id).is_some_and(|gpu| gpu.presented()),
+                        host.dom.get(&id).is_some_and(|dom| dom.frame_requested),
+                    )
                 };
+                // WARNING: animation frame callbacks run before the frame lays out, like in browsers.
+                if frame
+                    && let (Some(handle), Some(data)) = (view.handle, view.data.upgrade())
+                    && cx
+                        .update_window(handle, |window, _| {
+                            window.on_next_frame(move |window, cx| {
+                                crate::render::animation_frame(data, window, cx)
+                            })
+                        })
+                        .is_some()
+                    && let Some(dom) = app.host.borrow_mut().dom.get_mut(&id)
+                {
+                    dom.frame_requested = false;
+                }
                 if dirty && let Some(handle) = view.handle {
                     cx.refresh_window(handle);
                 }
@@ -901,10 +1042,19 @@ impl Desktop {
             Err(error) => {
                 eprintln!("apps: {error:#}");
                 let mut app = runtime.borrow_mut();
+                app.fail();
                 app.error = Some(error);
-                app.quit = true;
                 cx.quit();
             }
+        }
+    }
+
+    /// Quits with a failure code, because AppKit exits with 0 after its quit hook.
+    fn fail(&mut self) {
+        self.quit = true;
+        let mut host = self.host.borrow_mut();
+        if host.exit_code == 0 {
+            host.exit_code = 1;
         }
     }
 
@@ -968,11 +1118,10 @@ impl Desktop {
         renderer::run(move |cx| {
             let reopen = runtime.clone();
             cx.on_reopen(move |cx, visible| {
-                if let Err(error) = reopen
-                    .borrow()
-                    .main
-                    .eval(&format!("__appsEvent('activate',0,{visible})"), "apps:activate")
-                {
+                if let Err(error) = reopen.borrow().main.eval(
+                    &format!("__appsEvent('activate',0,{visible})"),
+                    "apps:activate",
+                ) {
                     eprintln!("apps: {error}");
                 }
                 Self::drive(reopen.clone(), cx);
@@ -1004,7 +1153,9 @@ impl Desktop {
                         .filter(|url| url.scheme() == "file")
                         .and_then(|url| url.to_file_path().ok())
                     {
-                        Some(path) => format!("__appsEvent('open-file',0,{})", serde_json::json!(path)),
+                        Some(path) => {
+                            format!("__appsEvent('open-file',0,{})", serde_json::json!(path))
+                        }
                         None => format!("__appsEvent('open-url',0,{})", serde_json::json!(url)),
                     };
                     if let Err(error) = runtime.borrow().main.eval(&event, "apps:open") {
@@ -1048,9 +1199,13 @@ impl Desktop {
             let _ = runtime.borrow().waker.set(cx.waker());
             #[cfg(target_os = "macos")]
             native::observe();
-            if let Err(error) = runtime.borrow().main.eval("__appsEvent('ready')", "apps:ready") {
+            if let Err(error) = runtime
+                .borrow()
+                .main
+                .eval("__appsEvent('ready')", "apps:ready")
+            {
                 eprintln!("apps: {error}");
-                runtime.borrow_mut().quit = true;
+                runtime.borrow_mut().fail();
                 cx.quit();
                 return;
             }
@@ -1070,7 +1225,8 @@ impl Desktop {
                 match handle {
                     Some(handle) => {
                         cx.update_window(handle, |window, _| {
-                            window.on_next_frame(|window, _| window.on_next_frame(move |_, _| init()))
+                            window
+                                .on_next_frame(|window, _| window.on_next_frame(move |_, _| init()))
                         });
                     }
                     None => init(),
@@ -1079,14 +1235,18 @@ impl Desktop {
             if devtools && !runtime.borrow().quit {
                 let mut app = runtime.borrow_mut();
                 let id = app.views.keys().copied().min().unwrap_or(0);
-                let title = if id == 0 { "Main".to_owned() } else { format!("Window {id}") };
+                let title = if id == 0 {
+                    "Main".to_owned()
+                } else {
+                    format!("Window {id}")
+                };
                 match devtools::DevTools::new(&title) {
                     Ok(tools) => {
                         app.devtools.insert(id, tools);
                     }
                     Err(error) => {
                         app.error = Some(error);
-                        app.quit = true;
+                        app.fail();
                         cx.quit();
                         return;
                     }
@@ -1165,6 +1325,16 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             args[2].as_str().and_then(crate::style::color).is_some(),
             "Invalid background color"
         ),
+        "load" | "loadFile" => ensure!(
+            args[2].is_string() && (args[3].is_null() || args[3].is_u64()),
+            "Invalid page load"
+        ),
+        "execute" => ensure!(
+            args[2].is_u64() && args[3].is_string(),
+            "Invalid script request"
+        ),
+        "capture" => ensure!(args[2].is_u64(), "Invalid capture request"),
+        "executed" => bail!("Unsupported window action: executed"),
         _ => {}
     }
     Ok(())
@@ -1185,35 +1355,111 @@ fn window_state(window: &renderer::Window) -> serde_json::Value {
     serde_json::json!({"frame":rect(state.frame),"content":rect(state.content),"minimized":state.minimized,"maximized":state.maximized,"fullscreen":state.fullscreen,"visible":state.visible,"focused":window.is_window_active(),"resizing":state.resizing})
 }
 
+/// Crops a captured frame to `rect` (in window points) and encodes it as PNG, in CSS pixels when `css` is set.
+fn png(
+    ([width, height], pixels): ([u32; 2], Vec<u8>),
+    scale: f32,
+    rect: &serde_json::Value,
+    css: bool,
+) -> Result<([u32; 2], Vec<u8>)> {
+    use resvg::tiny_skia as skia;
+    let mut image = skia::IntSize::from_wh(width, height)
+        .and_then(|size| skia::Pixmap::from_vec(pixels, size))
+        .context("Invalid frame")?;
+    if rect.is_object() {
+        let value = |key: &str| {
+            (rect[key].as_f64().unwrap_or(0.) as f32 * scale)
+                .round()
+                .max(0.) as u32
+        };
+        let (x, y) = (value("x").min(width), value("y").min(height));
+        image = skia::IntRect::from_xywh(
+            x as i32,
+            y as i32,
+            value("width").min(width - x),
+            value("height").min(height - y),
+        )
+        .and_then(|rect| image.clone_rect(rect))
+        .context("Empty capture area")?;
+    }
+    if css && scale > 1. {
+        let size = |value: u32| ((value as f32 / scale).round() as u32).max(1);
+        let mut scaled = skia::Pixmap::new(size(image.width()), size(image.height()))
+            .context("Invalid frame")?;
+        scaled.draw_pixmap(
+            0,
+            0,
+            image.as_ref(),
+            &skia::PixmapPaint {
+                quality: skia::FilterQuality::Bicubic,
+                ..Default::default()
+            },
+            skia::Transform::from_scale(
+                scaled.width() as f32 / image.width() as f32,
+                scaled.height() as f32 / image.height() as f32,
+            ),
+            None,
+        );
+        image = scaled;
+    }
+    Ok(([image.width(), image.height()], image.encode_png()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn navigation_trust_and_optional_preloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("page.html");
-        std::fs::write(
-            &path,
-            "<script type='preload'>__apps.ipcRenderer.send('pwned')</script><body>safe</body>",
-        )
-        .unwrap();
-        let files = BBTreeMap::from([(
+    fn app(code: &str, extra: &[(&str, &str)], root: std::path::PathBuf) -> Desktop {
+        let mut files = BBTreeMap::from([(
             "app.js".into(),
             format!(
                 "$appsDefine({});",
-                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":"globalThis.pwned=0;__apps.ipcMain.on('pwned',()=>pwned++);__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.load('<body>first</body>')})"})
+                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":code})
             ),
         )]);
-        let mut desktop = Desktop::new(&files).unwrap();
+        for (name, source) in extra {
+            files.insert((*name).into(), (*source).into());
+        }
+        let mut desktop = Desktop::create(&files, HashMap::new(), false, root).unwrap();
         desktop.main.eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
-        assert!(desktop.views[&1].preload.is_none());
+        desktop
+    }
+
+    #[test]
+    fn navigation_trust_and_optional_preloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, user) = (dir.path().join("app"), dir.path().join("user"));
+        let page =
+            "<script type='preload'>__apps.ipcRenderer.send('pwned')</script><body>safe</body>";
+        for directory in [&root, &user] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("page.html"), page).unwrap();
+        }
+        let code = format!(
+            "globalThis.pwned=0;__apps.ipcMain.on('pwned',()=>pwned++);__apps.app.whenReady().then(()=>{{globalThis.win=new __apps.BrowserWindow();win.load({})}})",
+            serde_json::json!(page)
+        );
+        let mut desktop = app(&code, &[("bundled.html", page)], root.clone());
+        let step = |desktop: &mut Desktop, script: &str, preload: bool, pwned: &str| {
+            if !script.is_empty() {
+                desktop.main.eval(script, "test").unwrap();
+                desktop.pump(None, None).unwrap();
+            }
+            desktop.main.tick().unwrap();
+            assert_eq!(desktop.views[&1].preload.is_some(), preload, "{script}");
+            assert_eq!(
+                desktop.main.eval("pwned", "test").unwrap(),
+                pwned,
+                "{script}"
+            );
+        };
+        step(&mut desktop, "", false, "0");
         desktop
             .main
             .eval("win.webContents.send('unused',42)", "test")
             .unwrap();
-        let url = url::Url::from_file_path(&path).unwrap();
+        let url = url::Url::from_file_path(root.join("page.html")).unwrap();
         desktop.views[&1]
             .renderer
             .as_ref()
@@ -1224,26 +1470,142 @@ mod tests {
             )
             .unwrap();
         desktop.pump(None, None).unwrap();
-        assert!(desktop.views[&1].preload.is_none());
-        assert_eq!(desktop.main.eval("pwned", "test").unwrap(), "0");
-        desktop
-            .main
-            .eval(
-                &format!("win.loadFile({})", serde_json::json!(path)),
-                "test",
-            )
-            .unwrap();
-        desktop.pump(None, None).unwrap();
-        assert!(desktop.views[&1].preload.is_some());
-        assert_eq!(desktop.main.eval("pwned", "test").unwrap(), "1");
+        step(&mut desktop, "", false, "0");
+        let load = |path: &std::path::Path| format!("win.loadFile({})", serde_json::json!(path));
+        step(&mut desktop, &load(&user.join("page.html")), false, "0");
+        step(
+            &mut desktop,
+            &load(&root.join("../user/page.html")),
+            false,
+            "0",
+        );
+        step(&mut desktop, &load(&root.join("page.html")), true, "1");
+        step(&mut desktop, "win.loadFile('page.html')", true, "2");
         assert_eq!(
             desktop.views[&1]
                 .renderer
                 .as_ref()
                 .unwrap()
-                .eval("location.protocol", "test")
+                .eval("location.href", "test")
                 .unwrap(),
-            "file:"
+            url.as_str()
+        );
+        step(
+            &mut desktop,
+            "win.loadFile('apps:///bundled.html')",
+            true,
+            "3",
+        );
+        step(&mut desktop, "win.reload()", true, "4");
+    }
+
+    #[test]
+    fn loads_return_promises_and_failures_never_quit() {
+        let code = r#"
+            globalThis.log = [];
+            __apps.app.whenReady().then(() => {
+                globalThis.win = new __apps.BrowserWindow();
+                for (const name of ['did-start-loading', 'did-navigate', 'dom-ready', 'did-finish-load', 'did-stop-loading', 'did-fail-load', 'destroyed'])
+                    win.webContents.on(name, (event, ...args) => log.push(name + (name === 'did-fail-load' || name === 'did-navigate' ? ':' + args.slice(0, 3).join(' ') : '')));
+                win.loadFile('missing.html').then(() => log.push('resolved'), error => log.push('rejected:' + [error.message, error.code, error.errno].join(' ')));
+            });
+        "#;
+        let mut desktop = app(code, &[], std::path::PathBuf::from("/app"));
+        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        assert!(!desktop.quit && desktop.views.contains_key(&1));
+        assert_eq!(
+            eval(&desktop, "log.join('|')"),
+            "did-fail-load:-6 ERR_FILE_NOT_FOUND file:///app/missing.html|did-stop-loading|rejected:ERR_FILE_NOT_FOUND (-6) loading 'file:///app/missing.html' ERR_FILE_NOT_FOUND -6"
+        );
+        eval(
+            &desktop,
+            "log.length = 0; win.load('<p>first</p>').catch(error => log.push(error.code)); win.load('<title>T</title><p>second</p>').then(() => log.push('resolved:' + win.webContents.getURL() + ':' + win.webContents.isLoading()))",
+        );
+        assert_eq!(
+            eval(&desktop, "log.join('|')+':'+win.webContents.isLoading()"),
+            "ERR_ABORTED:true"
+        );
+        desktop.pump(None, None).unwrap();
+        assert_eq!(
+            eval(&desktop, "log.slice(1).join('|')"),
+            "did-start-loading|did-navigate:apps://app/ -1 |dom-ready|did-finish-load|did-stop-loading|did-start-loading|did-navigate:apps://app/ -1 |dom-ready|did-finish-load|did-stop-loading|resolved:apps://app/:false"
+        );
+        eval(
+            &desktop,
+            "globalThis.results = []; for (const code of ['document.title', 'new Promise(r => setTimeout(() => r({list: [1, 2]}), 0))', 'throw new TypeError(\"inner\")', 'undefined']) win.webContents.executeJavaScript(code).then(v => results.push(JSON.stringify(v) ?? 'undefined'), e => results.push('error:' + e.message))",
+        );
+        desktop.pump(None, None).unwrap();
+        for engine in [
+            &desktop.main,
+            desktop.views[&1].renderer.as_deref().unwrap(),
+        ] {
+            engine.tick().unwrap();
+        }
+        desktop.pump(None, None).unwrap();
+        assert_eq!(
+            eval(&desktop, "results.join('|')"),
+            r#""T"|error:inner|undefined|{"list":[1,2]}"#
+        );
+        assert!(
+            desktop.views[&1]
+                .renderer
+                .as_ref()
+                .unwrap()
+                .eval("eval('1')", "test")
+                .is_err(),
+            "executeJavaScript must not unlock eval for the page"
+        );
+        assert!(
+            eval(
+                &desktop,
+                "try { win.webContents.executeJavaScript('1'); win.load(1); 'ok' } catch (e) { e.message }"
+            ) == "ok"
+        );
+        assert!(!desktop.quit);
+    }
+
+    #[test]
+    fn fatal_errors_quit_with_a_failure_code() {
+        let mut desktop = app("", &[], std::path::PathBuf::new());
+        desktop.fail();
+        assert!(desktop.quit && desktop.host.borrow().exit_code == 1);
+        desktop.host.borrow_mut().exit_code = 3;
+        desktop.fail();
+        assert_eq!(desktop.host.borrow().exit_code, 3);
+    }
+
+    #[test]
+    fn destroy_is_synchronous_and_web_contents_are_real() {
+        let code = r#"
+            const {app, BrowserWindow, webContents} = __apps;
+            globalThis.log = [];
+            app.on('window-all-closed', () => log.push('all-closed'));
+            app.whenReady().then(() => {
+                globalThis.win = new BrowserWindow();
+                globalThis.other = new BrowserWindow();
+                for (const name of ['close', 'closed']) win.on(name, () => log.push(name));
+                win.webContents.on('destroyed', () => log.push('destroyed'));
+                globalThis.ids = [win.id, win.webContents.id, other.webContents.id, webContents.fromId(other.webContents.id) === other.webContents, webContents.getAllWebContents().length, BrowserWindow.fromWebContents(win.webContents) === win].join();
+                win.destroy();
+                log.push(win.isDestroyed(), win.webContents.isDestroyed(), BrowserWindow.getAllWindows().length);
+                for (const call of [() => win.setTitle('x'), () => win.close(), () => win.webContents.send('x'), () => win.loadFile('x.html')]) try { call(); log.push('no throw'); } catch (error) { log.push(error.message); }
+                win.destroy();
+            });
+        "#;
+        let desktop = app(code, &[], std::path::PathBuf::new());
+        assert_eq!(
+            desktop.main.eval("ids", "test").unwrap(),
+            "1,1,2,true,2,true"
+        );
+        assert_eq!(
+            desktop.main.eval("log.join('|')", "test").unwrap(),
+            "destroyed|closed|true|true|1|Object has been destroyed|Object has been destroyed|Object has been destroyed|Object has been destroyed"
+        );
+        assert!(!desktop.views.contains_key(&1) && desktop.views.contains_key(&2));
+        desktop.main.eval("other.destroy()", "test").unwrap();
+        assert_eq!(
+            desktop.main.eval("log.at(-1)", "test").unwrap(),
+            "all-closed"
         );
     }
 
@@ -1592,46 +1954,8 @@ mod tests {
                 renderer
                     .eval("getComputedStyle(document.body).color", "test")
                     .unwrap(),
-                "purple"
+                "rgb(128, 0, 128)"
             );
         }
     }
-}
-
-/// Crops a captured frame to `rect` (in window points) and encodes it as PNG, in CSS pixels when `css` is set.
-fn png(
-    ([width, height], pixels): ([u32; 2], Vec<u8>),
-    scale: f32,
-    rect: &serde_json::Value,
-    css: bool,
-) -> Result<([u32; 2], Vec<u8>)> {
-    let mut image = image::RgbaImage::from_raw(width, height, pixels).context("Invalid frame")?;
-    if rect.is_object() {
-        let value = |key: &str| {
-            (rect[key].as_f64().unwrap_or(0.) as f32 * scale)
-                .round()
-                .max(0.) as u32
-        };
-        let (x, y) = (value("x").min(width), value("y").min(height));
-        let size = [
-            value("width").min(width - x),
-            value("height").min(height - y),
-        ];
-        image = image::imageops::crop_imm(&image, x, y, size[0], size[1]).to_image();
-    }
-    if css && scale > 1. {
-        let size = |value: u32| ((value as f32 / scale).round() as u32).max(1);
-        image = image::imageops::resize(
-            &image,
-            size(image.width()),
-            size(image.height()),
-            image::imageops::FilterType::Triangle,
-        );
-    }
-    let mut bytes = Vec::new();
-    image.write_to(
-        &mut std::io::Cursor::new(&mut bytes),
-        image::ImageFormat::Png,
-    )?;
-    Ok(([image.width(), image.height()], bytes))
 }

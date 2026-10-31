@@ -99,6 +99,8 @@ struct TextLayoutInner {
     wrap_width: Option<Pixels>,
     truncated: bool,
     size: Size<Pixels>,
+    /// The first and last line's baselines.
+    baselines: [Pixels; 2],
     bounds: Option<Bounds<Pixels>>,
 }
 
@@ -144,10 +146,10 @@ impl TextLayout {
                     text,
                     runs,
                     style,
-                    scale,
                     layout,
+                    ..
                 } = measured;
-                let line_height = px((style.line_height.0 * scale).round() / scale);
+                let line_height = style.line_height;
                 let definite = |space: AvailableSpace| match space {
                     AvailableSpace::Definite(width) => Some(width),
                     _ => None,
@@ -162,7 +164,7 @@ impl TextLayout {
                     && truncate.is_none()
                     && !inner.truncated
                 {
-                    return inner.size;
+                    return (inner.size, Some(inner.baselines));
                 }
                 let system = window.text_system().clone();
                 let (text, runs, truncated) = match truncate {
@@ -183,6 +185,7 @@ impl TextLayout {
                         style.line_clamp,
                         style.text_indent,
                         style.text_wrap,
+                        style.word_break,
                     )
                     .unwrap_or_default();
                 let mut size = Size::<Pixels>::default();
@@ -191,6 +194,13 @@ impl TextLayout {
                     size.height += line.height;
                     size.width = size.width.max(line.width);
                 }
+                let baseline = system.baseline(
+                    system.resolve_font(&style.font()),
+                    style.font_size,
+                    line_height,
+                    window.scale_factor(),
+                );
+                let baselines = [baseline, baseline + size.height - line_height];
                 *layout.0.borrow_mut() = Some(TextLayoutInner {
                     len,
                     lines,
@@ -198,9 +208,10 @@ impl TextLayout {
                     wrap_width,
                     truncated,
                     size,
+                    baselines,
                     bounds: None,
                 });
-                size
+                (size, Some(baselines))
             },
         );
         *self = measured.layout.clone();
@@ -342,6 +353,7 @@ fn truncate_text(
         runs,
         clamp.map(|(_, width)| width),
         None,
+        style.word_break,
     ) else {
         return unchanged();
     };

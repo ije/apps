@@ -99,6 +99,16 @@ int main(int argc, const char *argv[]) {
         if (NSApp.mainMenu.numberOfItems != 1 || ![[NSApp.mainMenu itemAtIndex:0].title isEqual:@"Custom"]) return 18;
         native("menu.set", "null");
         if (NSApp.mainMenu) return 19;
+        native("menu.set", "[{\"label\":\"Keys\",\"submenu\":[{\"label\":\"Home\",\"accelerator\":\"Meta+Home\"},{\"label\":\"F13\",\"accelerator\":\"F13\"},{\"label\":\"Plus\",\"accelerator\":\"CmdOrCtrl+Plus\"},{\"label\":\"Slash\",\"accelerator\":\"Cmd+\\\\\"},{\"label\":\"Media\",\"accelerator\":\"MediaPlayPause\"},{\"label\":\"Zoom\",\"role\":\"zoomin\"},{\"label\":\"A\",\"type\":\"radio\",\"checked\":true,\"click\":1},{\"label\":\"B\",\"type\":\"radio\",\"click\":2}]}]");
+        NSMenu *keys = [NSApp.mainMenu itemAtIndex:0].submenu;
+        unichar home = NSHomeFunctionKey, f13 = NSF13FunctionKey;
+        if (keys.numberOfItems != 8 || ![[keys itemAtIndex:0].keyEquivalent isEqual:[NSString stringWithCharacters:&home length:1]] || [keys itemAtIndex:0].keyEquivalentModifierMask != NSEventModifierFlagCommand || ![[keys itemAtIndex:1].keyEquivalent isEqual:[NSString stringWithCharacters:&f13 length:1]] || ![[keys itemAtIndex:2].keyEquivalent isEqual:@"+"] || ![[keys itemAtIndex:3].keyEquivalent isEqual:@"\\"] || [keys itemAtIndex:4].keyEquivalent.length || [keys itemAtIndex:5].action != @selector(menuAction:)) return 31;
+        [NSApp sendAction:[keys itemAtIndex:7].action to:[keys itemAtIndex:7].target from:[keys itemAtIndex:7]];
+        if ([keys itemAtIndex:6].state != NSControlStateValueOff || [keys itemAtIndex:7].state != NSControlStateValueOn) return 32;
+        native("poll", "null");
+        native("menu.set", "null");
+        NSArray *displays = native("screen.displays", "null");
+        if (!displays.count || [displays[0][@"bounds"][@"x"] doubleValue] != 0 || [displays[0][@"bounds"][@"y"] doubleValue] != 0 || [displays[0][@"scaleFactor"] doubleValue] < 1 || ![native("screen.cursor", "null")[@"x"] isKindOfClass:NSNumber.class]) return 33;
         NSDictionary *options=@{ @"id": NSUUID.UUID.UUIDString, @"argv": @[@"smoke",@"second"], @"cwd": NSTemporaryDirectory(), @"data": @{ @"value": @42 } };
         NSString *arguments=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:options options:0 error:nil] encoding:NSUTF8StringEncoding];
         if (![native("app.singleInstance",arguments.UTF8String) boolValue]) return 7;
@@ -127,7 +137,7 @@ int main(int argc, const char *argv[]) {
         [native("poll", "null") count];
         NSWindow *owner = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 200, 100) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
         [owner orderFront:nil];
-        for (NSString *request in @[@"{\"message\":\"Async\",\"async\":7}", @"{\"async\":8}"]) {
+        for (NSString *request in @[@"{\"message\":\"Async\",\"type\":\"warning\",\"buttons\":[\"OK\",\"Cancel\"],\"defaultId\":1,\"cancelId\":0,\"async\":7}", @"{\"filters\":[{\"name\":\"Images\",\"extensions\":[\"png\",\"jpg\"]}],\"buttonLabel\":\"Pick\",\"async\":8}"]) {
             __block BOOL running = NO;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
                 running = !NSApp.modalWindow;

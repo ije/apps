@@ -1,5 +1,8 @@
 globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}) => {
   const contents = new Map(), pending = new Map(), partitions = new Map(), layouts = new WeakMap(), owners = new WeakMap();
+  const safe = { nodeIntegration: false, nodeIntegrationInWorker: false, nodeIntegrationInSubFrames: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, experimentalFeatures: false };
+  const eventOf = (fields = {}) => ({ ...fields, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  const failure = text => { const match = /^(\w*Error): ([\s\S]*)$/.exec(text ?? ''); return match ? Object.assign(new Error(match[2]), { name: match[1] }) : new Error(text); };
   let nextRequest = 0;
   class WebContents extends EventEmitter {
     #destroyed = false;
@@ -10,10 +13,12 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     #back = false;
     #forward = false;
     #devTools;
+    #open = null;
     constructor(options = {}) {
       super();
-      Object.defineProperty(this, 'id', { value: call('browser.create', { partition: options.partition || 'persist:default', javascript: options.javascript ?? true, inspectable: options.devTools ?? true }) });
+      Object.defineProperty(this, 'id', { value: call('browser.create', { partition: options.partition || 'persist:default', javascript: options.javascript ?? true, inspectable: options.devTools ?? true, navigation: true, ...(options.show ? { show: true } : {}) }) });
       this.#devTools = options.devTools !== false;
+      this.#partition = options.partition;
       this.session = Object.freeze({
         cookies: Object.freeze({
           get: (filter = {}) => this.#request('cookies.get', { filter }),
@@ -36,12 +41,15 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       });
     }
     loadFile(file, options = {}) {
-      const url = __apps.url.pathToFileURL(__apps.path.resolve(file));
+      if (/^apps:/.test(file)) return Promise.reject(new Error('Bundled pages load in BrowserWindow. Use loadURL() with a file URL in WebContentsView'));
+      const url = __apps.url.pathToFileURL(__apps.path.resolve(__apps.app.getAppPath(), file));
       if (options.query) url.search = new URLSearchParams(options.query).toString();
       if (options.search !== undefined) url.search = options.search;
       if (options.hash !== undefined) url.hash = options.hash;
       return this.loadURL(url.href);
     }
+    #partition;
+    setWindowOpenHandler(handler) { if (handler !== null && typeof handler !== 'function') throw new TypeError('Expected a window open handler'); this.#open = handler; }
     #request(operation, arguments_) {
       if (this.#destroyed) return Promise.reject(new Error('Browser is destroyed'));
       return new Promise((resolve, reject) => {
@@ -84,18 +92,39 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       this.emit('destroyed');
     }
     _event(event) {
-      if (event.url !== undefined) this.#url = event.url;
+      if (event.url !== undefined && /^did-/.test(event.type)) this.#url = event.url;
       if (event.title !== undefined) this.#title = event.title;
       if (event.canGoBack !== undefined) this.#back = event.canGoBack;
       if (event.canGoForward !== undefined) this.#forward = event.canGoForward;
       if (event.type === 'did-start-loading') this.#loading = true;
       if (event.type === 'did-finish-load' || event.type === 'did-fail-load') this.#loading = false;
       if (event.type === 'closed') { this.close(); return; }
-      if (event.type === 'did-fail-load') this.emit(event.type, {}, event.code ?? -2, event.error ?? 'Navigation failed', event.url ?? this.#url, true, -1, -1);
-      else if (event.type === 'page-title-updated') this.emit(event.type, {}, this.#title, true);
-      else if (event.type === 'did-navigate') this.emit(event.type, {}, this.#url, -1, '');
-      else if (event.type === 'did-start-loading' || event.type === 'did-finish-load') this.emit(event.type);
-      else this.emit(event.type, event);
+      if (event.type === 'will-navigate') {
+        const navigation = eventOf({ url: event.url, isSameDocument: false, isMainFrame: true });
+        try { this.emit('will-navigate', navigation, event.url, false, true, -1, -1); }
+        finally { call('browser.command', this.id, 'decide', { id: event.id, allow: !navigation.defaultPrevented && !this.#destroyed }); }
+      }
+      else if (event.type === 'window-open') {
+        const details = { url: event.url ?? '', frameName: event.frameName ?? '', features: event.features ?? '', disposition: 'new-window', referrer: { url: this.#url, policy: 'strict-origin-when-cross-origin' } };
+        const result = this.#open ? this.#open(details) : { action: 'allow' };
+        if (result?.action === 'allow' && details.url) {
+          const child = new WebContents({ partition: this.#partition, show: true });
+          created(child);
+          child.loadURL(details.url).catch(() => {});
+          this.emit('did-create-window', child, details);
+        }
+      }
+      else if (event.type === 'did-fail-load') this.emit(event.type, eventOf(), event.code ?? -2, event.error ?? 'Navigation failed', event.url ?? this.#url, true, -1, -1);
+      else if (event.type === 'page-title-updated') this.emit(event.type, eventOf(), this.#title, true);
+      else if (event.type === 'did-navigate') this.emit(event.type, eventOf(), this.#url, -1, '');
+      else if (event.type === 'did-start-loading' || event.type === 'did-finish-load' || event.type === 'dom-ready') this.emit(event.type, eventOf());
+      else if (event.type === 'render-process-gone') this.emit(event.type, eventOf(), { reason: 'crashed', exitCode: 0 });
+      else if (event.type === 'message' && (event.data?.kind === 'console' || event.data?.kind === 'error')) {
+        const level = event.data.kind === 'error' ? 'error' : { log: 'info', info: 'info', warn: 'warning', error: 'error', debug: 'debug' }[event.data.level] ?? 'info';
+        const message = event.data.kind === 'error' ? String(event.data.message ?? '') : (event.data.args ?? []).join(' '), line = event.data.line ?? 0, source = event.data.source ?? event.url ?? '';
+        this.emit('console-message', eventOf({ level, message, lineNumber: line, sourceId: source }), ['debug', 'info', 'warning', 'error'].indexOf(level), message, line, source);
+      }
+      else if (event.type === 'message') this.emit('ipc-message', eventOf(), 'message', event.data?.data);
       if (event.type === 'did-finish-load' || event.type === 'did-fail-load') this.emit('did-stop-loading');
     }
   }
@@ -164,7 +193,10 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
   class WebContentsView extends View {
     constructor(options = {}) {
       super();
-      const webContents = options.webContents ?? new WebContents(options.webPreferences);
+      const preferences = options.webPreferences ?? {};
+      for (const [key, value] of Object.entries(preferences))
+        if (value !== undefined && (key === 'partition' ? typeof value !== 'string' : key === 'javascript' || key === 'devTools' ? typeof value !== 'boolean' : !Object.hasOwn(safe, key) || safe[key] !== value)) throw new Error(`Unsupported webPreferences option: ${key}`);
+      const webContents = options.webContents ?? new WebContents(preferences);
       if (!(webContents instanceof WebContents) || webContents.isDestroyed()) throw new TypeError('Expected a live WebContents');
       if (owners.has(webContents)) {
         call('browser.detach', webContents.id);
@@ -183,7 +215,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
         const request = pending.get(event.id);
         if (!request || request.view !== view) continue;
         pending.delete(event.id);
-        if (event.error) request.reject(new Error(event.error)); else request.resolve(event.value);
+        if (event.error) request.reject(failure(event.error)); else request.resolve(event.value);
       } else contents.get(view)?._event(event);
     }
   };
@@ -196,7 +228,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     get defaultSession() { return this.fromPartition('persist:default'); },
   });
   // WARNING: Linux webviews need GTK pumping from poll; other platforms wake the loop on events.
-  return { View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux',
+  return { View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux', reserve: () => call('browser.reserve'), all: () => [...contents.values()].filter(item => ![...partitions.values()].includes(item)),
     contentView(window, options) {
       const view = new View(), state = layouts.get(view);
       state.root = state.window = window;
@@ -209,10 +241,12 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
 
 globalThis.__appsNativeShell = (call, EventEmitter) => {
   const native = (op, args = null) => call('native.' + op, args);
-  const shortcuts = new Map(), menuCallbacks = new Map(), notifications = new Map();
-  let nextNativeID = 0, menuActive = false, menuReady = false, applicationMenu, observeTheme = false, observePower = false, observeApp = false, nativeApp;
-  const bindApp = (app, identifier) => {
+  const shortcuts = new Map(), notifications = new Map();
+  const eventOf = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  let nextNativeID = 0, menuActive = false, menuReady = false, applicationMenu, observeTheme = false, observePower = false, observeApp = false, nativeApp, focused = () => null;
+  const bindApp = (app, identifier, focusedWindow = focused) => {
     nativeApp = app;
+    focused = focusedWindow;
     let ownsInstance = false, badge = '', badgeCount = 0;
     app.requestSingleInstanceLock = (additionalData = null) => {
       ownsInstance = native('app.singleInstance', { id: String(identifier), argv: process.argv, cwd: process.cwd(), data: additionalData });
@@ -274,96 +308,121 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     showSaveDialogSync: (...args) => { const result = native('dialog.save', options(args)); return result.canceled ? undefined : result.filePath; },
     showMessageBox: async (...args) => later('dialog.message', options(args)),
     showMessageBoxSync: (...args) => native('dialog.message', options(args)).response,
-    showErrorBox: (title, content) => native('dialog.message', { message: String(title), detail: String(content) }),
+    showErrorBox: (title, content) => native('dialog.message', { message: String(title), detail: String(content), type: 'error' }),
   });
   const nativeTheme = new EventEmitter();
-  nativeTheme.on = function (name, listener) { native('theme.get'); observeTheme = true; return EventEmitter.prototype.on.call(this, name, listener); };
+  let themeSource = 'system';
+  // WARNING: only macOS reports the system theme, so other platforms read light defaults instead of throwing.
+  const theme = () => { try { return native('theme.get'); } catch { return { themeSource, shouldUseDarkColors: themeSource === 'dark', shouldUseHighContrastColors: false, shouldUseDarkColorsForSystemIntegratedUI: themeSource === 'dark', shouldUseInvertedColorScheme: false, inForcedColorsMode: false, prefersReducedTransparency: false, shouldDifferentiateWithoutColor: false }; } };
+  for (const method of ['on', 'addListener', 'prependListener', 'prependOnceListener']) nativeTheme[method] = function (...args) { theme(); observeTheme = true; return EventEmitter.prototype[method].apply(this, args); };
   for (const name of ['shouldUseDarkColors', 'shouldUseHighContrastColors', 'shouldUseDarkColorsForSystemIntegratedUI', 'shouldUseInvertedColorScheme', 'inForcedColorsMode', 'prefersReducedTransparency', 'shouldDifferentiateWithoutColor']) {
-    Object.defineProperty(nativeTheme, name, { enumerable: true, get: () => native('theme.get')[name] });
+    Object.defineProperty(nativeTheme, name, { enumerable: true, get: () => theme()[name] });
   }
   Object.defineProperty(nativeTheme, 'themeSource', {
-    enumerable: true, get: () => native('theme.get').themeSource, set: value => {
+    enumerable: true, get: () => theme().themeSource, set: value => {
       if (!['system', 'light', 'dark'].includes(value)) throw new TypeError('Invalid theme source');
-      native('theme.set', value);
+      try { native('theme.set', value); } catch { themeSource = value; }
     },
   });
   const safeStorage = Object.freeze({
     isEncryptionAvailable: () => native('safeStorage.available'),
-    encryptString: value => Uint8Array.from(atob(native('safeStorage.encrypt', String(value))), char => char.charCodeAt(0)),
+    encryptString: value => Buffer.from(native('safeStorage.encrypt', String(value)), 'base64'),
     decryptString: bytes => {
       if (!ArrayBuffer.isView(bytes)) throw new TypeError('Expected encrypted bytes');
-      let value = ''; for (const byte of new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)) value += String.fromCharCode(byte);
-      return native('safeStorage.decrypt', btoa(value));
+      return native('safeStorage.decrypt', Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64'));
     },
   });
   class Notification extends EventEmitter {
     #id;
+    static isSupported() { return process.platform === 'darwin'; }
     constructor(options = {}) { super(); this.options = { ...options }; }
-    show() { this.#id = native('notification.show', this.options); notifications.set(this.#id, this); }
-    close() { if (this.#id) { native('notification.close', this.#id); notifications.delete(this.#id); this.emit('close'); } }
+    show() {
+      try { this.#id = native('notification.show', this.options); notifications.set(this.#id, this); }
+      catch (error) { setTimeout(() => this.emit('failed', eventOf(), error.message), 0); }
+    }
+    close() { if (this.#id) { native('notification.close', this.#id); notifications.delete(this.#id); this.emit('close', eventOf()); } }
   }
-  class Menu {
-    constructor() { this.items = []; }
+  const roles = { undo: ['Undo', 'CommandOrControl+Z'], redo: ['Redo', 'Shift+CommandOrControl+Z'], cut: ['Cut', 'CommandOrControl+X'], copy: ['Copy', 'CommandOrControl+C'], paste: ['Paste', 'CommandOrControl+V'], pasteandmatchstyle: ['Paste and Match Style', 'Shift+Option+CommandOrControl+V'], delete: ['Delete'], selectall: ['Select All', 'CommandOrControl+A'],
+    reload: ['Reload', 'CommandOrControl+R'], forcereload: ['Force Reload', 'Shift+CommandOrControl+R'], toggledevtools: ['Toggle Developer Tools', 'Alt+CommandOrControl+I'], resetzoom: ['Actual Size', 'CommandOrControl+0'], zoomin: ['Zoom In', 'CommandOrControl+Plus'], zoomout: ['Zoom Out', 'CommandOrControl+-'], togglespellchecker: ['Check Spelling While Typing'], togglefullscreen: ['Toggle Full Screen', 'Control+Command+F'],
+    window: ['Window'], minimize: ['Minimize', 'CommandOrControl+M'], close: ['Close Window', 'CommandOrControl+W'], help: ['Help'], about: [name => 'About ' + name], services: ['Services'], hide: [name => 'Hide ' + name, 'Command+H'], hideothers: ['Hide Others', 'Command+Alt+H'], unhide: ['Show All'], quit: [name => 'Quit ' + name, 'Command+Q'],
+    startspeaking: ['Start Speaking'], stopspeaking: ['Stop Speaking'], zoom: ['Zoom'], front: ['Bring All to Front'], appmenu: [name => name], filemenu: ['File'], editmenu: ['Edit'], viewmenu: ['View'], windowmenu: ['Window'], sharemenu: ['Share'], recentdocuments: ['Open Recent'], clearrecentdocuments: ['Clear Menu'],
+    toggletabbar: ['Show Tab Bar'], selectnexttab: ['Select Next Tab'], selectprevioustab: ['Select Previous Tab'], showalltabs: ['Show All Tabs'], mergeallwindows: ['Merge All Windows'], movetabtonewwindow: ['Move Tab to New Window'], showsubstitutions: ['Show Substitutions'], togglesmartquotes: ['Smart Quotes'], togglesmartdashes: ['Smart Dashes'], toggletextreplacement: ['Text Replacement'] };
+  const separator = { type: 'separator' };
+  const submenus = {
+    appmenu: () => [{ role: 'about' }, separator, { role: 'services' }, separator, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, separator, { role: 'quit' }],
+    filemenu: () => [{ role: 'close' }],
+    editmenu: () => [{ role: 'undo' }, { role: 'redo' }, separator, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'pasteAndMatchStyle' }, { role: 'delete' }, { role: 'selectAll' }, separator, { label: 'Speech', submenu: [{ role: 'startSpeaking' }, { role: 'stopSpeaking' }] }],
+    viewmenu: () => [{ role: 'reload' }, { role: 'forceReload' }, ...(nativeApp?.isPackaged ? [] : [{ role: 'toggleDevTools' }]), separator, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, separator, { role: 'togglefullscreen' }],
+    windowmenu: () => [{ role: 'minimize' }, { role: 'zoom' }, separator, { role: 'front' }],
+    recentdocuments: () => [{ role: 'clearRecentDocuments' }],
+  };
+  class MenuItem {
+    constructor(options = {}) {
+      const role = typeof options.role === 'string' ? options.role : undefined, key = role?.toLowerCase(), defaults = roles[key] ?? [], label = defaults[0];
+      let submenu = options.submenu instanceof Menu ? options.submenu : Array.isArray(options.submenu) ? Menu.buildFromTemplate(options.submenu) : submenus[key] ? Menu.buildFromTemplate(submenus[key]()) : undefined;
+      Object.assign(this, { id: options.id, label: options.label ?? (typeof label === 'function' ? label(nativeApp?.getName() ?? '') : label ?? ''), sublabel: options.sublabel ?? '', toolTip: options.toolTip ?? '', role, type: options.type ?? (submenu ? 'submenu' : 'normal'), accelerator: options.accelerator ?? defaults[1], icon: options.icon, enabled: options.enabled ?? true, visible: options.visible ?? true, checked: options.checked ?? false, submenu, registerAccelerator: options.registerAccelerator ?? true, menu: null });
+      const action = options.click;
+      this.click = (event = {}, window = focused(), contents = window?.webContents) => {
+        if (this.type === 'checkbox') this.checked = !this.checked;
+        if (this.type === 'radio') {
+          const items = this.menu?.items ?? [this];
+          let start = items.indexOf(this), end = start;
+          while (start > 0 && items[start - 1].type === 'radio') start--;
+          while (end + 1 < items.length && items[end + 1].type === 'radio') end++;
+          for (let i = start; i <= end; i++) items[i].checked = items[i] === this;
+        }
+        if (key === 'reload' || key === 'forcereload') return contents?.reload();
+        if (!key && typeof action === 'function') action(this, window, event);
+      };
+    }
+  }
+  let interactive = false;
+  const serialize = (menu, items) => menu.items.map(item => {
+    item.menu = menu;
+    items.set(++nextNativeID, item);
+    if (!item.submenu && item.type !== 'separator' && (!item.role || /^(force)?reload$/i.test(item.role))) interactive = true;
+    return { label: String(item.label), type: String(item.type), ...(item.role ? { role: item.role.toLowerCase() } : {}), ...(item.accelerator && item.registerAccelerator !== false ? { accelerator: String(item.accelerator) } : {}), ...(item.toolTip ? { toolTip: String(item.toolTip) } : {}), enabled: !!item.enabled, visible: !!item.visible, checked: !!item.checked, click: nextNativeID, ...(item.submenu ? { submenu: serialize(item.submenu, items) } : {}) };
+  });
+  class Menu extends EventEmitter {
+    constructor() { super(); this.items = []; }
     static buildFromTemplate(template) {
       if (!Array.isArray(template)) throw new TypeError('Expected menu template');
       const menu = new Menu();
-      menu.items = template.map(item => {
-        const value = { ...item };
-        if (value.submenu) value.submenu = Menu.buildFromTemplate(value.submenu).items;
-        if (typeof value.click === 'function') { const id = ++nextNativeID; menuCallbacks.set(id, { callback: value.click, item }); value.click = id; }
-        return value;
-      });
+      for (const item of template) menu.append(item instanceof MenuItem ? item : new MenuItem(item));
       return menu;
     }
     static setApplicationMenu(menu) {
-      if (menuReady || nativeApp?.isReady()) { native('menu.set', menu?.items ?? null); menuReady = true; }
+      if (menu != null && !(menu instanceof Menu)) throw new TypeError('Expected a Menu');
+      interactive = false;
+      if (menuReady || nativeApp?.isReady()) { applicationItems = new Map(); native('menu.set', menu ? serialize(menu, applicationItems) : null); menuReady = true; }
       applicationMenu = menu ?? null;
-      menuActive = menuReady && !!menu && menuCallbacks.size > 0;
+      menuActive = menuReady && interactive;
     }
     static getApplicationMenu() { return applicationMenu ?? null; }
-    popup(options = {}) { menuActive = true; native('menu.popup', { template: this.items, ...(options.x === undefined ? {} : { x: options.x }), ...(options.y === undefined ? {} : { y: options.y }) }); options.callback?.(); }
+    append(item) { this.insert(this.items.length, item); }
+    insert(position, item) { if (!(item instanceof MenuItem)) throw new TypeError('Expected a MenuItem'); item.menu = this; this.items.splice(position, 0, item); }
+    getMenuItemById(id) { for (const item of this.items) { const found = item.id === id ? item : item.submenu?.getMenuItemById(id); if (found) return found; } return null; }
+    popup(options = {}) {
+      popupItems = new Map();
+      const template = serialize(this, popupItems);
+      this.emit('menu-will-show', eventOf());
+      native('menu.popup', { template, ...(options.x === undefined ? {} : { x: options.x }), ...(options.y === undefined ? {} : { y: options.y }) });
+      this.emit('menu-will-close', eventOf());
+      options.callback?.();
+    }
+    closePopup() {}
   }
+  let applicationItems = new Map(), popupItems = new Map();
   globalThis.__appsInitMenu = () => {
     if (menuReady) return;
     if (applicationMenu === undefined) {
-      const name = nativeApp.getName();
       applicationMenu = Menu.buildFromTemplate([
-        { label: name, submenu: [
-          { label: 'About ' + name, role: 'about' },
-          { type: 'separator' },
-          { label: 'Services', role: 'services' },
-          { type: 'separator' },
-          { label: 'Hide ' + name, role: 'hide', accelerator: 'Command+H' },
-          { label: 'Hide Others', role: 'hideOthers', accelerator: 'Command+Alt+H' },
-          { label: 'Show All', role: 'unhide' },
-          { type: 'separator' },
-          { label: 'Quit ' + name, role: 'quit', accelerator: 'Command+Q' },
-        ] },
-        { label: 'File', submenu: [{ label: 'Close Window', role: 'close', accelerator: 'Command+W' }] },
-        { label: 'Edit', submenu: [
-          { label: 'Undo', role: 'undo', accelerator: 'Command+Z' },
-          { label: 'Redo', role: 'redo', accelerator: 'Command+Shift+Z' },
-          { type: 'separator' },
-          { label: 'Cut', role: 'cut', accelerator: 'Command+X' },
-          { label: 'Copy', role: 'copy', accelerator: 'Command+C' },
-          { label: 'Paste', role: 'paste', accelerator: 'Command+V' },
-          { label: 'Paste and Match Style', role: 'pasteAndMatchStyle', accelerator: 'Command+Alt+Shift+V' },
-          { label: 'Delete', role: 'delete' },
-          { label: 'Select All', role: 'selectAll', accelerator: 'Command+A' },
-          { type: 'separator' },
-          { label: 'Speech', submenu: [{ label: 'Start Speaking', role: 'startSpeaking' }, { label: 'Stop Speaking', role: 'stopSpeaking' }] },
-        ] },
-        { label: 'View', submenu: [
-          ...(!nativeApp.isPackaged ? [{ label: 'Toggle Developer Tools', role: 'toggleDevTools', accelerator: 'Command+Alt+I' }, { type: 'separator' }] : []),
-          { label: 'Toggle Full Screen', role: 'togglefullscreen', accelerator: 'Control+Command+F' },
-        ] },
-        { label: 'Window', role: 'windowMenu', submenu: [
-          { label: 'Minimize', role: 'minimize', accelerator: 'Command+M' },
-          { label: 'Zoom', role: 'zoom' },
-          { type: 'separator' },
-          { label: 'Bring All to Front', role: 'front' },
-        ] },
-        { label: 'Help', role: 'help', submenu: [{ label: 'About ' + name, role: 'about' }] },
+        { role: 'appMenu' },
+        { role: 'fileMenu' },
+        { role: 'editMenu' },
+        { label: 'View', submenu: [...(nativeApp.isPackaged ? [] : [{ role: 'toggleDevTools' }, separator]), { role: 'togglefullscreen' }] },
+        { role: 'windowMenu' },
+        { role: 'help', submenu: [{ role: 'about' }] },
       ]);
     }
     menuReady = true;
@@ -377,6 +436,7 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
       if (!native('shortcut.register', { id, accelerator })) return false;
       shortcuts.set(accelerator, { id, callback }); return true;
     },
+    registerAll(accelerators, callback) { for (const accelerator of accelerators) this.register(accelerator, callback); },
     unregister(accelerator) { const item = shortcuts.get(accelerator); if (item) { native('shortcut.unregister', item.id); shortcuts.delete(accelerator); } },
     unregisterAll() { for (const accelerator of [...shortcuts.keys()]) this.unregister(accelerator); },
     isRegistered: accelerator => shortcuts.has(accelerator),
@@ -392,27 +452,52 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     getCurrentThermalState: () => native('power.thermal'),
     on(name, listener) { native('power.init'); observePower = true; return EventEmitter.prototype.on.call(this, name, listener); },
   });
+  let displays = null;
+  const screen = new EventEmitter();
+  const distance = (display, x, y) => { const { x: left, y: top, width, height } = display.bounds; return Math.hypot(Math.max(left - x, 0, x - left - width), Math.max(top - y, 0, y - top - height)); };
+  const nearest = (x, y) => native('screen.displays').reduce((best, display) => distance(display, x, y) < distance(best, x, y) ? display : best);
+  Object.assign(screen, {
+    getAllDisplays: () => native('screen.displays'),
+    getPrimaryDisplay: () => native('screen.displays')[0],
+    getCursorScreenPoint: () => native('screen.cursor'),
+    getDisplayNearestPoint: point => nearest(point.x, point.y),
+    getDisplayMatching(rect) {
+      const area = display => { const b = display.bounds; return Math.max(0, Math.min(b.x + b.width, rect.x + rect.width) - Math.max(b.x, rect.x)) * Math.max(0, Math.min(b.y + b.height, rect.y + rect.height) - Math.max(b.y, rect.y)); };
+      const best = native('screen.displays').reduce((best, display) => area(display) > area(best) ? display : best);
+      return area(best) > 0 ? best : nearest(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    },
+    on(name, listener) { displays ??= native('screen.displays'); return EventEmitter.prototype.on.call(this, name, listener); },
+  });
   const poll = () => {
-    if (!menuActive && !shortcuts.size && !notifications.size && !dialogs.size && !observeTheme && !observePower && !observeApp) return;
+    if (!menuActive && !popupItems.size && !shortcuts.size && !notifications.size && !dialogs.size && !observeTheme && !observePower && !observeApp && !displays) return;
     for (const event of native('poll')) {
       if (event.type === 'dialog') { dialogs.get(event.id)?.(event.value); dialogs.delete(event.id); }
       else if (event.type === 'shortcut') { for (const item of shortcuts.values()) if (item.id === event.id) item.callback(); }
-      else if (event.type === 'menu') { const item = menuCallbacks.get(event.id); if (item) { if (item.item.type === 'checkbox') item.item.checked = event.checked; item.callback(item.item); } }
+      else if (event.type === 'menu') (applicationItems.get(event.id) ?? popupItems.get(event.id))?.click({ shiftKey: !!event.shift, ctrlKey: !!event.control, altKey: !!event.alt, metaKey: !!event.meta, triggeredByAccelerator: !!event.accelerator });
       else if (event.type === 'theme') nativeTheme.emit('updated');
       else if (event.type === 'power') powerMonitor.emit(event.event, event.event === 'thermal-state-change' ? { state: native('power.thermal') } : undefined);
+      else if (event.type === 'screen' && displays) {
+        const next = native('screen.displays'), old = new Map(displays.map(display => [display.id, display]));
+        displays = next;
+        for (const display of next) {
+          const before = old.get(display.id);
+          old.delete(display.id);
+          const changed = before ? ['bounds', 'workArea', 'scaleFactor', 'rotation'].filter(key => JSON.stringify(before[key]) !== JSON.stringify(display[key])) : [];
+          if (!before) screen.emit('display-added', eventOf(), display);
+          else if (changed.length) screen.emit('display-metrics-changed', eventOf(), display, changed);
+        }
+        for (const display of old.values()) screen.emit('display-removed', eventOf(), display);
+      }
       else if (event.type === 'app' && nativeApp) {
-        const message = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
-        if (event.event === 'open-url') nativeApp.emit('open-url', message, event.url);
-        else if (event.event === 'second-instance') nativeApp.emit('second-instance', message, event.args, event.cwd, event.data);
+        if (event.event === 'open-url') nativeApp.emit('open-url', eventOf(), event.url);
+        else if (event.event === 'second-instance') nativeApp.emit('second-instance', eventOf(), event.args, event.cwd, event.data);
       }
       else if (event.type === 'notification') {
         const notification = notifications.get(event.id);
-        if (notification) notification.emit(event.event, event.error ? new Error(event.error) : undefined);
-        if (event.event === 'error' || event.event === 'close') notifications.delete(event.id);
+        if (event.event === 'failed' || event.event === 'close') notifications.delete(event.id);
+        notification?.emit(event.event, eventOf(), ...(event.error ? [event.error] : []));
       }
     }
   };
-  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, globalShortcut, powerMonitor, bindApp, poll, pending: () => menuActive || shortcuts.size > 0 || notifications.size > 0 || observePower || observeApp };
-
-
+  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, MenuItem, globalShortcut, powerMonitor, screen, bindApp, poll, pending: () => menuActive || shortcuts.size > 0 || notifications.size > 0 || observePower || observeApp };
 };

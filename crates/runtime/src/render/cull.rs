@@ -21,6 +21,8 @@ pub(crate) const SIZED: u16 = 64;
 pub(crate) const STALE: u16 = 128;
 /// The box's children in the flow are not the ones of the last frame.
 pub(crate) const RELISTED: u16 = 256;
+/// The subtree sizes something in viewport units, so a frame that resizes the viewport lays it out.
+pub(crate) const VIEWPORT: u16 = 512;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {
@@ -44,6 +46,8 @@ pub(crate) struct Cull {
     pub(crate) enabled: bool,
     /// The viewport size, scale and font loads of the last frame.
     pub(crate) frame: [f32; 4],
+    /// Whether this frame has another viewport size than the last one.
+    pub(crate) resized: bool,
     /// The scroll offsets of the last frame, by scroll container, `0` for the page.
     pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     /// The nodes that are not hidden, built with `info`.
@@ -57,6 +61,8 @@ pub(super) struct Zone {
     pub(super) top: f32,
     pub(super) bottom: f32,
     pub(super) clips: Vec<usize>,
+    /// The viewport changed size since the last frame.
+    pub(super) resized: bool,
 }
 
 impl Zone {
@@ -239,6 +245,25 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         (display == "none", HIDDEN),
         (solid, SOLID),
         (!auto(Prop::HEIGHT) || !auto(Prop::FLEX_BASIS), SIZED),
+        (
+            style.iter().any(|(prop, value)| {
+                let bytes = value.as_bytes();
+                !prop.is_custom()
+                    && bytes.iter().enumerate().any(|(index, &byte)| {
+                        byte == b'v'
+                            && matches!(
+                                bytes.get(index + 1),
+                                Some(b'w' | b'h' | b'i' | b'b' | b'm')
+                            )
+                            && bytes[..index]
+                                .iter()
+                                .rev()
+                                .find(|byte| !matches!(byte, b's' | b'l' | b'd'))
+                                .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+                    })
+            }),
+            VIEWPORT,
+        ),
     ]
     .into_iter()
     .fold(0, |flags, (on, bit)| if on { flags | bit } else { flags })
@@ -254,7 +279,9 @@ pub(super) fn member(
     margin: f32,
     flex: bool,
 ) -> Option<([f32; 4], [f32; 2])> {
-    let fits = info.flags & (BLOCKED | SOLID) == SOLID && (!flex || info.flags & SIZED == 0);
+    let fits = info.flags & (BLOCKED | SOLID) == SOLID
+        && (!flex || info.flags & SIZED == 0)
+        && (!zone.resized || info.flags & VIEWPORT == 0);
     if !fits || info.revision == 0 || placed != info.revision {
         return None;
     }
@@ -536,7 +563,8 @@ mod tests {
              <div id=m style='position:relative;top:2px'></div><div id=n style='position:relative'></div>\
              <div id=o style='flex-grow:1'></div><div id=p style='height:50%'></div>\
              <div id=q style='height:20px'></div><div id=r style='margin:auto'></div>\
-             <div id=u style='margin-bottom:2%'></div><ul><li id=v></li></ul>",
+             <div id=u style='margin-bottom:2%'></div><ul><li id=v></li></ul>\
+             <div id=w style='min-height:100dvh'></div><div id=x style='padding:0 .5vw;overflow:visible'></div>",
         );
         let flags = |name: &str| {
             let node = id(name);
@@ -547,6 +575,10 @@ mod tests {
                 600.,
             )
         };
+        assert_eq!(flags("w") & VIEWPORT, VIEWPORT);
+        assert_eq!(flags("x") & VIEWPORT, VIEWPORT);
+        assert_eq!(flags("a") & VIEWPORT, 0);
+        assert_eq!(flags("n") & VIEWPORT, 0);
         let text = doc.nodes[id("v")]
             .parent
             .map_or(0, |list| doc.nodes[list].children[0]);
@@ -639,6 +671,7 @@ mod tests {
             top: 0.,
             bottom: 600.,
             clips: Vec::new(),
+            resized: false,
         };
         let info = Info {
             revision: 7,
@@ -657,6 +690,43 @@ mod tests {
             .map(|(bounds, _)| bounds)
         };
         assert_eq!(member(info, 7, below, false), Some([0., 1300., 116., 20.]));
+        let viewport = Info {
+            revision: 7,
+            flags: SOLID | VIEWPORT,
+        };
+        assert!(member(viewport, 7, below, false).is_some());
+        let resized = Zone {
+            resized: true,
+            ..Zone {
+                top: 0.,
+                bottom: 600.,
+                clips: Vec::new(),
+                resized: false,
+            }
+        };
+        let bounds = Some(&below);
+        assert!(
+            super::member(
+                viewport,
+                (7, [116., 20.], [0.; 4]),
+                bounds,
+                &resized,
+                600.,
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            super::member(
+                info,
+                (7, [116., 20.], [0.; 4]),
+                bounds,
+                &resized,
+                600.,
+                false
+            )
+            .is_some()
+        );
         assert_eq!(
             member(info, 7, [0., -621., 100., 20.], false),
             Some([0., -621., 116., 20.])
@@ -728,6 +798,7 @@ mod tests {
             top: 2000.,
             bottom: 2400.,
             clips: vec![3],
+            resized: false,
         };
         assert_eq!(
             super::member(

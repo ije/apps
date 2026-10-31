@@ -31,7 +31,7 @@ fn browser_window_rejects_url_loads() {
         .unwrap();
     assert_eq!(
         host.borrow().commands.as_slice(),
-        &[serde_json::json!({"op":"window","args":["loadFile",1,"apps:///page.html"]})]
+        &[serde_json::json!({"op":"window","args":["loadFile",1,"apps:///page.html",1]})]
     );
 }
 

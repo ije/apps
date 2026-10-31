@@ -65,7 +65,7 @@ fn native_addons_values_callbacks_and_contexts() {
             collect("addon.finalizerCount()-initialFinalizers>=299990"),
             "Finalizers waited for a lazy sweep"
         );
-        engine.eval("globalThis.externals=addon.externalCount();globalThis.moved=addon.externalBuffer().buffer.transfer();addon.setLoader(()=>{try{globalThis.loaded=__appsLoadAddon('fixture/second.node').add(1,1)}catch(error){globalThis.loaded=String(error)}});addon.loading();", "test").unwrap();
+        engine.eval("globalThis.externals=addon.externalCount();globalThis.moved=addon.externalBuffer().buffer.transfer();addon.setLoader(()=>{try{globalThis.loaded=__appsLoadAddon('fixture/second.node').add(1,1)}catch(error){globalThis.loaded=String(error)}});addon.loading();0", "test").unwrap();
         assert!(collect("globalThis.loaded!==undefined"));
         assert_eq!(engine.eval("loaded", "test").unwrap(), "3");
         assert_eq!(

@@ -11,9 +11,17 @@ pub(crate) type Measurements = rustc_hash::FxHashMap<(usize, Option<u32>, Option
 pub(crate) struct Grid {
     pub columns: Vec<f32>,
     pub rows: Vec<f32>,
-    pub cells: Vec<(usize, [usize; 4], [f32; 4])>,
+    /// Each item, its cell, its margin box, and whether the grid uses its baselines.
+    pub cells: Vec<(usize, [usize; 4], [f32; 4], bool)>,
     pub gap: [f32; 2],
+    /// In an item's slot: the grid uses the item's baselines, so its layout reports them.
+    pub baseline: bool,
+    /// The grid's first baseline from its content box top, once its items' baselines are known.
+    pub first_baseline: Option<f32>,
 }
+
+/// The first and last baselines of grid items from their last layout, by node.
+pub(crate) type Baselines = rustc_hash::FxHashMap<usize, [Option<f32>; 2]>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Sizing {
@@ -241,6 +249,7 @@ fn size(
     gap: f32,
     available: Option<f32>,
     stretch: bool,
+    table: bool,
 ) -> Vec<f32> {
     use Sizing::*;
     let count = tracks.len();
@@ -404,7 +413,19 @@ fn size(
         }
         *limit = limit.max(base[i]);
     }
-    if let Some(space) = available {
+    if let Some(space) = available
+        && table
+    {
+        // Table columns grow from their min-content toward their max-content width in proportion to the gap.
+        let free = space - base.iter().sum::<f32>() - gaps(count);
+        let room: f32 = (0..count).map(|i| limit[i] - base[i]).sum();
+        if free > 0. && room > 0. {
+            let share = (free / room).min(1.);
+            for i in 0..count {
+                base[i] += (limit[i] - base[i]) * share;
+            }
+        }
+    } else if let Some(space) = available {
         let mut free = space - base.iter().sum::<f32>() - gaps(count);
         for _ in 0..=count {
             let open: Vec<_> = (0..count).filter(|&i| base[i] < limit[i]).collect();
@@ -466,9 +487,15 @@ fn size(
     if stretch && let Some(space) = available {
         let free = space - base.iter().sum::<f32>() - gaps(count);
         let automatic: Vec<_> = (0..count).filter(|&i| max(i) == Auto).collect();
+        // Tables give the extra width to columns in proportion to their width, like Chrome.
+        let total: f32 = automatic.iter().map(|&i| base[i]).sum();
         if free > 0. {
             for &i in &automatic {
-                base[i] += free / automatic.len() as f32;
+                base[i] += if table && total > 0. {
+                    free * base[i] / total
+                } else {
+                    free / automatic.len() as f32
+                };
             }
         }
     }
@@ -568,13 +595,23 @@ pub(crate) fn intrinsic(
         let wrap = !style
             .get(Prop::WHITE_SPACE)
             .is_some_and(|space| matches!(space, "pre" | "nowrap"));
+        let word_break = style::word_break(style);
+        let anywhere = matches!(
+            word_break,
+            renderer::WordBreak::Anywhere | renderer::WordBreak::BreakAll
+        );
         let lines = text
             .shape_text(
                 inline.text.to_string().into(),
                 renderer::px(units.font.em),
                 &inline.runs,
                 available.filter(|_| wrap).map(renderer::px),
-                None,
+                style
+                    .get(Prop::WEBKIT_LINE_CLAMP)
+                    .or_else(|| style.get(Prop::LINE_CLAMP))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .map(|lines| lines.max(1)),
+                word_break,
             )
             .unwrap_or_default();
         for line in &lines {
@@ -592,7 +629,7 @@ pub(crate) fn intrinsic(
                     .unwrap_or(' ');
                 if !character.is_whitespace() {
                     let x = f32::from(glyph.position.x);
-                    if previous.is_whitespace() || character > '\u{2e7f}' {
+                    if anywhere || previous.is_whitespace() || character > '\u{2e7f}' {
                         start = x;
                     }
                     let end = glyphs
@@ -623,10 +660,13 @@ pub(crate) fn intrinsic(
             Some(0.),
             None,
             None,
+            None,
             text,
             measured,
         ));
-        let [max, natural] = extent(&layout(doc, id, styles, None, None, None, text, measured));
+        let [max, natural] = extent(&layout(
+            doc, id, styles, None, None, None, None, text, measured,
+        ));
         content = [min, max, natural];
         if available.is_some() || vertical[0].is_some() {
             let grid = layout(
@@ -636,6 +676,7 @@ pub(crate) fn intrinsic(
                 available,
                 vertical[0],
                 None,
+                None,
                 text,
                 measured,
             );
@@ -643,11 +684,12 @@ pub(crate) fn intrinsic(
         }
     } else {
         let inline = !node.children.is_empty()
-            && node.children.iter().all(|child| {
-                matches!(
-                    doc.nodes[*child].tag.as_str(),
-                    "#text" | "span" | "strong" | "b" | "em" | "i" | "a" | "code" | "small" | "br"
-                )
+            && node.children.iter().all(|&child| {
+                doc.nodes[child].tag.starts_with('#')
+                    || doc.nodes[child].tag == "br"
+                    || styles.values[child]
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|value| value.starts_with("inline"))
             });
         let flex = matches!(display, "flex" | "inline-flex");
         let row = inline
@@ -667,7 +709,7 @@ pub(crate) fn intrinsic(
         let preserve = style
             .get(Prop::WHITE_SPACE)
             .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"));
-        let mut line = [0f32; 2];
+        let (mut line, mut run) = ([0f32; 2], 0f32);
         let mut first = true;
         for &child in &node.children {
             if styles.values[child]
@@ -675,13 +717,23 @@ pub(crate) fn intrinsic(
                 .is_some_and(|v| matches!(v, "absolute" | "fixed"))
                 || !preserve
                     && doc.nodes[child].tag == "#text"
-                    && doc.nodes[child].text.trim().is_empty()
+                    && doc.nodes[child].text.trim_ascii().is_empty()
             {
                 continue;
             }
             let gap = if first { [0.; 2] } else { gaps };
             first = false;
-            if !row {
+            // Inline-level children of a block share lines between its block children.
+            let inline_level = !flex
+                && (doc.nodes[child].tag.starts_with('#')
+                    || doc.nodes[child].tag == "br"
+                    || styles.values[child]
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|value| value.starts_with("inline")));
+            if !row && !inline_level {
+                content[1] = content[1].max(run);
+                content[2] += line[1];
+                (line, run) = ([0.; 2], 0.);
                 let [min, max, _, height] =
                     intrinsic(doc, child, styles, available, None, text, measured);
                 content = [
@@ -698,12 +750,13 @@ pub(crate) fn intrinsic(
             } else {
                 height
             };
+            let wrap = wrap || inline_level;
             content[0] = if wrap {
                 content[0].max(min)
             } else {
                 content[0] + min + gap[0]
             };
-            content[1] += max + gap[0];
+            run += max + gap[0];
             if wrap
                 && line[0] > 0.
                 && available.is_some_and(|available| line[0] + gaps[0] + width > available)
@@ -715,10 +768,28 @@ pub(crate) fn intrinsic(
                 line[0] + if line[0] > 0. { gaps[0] } else { 0. } + width,
                 line[1].max(height),
             ];
+            if !flex && doc.nodes[child].tag == "br" {
+                content[1] = content[1].max(run);
+                content[2] += line[1].max(styles.lengths[child].font.lh);
+                (line, run) = ([0.; 2], 0.);
+            }
         }
+        content[1] = content[1].max(run);
         content[2] += line[1];
     }
     let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
+    // Like Chrome, replaced boxes sized against their container add nothing to the min-content width.
+    let min = if matches!(
+        node.tag.as_str(),
+        "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object"
+    ) && [Prop::WIDTH, Prop::MAX_WIDTH]
+        .into_iter()
+        .any(|prop| style.get(prop).is_some_and(|value| value.contains('%')))
+    {
+        0.
+    } else {
+        min
+    };
     let result = [
         min + outer[0],
         max + outer[0],
@@ -740,6 +811,7 @@ pub(crate) fn layout(
     width: Option<f32>,
     height: Option<f32>,
     inherited: Option<&Grid>,
+    baselines: Option<&Baselines>,
     text: &renderer::TextSystem,
     measured: &mut Measurements,
 ) -> Grid {
@@ -959,22 +1031,25 @@ pub(crate) fn layout(
                 break;
             }
         }
+        // Baseline alignment falls back to the start, or to the end for the last baseline.
+        let last = value.starts_with("last");
         match (margins, value.split_whitespace().last().unwrap_or(value)) {
-            ([true, true], _) => Some(0.5),
-            ([true, false], _) => Some(1.),
-            ([false, true], _) => Some(0.),
+            ([true, true], _) => (Some(0.5), None),
+            ([true, false], _) => (Some(1.), None),
+            ([false, true], _) => (Some(0.), None),
             (_, "normal")
                 if matches!(
                     doc.nodes[child].tag.as_str(),
                     "img" | "svg" | "canvas" | "video"
                 ) =>
             {
-                Some(0.)
+                (Some(0.), None)
             }
-            (_, "normal" | "stretch") => None,
-            (_, "center") => Some(0.5),
-            (_, "end" | "flex-end" | "self-end" | "right") => Some(1.),
-            _ => Some(0.),
+            (_, "normal" | "stretch") => (None, None),
+            (_, "center") => (Some(0.5), None),
+            (_, "end" | "flex-end" | "self-end" | "right") => (Some(1.), None),
+            (_, "baseline") => (Some(f32::from(u8::from(last))), (axis == 1).then_some(last)),
+            _ => (Some(0.), None),
         }
     };
     /// What an item's style says, read once per style.
@@ -984,6 +1059,8 @@ pub(crate) fn layout(
         order: i32,
         placed: ([Option<usize>; 2], [usize; 2]),
         alignment: [Option<f32>; 2],
+        /// Aligns its first baseline with its row, or its last one when `true`.
+        baseline: Option<bool>,
         /// Whether the minimum size is zero, per axis.
         shrink: [bool; 2],
         auto_width: bool,
@@ -992,13 +1069,18 @@ pub(crate) fn layout(
     }
     // WARNING: large grids repeat a few styles over thousands of items, so each style is read once.
     let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
+    // A fieldset's rendered legend sits in its top border, outside its grid.
+    let legend = (doc.nodes[id].tag == "fieldset")
+        .then(|| super::element::legend(doc, styles, id))
+        .flatten()
+        .map(|(legend, ..)| legend);
     let mut read = |child: usize| -> Item {
         let style = &styles.values[child];
         let replaced = matches!(
             doc.nodes[child].tag.as_str(),
             "img" | "svg" | "canvas" | "video"
         );
-        *memo
+        let mut item = *memo
             .entry((std::rc::Rc::as_ptr(style), replaced))
             .or_insert_with(|| {
                 let flowed = !style.get(Prop::DISPLAY).is_some_and(|v| v == "none")
@@ -1068,23 +1150,27 @@ pub(crate) fn layout(
                         .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
                         .is_some_and(|v| v.starts_with("subgrid"))
                 });
+                let [(column, _), (row, baseline)] = [0, 1].map(|axis| alignment(child, axis));
                 Item {
                     flowed,
                     order,
                     placed,
-                    alignment: [alignment(child, 0), alignment(child, 1)],
+                    alignment: [column, row],
+                    baseline,
                     shrink,
                     auto_width: style.get(Prop::WIDTH).is_none_or(|v| v == "auto"),
                     height: style.get(Prop::HEIGHT),
                     subgrid,
                 }
-            })
+            });
+        item.flowed &= legend != Some(child);
+        item
     };
     let mut children: Vec<(usize, Item)> = doc.nodes[id]
         .children
         .iter()
         .filter(|&&child| {
-            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim().is_empty())
+            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty())
         })
         .map(|&child| (child, read(child)))
         .filter(|(_, item)| item.flowed)
@@ -1301,9 +1387,12 @@ pub(crate) fn layout(
     };
     let mut offsets = [0.; 2];
     let mut boxes = vec![[0f32; 4]; cells.len()];
+    // How far baseline alignment moves each item down, or up for the last baseline.
+    let mut shims = Vec::new();
     for axis in 0..2 {
         if axis == 1 {
             let column_starts = starts(&grid.columns);
+            let mut aligned = Vec::new();
             for (index, (&child, cell)) in children.iter().zip(&cells).enumerate() {
                 let [x, area] = area(
                     &grid.columns,
@@ -1327,6 +1416,34 @@ pub(crate) fn layout(
                     intrinsic(doc, child, styles, Some(size), None, text, measured)[3]
                 };
                 boxes[index] = [x + (area - size) * fraction.unwrap_or(0.), 0., size, height];
+                // Items in a row align their margin box's distance to the first baseline, or from the last
+                // baseline to the bottom. Without a baseline, the bottom border edge is used.
+                if let (Some(last), Some(&[first, end])) = (
+                    derived[index].baseline,
+                    baselines.and_then(|baselines| baselines.get(&child)),
+                ) {
+                    let [top, _, bottom, _] =
+                        styles.lengths[child].edges(&styles.values[child], style::MARGIN, area);
+                    let border = height - top - bottom;
+                    let offset = if last {
+                        bottom + border - end.unwrap_or(border)
+                    } else {
+                        top + first.unwrap_or(border)
+                    };
+                    let row = if last { cell[1] + cell[3] - 1 } else { cell[1] };
+                    aligned.push((index, (row, last), offset));
+                }
+            }
+            if !aligned.is_empty() {
+                let mut shared = rustc_hash::FxHashMap::default();
+                for &(_, key, offset) in &aligned {
+                    let max = shared.entry(key).or_insert(offset);
+                    *max = offset.max(*max);
+                }
+                shims = vec![0.; cells.len()];
+                for (index, key, offset) in aligned {
+                    shims[index] = shared[&key] - offset;
+                }
             }
         }
         let mut contributions = Vec::new();
@@ -1339,7 +1456,7 @@ pub(crate) fn layout(
                     let value = intrinsic(doc, child, styles, None, None, text, measured);
                     [value[0], value[1]]
                 } else {
-                    [boxes[index][3]; 2]
+                    [boxes[index][3] + shims.get(index).copied().unwrap_or(0.); 2]
                 };
                 contributions.push((
                     cell[axis],
@@ -1353,7 +1470,7 @@ pub(crate) fn layout(
                 let style = &styles.values[grandchild];
                 if style.get(Prop::DISPLAY).is_some_and(|v| v == "none")
                     || doc.nodes[grandchild].tag == "#text"
-                        && doc.nodes[grandchild].text.trim().is_empty()
+                        && doc.nodes[grandchild].text.trim_ascii().is_empty()
                 {
                     continue;
                 }
@@ -1391,6 +1508,7 @@ pub(crate) fn layout(
             gap[axis],
             available[axis],
             matches!(content, "normal" | "stretch"),
+            axis == 0 && doc.nodes[id].tag == "table",
         );
         if let Some(space) = available[axis]
             && !sizes.is_empty()
@@ -1417,6 +1535,12 @@ pub(crate) fn layout(
         }
     }
     let row_starts = starts(&grid.rows);
+    let extent = available[0].unwrap_or_else(|| {
+        grid.columns.iter().sum::<f32>()
+            + grid.gap[0] * grid.columns.len().saturating_sub(1) as f32
+            + offsets[0] * 2.
+    });
+    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     for (index, (&child, cell)) in children.iter().zip(&cells).enumerate() {
         let [y, area] = area(
             &grid.rows,
@@ -1435,16 +1559,42 @@ pub(crate) fn layout(
         if fraction.is_none() && value.is_none_or(|v| v == "auto") {
             height = area;
         }
+        let shim = shims.get(index).copied().unwrap_or(0.);
         grid.cells.push((
             child,
             *cell,
             [
-                x,
-                y + (area - height) * fraction.unwrap_or(0.),
+                if rtl { extent - x - width } else { x },
+                y + (area - height) * fraction.unwrap_or(0.)
+                    + if derived[index].baseline == Some(true) {
+                        -shim
+                    } else {
+                        shim
+                    },
                 width,
                 height,
             ],
+            derived[index].baseline.is_some(),
         ));
+    }
+    // Like Chrome, the grid's first baseline is the shared one of the first row's items that align their first
+    // baselines, else the first item's in that row. An item without one gives its bottom border edge.
+    let top = cells.iter().map(|cell| cell[1]).min();
+    if let Some((index, cell)) = cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| Some(cell[1]) == top)
+        .min_by_key(|(index, cell)| (derived[*index].baseline != Some(false), cell[0]))
+    {
+        let (child, _, [_, y, _, height], ref mut used) = grid.cells[index];
+        *used = true;
+        if let Some(&[first, _]) = baselines.and_then(|baselines| baselines.get(&child)) {
+            let area = grid.columns.iter().skip(cell[0]).take(cell[2]).sum::<f32>()
+                + cell[2].saturating_sub(1) as f32 * grid.gap[0];
+            let [top, _, bottom, _] =
+                styles.lengths[child].edges(&styles.values[child], style::MARGIN, area);
+            grid.first_baseline = Some(y + top + first.unwrap_or(height - top - bottom));
+        }
     }
     grid.cells.sort_unstable_by_key(|(child, ..)| *child);
     grid
@@ -1461,7 +1611,7 @@ mod tests {
         available: Option<f32>,
     ) -> Vec<f32> {
         let (list, ..) = tracks(template, &Lengths::new(16., 800., 600.), available, gap);
-        size(&list, items, gap, available, true)
+        size(&list, items, gap, available, true, false)
             .into_iter()
             .map(|v| (v * 100.).round() / 100.)
             .collect()
@@ -1625,12 +1775,13 @@ mod tests {
                 Some(800.),
                 None,
                 None,
+                None,
                 &text,
                 &mut Default::default(),
             )
             .cells
             .into_iter()
-            .map(|(_, cell, _)| cell)
+            .map(|(_, cell, ..)| cell)
             .collect::<Vec<_>>()
         };
         let cells = place(

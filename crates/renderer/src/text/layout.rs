@@ -1,4 +1,4 @@
-use super::{FontId, FontRun, GlyphId, SharedString, TextWrap};
+use super::{FontId, FontRun, GlyphId, SharedString, TextWrap, WordBreak};
 use crate::{Pixels, Point, Size, platform, point, px};
 use rustc_hash::FxHashMap;
 use std::{
@@ -132,6 +132,7 @@ impl LineLayout {
         max_lines: Option<usize>,
         indent: Pixels,
         wrap: TextWrap,
+        word_break: WordBreak,
     ) -> Vec<WrapBoundary> {
         let mut boundaries = Vec::new();
         // Break opportunities for `wrap`: the boundary, its x, and the x where the words before it end.
@@ -172,7 +173,7 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if first_non_whitespace_ix.is_some()
                 && ch != ' '
-                && (prev_ch == ' ' || !is_word_char(ch))
+                && (prev_ch == ' ' || !is_word_char(ch) || word_break == WordBreak::BreakAll)
             {
                 last_candidate_ix = Some(boundary);
                 last_candidate_x = x;
@@ -197,7 +198,12 @@ impl LineLayout {
                 wrap_width
             };
 
-            if width > available && boundary > last_boundary {
+            // Spaces at the end of a line hang, and float error must not wrap a line.
+            if ch != ' '
+                && width > available + px(0.01)
+                && boundary > last_boundary
+                && (last_candidate_ix.is_some() || word_break != WordBreak::Normal)
+            {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -574,6 +580,7 @@ impl LineLayoutCache {
         max_lines: Option<usize>,
         indent: Pixels,
         wrap: TextWrap,
+        word_break: WordBreak,
     ) -> (SharedString, Rc<WrappedLineLayout>) {
         let key = &CacheKeyRef {
             text,
@@ -584,6 +591,7 @@ impl LineLayoutCache {
             max_lines,
             indent,
             wrap,
+            word_break,
         } as &dyn AsCacheKeyRef;
         {
             let state = self.state.borrow();
@@ -594,9 +602,8 @@ impl LineLayoutCache {
         }
         let unwrapped_layout = self.layout_line(platform, text, font_size, runs, None);
         let wrap_boundaries = match wrap_width {
-            Some(width) => {
-                unwrapped_layout.compute_wrap_boundaries(text, width, max_lines, indent, wrap)
-            }
+            Some(width) => unwrapped_layout
+                .compute_wrap_boundaries(text, width, max_lines, indent, wrap, word_break),
             None => Vec::new(),
         };
         let size = size_of_line(text, &unwrapped_layout)
@@ -616,6 +623,7 @@ impl LineLayoutCache {
             max_lines,
             indent,
             wrap,
+            word_break,
         });
         let state = &mut *self.state.borrow_mut();
         state.bytes += size;
@@ -642,6 +650,7 @@ impl LineLayoutCache {
             max_lines: None,
             indent: px(0.),
             wrap: TextWrap::Wrap,
+            word_break: WordBreak::Normal,
         } as &dyn AsCacheKeyRef;
         {
             let state = self.state.borrow();
@@ -670,6 +679,7 @@ impl LineLayoutCache {
             max_lines: None,
             indent: px(0.),
             wrap: TextWrap::Wrap,
+            word_break: WordBreak::Normal,
         });
         let layout = Rc::new(layout);
         let state = &mut *self.state.borrow_mut();
@@ -757,6 +767,7 @@ struct CacheKey {
     max_lines: Option<usize>,
     indent: Pixels,
     wrap: TextWrap,
+    word_break: WordBreak,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -769,6 +780,7 @@ struct CacheKeyRef<'a> {
     max_lines: Option<usize>,
     indent: Pixels,
     wrap: TextWrap,
+    word_break: WordBreak,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -796,6 +808,7 @@ impl AsCacheKeyRef for CacheKey {
             max_lines: self.max_lines,
             indent: self.indent,
             wrap: self.wrap,
+            word_break: self.word_break,
         }
     }
 }
@@ -871,7 +884,14 @@ mod tests {
             (TextWrap::Balance, vec![15, 30]),
             (TextWrap::Pretty, vec![15, 30]),
         ] {
-            let boundaries = layout.compute_wrap_boundaries(&text, px(200.), None, px(0.), wrap);
+            let boundaries = layout.compute_wrap_boundaries(
+                &text,
+                px(200.),
+                None,
+                px(0.),
+                wrap,
+                WordBreak::Normal,
+            );
             let found: Vec<_> = boundaries
                 .iter()
                 .map(|boundary| boundary.glyph_ix)

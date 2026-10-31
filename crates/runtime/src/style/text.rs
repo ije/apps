@@ -53,6 +53,27 @@ pub(crate) struct InlineText {
     pub cursors: Vec<(usize, renderer::CursorStyle)>,
     pub shadows: Vec<(f32, f32, f32, u32)>,
     pub first_line: Option<(renderer::TextRun, renderer::TextRun, Option<String>)>,
+    /// The line height of the text up to each end offset, which sizes its inline boxes in a row.
+    pub line_heights: Vec<(usize, LineHeight)>,
+}
+
+/// A computed `line-height`. A number scales with the font size of the text that inherits it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum LineHeight {
+    Normal,
+    Scale(f32),
+    Fixed(f32),
+}
+
+pub(crate) fn line_height(style: &Style) -> LineHeight {
+    match style.get(Prop::LINE_HEIGHT) {
+        Some(value) if value.ends_with("px") => value
+            .trim_end_matches("px")
+            .parse()
+            .map_or(LineHeight::Normal, LineHeight::Fixed),
+        Some(value) => value.parse().map_or(LineHeight::Normal, LineHeight::Scale),
+        None => LineHeight::Normal,
+    }
 }
 
 pub(crate) fn restyle(
@@ -187,12 +208,14 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
         font: font(style),
         color: ink,
         background_color: None,
-        underline: lines.contains("underline").then(|| renderer::UnderlineStyle {
-            thickness,
-            color: Some(decoration),
-            style: decoration_style,
-            offset: length(Prop::TEXT_UNDERLINE_OFFSET),
-        }),
+        underline: lines
+            .contains("underline")
+            .then(|| renderer::UnderlineStyle {
+                thickness,
+                color: Some(decoration),
+                style: decoration_style,
+                offset: length(Prop::TEXT_UNDERLINE_OFFSET),
+            }),
         strikethrough: lines
             .contains("line-through")
             .then_some(renderer::StrikethroughStyle {
@@ -259,6 +282,7 @@ pub(crate) fn inline_text(
     let trailing = inline_sibling(siblings.get(position + 1));
     let mut text = String::new();
     let mut runs: Vec<renderer::TextRun> = Vec::new();
+    let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
     let mut backgrounds = Vec::new();
     let mut cursors = Vec::new();
@@ -289,13 +313,18 @@ pub(crate) fn inline_text(
             continue;
         }
         if node.tag == "br" {
+            // An empty range gives the `<br>` a box at the end of its line, like Chrome.
+            ranges.push((child, text.len()..text.len()));
             text.push('\n');
             runs.push(text_run(style, &styles.lengths[child], 1));
+            line_heights.push((text.len(), line_height(style)));
             space = true;
             continue;
         }
         if node.tag != "#text"
-            && (style.get(Prop::DISPLAY).is_some_and(|value| value != "inline")
+            && (style
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| value != "inline")
                 || matches!(
                     node.tag.as_str(),
                     "img"
@@ -315,11 +344,14 @@ pub(crate) fn inline_text(
                 ))
             || styles.pseudos.contains_key(&child)
             || styles.animations.contains_key(&child)
-            // Runs carry their own font size; the paragraph's line height must hold the child's.
-            || styles.lengths[child].font.lh > styles.lengths[id].font.lh + 0.01
-            || [Prop::WHITE_SPACE, Prop::VISIBILITY, Prop::POINTER_EVENTS, Prop::TEXT_SHADOW]
-                .into_iter()
-                .any(|prop| style.get(prop) != parent.get(prop))
+            || [
+                Prop::WHITE_SPACE,
+                Prop::VISIBILITY,
+                Prop::POINTER_EVENTS,
+                Prop::TEXT_SHADOW,
+            ]
+            .into_iter()
+            .any(|prop| style.get(prop) != parent.get(prop))
             || style.iter().any(|(key, value)| {
                 !key.is_custom()
                     && parent.value(key) != Some(value)
@@ -366,6 +398,11 @@ pub(crate) fn inline_text(
                             | Prop::USER_SELECT
                             | Prop::WEBKIT_USER_SELECT
                             | Prop::FONT_SIZE
+                            // Colors of borders without width, like Tailwind's `currentColor` borders.
+                            | Prop::BORDER_TOP_COLOR
+                            | Prop::BORDER_RIGHT_COLOR
+                            | Prop::BORDER_BOTTOM_COLOR
+                            | Prop::BORDER_LEFT_COLOR
                             | Prop::LINE_HEIGHT
                             | Prop::LETTER_SPACING
                             | Prop::WORD_SPACING
@@ -423,7 +460,7 @@ pub(crate) fn inline_text(
             let transform = style.get(Prop::TEXT_TRANSFORM);
             let mut word = true;
             for c in node.text.chars() {
-                if c.is_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
+                if c.is_ascii_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
                     if !space {
                         text.push(' ');
                     }
@@ -458,6 +495,7 @@ pub(crate) fn inline_text(
                     run.font_size = Some(renderer::px(size));
                 }
                 runs.push(run);
+                line_heights.push((text.len(), line_height(style)));
             }
         }
     }
@@ -567,6 +605,7 @@ pub(crate) fn inline_text(
         backgrounds,
         cursors,
         shadows,
+        line_heights,
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
             (
                 text_run(parent, &styles.lengths[id], 0),
@@ -577,6 +616,16 @@ pub(crate) fn inline_text(
             )
         }),
     })
+}
+
+/// Where lines may break inside words, from `word-break` and `overflow-wrap`.
+pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
+    match (style.get(Prop::WORD_BREAK), style.get(Prop::OVERFLOW_WRAP)) {
+        (Some("break-all"), _) => renderer::WordBreak::BreakAll,
+        (Some("break-word"), _) | (_, Some("anywhere")) => renderer::WordBreak::Anywhere,
+        (_, Some("break-word")) => renderer::WordBreak::BreakWord,
+        _ => renderer::WordBreak::Normal,
+    }
 }
 
 pub(crate) fn font(style: &Style) -> renderer::Font {
@@ -592,15 +641,12 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
                 let family = family.trim().trim_matches(['\'', '"']);
                 let lower = family.to_ascii_lowercase();
                 let generic: &[&str] = match lower.as_str() {
-                    // The macOS system fonts, like WebKit: SF Mono, New York and SF Rounded.
-                    "ui-monospace" if cfg!(target_os = "macos") => {
-                        &[".AppleSystemUIFontMonospaced"]
+                    // Like Chrome, the `ui-*` families are not supported, so lists fall through to the next family.
+                    "ui-monospace" | "ui-serif" | "ui-sans-serif" | "ui-rounded" => return None,
+                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "sans-serif" => {
+                        &[".SystemUIFont"]
                     }
-                    "ui-serif" if cfg!(target_os = "macos") => &[".AppleSystemUIFontSerif"],
-                    "ui-rounded" if cfg!(target_os = "macos") => &[".AppleSystemUIFontRounded"],
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "ui-sans-serif"
-                    | "sans-serif" | "ui-rounded" => &[".SystemUIFont"],
-                    "monospace" | "ui-monospace" => &[
+                    "monospace" => &[
                         "Menlo",
                         "SF Mono",
                         "Consolas",
@@ -608,7 +654,7 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
                         "Liberation Mono",
                         "Courier New",
                     ],
-                    "serif" | "ui-serif" => &[
+                    "serif" => &[
                         "Times",
                         "Times New Roman",
                         "DejaVu Serif",
@@ -655,5 +701,55 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         Some(value) if value.starts_with("oblique") => renderer::FontStyle::Oblique,
         _ => renderer::FontStyle::Normal,
     };
+    // OpenType features in cascade order, so `font-feature-settings` wins over the `font-variant-*` keywords.
+    let mut features: Vec<(String, u32)> = Vec::new();
+    if style.get(Prop::FONT_KERNING) == Some("none") {
+        features.push(("kern".into(), 0));
+    }
+    let keywords = [Prop::FONT_VARIANT_LIGATURES, Prop::FONT_VARIANT_NUMERIC]
+        .into_iter()
+        .filter_map(|prop| style.get(prop))
+        .flat_map(str::split_ascii_whitespace);
+    for keyword in keywords {
+        let tags: &[(&str, u32)] = match keyword {
+            "none" | "no-common-ligatures" => &[("liga", 0), ("clig", 0)],
+            "no-contextual" => &[("calt", 0)],
+            "discretionary-ligatures" => &[("dlig", 1)],
+            "lining-nums" => &[("lnum", 1)],
+            "oldstyle-nums" => &[("onum", 1)],
+            "proportional-nums" => &[("pnum", 1)],
+            "tabular-nums" => &[("tnum", 1)],
+            "diagonal-fractions" => &[("frac", 1)],
+            "stacked-fractions" => &[("afrc", 1)],
+            "ordinal" => &[("ordn", 1)],
+            "slashed-zero" => &[("zero", 1)],
+            _ => &[],
+        };
+        features.extend(tags.iter().map(|&(tag, value)| (tag.to_owned(), value)));
+    }
+    for setting in style
+        .get(Prop::FONT_FEATURE_SETTINGS)
+        .filter(|value| *value != "normal")
+        .map(|value| components(value, ','))
+        .unwrap_or_default()
+    {
+        let mut parts = setting.split_ascii_whitespace();
+        let Some(tag) = parts
+            .next()
+            .map(|tag| tag.trim_matches(['"', '\'']))
+            .filter(|tag| tag.len() == 4)
+        else {
+            continue;
+        };
+        let value = match parts.next() {
+            None | Some("on") => 1,
+            Some("off") => 0,
+            Some(value) => value.parse().unwrap_or(1),
+        };
+        features.push((tag.to_owned(), value));
+    }
+    if !features.is_empty() {
+        font.features = renderer::text::FontFeatures(features.into());
+    }
     font
 }

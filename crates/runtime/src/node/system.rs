@@ -1,7 +1,6 @@
 use super::bytes;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::io::Read;
 
 #[cfg(windows)]
 mod win {
@@ -97,6 +96,7 @@ pub(super) enum Hasher {
     Sha224(sha2::Sha224),
     Digest(ring::digest::Context),
     Hmac(ring::hmac::Context),
+    Keyed(Box<Hasher>, Box<Hasher>),
 }
 
 impl Hasher {
@@ -109,7 +109,24 @@ impl Hasher {
                 "sha256" => ring::hmac::HMAC_SHA256,
                 "sha384" => ring::hmac::HMAC_SHA384,
                 "sha512" => ring::hmac::HMAC_SHA512,
-                name => bail!("Digest method not supported: {name}"),
+                _ => {
+                    let mut block = bytes(key)?.to_vec();
+                    if block.len() > 64 {
+                        let mut hasher = Self::new(&json!(name), &Value::Null)?;
+                        hasher.update(&block);
+                        block = hasher.digest();
+                    }
+                    block.resize(64, 0);
+                    let mut pads = [
+                        Self::new(&json!(name), &Value::Null)?,
+                        Self::new(&json!(name), &Value::Null)?,
+                    ];
+                    for (hasher, pad) in pads.iter_mut().zip([0x36, 0x5c]) {
+                        hasher.update(&block.iter().map(|byte| byte ^ pad).collect::<Vec<_>>());
+                    }
+                    let [inner, outer] = pads;
+                    return Ok(Self::Keyed(Box::new(inner), Box::new(outer)));
+                }
             };
             return Ok(Self::Hmac(ring::hmac::Context::with_key(
                 &ring::hmac::Key::new(algorithm, bytes(key)?),
@@ -133,16 +150,152 @@ impl Hasher {
             Self::Sha224(hasher) => hasher.update(data),
             Self::Digest(context) => context.update(data),
             Self::Hmac(context) => context.update(data),
+            Self::Keyed(inner, _) => inner.update(data),
         }
     }
-    pub(super) fn finish(self) -> Value {
+    fn digest(self) -> Vec<u8> {
         use sha2::Digest;
-        crate::web::base64(&match self {
+        match self {
             Self::Md5(hasher) => hasher.finalize().to_vec(),
             Self::Sha224(hasher) => hasher.finalize().to_vec(),
             Self::Digest(context) => context.finish().as_ref().to_vec(),
             Self::Hmac(context) => context.sign().as_ref().to_vec(),
-        })
+            Self::Keyed(inner, mut outer) => {
+                outer.update(&inner.digest());
+                outer.digest()
+            }
+        }
+    }
+    pub(super) fn finish(self) -> Value {
+        crate::web::base64(&self.digest())
+    }
+}
+
+pub(crate) enum Codec {
+    Encode(flate2::Compress),
+    Decode(flate2::Decompress, bool),
+}
+
+impl Codec {
+    pub(super) fn new(
+        format: &str,
+        inflate: bool,
+        level: Option<i64>,
+        bits: Option<u64>,
+        dictionary: Option<&[u8]>,
+    ) -> Result<Self> {
+        use flate2::{Compress, Compression, Decompress};
+        let level = match level {
+            Some(level @ 0..=9) => Compression::new(level as u32),
+            _ => Compression::default(),
+        };
+        let bits = bits.filter(|bits| (9..=15).contains(bits)).unwrap_or(15) as u8;
+        let mut codec = match (format, inflate) {
+            ("gzip", false) => Self::Encode(Compress::new_gzip(level, bits)),
+            ("deflate" | "deflate-raw", false) => Self::Encode(Compress::new_with_window_bits(
+                level,
+                format == "deflate",
+                bits,
+            )),
+            ("gzip", true) => Self::Decode(Decompress::new_gzip(bits), true),
+            ("deflate" | "deflate-raw", true) => Self::Decode(
+                Decompress::new_with_window_bits(format == "deflate", bits),
+                false,
+            ),
+            _ => bail!("Unsupported zlib format"),
+        };
+        if let Some(dictionary) = dictionary {
+            match &mut codec {
+                Self::Encode(encoder) => encoder.set_dictionary(dictionary).map(drop)?,
+                Self::Decode(decoder, _) => decoder.set_dictionary(dictionary).map(drop)?,
+            }
+        }
+        Ok(codec)
+    }
+
+    /// Runs `input` through the codec with a zlib flush mode (0 none, 2 sync, 3 full, 4 finish). Gzip input may hold several members.
+    pub(super) fn write(
+        &mut self,
+        mut input: &[u8],
+        flush: u64,
+        ended: &mut bool,
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        use flate2::{Decompress, FlushCompress, FlushDecompress, Status};
+        let mut output =
+            Vec::with_capacity((input.len() / 2 + 1024).min(limit.saturating_add(1) as usize));
+        loop {
+            if output.capacity() - output.len() < 1024 {
+                output.reserve(output.capacity());
+            }
+            let (status, read, written) = match self {
+                Self::Encode(encoder) => {
+                    if *ended {
+                        break;
+                    }
+                    let (read, written) = (encoder.total_in(), encoder.total_out());
+                    let mode = match flush {
+                        4 => FlushCompress::Finish,
+                        3 => FlushCompress::Full,
+                        1 | 2 => FlushCompress::Sync,
+                        _ => FlushCompress::None,
+                    };
+                    let status =
+                        encoder
+                            .compress_vec(input, &mut output, mode)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "{}",
+                                    error.message().unwrap_or("compression failed")
+                                )
+                            })?;
+                    (
+                        status,
+                        encoder.total_in() - read,
+                        encoder.total_out() - written,
+                    )
+                }
+                Self::Decode(decoder, gzip) => {
+                    if *ended && *gzip && input.starts_with(&[0x1f, 0x8b]) {
+                        *decoder = Decompress::new_gzip(15);
+                        *ended = false;
+                    }
+                    if *ended {
+                        break;
+                    }
+                    let (read, written) = (decoder.total_in(), decoder.total_out());
+                    let mode = if flush == 4 {
+                        FlushDecompress::Finish
+                    } else {
+                        FlushDecompress::Sync
+                    };
+                    let status =
+                        decoder
+                            .decompress_vec(input, &mut output, mode)
+                            .map_err(|error| {
+                                anyhow::anyhow!("{}", error.message().unwrap_or("invalid data"))
+                            })?;
+                    (
+                        status,
+                        decoder.total_in() - read,
+                        decoder.total_out() - written,
+                    )
+                }
+            };
+            ensure!(
+                output.len() as u64 <= limit,
+                "Cannot create a Buffer larger than {limit} bytes"
+            );
+            input = &input[read as usize..];
+            *ended |= status == Status::StreamEnd;
+            if *ended && input.is_empty()
+                || !*ended && input.is_empty() && output.len() < output.capacity()
+                || read == 0 && written == 0 && !*ended
+            {
+                break;
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -155,10 +308,11 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
         }
         "pbkdf2" => {
             let algorithm = match args[4].as_str().unwrap_or("") {
-                "sha1" => ring::pbkdf2::PBKDF2_HMAC_SHA1,
-                "sha256" => ring::pbkdf2::PBKDF2_HMAC_SHA256,
-                "sha384" => ring::pbkdf2::PBKDF2_HMAC_SHA384,
-                "sha512" => ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                "sha1" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA1),
+                "sha256" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA256),
+                "sha384" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA384),
+                "sha512" => Some(ring::pbkdf2::PBKDF2_HMAC_SHA512),
+                "md5" | "sha224" => None,
                 name => bail!("Invalid digest: {name}"),
             };
             let iterations = u32::try_from(args[2].as_u64().context("Expected iterations")?)
@@ -168,7 +322,9 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             let length = args[3].as_u64().context("Expected key length")?;
             ensure!(length <= 1 << 26, "Key length exceeds 64 MiB");
             let mut key = vec![0; length as usize];
-            if length > 0 {
+            if let Some(algorithm) = algorithm
+                && length > 0
+            {
                 ring::pbkdf2::derive(
                     algorithm,
                     iterations,
@@ -176,36 +332,44 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     bytes(&args[0])?,
                     &mut key,
                 );
+            } else if length > 0 {
+                let mac = Hasher::new(&args[4], &args[0])?;
+                for (index, block) in key
+                    .chunks_mut(if args[4] == "md5" { 16 } else { 28 })
+                    .enumerate()
+                {
+                    let mut next = mac.clone();
+                    next.update(bytes(&args[1])?);
+                    next.update(&(index as u32 + 1).to_be_bytes());
+                    let mut round = next.digest();
+                    let mut sum = round.clone();
+                    for _ in 1..iterations.get() {
+                        let mut next = mac.clone();
+                        next.update(&round);
+                        round = next.digest();
+                        sum.iter_mut().zip(&round).for_each(|(a, b)| *a ^= b);
+                    }
+                    block.copy_from_slice(&sum[..block.len()]);
+                }
             }
             Ok(crate::web::base64(&key))
         }
         "zlib" => {
-            use flate2::{Compression, read};
             let input = bytes(&args[2])?;
-            let level = match args[3].as_u64() {
-                Some(level @ 0..=9) => Compression::new(level as u32),
-                _ => Compression::default(),
+            let format = match args[0].as_str().unwrap_or("") {
+                "unzip" if input.starts_with(&[0x1f, 0x8b]) => "gzip",
+                "unzip" => "deflate",
+                format => format,
             };
-            let gzip = input.starts_with(&[0x1f, 0x8b]);
-            let reader: Box<dyn Read> = match (args[0].as_str().unwrap_or(""), args[1] == true) {
-                ("gzip", false) => Box::new(read::GzEncoder::new(input, level)),
-                ("deflate", false) => Box::new(read::ZlibEncoder::new(input, level)),
-                ("deflate-raw", false) => Box::new(read::DeflateEncoder::new(input, level)),
-                ("gzip", true) => Box::new(read::MultiGzDecoder::new(input)),
-                ("unzip", true) if gzip => Box::new(read::MultiGzDecoder::new(input)),
-                ("deflate" | "unzip", true) => Box::new(read::ZlibDecoder::new(input)),
-                ("deflate-raw", true) => Box::new(read::DeflateDecoder::new(input)),
-                _ => bail!("Unsupported zlib format"),
-            };
-            let limit = args[4].as_u64().unwrap_or(1 << 30);
-            let mut output = Vec::new();
-            reader
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut output)?;
-            ensure!(
-                output.len() as u64 <= limit,
-                "Output exceeds maxOutputLength"
-            );
+            let inflate = args[1] == true;
+            let mut ended = false;
+            let output = Codec::new(format, inflate, args[3].as_i64(), None, None)?.write(
+                input,
+                4,
+                &mut ended,
+                args[4].as_u64().unwrap_or(1 << 30),
+            )?;
+            ensure!(!inflate || ended, "unexpected end of file");
             Ok(crate::web::base64(&output))
         }
         "lookup" => {
@@ -531,6 +695,37 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             }
             #[allow(unreachable_code)]
             Ok(json!(0))
+        }
+        "os.priority" => {
+            #[cfg(unix)]
+            unsafe {
+                let pid = args[0].as_i64().unwrap_or(0) as libc::id_t;
+                if let Some(priority) = args[1].as_i64() {
+                    if libc::setpriority(libc::PRIO_PROCESS, pid, priority as libc::c_int) != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    return Ok(Value::Null);
+                }
+                // WARNING: -1 is a valid priority, so only errno tells a failure apart.
+                #[cfg(target_os = "macos")]
+                {
+                    *libc::__error() = 0;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    *libc::__errno_location() = 0;
+                }
+                let priority = libc::getpriority(libc::PRIO_PROCESS, pid);
+                let error = std::io::Error::last_os_error();
+                if priority == -1 && error.raw_os_error() != Some(0) {
+                    return Err(error.into());
+                }
+                return Ok(json!(priority));
+            }
+            #[allow(unreachable_code)]
+            {
+                bail!("Process priority is unavailable on this platform")
+            }
         }
         "isatty" => {
             use std::io::IsTerminal;

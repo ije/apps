@@ -16,7 +16,7 @@ const define = definition => {
   const debug = definition.map && devtools ? `\n//# sourceURL=${definition.url}\n//# sourceMappingURL=data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(definition.map)).replaceAll("'", '%27')}\n` : '';
   // WARNING: pages compile only while their own script runs, so development modules compile here, before any of them runs.
   let source;
-  if (definition.commonjs) source = `(function(module,exports,$appsRequire,$appsImport){\n${definition.code}\n})${debug}`;
+  if (definition.commonjs) source = `(function(exports,require,module,__filename,__dirname,$appsRequire,$appsImport){\n${definition.code}\n})${debug}`;
   else {
     const exports = definition.exports.map(item => `[${JSON.stringify(item.name)}]:{enumerable:true,get:()=>(${item.value})}`).join(',');
     const params = definition.linked === false ? '' : ',$appsImport' + definition.deps.map(id => ',$appsN' + id).join('');
@@ -33,7 +33,7 @@ const refreshStars = id => {
     for (const parent of starredBy.get(target.definition.id) ?? []) {
       let changed = false;
       for (const name of Object.keys(target.namespace)) {
-        if (name !== 'default' && !Object.hasOwn(parent.namespace, name)) {
+        if (name !== 'default' && name !== 'module.exports' && !Object.hasOwn(parent.namespace, name)) {
           Object.defineProperty(parent.namespace, name, { enumerable: true, get: () => target.namespace[name] });
           changed = true;
         }
@@ -57,9 +57,24 @@ const $appsRequire = target => {
   if (result instanceof Promise) throw Error('Cannot require an asynchronous module');
   const commonjs = modules.get(target).commonjs;
   if (commonjs) return commonjs.exports;
+  if (Object.hasOwn(result, 'module.exports')) return result['module.exports'];
+  if (!Object.hasOwn(result, 'default')) return result;
   const names = Object.keys(result);
-  return names.length === 1 && names[0] === 'default' ? result.default : result;
+  if (names.length === 1) return result.default;
+  // WARNING: like Node, require() of a module with a default export adds __esModule, so transpiled interop picks `default`.
+  return modules.get(target).required ??= Object.preventExtensions(Object.defineProperties(Object.create(null), Object.fromEntries([['__esModule', { value: true, enumerable: true }], ...names.map(name => [name, { enumerable: true, get: () => result[name] }])])));
 };
+const cache = Object.create(null);
+const missing = name => Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
+const absolute = file => file === undefined || /^(?:[\\/]|[A-Za-z]:)/.test(file) ? file : globalThis.__apps ? __apps.path.join(__apps.app.getAppPath(), file) : '/' + file;
+const requireFrom = definition => Object.assign(id => {
+  if (typeof id !== 'string') throw Object.assign(new TypeError(`The "id" argument must be of type string. Received ${typeof id}`), { code: 'ERR_INVALID_ARG_TYPE' });
+  if (!globalThis.__apps) throw missing(id);
+  return __apps.module.createRequire()(id);
+}, {
+  resolve: id => { if (globalThis.__apps?.module.isBuiltin(id)) return id; const file = definition.resolved?.[id]; if (file === undefined) throw missing(id); return absolute(file); },
+  cache, main: undefined,
+});
 const definitionOf = id => {
   const name = chunks.get(id);
   if (name !== undefined && !loaded.has(name)) {
@@ -76,13 +91,14 @@ const setup = root => {
     const definition = definitionOf(id);
     if (!definition) throw Error('Missing module: ' + id);
     const commonjs = definition.commonjs ? { exports: {} } : null;
-    const namespace = commonjs ? new Proxy(Object.create(null), {
-      get: (_, name) => name === 'default' ? commonjs.exports : commonjs.exports?.[name],
-      has: (_, name) => name === 'default' || Object.hasOwn(Object(commonjs.exports), name),
-      ownKeys: () => [...new Set(['default', ...Object.keys(Object(commonjs.exports))])],
-      getOwnPropertyDescriptor: (_, name) => name === 'default' || Object.hasOwn(Object(commonjs.exports), name) ? { enumerable: true, configurable: true } : undefined,
-    }) : Object.create(null);
-    const module = { namespace, commonjs, definition, state: 0, dynamicStars: !!commonjs };
+    const module = { namespace: null, commonjs, definition, state: 0, dynamicStars: !!commonjs };
+    const exported = () => module.commonjs.exports;
+    module.namespace = commonjs ? new Proxy(Object.create(null), {
+      get: (_, name) => name === 'default' || name === 'module.exports' ? exported() : exported()?.[name],
+      has: (_, name) => name === 'default' || name === 'module.exports' || Object.hasOwn(Object(exported()), name),
+      ownKeys: () => [...new Set(['default', 'module.exports', ...Object.keys(Object(exported()))])],
+      getOwnPropertyDescriptor: (_, name) => name === 'default' || name === 'module.exports' || Object.hasOwn(Object(exported()), name) ? { enumerable: true, configurable: true } : undefined,
+    }) : Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' });
     modules.set(id, module);
     fresh.push(module);
     if (!commonjs) for (const dep of definition.deps) if (dep !== null) pending.push(dep);
@@ -122,11 +138,18 @@ const load = (id, ancestors = new Set()) => {
   if (!modules.has(id)) setup(id);
   const module = modules.get(id);
   if (module.state === 3) throw module.error;
+  if (module.state === 2 && module.commonjs?.filename !== undefined && cache[module.commonjs.filename] !== module.commonjs) module.state = 0;
   if (module.state) return ancestors.has(id) ? module.namespace : module.promise ?? module.namespace;
   module.state = 1;
   if (module.commonjs) {
-    const factory = module.definition.factory;
-    factory.call(module.commonjs.exports, module.commonjs, module.commonjs.exports, $appsRequire, $appsImport);
+    const { definition } = module, filename = absolute(definition.file);
+    const dirname = filename && (globalThis.__apps?.path.dirname(filename) ?? (filename.replace(/[\\/][^\\/]*$/, '') || '/'));
+    const commonjs = module.commonjs = { id: filename, path: dirname, exports: {}, filename, loaded: false, children: [], paths: [], require: requireFrom(definition) };
+    if (filename !== undefined) cache[filename] = commonjs;
+    // WARNING: like Node, a module that throws leaves the cache, so the next require runs it again.
+    try { definition.factory.call(commonjs.exports, commonjs.exports, commonjs.require, commonjs, filename, dirname, $appsRequire, $appsImport); }
+    catch (error) { module.state = 0; if (cache[filename] === commonjs) delete cache[filename]; throw error; }
+    commonjs.loaded = true;
     module.state = 2;
     refreshStars(id);
     return module.namespace;

@@ -29,6 +29,18 @@ fn main() {
         }
     }
     if root.ends_with("runtime") {
+        let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        println!("cargo:rerun-if-changed={}", root.join("js").display());
+        for dir in ["js", "js/node", "js/web"] {
+            fs::create_dir_all(out.join(dir)).unwrap();
+            for entry in fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|extension| extension == "js") {
+                    let data = miniz_oxide::deflate::compress_to_vec(&fs::read(&path).unwrap(), 10);
+                    fs::write(out.join(dir).join(path.file_name().unwrap()), data).unwrap();
+                }
+            }
+        }
         let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let directory = root.join(format!("../../target/bun-jsc/{target}-{arch}"));
         println!("cargo:rustc-env=APPS_JSC_BUILD_DIR={}", directory.display());
@@ -48,7 +60,9 @@ fn main() {
             "Carbon",
             "IOKit",
             "CoreGraphics",
+            "ImageIO",
             "ServiceManagement",
+            "UniformTypeIdentifiers",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

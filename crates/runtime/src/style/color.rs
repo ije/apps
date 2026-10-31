@@ -38,19 +38,112 @@ const SYSTEM_COLORS: [(&str, u32); 19] = [
     ("activetext", 0xff0000),
     ("buttonface", 0xefefef),
     ("buttontext", 0x000000),
-    ("buttonborder", 0x767676),
+    ("buttonborder", 0x000000),
     ("field", 0xffffff),
     ("fieldtext", 0x000000),
     ("highlight", 0xb3d7ff),
     ("highlighttext", 0x000000),
-    ("selecteditem", 0x007aff),
-    ("selecteditemtext", 0xffffff),
+    ("selecteditem", 0xe0e0e0),
+    ("selecteditemtext", 0x000000),
     ("mark", 0xffff00),
     ("marktext", 0x000000),
     ("graytext", 0x808080),
-    ("accentcolor", 0x007aff),
+    ("accentcolor", 0x0075ff),
     ("accentcolortext", 0xffffff),
 ];
+
+const DARK_SYSTEM_COLORS: [(&str, &str); 19] = [
+    ("canvas", "#121212"),
+    ("canvastext", "#ffffff"),
+    ("linktext", "#9e9eff"),
+    ("visitedtext", "#d0adf0"),
+    ("activetext", "#ff0000"),
+    ("buttonface", "#6b6b6b"),
+    ("buttontext", "#ffffff"),
+    ("buttonborder", "#ffffff"),
+    ("field", "#3b3b3b"),
+    ("fieldtext", "#ffffff"),
+    ("highlight", "#b3d7ffcc"),
+    ("highlighttext", "#000000"),
+    ("selecteditem", "#99c8ff"),
+    ("selecteditemtext", "#3b3b3b"),
+    ("mark", "#ffff00"),
+    ("marktext", "#000000"),
+    ("graytext", "#808080"),
+    ("accentcolor", "#0075ff"),
+    ("accentcolortext", "#ffffff"),
+];
+
+pub(crate) fn serialize(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    let (mut space, mut channels, alpha) = parse(&lower, 0)?;
+    let function = lower.split_once('(').map_or("", |(name, _)| name);
+    let own = matches!(
+        function,
+        "color" | "color-mix" | "lab" | "lch" | "oklab" | "oklch"
+    ) || lower.contains("(from ");
+    if matches!(space, Space::Hsl | Space::Hwb) {
+        channels = convert(space, channels, Space::Srgb);
+        space = Space::Srgb;
+    }
+    let number = |value: f64| {
+        if value.is_nan() {
+            "none".to_owned()
+        } else {
+            super::value::number(value)
+        }
+    };
+    let name = match space {
+        Space::Srgb => "color(srgb ",
+        Space::SrgbLinear => "color(srgb-linear ",
+        Space::DisplayP3 => "color(display-p3 ",
+        Space::XyzD50 => "color(xyz-d50 ",
+        Space::XyzD65 => "color(xyz-d65 ",
+        Space::Lab => "lab(",
+        Space::Lch => "lch(",
+        Space::Oklab => "oklab(",
+        Space::Oklch => "oklch(",
+        Space::Hsl | Space::Hwb => "",
+    };
+    if !own {
+        let (rgb, alpha) = color(value)?;
+        let fraction = f32::from(alpha) / 255.;
+        let short = (fraction * 100.).round() / 100.;
+        return Some(match alpha {
+            255 => format!("rgb({}, {}, {})", rgb >> 16, rgb >> 8 & 255, rgb & 255),
+            _ => format!(
+                "rgba({}, {}, {}, {})",
+                rgb >> 16,
+                rgb >> 8 & 255,
+                rgb & 255,
+                if (short * 255.).round() as u8 == alpha {
+                    short
+                } else {
+                    (fraction * 1000.).round() / 1000.
+                }
+            ),
+        });
+    }
+    let channels = channels.map(number).join(" ");
+    Some(if alpha < 1. {
+        format!("{name}{channels} / {})", number(alpha.max(0.)))
+    } else {
+        format!("{name}{channels})")
+    })
+}
+
+pub(crate) fn system(name: &str, dark: bool) -> Option<String> {
+    if dark {
+        return DARK_SYSTEM_COLORS
+            .iter()
+            .find(|(system, _)| system.eq_ignore_ascii_case(name))
+            .map(|(_, value)| (*value).to_owned());
+    }
+    SYSTEM_COLORS
+        .iter()
+        .find(|(system, _)| system.eq_ignore_ascii_case(name))
+        .map(|(_, value)| format!("#{value:06x}"))
+}
 
 const SRGB_TO_XYZ: [[f64; 3]; 3] = [
     [0.41239079926595934, 0.357584339383878, 0.1804807884018343],
@@ -628,7 +721,7 @@ mod tests {
             ("Canvas", Some((0xffffff, 255))),
             ("CanvasText", Some((0, 255))),
             ("LinkText", Some((0x0000ee, 255))),
-            ("AccentColor", Some((0x007aff, 255))),
+            ("AccentColor", Some((0x0075ff, 255))),
             ("Mark", Some((0xffff00, 255))),
             ("RGB(1 2 3)", Some((0x010203, 255))),
             ("rgb(1, 2, 3, 50%)", Some((0x010203, 128))),

@@ -231,12 +231,17 @@ impl Api {
                 make_error: *library.get(b"JSObjectMakeError\0")?,
                 make_array: *library.get(b"JSObjectMakeArray\0")?,
                 typed_from_buffer: *library.get(b"JSObjectMakeTypedArrayWithArrayBuffer\0")?,
-                memory: library.get(b"JSGetMemoryUsageStatistics\0").ok().map(|s| *s),
+                memory: library
+                    .get(b"JSGetMemoryUsageStatistics\0")
+                    .ok()
+                    .map(|s| *s),
                 json_string: *library.get(b"JSValueCreateJSONString\0")?,
                 inspector: (|| {
                     Some(Inspector {
                         connect: *library.get(b"JSGlobalContextConnectInspector\0").ok()?,
-                        dispatch: *library.get(b"JSGlobalContextDispatchInspectorMessage\0").ok()?,
+                        dispatch: *library
+                            .get(b"JSGlobalContextDispatchInspectorMessage\0")
+                            .ok()?,
                         disconnect: *library.get(b"JSGlobalContextDisconnectInspector\0").ok()?,
                     })
                 })(),
@@ -334,6 +339,8 @@ thread_local! {
     static ARMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSPECTED: RefCell<rustc_hash::FxHashMap<usize, Ptr>> = RefCell::default();
     static INSPECTOR_MESSAGES: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
+    // WARNING: the render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
+    pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Returns the context of this thread with `role`.
@@ -348,7 +355,12 @@ pub(crate) fn context(role: Role) -> Option<usize> {
 
 /// Returns every context of this thread.
 pub(crate) fn contexts() -> Vec<(usize, Role)> {
-    HOSTS.with_borrow(|hosts| hosts.iter().map(|(&ctx, binding)| (ctx, binding.2)).collect())
+    HOSTS.with_borrow(|hosts| {
+        hosts
+            .iter()
+            .map(|(&ctx, binding)| (ctx, binding.2))
+            .collect()
+    })
 }
 
 /// Connects the Web Inspector to a context once. Returns true for a new connection.
@@ -471,7 +483,10 @@ unsafe extern "C" fn chunk(
         .try_borrow()
         .ok()
         .and_then(|host| host.scripts.get(&name).cloned());
-    let Some(source) = source else {
+    let Some(source) = source
+        .as_deref()
+        .and_then(|source| std::str::from_utf8(source).ok())
+    else {
         if !exception.is_null() {
             let message = api.string(&format!("Error: Missing bundled script: {name}"));
             unsafe {
@@ -481,7 +496,7 @@ unsafe extern "C" fn chunk(
         }
         return ptr::null_mut();
     };
-    let script = api.string(&source);
+    let script = api.string(source);
     let url = api.string(&format!("apps:///{name}"));
     let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
     unsafe {
@@ -566,6 +581,15 @@ unsafe extern "C" fn call(
             });
         }
         let role = binding.2;
+        // WARNING: a forced layout builds the page, which borrows the host, so it runs before any borrow.
+        if let Role::Renderer(id) = role
+            && op == "dom.reflow"
+        {
+            if let Some(reflow) = REFLOW.get() {
+                reflow(id);
+            }
+            return Ok(unsafe { (api.undefined)(ctx) });
+        }
         // WARNING: page writes arrive as `dom.batch` with integer codes in bytes and their strings joined in the text, so they skip JSON and copies.
         if let Role::Renderer(id) = role
             && op == "dom.batch"
@@ -901,6 +925,10 @@ fn dispatch(
             .call(role, op, &args)
     } else if let (Role::Renderer(id), Some(op)) = (role, op.strip_prefix("gpu.")) {
         gpu(binding, ctx, id, op, &serde_json::to_vec(&args)?)
+    } else if let (Role::Renderer(id), Some(op)) = (role, op.strip_prefix("media.")) {
+        host.try_borrow_mut()
+            .context("Host is busy")?
+            .media(id, op, &args)
     } else {
         host.try_borrow_mut()
             .context("Host is busy")?
@@ -1404,39 +1432,30 @@ impl Engine {
                 );
                 (engine.api.string_release)(name);
             }
-            engine.eval(include_str!("../../js/node/ffi.js"), "apps:ffi")?;
-            engine.eval(include_str!("../../js/node/sqlite.js"), "apps:sqlite")?;
-            engine.eval(include_str!("../../js/events.js"), "apps:events")?;
-            engine.eval(
-                include_str!("../../js/node/child_process.js"),
-                "apps:child_process",
-            )?;
-            engine.eval(include_str!("../../js/web/serve.js"), "apps:serve")?;
-            engine.eval(include_str!("../../js/node/index.js"), "apps:node")?;
-            engine.eval(include_str!("../../js/node/stream.js"), "apps:node-streams")?;
-            engine.eval(include_str!("../../js/node/io.js"), "apps:node-io")?;
-            engine.eval(include_str!("../../js/node/http.js"), "apps:node-http")?;
-            engine.eval(include_str!("../../js/node/net.js"), "apps:net")?;
-            engine.eval(include_str!("../../js/node/pty.js"), "apps:pty")?;
+            engine.eval(&js!("node/ffi.js"), "apps:ffi")?;
+            engine.eval(&js!("node/sqlite.js"), "apps:sqlite")?;
+            engine.eval(&js!("events.js"), "apps:events")?;
+            engine.eval(&js!("node/child_process.js"), "apps:child_process")?;
+            engine.eval(&js!("web/serve.js"), "apps:serve")?;
+            engine.eval(&js!("node/index.js"), "apps:node")?;
+            engine.eval(&js!("node/stream.js"), "apps:node-streams")?;
+            engine.eval(&js!("node/io.js"), "apps:node-io")?;
+            engine.eval(&js!("node/http.js"), "apps:node-http")?;
+            engine.eval(&js!("node/net.js"), "apps:net")?;
+            engine.eval(&js!("node/pty.js"), "apps:pty")?;
         }
-        engine.eval(include_str!("../../js/web/streams.js"), "apps:streams")?;
-        engine.eval(include_str!("../../js/web/crypto.js"), "apps:crypto")?;
-        engine.eval(include_str!("../../js/web/index.js"), "apps:web")?;
-        engine.eval(include_str!("../../js/web/platform.js"), "apps:platform")?;
-        engine.eval(include_str!("../../js/bridge.js"), "apps:bridge")?;
-        engine.eval(include_str!("../../js/browser.js"), "apps:browser")?;
-        engine.eval(include_str!("../../js/web/worker.js"), "apps:worker")?;
-        engine.eval(
-            include_str!("../../js/web/environment.js"),
-            "apps:browser-environment",
-        )?;
-        engine.eval(include_str!("../../js/inspect.js"), "apps:inspect")?;
-        engine.eval(include_str!("../../js/bootstrap.js"), "apps:bootstrap")?;
-        engine.eval(include_str!("../../js/web/wasm.js"), "apps:wasm")?;
-        engine.eval(
-            include_str!("../../js/web/file_system.js"),
-            "apps:file-system",
-        )?;
+        engine.eval(&js!("web/streams.js"), "apps:streams")?;
+        engine.eval(&js!("web/crypto.js"), "apps:crypto")?;
+        engine.eval(&js!("web/index.js"), "apps:web")?;
+        engine.eval(&js!("web/platform.js"), "apps:platform")?;
+        engine.eval(&js!("bridge.js"), "apps:bridge")?;
+        engine.eval(&js!("browser.js"), "apps:browser")?;
+        engine.eval(&js!("web/worker.js"), "apps:worker")?;
+        engine.eval(&js!("web/environment.js"), "apps:browser-environment")?;
+        engine.eval(&js!("inspect.js"), "apps:inspect")?;
+        engine.eval(&js!("bootstrap.js"), "apps:bootstrap")?;
+        engine.eval(&js!("web/wasm.js"), "apps:wasm")?;
+        engine.eval(&js!("web/file_system.js"), "apps:file-system")?;
         let name = engine.api.string("__appsRejection");
         unsafe {
             let callback = (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut());
@@ -1446,10 +1465,10 @@ impl Engine {
         engine.eval("delete globalThis.__appsRejection", "apps:rejections")?;
         if matches!(role, Role::Renderer(_)) {
             if enabled("webgpu") {
-                engine.eval(include_str!("../../js/web/gpu.js"), "apps:gpu")?;
+                engine.eval(&js!("web/gpu.js"), "apps:gpu")?;
             }
-            engine.eval(include_str!("../../js/dom.js"), "apps:dom")?;
-            engine.eval(include_str!("../../js/lockdown.js"), "apps:lockdown")?;
+            engine.eval(&js!("dom.js"), "apps:dom")?;
+            engine.eval(&js!("lockdown.js"), "apps:lockdown")?;
         }
         Ok(engine)
     }
@@ -1571,11 +1590,16 @@ impl Engine {
 
     /// Returns JSC heap statistics. The VM is shared, so they cover every context of this thread.
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {
-        let memory = self.api.memory.context("Missing JSGetMemoryUsageStatistics")?;
+        let memory = self
+            .api
+            .memory
+            .context("Missing JSGetMemoryUsageStatistics")?;
         unsafe {
             let json = (self.api.json_string)(self.ctx, memory(self.ctx), 0, ptr::null_mut());
             ensure!(!json.is_null(), "Cannot read heap statistics");
-            let text = self.api.text(self.ctx, (self.api.make_string)(self.ctx, json));
+            let text = self
+                .api
+                .text(self.ctx, (self.api.make_string)(self.ctx, json));
             (self.api.string_release)(json);
             Ok(serde_json::from_str(&text)?)
         }
@@ -1591,11 +1615,16 @@ impl Engine {
         if let Some(napi) = &self.napi {
             napi.sweep();
         }
-        let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
-            (self.api.to_number)(self.ctx, value, ptr::null_mut())
-        })
-        .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
-        Ok(if delay.is_finite() { delay as i64 } else { -1 })
+        // WARNING: -2 means one macrotask ran. Each call returns to the VM, which drains the microtasks before the next one.
+        loop {
+            let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
+                (self.api.to_number)(self.ctx, value, ptr::null_mut())
+            })
+            .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
+            if delay != -2. {
+                return Ok(if delay.is_finite() { delay as i64 } else { -1 });
+            }
+        }
     }
 
     pub fn validate(&self, files: &BBTreeMap<String, String>) -> Result<()> {
@@ -1614,17 +1643,19 @@ impl Engine {
     fn install(&self, files: &BBTreeMap<String, String>) -> Result<()> {
         let paths: HashMap<String, std::path::PathBuf> =
             serde_json::from_str(files.get("native.json").map_or("{}", String::as_str))?;
-        let scripts: HashMap<String, std::sync::Arc<str>> = files
+        let scripts: Vec<(String, bytes::Bytes)> = files
             .iter()
             .filter(|(name, _)| name.starts_with("script-"))
-            .map(|(name, source)| (name.clone(), source.as_str().into()))
+            .map(|(name, source)| (name.clone(), source.clone().into()))
             .collect();
         HOSTS.with(|hosts| {
             let binding = &hosts.borrow()[&(self.ctx as usize)];
             let mut host = binding.1.borrow_mut();
             host.native_modules.extend(paths);
             if !scripts.is_empty() {
-                host.scripts = std::sync::Arc::new(scripts);
+                std::sync::Arc::make_mut(&mut host.scripts).extend(scripts);
+            }
+            if !host.scripts.is_empty() {
                 let window = match binding.2 {
                     Role::Renderer(id) | Role::Preload(id) => Some(id),
                     Role::Main => None,
@@ -1858,15 +1889,11 @@ mod tests {
                 .unwrap(),
             "C:\\a\\c"
         );
-        assert_eq!(
-            engine
-                .eval(
-                    "globalThis.fired=0;setTimeout(()=>fired++,0);__appsTick();fired",
-                    "test"
-                )
-                .unwrap(),
-            "1"
-        );
-        assert_eq!(engine.eval("__appsTick()", "test").unwrap(), "-1");
+        engine
+            .eval("globalThis.fired=0;setTimeout(()=>fired++,0)", "test")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(engine.tick().unwrap(), -1);
+        assert_eq!(engine.eval("fired", "test").unwrap(), "1");
     }
 }

@@ -68,7 +68,8 @@ fn sqlite_statements_values_and_lifecycle() {
         throws(() => insert.run('bad', null, {}), 'Invalid parameter');
         const special = db.prepare('SELECT ? AS x');
         assert(special.get(NaN).x === null && special.get(Infinity).x === Infinity && special.get(-Infinity).x === -Infinity, 'Non-finite numbers');
-        assert(special.get(true).x === 1 && special.get(undefined).x === null, 'Boolean and undefined');
+        throws(() => special.get(true), 'Boolean');
+        throws(() => special.get(undefined), 'Undefined');
         assert(special.get(bytes.buffer).x.length === 4, 'ArrayBuffer');
         assert(db.prepare('SELECT 1 AS __proto__').get().__proto__ === 1, 'Prototype column');
         assert(db.prepare('SELECT ?1 AS a, ?1 AS b').get({ '1': 4 }).b === 4, 'Numbered parameter');
@@ -164,4 +165,34 @@ fn sqlite_iterators_release_statements_and_read_incrementally() {
         assert(closed.next().done, 'Statement close ends iterator');
         db.close();
     "#, "sqlite-iterator-test").unwrap();
+}
+
+#[test]
+fn sqlite_errors_match_node() {
+    let engine = Engine::new(
+        Api::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    engine.eval(r#"
+        const db = new __apps.sqlite.DatabaseSync(':memory:');
+        db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)');
+        const insert = db.prepare('INSERT INTO t (name) VALUES (?)');
+        const error = fn => { try { fn(); } catch (e) { return [e.name, e.code, e.message, e.errcode, e.errstr].join('|'); } return 'none'; };
+        const expect = (fn, value) => { const actual = error(fn); if (actual !== value) throw Error(actual + ' !== ' + value); };
+        expect(() => db.exec('selec'), 'Error|ERR_SQLITE_ERROR|near "selec": syntax error|1|SQL logic error');
+        insert.run('a');
+        expect(() => insert.run('a'), 'Error|ERR_SQLITE_ERROR|UNIQUE constraint failed: t.name|2067|constraint failed');
+        expect(() => insert.run(undefined), 'TypeError|ERR_INVALID_ARG_TYPE|Provided value cannot be bound to SQLite parameter 1.||');
+        expect(() => insert.run(false), 'TypeError|ERR_INVALID_ARG_TYPE|Provided value cannot be bound to SQLite parameter 1.||');
+        expect(() => insert.run(1, 2), 'Error|ERR_SQLITE_ERROR|column index out of range|25|column index out of range');
+        expect(() => db.prepare('SELECT :n').get({ x: 1 }), "Error|ERR_INVALID_STATE|Unknown named parameter 'x'||");
+        expect(() => insert.run(2n ** 64n), 'TypeError|ERR_INVALID_ARG_VALUE|BigInt value is too large to bind.||');
+        expect(() => db.prepare('SELECT 9007199254740993 AS x').get(), 'RangeError|ERR_OUT_OF_RANGE|Value is too large to be represented as a JavaScript number: 9007199254740993||');
+        expect(() => db.exec(1), 'TypeError|ERR_INVALID_ARG_TYPE|The "sql" argument must be a string.||');
+        db.close();
+        expect(() => db.exec('SELECT 1'), 'Error|ERR_INVALID_STATE|database is not open||');
+        expect(() => insert.run('b'), 'Error|ERR_INVALID_STATE|statement has been finalized||');
+    "#, "sqlite-errors").unwrap();
 }

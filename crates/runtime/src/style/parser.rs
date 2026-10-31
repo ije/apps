@@ -6,16 +6,24 @@ use cssparser::{
 };
 use std::rc::Rc;
 
+thread_local! {
+    pub(crate) static DROPPED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
+}
+
 #[derive(Default)]
 struct Rules {
     parent: Option<SelectorList>,
     top_level: bool,
     declarations_only: bool,
     theme: bool,
+    scope: bool,
+    suffix: String,
 }
 
 enum Item {
     Rule(Rule),
+    Scope(String, Option<String>),
+    Starting,
     Declaration(Declaration),
 }
 
@@ -31,10 +39,22 @@ impl Stylesheet {
             StyleSheetParser::new(&mut input, &mut parser)
                 .filter_map(|item| match item.ok()? {
                     Item::Rule(rule) => Some(rule),
-                    Item::Declaration(_) => None,
+                    _ => None,
                 })
                 .collect(),
         )
+    }
+}
+
+impl Rule {
+    pub(crate) fn parse_nested(source: &str, parent: &SelectorList) -> Vec<Rule> {
+        let mut input = Parser::new(source);
+        input.set_nested_block_limit(128);
+        Rules {
+            parent: Some(parent.clone()),
+            ..Rules::default()
+        }
+        .body(&mut input)
     }
 }
 
@@ -52,7 +72,7 @@ impl Declarations {
             RuleBodyParser::new(input, &mut parser)
                 .filter_map(|item| match item.ok()? {
                     Item::Declaration(declaration) => Some(declaration),
-                    Item::Rule(_) => None,
+                    _ => None,
                 })
                 .collect(),
         )
@@ -61,17 +81,33 @@ impl Declarations {
 
 impl Rules {
     fn body(&mut self, input: &mut Parser<'_>) -> Vec<Rule> {
+        let theme = self.theme;
         let mut rules = Vec::new();
-        for item in RuleBodyParser::new(input, self).flatten() {
-            match item {
-                Item::Rule(rule) => rules.push(rule),
-                Item::Declaration(declaration) => {
-                    if let Some(Rule::Declarations(values)) = rules.last_mut() {
-                        values.0.push(declaration);
-                    } else {
-                        rules.push(Rule::Declarations(Declarations(vec![declaration])));
-                    }
+        for item in RuleBodyParser::new(input, self) {
+            let declaration = match item {
+                Ok(Item::Rule(rule)) => {
+                    rules.push(rule);
+                    continue;
                 }
+                Ok(Item::Declaration(declaration)) => declaration,
+                Ok(Item::Scope(..) | Item::Starting) => continue,
+                // WARNING: `--color-*: initial` is no declaration for the tokenizer, so it comes as an error.
+                Err((_, source, _)) if theme => match source.split_once(':') {
+                    Some((name, value))
+                        if name.trim().starts_with("--")
+                            && name.trim().ends_with("-*")
+                            && value.trim().trim_end_matches(';').trim() == "initial" =>
+                    {
+                        Declaration::Property(name.trim().into(), "initial".into())
+                    }
+                    _ => continue,
+                },
+                Err(_) => continue,
+            };
+            if let Some(Rule::Declarations(values)) = rules.last_mut() {
+                values.0.push(declaration);
+            } else {
+                rules.push(Rule::Declarations(Declarations(vec![declaration])));
             }
         }
         rules
@@ -128,6 +164,26 @@ impl<'i> QualifiedRuleParser<'i> for Rules {
     fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<SelectorList, ParseError<()>> {
         let mut value = String::new();
         source(input, &mut value)?;
+        if self.scope {
+            value = value.replace(":scope", "&");
+        }
+        if !self.suffix.is_empty() {
+            let mut depth = 0;
+            let mut parts = vec![String::new()];
+            for c in value.chars() {
+                depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
+                match parts.last_mut() {
+                    Some(_) if c == ',' && depth == 0 => parts.push(String::new()),
+                    Some(part) => part.push(c),
+                    None => {}
+                }
+            }
+            value = parts
+                .iter()
+                .map(|part| format!("{}{}", part.trim(), self.suffix))
+                .collect::<Vec<_>>()
+                .join(",");
+        }
         let selectors = Selector::parse(&value, self.parent.as_ref());
         if selectors.is_empty() {
             return Err(ParseError::unexpected_token());
@@ -169,7 +225,13 @@ impl<'i> AtRuleParser<'i> for Rules {
             };
             // WARNING: `layer()`, `source()`, `prefix()` and `important` are ignored.
             while input.next().is_ok() {}
-            return Ok(Item::Rule(Rule::Tailwind(preflight)));
+            return Ok(Item::Rule(Rule::Tailwind(Some(preflight))));
+        }
+        if name.eq_ignore_ascii_case("reference") && self.top_level {
+            // WARNING: the referenced file isn't loaded; the theme of the page's other sheets applies.
+            input.expect_url_or_string()?;
+            while input.next().is_ok() {}
+            return Ok(Item::Rule(Rule::Tailwind(None)));
         }
         if name.eq_ignore_ascii_case("keyframes") && !self.declarations_only {
             let name = input.expect_ident_or_string()?.to_string();
@@ -178,11 +240,21 @@ impl<'i> AtRuleParser<'i> for Rules {
         }
         if name.eq_ignore_ascii_case("custom-variant") && self.top_level {
             let name = input.expect_ident_cloned()?.to_string();
-            input.expect_parenthesis_block()?;
             let mut template = String::new();
-            input.parse_nested_block(|input| source(input, &mut template))?;
-            input.expect_exhausted()?;
+            if !input.is_exhausted() {
+                input.expect_parenthesis_block()?;
+                input.parse_nested_block(|input| source(input, &mut template))?;
+                input.expect_exhausted()?;
+            }
             return Ok(Item::Rule(Rule::Variant(name, template.trim().to_owned())));
+        }
+        if name.eq_ignore_ascii_case("variant") && self.parent.is_some() {
+            let mut name = String::new();
+            source(input, &mut name)?;
+            return Ok(Item::Rule(Rule::Variant(
+                name.trim().to_owned(),
+                String::new(),
+            )));
         }
         if name.eq_ignore_ascii_case("theme") && self.top_level {
             let mut inline = false;
@@ -190,6 +262,39 @@ impl<'i> AtRuleParser<'i> for Rules {
                 inline |= option.eq_ignore_ascii_case("inline");
             }
             return Ok(Item::Rule(Rule::Theme(inline, Vec::new())));
+        }
+        if name.eq_ignore_ascii_case("property")
+            && self.parent.is_none()
+            && !self.declarations_only
+            && !self.theme
+        {
+            let name = input.expect_ident_cloned()?.to_string();
+            input.expect_exhausted()?;
+            if !name.starts_with("--") {
+                return Err(ParseError::unexpected_token());
+            }
+            return Ok(Item::Rule(Rule::Property(name, String::new(), false, None)));
+        }
+        if name.eq_ignore_ascii_case("scope") && !self.declarations_only && !self.theme {
+            let group = |input: &mut Parser<'i>| -> Result<String, ParseError<()>> {
+                input.expect_parenthesis_block()?;
+                let mut text = String::new();
+                input.parse_nested_block(|input| source(input, &mut text))?;
+                Ok(text.trim().to_owned())
+            };
+            let start = input.try_parse(group).ok();
+            let end = input
+                .try_parse(|input| {
+                    input.expect_ident_matching("to")?;
+                    group(input)
+                })
+                .ok();
+            input.expect_exhausted()?;
+            return Ok(Item::Scope(start.unwrap_or_else(|| ":root".into()), end));
+        }
+        if name.eq_ignore_ascii_case("starting-style") && !self.declarations_only && !self.theme {
+            input.expect_exhausted()?;
+            return Ok(Item::Starting);
         }
         if name.eq_ignore_ascii_case("font-face") && self.top_level {
             input.expect_exhausted()?;
@@ -348,13 +453,16 @@ impl<'i> AtRuleParser<'i> for Rules {
             };
             return Ok(Item::Rule(Rule::Media(queries, Vec::new())));
         }
+        if !name.eq_ignore_ascii_case("charset") {
+            DROPPED.with_borrow_mut(|dropped| dropped.insert(name.to_ascii_lowercase()));
+        }
         Err(ParseError::unexpected_token())
     }
 
     fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
         match item {
-            Item::Rule(Rule::Tailwind(_) | Rule::Variant(..) | Rule::Layer(..))
-            | Item::Declaration(_) => Ok(item),
+            Item::Rule(Rule::Tailwind(_) | Rule::Layer(..)) | Item::Declaration(_) => Ok(item),
+            Item::Rule(Rule::Variant(_, ref template)) if !template.is_empty() => Ok(item),
             _ => Err(()),
         }
     }
@@ -366,6 +474,42 @@ impl<'i> AtRuleParser<'i> for Rules {
         input: &mut Parser<'i>,
     ) -> Result<Item, ParseError<()>> {
         Ok(Item::Rule(match item {
+            Item::Scope(start, end) => {
+                let root = Rc::new(Selector::parse(
+                    &format!(":where({start})"),
+                    self.parent.as_ref(),
+                ));
+                if root.is_empty() {
+                    return Err(ParseError::unexpected_token());
+                }
+                let suffix = end.map_or_else(String::new, |end| {
+                    format!(":not(:where({start}) :where({end}), :where({start}) :where({end}) *)")
+                });
+                let children = Rules {
+                    parent: Some(root.clone()),
+                    scope: true,
+                    suffix,
+                    ..Rules::default()
+                }
+                .body(input);
+                Rule::Style(root, children)
+            }
+            Item::Starting => Rule::Starting(match &self.parent {
+                Some(parent) => {
+                    let own = Rc::new(Selector::parse("&::starting-style", Some(parent)));
+                    let children = Rules {
+                        parent: Some(own.clone()),
+                        ..Rules::default()
+                    }
+                    .body(input);
+                    vec![Rule::Style(own, children)]
+                }
+                None => Rules {
+                    suffix: "::starting-style".into(),
+                    ..Rules::default()
+                }
+                .body(input),
+            }),
             Item::Rule(Rule::Layer(names, _)) => Rule::Layer(
                 names,
                 Rules {
@@ -392,10 +536,46 @@ impl<'i> AtRuleParser<'i> for Rules {
                 .body(input),
             ),
             Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input)),
+            Item::Rule(Rule::Property(name, ..)) => {
+                let (mut syntax, mut inherits, mut initial) = (None, None, None);
+                for declaration in Declarations::parse_input(input).0 {
+                    if let Declaration::Property(key, value) = declaration {
+                        match key.as_str() {
+                            "syntax" => syntax = Some(value.trim_matches(['"', '\'']).to_owned()),
+                            "inherits" => {
+                                inherits = ["false", "true"]
+                                    .iter()
+                                    .position(|word| value.eq_ignore_ascii_case(word))
+                            }
+                            "initial-value" => initial = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                let (Some(syntax), Some(inherits)) = (syntax, inherits) else {
+                    return Err(ParseError::unexpected_token());
+                };
+                if syntax.trim() != "*"
+                    && initial.as_deref().is_none_or(|value| {
+                        value.contains("var(") || !super::syntax_matches(&syntax, value)
+                    })
+                {
+                    return Err(ParseError::unexpected_token());
+                }
+                Rule::Property(name, syntax, inherits == 1, initial)
+            }
             Item::Rule(Rule::Utility(name, _)) => {
                 let mut body = String::new();
                 source(input, &mut body)?;
                 Rule::Utility(name, body)
+            }
+            Item::Rule(Rule::Variant(name, template)) if template.is_empty() => {
+                let mut body = String::new();
+                source(input, &mut body)?;
+                if !self.top_level {
+                    body = format!("{{{body}}}");
+                }
+                Rule::Variant(name, body)
             }
             Item::Rule(Rule::Keyframes(name, _)) => Rule::Keyframes(
                 name,
@@ -433,7 +613,7 @@ impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
     }
 
     fn parse_qualified(&self) -> bool {
-        !self.declarations_only
+        !self.declarations_only && !self.theme
     }
 }
 
@@ -452,7 +632,7 @@ fn condition(
         let start = input.position();
         let selector = match input.next()? {
             Token::ParenthesisBlock => None,
-            Token::Function(name) => Some(name.eq_ignore_ascii_case("selector")),
+            Token::Function(name) => Some(name.to_ascii_lowercase()),
             _ => return Err(ParseError::unexpected_token()),
         };
         let item = input.parse_nested_block(|input| {
@@ -467,36 +647,20 @@ fn condition(
             source(input, &mut text)?;
             let text = text.trim();
             if supports {
-                let supported = match selector {
-                    Some(selector) => selector && !Selector::parse(text, None).is_empty(),
+                let supported = match selector.as_deref() {
+                    Some("selector") => !Selector::parse(text, None).is_empty(),
+                    Some("font-format") => ["truetype", "opentype"]
+                        .iter()
+                        .any(|format| text.eq_ignore_ascii_case(format)),
+                    Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
-                        let name = name.trim().to_ascii_lowercase();
                         let value = value.trim();
-                        let value = value
-                            .strip_suffix("!important")
-                            .map_or(value, str::trim_end)
-                            .to_ascii_lowercase();
-                        let value = value.as_str();
-                        let wide = value.contains("var(")
-                            || matches!(
-                                value,
-                                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
-                            );
-                        !value.is_empty()
-                            && (name.starts_with("--")
-                                || super::SUPPORTED_PROPERTIES
-                                    .iter()
-                                    .any(|(property, values)| {
-                                        *property == name
-                                            && (wide
-                                                || if values.is_empty() {
-                                                    !name.ends_with("color")
-                                                        || value == "currentcolor"
-                                                        || super::color(value).is_some()
-                                                } else {
-                                                    values.contains(&value)
-                                                })
-                                    }))
+                        super::supports(
+                            &name.trim().to_ascii_lowercase(),
+                            value
+                                .strip_suffix("!important")
+                                .map_or(value, str::trim_end),
+                        ) == Some(true)
                     }),
                 };
                 return Ok(Some(if supported {
@@ -518,7 +682,11 @@ fn condition(
                 MediaQuery::Feature(name.into(), op.into(), value.into())
             };
             if let Some((name, value)) = text.split_once(':') {
-                let (name, value) = (name.trim(), value.trim());
+                let name = name
+                    .trim()
+                    .replacen("-webkit-min-", "min--webkit-", 1)
+                    .replacen("-webkit-max-", "max--webkit-", 1);
+                let (name, value) = (name.as_str(), value.trim());
                 return Ok((ident(name) && !value.is_empty()).then(|| {
                     if let Some(name) = name.strip_prefix("min-") {
                         feature(name, ">=", value)
@@ -644,6 +812,9 @@ pub(crate) struct FontUnits {
     pub cap: f32,
     pub ic: f32,
     pub lh: f32,
+    /// Whether the font size comes from an absolute length here or in an ancestor, which stops
+    /// monospace fonts from getting their smaller default size, like Chrome.
+    pub absolute: bool,
 }
 
 impl FontUnits {
@@ -655,6 +826,7 @@ impl FontUnits {
             cap: em * 0.8,
             ic: em,
             lh: em * 1.2,
+            absolute: false,
         }
     }
 }
@@ -1041,6 +1213,7 @@ mod tests {
                 cap: 14.,
                 ic: 20.,
                 lh: 30.,
+                absolute: false,
             },
             root: FontUnits {
                 em: 24.,
@@ -1049,6 +1222,7 @@ mod tests {
                 cap: 18.,
                 ic: 24.,
                 lh: 36.,
+                absolute: false,
             },
             viewport: [1200., 800.],
         };
@@ -1336,6 +1510,9 @@ mod tests {
             ("(dynamic-range: high)", false),
             ("(color-gamut: srgb)", true),
             ("(color-gamut: p3)", false),
+            ("(-webkit-min-device-pixel-ratio: 1)", true),
+            ("(-webkit-min-device-pixel-ratio: 2)", false),
+            ("(color-gamut)", true),
             ("(min-width: 600px) and (max-width: 900px)", true),
             ("(max-width: 600px) or (orientation: landscape)", true),
             ("not (max-width: 600px)", true),
@@ -1377,6 +1554,19 @@ mod tests {
                 "{query} -> {source}"
             );
         }
+        let retina = |query: &str| {
+            let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
+            let [Rule::Media(queries, _)] = sheet.0.as_slice() else {
+                return None;
+            };
+            queries[0].matches(800., 600., false, 200 << 16 | 64, FontUnits::new(16.))
+        };
+        assert_eq!(retina("(min-resolution: 2dppx)"), Some(true));
+        assert_eq!(retina("(-webkit-min-device-pixel-ratio: 2)"), Some(true));
+        assert_eq!(retina("(min-resolution: 192dpi)"), Some(true));
+        assert_eq!(retina("(resolution > 2x)"), Some(false));
+        assert_eq!(retina("(color-gamut: p3)"), Some(true));
+        assert_eq!(retina("(color-gamut: rec2020)"), Some(false));
         let deep = format!("{}(hover){}", "(".repeat(200), ")".repeat(200));
         assert!(evaluate(&deep).is_none_or(|(matched, _)| !matched));
     }
@@ -1426,6 +1616,30 @@ mod tests {
             ("not selector(a > b)", Some(false)),
             ("font-tech(color-colrv1)", Some(false)),
             ("not font-format(woff2)", Some(true)),
+            ("font-format(opentype)", Some(true)),
+            ("(width: bogus)", Some(false)),
+            ("(width: calc(100% - 2px))", Some(true)),
+            ("(filter: blur(2px))", Some(true)),
+            ("(backdrop-filter: blur(1px) saturate(2))", Some(true)),
+            ("(-webkit-backdrop-filter: none)", Some(true)),
+            ("(mask-image: linear-gradient(red, blue))", Some(true)),
+            ("(clip-path: circle(50%))", Some(true)),
+            ("(scrollbar-width: thin)", Some(true)),
+            ("(scrollbar-color: red blue)", Some(true)),
+            ("(mix-blend-mode: multiply)", Some(true)),
+            ("(transform: translateX(1px) rotate(2deg))", Some(true)),
+            ("(transform: bogus)", Some(false)),
+            ("(margin: 1px auto)", Some(true)),
+            ("(margin: red)", Some(false)),
+            ("(opacity: 50%)", Some(true)),
+            ("(z-index: 1.5)", Some(false)),
+            ("(text-wrap: balance)", Some(true)),
+            ("(word-break: break-all)", Some(true)),
+            ("(word-break: keep-all)", Some(false)),
+            (
+                "((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b))))",
+                Some(false),
+            ),
             ("(foo bar)", Some(false)),
             ("not (foo bar)", Some(true)),
             ("display: flex", None),

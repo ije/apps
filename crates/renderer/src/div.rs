@@ -277,7 +277,7 @@ impl Element for Div {
         }
         window.with_element_opacity(self.style.opacity, |window| {
             let style = &self.style;
-            let radii = style.corner_radii.clamp_radii_for_quad_size(bounds.size);
+            let radii = style.corner_radii.resolve(bounds.size);
             window.paint_drop_shadows(bounds, radii, &style.box_shadow);
             if let Some(background) = style.background.filter(|color| !color.is_transparent()) {
                 window.paint_quad(quad(
@@ -371,11 +371,9 @@ impl ScrollHandle {
         content: crate::Size<Pixels>,
         scale: f32,
     ) -> Point<Pixels> {
-        // Padding was snapped to device pixels for layout, so it is snapped the same way here.
+        // Padding was truncated to layout units, so it is truncated the same way here.
         let snap = |length: crate::Length| match length {
-            crate::Length::Px(value) => {
-                px(crate::geometry::round_to_device_pixel(value.0, scale) / scale)
-            }
+            crate::Length::Px(value) => px(crate::geometry::to_layout_unit(value.0, scale) / scale),
             crate::Length::Fraction(fraction) => bounds.size.width * fraction,
             crate::Length::Auto => Pixels::ZERO,
         };

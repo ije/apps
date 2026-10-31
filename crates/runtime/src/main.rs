@@ -15,10 +15,13 @@ fn main() {
         if home.ends_with("Contents/MacOS") {
             home = home.parent().unwrap().join("Resources");
         }
-        // A built app passes all of its arguments to process.argv.
+        // A built app passes all of its arguments to process.argv. Otherwise the arguments after `--` go there.
         let packaged = home.join("app.h2o").is_file() || home.join("app.js").is_file();
-        for arg in std::env::args().skip(1).filter(|_| !packaged) {
-            if arg == "--check" {
+        for os in std::env::args_os().skip(1).filter(|_| !packaged) {
+            let arg = os.to_string_lossy();
+            if arg == "--" {
+                break;
+            } else if arg == "--check" {
                 check = true;
             } else if arg == "--devtools" {
                 devtools = true;
@@ -29,9 +32,9 @@ fn main() {
             } else {
                 anyhow::ensure!(
                     directory.is_none() && !arg.starts_with('-'),
-                    "Usage: apps-runtime [directory | --bundle-stdin] [--check] [--devtools] [--devtools-mcp=<port>]"
+                    "Usage: apps-runtime [directory | --bundle-stdin] [--check] [--devtools] [--devtools-mcp=<port>] [-- <arguments>]"
                 );
-                directory = Some(std::path::PathBuf::from(arg));
+                directory = Some(std::path::PathBuf::from(&os));
             }
         }
         let bundle = if bundle_stdin {

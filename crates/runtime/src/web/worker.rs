@@ -25,9 +25,30 @@ struct Parent {
     stop: Arc<AtomicBool>,
     /// The bytes of the message that `__appsWorkerReceive` is reading.
     received: Vec<bytes::Bytes>,
+    code: Option<i32>,
+}
+
+pub(crate) fn exit(code: i32) -> bool {
+    PARENT.with(|parent| {
+        parent.borrow_mut().as_mut().is_some_and(|parent| {
+            parent.code = Some(code);
+            parent.stop.store(true, Ordering::Release);
+            true
+        })
+    })
 }
 thread_local! { static PARENT: RefCell<Option<Parent>> = const { RefCell::new(None) }; }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+// WARNING: an engine that is dropped never polls again, so a subscriber whose queue overflows is removed.
+struct Subscriber {
+    names: Vec<String>,
+    queue: Vec<(String, Payload)>,
+    wake: crate::host::Waker,
+    thread: std::thread::ThreadId,
+}
+static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
+    std::sync::LazyLock::new(Default::default);
 
 // WARNING: messages are `[json, ...bytes]` from `worker.js`, so their JSON is parsed once, by the receiving engine.
 struct Worker {
@@ -48,7 +69,7 @@ pub(crate) struct State {
     namespace: String,
     packaged: bool,
     disabled: u32,
-    scripts: Arc<HashMap<String, Arc<str>>>,
+    scripts: Arc<HashMap<String, bytes::Bytes>>,
 }
 
 impl State {
@@ -57,7 +78,7 @@ impl State {
         namespace: &str,
         packaged: bool,
         disabled: u32,
-        scripts: Arc<HashMap<String, Arc<str>>>,
+        scripts: Arc<HashMap<String, bytes::Bytes>>,
     ) {
         self.namespace = namespace.to_owned();
         self.packaged = packaged;
@@ -77,7 +98,9 @@ impl State {
                 let parent = parent.as_ref().context("Worker has no parent")?;
                 parent
                     .events
-                    .send(Payload::snapshot(json!({"kind":"message","data":args.take()})))
+                    .send(Payload::snapshot(
+                        json!({"kind":"message","data":args.take()}),
+                    ))
                     .context("Worker parent is closed")?;
                 parent.wake.wake();
                 Ok(Value::Null)
@@ -101,10 +124,72 @@ impl State {
                 });
                 Ok(Value::Null)
             }
+            "channel.open" => {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                CHANNELS.lock().unwrap().insert(
+                    id,
+                    Subscriber {
+                        names: Vec::new(),
+                        queue: Vec::new(),
+                        wake: crate::host::Waker::current(),
+                        thread: std::thread::current().id(),
+                    },
+                );
+                Ok(json!(id))
+            }
+            "channel.subscribe" => {
+                let name = args[1].as_str().context("Expected channel name")?;
+                if let Some(subscriber) = CHANNELS
+                    .lock()
+                    .unwrap()
+                    .get_mut(&args[0].as_u64().context("Expected subscriber")?)
+                {
+                    subscriber.names.retain(|other| other != name);
+                    if args[2] == true {
+                        subscriber.names.push(name.to_owned());
+                    }
+                }
+                Ok(Value::Null)
+            }
+            "channel.post" => {
+                let id = args[0].as_u64().context("Expected subscriber")?;
+                let name = args[1]
+                    .as_str()
+                    .context("Expected channel name")?
+                    .to_owned();
+                let message = Payload::snapshot(Value::Array(
+                    args.as_array_mut()
+                        .context("Expected channel message")?
+                        .split_off(2),
+                ));
+                CHANNELS.lock().unwrap().retain(|other, subscriber| {
+                    if *other == id || !subscriber.names.contains(&name) {
+                        return true;
+                    }
+                    subscriber.queue.push((name.clone(), message.clone()));
+                    subscriber.wake.wake();
+                    subscriber.queue.len() < 4096
+                });
+                Ok(Value::Null)
+            }
+            "channel.poll" => {
+                let queue = CHANNELS
+                    .lock()
+                    .unwrap()
+                    .get_mut(&args[0].as_u64().context("Expected subscriber")?)
+                    .map(|subscriber| std::mem::take(&mut subscriber.queue))
+                    .unwrap_or_default();
+                Ok(json!(
+                    queue
+                        .into_iter()
+                        .map(|(name, message)| json!({"name": name, "data": message.into_value()}))
+                        .collect::<Vec<_>>()
+                ))
+            }
             "start" => {
                 ensure!(self.workers.len() < 64, "Too many workers");
                 let source = args[0].as_str().context("Expected worker source")?;
-                let source: Arc<str> = if args[3] == true {
+                let source: bytes::Bytes = if args[3] == true {
                     let name = source
                         .strip_prefix("apps:///")
                         .context("Expected a bundled worker URL")?;
@@ -113,7 +198,7 @@ impl State {
                         .cloned()
                         .with_context(|| format!("Missing bundled worker: {name}"))?
                 } else {
-                    source.into()
+                    source.to_owned().into()
                 };
                 let native = args[1] == true;
                 let data = args[2].take();
@@ -130,7 +215,7 @@ impl State {
                 let own = input.clone();
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
                     crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
-                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received: Vec::new() }));
+                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received: Vec::new(), code: None }));
                     let result = (|| -> Result<()> {
                         let host = Rc::new(RefCell::new(Host::default()));
                         host.borrow_mut().app_name=Some(namespace);
@@ -144,9 +229,9 @@ impl State {
                         let engine = Engine::new_interruptible(Api::load()?, host, role, Some(cancelled.clone()))?;
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = name => { const key = name.replace(/^node:/, ''); const value = globalThis.__apps[key]; if (!value) throw new Error('Unsupported worker module: ' + name); return value; };", "apps:worker-modules")?; }
-                        engine.eval_page(&source, "apps:worker")?;
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
+                        engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
                             if native && delay < 0 && engine.eval("__appsAlive()", "apps:worker")? != "true" { break; }
@@ -165,8 +250,11 @@ impl State {
                         Ok(())
                     })();
                     let terminated=cancelled.load(Ordering::Acquire);
+                    let code = PARENT.with(|parent| parent.borrow().as_ref().and_then(|parent| parent.code)).unwrap_or(if result.is_ok() && !terminated {0} else {1});
                     if !terminated && let Err(error) = &result { let _ = output.send(json!({"kind":"error","message":format!("{error:#}")}).into()); }
-                    let _ = output.send(json!({"kind":"exit","code":if result.is_ok() && !terminated {0} else {1}}).into());
+                    let thread = std::thread::current().id();
+                    CHANNELS.lock().unwrap().retain(|_, subscriber| subscriber.thread != thread);
+                    let _ = output.send(json!({"kind":"exit","code":code}).into());
                     wake.wake();
                     PARENT.with(|parent| *parent.borrow_mut() = None);
                 })?;

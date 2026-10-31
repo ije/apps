@@ -73,6 +73,66 @@ pub fn length(value: &str, base: f32, font: f32, vw: f32, vh: f32) -> f32 {
 }
 
 pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
+    // Most values have no strings, escapes, comments or URLs, so a byte scan splits them like
+    // the tokenizer below at a fraction of the cost.
+    let bytes = value.as_bytes();
+    let mut parts = Vec::new();
+    // Open brackets, two bits each, innermost lowest.
+    let (mut open, mut depth, mut start, mut closed) = (0u64, 0u32, 0, false);
+    let simple = 'scan: {
+        for (index, &byte) in bytes.iter().enumerate() {
+            // WARNING: the tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`.
+            if std::mem::take(&mut closed)
+                && separator == ' '
+                && !byte.is_ascii_whitespace()
+                && byte != b','
+            {
+                break 'scan false;
+            }
+            match byte {
+                b'"' | b'\'' | b'\\' => break 'scan false,
+                b'/' if bytes.get(index + 1) == Some(&b'*') => break 'scan false,
+                b'(' | b'[' | b'{' => {
+                    if depth == 32
+                        || byte == b'('
+                            && index >= 3
+                            && bytes[index - 3..index].eq_ignore_ascii_case(b"url")
+                    {
+                        break 'scan false;
+                    }
+                    open = open << 2 | u64::from(byte / 32 - 1);
+                    depth += 1;
+                }
+                b')' | b']' | b'}' => {
+                    if depth == 0 || open & 3 != u64::from(byte / 32 - 1) {
+                        break 'scan false;
+                    }
+                    open >>= 2;
+                    depth -= 1;
+                    closed = depth == 0;
+                }
+                byte if depth == 0 && separator != ' ' && byte == separator as u8 => {
+                    parts.extend(Some(value[start..index].trim()).filter(|part| !part.is_empty()));
+                    start = index + 1;
+                }
+                byte if depth == 0 && separator == ' ' && byte.is_ascii_whitespace() => {
+                    parts.extend(Some(value[start..index].trim()).filter(|part| !part.is_empty()));
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        depth == 0
+    };
+    if simple {
+        parts.extend(Some(value[start..].trim()).filter(|part| !part.is_empty()));
+        return parts;
+    }
+    tokenized(value, separator)
+}
+
+/// `components` with the CSS tokenizer, for values with strings, escapes, comments or URLs.
+fn tokenized(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut input = cssparser::Parser::new(value);
     let mut start = input.position();
@@ -100,6 +160,7 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
         }
         if matches!(token, cssparser::Token::Comma) && separator == ','
             || matches!(token, cssparser::Token::WhiteSpace(_)) && separator == ' '
+            || matches!(token, cssparser::Token::Delim(delim) if delim == separator)
         {
             let part = input.slice(start..position).trim();
             if !part.is_empty() {
@@ -435,4 +496,80 @@ pub(crate) fn clip_path(
         }
         _ => None,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn split_values_like_the_tokenizer() {
+    let values = [
+        "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)",
+        "rotate(1deg)scale(2)",
+        "f(x)(y)",
+        "f(x)[y]",
+        "f(a]b) c",
+        "calc(1px)/2 3",
+        "calc(1px), 2",
+        "  a \t b\n c  ",
+        "a,b, ,c,",
+        "f(x) , g(y)",
+        "translate(1px, 2px) rotate(3deg)",
+        "repeat(2, minmax(0, 1fr)) [a b] 1fr",
+        "f((1)) g",
+        "f(",
+        "a)",
+        "url(a b) c",
+        "URL(x) y",
+        "\"a b\" c",
+        "a /* b */ c",
+        "var(--a,1px) 2px",
+        "1px-2px",
+        "f(1)%",
+        "f(1)-1px",
+        "{a b} c",
+        "ﬁ g(ä) h",
+    ];
+    let mut seed = 1u64;
+    let random: Vec<String> = (0..20000)
+        .map(|_| {
+            (0..seed % 24)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    b"ab1-+.%/*(),[]{}  \t#"[(seed >> 33) as usize % 21] as char
+                })
+                .collect()
+        })
+        .collect();
+    for value in values
+        .iter()
+        .copied()
+        .chain(random.iter().map(String::as_str))
+    {
+        for separator in [' ', ',', '/'] {
+            assert_eq!(
+                components(value, separator),
+                tokenized(value, separator),
+                "{value:?} {separator:?}"
+            );
+        }
+    }
+}
+
+/// A number as Chrome serializes it: six significant digits, without trailing zeros.
+pub(crate) fn number(value: f64) -> String {
+    // Conversions leave float noise like 1e-17 where the result is 0.
+    let value = if value.abs() < 1e-9 { 0. } else { value };
+    let digits = if value == 0. || !value.is_finite() {
+        0
+    } else {
+        (5 - value.abs().log10().floor() as i32).max(0) as usize
+    };
+    let text = format!("{value:.digits$}");
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &text
+    };
+    if text == "-0" { "0" } else { text }.to_owned()
 }

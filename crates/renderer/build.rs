@@ -89,14 +89,10 @@ fn metal() {
         "-o",
         &air,
     ]));
-    run(Command::new("xcrun").args([
-        "-sdk",
-        "macosx",
-        "metallib",
-        &air,
-        "-o",
-        &format!("{out}/shaders.metallib"),
-    ]));
+    let library = format!("{out}/shaders.metallib");
+    run(Command::new("xcrun").args(["-sdk", "macosx", "metallib", &air, "-o", &library]));
+    let data = miniz_oxide::deflate::compress_to_vec(&std::fs::read(&library).unwrap(), 10);
+    std::fs::write(library, data).unwrap();
     println!("cargo::rustc-cfg=renderer_shaders");
 }
 

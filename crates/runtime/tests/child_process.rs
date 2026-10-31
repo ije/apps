@@ -298,3 +298,43 @@ fn synchronous_children_honor_stdio_modes() {
         r#"for(const stdio of ['ignore','inherit',['ignore','ignore','ignore']]){const result=__apps.child_process.spawnSync('/bin/sh',['-c','exit 0'],{stdio});if(result.status!==0||result.stdout!==null||result.stderr!==null)throw Error('sync stdio')}"#,
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn child_process_options_stdio_and_sync_errors() {
+    run(r#"
+        const { spawn, spawnSync, execFile } = __apps.child_process, { Writable } = __apps.stream, { once } = __apps.events;
+        const assert = (condition, message) => { if (!condition) throw Error(message); };
+        const missing = spawnSync('apps-missing-command', ['a']);
+        assert(missing.status === null && missing.pid === 0 && missing.output === null && missing.error.code === 'ENOENT' && missing.error.syscall === 'spawnSync apps-missing-command' && missing.error.message === 'spawnSync apps-missing-command ENOENT' && missing.error.path === 'apps-missing-command', 'spawnSync ENOENT');
+        const slow = spawnSync('/bin/sleep', ['5'], { timeout: 30 });
+        assert(slow.status === null && slow.signal === 'SIGTERM' && slow.error.code === 'ETIMEDOUT' && slow.error.errno < 0, 'spawnSync timeout uses SIGTERM');
+        assert(spawnSync('/bin/sleep', ['5'], { timeout: 30, killSignal: 'SIGKILL' }).signal === 'SIGKILL', 'spawnSync killSignal');
+        assert(spawnSync('/bin/sh', ['-c', 'printf "$0"'], { argv0: 'custom0', encoding: 'utf8', maxBuffer: 100, buffer: true, foo: 1 }).stdout === 'custom0', 'argv0 and unknown options');
+        for (const [stdio, kinds] of [[[0, 'pipe', 2], 'null,R,null'], [['ignore', 'pipe', process.stderr], 'null,R,null'], ['overlapped', 'W,R,R'], [[null, undefined, 'pipe'], 'W,R,R'], [['pipe', process.stdout, 'ignore'], 'W,null,null']]) {
+            const child = spawn('/bin/sh', ['-c', 'true'], { stdio, maxBuffer: 1, buffer: true });
+            assert(child.stdio.map(item => item === null ? 'null' : item instanceof Writable ? 'W' : 'R').join() === kinds, 'stdio ' + JSON.stringify(stdio));
+            await once(child, 'close');
+        }
+        try { spawn('/bin/sh', [], { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }); assert(false, 'IPC accepted'); } catch (error) { assert(error.code === 'ERR_INVALID_ARG_VALUE', 'IPC error'); }
+        const cat = spawn('/bin/cat'), order = [];
+        let echoed = '';
+        cat.stdout.on('data', data => { echoed += data; });
+        cat.stdout.on('close', () => order.push('stdout-close'));
+        cat.stdin.on('finish', () => order.push('finish'));
+        cat.stdin.on('close', () => order.push('stdin-close'));
+        assert(cat.stdin instanceof Writable, 'stdin is Writable');
+        cat.stdin.write('a', () => order.push('write'));
+        cat.stdin.end('b', () => order.push('end'));
+        await once(cat, 'close');
+        assert(echoed === 'ab' && order[0] === 'write' && order.includes('end') && order.includes('finish') && order.filter(item => item === 'stdout-close').length === 1 && order.at(-1) === 'stdout-close', 'stdin callbacks and one stdout close: ' + order);
+        const failed = spawn('apps-missing-command', ['x']);
+        const error = await once(failed, 'close').then(() => null, error => error);
+        assert(error.message === 'spawn apps-missing-command ENOENT' && error.syscall === 'spawn apps-missing-command', 'spawn error message');
+        const sleeper = spawn('/bin/sleep', ['5']);
+        sleeper.kill(9);
+        assert((await once(sleeper, 'exit'))[1] === 'SIGKILL', 'numeric signal');
+        const [limit, output] = await new Promise(resolve => execFile('/bin/sh', ['-c', 'printf 12345678'], { maxBuffer: 2 }, (error, stdout) => resolve([error, stdout])));
+        assert(limit.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && limit.message === 'stdout maxBuffer length exceeded' && output === '12', 'maxBuffer truncates');
+    "#);
+}

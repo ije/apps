@@ -3,30 +3,68 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const output = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const encoded = (data, encoding) => encoding && encoding !== 'buffer' ? data.toString(encoding) : data;
 
-  const zlibError = error => Object.assign(error, /maxOutputLength/.test(error.message) ? { code: 'ERR_BUFFER_TOO_LARGE' } : { code: 'Z_DATA_ERROR', errno: -3 });
+  const zlibError = error => Object.assign(error, /^Cannot create a Buffer/.test(error.message) ? { code: 'ERR_BUFFER_TOO_LARGE' } : /^unexpected end of file/.test(error.message) ? { code: 'Z_BUF_ERROR', errno: -5 } : { code: 'Z_DATA_ERROR', errno: -3 });
   const zlib = { constants: { Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3, Z_FINISH: 4, Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_BUF_ERROR: -5, Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_DEFAULT_COMPRESSION: -1, Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4, Z_DEFAULT_STRATEGY: 0 } };
-  const compressor = (format, inflate) => {
-    let writer, reading, failed = null;
-    const start = chunk => {
-      const kind = format === 'unzip' ? (chunk?.[0] === 0x1f && chunk?.[1] === 0x8b ? 'gzip' : 'deflate') : format;
-      const web = inflate ? new DecompressionStream(kind) : new CompressionStream(kind);
-      writer = web.writable.getWriter();
-      const reader = web.readable.getReader();
-      reading = (async () => { for (;;) { const { value, done } = await reader.read(); if (done) return; transform.push(output(value)); } })().catch(error => { failed = zlibError(error); });
-      writer.closed.catch(() => {});
-    };
-    const transform = new stream.Transform({
-      transform(chunk, _encoding, callback) { if (!writer) start(chunk); writer.write(chunk).then(() => callback(failed), error => callback(failed ?? zlibError(error))); },
-      flush(callback) { if (!writer) start(); writer.close().then(() => reading, () => reading).then(() => callback(failed)); },
-    });
-    return transform;
+  const codecs = new __appsFinalizers(id => sync('zlib.free', id)), flushes = new WeakMap();
+  class Zlib extends stream.Transform {
+    #format; #inflate; #options; #id = null; #ended = false;
+    constructor(format, inflate, o = {}) {
+      super({ ...o, objectMode: false, readableObjectMode: false, writableObjectMode: false });
+      this.#format = format; this.#inflate = inflate; this.#options = o; this.bytesWritten = 0;
+      this._defaultFlushFlag = o.flush ?? zlib.constants.Z_NO_FLUSH; this._finishFlushFlag = o.finishFlush ?? zlib.constants.Z_FINISH;
+    }
+    #write(chunk, flush) {
+      if (this.#id === null) {
+        if (!chunk.length && this.#format === 'unzip' && flush !== zlib.constants.Z_FINISH) return null;
+        const kind = this.#format === 'unzip' ? (chunk[0] === 0x1f && chunk[1] === 0x8b ? 'gzip' : 'deflate') : this.#format, o = this.#options;
+        this.#id = sync('zlib.new', kind, this.#inflate, o.level ?? -1, o.windowBits ?? 15, o.dictionary ? input(o.dictionary) : null);
+        codecs.register(this, this.#id, this);
+      }
+      try {
+        const result = sync('zlib.write', this.#id, chunk, flush);
+        this.#ended = result.ended;
+        return result.bytes.length ? output(result.bytes) : null;
+      } catch (error) { throw zlibError(error); }
+    }
+    _transform(chunk, _encoding, callback) {
+      let data;
+      try { this.bytesWritten += chunk.length; data = this.#write(chunk, flushes.get(chunk) ?? this._defaultFlushFlag); } catch (error) { return callback(error); }
+      callback(null, data);
+    }
+    _flush(callback) {
+      let data;
+      try {
+        data = this.#write(Buffer.alloc(0), this._finishFlushFlag);
+        if (this.#inflate && !this.#ended) throw Object.assign(new Error('unexpected end of file'), { code: 'Z_BUF_ERROR', errno: -5 });
+      } catch (error) { return callback(error); }
+      callback(null, data);
+    }
+    _destroy(error, callback) { if (this.#id !== null) { codecs.unregister(this); sync('zlib.free', this.#id); this.#id = null; } callback(error); }
+    flush(kind = zlib.constants.Z_FULL_FLUSH, callback) {
+      if (typeof kind === 'function') [kind, callback] = [zlib.constants.Z_FULL_FLUSH, kind];
+      if (this.writableEnded) { if (callback) queueMicrotask(callback); return; }
+      const marker = Buffer.alloc(0);
+      flushes.set(marker, kind);
+      this.write(marker, () => callback?.());
+    }
+    params(level, _strategy, callback) { this.flush(zlib.constants.Z_SYNC_FLUSH, () => { if (this.#id !== null) sync('zlib.params', this.#id, level); else this.#options = { ...this.#options, level }; callback?.(); }); }
+    reset() { if (this.#id !== null) { codecs.unregister(this); sync('zlib.free', this.#id); this.#id = null; } this.#ended = false; }
+    close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } this.destroy(); }
+  }
+  let table;
+  zlib.crc32 = (data, value = 0) => {
+    table ??= Int32Array.from({ length: 256 }, (_, n) => { for (let k = 0; k < 8; k++) n = n & 1 ? 0xEDB88320 ^ (n >>> 1) : n >>> 1; return n; });
+    const bytes = input(data, 'utf8');
+    let crc = ~value;
+    for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
+    return ~crc >>> 0;
   };
   for (const [name, format, inflate] of [['Gzip', 'gzip', false], ['Gunzip', 'gzip', true], ['Deflate', 'deflate', false], ['Inflate', 'deflate', true], ['DeflateRaw', 'deflate-raw', false], ['InflateRaw', 'deflate-raw', true], ['Unzip', 'unzip', true]]) {
     const method = name[0].toLowerCase() + name.slice(1), args = (data, o) => [format, inflate, input(data), o?.level ?? -1, o?.maxOutputLength];
     zlib[method + 'Sync'] = (data, o) => { try { return output(sync('zlib', ...args(data, o))); } catch (error) { throw zlibError(error); } };
     zlib[method] = (data, o, callback) => { if (typeof o === 'function') { callback = o; o = {}; } asyncCall('zlib', ...args(data, o)).then(result => callback(null, output(result)), error => callback(zlibError(error))); };
-    zlib['create' + name] = () => compressor(format, inflate);
-    zlib[name] = function() { return compressor(format, inflate); };
+    zlib[name] = { [name]: class extends Zlib { constructor(o) { super(format, inflate, o); } } }[name];
+    zlib['create' + name] = o => new zlib[name](o);
   }
 
   class Interface extends EventEmitter {
@@ -70,14 +108,30 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     question(query, options = {}) { return new Promise((resolve, reject) => { if (options.signal?.aborted) return reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })); super.question(query, resolve); }); }
   }
   const terminal = (stream, data, callback) => { if (!stream) { callback?.(); return true; } return stream.write(data, callback); };
+  const codes = {
+    clearLine: direction => direction < 0 ? '\x1b[1K' : direction > 0 ? '\x1b[0K' : '\x1b[2K',
+    cursorTo: (x, y) => typeof y === 'number' ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`,
+    moveCursor: (dx, dy) => (dx < 0 ? `\x1b[${-dx}D` : dx > 0 ? `\x1b[${dx}C` : '') + (dy < 0 ? `\x1b[${-dy}A` : dy > 0 ? `\x1b[${dy}B` : ''),
+  };
+  class Readline {
+    #stream; #auto; #todo = [];
+    constructor(stream, { autoCommit = false } = {}) { this.#stream = stream; this.#auto = autoCommit; }
+    #add(data) { if (this.#auto) this.#stream.write(data); else this.#todo.push(data); return this; }
+    clearLine(direction) { return this.#add(codes.clearLine(direction)); }
+    clearScreenDown() { return this.#add('\x1b[0J'); }
+    cursorTo(x, y) { return this.#add(codes.cursorTo(x, y)); }
+    moveCursor(dx, dy) { return dx || dy ? this.#add(codes.moveCursor(dx, dy)) : this; }
+    commit() { const data = this.#todo.splice(0).join(''); return new Promise(resolve => this.#stream.write(data, () => resolve())); }
+    rollback() { this.#todo = []; return this; }
+  }
   const readline = {
     Interface, createInterface: (...args) => new Interface(...args),
-    clearLine: (stream, direction, callback) => terminal(stream, direction < 0 ? '\x1b[1K' : direction > 0 ? '\x1b[0K' : '\x1b[2K', callback),
+    clearLine: (stream, direction, callback) => terminal(stream, codes.clearLine(direction), callback),
     clearScreenDown: (stream, callback) => terminal(stream, '\x1b[0J', callback),
-    cursorTo: (stream, x, y, callback) => { if (typeof y === 'function') { callback = y; y = undefined; } return terminal(stream, typeof y === 'number' ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`, callback); },
-    moveCursor: (stream, dx, dy, callback) => terminal(stream, (dx < 0 ? `\x1b[${-dx}D` : dx > 0 ? `\x1b[${dx}C` : '') + (dy < 0 ? `\x1b[${-dy}A` : dy > 0 ? `\x1b[${dy}B` : ''), callback),
+    cursorTo: (stream, x, y, callback) => { if (typeof y === 'function') { callback = y; y = undefined; } return terminal(stream, codes.cursorTo(x, y), callback); },
+    moveCursor: (stream, dx, dy, callback) => terminal(stream, codes.moveCursor(dx, dy), callback),
     emitKeypressEvents() {},
-    promises: { Interface: PromiseInterface, createInterface: (...args) => new PromiseInterface(...args) },
+    promises: { Interface: PromiseInterface, Readline, createInterface: (...args) => new PromiseInterface(...args) },
   };
 
   const hashes = ['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512'];
@@ -115,7 +169,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     copy() { if (this.#done || this.#secret) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' }); return new Hash(this.#algorithm, null, { chunks: this.#chunks, size: this.#size, id: this.#id }); }
   }
   class Cipher extends stream.Transform {
-    #decrypt; #key; #iv; #chunks = []; #aad = new Uint8Array(0); #tag = null; #done = false;
+    #decrypt; #key; #iv; #chunks = []; #aad = new Uint8Array(0); #tag = null; #done = false; #pad = new Uint8Array(0); #size = 0; #decoder = null;
     constructor(decrypt, algorithm, key, iv) {
       super();
       const bits = /^aes-(128|256)-gcm$/i.exec(algorithm)?.[1];
@@ -126,19 +180,32 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     }
     _transform(chunk, encoding, callback) { callback(null, this.update(chunk, encoding)); }
     _flush(callback) { try { callback(null, this.final()); } catch (error) { callback(error); } }
-    update(data, inputEncoding, outputEncoding) { this.#chunks.push(Buffer.from(input(data, inputEncoding))); return encoded(Buffer.alloc(0), outputEncoding); }
+    #text(data, encoding) { if (!encoding || encoding === 'buffer') return data; this.#decoder ??= new StringDecoder(encoding); return this.#decoder.write(data); }
+    update(data, inputEncoding, outputEncoding) {
+      if (this.#done) throw Object.assign(new Error('Unsupported state'), { code: 'ERR_CRYPTO_INVALID_STATE' });
+      const bytes = input(data, inputEncoding), end = this.#size + bytes.length;
+      // WARNING: GCM encrypts with an AES-CTR keystream that does not depend on the data, so sealing zeros yields it. It grows by doubling, so the total work stays linear.
+      if (end > this.#pad.length) { const size = Math.max(end, this.#pad.length * 2, 4096); this.#pad = output(call('web.crypto.encrypt', this.#key, this.#iv, new Uint8Array(0), new Uint8Array(size))).subarray(0, size); }
+      const out = Buffer.allocUnsafe(bytes.length);
+      for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ this.#pad[this.#size + i];
+      this.#chunks.push(Buffer.from(bytes));
+      this.#size = end;
+      return this.#text(out, outputEncoding);
+    }
     final(outputEncoding) {
-      if (this.#done) throw new Error('Unsupported state');
+      if (this.#done) throw Object.assign(new Error('Unsupported state'), { code: 'ERR_CRYPTO_INVALID_STATE' });
       this.#done = true;
-      const data = Buffer.concat(this.#chunks);
+      const data = Buffer.concat(this.#chunks), tail = outputEncoding && outputEncoding !== 'buffer' ? this.#decoder?.end() ?? '' : Buffer.alloc(0);
+      this.#chunks = []; this.#pad = new Uint8Array(0);
       if (this.#decrypt) {
         if (!this.#tag) throw new Error('Unsupported state or unable to authenticate data');
-        try { return encoded(output(call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, Buffer.concat([data, this.#tag]))), outputEncoding); }
+        try { call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, Buffer.concat([data, this.#tag])); }
         catch { throw new Error('Unsupported state or unable to authenticate data'); }
+        return tail;
       }
       const sealed = output(call('web.crypto.encrypt', this.#key, this.#iv, this.#aad, data));
       this.#tag = sealed.subarray(sealed.length - 16);
-      return encoded(sealed.subarray(0, sealed.length - 16), outputEncoding);
+      return tail;
     }
     setAAD(data) { this.#aad = input(data); return this; }
     getAuthTag() { if (this.#decrypt || !this.#tag) throw new Error('Invalid state for operation getAuthTag'); return Buffer.from(this.#tag); }
@@ -151,10 +218,13 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const crypto = {
     webcrypto, subtle: webcrypto.subtle, getRandomValues: array => webcrypto.getRandomValues(array),
     createHash: algorithm => new Hash(algorithm),
-    createHmac: (algorithm, secret) => { const name = digest(algorithm); if (name === 'md5' || name === 'sha224') throw new Error('Digest method not supported'); return new Hash(name, key(secret)); },
+    createHmac: (algorithm, secret) => new Hash(digest(algorithm), key(secret)),
     hash: (algorithm, data, encoding = 'hex') => new Hash(algorithm).update(data).digest(encoding),
     getHashes: () => [...hashes],
     getCiphers: () => ['aes-128-gcm', 'aes-256-gcm'],
+    getCurves: () => ['prime256v1'],
+    timingSafeEqual: (a, b) => { a = input(a); b = input(b); if (a.length !== b.length) throw Object.assign(new RangeError('Input buffers must have the same byte length'), { code: 'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH' }); return call('web.crypto.equal', a, b); },
+    constants: { RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6 },
     createCipheriv: (algorithm, secret, iv) => new Cipher(false, algorithm, secret, iv),
     createDecipheriv: (algorithm, secret, iv) => new Cipher(true, algorithm, secret, iv),
     pbkdf2Sync: (...args) => output(sync('pbkdf2', ...pbkdf2(...args))),

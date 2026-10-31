@@ -549,3 +549,65 @@ fn layout_reads() {
         "rect_100k_ms={rect:.1} scroll_client_100k_ms={scroll:.1} offset_top_10k_ms={offset:.1} intersection_2000_layout_ms={intersection:.2} resize_2000_layout_ms={resize:.2}"
     );
 }
+
+#[test]
+#[ignore = "release performance measurement"]
+fn css_in_js_insert() {
+    let html = format!(
+        "<style>{}</style><style id=dyn></style><main>{}</main>",
+        (0..1000)
+            .map(|i| format!(".r{i}{{padding:{}px}}", i % 7))
+            .collect::<String>(),
+        (0..2000)
+            .map(|i| format!("<div class='r{} x'><span>a</span></div>", i % 1000))
+            .collect::<String>()
+    );
+    println!(
+        "css_in_js_6k_nodes_1k_rules_text_sheet_class_ms={}",
+        page(
+            &html,
+            r#"
+        const style = document.getElementById('dyn'), div = document.querySelector('main div');
+        getComputedStyle(div).color;
+        let t = performance.now();
+        for (let i = 0; i < 20; i++) { style.append('.n' + i + '{color:red}'); getComputedStyle(div).color; }
+        const text = (performance.now() - t) / 20;
+        let sheet = '';
+        if (style.sheet?.insertRule) { t = performance.now(); for (let i = 0; i < 20; i++) { style.sheet.insertRule('.m' + i + '{color:blue}', style.sheet.cssRules.length); getComputedStyle(div).color; } sheet = ((performance.now() - t) / 20).toFixed(1); }
+        t = performance.now();
+        for (let i = 0; i < 20; i++) { div.classList.toggle('on'); getComputedStyle(div).color; }
+        [text.toFixed(1), sheet, ((performance.now() - t) / 20).toFixed(1)].join()
+    "#
+        )
+    );
+}
+
+#[test]
+#[ignore = "release performance measurement"]
+fn root_custom_properties() {
+    let html = format!(
+        "<html><style>:root{{{}}}.c{{color:red;padding:var(--v7)}}</style><main>{}</main></html>",
+        (0..300)
+            .map(|i| format!("--v{i}:{i}px;"))
+            .collect::<String>(),
+        (0..5000)
+            .map(|i| format!("<div class=c style='width:{i}px'>x</div>"))
+            .collect::<String>()
+    );
+    let restyle = page(
+        &html,
+        r#"
+        const div = document.querySelector('.c');
+        let t = performance.now(); getComputedStyle(div).color; const first = performance.now() - t;
+        t = performance.now();
+        for (let i = 0; i < 10; i++) { document.documentElement.style.setProperty('--v7', i + 'px'); getComputedStyle(div).color; }
+        [first.toFixed(1), ((performance.now() - t) / 10).toFixed(1)].join()
+    "#,
+    );
+    let rss = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default();
+    println!("root_300_vars_10k_nodes_first_restyle_ms={restyle} rss_kb={rss}");
+}

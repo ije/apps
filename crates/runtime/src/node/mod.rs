@@ -15,7 +15,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, mpsc},
 };
-use system::Hasher;
+use system::{Codec, Hasher};
 
 pub(crate) fn bytes(value: &Value) -> Result<&[u8]> {
     if let Some(bytes) = crate::jsc::payload::slice(value) {
@@ -218,6 +218,7 @@ pub(crate) struct State {
     receiver: mpsc::Receiver<crate::jsc::payload::Payload>,
     watchers: HashMap<u64, notify::RecommendedWatcher>,
     hashers: HashMap<u64, Hasher>,
+    codecs: HashMap<u64, (Codec, bool)>,
     tasks: Option<mpsc::Sender<Job>>,
     pool: Option<mpsc::Sender<Job>>,
 }
@@ -231,6 +232,7 @@ impl Default for State {
             receiver,
             watchers: HashMap::new(),
             hashers: HashMap::new(),
+            codecs: HashMap::new(),
             tasks: None,
             pool: None,
         }
@@ -363,6 +365,53 @@ impl State {
             "hash.free" => {
                 self.hashers
                     .remove(&args[0].as_u64().context("Expected hash ID")?);
+                Ok(Value::Null)
+            }
+            "zlib.new" => {
+                let dictionary = if args[4].is_null() {
+                    None
+                } else {
+                    Some(bytes(&args[4])?)
+                };
+                let codec = Codec::new(
+                    args[0].as_str().unwrap_or(""),
+                    args[1] == true,
+                    args[2].as_i64(),
+                    args[3].as_u64(),
+                    dictionary,
+                )?;
+                self.next += 1;
+                self.codecs.insert(self.next, (codec, false));
+                Ok(json!(self.next))
+            }
+            "zlib.write" => {
+                let (codec, ended) = self
+                    .codecs
+                    .get_mut(&args[0].as_u64().context("Expected zlib ID")?)
+                    .context("Zlib stream is closed")?;
+                let output = codec.write(
+                    bytes(&args[1])?,
+                    args[2].as_u64().unwrap_or(0),
+                    ended,
+                    u64::MAX,
+                )?;
+                Ok(json!({"bytes":crate::jsc::payload::write(output),"ended":*ended}))
+            }
+            "zlib.params" => {
+                if let Some((Codec::Encode(encoder), _)) = self
+                    .codecs
+                    .get_mut(&args[0].as_u64().context("Expected zlib ID")?)
+                {
+                    // WARNING: zlib-rs cannot switch to a level with another match strategy mid-stream, so such a change keeps the old level.
+                    let _ = encoder.set_level(flate2::Compression::new(
+                        args[1].as_u64().filter(|level| *level <= 9).unwrap_or(6) as u32,
+                    ));
+                }
+                Ok(Value::Null)
+            }
+            "zlib.free" => {
+                self.codecs
+                    .remove(&args[0].as_u64().context("Expected zlib ID")?);
                 Ok(Value::Null)
             }
             "unwatch" => {

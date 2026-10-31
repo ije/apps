@@ -78,7 +78,7 @@ pub struct Host {
     pub disabled: u32,
     pub native_modules: HashMap<String, PathBuf>,
     pub assets: HashMap<String, PathBuf>,
-    pub scripts: std::sync::Arc<HashMap<String, std::sync::Arc<str>>>,
+    pub scripts: std::sync::Arc<HashMap<String, bytes::Bytes>>,
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
     pub dom: HashMap<u64, crate::dom::State>,
@@ -86,6 +86,7 @@ pub struct Host {
     pub browsers: crate::desktop::browser::State,
     pub logs: std::collections::VecDeque<Value>,
     pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
+    pub media: HashMap<u64, crate::web::media::Media>,
     pub viewports: HashMap<u64, [f32; 2]>,
     pub resized: Vec<u64>,
     pub window_changes: Vec<u64>,
@@ -169,7 +170,7 @@ impl Host {
             let mut parts = ["", ""];
             for (part, units) in parts.iter_mut().zip([b, c]).take(match code {
                 0 | 4 => 2,
-                1 | 5 => 1,
+                1 | 5 | 7 => 1,
                 _ => 0,
             }) {
                 let units = usize::try_from(units).unwrap_or(usize::MAX);
@@ -207,8 +208,9 @@ impl Host {
                         state.place(
                             doc,
                             id,
+                            // WARNING: pages lower-case HTML names themselves; SVG and other namespaces keep their case.
                             Node {
-                                tag: tag.to_ascii_lowercase(),
+                                tag: tag.into(),
                                 text: parts[1].into(),
                                 ..Node::default()
                             },
@@ -351,6 +353,49 @@ impl Host {
                         state.hosts.insert(root, host);
                         true
                     }
+                    7 => {
+                        let id = node(doc, a)?;
+                        let value = (c == 0).then(|| parts[0].to_owned());
+                        let current = &doc.nodes[id];
+                        if current.value == value {
+                            return Ok(false);
+                        }
+                        // WARNING: selectors only see whether a value is empty, so other edits keep the styles.
+                        let fallback = current.attrs.get("value").map(String::as_str);
+                        let empty = |value: Option<&String>| {
+                            value
+                                .map(String::as_str)
+                                .or(fallback)
+                                .is_none_or(str::is_empty)
+                        };
+                        if state.computed.is_some()
+                            && empty(current.value.as_ref()) != empty(value.as_ref())
+                            && connected(doc, &state.hosts, id)
+                        {
+                            state.computed = None;
+                        }
+                        doc.nodes[id].value = value;
+                        true
+                    }
+                    8 => {
+                        let id = node(doc, a)?;
+                        let bits = [crate::dom::CHECKED, crate::dom::DIRTY, crate::dom::MODAL]
+                            .into_iter()
+                            .enumerate()
+                            .fold(0, |bits, (index, bit)| {
+                                bits | if b & 1 << index != 0 { bit } else { 0 }
+                            });
+                        let mask = crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::MODAL;
+                        if doc.nodes[id].state & mask == bits {
+                            return Ok(false);
+                        }
+                        if state.computed.is_some() && connected(doc, &state.hosts, id) {
+                            state.computed = None;
+                        }
+                        let node = &mut doc.nodes[id];
+                        node.state = node.state & !mask | bits;
+                        true
+                    }
                     _ => bail!("Unknown DOM operation"),
                 })
             })();
@@ -375,6 +420,59 @@ impl Host {
             page.dirty = true;
         }
         Ok(result)
+    }
+
+    /// Runs media `op` of page `id`. Frames that are due go to the page images.
+    pub fn media(&mut self, id: u64, op: &str, args: &Value) -> Result<Value> {
+        let disabled = self.disabled;
+        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let state = self.dom.entry(id).or_default();
+        let media = self.media.entry(id).or_default();
+        if op == "poll" {
+            let events: Value = serde_json::from_slice(&media.poll())?;
+            for event in events.as_array().into_iter().flatten() {
+                if event[1] == "frame"
+                    && let Some(node) = event[0].as_u64()
+                    && let Some(image) = media.frame(node)
+                {
+                    crate::dom::show_frame(state, node as usize, Some(std::sync::Arc::new(image)));
+                }
+            }
+            page.dirty |= std::mem::take(&mut state.dirty);
+            return Ok(events);
+        }
+        let node = args[0].as_u64().context("Invalid node")?;
+        ensure!((node as usize) < page.doc.nodes.len(), "Invalid node id");
+        match op {
+            "open" => {
+                let video = args[2].as_bool().unwrap_or(false);
+                let feature = if video { "video" } else { "audio" };
+                ensure!(
+                    disabled & crate::bundle::feature_bit(feature) == 0,
+                    "The {feature} feature is disabled. Add \"{feature}\" to \"features\" in package.json"
+                );
+                if args[1].is_string() {
+                    let path = local_file(&self.assets, state, &args[1])?
+                        .context("Media is not a bundled asset or local file")?;
+                    media.open(node, Ok(&path), video)?;
+                } else {
+                    media.open(node, Err(crate::node::bytes(&args[1])?), video)?;
+                }
+            }
+            "control" => media.control(
+                node,
+                args[1].as_u64().context("Expected a media operation")? as u32,
+                args[2].as_f64().unwrap_or(0.),
+            ),
+            "time" => return Ok(json!(media.time(node))),
+            "close" => {
+                media.close(node);
+                crate::dom::show_frame(state, node as usize, None);
+                page.dirty |= std::mem::take(&mut state.dirty);
+            }
+            _ => bail!("Unknown media operation: {op}"),
+        }
+        Ok(Value::Null)
     }
 
     pub fn call(&mut self, role: Role, op: &str, args: Value) -> Result<Value> {
@@ -413,6 +511,15 @@ impl Host {
                     .push(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
                 return Ok(Value::Null);
             }
+            if op == "dom.executed" {
+                ensure!(
+                    args[0].is_u64() && args[1].is_string(),
+                    "Invalid script result"
+                );
+                self.commands
+                    .push(json!({"op":"window", "args":["executed",id,args[0],args[1]]}));
+                return Ok(Value::Null);
+            }
             let page = self.pages.get_mut(&id).context("Window is closed")?;
             if op == "dom.viewport" {
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
@@ -429,18 +536,8 @@ impl Host {
             if op == "dom.imageURL" {
                 let node = args[0].as_u64().context("Invalid node")? as usize;
                 ensure!(node < page.doc.nodes.len(), "Invalid node id");
-                let base = state.base.as_ref().context("Missing page URL")?;
-                let url = base.join(args[1].as_str().context("Expected image URL")?)?;
-                let path = match url.scheme() {
-                    "apps" => self.assets.get(url.path().trim_start_matches('/')).cloned(),
-                    "file"
-                        if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) =>
-                    {
-                        url.to_file_path().ok()
-                    }
-                    _ => None,
-                }
-                .context("Image is not a bundled asset or local file")?;
+                let path = local_file(&self.assets, state, &args[1])?
+                    .context("Image is not a bundled asset or local file")?;
                 return Ok(crate::dom::load_image(state, node, move || {
                     let metadata = std::fs::metadata(&path)?;
                     ensure!(
@@ -469,10 +566,14 @@ impl Host {
             page.dirty |= std::mem::take(&mut state.dirty);
             if op == "dom.release"
                 && let Ok(ids) = &result
-                && let Some(gpu) = self.graphics.get_mut(&id)
             {
                 for node in ids.as_array().into_iter().flatten() {
-                    let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
+                    if let Some(gpu) = self.graphics.get_mut(&id) {
+                        let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
+                    }
+                    if let (Some(media), Some(node)) = (self.media.get_mut(&id), node.as_u64()) {
+                        media.close(node);
+                    }
                 }
             }
             return result;
@@ -486,6 +587,19 @@ impl Host {
                     std::io::stdout().write_all(bytes)?;
                 }
                 Ok(Value::Null)
+            }
+            "process.exit" => {
+                let code = args[0].as_f64().unwrap_or(0.) as i32;
+                if crate::web::worker::exit(code) {
+                    return Ok(Value::Null);
+                }
+                ensure!(
+                    matches!(role, Role::Main),
+                    "process.exit() is only available in the main process and workers"
+                );
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                std::process::exit(code)
             }
             "process.kill" => {
                 #[cfg(unix)]
@@ -563,8 +677,18 @@ impl Host {
                     .map(|value| value.replace('_', "-"))
                     .collect();
                 let locale = json!({"system":system,"languages":if languages.is_empty() {vec![system.clone()]} else {languages}});
+                let lossy = |value: std::ffi::OsString| value.to_string_lossy().into_owned();
+                let mut argv: Vec<_> = std::env::args_os().map(lossy).collect();
+                if !self.packaged
+                    && let Some(end) = argv.iter().position(|arg| arg == "--")
+                {
+                    argv.drain(1..=end);
+                }
+                let env: HashMap<_, _> = std::env::vars_os()
+                    .map(|(name, value)| (lossy(name), lossy(value)))
+                    .collect();
                 Ok(
-                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":std::env::args().collect::<Vec<_>>(),"env":std::env::vars().collect::<HashMap<_,_>>(),"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             "cwd" => Ok(json!(std::env::current_dir()?)),
@@ -589,4 +713,21 @@ impl Host {
             _ => bail!("Unsupported host operation: {op}"),
         }
     }
+}
+
+/// The file of a bundled asset URL, or of a local file URL in a local page.
+fn local_file(
+    assets: &HashMap<String, PathBuf>,
+    state: &crate::dom::State,
+    url: &Value,
+) -> Result<Option<PathBuf>> {
+    let base = state.base.as_ref().context("Missing page URL")?;
+    let url = base.join(url.as_str().context("Expected a URL")?)?;
+    Ok(match url.scheme() {
+        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
+        "file" if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) => {
+            url.to_file_path().ok()
+        }
+        _ => None,
+    })
 }

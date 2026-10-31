@@ -122,7 +122,8 @@ impl State {
     ) -> Result<Rc<Self>> {
         let mut helpers = HashMap::new();
         if addon {
-            let source = api.string(include_str!("../../js/node/napi.js"));
+            let napi = js!("node/napi.js");
+            let source = api.string(&napi);
             let mut exception = ptr::null_mut();
             let object = unsafe {
                 (api.evaluate)(
@@ -145,7 +146,7 @@ impl State {
             unsafe {
                 (api.protect)(ctx, object);
             }
-            for line in include_str!("../../js/node/napi.js").lines() {
+            for line in napi.lines() {
                 if let Some((name, _)) = line
                     .strip_prefix("  ")
                     .and_then(|line| line.split_once(':'))

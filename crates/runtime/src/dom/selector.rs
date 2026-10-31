@@ -8,6 +8,7 @@ pub(crate) const FOCUS: u8 = 1;
 pub(crate) const FOCUS_WITHIN: u8 = 2;
 pub(crate) const HOVER: u8 = 4;
 pub(crate) const ACTIVE: u8 = 8;
+pub(crate) const FOCUS_VISIBLE: u8 = 128;
 const HAS: u8 = 16;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,7 +29,17 @@ enum SimpleSelector {
     Pseudo(String, String, #[serde(skip)] Vec<Selector>, [i32; 2]),
     Element(String, String),
     Parent(#[serde(skip)] SelectorList, usize),
+    NoNamespace,
 }
+
+// WARNING: page queries reject pseudo-classes and pseudo-elements outside these lists, as browsers
+// do; stylesheets keep unknown ones as selectors that never match.
+const PSEUDOS: [&str; 4] = [
+    "active any-link autofill blank buffering checked closed default defined disabled empty enabled first-child first-of-type focus focus-visible focus-within fullscreen future has-slotted host hover in-range indeterminate invalid last-child last-of-type link local-link modal muted only-child only-of-type open optional out-of-range past paused picture-in-picture placeholder-shown playing popover-open read-only read-write required root scope seeking stalled target target-within user-invalid user-valid valid visited volume-locked -webkit-any-link -webkit-autofill -webkit-full-screen",
+    "current dir has host host-context is lang not nth-child nth-last-child nth-last-of-type nth-of-type state where -webkit-any",
+    "after backdrop before cue details-content file-selector-button first-letter first-line grammar-error marker placeholder selection spelling-error target-text view-transition",
+    "cue highlight part slotted view-transition-group view-transition-image-pair view-transition-new view-transition-old",
+];
 
 fn split(source: &str) -> Vec<&str> {
     let mut parts = Vec::new();
@@ -181,7 +192,9 @@ impl SelectorCache {
                 node.tag != old.tag || node.attrs != old.attrs || node.inline != old.inline,
                 node.parent != old.parent,
                 node.children != old.children,
-                node.text.is_empty() != old.text.is_empty(),
+                node.text.is_empty() != old.text.is_empty()
+                    || node.value.as_deref().map(str::is_empty)
+                        != old.value.as_deref().map(str::is_empty),
                 node.tag != old.tag,
                 node.state != old.state,
             ];
@@ -213,6 +226,10 @@ impl SelectorCache {
                     } else {
                         "x".into()
                     },
+                    value: node
+                        .value
+                        .as_deref()
+                        .map(|value| if value.is_empty() { "" } else { "x" }.into()),
                     ..Default::default()
                 };
             }
@@ -299,13 +316,20 @@ impl SelectorCache {
 }
 
 impl Selector {
-    fn argument(name: &str, argument: &str) -> Option<(Vec<Self>, [i32; 2])> {
-        let list = |source: &str| Some(Self::parse(source, None)).filter(|list| !list.is_empty());
+    fn argument(
+        name: &str,
+        argument: &str,
+        parent: Option<&SelectorList>,
+        strict: bool,
+    ) -> Option<(Vec<Self>, [i32; 2])> {
+        let list = |source: &str| {
+            Self::list(source, parent, strict, false).filter(|list| !list.is_empty())
+        };
         match name {
             "is" | "where" => Some((
                 split(argument)
                     .into_iter()
-                    .flat_map(|part| Self::parse(part, None))
+                    .flat_map(|part| list(part).unwrap_or_default())
                     .collect(),
                 [0, 0],
             )),
@@ -384,7 +408,7 @@ impl Selector {
                         .ok_or_else(|| anyhow::anyhow!("Missing CSS parent selector"))?;
                 }
                 SimpleSelector::Pseudo(name, argument, parsed, _) => {
-                    if let Some((selectors, _)) = Self::argument(name, argument) {
+                    if let Some((selectors, _)) = Self::argument(name, argument, parent, false) {
                         *parsed = selectors;
                     }
                 }
@@ -445,13 +469,16 @@ impl Selector {
                     "-webkit-scrollbar-thumb",
                     "-webkit-scrollbar-corner",
                     "-webkit-scrollbar-track-piece",
+                    "slotted",
+                    "part",
+                    "starting-style",
                 ]
                 .iter()
                 .position(|n| n == name)?,
             ))
         })?;
         let mut selector = self.clone();
-        if kind < 7 {
+        if !(7..12).contains(&kind) {
             selector.simple.remove(index);
             return Some((kind, selector));
         }
@@ -466,14 +493,28 @@ impl Selector {
         Some((kind, selector))
     }
 
+    pub(crate) fn pseudo_argument(&self) -> Option<&str> {
+        self.simple.iter().find_map(|part| match part {
+            SimpleSelector::Element(_, argument) => Some(argument.as_str()),
+            _ => None,
+        })
+    }
+
     pub(crate) fn key(&self) -> Option<(u8, &str)> {
         self.simple
             .iter()
             .filter_map(|selector| match selector {
                 SimpleSelector::Id(id) => Some((0, id.as_str())),
                 SimpleSelector::Class(class) => Some((1, class.as_str())),
-                SimpleSelector::Tag(tag) => Some((2, tag.as_str())),
-                SimpleSelector::Attribute(name, ..) => Some((3, name.as_str())),
+                // WARNING: keys match node tags and attribute names exactly, so mixed-case names, which also match lowercase HTML ones, have none.
+                SimpleSelector::Tag(name) if !name.bytes().any(|c| c.is_ascii_uppercase()) => {
+                    Some((2, name.as_str()))
+                }
+                SimpleSelector::Attribute(name, ..)
+                    if !name.bytes().any(|c| c.is_ascii_uppercase()) =>
+                {
+                    Some((3, name.as_str()))
+                }
                 _ => None,
             })
             .min_by_key(|(kind, _)| *kind)
@@ -564,12 +605,31 @@ impl Selector {
                     }
                 }
                 SimpleSelector::Parent(_, count) => source.extend(std::iter::repeat_n('&', *count)),
+                SimpleSelector::NoNamespace => source.push('|'),
             }
         }
         source
     }
 
+    /// Parses a stylesheet selector list; an invalid list gives no selectors.
     pub(crate) fn parse(source: &str, parent: Option<&SelectorList>) -> Vec<Self> {
+        Self::list(source, parent, false, true).unwrap_or_default()
+    }
+
+    /// Parses a selector list of a page query, which also rejects unknown pseudo-classes and
+    /// pseudo-elements. Lists past the nesting and length limits match nothing.
+    pub(crate) fn try_parse(source: &str) -> anyhow::Result<Vec<Self>> {
+        Self::list(source, None, true, true)
+            .ok_or_else(|| anyhow::anyhow!("SyntaxError: '{source}' is not a valid selector"))
+    }
+
+    // WARNING: lists past the nesting and length limits give no selectors instead of `None`.
+    fn list(
+        source: &str,
+        parent: Option<&SelectorList>,
+        strict: bool,
+        nested: bool,
+    ) -> Option<Vec<Self>> {
         let mut depth = 0u32;
         if source.bytes().any(|c| {
             depth = match c {
@@ -579,7 +639,7 @@ impl Selector {
             };
             depth > 32
         }) {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let mut selectors = Vec::new();
         let parent_specificity = parent
@@ -588,10 +648,10 @@ impl Selector {
         for source in split(source) {
             let mut rest = source.trim();
             if rest.is_empty() {
-                return Vec::new();
+                return None;
             }
             let mut previous = parent
-                .filter(|_| !rest.contains('&') || rest.starts_with(['>', '+', '~']))
+                .filter(|_| nested && (!rest.contains('&') || rest.starts_with(['>', '+', '~'])))
                 .map(|parent| Self {
                     simple: vec![SimpleSelector::Parent(Rc::clone(parent), 1)],
                     previous: None,
@@ -602,13 +662,11 @@ impl Selector {
                 // WARNING: matching recurses per compound, so long chains can overflow the stack.
                 compounds += 1;
                 if compounds > 256 {
-                    return Vec::new();
+                    return Some(Vec::new());
                 }
                 let mut combinator = ' ';
                 if rest.starts_with(['>', '+', '~']) {
-                    if previous.is_none() {
-                        return Vec::new();
-                    }
+                    previous.as_ref()?;
                     combinator = rest.as_bytes()[0] as char;
                     rest = rest[1..].trim_start();
                 }
@@ -616,9 +674,24 @@ impl Selector {
                     c.is_ascii_whitespace() || matches!(c, '>' | '+' | '~')
                 });
                 if end == 0 {
-                    return Vec::new();
+                    return None;
                 }
                 let mut compound = &rest[..end];
+                let none = compound.starts_with('|');
+                if let Some(tail) = compound
+                    .strip_prefix("*|")
+                    .or_else(|| compound.strip_prefix('|'))
+                {
+                    if !tail.starts_with('*') && identifier(tail).is_none() {
+                        return None;
+                    }
+                    compound = tail;
+                } else if compound.contains('|')
+                    && let Some((_, length)) = identifier(compound)
+                    && compound[length..].starts_with('|')
+                {
+                    return None;
+                }
                 let mut simple = Vec::new();
                 let mut parent_index = None;
                 let mut specificity = previous.as_ref().map_or([0; 3], |s| s.specificity);
@@ -627,7 +700,7 @@ impl Selector {
                     if marker == b'[' {
                         let end = 1 + selector_boundary(&compound[1..], |c| c == ']');
                         if end == compound.len() {
-                            return Vec::new();
+                            return None;
                         }
                         let attribute = compound[1..end].trim();
                         let attribute = attribute
@@ -638,37 +711,30 @@ impl Selector {
                                     .filter(|rest| !rest.starts_with('='))
                             })
                             .unwrap_or(attribute);
-                        let Some((name, length)) = identifier(attribute) else {
-                            return Vec::new();
-                        };
+                        let (name, length) = identifier(attribute)?;
                         let tail = attribute[length..].trim_start();
                         let (operator, value, insensitive) = if tail.is_empty() {
                             ("", String::new(), false)
                         } else {
-                            let Some(operator) = ["=", "~=", "|=", "^=", "$=", "*="]
+                            let operator = ["=", "~=", "|=", "^=", "$=", "*="]
                                 .into_iter()
-                                .find(|operator| tail.starts_with(operator))
-                            else {
-                                return Vec::new();
-                            };
+                                .find(|operator| tail.starts_with(operator))?;
                             let tail = tail[operator.len()..].trim_start();
                             let (value, length) = if let Some(quote) =
                                 tail.chars().next().filter(|c| matches!(c, '"' | '\''))
                             {
                                 let (value, length) = unescape(&tail[1..], |c| c == quote);
                                 if length + 1 == tail.len() {
-                                    return Vec::new();
+                                    return None;
                                 }
                                 (value, length + 2)
-                            } else if let Some(value) = identifier(tail) {
-                                value
                             } else {
-                                return Vec::new();
+                                identifier(tail)?
                             };
                             let insensitive = match tail[length..].trim_start() {
                                 "" | "s" | "S" => false,
                                 "i" | "I" => true,
-                                _ => return Vec::new(),
+                                _ => return None,
                             };
                             (
                                 operator,
@@ -692,7 +758,7 @@ impl Selector {
                     }
                     if matches!(marker, b'&' | b'*') {
                         if marker == b'*' && !simple.is_empty() {
-                            return Vec::new();
+                            return None;
                         }
                         if marker == b'&' {
                             if let Some(parent) = parent {
@@ -721,26 +787,33 @@ impl Selector {
                     if marker == b':' {
                         let element = compound.starts_with("::");
                         compound = &compound[if element { 2 } else { 1 }..];
-                        let Some((name, length)) = identifier(compound) else {
-                            return Vec::new();
-                        };
+                        let (name, length) = identifier(compound)?;
                         let name = name.to_ascii_lowercase();
                         compound = &compound[length..];
                         let mut argument = "";
-                        if compound.starts_with('(') {
+                        let functional = compound.starts_with('(');
+                        if functional {
                             let close = 1 + selector_boundary(&compound[1..], |c| c == ')');
                             if close == compound.len() {
-                                return Vec::new();
+                                return None;
                             }
                             argument = &compound[1..close];
                             compound = &compound[close + 1..];
                         }
-                        if element
+                        let element = element
                             || matches!(
                                 name.as_str(),
                                 "before" | "after" | "first-line" | "first-letter"
-                            )
+                            );
+                        if strict
+                            && !PSEUDOS[usize::from(element) * 2 + usize::from(functional)]
+                                .split(' ')
+                                .any(|known| known == name)
+                            && !(element && !functional && name.starts_with("-webkit-"))
                         {
+                            return None;
+                        }
+                        if element {
                             specificity[2] = specificity[2].saturating_add(1);
                             simple.push(SimpleSelector::Element(name, argument.into()));
                             continue;
@@ -750,9 +823,7 @@ impl Selector {
                             simple.push(SimpleSelector::Root);
                             continue;
                         }
-                        let Some((selectors, nth)) = Self::argument(&name, argument) else {
-                            return Vec::new();
-                        };
+                        let (selectors, nth) = Self::argument(&name, argument, parent, strict)?;
                         let [ids, classes, tags] = selectors
                             .iter()
                             .map(|selector| selector.specificity)
@@ -778,11 +849,9 @@ impl Selector {
                     if matches!(marker, b'.' | b'#') {
                         compound = &compound[1..];
                     } else if !simple.is_empty() {
-                        return Vec::new();
+                        return None;
                     }
-                    let Some((name, length)) = identifier(compound) else {
-                        return Vec::new();
-                    };
+                    let (name, length) = identifier(compound)?;
                     compound = &compound[length..];
                     simple.push(match marker {
                         b'#' => {
@@ -799,6 +868,9 @@ impl Selector {
                         }
                     });
                 }
+                if none {
+                    simple.insert(0, SimpleSelector::NoNamespace);
+                }
                 previous = Some(Self {
                     simple,
                     previous: previous.map(|s| (combinator, Box::new(s))),
@@ -806,9 +878,9 @@ impl Selector {
                 });
                 rest = rest[end..].trim_start();
             }
-            selectors.push(previous.unwrap());
+            selectors.push(previous?);
         }
-        selectors
+        Some(selectors)
     }
 
     pub(crate) fn matches(&self, doc: &Document, id: usize) -> bool {
@@ -855,7 +927,12 @@ impl Selector {
             let node = &doc.nodes[id];
             if node.tag.starts_with('#')
                 || !self.simple.iter().all(|s| match s {
-                    SimpleSelector::Tag(tag) => node.tag == *tag,
+                    // WARNING: HTML tags and attribute names are lowercase in the tree and match selectors ASCII case-insensitively; SVG ones keep their case and match as written.
+                    SimpleSelector::Tag(tag) => {
+                        node.tag == *tag
+                            || node.tag.eq_ignore_ascii_case(tag)
+                                && !node.tag.bytes().any(|c| c.is_ascii_uppercase())
+                    }
                     SimpleSelector::Id(id) => node.attrs.get("id") == Some(id),
                     SimpleSelector::Class(class) => {
                         node.attrs.get("class").is_some_and(|classes| {
@@ -864,30 +941,51 @@ impl Selector {
                     }
                     SimpleSelector::Universal => true,
                     SimpleSelector::Root => node.tag == "html",
-                    SimpleSelector::Attribute(name, operator, value, insensitive) => {
-                        node.attrs.get(name).is_some_and(|actual| {
-                            let lower;
-                            let actual = if *insensitive {
-                                lower = actual.to_ascii_lowercase();
-                                &lower
-                            } else {
-                                actual
+                    SimpleSelector::Attribute(name, operator, value, insensitive) => node
+                        .attrs
+                        .iter()
+                        .find(|(key, _)| {
+                            *key == name
+                                || key.eq_ignore_ascii_case(name)
+                                    && !key.bytes().any(|c| c.is_ascii_uppercase())
+                        })
+                        .is_some_and(|(_, actual)| {
+                            let equal = |part: Option<&str>| {
+                                part.is_some_and(|part| {
+                                    if *insensitive {
+                                        part.eq_ignore_ascii_case(value)
+                                    } else {
+                                        part == value
+                                    }
+                                })
                             };
+                            let length = value.len();
                             match operator.as_str() {
                                 "" => true,
-                                "=" => actual == value,
-                                "~=" => actual.split_ascii_whitespace().any(|word| word == value),
-                                "|=" => actual
-                                    .strip_prefix(value.as_str())
-                                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-')),
+                                "=" => equal(Some(actual)),
+                                "~=" => actual
+                                    .split_ascii_whitespace()
+                                    .any(|word| equal(Some(word))),
+                                "|=" => {
+                                    equal(actual.get(..length))
+                                        && actual.as_bytes().get(length).is_none_or(|&c| c == b'-')
+                                }
                                 _ if value.is_empty() => false,
-                                "^=" => actual.starts_with(value.as_str()),
-                                "$=" => actual.ends_with(value.as_str()),
+                                "^=" => equal(actual.get(..length)),
+                                "$=" => equal(
+                                    actual
+                                        .len()
+                                        .checked_sub(length)
+                                        .and_then(|start| actual.get(start..)),
+                                ),
+                                "*=" if *insensitive => actual
+                                    .as_bytes()
+                                    .windows(length)
+                                    .any(|part| part.eq_ignore_ascii_case(value.as_bytes())),
                                 "*=" => actual.contains(value.as_str()),
                                 _ => false,
                             }
-                        })
-                    }
+                        }),
                     SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
                         "scope" => scope.map_or(node.tag == "html", |scope| scope == id),
                         "has" => {
@@ -948,6 +1046,7 @@ impl Selector {
                                     "hover" => HOVER,
                                     "active" => ACTIVE,
                                     "focus-within" => FOCUS_WITHIN,
+                                    "focus-visible" => FOCUS_VISIBLE,
                                     _ => FOCUS,
                                 }
                                 != 0
@@ -964,17 +1063,63 @@ impl Selector {
                         "indeterminate" => {
                             node.tag == "progress" && !node.attrs.contains_key("value")
                         }
-                        "checked" => match node.tag.as_str() {
-                            "input" => {
-                                node.attrs.contains_key("checked")
-                                    && node.attrs.get("type").is_some_and(|kind| {
-                                        kind.eq_ignore_ascii_case("checkbox")
-                                            || kind.eq_ignore_ascii_case("radio")
-                                    })
+                        "checked" => {
+                            memo.depend(id, 0);
+                            memo.depend(id, 5);
+                            match node.tag.as_str() {
+                                "input" => {
+                                    node.checked()
+                                        && node.attrs.get("type").is_some_and(|kind| {
+                                            kind.eq_ignore_ascii_case("checkbox")
+                                                || kind.eq_ignore_ascii_case("radio")
+                                        })
+                                }
+                                "option" if node.state & super::DIRTY != 0 || node.checked() => {
+                                    node.checked()
+                                }
+                                // WARNING: until a script syncs the selection, a single select without a selected option shows its first enabled one.
+                                "option" => {
+                                    let mut select = node.parent.unwrap_or_default();
+                                    memo.depend(select, 1);
+                                    if doc.nodes[select].tag == "optgroup" {
+                                        select = doc.nodes[select].parent.unwrap_or_default();
+                                    }
+                                    memo.depend(select, 0);
+                                    memo.depend(select, 2);
+                                    let parent = &doc.nodes[select];
+                                    let mut options = Vec::new();
+                                    for &child in &parent.children {
+                                        if doc.nodes[child].tag == "optgroup" {
+                                            memo.depend(child, 2);
+                                            options.extend(&doc.nodes[child].children);
+                                        } else {
+                                            options.push(child);
+                                        }
+                                    }
+                                    options.retain(|&option| doc.nodes[option].tag == "option");
+                                    for &option in &options {
+                                        memo.depend(option, 0);
+                                        memo.depend(option, 5);
+                                    }
+                                    parent.tag == "select"
+                                        && !parent.attrs.contains_key("multiple")
+                                        && parent.attrs.get("size").is_none_or(|size| {
+                                            size.trim().parse::<u32>().is_ok_and(|size| size <= 1)
+                                        })
+                                        && options
+                                            .iter()
+                                            .all(|&option| !doc.nodes[option].checked())
+                                        && options.iter().find(|&&option| {
+                                            !doc.nodes[option].attrs.contains_key("disabled")
+                                        }) == Some(&id)
+                                }
+                                _ => false,
                             }
-                            "option" => node.attrs.contains_key("selected"),
-                            _ => false,
-                        },
+                        }
+                        "modal" => {
+                            memo.depend(id, 5);
+                            node.state & super::MODAL != 0
+                        }
                         "disabled" | "enabled" => {
                             matches!(
                                 node.tag.as_str(),
@@ -990,16 +1135,24 @@ impl Selector {
                         "placeholder-shown" | "required" | "optional" | "valid" | "invalid" => {
                             memo.depend(id, 2);
                             memo.depend(id, 3);
+                            memo.depend(id, 5);
+                            for &child in &node.children {
+                                memo.depend(child, 3);
+                            }
                             let required = node.attrs.contains_key("required");
                             let empty = if node.attrs.get("type").is_some_and(|kind| {
                                 kind.eq_ignore_ascii_case("checkbox")
                                     || kind.eq_ignore_ascii_case("radio")
                             }) {
-                                !node.attrs.contains_key("checked")
+                                !node.checked()
                             } else {
-                                node.attrs.get("value").map_or(
-                                    node.text.is_empty() && node.children.is_empty(),
-                                    String::is_empty,
+                                node.current_value().map_or(
+                                    node.text.is_empty()
+                                        && node.children.iter().all(|&child| {
+                                            doc.nodes[child].tag == "#text"
+                                                && doc.nodes[child].text.is_empty()
+                                        }),
+                                    str::is_empty,
                                 )
                             };
                             matches!(node.tag.as_str(), "input" | "select" | "textarea")
@@ -1190,7 +1343,7 @@ impl Selector {
                         }
                         _ => false,
                     },
-                    SimpleSelector::Element(..) => false,
+                    SimpleSelector::Element(..) | SimpleSelector::NoNamespace => false,
                     SimpleSelector::Parent(parent, _) => parent
                         .iter()
                         .any(|s| s.matches_cached(doc, id, scope, memo)),
@@ -1394,8 +1547,9 @@ mod tests {
 
     #[test]
     fn attribute_selectors_handle_flags_quotes_and_escapes() {
-        let doc = Document::parse(
+        let doc = Document::fragment(
             "<div id=x data-k='ABC def' lang='en-US' title='a]b c' class='hover:bg md:w-1/2 123'></div>",
+            "body",
         );
         for selector in [
             "[data-k='abc def' i]",
@@ -1477,6 +1631,161 @@ mod tests {
             assert!(!Selector::parse(selector, None).is_empty(), "{selector}");
         }
         assert!(Selector::parse(&"a ".repeat(2000), None).is_empty());
+    }
+
+    #[test]
+    fn page_queries_reject_invalid_selectors() {
+        for selector in [
+            "",
+            " ",
+            "div[",
+            "li,",
+            ",li",
+            "li >",
+            "> li",
+            "+ li",
+            ":foo",
+            "::foo",
+            "li:foo(1)",
+            "li::before()",
+            ":hover()",
+            ":root()",
+            ":is",
+            ":has(:has(a))",
+            ":has(:is(:has(a)))",
+            ":not(:foo)",
+            ":nth-child(2 of :foo)",
+            "a)",
+            "(a",
+            ":not(a",
+            "a[x=\"y]",
+            "'a'",
+            "a..b",
+            "#1a",
+            "svg|rect",
+            "*|.a",
+            "|",
+            "|.a",
+            "a|",
+            "div|*",
+            "*|",
+            "[ns|a]",
+            "a > > b",
+            "li:nth-child",
+            "a!",
+        ] {
+            let error = Selector::try_parse(selector).unwrap_err().to_string();
+            assert!(error.starts_with("SyntaxError: "), "{selector}: {error}");
+        }
+        for selector in [
+            "li",
+            ":is()",
+            ":is(:foo, li)",
+            ":where(.a, 1x)",
+            "#\\31 a",
+            "*|rect",
+            "*|*",
+            "|rect",
+            "|*",
+            "[*|title]",
+            "[|title]",
+            "a::before",
+            "a:before",
+            "::-webkit-scrollbar-thumb:hover",
+            "::-webkit-anything",
+            "::slotted(span)",
+            "::part(label)",
+            ":host",
+            ":host(.a)",
+            ":host-context(.dark) b",
+            ":focus-visible",
+            ":visited",
+            ":has(> img, + p)",
+            "li:nth-child(2n+1 of .k)",
+            ":-webkit-any(a, b)",
+            "DIV > Span.A",
+        ] {
+            assert!(Selector::try_parse(selector).is_ok(), "{selector}");
+        }
+        let deep = format!("{}li{}", ":not(".repeat(1000), ")".repeat(1000));
+        assert!(Selector::try_parse(&deep).unwrap().is_empty());
+        assert!(Selector::try_parse(&format!(":not({})", "a ".repeat(300))).is_err());
+        for selector in [":unknown", "::-moz-selection", "li:foo(1)"] {
+            assert!(!Selector::parse(selector, None).is_empty(), "{selector}");
+        }
+    }
+
+    #[test]
+    fn html_names_match_case_insensitively_and_svg_names_as_written() {
+        let doc = Document::parse(
+            "<ul><li id=a data-v=1></li></ul><svg id=s viewBox='0 0 1 1'><linearGradient id=g></linearGradient><rect id=r></rect></svg>",
+        );
+        let query = |selector: &str| {
+            let selectors = Selector::try_parse(selector).unwrap();
+            (0..doc.nodes.len())
+                .filter(|&id| selectors.iter().any(|s| s.matches(&doc, id)))
+                .filter_map(|id| doc.nodes[id].attrs.get("id").cloned())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for (selector, expected) in [
+            ("LI", "a"),
+            ("Ul > lI", "a"),
+            ("[DATA-V]", "a"),
+            ("[Data-V='1']", "a"),
+            ("[data-v='1' i]", "a"),
+            ("linearGradient", "g"),
+            ("lineargradient", ""),
+            ("LINEARGRADIENT", ""),
+            ("rect", "r"),
+            ("[viewBox]", "s"),
+            ("[viewbox]", ""),
+            ("*|rect", "r"),
+            ("*|li", "a"),
+            ("|rect, |li, |*", ""),
+            ("*|*[id=g]", "g"),
+            ("[*|data-v]", "a"),
+        ] {
+            assert_eq!(query(selector), expected, "{selector}");
+        }
+        assert_eq!(Selector::try_parse("|rect").unwrap()[0].source(), "|rect");
+        let doc =
+            Document::parse("<style>LI{color:red}[DATA-V]{margin-top:1px}</style><li data-v></li>");
+        let styles = crate::style::styles(&doc, 800., 600.);
+        let li = doc.nodes.iter().position(|n| n.tag == "li").unwrap();
+        assert_eq!(styles[li]["color"], "red");
+        assert_eq!(styles[li]["margin-top"], "1px");
+    }
+
+    #[test]
+    fn hostile_selectors_never_panic() {
+        let alphabet: Vec<char> = "ab*|#.:()[]=~^$'\"\\>+, -_1nof&!é😀i".chars().collect();
+        let doc =
+            Document::parse("<div id=x class=a><p lang=en><b>t</b></p></div><svg><rect/></svg>");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            let mut text = String::new();
+            for _ in 0..(seed % 24) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push(alphabet[(seed % alphabet.len() as u64) as usize]);
+            }
+            for prefix in ["", ":is(", ":has(", ":not(", "[", ":nth-child("] {
+                let source = format!("{prefix}{text}");
+                for selectors in [
+                    Selector::try_parse(&source).unwrap_or_default(),
+                    Selector::parse(&source, None),
+                ] {
+                    for selector in &selectors {
+                        selector.source();
+                        for id in 0..doc.nodes.len() {
+                            selector.matches(&doc, id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

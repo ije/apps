@@ -29,9 +29,10 @@ pub use layout::{AvailableSpace, LayoutId};
 pub use scene::{Backdrop, BlendMode, BorderStyle, PaintEffect, RenderImage, Scene};
 pub use style::*;
 pub use text::{
-    DecorationStyle, Font, FontId, FontStyle, FontWeight, GlyphId, LineLayout, ShapedLine,
-    SharedString, StrikethroughStyle, StyledText, TextAlign, TextLayout, TextRun, TextSystem,
-    TextWrap, UnderlineStyle, WhiteSpace, WrapBoundary, WrappedLine, WrappedLineLayout, font,
+    DecorationStyle, Font, FontId, FontStyle, FontWeight, GlyphId, LineLayout, SUBPIXEL_VARIANTS_X,
+    ShapedLine, SharedString, StrikethroughStyle, StyledText, TextAlign, TextLayout, TextRun,
+    TextSystem, TextWrap, UnderlineStyle, WhiteSpace, WordBreak, WrapBoundary, WrappedLine,
+    WrappedLineLayout, font,
 };
 pub use window::*;
 

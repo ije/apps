@@ -94,14 +94,8 @@ impl State {
         match op {
             "sync" => {
                 let mut state = State::default();
-                let mut config = args[2].clone();
-                if let Some(stdio) = config["stdio"].as_str() {
-                    config["stdio"] = json!([stdio, stdio, stdio]);
-                }
-                if config["stdio"].is_null() {
-                    config["stdio"] = json!(["pipe", "pipe", "pipe"]);
-                }
-                let spawned = state.call(role, "spawn", &json!([args[0], args[1], config]))?;
+                let config = &args[2];
+                let spawned = state.call(role, "spawn", args)?;
                 if !spawned["error"].is_null() {
                     return Ok(spawned);
                 }
@@ -144,7 +138,7 @@ impl State {
                             };
                             output.extend(data);
                             if output.len() > limit {
-                                break Some("ENOBUFS");
+                                break Some(("ENOBUFS", libc::ENOBUFS));
                             }
                         }
                         Ok(Event::End(_)) => process.open_streams -= 1,
@@ -155,10 +149,23 @@ impl State {
                             process.exit(status);
                         }
                         Err(RecvTimeoutError::Disconnected) => break None,
-                        Err(RecvTimeoutError::Timeout) => break Some("ETIMEDOUT"),
+                        Err(RecvTimeoutError::Timeout) => {
+                            break Some(("ETIMEDOUT", libc::ETIMEDOUT));
+                        }
                         Ok(_) => {}
                     }
                 };
+                if error.is_some() && process.status.is_none() {
+                    let signal = config["killSignal"].as_str().unwrap_or("SIGTERM");
+                    let _ = state.call(role, "kill", &json!([id, signal]));
+                    let process = state
+                        .children
+                        .get_mut(&id)
+                        .context("Child process is closed")?;
+                    let status = process.child.wait()?;
+                    process.exit(status);
+                }
+                let process = state.children.get(&id).context("Child process is closed")?;
                 let (status, signal) = (process.code(), process.signal.clone());
                 let output = |data: &[u8], index: usize| {
                     if config["stdio"][index] == "pipe" {
@@ -168,11 +175,8 @@ impl State {
                     }
                 };
                 let mut result = json!({"pid":spawned["pid"],"stdout":output(&stdout, 1),"stderr":output(&stderr, 2),"status":status,"signal":signal});
-                if let Some(code) = error {
-                    let _ = state.call(role, "kill", &json!([id, "SIGKILL"]));
-                    result["status"] = Value::Null;
-                    result["signal"] = "SIGKILL".into();
-                    result["error"] = json!({"code":code,"message":"Child process exceeded its output or time limit"});
+                if let Some((code, errno)) = error {
+                    result["error"] = json!({"code":code,"errno":cfg!(unix).then_some(-errno)});
                 }
                 Ok(result)
             }
@@ -215,11 +219,33 @@ impl State {
                         );
                     }
                 }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    if let Some(argv0) = options["argv0"].as_str() {
+                        builder.arg0(argv0);
+                    }
+                    if let Some(uid) = options["uid"].as_u64() {
+                        builder.uid(u32::try_from(uid)?);
+                    }
+                    if let Some(gid) = options["gid"].as_u64() {
+                        builder.gid(u32::try_from(gid)?);
+                    }
+                }
+                #[cfg(not(unix))]
+                ensure!(
+                    options["uid"].is_null() && options["gid"].is_null(),
+                    "The uid and gid options are not supported on Windows"
+                );
                 for index in 0..3 {
-                    let stdio = match options["stdio"][index].as_str().unwrap_or("pipe") {
-                        "pipe" => Stdio::piped(),
-                        "ignore" => Stdio::null(),
-                        "inherit" => Stdio::inherit(),
+                    let stdio = match &options["stdio"][index] {
+                        Value::Null => Stdio::piped(),
+                        Value::String(kind) if kind == "pipe" => Stdio::piped(),
+                        Value::String(kind) if kind == "ignore" => Stdio::null(),
+                        Value::String(kind) if kind == "inherit" => Stdio::inherit(),
+                        fd if fd.as_u64() == Some(index as u64) => Stdio::inherit(),
+                        fd if fd == 1 => Stdio::from(io::stdout()),
+                        fd if fd == 2 => Stdio::from(io::stderr()),
                         _ => bail!("Unsupported stdio option"),
                     };
                     match index {

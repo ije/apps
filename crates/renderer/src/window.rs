@@ -1,8 +1,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Backdrop, BorderStyle, Bounds, BoxShadow, ContentMask,
-    Corners, CursorStyle, DevicePixels, Edges, ElementId, LayoutId, Modifiers, MouseEvent,
-    PaintEffect, Pixels, PlatformInput, Point, RenderImage, Rgba, ScaledPixels, Size, Style,
-    TextStyle, TextStyleRefinement, Utf16Selection, WindowControlArea,
+    CursorStyle, DevicePixels, Edges, ElementId, LayoutId, Modifiers, MouseEvent, PaintEffect,
+    Pixels, PlatformInput, Point, Radii, RenderImage, Rgba, ScaledPixels, Size, Style, TextStyle,
+    TextStyleRefinement, Utf16Selection, WindowControlArea,
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
     input::{DEFAULT_LINE_HEIGHT, DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
@@ -285,7 +285,7 @@ fn invert3(m: &[f32; 9]) -> Option<[f32; 9]> {
 #[derive(Clone, Debug)]
 pub struct PaintQuad {
     pub bounds: Bounds<Pixels>,
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: Radii<Pixels>,
     pub background: Rgba,
     pub border_widths: Edges<Pixels>,
     pub border_color: Rgba,
@@ -293,7 +293,7 @@ pub struct PaintQuad {
 }
 
 impl PaintQuad {
-    pub fn corner_radii(self, radii: impl Into<Corners<Pixels>>) -> Self {
+    pub fn corner_radii(self, radii: impl Into<Radii<Pixels>>) -> Self {
         Self {
             corner_radii: radii.into(),
             ..self
@@ -303,7 +303,7 @@ impl PaintQuad {
 
 pub fn quad(
     bounds: Bounds<Pixels>,
-    corner_radii: impl Into<Corners<Pixels>>,
+    corner_radii: impl Into<Radii<Pixels>>,
     background: Rgba,
     border_widths: impl Into<Edges<Pixels>>,
     border_color: Rgba,
@@ -683,6 +683,49 @@ impl Window {
         self.update_cursor(cx);
     }
 
+    /// Lays out and prepaints `render`'s element without painting or showing it, so a view can
+    /// read current bounds between frames. Like a draw, a pass that calls [`Self::redraw`] runs
+    /// once more. Returns `false` while the window draws.
+    pub fn layout(
+        &mut self,
+        cx: &mut App,
+        mut render: impl FnMut(&mut Self, &mut App) -> AnyElement,
+    ) -> bool {
+        if self.drawing {
+            return false;
+        }
+        self.drawing = true;
+        for _ in 0..2 {
+            self.next.clear();
+            self.next_hitbox = 0;
+            if let Some(layout) = &mut self.layout {
+                layout.begin_frame(self.scale_factor, self.text_system.generation());
+            }
+            let mut root = render(self, cx);
+            let id = root.request_layout(self);
+            let viewport = self.viewport_size;
+            if let Some(layout) = &mut self.layout {
+                layout.stretch(id, viewport, self.scale_factor);
+            }
+            self.compute_layout(
+                id,
+                size(
+                    AvailableSpace::Definite(viewport.width),
+                    AvailableSpace::Definite(viewport.height),
+                ),
+            );
+            root.prepaint_at(Point::default(), self);
+            // WARNING: the next draw starts from `states`, so states taken by this pass go back there.
+            let states = mem::take(&mut self.next_states);
+            self.states.extend(states);
+            if !mem::take(&mut self.redraw[0]) {
+                break;
+            }
+        }
+        self.drawing = false;
+        true
+    }
+
     fn update_cursor(&mut self, cx: &mut App) {
         let style = self
             .rendered
@@ -825,13 +868,19 @@ impl Window {
         }
     }
 
-    /// A leaf sized by `measure`. While `state` compares equal to last frame's, the node keeps
-    /// its layout and the returned state is last frame's, with what `measure` stored in it.
+    /// A leaf sized by `measure`, which also returns its first and last baselines. While `state` compares
+    /// equal to last frame's, the node keeps its layout and the returned state is last frame's,
+    /// with what `measure` stored in it.
     pub fn request_measured_layout<S: PartialEq + 'static>(
         &mut self,
         style: &Style,
         state: S,
-        measure: impl FnMut(&S, Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window) -> Size<Pixels>
+        measure: impl FnMut(
+            &S,
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+        ) -> (Size<Pixels>, Option<[Pixels; 2]>)
         + 'static,
     ) -> (LayoutId, Rc<S>) {
         let scale = self.scale_factor;
@@ -878,6 +927,24 @@ impl Window {
             .layout
             .as_mut()
             .map_or_else(Bounds::default, |layout| layout.layout_bounds(id, scale));
+        bounds + self.element_offset()
+    }
+
+    /// The first and last baselines of a laid out node, from the top of its border box.
+    pub fn layout_baselines(&self, id: LayoutId) -> [Option<Pixels>; 2] {
+        let scale = self.scale_factor;
+        self.layout
+            .as_ref()
+            .map_or([None; 2], |layout| layout.baselines(id, scale))
+    }
+
+    /// Like `layout_bounds`, but with edges in layout units instead of device pixels.
+    pub fn exact_layout_bounds(&mut self, id: LayoutId) -> Bounds<Pixels> {
+        let scale = self.scale_factor;
+        let bounds = self
+            .layout
+            .as_mut()
+            .map_or_else(Bounds::default, |layout| layout.exact_bounds(id, scale));
         bounds + self.element_offset()
     }
 
@@ -1194,7 +1261,7 @@ impl Window {
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: Radii<Pixels>,
         shadows: &[BoxShadow],
     ) {
         self.paint_shadows(bounds, corner_radii, shadows, false);
@@ -1204,7 +1271,7 @@ impl Window {
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: Radii<Pixels>,
         shadows: &[BoxShadow],
     ) {
         self.paint_shadows(bounds, corner_radii, shadows, true);
@@ -1213,7 +1280,7 @@ impl Window {
     fn paint_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: Radii<Pixels>,
         shadows: &[BoxShadow],
         inset: bool,
     ) {
@@ -1223,16 +1290,29 @@ impl Window {
         let element_corner_radii = corner_radii.scale(scale);
         for shadow in shadows.iter().filter(|shadow| shadow.inset == inset) {
             let (shape, radii) = if inset {
-                let zero = Pixels::ZERO;
                 let spread = shadow.spread_radius;
                 (
                     (bounds + shadow.offset).dilate(-spread),
-                    corner_radii.map(|radius| (radius - spread).max(zero)),
+                    corner_radii.inset(spread, spread, spread, spread),
                 )
             } else {
+                let spread = f32::from(shadow.spread_radius);
+                let grow = |radius: Pixels| {
+                    let radius = f32::from(radius);
+                    Pixels::from(if radius <= 0. || spread == 0. {
+                        radius
+                    } else if spread < 0. || radius >= spread {
+                        (radius + spread).max(0.)
+                    } else {
+                        radius + spread * (1. + (radius / spread - 1.).powi(3))
+                    })
+                };
                 (
                     (bounds + shadow.offset).dilate(shadow.spread_radius),
-                    corner_radii,
+                    Radii {
+                        x: corner_radii.x.map(grow),
+                        y: corner_radii.y.map(grow),
+                    },
                 )
             };
             self.scene.insert(Primitive::Shadow(Shadow {
@@ -1493,7 +1573,7 @@ impl Window {
                 size: tile.bounds.size.map(ScaledPixels::from),
             },
             content_mask: self.snapped_content_mask(),
-            corner_radii: Corners::default(),
+            corner_radii: Radii::default(),
         }));
     }
 
@@ -1535,7 +1615,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<Radii<Pixels>>,
         image: Arc<RenderImage>,
         grayscale: bool,
     ) {
@@ -1583,6 +1663,7 @@ impl Window {
             }
         };
         let corner_radii = corner_radii
+            .into()
             .clamp_radii_for_quad_size(visible.size)
             .scale(self.scale_factor);
         self.scene.insert(Primitive::Poly(PolychromeSprite {
@@ -1628,10 +1709,10 @@ fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
     let radii = &quad.corner_radii;
     let widths = &quad.border_widths;
     let edge = Edges {
-        top: radii.top_left.max(radii.top_right),
-        right: radii.top_right.max(radii.bottom_right),
-        bottom: radii.bottom_left.max(radii.bottom_right),
-        left: radii.top_left.max(radii.bottom_left),
+        top: radii.y.top_left.max(radii.y.top_right),
+        right: radii.x.top_right.max(radii.x.bottom_right),
+        bottom: radii.y.bottom_left.max(radii.y.bottom_right),
+        left: radii.x.top_left.max(radii.x.bottom_left),
     };
     let antialias = point(ScaledPixels(1.), ScaledPixels(1.));
     let inset = |near: Point<ScaledPixels>, far: Point<ScaledPixels>| {

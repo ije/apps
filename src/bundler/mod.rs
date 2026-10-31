@@ -84,8 +84,34 @@ struct Linker<'a, 'b> {
     cacheable: bool,
     imported: Vec<usize>,
     required: Vec<usize>,
+    resolved: serde_json::Map<String, Value>,
     error: Option<anyhow::Error>,
 }
+
+/// The named exports of `electron` and `@pierre/apps`.
+const ELECTRON: &[&str] = &[
+    "app",
+    "BrowserWindow",
+    "View",
+    "WebContentsView",
+    "webContents",
+    "serve",
+    "contextBridge",
+    "ipcMain",
+    "ipcRenderer",
+    "clipboard",
+    "shell",
+    "dialog",
+    "nativeTheme",
+    "safeStorage",
+    "Notification",
+    "Menu",
+    "MenuItem",
+    "globalShortcut",
+    "session",
+    "powerMonitor",
+    "screen",
+];
 
 /// `$appsN<module>.<name>`: how linked module code reads an import, so it needs no `with` scope.
 fn namespace_access(dep: usize, name: &str) -> String {
@@ -269,6 +295,27 @@ impl<'a> Visit<'a> for Uses {
     }
 }
 
+impl<'a> Linker<'a, '_> {
+    /// Bundles an HTML page of the app and returns its `apps:///` URL.
+    fn page(&mut self, target: PathBuf) -> Result<&'a str> {
+        self.cacheable = false;
+        if !self.builder.assets.contains_key(&target) {
+            self.builder.files.borrow_mut().insert(target.clone());
+            let name = format!("page-{}.html", self.builder.assets.len());
+            let source = html(
+                &target,
+                self.builder.files.clone(),
+                self.builder.shared.clone(),
+                self.builder.production,
+            )?;
+            self.builder.assets.insert(target.clone(), (name, source));
+        }
+        Ok(self
+            .allocator
+            .alloc_str(&format!("apps:///{}", self.builder.assets[&target].0)))
+    }
+}
+
 impl<'a> VisitMut<'a> for Linker<'a, '_> {
     fn visit_expression(&mut self, expression: &mut Expression<'a>) {
         if self.error.is_some() {
@@ -384,19 +431,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 ) && member.property.name == "url"
                 {
                     let url = if self.builder.production {
-                        let relative = self
-                            .path
-                            .strip_prefix(&self.builder.shared.root)
-                            .ok()
-                            .or_else(|| {
-                                self.path
-                                    .ancestors()
-                                    .find(|directory| directory.ends_with("node_modules"))
-                                    .and_then(Path::parent)
-                                    .and_then(|base| self.path.strip_prefix(base).ok())
-                            })
-                            .or_else(|| self.path.file_name().map(Path::new))
-                            .unwrap_or(Path::new(""));
+                        let relative = app_relative(&self.builder.shared.root, self.path);
                         let mut url = String::from("apps:///");
                         for &byte in relative.as_os_str().as_encoded_bytes() {
                             match byte {
@@ -470,22 +505,52 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 let target = target
                     .canonicalize()
                     .with_context(|| format!("Cannot resolve {}", target.display()))?;
-                self.cacheable = false;
-                if !self.builder.assets.contains_key(&target) {
-                    self.builder.files.borrow_mut().insert(target.clone());
-                    let name = format!("page-{}.html", self.builder.assets.len());
-                    let source = html(
-                        &target,
-                        self.builder.files.clone(),
-                        self.builder.shared.clone(),
-                        self.builder.production,
-                    )?;
-                    self.builder.assets.insert(target.clone(), (name, source));
-                }
-                let value = self
-                    .allocator
-                    .alloc_str(&format!("apps:///{}", self.builder.assets[&target].0));
+                let value = self.page(target)?;
                 *expression = Expression::new_string_literal(span, value, None, &self.ast);
+                return Ok(());
+            }
+            if self.commonjs
+                && let Expression::CallExpression(call) = expression
+                && let Expression::StaticMemberExpression(member) =
+                    call.callee.get_inner_expression()
+                && member.property.name == "resolve"
+                && let Expression::Identifier(require) = member.object.get_inner_expression()
+                && require.name == "require"
+                && self
+                    .scoping
+                    .get_reference(require.reference_id())
+                    .symbol_id()
+                    .is_none()
+                && let Some(Argument::StringLiteral(specifier)) = call.arguments.first()
+                && let Some(specifier) = specifier.value.as_str()
+            {
+                let base = self.path.parent().unwrap_or(Path::new("."));
+                self.cacheable = false;
+                if let Ok((path, None)) = self.builder.locate(base, specifier, true)
+                    && !path.as_os_str().as_encoded_bytes().starts_with(b"apps:")
+                {
+                    let path = self.builder.runtime_path(&path);
+                    self.resolved.insert(specifier.to_owned(), path.into());
+                }
+            }
+            // WARNING: like Electron, a relative `loadFile` path is relative to the app folder, not to the module.
+            if let Expression::CallExpression(call) = expression
+                && self.builder.realm == Realm::Main
+                && let Expression::StaticMemberExpression(member) =
+                    call.callee.get_inner_expression()
+                && member.property.name == "loadFile"
+                && let Some(Argument::StringLiteral(specifier)) = call.arguments.first()
+                && let Some(path) = specifier.value.as_str()
+                && (path.ends_with(".html") || path.ends_with(".htm"))
+                && !path.contains(':')
+                && !Path::new(path).is_absolute()
+                && let Ok(target) = self.builder.shared.root.join(path).canonicalize()
+            {
+                let literal = specifier.span;
+                let value = self.page(target)?;
+                call.arguments[0] =
+                    Expression::new_string_literal(literal, value, None, &self.ast).into();
+                walk_mut::walk_expression(self, expression);
                 return Ok(());
             }
             let import = match expression {
@@ -520,16 +585,13 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             "ESM only: require is not supported in {}",
                             self.path.display()
                         );
-                        let [Argument::StringLiteral(specifier)] = call.arguments.as_slice() else {
-                            bail!(
-                                "Package require needs one string literal in {}",
-                                self.path.display()
-                            );
-                        };
-                        Some((
-                            "$appsRequire",
-                            specifier.value.as_str().context("Invalid module path")?,
-                        ))
+                        match call.arguments.as_slice() {
+                            [Argument::StringLiteral(specifier)] => specifier
+                                .value
+                                .as_str()
+                                .map(|specifier| ("$appsRequire", specifier)),
+                            _ => None,
+                        }
                     }
                 }
                 Expression::ImportMeta(_) => bail!(
@@ -540,9 +602,16 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
             };
             if let Some((name, specifier)) = import {
                 let base = self.path.parent().unwrap_or(Path::new("."));
-                let dep = self
-                    .builder
-                    .resolve(base, specifier, name == "$appsRequire")?;
+                // WARNING: like esbuild, a require() that cannot be resolved throws MODULE_NOT_FOUND when it runs.
+                let dep = if name == "$appsImport" {
+                    self.builder.resolve(base, specifier, false)?
+                } else if let Ok((path, inline)) = self.builder.locate(base, specifier, true) {
+                    self.builder.visit(path, inline)?
+                } else {
+                    self.cacheable = false;
+                    walk_mut::walk_expression(self, expression);
+                    return Ok(());
+                };
                 self.builder.requests.push((
                     base.to_owned(),
                     specifier.to_owned(),
@@ -587,6 +656,28 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
 
 impl Builder {
     fn resolve(&mut self, base: &Path, specifier: &str, require: bool) -> Result<usize> {
+        let (path, inline) = self.locate(base, specifier, require)?;
+        self.visit(path, inline)
+    }
+
+    fn runtime_path(&self, path: &Path) -> String {
+        if !self.production {
+            return std::path::absolute(path)
+                .unwrap_or_else(|_| path.to_owned())
+                .to_string_lossy()
+                .into_owned();
+        }
+        app_relative(&self.shared.root, path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn locate(
+        &mut self,
+        base: &Path,
+        specifier: &str,
+        require: bool,
+    ) -> Result<(PathBuf, Option<String>)> {
         let normalized;
         let specifier = if matches!(
             specifier,
@@ -625,6 +716,8 @@ impl Builder {
                 | "dns/promises"
                 | "querystring"
                 | "perf_hooks"
+                | "constants"
+                | "sys"
         ) && (self.realm != Realm::Renderer
             || !base.ancestors().any(|directory| {
                 directory
@@ -651,33 +744,11 @@ impl Builder {
                 "Window APIs are only available in the main context"
             );
             let path = PathBuf::from(format!("apps:{specifier}"));
-            if let Some(&id) = self.ids.get(&path) {
-                return Ok(id);
+            if self.ids.contains_key(&path) {
+                return Ok((path, None));
             }
             let (object, names) = match specifier {
-                "@pierre/apps" | "electron" => (
-                    "globalThis.__apps",
-                    vec![
-                        "app",
-                        "BrowserWindow",
-                        "View",
-                        "WebContentsView",
-                        "serve",
-                        "contextBridge",
-                        "ipcMain",
-                        "ipcRenderer",
-                        "clipboard",
-                        "shell",
-                        "dialog",
-                        "nativeTheme",
-                        "safeStorage",
-                        "Notification",
-                        "Menu",
-                        "globalShortcut",
-                        "session",
-                        "powerMonitor",
-                    ],
-                ),
+                "@pierre/apps" | "electron" => ("globalThis.__apps", ELECTRON.to_vec()),
                 "ws" => (
                     "globalThis.__apps.ws",
                     vec![
@@ -703,7 +774,17 @@ impl Builder {
                         "isIPv6",
                     ],
                 ),
-                "node:https" => ("globalThis.__apps.https", vec!["request", "get"]),
+                "node:https" => (
+                    "globalThis.__apps.https",
+                    vec![
+                        "Agent",
+                        "Server",
+                        "createServer",
+                        "get",
+                        "globalAgent",
+                        "request",
+                    ],
+                ),
                 "node:http" => (
                     "globalThis.__apps.http",
                     vec![
@@ -713,6 +794,15 @@ impl Builder {
                         "get",
                         "STATUS_CODES",
                         "METHODS",
+                        "Agent",
+                        "globalAgent",
+                        "ClientRequest",
+                        "IncomingMessage",
+                        "OutgoingMessage",
+                        "ServerResponse",
+                        "validateHeaderName",
+                        "validateHeaderValue",
+                        "maxHeaderSize",
                     ],
                 ),
                 "node-pty" => ("globalThis.__apps.pty", vec!["spawn"]),
@@ -730,6 +820,7 @@ impl Builder {
                         "isUtf8",
                         "isAscii",
                         "INSPECT_MAX_BYTES",
+                        "transcode",
                     ],
                 ),
                 "node:stream" => (
@@ -745,6 +836,13 @@ impl Builder {
                         "finished",
                         "addAbortSignal",
                         "promises",
+                        "consumers",
+                        "compose",
+                        "duplexPair",
+                        "isErrored",
+                        "isReadable",
+                        "getDefaultHighWaterMark",
+                        "setDefaultHighWaterMark",
                     ],
                 ),
                 "node:stream/promises" => (
@@ -756,7 +854,7 @@ impl Builder {
                     vec!["arrayBuffer", "blob", "buffer", "json", "text"],
                 ),
                 "node:stream/web" => (
-                    "globalThis",
+                    "globalThis.__apps.module.createRequire()('stream/web')",
                     vec![
                         "ReadableStream",
                         "WritableStream",
@@ -767,9 +865,17 @@ impl Builder {
                         "TextDecoderStream",
                         "CompressionStream",
                         "DecompressionStream",
+                        "ReadableStreamDefaultReader",
+                        "ReadableStreamBYOBReader",
+                        "ReadableStreamBYOBRequest",
+                        "ReadableStreamDefaultController",
+                        "ReadableByteStreamController",
+                        "WritableStreamDefaultWriter",
+                        "WritableStreamDefaultController",
+                        "TransformStreamDefaultController",
                     ],
                 ),
-                "node:util" => (
+                "node:util" | "node:sys" => (
                     "globalThis.__apps.util",
                     vec![
                         "promisify",
@@ -790,6 +896,13 @@ impl Builder {
                         "types",
                         "TextEncoder",
                         "TextDecoder",
+                        "getSystemErrorMessage",
+                        "getSystemErrorMap",
+                        "toUSVString",
+                        "transferableAbortSignal",
+                        "transferableAbortController",
+                        "MIMEType",
+                        "MIMEParams",
                     ],
                 ),
                 "node:util/types" => (
@@ -814,6 +927,30 @@ impl Builder {
                         "isUint8Array",
                         "isWeakMap",
                         "isWeakSet",
+                        "isCryptoKey",
+                        "isMapIterator",
+                        "isSetIterator",
+                        "isModuleNamespaceObject",
+                        "isNumberObject",
+                        "isStringObject",
+                        "isBooleanObject",
+                        "isBigIntObject",
+                        "isSymbolObject",
+                        "isUint8ClampedArray",
+                        "isUint16Array",
+                        "isUint32Array",
+                        "isInt8Array",
+                        "isInt16Array",
+                        "isInt32Array",
+                        "isFloat32Array",
+                        "isFloat64Array",
+                        "isBigInt64Array",
+                        "isBigUint64Array",
+                        "isKeyObject",
+                        "isExternal",
+                        "isProxy",
+                        "isArgumentsObject",
+                        "isFloat16Array",
                     ],
                 ),
                 "node:url" => (
@@ -825,6 +962,8 @@ impl Builder {
                         "pathToFileURL",
                         "format",
                         "urlToHttpOptions",
+                        "domainToASCII",
+                        "domainToUnicode",
                     ],
                 ),
                 "node:string_decoder" => {
@@ -851,6 +990,8 @@ impl Builder {
                         "timingSafeEqual",
                         "webcrypto",
                         "subtle",
+                        "constants",
+                        "getCurves",
                     ],
                 ),
                 "node:worker_threads" => (
@@ -863,6 +1004,9 @@ impl Builder {
                         "parentPort",
                         "workerData",
                         "threadId",
+                        "BroadcastChannel",
+                        "SHARE_ENV",
+                        "receiveMessageOnPort",
                     ],
                 ),
                 "node:module" => (
@@ -893,6 +1037,7 @@ impl Builder {
                         "pid",
                         "ppid",
                         "title",
+                        "type",
                         "version",
                         "versions",
                         "release",
@@ -918,6 +1063,11 @@ impl Builder {
                         "emitWarning",
                         "stdout",
                         "stderr",
+                        "exitCode",
+                        "getuid",
+                        "geteuid",
+                        "getgid",
+                        "getegid",
                     ],
                 ),
                 "node:sqlite" => (
@@ -941,6 +1091,10 @@ impl Builder {
                         "getEventListeners",
                         "setMaxListeners",
                         "defaultMaxListeners",
+                        "captureRejections",
+                        "captureRejectionSymbol",
+                        "getMaxListeners",
+                        "addAbortListener",
                     ],
                 ),
                 "node:ffi" => (
@@ -1074,6 +1228,18 @@ impl Builder {
                         "unwatchFile",
                         "createReadStream",
                         "createWriteStream",
+                        "ReadStream",
+                        "WriteStream",
+                        "Dir",
+                        "openAsBlob",
+                        "fchmod",
+                        "fchmodSync",
+                        "fchown",
+                        "fchownSync",
+                        "futimes",
+                        "futimesSync",
+                        "fdatasync",
+                        "fdatasyncSync",
                     ],
                 ),
                 "node:fs/promises" => (
@@ -1134,6 +1300,8 @@ impl Builder {
                         "networkInterfaces",
                         "userInfo",
                         "constants",
+                        "getPriority",
+                        "setPriority",
                     ],
                 ),
                 "node:path" => (
@@ -1276,6 +1444,7 @@ impl Builder {
                         "unzipSync",
                         "createUnzip",
                         "Unzip",
+                        "crc32",
                     ],
                 ),
                 "node:readline" => (
@@ -1293,9 +1462,12 @@ impl Builder {
                 ),
                 "node:readline/promises" => (
                     "globalThis.__apps.readline.promises",
-                    vec!["Interface", "createInterface"],
+                    vec!["Interface", "Readline", "createInterface"],
                 ),
-                "node:tty" => ("globalThis.__apps.tty", vec!["isatty"]),
+                "node:tty" => (
+                    "globalThis.__apps.tty",
+                    vec!["isatty", "ReadStream", "WriteStream"],
+                ),
                 "node:dns" => ("globalThis.__apps.dns", vec!["lookup", "promises"]),
                 "node:dns/promises" => ("globalThis.__apps.dns.promises", vec!["lookup"]),
                 "node:querystring" => (
@@ -1307,19 +1479,34 @@ impl Builder {
                         "unescape",
                         "decode",
                         "encode",
+                        "unescapeBuffer",
                     ],
                 ),
-                "node:perf_hooks" => ("globalThis.__apps.perf_hooks", vec!["performance"]),
+                "node:perf_hooks" => (
+                    "globalThis.__apps.perf_hooks",
+                    vec![
+                        "performance",
+                        "PerformanceEntry",
+                        "PerformanceMark",
+                        "PerformanceMeasure",
+                        "PerformanceObserver",
+                        "PerformanceObserverEntryList",
+                        "createHistogram",
+                        "monitorEventLoopDelay",
+                    ],
+                ),
+                "node:constants" => ("globalThis.__apps.constants", vec![]),
                 _ => bail!("Unsupported built-in module: {specifier}"),
             };
+            // WARNING: Node's require(esm) returns the 'module.exports' export, so CommonJS gets the module object itself.
             let source = format!(
-                "const api={object};export default api;{}",
+                "const api={object};export default api;export{{api as 'module.exports'}};{}",
                 names
                     .iter()
                     .map(|name| format!("export const {name}=api.{name};"))
                     .collect::<String>()
             );
-            return self.visit(path, Some(source));
+            return Ok((path, Some(source)));
         }
         ensure!(
             !specifier.contains("://") && !specifier.starts_with("//"),
@@ -1333,7 +1520,7 @@ impl Builder {
         if let Some((target, root, manifest)) = cached {
             self.package_roots.extend(root);
             self.files.borrow_mut().extend(manifest);
-            return self.visit(target, None);
+            return Ok((target, None));
         }
         if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
             let path = base.join(specifier);
@@ -1349,7 +1536,7 @@ impl Builder {
                     .borrow_mut()
                     .insert(resolution, (path.clone(), root, None));
             }
-            return self.visit(path, None);
+            return Ok((path, None));
         }
         let imports = specifier.starts_with('#');
         let (directory, key) = if imports {
@@ -1432,15 +1619,12 @@ impl Builder {
                 ensure!(key == ".", "Package does not export {key}");
                 exports
             };
-            let conditions = [
-                if self.realm == Realm::Renderer {
-                    "browser"
-                } else {
-                    "node"
-                },
-                if require { "require" } else { "import" },
-                "default",
-            ];
+            let conditions: &[&str] = match (self.realm == Realm::Renderer, require) {
+                (true, true) => &["browser", "require", "default"],
+                (true, false) => &["browser", "import", "default"],
+                (false, true) => &["node", "require", "module-sync", "node-addons", "default"],
+                (false, false) => &["node", "import", "module-sync", "node-addons", "default"],
+            };
             let mut candidates = vec![selected];
             let mut path = None;
             while let Some(value) = candidates.pop() {
@@ -1468,7 +1652,7 @@ impl Builder {
                 value.to_owned()
             };
             if imports && !value.starts_with(['.', '/', '#']) {
-                return self.resolve(&directory, &value, require);
+                return self.locate(&directory, &value, require);
             }
             ensure!(value.starts_with("./"), "Package export must start with ./");
             value
@@ -1480,12 +1664,16 @@ impl Builder {
         } else if key != "." {
             key
         } else {
-            metadata
-                .get("browser")
-                .filter(|_| self.realm == Realm::Renderer)
-                .and_then(Value::as_str)
-                .or_else(|| metadata.get("module").and_then(Value::as_str))
-                .or_else(|| metadata.get("main").and_then(Value::as_str))
+            // WARNING: Node ignores `module`. Like esbuild, node realms prefer `main` and require() never uses `module`.
+            let fields: &[&str] = match (self.realm == Realm::Renderer, require) {
+                (true, true) => &["browser", "main"],
+                (true, false) => &["browser", "module", "main"],
+                (false, true) => &["main"],
+                (false, false) => &["main", "module"],
+            };
+            fields
+                .iter()
+                .find_map(|field| metadata.get(*field).and_then(Value::as_str))
                 .unwrap_or("index.js")
                 .to_owned()
         };
@@ -1504,7 +1692,7 @@ impl Builder {
                 ),
             );
         }
-        self.visit(target, None)
+        Ok((target, None))
     }
 
     fn visit(&mut self, path: PathBuf, inline: Option<String>) -> Result<usize> {
@@ -1675,7 +1863,7 @@ impl Builder {
         let commonjs = !esm
             && dependency
             && (path.extension().is_some_and(|e| e == "cjs" || e == "cts")
-                || ["require", "module", "exports"]
+                || ["require", "module", "exports", "__dirname", "__filename"]
                     .iter()
                     .any(|name| references.contains_key(*name)));
         // WARNING: direct `eval` needs import names in scope, so only those modules keep the `with` scope.
@@ -1692,13 +1880,19 @@ impl Builder {
             cacheable: stamp.is_some() && !path.extension().is_some_and(|e| e == "html"),
             imported: Vec::new(),
             required: Vec::new(),
+            resolved: serde_json::Map::new(),
             error: None,
         };
         linker.visit_program(&mut program);
         if let Some(error) = linker.error {
             return Err(error);
         }
-        let (cacheable, imported, required) = (linker.cacheable, linker.imported, linker.required);
+        let (cacheable, imported, required, resolved) = (
+            linker.cacheable,
+            linker.imported,
+            linker.required,
+            linker.resolved,
+        );
         let ast = AstBuilder::new(&allocator);
         let mut imports = Vec::new();
         let mut exports = Vec::new();
@@ -1719,6 +1913,7 @@ impl Builder {
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
                     imports.push(json!({"id":dep,"local":null,"name":"*"}));
+                    let source = specifier.to_owned();
                     for specifier in import.unbox().specifiers.into_iter().flatten() {
                         let symbol = specifier.local().symbol_id();
                         if types.contains(&symbol) {
@@ -1727,7 +1922,14 @@ impl Builder {
                         let local = specifier.local().name.to_string();
                         let name = match specifier {
                             ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
-                                specifier.imported.name().to_string()
+                                let name = specifier.imported.name().to_string();
+                                ensure!(
+                                    !matches!(source.as_str(), "electron" | "@pierre/apps")
+                                        || ELECTRON.contains(&name.as_str()),
+                                    "{source}.{name} is not supported (imported in {})",
+                                    path.display()
+                                );
+                                name
                             }
                             ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {
                                 "default".into()
@@ -1927,6 +2129,12 @@ impl Builder {
             }
         }
         let mut module = json!({"id":id,"deps":deps,"code":output.code,"imports":imports,"exports":exports,"stars":stars,"commonjs":commonjs,"linked":linked,"async":asynchronous});
+        if commonjs {
+            module["file"] = self.runtime_path(&path).into();
+            if !resolved.is_empty() {
+                module["resolved"] = resolved.into();
+            }
+        }
         if let Some(map) = output.map {
             let mut map: Value = serde_json::from_str(&map.to_json_string())?;
             // WARNING: The runtime adds one line before the module body.
@@ -1983,6 +2191,19 @@ impl Builder {
         }
         Ok(id)
     }
+}
+
+fn app_relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root)
+        .ok()
+        .or_else(|| {
+            path.ancestors()
+                .find(|directory| directory.ends_with("node_modules"))
+                .and_then(Path::parent)
+                .and_then(|base| path.strip_prefix(base).ok())
+        })
+        .or_else(|| path.file_name().map(Path::new))
+        .unwrap_or(Path::new(""))
 }
 
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
@@ -2176,7 +2397,7 @@ fn bundle(
             let exports = module["exports"].as_array().unwrap();
             let mut source = if module["commonjs"] == true {
                 format!(
-                    "$appsFactory=function(module,exports,$appsRequire,$appsImport){{\n{}\n}};",
+                    "$appsFactory=function(exports,require,module,__filename,__dirname,$appsRequire,$appsImport){{\n{}\n}};",
                     module["code"].as_str().unwrap()
                 )
             } else {
@@ -2341,6 +2562,11 @@ fn bundle(
             }
             if module["commonjs"] == true {
                 line.push_str(",commonjs:1");
+                for field in ["file", "resolved"] {
+                    if !module[field].is_null() {
+                        let _ = write!(line, ",{field}:{}", ascii_json(&module[field])?);
+                    }
+                }
             }
             if module["async"] != 0 {
                 let _ = write!(line, ",async:{}", module["async"]);
@@ -2522,8 +2748,7 @@ fn bundle(
             }
         }
         let source = package.to_string();
-        let (name, product_name, version) =
-            apps_runtime::bundle::package_metadata(Some(&source))?;
+        let (name, product_name, version) = apps_runtime::bundle::package_metadata(Some(&source))?;
         apps_runtime::bundle::disabled_features(Some(&source))?;
         let mut metadata = json!({"name":name,"productName":product_name,"version":version});
         if let Some(features) = package.get("features") {
@@ -2655,6 +2880,20 @@ fn asset_name(path: &Path) -> Option<String> {
             | "otf"
             | "woff"
             | "woff2"
+            | "mp4"
+            | "m4v"
+            | "m4a"
+            | "mov"
+            | "webm"
+            | "mkv"
+            | "ogg"
+            | "oga"
+            | "ogv"
+            | "opus"
+            | "mp3"
+            | "wav"
+            | "flac"
+            | "aac"
     ) {
         return None;
     }
@@ -2710,23 +2949,30 @@ fn html(
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
     let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
-    for (index, node) in doc.nodes.iter_mut().enumerate() {
+    for index in 0..doc.nodes.len() {
+        let text = matches!(doc.nodes[index].tag.as_str(), "style" | "script")
+            .then(|| doc.text(index))
+            .unwrap_or_default();
+        let child = doc.nodes.len();
+        let node = &mut doc.nodes[index];
         if let Some(style) = node.attrs.get_mut("style") {
             *style = urls(style, parent, &files);
         }
-        if node.tag == "img"
-            && let Some(source) = node.attrs.get_mut("src")
-            && let Some(url) = asset(parent, source, &files)
-        {
-            *source = url;
+        let references: &[&str] = match node.tag.as_str() {
+            "img" | "audio" | "source" => &["src"],
+            "video" => &["src", "poster"],
+            _ => &[],
+        };
+        for name in references {
+            if let Some(source) = node.attrs.get_mut(*name)
+                && let Some(url) = asset(parent, source, &files)
+            {
+                *source = url;
+            }
         }
+        let mut sheet = None;
         if node.tag == "style" {
-            node.text = css(
-                path,
-                Some(std::mem::take(&mut node.text)),
-                &mut Vec::new(),
-                &files,
-            )?;
+            sheet = Some(css(path, Some(text), &mut Vec::new(), &files)?);
         } else if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
             ensure!(
@@ -2739,23 +2985,23 @@ fn html(
                 &mut Vec::new(),
                 &files,
             )?;
-            node.text = match node.attrs.get("media") {
+            sheet = Some(match node.attrs.get("media") {
                 Some(media) => format!("@media {media}{{{text}}}"),
                 None => text,
-            };
+            });
             node.tag = "style".into();
             node.attrs.clear();
         } else if node.tag == "script" {
-            let kind = node
+            let preload = match node
                 .attrs
                 .get("type")
-                .map(String::as_str)
-                .unwrap_or("module");
-            ensure!(
-                matches!(kind, "module" | "preload"),
-                "Use type=module or type=preload for HTML scripts"
-            );
-            let preload = kind == "preload";
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("" | "module" | "text/javascript" | "application/javascript") => false,
+                Some("preload") => true,
+                _ => continue,
+            };
             let entry = match node.attrs.remove("src") {
                 Some(src) => {
                     ensure!(
@@ -2764,13 +3010,22 @@ fn html(
                     );
                     (parent.join(src).canonicalize()?, None)
                 }
-                None => (path.to_owned(), Some(std::mem::take(&mut node.text))),
+                None => (path.to_owned(), Some(text)),
             };
+            node.children.clear();
             node.attrs.insert(
                 "type".into(),
                 if preload { "preload" } else { "module" }.into(),
             );
             scripts[usize::from(preload)].push((index, entry));
+        }
+        if let Some(sheet) = sheet {
+            node.children = vec![child];
+            let mut text = apps_runtime::dom::Node::default();
+            text.tag = "#text".into();
+            text.text = sheet;
+            text.parent = Some(index);
+            doc.nodes.push(text);
         }
     }
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
@@ -2896,19 +3151,32 @@ fn css(
         rest = &rest[start + 7..];
         let end = rest.find(';').context("CSS @import needs a semicolon")?;
         let spec = rest[..end].trim();
-        // Tailwind's parts take `layer(...)` and other options after the name.
-        let spec = match spec.as_bytes().first() {
-            Some(&quote @ (b'\'' | b'"')) => spec[1..]
-                .find(quote as char)
-                .filter(|&close| spec[1..close + 1].starts_with("tailwindcss/"))
-                .map_or(spec, |close| &spec[..close + 2]),
-            _ => spec,
+        let (spec, options) = match spec.strip_prefix("url(") {
+            Some(inner) => {
+                let close = inner.find(')').context("Expected a closing parenthesis")?;
+                let target = inner[..close].trim();
+                let target = if target.starts_with(['\'', '"']) {
+                    target
+                } else {
+                    &spec[4..4 + close]
+                };
+                (target, inner[close + 1..].trim())
+            }
+            None => match spec.as_bytes().first() {
+                Some(&quote @ (b'\'' | b'"')) => {
+                    let close = spec[1..]
+                        .find(quote as char)
+                        .context("Expected a string literal")?;
+                    (&spec[..close + 2], spec[close + 2..].trim())
+                }
+                _ => (spec, ""),
+            },
         };
-        let spec = spec
-            .strip_prefix("url(")
-            .and_then(|s| s.strip_suffix(')'))
-            .unwrap_or(spec)
-            .trim();
+        let spec = if spec.starts_with(['\'', '"']) {
+            spec
+        } else {
+            &format!("'{spec}'")
+        };
         ensure!(
             spec.len() >= 2 && spec.starts_with(['\'', '"']) && spec.ends_with(&spec[..1]),
             "Expected a string literal"
@@ -2940,7 +3208,43 @@ fn css(
         } else {
             css_package(directory, name)?
         };
-        result.push_str(&css(&target.canonicalize()?, None, stack, files)?);
+        let mut imported = css(&target.canonicalize()?, None, stack, files)?;
+        let mut options = options;
+        let starts = |text: &str, word: &str| {
+            text.get(..word.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(word))
+        };
+        let group = |text: &str| -> Option<usize> {
+            let mut depth = 0;
+            for (index, c) in text.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 1 => return Some(index),
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            None
+        };
+        if starts(options, "layer(") {
+            let close = group(options).context("Expected a closing parenthesis")?;
+            imported = format!("@layer {}{{{imported}}}", options[6..close].trim());
+            options = options[close + 1..].trim();
+        } else if starts(options, "layer")
+            && !options[5..].starts_with(|c: char| c.is_alphanumeric() || c == '-')
+        {
+            imported = format!("@layer{{{imported}}}");
+            options = options[5..].trim();
+        }
+        if starts(options, "supports(") {
+            let close = group(options).context("Expected a closing parenthesis")?;
+            imported = format!("@supports ({}){{{imported}}}", options[9..close].trim());
+            options = options[close + 1..].trim();
+        }
+        if !options.is_empty() {
+            imported = format!("@media {options}{{{imported}}}");
+        }
+        result.push_str(&imported);
         rest = &rest[end + 1..];
     }
     result.push_str(rest);

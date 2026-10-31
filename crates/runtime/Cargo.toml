@@ -14,23 +14,22 @@ cssparser = "0.38"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 futures-util = "0.3"
 getrandom = "0.3"
+gif = "0.14"
 renderer = { package = "apps-renderer", path = "../renderer" }
-avif-parse = "=2.1.0"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-rustls = { version = "0.27", default-features = false }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-image.workspace = true
 libc.workspace = true
 libffi = "5.2.0"
 libloading = "0.8"
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
+memmap2 = "0.9"
 md-5 = "0.10"
 notify = "8.2"
+png = "0.17"
 portable-pty = "0.9"
 raw-window-handle.workspace = true
-# The published rav1d can abort on corrupt AV1 data.
-rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 resvg.workspace = true
 rustc-hash.workspace = true
@@ -45,6 +44,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 tower-service = "0.3"
 url.workspace = true
+zune-jpeg = "0.5"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+avif-parse = "=2.1.0"
+image.workspace = true
+# The published rav1d can abort on corrupt AV1 data.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 apps-webgpu = { path = "../webgpu" }
@@ -53,10 +59,13 @@ apps-webgpu = { path = "../webgpu" }
 name = "apps-runtime"
 path = "src/main.rs"
 
-# Puts the WebGPU library next to test executables.
+# Puts the WebGPU and media libraries next to test executables.
 [dev-dependencies]
+apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }
+image.workspace = true
 tempfile = "3"
 
 [build-dependencies]
 cc = "1"
+miniz_oxide = "0.8"

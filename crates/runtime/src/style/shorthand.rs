@@ -1,6 +1,17 @@
 use super::components;
 
-/// Expands a shorthand or logical property into physical longhands. Returns false for other properties.
+fn expand_border(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
+    let mut parts = Vec::new();
+    expand("border-top", value, &mut parts);
+    out.extend(
+        parts
+            .into_iter()
+            .map(|(name, value)| (name.replacen("border-top", key, 1), value)),
+    );
+    true
+}
+
+/// Expands a shorthand or block-logical property into longhands; inline-logical ones stay for the cascade. Returns false for other properties.
 pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
         "inline-size" => "width",
@@ -15,10 +26,6 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         "grid-row-gap" => "row-gap",
         "-webkit-background-clip" => "background-clip",
         "grid-column-gap" => "column-gap",
-        "border-start-start-radius" => "border-top-left-radius",
-        "border-start-end-radius" => "border-top-right-radius",
-        "border-end-start-radius" => "border-bottom-left-radius",
-        "border-end-end-radius" => "border-bottom-right-radius",
         _ => "",
     };
     if !alias.is_empty() {
@@ -37,6 +44,13 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             .map_or(Some((rest, "")), Some)
             .filter(|(side, _)| matches!(*side, "start" | "end"))
     {
+        if key.contains("-inline-") && !property.starts_with("scroll") {
+            if property == "border" && rest.is_empty() {
+                return expand_border(key, value, out);
+            }
+            out.push((key.into(), value.into()));
+            return true;
+        }
         let side = match (key.contains("-inline-"), side) {
             (true, "start") => "left",
             (true, _) => "right",
@@ -89,13 +103,14 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 })
                 .unwrap_or((key, ""));
             let sides = if key.contains("-inline") {
-                ["left", "right"]
+                ["inline-start", "inline-end"]
             } else {
                 ["top", "bottom"]
             };
             (
                 sides
                     .map(|side| match property {
+                        "inset" if side.starts_with("inline") => format!("inset-{side}"),
                         "inset" => side.to_owned(),
                         "border" => format!("border-{side}{rest}"),
                         _ => format!("{property}-{side}"),
@@ -111,7 +126,7 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 "border-right" => &["right"],
                 "border-bottom" => &["bottom"],
                 "border-left" => &["left"],
-                "border-inline" => &["left", "right"],
+                "border-inline" => &["inline-start", "inline-end"],
                 "border-block" => &["top", "bottom"],
                 "outline" => &[""],
                 _ => &BOX,
@@ -202,24 +217,35 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 .any(|f| part.starts_with(f))
     };
     let mut values: Vec<String> = match kind {
-        0 | 1 => {
-            let parts = if kind == 1 {
-                let end = parts
-                    .iter()
-                    .position(|part| *part == "/")
-                    .unwrap_or(parts.len());
-                &parts[..end.max(1)]
-            } else {
-                &parts[..]
-            };
+        0 => {
             let side = |index: usize, fallback: usize| {
-                let part = parts.get(index).or(parts.get(fallback)).unwrap_or(&first);
-                part.split_once('/')
-                    .filter(|_| kind == 1 && !part.contains('('))
-                    .map_or(*part, |(part, _)| part)
-                    .to_owned()
+                (*parts.get(index).or(parts.get(fallback)).unwrap_or(&first)).to_owned()
             };
             vec![side(0, 0), side(1, 0), side(2, 0), side(3, 1)]
+        }
+        1 => {
+            let corners = |half: &str| -> Option<[String; 4]> {
+                let parts = components(half.trim(), ' ');
+                let side = |index: usize, fallback: usize| {
+                    (*parts
+                        .get(index)
+                        .or(parts.get(fallback))
+                        .unwrap_or(&parts[0]))
+                    .to_owned()
+                };
+                (!parts.is_empty()).then(|| [side(0, 0), side(1, 0), side(2, 0), side(3, 1)])
+            };
+            let halves = components(value, '/');
+            let Some(x) = corners(halves.first().copied().unwrap_or_default()) else {
+                return false;
+            };
+            let Some(y) = halves.get(1).map_or(Some(x.clone()), |half| corners(half)) else {
+                return false;
+            };
+            x.into_iter()
+                .zip(y)
+                .map(|(x, y)| if x == y { x } else { format!("{x} {y}") })
+                .collect()
         }
         2 => vec![first.into(), parts.get(1).unwrap_or(&first).to_string()],
         3 => {

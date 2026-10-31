@@ -33,7 +33,7 @@ pub(crate) fn observe() {
 fn validate_menu(template: &Value) -> Result<()> {
     for item in template.as_array().context("Expected menu template")? {
         let options = item.as_object().context("Expected menu item")?;
-        for name in ["label", "role", "type", "accelerator"] {
+        for name in ["label", "role", "type", "accelerator", "toolTip"] {
             ensure!(
                 options.get(name).is_none_or(Value::is_string),
                 "Expected menu text: {name}"
@@ -66,7 +66,9 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "app.releaseInstance"
         | "app.hasInstance"
         | "app.locale"
-        | "app.state" => {}
+        | "app.state"
+        | "screen.displays"
+        | "screen.cursor" => {}
         "app.hidden" => ensure!(arguments.is_boolean(), "Expected boolean argument"),
         "app.loginItem" => ensure!(
             arguments.is_null() || arguments.is_boolean(),
@@ -178,6 +180,9 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                 "body",
                 "id",
                 "checkboxLabel",
+                "buttonLabel",
+                "nameFieldLabel",
+                "type",
             ] {
                 ensure!(
                     options.get(name).is_none_or(Value::is_string),
@@ -198,9 +203,21 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                     "Expected boolean option: {name}"
                 );
             }
+            for name in ["async", "defaultId", "cancelId"] {
+                ensure!(
+                    options.get(name).is_none_or(Value::is_u64),
+                    "Expected integer option: {name}"
+                );
+            }
             ensure!(
-                options.get("async").is_none_or(Value::is_u64),
-                "Expected dialog request id"
+                options
+                    .get("filters")
+                    .is_none_or(|filters| filters.as_array().is_some_and(|filters| filters
+                        .iter()
+                        .all(|filter| filter["extensions"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().all(Value::is_string))))),
+                "Expected dialog filters with extensions"
             );
         }
         _ => bail!("Unknown native operation: {operation}"),

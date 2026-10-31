@@ -153,17 +153,48 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
     _pending = [];
     postMessage(value, options) {
       if (this._closed || this._peer._closed) return;
-      const data = structuredClone(value, Array.isArray(options) ? { transfer: options } : options), target = this._peer;
-      queueMicrotask(() => { if (target._closed) return; if (target._started || target.onmessage || target._listeners.has('message')) target._emit('message', data); else target._pending.push(data); });
+      const target = this._peer;
+      target._pending.push(structuredClone(value, Array.isArray(options) ? { transfer: options } : options));
+      if (target._started || target.onmessage || target._listeners.has('message')) target._deliver();
     }
-    start() { this._started = true; for (const value of this._pending.splice(0)) queueMicrotask(() => { if (!this._closed) this._emit('message', value); }); }
+    _deliver() { queueMicrotask(() => { if (!this._closed && this._pending.length) this._emit('message', this._pending.shift()); }); }
+    start() { this._started = true; for (let i = 0; i < this._pending.length; i++) this._deliver(); }
     close() { this._closed = true; this._pending.length = 0; }
     on(type, listener) { super.on(type, listener); if (type === 'message') this.start(); return this; }
   }
   class MessageChannel { constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); this.port1._peer = this.port2; this.port2._peer = this.port1; } }
-  Object.assign(globalThis, { Worker, MessageChannel, MessagePort });
+  // WARNING: node engines share channels across threads through native subscribers; pages only reach channels of their own engine.
+  const channels = new Map();
+  let subscriber = null;
+  const dispatch = (name, data, except) => { for (const channel of channels.get(name) ?? []) if (channel !== except) { const copy = structuredClone(data); queueMicrotask(() => { if (channels.get(name)?.has(channel)) channel.dispatchEvent(new MessageEvent('message', { data: copy })); }); } };
+  class BroadcastChannel extends EventTarget {
+    #name; #closed = false;
+    _referenced = true;
+    constructor(name) {
+      super(); this.#name = String(name);
+      if (!channels.has(this.#name)) { channels.set(this.#name, new Set()); if (nativeAccess) call('web.worker.channel.subscribe', subscriber ??= call('web.worker.channel.open'), this.#name, true); }
+      channels.get(this.#name).add(this);
+    }
+    get name() { return this.#name; }
+    postMessage(value) {
+      if (this.#closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
+      dispatch(this.#name, value, this);
+      if (nativeAccess) call('web.worker.channel.post', subscriber, this.#name, ...message(value));
+    }
+    close() {
+      if (this.#closed) return;
+      this.#closed = true;
+      const set = channels.get(this.#name);
+      set.delete(this);
+      if (!set.size) { channels.delete(this.#name); if (nativeAccess) call('web.worker.channel.subscribe', subscriber, this.#name, false); }
+    }
+    ref() { this._referenced = true; return this; }
+    unref() { this._referenced = false; return this; }
+  }
+  Object.assign(globalThis, { Worker, MessageChannel, MessagePort, BroadcastChannel });
   return {
     poll() {
+      if (subscriber !== null && channels.size) for (const event of call('web.worker.channel.poll', subscriber)) { const [text, ...buffers] = event.data; for (const channel of channels.get(event.name) ?? []) channel.dispatchEvent(new MessageEvent('message', { data: decode(parse(text), () => buffers) })); }
       if (!workers.size) return;
       for (const event of call('web.worker.poll')) {
         const worker = workers.get(event.id); if (!worker) continue;
@@ -173,7 +204,8 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
         else if (event.kind === 'exit') { workers.delete(event.id); worker._closed = true; worker._exitCode = event.code; worker._emit('exit', event.code); }
       }
     },
-    pending: () => !!parentPort && ((parentPort._listeners.get('message')?.length ?? 0) > 0 || parentPort._messageListeners.size > 0 || typeof parentPort.onmessage === 'function') || [...workers.values()].some(worker => worker._referenced),
-    api: { Worker: NodeWorker, MessageChannel, MessagePort, isMainThread: info.main, parentPort, workerData: decode(info.data) ?? null, threadId: info.id },
+    pending: () => !!parentPort && ((parentPort._listeners.get('message')?.length ?? 0) > 0 || parentPort._messageListeners.size > 0 || typeof parentPort.onmessage === 'function') || [...workers.values()].some(worker => worker._referenced) || [...channels.values()].some(set => [...set].some(channel => channel._referenced)),
+    api: { Worker: NodeWorker, MessageChannel, MessagePort, BroadcastChannel, isMainThread: info.main, parentPort, workerData: decode(info.data) ?? null, threadId: info.id, SHARE_ENV: Symbol.for('nodejs.worker_threads.SHARE_ENV'),
+      receiveMessageOnPort: port => port._pending?.length ? { message: port._pending.shift() } : undefined },
   };
 };

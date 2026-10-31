@@ -96,6 +96,56 @@ fn resolves_default_entries_with_build_options() {
 }
 
 #[test]
+fn bundles_electron_pages_and_rejects_unsupported_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    let out = dir.path().join("output");
+    fs::write(&runtime, binary("windows", "x64")).unwrap();
+    fs::write(dir.path().join("styles.css"), "p { color: #123456 }").unwrap();
+    fs::write(
+        dir.path().join("renderer.js"),
+        "document.querySelector('p').textContent = 'renderer';",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("index.html"),
+        "<link rel='stylesheet' href='styles.css'><p>x</p><script src='./renderer.js'></script>",
+    )
+    .unwrap();
+    let entry = dir.path().join("main.js");
+    let build = || {
+        apps(&entry, &runtime)
+            .args(["--platform", "windows", "--arch", "x64", "--out-dir"])
+            .arg(&out)
+            .output()
+            .unwrap()
+    };
+    fs::write(&entry, "import {app, BrowserWindow} from 'electron'; app.whenReady().then(() => new BrowserWindow().loadFile('index.html'));").unwrap();
+    let result = build();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let bundle = apps_runtime::bundle::read(&out).unwrap();
+    assert!(bundle.files["app.js"].contains("apps:///page-0.html"));
+    let page = bundle
+        .pages
+        .get("page-0.html")
+        .map(|doc| doc.serialize(0))
+        .or_else(|| bundle.files.get("page-0.html").cloned())
+        .unwrap();
+    assert!(
+        page.contains("#123456") && page.contains("apps:///script-"),
+        "{page}"
+    );
+    fs::write(&entry, "import {app, Tray} from 'electron'; app.quit();").unwrap();
+    let result = build();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("electron.Tray is not supported"));
+}
+
+#[test]
 fn packages_every_platform_and_arch_with_matching_jsc() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("app.ts");
