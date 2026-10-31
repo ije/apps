@@ -108,6 +108,42 @@ pub(crate) fn tls() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
+/// Downloads an HTTP or HTTPS URL and follows redirects. `apps build` uses it for remote imports.
+pub fn download(url: &str) -> Result<Vec<u8>> {
+    let mut http = HttpConnector::new_with_resolver(Dns(false));
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(Duration::from_secs(30)));
+    let client: Client<_, http_body_util::Empty<bytes::Bytes>> = Client::builder(
+        hyper_util::rt::TokioExecutor::new(),
+    )
+    .build(hyper_rustls::HttpsConnector::new(
+        http,
+        tls(),
+        false,
+        Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
+    ));
+    network()?.block_on(async {
+        let mut url = Url::parse(url)?;
+        for _ in 0..20 {
+            ensure!(
+                matches!(url.scheme(), "http" | "https"),
+                "Cannot download {url}"
+            );
+            let response = client.get(url.as_str().parse()?).await?;
+            let status = response.status();
+            if status.is_redirection()
+                && let Some(location) = response.headers().get("location")
+            {
+                url = url.join(location.to_str()?)?;
+                continue;
+            }
+            ensure!(status.is_success(), "Cannot download {url}: HTTP {status}");
+            return Ok(response.into_body().collect().await?.to_bytes().to_vec());
+        }
+        bail!("Too many redirects: {url}")
+    })
+}
+
 pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
     if let Some(bytes) = crate::jsc::payload::read(value) {
         return bytes.map(Vec::from);

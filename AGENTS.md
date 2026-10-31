@@ -18,9 +18,15 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 
 ## Security
 
-- Disable `new Funcion()` and `eval()`
-- Reject remote JS and CSS
-- Disable `loadURL`
+By default script execute and dynamic importing are disabled:
+
+- `new Function()`
+- `eval()`
+- `import("data:...")`
+- Remote JS and HTTP imports
+- Remote CSS
+
+To enable the two features, add `jsExecute` and `httpImport` in `features` option in `package.json`
 
 > The limtation is only applied to `BrowserWindow` class, `WebContentsView` respects the webview sandboxing.
 

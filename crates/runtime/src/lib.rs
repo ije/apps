@@ -23,6 +23,7 @@ mod node;
 pub mod render;
 pub mod style;
 mod web;
+pub use web::download;
 pub use web::{gpu, media};
 
 // WARNING: module code must stay outside the loader function, or it could see loader internals such as

@@ -50,6 +50,14 @@ struct Shared {
     workers: RefCell<BBTreeMap<(PathBuf, Realm), usize>>,
     scripts: RefCell<Vec<String>>,
     cache: Option<Rc<Cache>>,
+    /// Features that package.json disables, as bits by `apps_runtime::bundle::FEATURES` index.
+    disabled: u32,
+}
+
+impl Shared {
+    fn enabled(&self, feature: &str) -> bool {
+        self.disabled & apps_runtime::bundle::feature_bit(feature) == 0
+    }
 }
 
 // WARNING: cached modules contain `$appsImport(N)` and `$appsN<id>`, so a graph never reuses or changes module ids.
@@ -430,7 +438,9 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     Expression::ImportMeta(_)
                 ) && member.property.name == "url"
                 {
-                    let url = if self.builder.production {
+                    let url = if is_remote(self.path) {
+                        self.path.to_string_lossy().trim_end_matches('#').to_owned()
+                    } else if self.builder.production {
                         let relative = app_relative(&self.builder.shared.root, self.path);
                         let mut url = String::from("apps:///");
                         for &byte in relative.as_os_str().as_encoded_bytes() {
@@ -555,17 +565,32 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
             }
             let import = match expression {
                 Expression::ImportExpression(import) => {
-                    let Expression::StringLiteral(specifier) = import.source.get_inner_expression()
-                    else {
-                        bail!(
-                            "Dynamic import needs one literal specifier in {}",
-                            self.path.display()
-                        );
-                    };
-                    Some((
-                        "$appsImport",
-                        specifier.value.as_str().context("Invalid module path")?,
-                    ))
+                    match import.source.get_inner_expression() {
+                        Expression::StringLiteral(specifier)
+                            if !specifier.value.starts_with("data:") =>
+                        {
+                            Some((
+                                "$appsImport",
+                                specifier.value.as_str().context("Invalid module path")?,
+                            ))
+                        }
+                        // WARNING: other specifiers stay native import() calls, which the runtime loads only with these features.
+                        source => {
+                            let (data, shared) = (source.is_string_literal(), &self.builder.shared);
+                            let feature = if data {
+                                "jsExecute"
+                            } else {
+                                "jsExecute or httpImport"
+                            };
+                            ensure!(
+                                shared.enabled("jsExecute")
+                                    || (!data && shared.enabled("httpImport")),
+                                "import() of a data: URL or without a string literal needs the {feature} feature in {}",
+                                self.path.display()
+                            );
+                            None
+                        }
+                    }
                 }
                 Expression::CallExpression(call) if call.callee.is_specific_id("require") => {
                     let Expression::Identifier(identifier) = call.callee.get_inner_expression()
@@ -1508,10 +1533,9 @@ impl Builder {
             );
             return Ok((path, Some(source)));
         }
-        ensure!(
-            !specifier.contains("://") && !specifier.starts_with("//"),
-            "Only local ESM imports are supported: {specifier}"
-        );
+        if let Some((path, source)) = remote(base, specifier, self.shared.enabled("httpImport"))? {
+            return Ok((path, Some(source)));
+        }
         let cache = self.shared.cache.clone();
         let resolution = (self.realm, base.to_owned(), specifier.to_owned(), require);
         let cached = cache
@@ -2140,9 +2164,13 @@ impl Builder {
             // WARNING: The runtime adds one line before the module body.
             map["mappings"] = format!(";{}", map["mappings"].as_str().unwrap()).into();
             module["map"] = map;
-            module["url"] = url::Url::from_file_path(std::path::absolute(&path)?)
-                .map(|url| Value::String(url.into()))
-                .unwrap_or_else(|_| Value::String(path.to_string_lossy().into()));
+            module["url"] = if is_remote(&path) {
+                Value::String(path.to_string_lossy().trim_end_matches('#').into())
+            } else {
+                url::Url::from_file_path(std::path::absolute(&path)?)
+                    .map(|url| Value::String(url.into()))
+                    .unwrap_or_else(|_| Value::String(path.to_string_lossy().into()))
+            };
         }
         let requests = std::mem::replace(&mut self.requests, outer);
         if self.production {
@@ -2246,8 +2274,16 @@ pub fn compile(
     cache: Option<Rc<Cache>>,
 ) -> Result<BBTreeMap<String, String>> {
     let root = entry.parent().context("Missing entry directory")?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let package = root
+        .ancestors()
+        .map(|directory| directory.join("package.json"))
+        .find(|path| path.is_file())
+        .map(fs::read_to_string)
+        .transpose()?;
     let shared = Rc::new(Shared {
-        root: root.canonicalize().unwrap_or_else(|_| root.to_owned()),
+        disabled: apps_runtime::bundle::disabled_features(package.as_deref())?,
+        root,
         cache,
         ..Shared::default()
     });
@@ -2905,13 +2941,78 @@ fn asset_name(path: &Path) -> Option<String> {
     ))
 }
 
+thread_local! {
+    // WARNING: downloads stay for the process, so `apps run` rebuilds don't fetch remote files again.
+    static DOWNLOADS: RefCell<HashMap<String, String>> = RefCell::default();
+}
+
+/// A remote file uses its URL as its path, so `parent()` gives the base URL of its imports.
+fn is_remote(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|path| path.starts_with("https://") || path.starts_with("http://"))
+}
+
+fn remote_base(directory: &Path) -> Option<url::Url> {
+    is_remote(directory)
+        .then(|| url::Url::parse(&format!("{}/", directory.to_str()?)).ok())
+        .flatten()
+}
+
+/// Downloads `reference` when it is an HTTP URL or relative to a remote file. Returns `None` for local files.
+fn remote(directory: &Path, reference: &str, http: bool) -> Result<Option<(PathBuf, String)>> {
+    let mut url = match remote_base(directory) {
+        Some(base) => {
+            ensure!(
+                reference.contains(':') || reference.starts_with(['.', '/']),
+                "Bare import {reference:?} is not supported in remote files: {base}"
+            );
+            base.join(reference)?
+        }
+        None if reference.contains("://") || reference.starts_with("//") => {
+            url::Url::parse(reference).with_context(|| format!("Invalid URL: {reference}"))?
+        }
+        None => return Ok(None),
+    };
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "Only local files and HTTP URLs can be imported: {url}"
+    );
+    ensure!(
+        http,
+        "Importing {url} needs the httpImport feature. Add \"httpImport\" to \"features\" in package.json"
+    );
+    url.set_fragment(None);
+    let source = match DOWNLOADS.with_borrow(|downloads| downloads.get(url.as_str()).cloned()) {
+        Some(source) => source,
+        None => {
+            let source = String::from_utf8(apps_runtime::download(url.as_str())?)
+                .with_context(|| format!("{url} is not UTF-8"))?;
+            DOWNLOADS
+                .with_borrow_mut(|downloads| downloads.insert(url.to_string(), source.clone()));
+            source
+        }
+    };
+    let mut path = url.to_string();
+    // WARNING: `parent()` drops a trailing slash, so a directory URL gets an empty fragment.
+    if url.path().ends_with('/') && url.query().is_none() {
+        path.push('#');
+    }
+    Ok(Some((PathBuf::from(path), source)))
+}
+
 fn asset(
     directory: &Path,
     reference: &str,
     files: &Rc<RefCell<BTreeSet<PathBuf>>>,
 ) -> Option<String> {
     let reference = reference.trim().trim_matches(['"', '\'']);
-    if reference.contains(':') || reference.starts_with(['/', '#']) {
+    if reference.contains(':') || reference.starts_with('#') {
+        return None;
+    }
+    if let Some(base) = remote_base(directory) {
+        return base.join(reference).ok().map(String::from);
+    }
+    if reference.starts_with('/') {
         return None;
     }
     let path = directory
@@ -2948,6 +3049,7 @@ fn html(
 ) -> Result<String> {
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
+    let http = shared.enabled("httpImport");
     let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
     for index in 0..doc.nodes.len() {
         let text = matches!(doc.nodes[index].tag.as_str(), "style" | "script")
@@ -2972,19 +3074,19 @@ fn html(
         }
         let mut sheet = None;
         if node.tag == "style" {
-            sheet = Some(css(path, Some(text), &mut Vec::new(), &files)?);
+            sheet = Some(css(path, Some(text), &mut Vec::new(), &files, http)?);
         } else if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
-            ensure!(
-                !href.contains("://") && !href.starts_with("//"),
-                "Only local CSS is supported"
-            );
-            let text = css(
-                &parent.join(href).canonicalize()?,
-                None,
-                &mut Vec::new(),
-                &files,
-            )?;
+            let text = match remote(parent, href, http)? {
+                Some((path, text)) => css(&path, Some(text), &mut Vec::new(), &files, http)?,
+                None => css(
+                    &parent.join(href).canonicalize()?,
+                    None,
+                    &mut Vec::new(),
+                    &files,
+                    http,
+                )?,
+            };
             sheet = Some(match node.attrs.get("media") {
                 Some(media) => format!("@media {media}{{{text}}}"),
                 None => text,
@@ -3003,13 +3105,10 @@ fn html(
                 _ => continue,
             };
             let entry = match node.attrs.remove("src") {
-                Some(src) => {
-                    ensure!(
-                        !src.contains("://") && !src.starts_with("//"),
-                        "Only local scripts are supported"
-                    );
-                    (parent.join(src).canonicalize()?, None)
-                }
+                Some(src) => match remote(parent, &src, http)? {
+                    Some((path, source)) => (path, Some(source)),
+                    None => (parent.join(src).canonicalize()?, None),
+                },
                 None => (path.to_owned(), Some(text)),
             };
             node.children.clear();
@@ -3078,6 +3177,7 @@ fn css(
     inline: Option<String>,
     stack: &mut Vec<PathBuf>,
     files: &Rc<RefCell<BTreeSet<PathBuf>>>,
+    http: bool,
 ) -> Result<String> {
     ensure!(
         !stack.contains(&path.to_owned()),
@@ -3198,17 +3298,18 @@ fn css(
             rest = &rest[end + 1..];
             continue;
         }
-        ensure!(
-            !name.contains("://") && !name.starts_with("//"),
-            "Remote CSS is not supported"
-        );
         let directory = path.parent().unwrap();
-        let target = if name.starts_with('.') || Path::new(name).is_absolute() {
-            directory.join(name)
-        } else {
-            css_package(directory, name)?
+        let mut imported = match remote(directory, name, http)? {
+            Some((target, text)) => css(&target, Some(text), stack, files, http)?,
+            None => {
+                let target = if name.starts_with('.') || Path::new(name).is_absolute() {
+                    directory.join(name)
+                } else {
+                    css_package(directory, name)?
+                };
+                css(&target.canonicalize()?, None, stack, files, http)?
+            }
         };
-        let mut imported = css(&target.canonicalize()?, None, stack, files)?;
         let mut options = options;
         let starts = |text: &str, word: &str| {
             text.get(..word.len())

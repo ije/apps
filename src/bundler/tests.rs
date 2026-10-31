@@ -2199,7 +2199,8 @@ fn resolves_dotted_files_package_imports_browser_fields_and_type_only_imports() 
             &dir.path().join("style.css"),
             None,
             &mut Vec::new(),
-            &Rc::default()
+            &Rc::default(),
+            false
         )
         .is_err()
     );
@@ -2845,5 +2846,93 @@ fn css_imports_keep_layer_supports_and_media_conditions() {
         "@supports (not (display: nonsense)){@layer x.y{.e{}}}",
     ] {
         assert!(page.contains(expected), "{expected} in {page}");
+    }
+}
+
+#[test]
+fn http_imports_download_with_the_feature() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            let (mut request, mut byte) = (Vec::new(), [0]);
+            while !request.ends_with(b"\r\n\r\n") && socket.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+            }
+            let body = match String::from_utf8_lossy(&request)
+                .split(' ')
+                .nth(1)
+                .unwrap_or("")
+            {
+                "/lib/a.js" => {
+                    "import b from './b.js'; import c from '/c.js'; export default b + c; export const url = import.meta.url;"
+                }
+                "/lib/b.js" => "export default 40",
+                "/c.js" => "export default 2",
+                "/style.css" => "@import './more.css'; .a{background:url(img/a.png)}",
+                "/more.css" => ".b{color:red}",
+                _ => "",
+            };
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.js");
+    fs::write(
+        &entry,
+        format!("import a, {{url}} from '{origin}/lib/a.js'; globalThis.result = a + ' ' + url; globalThis.page = import.meta.resolve('./index.html'); globalThis.later = () => import(globalThis.name);"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("index.html"),
+        format!(r#"<link rel="stylesheet" href="{origin}/style.css"><script type="module" src="{origin}/c.js"></script>"#),
+    )
+    .unwrap();
+    let package = dir.path().join("package.json");
+    fs::write(&package, r#"{"name":"remote"}"#).unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), true, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("httpImport"), "{error}");
+    let dynamic = dir.path().join("dynamic.js");
+    fs::write(&dynamic, "import(globalThis.name)").unwrap();
+    let error = compile(&dynamic, Realm::Main, None, Rc::default(), true, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("jsExecute or httpImport"), "{error}");
+    fs::write(&package, r#"{"name":"remote","features":["httpImport"]}"#).unwrap();
+    fs::write(&dynamic, "import('data:text/javascript,export default 1')").unwrap();
+    let error = compile(&dynamic, Realm::Main, None, Rc::default(), true, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("needs the jsExecute feature"), "{error}");
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        if production {
+            let page = &files["page-0.html"];
+            assert!(
+                page.contains(".b{color:red}") && page.contains(&format!("\"{origin}/img/a.png\"")),
+                "{page}"
+            );
+        }
+        let engine = apps_runtime::jsc::Engine::new(
+            apps_runtime::jsc::Api::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.bundle(&files, "app.js").unwrap();
+        assert_eq!(
+            engine.eval("result", "test").unwrap(),
+            format!("42 {origin}/lib/a.js")
+        );
     }
 }

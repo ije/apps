@@ -60,6 +60,7 @@ pub struct Api {
     pub(crate) function: unsafe extern "C" fn(Ptr, Ptr, Callback) -> Ptr,
     pub(crate) get: unsafe extern "C" fn(Ptr, Ptr, Ptr, *mut Ptr) -> Ptr,
     rejection_callback: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr),
+    module_loader: Option<unsafe extern "C" fn(Ptr, Ptr)>,
     pub(crate) set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
     pub(crate) undefined: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) null: unsafe extern "C" fn(Ptr) -> Ptr,
@@ -211,6 +212,10 @@ impl Api {
                 get: *library.get(b"JSObjectGetProperty\0")?,
                 rejection_callback: *library
                     .get(b"JSGlobalContextSetUnhandledRejectionCallback\0")?,
+                module_loader: library
+                    .get(b"JSGlobalContextSetModuleLoader\0")
+                    .ok()
+                    .map(|s| *s),
                 set: *library.get(b"JSObjectSetProperty\0")?,
                 undefined: *library.get(b"JSValueMakeUndefined\0")?,
                 null: *library.get(b"JSValueMakeNull\0")?,
@@ -418,13 +423,18 @@ unsafe extern "C" fn compile(
         hosts
             .borrow()
             .get(&(ctx as usize))
-            .map(|binding| (binding.0.clone(), binding.2))
+            .map(|binding| (binding.0.clone(), binding.1.clone(), binding.2))
     });
-    let Some((api, role)) = binding else {
+    let Some((api, host, role)) = binding else {
         return ptr::null_mut();
     };
-    // WARNING: pages compile only while Rust evaluates one of their own scripts, never from later strings.
-    if matches!(role, Role::Renderer(_)) && ARMED.get() != ctx as usize {
+    // WARNING: without jsExecute, pages compile only while Rust evaluates one of their own scripts, never from later strings.
+    if matches!(role, Role::Renderer(_))
+        && ARMED.get() != ctx as usize
+        && !host
+            .try_borrow()
+            .is_ok_and(|host| host.enabled("jsExecute"))
+    {
         if !exception.is_null() {
             let message = api.string("EvalError: Code generation is disabled in pages");
             unsafe {
@@ -1462,13 +1472,28 @@ impl Engine {
             (engine.api.rejection_callback)(ctx, callback, ptr::null_mut());
             (engine.api.string_release)(name);
         }
-        engine.eval("delete globalThis.__appsRejection", "apps:rejections")?;
+        if let Some(set) = engine.api.module_loader {
+            let name = engine.api.string("__appsModuleLoader");
+            unsafe {
+                set(
+                    ctx,
+                    (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut()),
+                );
+                (engine.api.string_release)(name);
+            }
+        }
+        engine.eval(
+            "delete globalThis.__appsRejection;delete globalThis.__appsModuleLoader",
+            "apps:rejections",
+        )?;
         if matches!(role, Role::Renderer(_)) {
             if enabled("webgpu") {
                 engine.eval(&js!("web/gpu.js"), "apps:gpu")?;
             }
             engine.eval(&js!("dom.js"), "apps:dom")?;
-            engine.eval(&js!("lockdown.js"), "apps:lockdown")?;
+            if !enabled("jsExecute") {
+                engine.eval(&js!("lockdown.js"), "apps:lockdown")?;
+            }
         }
         Ok(engine)
     }
@@ -1791,6 +1816,7 @@ mod tests {
     #[test]
     fn pages_cannot_turn_strings_into_code() {
         let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().disabled = crate::bundle::disabled_features(None).unwrap();
         host.borrow_mut().pages.insert(
             1,
             crate::host::Page {

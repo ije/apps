@@ -17,17 +17,19 @@ To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.clau
 `apps run` keeps source maps in memory and reads assets and native addons from their original paths. It does not create `.apps/`.
 `apps build` writes to `dist/` by default and does not generate source maps.
 
-WebGPU, `<video>` and `<audio>` are off by default. Turn them on with `features` in `package.json`:
+WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by default. Turn them on with `features` in `package.json`:
 
 ```json
 {
   "name": "my_app",
-  "features": ["webgpu", "video", "audio"]
+  "features": ["webgpu", "video", "audio", "jsExecute", "httpImport"]
 }
 ```
 
 `"name"` enables a feature, `"-name"` disables it, and `"*"` means all features. Entries apply in order.
 A disabled feature is not loaded, and its API throws an error when called. On macOS and Windows, WebGPU is a separate library (3.2 MB) that `apps build` copies only for apps that enable it. Linux always includes it, because the renderer uses wgpu.
+
+`jsExecute` lets pages use `eval()`, `new Function()` and `import()` of `data:` and `blob:` URLs. `httpImport` lets apps import `http` and `https` URLs: `apps build` and `apps run` download the imports, `<script src>`, `<link rel="stylesheet">` and CSS `@import` with a string literal URL, and bundle them. Remote files can import other files only by relative or absolute URLs. An `import()` without a string literal stays in the code and loads its URL when it runs. It needs `jsExecute` or `httpImport`.
 
 `video` and `audio` play media with the FFmpeg shared libraries, under the LGPL 2.1. Build them once with `bash scripts/build-ffmpeg.sh` before `cargo build --workspace`. `apps build` copies the media library and FFmpeg (about 7 MB) with `FFmpeg.LICENSE` only for apps that enable one of them, so users can replace FFmpeg. Hardware decoding uses VideoToolbox on macOS and Direct3D 11 on Windows.
 

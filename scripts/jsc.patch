@@ -1,3 +1,172 @@
+diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
+index 81101c17f..beca22083 100644
+--- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
++++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
+@@ -28,6 +28,21 @@
+ 
+ #include "GlobalObjectMethodTable.h"
+ #include "JSCellInlines.h"
++#if !JSC_OBJC_API_ENABLED
++#include "CallFrameInlines.h"
++#include "Completion.h"
++#include "Error.h"
++#include "IdentifierInlines.h"
++#include "JSModuleLoader.h"
++#include "JSNativeStdFunction.h"
++#include "JSObjectInlines.h"
++#include "JSPromise.h"
++#include "JSSourceCode.h"
++#include "ObjectConstructor.h"
++#include "SourceOrigin.h"
++#include <wtf/URL.h>
++#include <wtf/text/MakeString.h>
++#endif
+ #include "StructureCreateInlines.h"
+ 
+ namespace JSC {
+@@ -44,10 +59,10 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
+         &javaScriptRuntimeFlags,
+         &shouldInterruptScriptBeforeTimeout,
+         nullptr, // moduleTypeIsAllowed
+-        nullptr, // moduleLoaderImportModule
+-        nullptr, // moduleLoaderResolve
+-        nullptr, // moduleLoaderFetch
+-        nullptr, // moduleLoaderCreateImportMetaProperties
++        &moduleLoaderImportModule,
++        &moduleLoaderResolve,
++        &moduleLoaderFetch,
++        &moduleLoaderCreateImportMetaProperties,
+         nullptr, // moduleLoaderEvaluate
+         &promiseRejectionTracker,
+         &reportUncaughtExceptionAtEventLoop,
+@@ -74,8 +89,109 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
+     Base::reportUncaughtExceptionAtEventLoop(globalObject, exception);
+ }
+ 
++// Like browsers: absolute URLs stay, and "/", "./" and "../" resolve against the importing module's URL.
++Identifier JSAPIGlobalObject::moduleLoaderResolve(JSGlobalObject* globalObject, JSModuleLoader*, JSValue key, JSValue referrer, RefPtr<ScriptFetcher>, bool)
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    String name = key.toWTFString(globalObject);
++    RETURN_IF_EXCEPTION(scope, { });
++    URL url { name };
++    if (!url.isValid()) {
++        URL base;
++        if (auto* string = dynamicDowncast<JSString>(referrer)) {
++            String value = string->value(globalObject);
++            RETURN_IF_EXCEPTION(scope, { });
++            base = URL { { }, value };
++        }
++        if (!name.startsWith('/') && !name.startsWith("./"_s) && !name.startsWith("../"_s)) {
++            throwVMError(globalObject, scope, createTypeError(globalObject, makeString("Cannot resolve module specifier \""_s, name, "\". Use a URL"_s)));
++            return { };
++        }
++        url = URL { base, name };
++        if (!base.isValid() || !url.isValid()) {
++            throwVMError(globalObject, scope, createTypeError(globalObject, makeString("Cannot resolve \""_s, name, "\" from \""_s, base.string(), "\""_s)));
++            return { };
++        }
++    }
++    return Identifier::fromString(vm, url.string());
++}
++
++JSPromise* JSAPIGlobalObject::moduleLoaderImportModule(JSGlobalObject* globalObject, JSModuleLoader*, JSString* specifierValue, RefPtr<ScriptFetchParameters> fetchParams, const SourceOrigin& sourceOrigin, bool deferred)
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    auto reject = [&] {
++        auto* promise = JSPromise::create(vm, globalObject->promiseStructure());
++        return promise->rejectWithCaughtException(vm, scope);
++    };
++    auto specifier = specifierValue->value(globalObject);
++    RETURN_IF_EXCEPTION(scope, reject());
++    Identifier origin;
++    if (const String& string = sourceOrigin.string(); !string.isNull())
++        origin = Identifier::fromString(vm, string);
++    auto* result = importModule(globalObject, Identifier::fromString(vm, specifier), origin, WTF::move(fetchParams), nullptr, deferred);
++    RETURN_IF_EXCEPTION(scope, reject());
++    return result;
++}
++
++// Calls the loader function with (url, resolve, reject). resolve takes the module source as a string.
++JSPromise* JSAPIGlobalObject::moduleLoaderFetch(JSGlobalObject* globalObject, JSModuleLoader*, JSValue key, const String&, RefPtr<ScriptFetchParameters>, RefPtr<ScriptFetcher>)
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    auto* promise = JSPromise::create(vm, globalObject->promiseStructure());
++    String url = key.toWTFString(globalObject);
++    RETURN_IF_EXCEPTION(scope, promise->rejectWithCaughtException(vm, scope));
++    JSObject* loader = uncheckedDowncast<JSAPIGlobalObject>(globalObject)->m_moduleLoader.get();
++    if (!loader) {
++        scope.release();
++        promise->reject(vm, createTypeError(globalObject, makeString("Cannot import "_s, url)));
++        return promise;
++    }
++    auto* resolve = JSNativeStdFunction::create(vm, globalObject, 1, "resolve"_s, [promise, url] (JSGlobalObject* globalObject, CallFrame* callFrame) {
++        VM& vm = globalObject->vm();
++        auto scope = DECLARE_THROW_SCOPE(vm);
++        String source = callFrame->argument(0).toWTFString(globalObject);
++        RETURN_IF_EXCEPTION(scope, encodedJSValue());
++        URL origin { { }, url };
++        promise->resolve(globalObject, vm, JSSourceCode::create(vm, makeSource(source, SourceOrigin { origin }, SourceTaintedOrigin::Untainted, url, TextPosition(), SourceProviderSourceType::Module)));
++        return encodedJSUndefined();
++    }, promise);
++    auto* reject = JSNativeStdFunction::create(vm, globalObject, 1, "reject"_s, [promise] (JSGlobalObject* globalObject, CallFrame* callFrame) {
++        promise->reject(globalObject->vm(), callFrame->argument(0));
++        return encodedJSUndefined();
++    }, promise);
++    auto callData = JSC::getCallData(loader);
++    MarkedArgumentBuffer arguments;
++    arguments.append(key);
++    arguments.append(resolve);
++    arguments.append(reject);
++    call(globalObject, loader, callData, jsUndefined(), arguments);
++    RETURN_IF_EXCEPTION(scope, promise->rejectWithCaughtException(vm, scope));
++    return promise;
++}
++
++JSObject* JSAPIGlobalObject::moduleLoaderCreateImportMetaProperties(JSGlobalObject* globalObject, JSModuleLoader*, JSValue key, JSModuleRecord*, RefPtr<ScriptFetcher>)
++{
++    VM& vm = globalObject->vm();
++    JSObject* meta = constructEmptyObject(vm, globalObject->nullPrototypeObjectStructure());
++    meta->putDirect(vm, Identifier::fromString(vm, "url"_s), key);
++    return meta;
++}
++
+ #endif
+ 
++template<typename Visitor>
++void JSAPIGlobalObject::visitChildrenImpl(JSCell* cell, Visitor& visitor)
++{
++    auto* thisObject = uncheckedDowncast<JSAPIGlobalObject>(cell);
++    Base::visitChildren(thisObject, visitor);
++    visitor.append(thisObject->m_moduleLoader);
++}
++
++DEFINE_VISIT_CHILDREN(JSAPIGlobalObject);
++
+ JSAPIGlobalObject::JSAPIGlobalObject(VM& vm, Structure* structure)
+     : Base(vm, structure, globalObjectMethodTable())
+ {
+diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.h b/Source/JavaScriptCore/API/JSAPIGlobalObject.h
+index a530e481c..aee05f9ac 100644
+--- a/Source/JavaScriptCore/API/JSAPIGlobalObject.h
++++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.h
+@@ -55,7 +55,13 @@ public:
+ 
+     JSValue loadAndEvaluateJSScriptModule(const JSLockHolder&, JSScript *);
+ 
++    void setModuleLoader(VM& vm, JSObject* loader) { m_moduleLoader.setMayBeNull(vm, this, loader); }
++
++    DECLARE_VISIT_CHILDREN;
++
+ private:
++    WriteBarrier<JSObject> m_moduleLoader;
++
+     static const GlobalObjectMethodTable* globalObjectMethodTable();
+     JSAPIGlobalObject(VM&, Structure*);
+ 
 diff --git a/Source/JavaScriptCore/API/JSBase.cpp b/Source/JavaScriptCore/API/JSBase.cpp
 index f96eb07c4..d3b545b68 100644
 --- a/Source/JavaScriptCore/API/JSBase.cpp
@@ -54,7 +223,7 @@ index f96eb07c4..d3b545b68 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b2619..f2d93117c 100644
+index b8e3b2619..b835675b3 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
 @@ -43,7 +43,9 @@
@@ -67,7 +236,7 @@ index b8e3b2619..f2d93117c 100644
  #include "JSGlobalObjectInspectorController.h"
  #include "JSRemoteInspector.h"
  #endif
-@@ -85,6 +87,13 @@ void JSContextGroupRelease(JSContextGroupRef group)
+@@ -85,6 +87,21 @@ void JSContextGroupRelease(JSContextGroupRef group)
      vm.derefSuppressingSaferCPPChecking();
  }
  
@@ -78,10 +247,18 @@ index b8e3b2619..f2d93117c 100644
 +    vm.shrinkFootprintNow(VM::ShrinkFootprint::KeepCodeInUse);
 +}
 +
++void JSGlobalContextSetModuleLoader(JSGlobalContextRef ctx, JSObjectRef loader)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    uncheckedDowncast<JSAPIGlobalObject>(globalObject)->setModuleLoader(vm, toJS(loader));
++}
++
  static bool internalScriptTimeoutCallback(JSGlobalObject* globalObject, void* callbackPtr, void* callbackData)
  {
      JSShouldTerminateCallback callback = reinterpret_cast<JSShouldTerminateCallback>(callbackPtr);
-@@ -166,7 +175,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
+@@ -166,7 +183,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -90,7 +267,7 @@ index b8e3b2619..f2d93117c 100644
  
      gcProtect(globalObject);
      vm.refSuppressingSaferCPPChecking();
-@@ -177,7 +186,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
+@@ -177,7 +194,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -99,7 +276,7 @@ index b8e3b2619..f2d93117c 100644
  
      bool protectCountIsZero = vm.heap.unprotect(globalObject);
      if (protectCountIsZero)
-@@ -192,7 +201,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
+@@ -192,7 +209,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -108,7 +285,7 @@ index b8e3b2619..f2d93117c 100644
  
      return toRef(uncheckedDowncast<JSObject>(JSValue(globalObject).toThis(globalObject, ECMAMode::sloppy())));
  }
-@@ -214,7 +223,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
+@@ -214,7 +231,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -117,7 +294,7 @@ index b8e3b2619..f2d93117c 100644
  
      return toGlobalRef(globalObject);
  }
-@@ -227,6 +236,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
+@@ -227,6 +244,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -125,7 +302,7 @@ index b8e3b2619..f2d93117c 100644
  
      String name = globalObject->name();
      if (name.isNull())
-@@ -243,6 +253,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
+@@ -243,6 +261,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -133,7 +310,7 @@ index b8e3b2619..f2d93117c 100644
      globalObject->setName(name ? name->string() : String());
  }
  
-@@ -274,6 +285,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
+@@ -274,6 +293,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
      globalObject->setInspectable(inspectable);
  }
  
@@ -201,7 +378,7 @@ index b8e3b2619..f2d93117c 100644
  void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function, JSValueRef* exception)
  {
      if (!ctx) {
-@@ -283,7 +355,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
+@@ -283,7 +363,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -211,10 +388,10 @@ index b8e3b2619..f2d93117c 100644
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
 diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-index c009bb5a2..83b0e6046 100644
+index c009bb5a2..a770c32d8 100644
 --- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
 +++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-@@ -69,6 +69,39 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
+@@ -69,6 +69,47 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
  typedef bool
  (*JSShouldTerminateCallback) (JSContextRef ctx, void* context);
  
@@ -224,6 +401,14 @@ index c009bb5a2..83b0e6046 100644
 +@param group The JavaScript context group to shrink.
 +*/
 +JS_EXPORT void JSContextGroupShrinkFootprint(JSContextGroupRef group);
++
++/*!
++@function
++@abstract Loads ES modules for import() and import statements in a context made without a global object class.
++@param ctx The JSGlobalContext.
++@param loader A function called with (url, resolve, reject) for each module. Call resolve with the module source as a string.
++*/
++JS_EXPORT void JSGlobalContextSetModuleLoader(JSGlobalContextRef ctx, JSObjectRef loader);
 +
 +typedef void (*JSInspectorMessageCallback)(void* data, const char* message, size_t length);
 +typedef void (*JSInspectorPauseCallback)(JSGlobalContextRef ctx, bool* done);

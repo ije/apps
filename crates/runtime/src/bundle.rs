@@ -87,7 +87,13 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)
 }
 
 /// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
-pub const FEATURES: [(&str, bool); 3] = [("webgpu", false), ("video", false), ("audio", false)];
+pub const FEATURES: [(&str, bool); 5] = [
+    ("webgpu", false),
+    ("video", false),
+    ("audio", false),
+    ("jsExecute", false),
+    ("httpImport", false),
+];
 
 /// The bit of `feature` in a set returned by `disabled_features`.
 pub fn feature_bit(feature: &str) -> u32 {
@@ -528,16 +534,17 @@ mod tests {
     #[test]
     fn package_features_enable_and_disable_in_order() {
         for (features, disabled) in [
-            (None, 7),
-            (Some(json!([])), 7),
-            (Some(json!(["webgpu"])), 6),
+            (None, 31),
+            (Some(json!([])), 31),
+            (Some(json!(["webgpu"])), 30),
             (Some(json!(["*"])), 0),
-            (Some(json!(["-*"])), 7),
+            (Some(json!(["-*"])), 31),
             (Some(json!(["*", "-webgpu"])), 1),
-            (Some(json!(["-*", "webgpu"])), 6),
-            (Some(json!(["webgpu", "-webgpu"])), 7),
-            (Some(json!(["video", "audio"])), 1),
+            (Some(json!(["-*", "webgpu"])), 30),
+            (Some(json!(["webgpu", "-webgpu"])), 31),
+            (Some(json!(["video", "audio"])), 25),
             (Some(json!(["*", "-audio"])), 4),
+            (Some(json!(["jsExecute", "httpImport"])), 7),
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(

@@ -134,6 +134,14 @@
   };
   const pollWeb = globalThis.__appsWeb(call);
   delete globalThis.__appsWeb;
+  // WARNING: runtime import() loads data: and blob: modules only with jsExecute, and http(s) modules only with httpImport.
+  const download = globalThis.fetch;
+  globalThis.__appsModuleLoader = (url, resolve, reject) => {
+    const name = /^(?:data|blob):/.test(url) ? 'jsExecute' : /^https?:/.test(url) ? 'httpImport' : '';
+    if (!name) return reject(new TypeError(`Cannot import ${url}. Only bundled modules, data:, blob: and http(s) URLs can be imported`));
+    if (disabled.has(name)) return reject(new TypeError(`Importing ${url.slice(0, url.indexOf(':'))} URLs needs the ${name} feature. Add "${name}" to "features" in package.json`));
+    download(url).then(response => response.ok ? response.text() : Promise.reject(new TypeError(`Cannot import ${url}: HTTP ${response.status}`))).then(resolve, reject);
+  };
   globalThis.__appsPlatform(call);
   delete globalThis.__appsPlatform;
   let modulesPending = 0;

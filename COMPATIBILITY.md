@@ -12,8 +12,10 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 | `DOMParser`, XPath, XSLT | `DOMParser` parses `text/html` only. XPath and XSLT are not supported |
 | `*AttributeNS()` | The namespace is ignored |
 | `<template>` | Parsed children move into `content` when `content` is first read |
-| `eval()`, `new Function()` | Throw an `EvalError` in pages and page workers, as do the constructors of async and generator functions |
-| Inline event attributes (`onclick="..."`) | Not run, because `eval` is disabled. `el.onclick = fn` and `addEventListener` work |
+| `eval()`, `new Function()` | Throw an `EvalError` in pages and page workers, as do the constructors of async and generator functions. The `jsExecute` feature allows them |
+| `import()` | A string literal imports a bundled module. Other specifiers stay in the code and load when they run: `data:` and `blob:` URLs with the `jsExecute` feature, `http` and `https` URLs with `httpImport`. Remote modules can import other modules only by URL |
+| Remote scripts and stylesheets | `<script src>`, `<link rel="stylesheet">`, JavaScript imports and CSS `@import` with `http` or `https` URLs need the `httpImport` feature. `apps build` downloads them into the app |
+| Inline event attributes (`onclick="..."`) | Not run. `el.onclick = fn` and `addEventListener` work |
 | HTML parsing | Follows the HTML5 tree builder, except misnested formatting tags (`<b><p></b>` keeps `p` in `b`), MathML and framesets |
 | Navigation | Pages can go to bundled `apps:///` pages and local `file:///` files only. Other URLs throw. Use `WebContentsView` or `shell.openExternal()` for websites |
 | `Worker` | Loads bundled, `data:`, `blob:` and local scripts. Remote scripts are rejected |

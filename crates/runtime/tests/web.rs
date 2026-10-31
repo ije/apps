@@ -269,3 +269,71 @@ fn stream_throughput() {
         assert!(Instant::now() < deadline, "Benchmark did not settle");
     }
 }
+
+#[test]
+fn runtime_imports_follow_features() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            let (mut request, mut byte) = (Vec::new(), [0]);
+            while !request.ends_with(b"\r\n\r\n") && socket.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+            }
+            let body = if request.starts_with(b"GET /a.js") {
+                "import b from './b.js';export default b+1"
+            } else {
+                "export default 41"
+            };
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/javascript\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let api = Api::load().unwrap();
+    let run = |disabled: u32, role: Role, code: &str| {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().disabled = disabled;
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
+                dirty: false,
+            },
+        );
+        let engine = Engine::new(api.clone(), host, role).unwrap();
+        engine
+            .eval(
+                &format!("globalThis.result='pending';Promise.resolve().then(()=>{code}).then(v=>result=String(v),e=>result=e.message)"),
+                "test",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            engine.tick().unwrap();
+            let result = engine.eval("result", "test").unwrap();
+            if result != "pending" {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "{code} did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let defaults = apps_runtime::bundle::disabled_features(None).unwrap();
+    let data = "import('data:text/javascript,export default 6*7').then(m=>m.default)";
+    let http = format!("import('http://127.0.0.1:{port}/a.js').then(m=>m.default)");
+    let strings = "[eval('1'), new Function('return 2')()].join()";
+    assert_eq!(run(0, Role::Renderer(1), strings), "1,2");
+    assert!(run(defaults, Role::Renderer(1), strings).contains("disabled in pages"));
+    assert_eq!(run(0, Role::Renderer(1), data), "42");
+    assert!(run(defaults, Role::Renderer(1), data).contains("jsExecute"));
+    assert_eq!(run(0, Role::Main, &http), "42");
+    assert!(run(defaults, Role::Main, &http).contains("httpImport"));
+    assert!(run(0, Role::Main, "import('file:///x.js')").contains("Cannot import"));
+}
