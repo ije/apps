@@ -174,7 +174,7 @@ globalThis.editorResult = 'pending';
   document.caretRangeFromPoint = originalCaret;
   const scroller = document.createElement('div'), item = document.createElement('span');
   scroller.style.overflow = 'auto'; scroller.append(item); document.body.append(scroller);
-  Object.defineProperties(scroller, { scrollTop: { value:0, writable:true }, scrollLeft: { value:0, writable:true }, clientHeight: { value:100 }, clientWidth: { value:100 } });
+  Object.defineProperties(scroller, { clientHeight: { value:100 }, clientWidth: { value:100 } });
   scroller.getBoundingClientRect = () => new DOMRect(0,0,100,100);
   item.getBoundingClientRect = () => new DOMRect(20,20,10,10);
   item.scrollIntoView({ block:'nearest' });

@@ -338,6 +338,7 @@ fn tools() -> Value {
             "count": {"type": "integer", "description": "Click count. 2 is a double click."},
             "key": {"type": "string"}, "text": {"type": "string"},
             "delta_x": {"type": "number"}, "delta_y": {"type": "number"},
+            "lines": {"type": "boolean", "description": "Scroll deltas are mouse wheel lines instead of trackpad pixels."},
         }, "required": ["action"]}},
         {"name": "console", "description": "Returns console messages and uncaught errors from all contexts since the last call.", "inputSchema": {"type": "object", "properties": {
             "keep": {"type": "boolean", "description": "Keep the messages for the next call."},
@@ -911,15 +912,22 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
             pressed_button: None,
             modifiers,
         })),
-        "scroll" => events.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
-            position,
-            delta: ScrollDelta::Pixels(point(
-                px(-args["delta_x"].as_f64().unwrap_or(0.) as f32),
-                px(-args["delta_y"].as_f64().unwrap_or(0.) as f32),
-            )),
-            modifiers,
-            touch_phase: Default::default(),
-        })),
+        "scroll" => {
+            let delta = point(
+                -args["delta_x"].as_f64().unwrap_or(0.) as f32,
+                -args["delta_y"].as_f64().unwrap_or(0.) as f32,
+            );
+            events.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: if args["lines"].as_bool() == Some(true) {
+                    ScrollDelta::Lines(delta)
+                } else {
+                    ScrollDelta::Pixels(delta.map(px))
+                },
+                modifiers,
+                touch_phase: Default::default(),
+            }));
+        }
         "key" => {
             let key = args["key"].as_str().context("Expected a key")?;
             for part in key.split_whitespace() {

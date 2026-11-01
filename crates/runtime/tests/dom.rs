@@ -70,6 +70,13 @@ fn window_scroll_moves_the_page() {
         __appsLayout();
         if (JSON.stringify(received) !== '[[true,true,0,50]]') throw Error(JSON.stringify(received));
         if (document.documentElement.clientHeight !== innerHeight) throw Error('Root client height is not the viewport');
+        if (!CSS.supports('scroll-behavior', 'smooth')) throw Error('scroll-behavior is not supported');
+        document.documentElement.style.scrollBehavior = 'smooth';
+        if (getComputedStyle(document.documentElement).scrollBehavior !== 'smooth') throw Error('scroll-behavior is not computed');
+        scrollTo({top: 70, behavior: 'smooth'}); scrollBy(0, 5);
+        if (scrollY !== 75) throw Error('A page without a scroll range does not scroll at once: ' + scrollY);
+        document.documentElement.style.scrollBehavior = '';
+        scrollTo(0, 50);
     "#, "test").unwrap();
     host.borrow().dom[&1].scroll[&0]
         .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));

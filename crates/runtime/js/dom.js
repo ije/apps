@@ -565,14 +565,14 @@
     get scrollTop() { return metric(pageScroller(this) ? document : this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
     get scrollLeft() { return metric(pageScroller(this) ? document : this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
     get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : Math.round(client(this)[2] + metric(this, 6)); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : Math.round(client(this)[3] + metric(this, 7)); }
-    scrollTo(left, top) { if (typeof left === 'object') { top = left.top; left = left.left; } call('dom.scroll', this._id, left ?? null, top ?? null); }
+    scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); call('dom.scroll', this._id, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
-    scrollBy(left, top) { if (typeof left === 'object') { top = left.top; left = left.left; } this.scrollTo(this.scrollLeft + (left ?? 0), this.scrollTop + (top ?? 0)); }
+    scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
       const target = this.getBoundingClientRect(); let left = target.left, top = target.top;
       for (let p = this.assignedSlot ?? this.parentElement ?? this.getRootNode().host; p; p = p.assignedSlot ?? p.parentElement ?? p.getRootNode().host) {
-        const style = getComputedStyle(p), bounds = p.getBoundingClientRect(); let scrollable = false;
+        const style = getComputedStyle(p), bounds = p.getBoundingClientRect(), to = [null, null]; let scrollable = false;
         for (const [axis, align, start, size, edge, extent] of [
           ['Y', options.block ?? 'start', top, target.height, bounds.top + p.clientTop, p.clientHeight],
           ['X', options.inline ?? 'nearest', left, target.width, bounds.left + p.clientLeft, p.clientWidth],
@@ -582,10 +582,12 @@
           const before = start - edge, after = start + size - edge - extent;
           let delta = align === 'center' ? (before + after) / 2 : align === 'end' ? after : before;
           if (align === 'nearest') delta = before < 0 && after > 0 ? 0 : before < 0 ? (size <= extent ? before : after) : after > 0 ? (size <= extent ? after : before) : 0;
-          if (!delta) continue;
-          const property = axis === 'Y' ? 'scrollTop' : 'scrollLeft', previous = p[property];
-          p[property] += delta;
-          if (axis === 'Y') top -= p[property] - previous; else left -= p[property] - previous;
+          if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) + delta;
+        }
+        // WARNING: a smooth scroll moves later, so the target shifts by where the scroll stops, not by the offset now.
+        if (to[0] !== null || to[1] !== null) {
+          const previous = [p.scrollLeft, p.scrollTop], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null);
+          left -= next[0] - previous[0]; top -= next[1] - previous[1];
         }
         if (scrollable && options.container === 'nearest') break;
       }

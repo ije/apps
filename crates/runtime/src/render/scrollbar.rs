@@ -560,14 +560,14 @@ impl renderer::Element for Scrollbar {
                     // A click on the track scrolls a page toward it, by WebKit's page step.
                     let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
                     let step = if position < bar.thumb[0] { step } else { -step };
-                    let mut offset = handle.offset();
+                    let mut offset = handle.target();
                     let value = if axis == 0 {
                         &mut offset.x
                     } else {
                         &mut offset.y
                     };
                     *value = (*value + px(step)).clamp(px(-bar.max), px(0.));
-                    handle.set_offset(offset);
+                    handle.animate_to(offset, false);
                 }
                 window.refresh();
             }

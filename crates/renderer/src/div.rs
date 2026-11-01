@@ -4,7 +4,11 @@ use crate::{
     Pixels, Point, ScrollWheelEvent, Style, Styled, Visibility, Window, WindowControlArea,
     input::DispatchPhase, point, px, quad,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 type Listener<E> = Box<dyn FnMut(&E, &mut Window, &mut App)>;
 
@@ -146,10 +150,10 @@ impl Events {
             });
         }
         if let Some(handle) = &self.scroll {
-            let (state, hitbox) = (handle.0.clone(), hitbox.clone());
+            let (handle, hitbox) = (handle.clone(), hitbox.clone());
             let (overflow, restrict) = (style.overflow, style.restrict_scroll_to_axis);
             let line_height = window.line_height();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, _| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
                     return;
                 }
@@ -169,12 +173,28 @@ impl Events {
                         x = Pixels::ZERO;
                     }
                 }
-                let mut state = state.borrow_mut();
-                let old = state.offset;
-                state.offset.x = (state.offset.x + x).clamp(-state.max_offset.x, px(0.));
-                state.offset.y = (state.offset.y + y).clamp(-state.max_offset.y, px(0.));
-                if state.offset != old {
-                    drop(state);
+                // WARNING: a wheel tick adds to where a running scroll stops, so fast ticks lose no distance.
+                let wheel = !event.delta.precise();
+                let from = if wheel {
+                    handle.target()
+                } else {
+                    handle.offset()
+                };
+                let max = handle.max_offset();
+                let to = point(
+                    (from.x + x).clamp(-max.x, px(0.)),
+                    (from.y + y).clamp(-max.y, px(0.)),
+                );
+                if to == from {
+                    return;
+                }
+                // WARNING: like browsers, only the innermost box that can scroll moves. Outer boxes get the event at its edge.
+                cx.stop_propagation();
+                if wheel {
+                    handle.animate_to(to, true);
+                    handle.drive(window);
+                } else {
+                    handle.set_offset(to);
                     window.refresh();
                 }
             });
@@ -250,7 +270,10 @@ impl Element for Div {
                 let hitbox =
                     needs_hitbox.then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal));
                 let offset = match scroll {
-                    Some(handle) => handle.clamp(style, bounds, content, window.scale_factor()),
+                    Some(handle) => {
+                        handle.drive(window);
+                        handle.clamp(style, bounds, content, window.scale_factor())
+                    }
                     None => Point::default(),
                 };
                 if style.display != crate::Display::None {
@@ -330,6 +353,41 @@ struct ScrollState {
     offset: Point<Pixels>,
     max_offset: Point<Pixels>,
     bounds: Bounds<Pixels>,
+    animation: Option<Animation>,
+    /// A frame callback advances `animation`.
+    driven: bool,
+}
+
+/// How long a wheel tick scrolls when the box is still.
+const WHEEL: Duration = Duration::from_millis(150);
+
+/// A smooth scroll. Each axis moves by `f(u) = s·u + (3 - 2s)·u² + (s - 2)·u³` of the distance as
+/// `u` goes from 0 to 1, so it starts at `s` times the average speed and stops softly. `s` stays
+/// in 0..=3, where 0 eases in and out and 3 is a cubic ease-out.
+struct Animation {
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    slope: Point<f32>,
+    start: Instant,
+    duration: Duration,
+}
+
+impl Animation {
+    /// The offset and the speed in pixels per second at `now`.
+    fn at(&self, now: Instant) -> (Point<Pixels>, Point<f32>) {
+        let duration = self.duration.as_secs_f32();
+        let u = (now.saturating_duration_since(self.start).as_secs_f32() / duration).min(1.);
+        let axis = |from: Pixels, to: Pixels, s: f32| {
+            let delta = f32::from(to - from);
+            (
+                from + px(delta * u * (s + u * (3. - 2. * s + u * (s - 2.)))),
+                delta * (1. - u) * (s + (6. - 3. * s) * u) / duration,
+            )
+        };
+        let (x, speed_x) = axis(self.from.x, self.to.x, self.slope.x);
+        let (y, speed_y) = axis(self.from.y, self.to.y, self.slope.y);
+        (point(x, y), point(speed_x, speed_y))
+    }
 }
 
 /// The scroll position of a box, shared between frames.
@@ -351,8 +409,96 @@ impl ScrollHandle {
         self.0.borrow().offset
     }
 
+    /// Moves at once and stops a smooth scroll.
     pub fn set_offset(&self, offset: Point<Pixels>) {
-        self.0.borrow_mut().offset = offset;
+        let mut state = self.0.borrow_mut();
+        state.offset = offset;
+        state.animation = None;
+    }
+
+    /// Where the box stops: the end of a smooth scroll, or the offset.
+    pub fn target(&self) -> Point<Pixels> {
+        let state = self.0.borrow();
+        state.animation.as_ref().map_or(state.offset, |animation| animation.to)
+    }
+
+    /// Scrolls smoothly to `offset` from the current position and speed. The box's next frame
+    /// starts it.
+    ///
+    /// A `wheel` tick starts at full speed. It lasts 150 ms, or twice the time since the last
+    /// tick but at least 50 ms, like Firefox. It never starts slower than 1.5 times its average
+    /// speed, so each tick is felt. Other scrolls ease in from rest and take the square root of
+    /// the distance in 60 Hz frames, up to 0.7 seconds, like Chromium.
+    pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
+        let now = Instant::now();
+        let mut state = self.0.borrow_mut();
+        let running = state
+            .animation
+            .as_ref()
+            .filter(|animation| now < animation.start + animation.duration);
+        let (from, speed) = running.map_or((state.offset, Point::default()), |animation| {
+            animation.at(now)
+        });
+        let distance = f32::from((offset.x - from.x).abs().max((offset.y - from.y).abs()));
+        let duration = if wheel {
+            running.map_or(WHEEL, |animation| {
+                ((now - animation.start) * 2).clamp(Duration::from_millis(50), WHEEL)
+            })
+        } else {
+            Duration::from_secs_f32((distance.sqrt() / 60.).clamp(1. / 60., 0.7))
+        };
+        let seconds = duration.as_secs_f32();
+        let slope = |delta: Pixels, speed: f32| match running {
+            None if wheel => 3.,
+            _ if delta.is_zero() => 0.,
+            _ => (speed * seconds / f32::from(delta)).clamp(if wheel { 1.5 } else { 0. }, 3.),
+        };
+        let animation = (distance > 0.).then(|| Animation {
+            from,
+            to: offset,
+            slope: point(
+                slope(offset.x - from.x, speed.x),
+                slope(offset.y - from.y, speed.y),
+            ),
+            start: now,
+            duration,
+        });
+        state.offset = from;
+        state.animation = animation;
+    }
+
+    /// Advances the smooth scroll at the start of each frame, before the view renders, so the
+    /// frame lays out at the new offset.
+    fn drive(&self, window: &mut Window) {
+        {
+            let mut state = self.0.borrow_mut();
+            if state.animation.is_none() || state.driven {
+                return;
+            }
+            state.driven = true;
+        }
+        let handle = self.clone();
+        window.on_next_frame(move |window, _| {
+            let now = Instant::now();
+            let mut state = handle.0.borrow_mut();
+            state.driven = false;
+            let Some(animation) = &state.animation else {
+                return;
+            };
+            let offset = if now < animation.start + animation.duration {
+                animation.at(now).0
+            } else {
+                let to = animation.to;
+                state.animation = None;
+                to
+            };
+            if offset != state.offset {
+                state.offset = offset;
+                window.refresh();
+            }
+            drop(state);
+            handle.drive(window);
+        });
     }
 
     pub fn max_offset(&self) -> Point<Pixels> {
@@ -392,5 +538,54 @@ impl ScrollHandle {
         state.max_offset = max;
         state.bounds = bounds;
         state.offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Animation, ScrollHandle};
+    use crate::{point, px};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn smooth_scrolls_keep_position_and_speed() {
+        let (start, duration) = (Instant::now(), Duration::from_millis(200));
+        let curve = |slope: f32| Animation {
+            from: point(px(0.), px(0.)),
+            to: point(px(0.), px(-100.)),
+            slope: point(0., slope),
+            start,
+            duration,
+        };
+        for slope in [0., 1.5, 3.] {
+            let animation = curve(slope);
+            assert_eq!(animation.at(start).0.y, px(0.));
+            assert!((animation.at(start).1.y + slope * 500.).abs() < 1e-3);
+            assert!((f32::from(animation.at(start + duration).0.y) + 100.).abs() < 1e-3);
+            assert_eq!(animation.at(start + duration).1.y, 0.);
+            let mut last = 0.;
+            for step in 1..=20 {
+                let y = f32::from(animation.at(start + duration * step / 20).0.y);
+                assert!(y <= last, "slope {slope} moves back at step {step}");
+                last = y;
+            }
+        }
+
+        let handle = ScrollHandle::new();
+        handle.animate_to(point(px(0.), px(-100.)), true);
+        assert_eq!(handle.target().y, px(-100.));
+        assert_eq!(handle.0.borrow().animation.as_ref().unwrap().slope.y, 3.);
+        handle.set_offset(point(px(0.), px(-10.)));
+        assert!(handle.0.borrow().animation.is_none());
+
+        let past = Instant::now() - Duration::from_millis(50);
+        handle.0.borrow_mut().animation = Some(Animation { start: past, ..curve(0.) });
+        handle.animate_to(point(px(0.), px(-400.)), false);
+        let state = handle.0.borrow();
+        let new = state.animation.as_ref().unwrap();
+        let old = Animation { start: past, ..curve(0.) }.at(new.start);
+        assert_eq!(state.offset, new.from);
+        assert!((f32::from(new.from.y - old.0.y)).abs() < 1e-3);
+        assert!((new.at(new.start).1.y - old.1.y).abs() < 1e-2);
     }
 }

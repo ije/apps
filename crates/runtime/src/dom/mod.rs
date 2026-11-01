@@ -378,7 +378,7 @@ impl State {
     /// Copies scroll offsets and ranges into the layout mirror.
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
-            let (offset, max) = (scroll_offset(handle), handle.max_offset());
+            let (offset, max) = (scroll_offset(handle, handle.offset()), handle.max_offset());
             self.bounds.scroll(
                 id,
                 [
@@ -634,8 +634,11 @@ pub fn call(
         if op == "dom.scrollEvents" {
             let mut changed = Vec::new();
             for (&id, handle) in &state.scroll {
-                let offset = scroll_offset(handle);
-                handle.set_offset(offset);
+                let offset = scroll_offset(handle, handle.offset());
+                // WARNING: `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
+                if offset != handle.offset() {
+                    handle.set_offset(offset);
+                }
                 let previous = state.scroll_offsets.entry(id).or_default();
                 if *previous != offset {
                     *previous = offset;
@@ -1503,26 +1506,46 @@ pub fn call(
                 Ok(json!(text))
             }
             "dom.scroll" => {
-                let handle = state.scroll.entry(if page { 0 } else { id }).or_default();
+                let handle = state
+                    .scroll
+                    .entry(if page { 0 } else { id })
+                    .or_default()
+                    .clone();
                 let previous = handle.offset();
-                handle.set_offset(renderer::point(
-                    renderer::px(
-                        -args[1]
-                            .as_f64()
-                            .map(|v| v as f32)
-                            .unwrap_or(-f32::from(previous.x)),
-                    ),
-                    renderer::px(
-                        -args[2]
-                            .as_f64()
-                            .map(|v| v as f32)
-                            .unwrap_or(-f32::from(previous.y)),
-                    ),
-                ));
-                handle.set_offset(scroll_offset(handle));
-                state.dirty |= handle.offset() != previous;
+                let axis = |value: &Value, current: renderer::Pixels| {
+                    renderer::px(value.as_f64().map_or(f32::from(current), |v| -v as f32))
+                };
+                let target = scroll_offset(
+                    &handle,
+                    renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
+                );
+                if target != handle.target() {
+                    let smooth = handle.max_offset() != renderer::Point::default()
+                        && match args[3].as_str() {
+                            Some("smooth") => true,
+                            Some("instant") => false,
+                            _ => {
+                                let system = state.text_system.clone();
+                                styles(
+                                    doc,
+                                    state,
+                                    viewport,
+                                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                                )
+                                .values[id]
+                                    .get(Prop::SCROLL_BEHAVIOR)
+                                    == Some("smooth")
+                            }
+                        };
+                    if smooth {
+                        handle.animate_to(target, false);
+                    } else {
+                        handle.set_offset(target);
+                    }
+                }
+                state.dirty |= target != previous;
                 state.sync_scroll();
-                Ok(Value::Null)
+                Ok(json!([-f32::from(target.x), -f32::from(target.y)]))
             }
             "dom.canvas" => {
                 if let Some(ops) = crate::jsc::payload::slice(&args[1]) {
@@ -2173,8 +2196,11 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     Value::Array(list)
 }
 
-fn scroll_offset(handle: &renderer::ScrollHandle) -> renderer::Point<renderer::Pixels> {
-    let mut offset = handle.offset();
+/// `offset` clamped to the scroll range of `handle`, once its box was laid out.
+fn scroll_offset(
+    handle: &renderer::ScrollHandle,
+    mut offset: renderer::Point<renderer::Pixels>,
+) -> renderer::Point<renderer::Pixels> {
     let bounds = handle.bounds();
     if bounds.size.width > renderer::px(0.) || bounds.size.height > renderer::px(0.) {
         let max = handle.max_offset();
