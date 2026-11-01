@@ -40,7 +40,7 @@ fn run() -> Result<i32> {
                 .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>] [--] [app arguments]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\napps skill\n\nRun and build default to main.ts, then main.js. Watching is off by default.\nOther arguments after the entry, and all arguments after --, go to the app in process.argv.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
+            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>] [--] [app arguments]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>]\napps skill\n\nRun and build default to main in package.json, then index.ts, index.mts, index.mjs or index.js. Watching is off by default.\nOther arguments after the entry, and all arguments after --, go to the app in process.argv.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
@@ -107,15 +107,28 @@ fn run() -> Result<i32> {
             _ => bail!("Unknown option: {arg}"),
         }
     }
-    if entry.is_none() {
-        entry = ["main.ts", "main.js"]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|path| path.is_file());
-    }
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            let main = match std::fs::read_to_string("package.json") {
+                Ok(source) => serde_json::from_str::<serde_json::Value>(&source)
+                    .context("Invalid package.json")?["main"]
+                    .as_str()
+                    .map(PathBuf::from),
+                Err(_) => None,
+            };
+            main.or_else(|| {
+                ["index.ts", "index.mts", "index.mjs", "index.js"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.is_file())
+            })
+            .context("No entry found. Provide an entry file, set main in package.json, or create index.ts, index.mts, index.mjs or index.js")?
+        }
+    };
     let entry = entry
-        .context("No entry found. Provide an entry file or create main.ts or main.js")?
-        .canonicalize()?;
+        .canonicalize()
+        .with_context(|| format!("Cannot find the entry {}", entry.display()))?;
     let root = entry.parent().context("Missing project directory")?;
     let runtime = if let Some(path) = std::env::var_os("APPS_RUNTIME") {
         PathBuf::from(path)

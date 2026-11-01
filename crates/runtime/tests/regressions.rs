@@ -25,7 +25,7 @@ fn page() -> (Engine, Rc<RefCell<Host>>) {
 }
 
 #[test]
-fn page_networks_are_public_and_main_can_use_localhost() {
+fn page_networks_are_public_except_own_servers() {
     let (renderer, host) = page();
     let main = Engine::new(Api::load().unwrap(), host, Role::Main).unwrap();
     let port = main
@@ -35,20 +35,22 @@ fn page_networks_are_public_and_main_can_use_localhost() {
         )
         .unwrap();
     main.eval(&format!("globalThis.result='';fetch('http://127.0.0.1:{port}').then(r=>r.text()).then(v=>result=v)"), "test").unwrap();
-    renderer.eval(&format!(r#"globalThis.blocked=0;for(const host of ['127.0.0.1','localhost','[::1]','[::ffff:127.0.0.1]'])fetch(`http://${{host}}:{port}`).then(()=>{{throw Error('private fetch allowed')}},e=>{{if(!String(e).includes('private networks'))throw e;blocked++}});const socket=new WebSocket('ws://127.0.0.1:{port}');socket.onerror=()=>blocked++"#), "test").unwrap();
+    renderer.eval(&format!(r#"globalThis.allowed=0;globalThis.blocked=0;for(const host of ['127.0.0.1','localhost'])fetch(`http://${{host}}:{port}`).then(r=>r.text()).then(v=>{{if(v!=='ok')throw Error(v);allowed++}});for(const url of ['http://[::ffff:127.0.0.1]:{port}','http://127.0.0.1:1','http://localhost:1'])fetch(url).then(()=>{{throw Error('private fetch allowed')}},e=>{{if(!String(e).includes('private networks'))throw e;blocked++}});const socket=new WebSocket('ws://127.0.0.1:1');socket.onerror=()=>blocked++"#), "test").unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         main.tick().unwrap();
         renderer.tick().unwrap();
         if main.eval("result", "test").unwrap() == "ok"
-            && renderer.eval("blocked", "test").unwrap() == "5"
+            && renderer.eval("allowed", "test").unwrap() == "2"
+            && renderer.eval("blocked", "test").unwrap() == "4"
         {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(main.eval("result", "test").unwrap(), "ok");
-    assert_eq!(renderer.eval("blocked", "test").unwrap(), "5");
+    assert_eq!(renderer.eval("allowed", "test").unwrap(), "2");
+    assert_eq!(renderer.eval("blocked", "test").unwrap(), "4");
     main.eval("server.stop()", "test").unwrap();
 }
 

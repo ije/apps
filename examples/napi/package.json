@@ -1,9 +1,0 @@
-{
-  "name": "napi",
-  "productName": "NAPI",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "build": "node build.mjs"
-  }
-}

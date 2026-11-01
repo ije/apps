@@ -158,6 +158,41 @@ pub(crate) fn base64(bytes: &[u8]) -> Value {
     crate::jsc::payload::write(bytes::Bytes::copy_from_slice(bytes))
 }
 
+static LISTENING: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) struct Listening(u16);
+
+impl Listening {
+    pub(crate) fn new(port: u16) -> Self {
+        LISTENING.lock().unwrap().push(port);
+        Self(port)
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        let mut ports = LISTENING.lock().unwrap();
+        if let Some(index) = ports.iter().position(|&port| port == self.0) {
+            ports.swap_remove(index);
+        }
+    }
+}
+
+// WARNING: pages can't reach private networks, but they may reach loopback ports that this app listens on, so a page
+// can call the app's own server.
+pub(crate) fn own_server(url: &Url) -> bool {
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    loopback
+        && url
+            .port_or_known_default()
+            .is_some_and(|port| LISTENING.lock().unwrap().contains(&port))
+}
+
 pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
@@ -260,6 +295,7 @@ pub struct State {
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
     agent: Option<Agent>,
+    local: Option<Agent>,
 }
 
 impl State {
@@ -403,23 +439,23 @@ impl State {
                 let redirect = args[0]["redirect"].as_str().unwrap_or("follow").to_owned();
                 let network = network()?;
                 let renderer = self.renderer;
-                let agent = self
-                    .agent
-                    .get_or_insert_with(|| {
-                        let mut http = HttpConnector::new_with_resolver(Dns(renderer));
-                        http.enforce_http(false);
-                        http.set_nodelay(true);
-                        http.set_connect_timeout(Some(Duration::from_secs(30)));
-                        Client::builder(hyper_util::rt::TokioExecutor::new())
-                            .pool_timer(hyper_util::rt::TokioTimer::new())
-                            .build(hyper_rustls::HttpsConnector::new(
-                                http,
-                                tls(),
-                                false,
-                                Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
-                            ))
-                    })
-                    .clone();
+                let agent = |restricted| {
+                    let mut http = HttpConnector::new_with_resolver(Dns(restricted));
+                    http.enforce_http(false);
+                    http.set_nodelay(true);
+                    http.set_connect_timeout(Some(Duration::from_secs(30)));
+                    Client::builder(hyper_util::rt::TokioExecutor::new())
+                        .pool_timer(hyper_util::rt::TokioTimer::new())
+                        .build(hyper_rustls::HttpsConnector::new(
+                            http,
+                            tls(),
+                            false,
+                            Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
+                        ))
+                };
+                let local = (renderer && own_server(&url))
+                    .then(|| self.local.get_or_insert_with(|| agent(false)).clone());
+                let agent = self.agent.get_or_insert_with(|| agent(renderer)).clone();
                 let (events_tx, events) = mpsc::channel(64);
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
@@ -436,7 +472,7 @@ impl State {
                                     Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
                                     _ => None,
                                 };
-                                ensure!(!ip.is_some_and(private_address), "Pages cannot access private networks");
+                                ensure!(own_server(&url) || !ip.is_some_and(private_address), "Pages cannot access private networks");
                             }
                             let mut request = hyper::Request::builder().method(method.as_bytes()).uri(url.as_str());
                             for (name, value) in &headers { request = request.header(name, value); }
@@ -453,7 +489,7 @@ impl State {
                                     Some((Ok::<_, std::io::Error>(hyper::body::Frame::data(chunk)), (receiver, sender)))
                                 })).boxed_unsync()
                             } else { http_body_util::Full::new(body.clone()).map_err(|never| match never {}).boxed_unsync() };
-                            let response = agent.request(request.body(request_body)?).await?;
+                            let response = match &local { Some(local) if own_server(&url) => local, _ => &agent }.request(request.body(request_body)?).await?;
                             let status = response.status().as_u16();
                             if !matches!(status, 301 | 302 | 303 | 307 | 308) { break response; }
                             ensure!(redirect != "error", "Redirect is not allowed");

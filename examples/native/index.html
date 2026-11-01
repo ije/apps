@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Native · apps</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="preload" src="./preload.js"></script>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">NODE-API + FFI</p>
+    <h1>Native code in a window</h1>
+    <p class="muted">The preload script loads a C addon and a C library, and gives their functions to the page.</p>
+    <div class="inputs">
+      <input id="a" type="number" value="20">
+      <span>+</span>
+      <input id="b" type="number" value="22">
+    </div>
+    <dl>
+      <dt>Node-API <code>add(a, b)</code></dt><dd id="napi"></dd>
+      <dt>FFI <code>add(a, b)</code></dt><dd id="ffi"></dd>
+      <dt>FFI <code>apply(double, a)</code></dt><dd id="callback"></dd>
+    </dl>
+  </main>
+  <script type="module" src="./page.js"></script>
+</body>
+</html>

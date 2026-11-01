@@ -1,6 +1,15 @@
 {
-  "private": true,
-  "type": "module",
-  "features": ["webgpu"],
-  "dependencies": { "three": "0.186.1" }
+  "name": "three",
+  "productName": "Three",
+  "main": "main.ts",
+  "features": [
+    "webgpu"
+  ],
+  "dependencies": {
+    "three": "0.186.1"
+  },
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  }
 }

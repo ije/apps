@@ -1,0 +1,11 @@
+body { margin: 0; background: #f1f0ec; color: #24211c; font: 15px system-ui, sans-serif; }
+main { padding: 36px; }
+h1 { margin: 12px 0; font-size: 30px; }
+code { font: 13px ui-monospace, monospace; }
+.eyebrow { margin: 0; color: #9a5b1e; font-size: 12px; font-weight: 700; }
+.muted { margin: 0 0 24px; color: #6d675d; }
+.inputs { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+input { width: 96px; padding: 8px 12px; border: 1px solid #d6d1c6; border-radius: 8px; background: white; font: inherit; }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 12px 24px; margin: 0; padding: 20px; border-radius: 12px; background: white; }
+dt { color: #6d675d; }
+dd { margin: 0; font-weight: 700; text-align: right; }

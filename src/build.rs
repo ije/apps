@@ -40,11 +40,8 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: Target) -> Result<(
             parsed.diagnostics
         );
     }
-    let public = entry
-        .parent()
-        .context("Missing project directory")?
-        .join("public");
-    let (bytes, _) = write_bundle(out, &files, runtime, &public, true, target)?;
+    let root = entry.parent().context("Missing project directory")?;
+    let (bytes, _) = write_bundle(out, &files, runtime, root, true, target)?;
     println!(
         "apps: built {} bytes in {} ms → {}",
         bytes,
@@ -58,7 +55,7 @@ pub fn write_bundle(
     out: &Path,
     files: &BBTreeMap<String, String>,
     runtime: &Path,
-    public: &Path,
+    root: &Path,
     production: bool,
     target: Target,
 ) -> Result<(usize, PathBuf)> {
@@ -127,22 +124,53 @@ pub fn write_bundle(
         out.display()
     );
     fs::create_dir_all(out.parent().context("Missing output parent")?)?;
-    let public = if public.try_exists()? {
-        let public = public.canonicalize()?;
-        let output = out
-            .parent()
-            .unwrap()
-            .canonicalize()?
-            .join(out.file_name().context("Missing output name")?);
+    let root = root.canonicalize()?;
+    let mut copies = Vec::new();
+    if root.join("public").try_exists()? {
+        copies.push(("public".to_owned(), root.join("public").canonicalize()?, PathBuf::new()));
+    }
+    if let Some(manifest) = root
+        .ancestors()
+        .map(|directory| directory.join("package.json"))
+        .find(|path| path.is_file())
+    {
+        let package: serde_json::Value = serde_json::from_str(&fs::read_to_string(&manifest)?)
+            .with_context(|| format!("Invalid package metadata in {}", manifest.display()))?;
+        for item in package
+            .get("files")
+            .map(|files| files.as_array().context("package.json files must be an array"))
+            .transpose()?
+            .into_iter()
+            .flatten()
+        {
+            let item = item.as_str().context("package.json files must be strings")?;
+            let source = manifest
+                .parent()
+                .unwrap()
+                .join(item)
+                .canonicalize()
+                .with_context(|| format!("Cannot find {item} of package.json files"))?;
+            let relative = source
+                .strip_prefix(&root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .with_context(|| format!("{item} of package.json files must be inside the app folder"))?
+                .to_owned();
+            copies.push((item.to_owned(), source, relative));
+        }
+    }
+    let output = out
+        .parent()
+        .unwrap()
+        .canonicalize()?
+        .join(out.file_name().context("Missing output name")?);
+    for (name, source, _) in &copies {
         ensure!(
-            !output.starts_with(&public),
-            "Output directory must be outside public: {}",
+            !output.starts_with(source),
+            "Output directory must be outside {name}: {}",
             out.display()
         );
-        Some(public)
-    } else {
-        None
-    };
+    }
     let stage = tempfile::Builder::new()
         .prefix(".apps-build-")
         .tempdir_in(out.parent().unwrap())?;
@@ -250,61 +278,58 @@ pub fn write_bundle(
         ensure!(!destination.exists(), "{name} conflicts with a build file");
         bytes += fs::copy(source, destination)? as usize;
     }
-    if let Some(public) = public {
-        let mut directories = vec![public.clone()];
-        while let Some(directory) = directories.pop() {
-            for entry in fs::read_dir(&directory)? {
-                let entry = entry?;
-                let source = entry.path();
-                let relative = source.strip_prefix(&public)?;
-                let destination = assets.join(relative);
-                let kind = entry.file_type()?;
-                ensure!(
-                    kind.is_file() || kind.is_dir(),
-                    "Public assets must be regular files or directories: {}",
-                    source.display()
-                );
-                ensure!(
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| !name.contains('\\')),
-                    "Public asset names must be UTF-8 without backslashes: {}",
-                    source.display()
-                );
-                ensure!(
-                    !files.contains_key(relative.to_string_lossy().as_ref())
-                        && !(target.platform == "windows"
-                            && relative.to_str().is_some_and(|name| {
-                                name.eq_ignore_ascii_case(library_name)
-                                    || name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
-                                    || webgpu
-                                        .is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
-                                    || media.iter().any(|media| name.eq_ignore_ascii_case(media))
-                            }))
-                        && relative != Path::new(&executable_name)
-                        && !matches!(
-                            relative.to_str(),
-                            Some(
-                                "app.h2o"
-                                    | "native.json"
-                                    | "assets.json"
-                                    | "package.json"
-                                    | ".apps-build"
-                            )
+    for (_, source, relative) in copies {
+        let mut entries = vec![(source, relative)];
+        while let Some((source, relative)) = entries.pop() {
+            let destination = assets.join(&relative);
+            let kind = fs::symlink_metadata(&source)?.file_type();
+            ensure!(
+                kind.is_file() || kind.is_dir(),
+                "App files must be regular files or directories: {}",
+                source.display()
+            );
+            ensure!(
+                relative
+                    .file_name()
+                    .is_none_or(|name| name.to_str().is_some_and(|name| !name.contains('\\'))),
+                "App file names must be UTF-8 without backslashes: {}",
+                source.display()
+            );
+            ensure!(
+                !files.contains_key(relative.to_string_lossy().as_ref())
+                    && !(target.platform == "windows"
+                        && relative.to_str().is_some_and(|name| {
+                            name.eq_ignore_ascii_case(library_name)
+                                || name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
+                                || webgpu.is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
+                                || media.iter().any(|media| name.eq_ignore_ascii_case(media))
+                        }))
+                    && relative != Path::new(&executable_name)
+                    && !matches!(
+                        relative.to_str(),
+                        Some(
+                            "app.h2o"
+                                | "native.json"
+                                | "assets.json"
+                                | "package.json"
+                                | ".apps-build"
                         )
-                        && (!destination.try_exists()? || (kind.is_dir() && destination.is_dir())),
-                    "Public asset conflicts with a build file: {}",
-                    relative.display()
-                );
-                if kind.is_dir() {
-                    fs::create_dir_all(&destination)?;
-                    directories.push(source);
-                } else {
-                    bytes += fs::copy(&source, &destination)
-                        .with_context(|| format!("Cannot copy public asset {}", source.display()))?
-                        as usize;
+                    )
+                    && (!destination.try_exists()? || (kind.is_dir() && destination.is_dir())),
+                "App file conflicts with a build file: {}",
+                relative.display()
+            );
+            if kind.is_dir() {
+                fs::create_dir_all(&destination)?;
+                for entry in fs::read_dir(&source)? {
+                    let entry = entry?;
+                    entries.push((entry.path(), relative.join(entry.file_name())));
                 }
+            } else {
+                fs::create_dir_all(destination.parent().unwrap())?;
+                bytes += fs::copy(&source, &destination)
+                    .with_context(|| format!("Cannot copy {}", source.display()))?
+                    as usize;
             }
         }
     }
@@ -414,7 +439,7 @@ mod tests {
                     &out,
                     &files,
                     &runtime,
-                    &dir.path().join("public"),
+                    dir.path(),
                     production,
                     Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
@@ -568,7 +593,7 @@ mod tests {
                     &out,
                     &files,
                     &runtime,
-                    &dir.path().join("public"),
+                    dir.path(),
                     production,
                     Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
@@ -606,7 +631,7 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            write_bundle(&out, &files, &runtime, &dir.path().join("public"), true, target)
+            write_bundle(&out, &files, &runtime, dir.path(), true, target)
         };
         let error = build(r#"["video"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
@@ -678,7 +703,7 @@ mod tests {
                 &out,
                 &files,
                 &runtime,
-                &dir.path().join("public"),
+                dir.path(),
                 true,
                 target,
             )
@@ -723,7 +748,7 @@ mod tests {
             &out,
             &files,
             &runtime,
-            &public,
+            dir.path(),
             false,
             Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
@@ -737,7 +762,7 @@ mod tests {
             &out,
             &files,
             &runtime,
-            &public,
+            dir.path(),
             true,
             Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
@@ -751,7 +776,7 @@ mod tests {
             &out,
             &files,
             &runtime,
-            &public,
+            dir.path(),
             false,
             Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
@@ -761,11 +786,21 @@ mod tests {
     }
 
     #[test]
-    fn public_assets_copy_unchanged_and_refresh_on_rebuild() {
+    fn public_and_package_files_copy_unchanged_and_refresh_on_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let public = dir.path().join("public");
         fs::create_dir_all(public.join("nested/empty")).unwrap();
         fs::write(public.join("nested/data.bin"), [0, 255, 128]).unwrap();
+        fs::create_dir_all(dir.path().join("lib")).unwrap();
+        fs::create_dir_all(dir.path().join("data/deep")).unwrap();
+        fs::write(dir.path().join("lib/math.bin"), [1, 2]).unwrap();
+        fs::write(dir.path().join("lib/skipped.bin"), [3]).unwrap();
+        fs::write(dir.path().join("data/deep/x.txt"), "x").unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"files":["./lib/math.bin","data"]}"#,
+        )
+        .unwrap();
         fs::write(
             public.join("static.js"),
             "throw new Error('static file executed')",
@@ -786,7 +821,7 @@ mod tests {
                 &out,
                 &files,
                 &runtime,
-                &public,
+                dir.path(),
                 production,
                 Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
@@ -796,6 +831,9 @@ mod tests {
                 [0, 255, 128]
             );
             assert!(assets.join("nested/empty").is_dir());
+            assert_eq!(fs::read(assets.join("lib/math.bin")).unwrap(), [1, 2]);
+            assert!(!assets.join("lib/skipped.bin").exists());
+            assert_eq!(fs::read(assets.join("data/deep/x.txt")).unwrap(), b"x");
             assert_eq!(fs::read(assets.join("message.txt")).unwrap(), b"first");
             assert_eq!(
                 fs::read(assets.join("static.js")).unwrap(),
@@ -814,7 +852,7 @@ mod tests {
                 &out,
                 &files,
                 &runtime,
-                &public,
+                dir.path(),
                 production,
                 Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
@@ -838,7 +876,7 @@ mod tests {
                 &out,
                 &files,
                 &runtime,
-                &public,
+                dir.path(),
                 production,
                 Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
@@ -857,7 +895,7 @@ mod tests {
                     &out,
                     &files,
                     &runtime,
-                    &public,
+                    dir.path(),
                     production,
                     Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
@@ -883,7 +921,7 @@ mod tests {
                     &out,
                     &files,
                     &runtime,
-                    &public,
+                    dir.path(),
                     production,
                     Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
@@ -896,7 +934,7 @@ mod tests {
             &public.join("dist"),
             &files,
             &runtime,
-            &public,
+            dir.path(),
             true,
             Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )

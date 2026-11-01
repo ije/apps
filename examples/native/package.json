@@ -1,0 +1,14 @@
+{
+  "name": "native",
+  "productName": "Native",
+  "private": true,
+  "main": "main.js",
+  "files": [
+    "./build/Release/math.dylib"
+  ],
+  "scripts": {
+    "dev": "apps run --watch",
+    "build:app": "apps build",
+    "build:native": "node build.mjs"
+  }
+}

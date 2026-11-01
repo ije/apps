@@ -2,13 +2,13 @@
  
 A tiny(small bundle), high performance, low memory usage and memory-safe electron alternative with compatible API design.
 
-- `apps run [entry]`: Compile and run the app in memory. Defaults to `main.ts`, then `main.js`.
+- `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps run --watch` / `-W`: Restart when the entry or its imports change. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.
 - `apps run --enable-devtools-mcp [--devtools-mcp-port <port>]`: Serve devtools to agents on `127.0.0.1`. The default port is `19876`, and `0` picks a free port. It is off by default.
 - `apps run main.js a b` or `apps run main.js -- --flag`: Pass arguments to the app. `process.argv` is `[execPath, entry, ...arguments]`.
 - `apps skill`: Print the agent skill that explains the devtools server.
-- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>]`: Create a production app with Bun's JavaScriptCore. Defaults to `main.ts`, then `main.js`.
+- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>]`: Create a production app with Bun's JavaScriptCore. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 
 The devtools server gives agents screenshots, DOM, JavaScript evaluation, console, mouse and keyboard input, memory, CPU and frame profiles, and a breakpoint debugger that uses source maps.
 Agents call the tools with plain HTTP (`curl -s http://127.0.0.1:<port>/` lists them), or connect an MCP client to `http://127.0.0.1:<port>/mcp`.
@@ -16,6 +16,25 @@ To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.clau
 
 `apps run` keeps source maps in memory and reads assets and native addons from their original paths. It does not create `.apps/`.
 `apps build` writes to `dist/` by default and does not generate source maps.
+It packs imported `.node` addons into the app bundle and writes each one to the user's cache folder the first time it loads.
+It copies the contents of `public/` into the app folder, and the files and folders in `files` of `package.json` at their path in the app, so `join(import.meta.dirname, './lib/math.dylib')` finds the same file in `apps run` and built apps:
+
+```json
+{
+  "files": ["./lib/math.dylib"]
+}
+```
+
+`imports` in the app's `package.json` works like Node's [subpath imports](https://nodejs.org/api/packages.html#subpath-imports). Keys without `#` also map bare specifiers in every module, dependencies included, like an import map. Use it to replace a package that a dependency imports but the app doesn't need:
+
+```json
+{
+  "imports": {
+    "shiki": "./shiki.ts",
+    "shiki/*": "./shiki.ts"
+  }
+}
+```
 
 WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by default. Turn them on with `features` in `package.json`:
 

@@ -28,4 +28,5 @@ apps build examples/diffs/main.ts
 
 Edit `oldFile` and `newFile` in `page.ts` to compare different source text.
 The example preloads both themes and sets `preferredHighlighter: 'highlights'` on `FileDiff`.
+Shiki is not used, so `imports` in `package.json` maps `shiki` and `@shikijs/*` to `shiki.ts`, a stub that throws when called. This makes `app.h2o` 1.6 MB instead of 11.8 MB.
 The native renderer uses the library’s original CSS.

@@ -149,8 +149,18 @@ pub fn disabled_features(source: Option<&str>) -> Result<u32> {
 }
 
 pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
+    #[derive(Serialize)]
+    struct Packed<'a> {
+        files: Vec<(&'a str, &'a [u8])>,
+        #[serde(with = "map")]
+        pages: BBTreeMap<String, Document>,
+    }
     ensure!(files.contains_key("app.js"), "Missing app.js");
-    let mut bundle = Bundle::default();
+    let mut owned = Vec::new();
+    let mut bundle = Packed {
+        files: Vec::new(),
+        pages: BBTreeMap::new(),
+    };
     for (name, source) in files {
         if name.ends_with(".html") {
             let mut doc = Document::parse(source);
@@ -169,23 +179,37 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
             }
             bundle.pages.insert(name.clone(), doc);
         } else if name == "native.json" {
-            bundle.files.insert(
-                name.clone(),
-                copy_native(path.parent().context("Missing bundle directory")?, source)?,
-            );
+            let paths: std::collections::BTreeMap<String, std::path::PathBuf> =
+                serde_json::from_str(source)?;
+            let mut output = std::collections::BTreeMap::new();
+            for (name, source) in paths {
+                let relative = format!("node_modules/{name}");
+                validate_native_path(&relative)?;
+                owned.push((
+                    relative.clone(),
+                    fs::read(&source)
+                        .with_context(|| format!("Cannot read native addon {}", source.display()))?,
+                ));
+                output.insert(name, relative);
+            }
+            owned.push((name.clone(), serde_json::to_vec(&output)?));
         } else if name == "assets.json" {
-            bundle.files.insert(
+            owned.push((
                 name.clone(),
-                copy_assets(path.parent().context("Missing bundle directory")?, source)?,
-            );
+                copy_assets(path.parent().context("Missing bundle directory")?, source)?
+                    .into_bytes(),
+            ));
         } else {
             ensure!(
                 name.ends_with(".js") || name == "package.json",
                 "Unsupported bundle file: {name}"
             );
-            bundle.files.insert(name.clone(), source.clone());
+            bundle.files.push((name.as_str(), source.as_bytes()));
         }
     }
+    bundle
+        .files
+        .extend(owned.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
     // WARNING: running apps map app.h2o, so a new bundle replaces the file instead of rewriting it.
@@ -247,7 +271,8 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             ..Bundle::default()
         };
         for (name, source) in mapped.files {
-            let duplicate = if name.starts_with("script-") {
+            // WARNING: packed addons stay mapped next to the script chunks, keyed by their node_modules path.
+            let duplicate = if name.starts_with("script-") || name.ends_with(".node") {
                 bundle
                     .scripts
                     .insert(name, bytes.slice_ref(source))
@@ -318,7 +343,9 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             let relative = format!("node_modules/{name}");
             validate_native_path(&relative)?;
             ensure!(*path == Path::new(&relative), "Invalid native addon path");
-            *path = directory.join(relative);
+            if !bundle.scripts.contains_key(&relative) {
+                *path = directory.join(relative);
+            }
         }
         *source = serde_json::to_string(&paths)?;
     }

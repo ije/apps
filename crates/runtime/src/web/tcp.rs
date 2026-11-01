@@ -164,6 +164,7 @@ struct Server {
     events: mpsc::Receiver<Accepted>,
     listener: Arc<Mutex<Option<Listener>>>,
     task: JoinHandle<()>,
+    _port: Option<crate::web::Listening>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -369,6 +370,9 @@ impl State {
                         events,
                         listener,
                         task,
+                        _port: address["port"]
+                            .as_u64()
+                            .map(|port| crate::web::Listening::new(port as u16)),
                     },
                 );
                 Ok(json!({"id":self.next_id,"address":address}))

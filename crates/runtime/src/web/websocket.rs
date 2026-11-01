@@ -205,9 +205,10 @@ impl State {
                             .collect();
                             ensure!(
                                 !addresses.is_empty()
-                                    && !addresses
-                                        .iter()
-                                        .any(|address| crate::web::private_address(address.ip())),
+                                    && (crate::web::own_server(&url)
+                                        || !addresses.iter().any(|address| {
+                                            crate::web::private_address(address.ip())
+                                        })),
                                 "Pages cannot access private networks"
                             );
                             let stream =

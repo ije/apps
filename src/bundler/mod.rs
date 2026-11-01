@@ -52,11 +52,28 @@ struct Shared {
     cache: Option<Rc<Cache>>,
     /// Features that package.json disables, as bits by `apps_runtime::bundle::FEATURES` index.
     disabled: u32,
+    aliases: Option<(PathBuf, Vec<String>)>,
 }
 
 impl Shared {
     fn enabled(&self, feature: &str) -> bool {
         self.disabled & apps_runtime::bundle::feature_bit(feature) == 0
+    }
+
+    // WARNING: unlike Node, `imports` keys without `#` in the app's package.json map bare specifiers in every module,
+    // dependencies included, like an import map.
+    fn aliased(&self, specifier: &str) -> bool {
+        !specifier.starts_with(['.', '/', '#'])
+            && self.aliases.as_ref().is_some_and(|(_, keys)| {
+                keys.iter().any(|key| match key.split_once('*') {
+                    Some((prefix, suffix)) => {
+                        specifier.len() >= prefix.len() + suffix.len()
+                            && specifier.starts_with(prefix)
+                            && specifier.ends_with(suffix)
+                    }
+                    None => key == specifier,
+                })
+            })
     }
 }
 
@@ -1592,8 +1609,11 @@ impl Builder {
             }
             return Ok((path, None));
         }
-        let imports = specifier.starts_with('#');
-        let (directory, key) = if imports {
+        let alias = self.shared.aliased(specifier);
+        let imports = alias || specifier.starts_with('#');
+        let (directory, key) = if let Some((directory, _)) = self.shared.aliases.as_ref().filter(|_| alias) {
+            (directory.canonicalize()?, specifier.to_owned())
+        } else if imports {
             (
                 base.ancestors()
                     .find(|directory| directory.join("package.json").is_file())
@@ -1650,7 +1670,7 @@ impl Builder {
             let mut replacement = None;
             let selected = if let Some(map) = exports
                 .as_object()
-                .filter(|map| map.keys().any(|k| k.starts_with(['.', '#'])))
+                .filter(|map| imports || map.keys().any(|k| k.starts_with(['.', '#'])))
             {
                 if let Some(value) = map.get(&key) {
                     value
@@ -1707,6 +1727,10 @@ impl Builder {
                 value.to_owned()
             };
             if imports && !value.starts_with(['.', '/', '#']) {
+                ensure!(
+                    !self.shared.aliased(&value),
+                    "{specifier} maps to {value}, which package.json imports maps again"
+                );
                 return self.locate(&directory, &value, require);
             }
             ensure!(value.starts_with("./"), "Package export must start with ./");
@@ -2316,14 +2340,28 @@ pub fn compile(
 ) -> Result<BBTreeMap<String, String>> {
     let root = entry.parent().context("Missing entry directory")?;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
-    let package = root
+    let manifest = root
         .ancestors()
         .map(|directory| directory.join("package.json"))
-        .find(|path| path.is_file())
-        .map(fs::read_to_string)
-        .transpose()?;
+        .find(|path| path.is_file());
+    let package = manifest.as_ref().map(fs::read_to_string).transpose()?;
+    let aliases = package
+        .as_deref()
+        .and_then(|source| serde_json::from_str::<Value>(source).ok())
+        .and_then(|package| {
+            let keys: Vec<_> = package
+                .get("imports")?
+                .as_object()?
+                .keys()
+                .filter(|key| !key.starts_with('#'))
+                .cloned()
+                .collect();
+            Some((manifest?.parent()?.to_owned(), keys))
+        })
+        .filter(|(_, keys)| !keys.is_empty());
     let shared = Rc::new(Shared {
         disabled: apps_runtime::bundle::disabled_features(package.as_deref())?,
+        aliases,
         root,
         cache,
         ..Shared::default()

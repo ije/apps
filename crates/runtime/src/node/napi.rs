@@ -557,6 +557,45 @@ impl State {
             .get(name)
             .cloned()
             .with_context(|| format!("Native addon is not in the bundle: {name}"))?;
+        let packed = path
+            .to_str()
+            .and_then(|key| host.borrow().scripts.get(key).cloned());
+        // WARNING: dlopen needs a file, so an addon packed in app.h2o is written to the user's cache folder, named by
+        // its name and content so copies at other paths stay separate modules, and rewritten only when the file differs.
+        let path = match packed {
+            Some(bytes) => {
+                let home = std::path::PathBuf::from(
+                    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                        .unwrap_or_default(),
+                );
+                let folder = if cfg!(target_os = "macos") {
+                    home.join("Library/Caches")
+                } else if cfg!(windows) {
+                    std::env::var_os("LOCALAPPDATA").map_or(home, Into::into)
+                } else {
+                    std::env::var_os("XDG_CACHE_HOME").map_or_else(|| home.join(".cache"), Into::into)
+                }
+                .join(host.borrow().app_name.as_deref().unwrap_or("apps"));
+                let hash = name.bytes().chain([0]).chain(bytes.iter().copied()).fold(
+                    0xcbf2_9ce4_8422_2325_u64,
+                    |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3),
+                );
+                let file = folder.join(format!("{hash:016x}.node"));
+                if std::fs::read(&file).ok().as_deref() != Some(&bytes[..]) {
+                    let temporary = file.with_extension(format!(
+                        "{}.{:?}.tmp",
+                        std::process::id(),
+                        std::thread::current().id()
+                    ));
+                    std::fs::create_dir_all(&folder)
+                        .and_then(|()| std::fs::write(&temporary, &bytes))
+                        .and_then(|()| std::fs::rename(&temporary, &file))
+                        .with_context(|| format!("Cannot unpack native addon {name}"))?;
+                }
+                file
+            }
+            None => path,
+        };
         let path = path
             .canonicalize()
             .with_context(|| format!("Cannot find native addon {}", path.display()))?;

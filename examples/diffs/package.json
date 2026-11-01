@@ -2,10 +2,15 @@
   "name": "diffs",
   "productName": "Diffs",
   "private": true,
-  "type": "module",
+  "main": "main.ts",
   "scripts": {
     "dev": "apps run --watch",
     "build": "apps build"
+  },
+  "imports": {
+    "shiki": "./shiki.ts",
+    "shiki/*": "./shiki.ts",
+    "@shikijs/*": "./shiki.ts"
   },
   "dependencies": {
     "@pierre/diffs": "1.6.2",

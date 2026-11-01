@@ -1,10 +1,12 @@
-body { margin: 0; background: #edf2ed; color: #172c29; font-size: 16px; }
-main { padding: 40px; }
-.eyebrow { color: #1c705c; font-size: 12px; font-weight: 700; }
-h1 { margin: 16px 0; font-size: 42px; font-weight: 700; }
-.intro { margin: 0 0 24px; color: #5e7069; }
-.count { margin: 0 0 24px; font-size: 28px; font-weight: 700; }
-.actions { display: flex; gap: 12px; }
-button { padding: 12px 20px; border: 0; font: inherit; background: #1c705c; color: white; border-radius: 8px; cursor: pointer; }
-.secondary { background: #d7e3da; color: #172c29; }
-#message { margin: 20px 0 0; color: #5e7069; }
+@import "tailwindcss";
+
+@theme {
+  --color-mint-500: oklch(0.72 0.11 178);
+  --color-ink: #172c29;
+  --color-muted: #5e7069;
+  --color-paper: #edf2ed;
+}
+
+.card {
+  @apply flex flex-col gap-3 rounded-lg bg-white p-6 shadow-md;
+}

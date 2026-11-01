@@ -21,6 +21,7 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 | HTML parsing | Follows the HTML5 tree builder, except misnested formatting tags (`<b><p></b>` keeps `p` in `b`), MathML and framesets |
 | Navigation | Pages can go to bundled `apps:///` pages and local `file:///` files only. Other URLs throw. Use `WebContentsView` or `shell.openExternal()` for websites |
 | `Worker` | Loads bundled, `data:`, `blob:` and local scripts. Remote scripts are rejected |
+| Private networks | `fetch()` and `WebSocket` in pages can't reach loopback, LAN and other private addresses, except loopback ports that the app's own servers listen on |
 | Long scripts | A page script that runs for more than 10 seconds without returning is stopped, so one page cannot freeze the app |
 | Origin private file system | `navigator.storage.getDirectory()` keeps files in memory, so they are lost when the page reloads or the app quits |
 | Forms | A submit that is not canceled sends nothing and does not navigate, so handle `submit` and call `preventDefault()`. `method="dialog"` closes its dialog |

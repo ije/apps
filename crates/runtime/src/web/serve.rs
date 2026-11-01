@@ -39,7 +39,7 @@ struct Server {
     events: mpsc::Receiver<RequestEvent>,
     replies: HashMap<u64, Reply>,
     task: JoinHandle<()>,
-    listener: Arc<Mutex<Option<tokio::net::TcpListener>>>,
+    listener: Arc<Mutex<Option<(tokio::net::TcpListener, crate::web::Listening)>>>,
     stop: watch::Sender<bool>,
     streams: HashMap<u64, (mpsc::Sender<Option<Bytes>>, Arc<AtomicBool>)>,
     sockets: Vec<u64>,
@@ -81,7 +81,10 @@ impl State {
                 let (sender, events) = mpsc::channel(64);
                 let wake = crate::host::Waker::current();
                 // WARNING: `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
-                let listener = Arc::new(Mutex::new(Some(listener)));
+                let listener = Arc::new(Mutex::new(Some((
+                    listener,
+                    crate::web::Listening::new(address.port()),
+                ))));
                 let (stop, stopping) = watch::channel(false);
                 let accepting = listener.clone();
                 let task = network.spawn(async move {
@@ -92,7 +95,7 @@ impl State {
                     loop {
                         let accepted = tokio::select! {
                             accepted = std::future::poll_fn(|cx| match accepting.lock().as_deref() {
-                                Ok(Some(listener)) => listener.poll_accept(cx).map(Some),
+                                Ok(Some((listener, _))) => listener.poll_accept(cx).map(Some),
                                 _ => Poll::Ready(None),
                             }) => accepted,
                             _ = stopped.wait_for(|stop| *stop) => None,

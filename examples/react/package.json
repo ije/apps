@@ -1,12 +1,11 @@
 {
   "name": "react",
-  "productName": "React App",
+  "productName": "React",
   "private": true,
-  "type": "module",
+  "main": "main.ts",
   "scripts": {
     "dev": "apps run --watch",
-    "build": "apps build",
-    "test": "cargo test -p apps react_counter -- --ignored"
+    "build": "apps build"
   },
   "dependencies": {
     "react": "19.3.1",

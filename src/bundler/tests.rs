@@ -2048,7 +2048,7 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             &output,
             &files,
             &entry,
-            &input.join("public"),
+            &input,
             production,
             crate::target::Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
@@ -2071,8 +2071,13 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             "local_app/local/build/own.node",
         ] {
             let path = assets.join("node_modules").join(name);
-            assert!(path.is_file(), "Missing copied addon: {name}");
-            assert_eq!(native[name], path.canonicalize().unwrap());
+            if production {
+                assert!(!path.exists(), "Copied packed addon: {name}");
+                assert!(bundle.scripts.contains_key(&format!("node_modules/{name}")));
+            } else {
+                assert!(path.is_file(), "Missing copied addon: {name}");
+                assert_eq!(native[name], path.canonicalize().unwrap());
+            }
         }
         assert_eq!(
             apps_runtime::desktop::Desktop::from_bundle(bundle)
@@ -2204,6 +2209,62 @@ fn resolves_dotted_files_package_imports_browser_fields_and_type_only_imports() 
         )
         .is_err()
     );
+}
+
+#[test]
+fn app_imports_map_bare_specifiers_in_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "package.json",
+            r##"{"imports":{"heavy":"./fake.js","heavy/*":{"node":"./fake.js","default":"./missing.js"},"swap":"other","#local":"./local.js"}}"##,
+        ),
+        (
+            "app.ts",
+            "import { dep } from 'dep'; import { other } from 'swap'; import { local } from '#local'; globalThis.result = [dep, other, local].join(':');",
+        ),
+        ("fake.js", "export const name = 'fake', core = '!';"),
+        ("local.js", "export const local = 'local';"),
+        (
+            "node_modules/dep/package.json",
+            r#"{"type":"module","main":"index.js"}"#,
+        ),
+        (
+            "node_modules/dep/index.js",
+            "import { name } from 'heavy'; import { core } from 'heavy/core'; export const dep = name + core;",
+        ),
+        (
+            "node_modules/heavy/package.json",
+            r#"{"type":"module","main":"index.js"}"#,
+        ),
+        ("node_modules/heavy/index.js", "export const name = 'real';"),
+        ("node_modules/heavy/core.js", "export const core = '?';"),
+        (
+            "node_modules/other/package.json",
+            r#"{"type":"module","main":"index.js"}"#,
+        ),
+        ("node_modules/other/index.js", "export const other = 'other';"),
+    ] {
+        fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let entry = dir.path().join("app.ts");
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    let engine = apps_runtime::jsc::Engine::new(
+        apps_runtime::jsc::Api::load().unwrap(),
+        Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    engine.bundle(&files, "app.js").unwrap();
+    assert_eq!(engine.eval("result", "test").unwrap(), "fake!:other:local");
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"imports":{"swap":"heavy","heavy":"swap"}}"#,
+    )
+    .unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap_err();
+    assert!(format!("{error:#}").contains("maps again"), "{error:#}");
 }
 
 #[test]

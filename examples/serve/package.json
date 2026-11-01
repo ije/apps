@@ -1,0 +1,10 @@
+{
+  "name": "serve",
+  "productName": "Serve",
+  "private": true,
+  "main": "main.ts",
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  }
+}

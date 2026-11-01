@@ -1,7 +1,7 @@
 import { app, BrowserWindow } from '@pierre/apps'
 
 function createWindow() {
-  const window = new BrowserWindow({ width: 640, height: 480 })
+  const window = new BrowserWindow({ width: 860, height: 640 })
   window.loadFile(import.meta.resolve('./index.html'))
 }
 

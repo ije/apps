@@ -1091,6 +1091,7 @@ const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
         "normal|ultra-condensed|extra-condensed|condensed|semi-condensed|semi-expanded|expanded|extra-expanded|ultra-expanded|<percentage>",
     ),
     ("font-style", "normal|italic|oblique|*"),
+    ("font-variant", "normal"),
     ("font-variation-settings", "*"),
     ("font-weight", "normal|bold|bolder|lighter|<number>"),
     ("gap", "[normal|<length-percentage>]+"),

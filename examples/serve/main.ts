@@ -18,5 +18,5 @@ export default {
   fetch(req) {
     return new Response('hello world')
   },
-  port: 8080,
+  port: 8089,
 }
