@@ -58,6 +58,8 @@ pub(crate) struct ViewData {
     reflowing: Cell<bool>,
     /// Boxes whose animations wait until they come into view, with their clipping ancestors.
     parked: RefCell<Vec<(usize, Clips)>>,
+    /// The caret drawn last: its node, offset and text length, when it moved, and its blink timer by phase.
+    caret: RefCell<Option<input::Blink>>,
 }
 
 /// Clipping ancestors with their clipped axes, see [`clips`].
@@ -191,6 +193,7 @@ impl WebView {
             window,
             reflowing: Cell::new(false),
             parked: RefCell::default(),
+            caret: RefCell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);

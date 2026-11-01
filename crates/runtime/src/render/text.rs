@@ -949,18 +949,19 @@ impl renderer::Element for InlineText {
                 let start = range.start + crate::dom::utf16_index(text, *start);
                 let end = range.start + crate::dom::utf16_index(text, *end);
                 if caret {
-                    let ink = styles.values[*id]
-                        .get(Prop::CARET_COLOR)
-                        .filter(|value| !matches!(*value, "auto" | "currentColor"))
-                        .or_else(|| styles.values[*id].get(Prop::COLOR))
-                        .and_then(style::color)
-                        .map(|(color, alpha)| color << 8 | alpha as u32)
-                        .unwrap_or(0x000000ff);
+                    // `auto` and `currentcolor` use the text color.
+                    let ink = [Prop::CARET_COLOR, Prop::COLOR]
+                        .into_iter()
+                        .find_map(|prop| style::color(styles.values[*id].get(prop)?))
+                        .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
                     if let Some(position) = text_position(layout, &self.data.text, rows, start) {
-                        window.paint_quad(renderer::fill(
+                        super::input::paint_caret(
+                            view,
+                            [*id, start, range.len()],
                             Bounds::new(position, size(px(1.), layout.line_height())),
                             rgba(ink),
-                        ));
+                            window,
+                        );
                     }
                 } else if start != end {
                     let (color, background) =

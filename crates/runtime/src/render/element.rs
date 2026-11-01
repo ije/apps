@@ -825,9 +825,9 @@ pub(super) fn element(
             .and_then(style::color)
             .map(|(c, a)| rgba((c << 8) | a as u32))
             .unwrap_or(renderer::black());
+        // `auto` and `currentcolor` use the text color.
         let caret_color = style
             .get(Prop::CARET_COLOR)
-            .filter(|value| !matches!(*value, "auto" | "currentColor"))
             .and_then(style::color)
             .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
             .unwrap_or(text_color);

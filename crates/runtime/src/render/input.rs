@@ -6,10 +6,47 @@ use renderer::{
     App, Bounds, FileDropEvent, Pixels, PlatformInput, Point, Utf16Selection, Window, point, px,
     size,
 };
-use std::{ops::Range, rc::Rc};
+use std::{
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 /// A field's selection while focused, and the length of the text it drew.
 pub(super) type Caret = (Option<[usize; 2]>, usize);
+
+/// A caret's node, offset and text length, when it moved, and the timer of its next blink by phase.
+pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
+
+/// Paints the caret of a collapsed selection. Like browsers, it shows for 500 ms after it moves,
+/// then blinks every 500 ms. Inactive windows and `caret-color: transparent` show no caret.
+pub(super) fn paint_caret(
+    view: &ViewData,
+    key: [usize; 3],
+    bounds: Bounds<Pixels>,
+    color: renderer::Rgba,
+    window: &mut Window,
+) {
+    const BLINK: Duration = Duration::from_millis(500);
+    if color.a == 0. || !window.is_window_active() {
+        return;
+    }
+    let now = Instant::now();
+    let mut caret = view.caret.borrow_mut();
+    if caret.as_ref().is_some_and(|(old, ..)| *old != key) {
+        *caret = None;
+    }
+    let (_, since, wake) = caret.get_or_insert((key, now, None));
+    // WARNING: a timer can fire just before its time, so the phase rounds up within 8 ms.
+    let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
+    if wake.as_ref().is_none_or(|(old, _)| *old != phase) {
+        let due = *since + BLINK * (phase + 1);
+        *wake = Some((phase, window.timer(due - now, |window, _| window.refresh())));
+    }
+    if phase.is_multiple_of(2) {
+        window.paint_quad(renderer::fill(bounds, color));
+    }
+}
 
 /// The text of an `input` or `textarea`: its value or placeholder, the selection and the caret. It
 /// scrolls its box to keep a moved caret in view, and records its layout for hit tests and IME.
@@ -170,10 +207,13 @@ impl renderer::Element for FieldText {
             && start == end
             && let Some(at) = layout.position_for_index(caret)
         {
-            window.paint_quad(renderer::fill(
+            paint_caret(
+                &self.view,
+                [self.id, caret, text.len()],
                 Bounds::new(at, size(px(1.), line_height)),
                 self.caret,
-            ));
+                window,
+            );
         }
     }
 }
