@@ -125,9 +125,9 @@ pub(super) struct DomBox {
     pub(super) margin: [f32; 4],
     /// The size of the grid cell the box fills, before layout snaps it to pixels.
     pub(super) cell: Option<[f32; 2]>,
-    /// The grid that aligns the box's baseline. Prepaint records the box's baselines and draws the frame again
-    /// when they change.
-    pub(super) grid: Option<usize>,
+    /// The grid that uses the box's baselines, and whether the box aligns them. Prepaint records the
+    /// baselines, and draws the frame again when the baselines of an aligned box change.
+    pub(super) grid: Option<(usize, bool)>,
     /// For a table, its rows with their cells, then its row groups with their rows. They have no box of their
     /// own, so their bounds are the union of their members'.
     pub(super) parts: Rc<[(usize, Vec<usize>)]>,
@@ -357,13 +357,17 @@ impl renderer::Element for DomBox {
                         f32::from(bounds.size.height) - self.sides[1],
                     ],
                 );
-                if let Some(grid) = self.grid {
+                if let Some((grid, aligned)) = self.grid {
                     let baselines = window
                         .layout_baselines(*id)
                         .map(|value| value.map(f32::from));
+                    // WARNING: the grid's own baseline comes from its first item in the same layout, so only aligned
+                    // items, which the grid places from their last baselines, need another pass.
                     if dom.baselines.insert(self.id, baselines) != Some(baselines) {
                         dom.grids.remove(&grid);
-                        window.redraw();
+                        if aligned {
+                            window.redraw();
+                        }
                     }
                 }
             }

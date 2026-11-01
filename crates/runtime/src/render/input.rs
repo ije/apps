@@ -137,6 +137,7 @@ impl renderer::Element for FieldText {
             })
             .into_iter()
             .collect();
+        let strut = window.text_system().resolve_font(&self.run.font);
         // WARNING: a long field shapes all its text once, but paints only the rows its box shows.
         let mask = window.content_mask().bounds;
         let mut origin = layout.bounds().origin;
@@ -158,6 +159,7 @@ impl renderer::Element for FieldText {
                     &[],
                     text,
                     None,
+                    strut,
                     window,
                 );
             }
@@ -494,16 +496,51 @@ impl renderer::View for WebView {
     fn bounds_for_range(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let state = self.editing()?;
+        // The IME asks right after an edit, before the next frame lays out the new text.
+        super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
         let password = password(&host, self.id, id, &state);
+        // A contenteditable host has no text layout itself, so the range starts in one of its text
+        // nodes: the caret's node when it starts at the caret (a line start is also the end of the
+        // line before), else the first node that reaches it.
+        let caret = state["node"]
+            .as_u64()
+            .map(|node| node as usize)
+            .filter(|node| {
+                state["end"].as_u64() == Some(range.start as u64)
+                    && dom.text_layouts.contains_key(node)
+            });
+        let (node, range) = if dom.text_layouts.contains_key(&id) {
+            (id, range)
+        } else if let Some(node) = caret {
+            let at = state["offset"].as_u64()? as usize;
+            (node, at..at + range.len())
+        } else {
+            let nodes = &host.pages.get(&self.id)?.doc.nodes;
+            let (mut offset, mut pending, mut found) = (0, vec![id], None);
+            while let Some(node) = pending.pop() {
+                let current = nodes.get(node)?;
+                if current.tag != "#text" {
+                    pending.extend(current.children.iter().rev());
+                    continue;
+                }
+                let length = current.text.encode_utf16().count();
+                if range.start <= offset + length {
+                    found = Some((node, range.start - offset..range.end - offset));
+                    break;
+                }
+                offset += length;
+            }
+            found.unwrap_or((id, range))
+        };
         // A field's text has a layout, so the range gets its own rectangle, where the IME shows its candidates.
-        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&id) {
+        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&node) {
             let content = &text[span.clone()];
             let [start, end] = [range.start, range.end].map(|index| {
                 let index = password.map_or(index, |value| crate::dom::bullets(value, index));

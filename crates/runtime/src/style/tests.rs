@@ -481,6 +481,10 @@ fn editor_media_caret_and_selection_styles() {
     assert_eq!(&narrow.values[id]["caret-color"], "red");
     assert_eq!(&wide.values[id]["caret-color"], "#0000");
     assert_eq!(&wide.selections[&id]["background-color"], "#0000");
+    assert_eq!(
+        selection_colors(&wide.values[id], wide.selections.get(&id)),
+        (None, 0)
+    );
     let div = doc.nodes[id]
         .parent
         .and_then(|parent| doc.nodes[parent].parent)

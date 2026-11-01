@@ -4592,7 +4592,13 @@ pub(crate) fn cascade(
                     );
                 }
             }
+            let colored = values.contains(Prop::COLOR);
             resolve_style(&mut values, parent, &[], &registry);
+            // WARNING: resolve_style gives an element without a color the root `canvastext`, but a
+            // `::selection` without one keeps the text color.
+            if !colored {
+                values.remove(Prop::COLOR);
+            }
             values.retain(|prop, value| {
                 if !painted(prop) {
                     return false;

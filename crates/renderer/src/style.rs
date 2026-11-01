@@ -300,6 +300,9 @@ pub struct Style {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub baseline: Baseline,
+    /// Its parent takes its first baseline from this box, even out of flow, like a grid from its
+    /// first item.
+    pub baseline_source: bool,
     pub background: Option<Rgba>,
     pub border_color: Option<Rgba>,
     pub border_style: BorderStyle,
@@ -337,6 +340,7 @@ impl Default for Style {
             flex_grow: 0.,
             flex_shrink: 1.,
             baseline: Baseline::Auto,
+            baseline_source: false,
             background: None,
             border_color: None,
             border_style: BorderStyle::Solid,

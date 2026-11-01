@@ -723,6 +723,185 @@ fn preload_bridge_survives_minification() {
 }
 
 #[test]
+fn package_preload_exports_cross_isolated_contexts() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r##"{"name":"my_app","preload":"./preload.ts","imports":{"#preload":"./preload.ts"}}"##,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("native.ts"),
+        "import {basename} from 'node:path'; export const native = () => basename('/a/b');",
+    )
+    .unwrap();
+    let entry = source.join("main.ts");
+    fs::write(&entry, "import {app,BrowserWindow} from 'electron';app.whenReady().then(()=>{for(let i=0;i<2;i++)new BrowserWindow().loadFile('./index.html')});").unwrap();
+    fs::write(source.join("index.html"), r#"<script type="preload">import {foo} from '../preload';if(foo()!=='24.0.0')throw Error('manual preload');</script><script type="module" src="./page.ts"></script><script type="module">import {foo} from '../preload';if(foo()!=='24.0.0')throw Error('second script');</script>"#).unwrap();
+    fs::write(source.join("exports.ts"), "export * from '../preload.ts';").unwrap();
+    fs::write(source.join("page.ts"), r##"
+        import defaults, {foo, next, callback, config, fail, later} from '../preload';
+        import * as api from '#preload';
+        import {native} from './exports';
+        if (foo() !== '24.0.0' || native() !== 'b' || defaults.answer() !== 42) throw Error('exports');
+        if (typeof process !== 'undefined' || typeof __apps !== 'undefined' || typeof privatePreload !== 'undefined') throw Error('isolation');
+        if (next() !== 1 || api.next() !== 2) throw Error('per-page state');
+        if (callback(value => value + 1) !== 42 || await later() !== 43) throw Error('callbacks');
+        config.nested.value = 0;
+        if (defaults.value() !== 7) throw Error('copy');
+        let caught = false;
+        try { fail(); } catch (error) { caught = error instanceof TypeError && error.message === 'preload error'; }
+        if (!caught) throw Error('errors');
+        const dynamic = await import('../preload.ts');
+        if (dynamic !== api || dynamic.foo !== foo || Object.keys(api).includes('module.exports')) throw Error('namespace');
+    "##).unwrap();
+    for asynchronous in [false, true] {
+        fs::write(
+            dir.path().join("preload.ts"),
+            format!(
+                r#"
+            export * from './native';
+            globalThis.privatePreload = (globalThis.privatePreload ?? 0) + 1;
+            if (globalThis.privatePreload !== 1) throw Error('duplicate preload');
+            {}
+            let count = 0;
+            export function foo() {{ return process.versions.node; }}
+            export const next = () => ++count;
+            export const callback = fn => fn(41);
+            export const config = {{ nested: {{ value: 7 }} }};
+            export const fail = () => {{ throw new TypeError('preload error'); }};
+            export async function later() {{ return 43; }}
+            export default {{ answer: () => 42, value: () => config.nested.value }};
+        "#,
+                if asynchronous {
+                    "await new Promise(resolve => setTimeout(resolve, 1));"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .unwrap();
+        for production in [false, true] {
+            let watched = Rc::default();
+            let files = compile(&entry, Realm::Main, None, watched, production, None).unwrap();
+            assert_eq!(
+                apps_runtime::desktop::Desktop::new(&files)
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+                0,
+                "production={production}, asynchronous={asynchronous}"
+            );
+        }
+    }
+}
+
+#[test]
+fn package_preload_validates_metadata_and_runs_without_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.ts");
+    fs::write(&entry, "import {app,BrowserWindow} from 'electron';app.whenReady().then(()=>new BrowserWindow().loadFile('./index.html'));").unwrap();
+    fs::write(
+        dir.path().join("index.html"),
+        "<script>if(document.body.getAttribute('data-preload')!=='yes')throw Error('missing preload');</script>",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("preload.ts"),
+        "document.body.setAttribute('data-preload','yes');export function foo(){return process.versions.node}",
+    )
+    .unwrap();
+    for value in [
+        json!(null),
+        json!(1),
+        json!([]),
+        json!(""),
+        json!("./missing.ts"),
+    ] {
+        fs::write(
+            dir.path().join("package.json"),
+            json!({"preload":value}).to_string(),
+        )
+        .unwrap();
+        let error = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap_err();
+        assert!(
+            error.to_string().contains("package.json preload"),
+            "{error:#}"
+        );
+    }
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"preload":"./preload.ts"}"#,
+    )
+    .unwrap();
+    for production in [false, true] {
+        let watched = Rc::new(RefCell::new(BTreeSet::new()));
+        let files = compile(&entry, Realm::Main, None, watched.clone(), production, None).unwrap();
+        assert!(
+            watched
+                .borrow()
+                .contains(&dir.path().join("preload.ts").canonicalize().unwrap())
+        );
+        assert_eq!(
+            apps_runtime::desktop::Desktop::new(&files)
+                .unwrap()
+                .check()
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn package_preload_dynamic_imports_follow_watch_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.ts");
+    fs::write(&entry, "import {app,BrowserWindow} from 'electron';app.whenReady().then(()=>new BrowserWindow().loadFile('./index.html'));").unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"preload":"./preload.ts"}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("index.html"), r#"<script type="module">const api=await import('./preload');if(api.foo()!==document.body.getAttribute('data-version'))throw Error('stale preload');if(typeof process!=='undefined')throw Error('isolation');</script>"#).unwrap();
+    let cache = Rc::new(Cache::default());
+    for version in ["first", "second"] {
+        fs::write(dir.path().join("preload.ts"), format!("const version={};document.body.setAttribute('data-version',version);export const foo=()=>version;", json!(version))).unwrap();
+        for production in [false, true] {
+            let files = compile(
+                &entry,
+                Realm::Main,
+                None,
+                Rc::default(),
+                production,
+                (!production).then(|| cache.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                apps_runtime::desktop::Desktop::new(&files)
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    fs::write(dir.path().join("index.html"), r#"<script type="module">import {missing} from './preload';globalThis.missing=missing;</script>"#).unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        let error = apps_runtime::desktop::Desktop::new(&files)
+            .unwrap()
+            .check()
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Missing export missing"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn jsx_tsx_and_commonjs_packages() {
     for production in [false, true] {
         let dir = tempfile::tempdir().unwrap();

@@ -36,6 +36,33 @@ It copies the contents of `public/` into the app folder, and the files and folde
 }
 ```
 
+Set `preload` in `package.json` to expose module exports to page scripts:
+
+```json
+{ "name": "my_app", "preload": "./preload.ts" }
+```
+
+```ts
+// preload.ts
+export function foo() {
+  return process.versions.node
+}
+```
+
+```ts
+// page.ts
+import { foo } from './preload'
+
+console.log(foo())
+```
+
+The preload path is relative to `package.json`. Each bundled page runs this module once in its isolated preload context with Node APIs.
+Page imports of this file receive its exports through the context bridge. Functions run in the preload context. Other values are copies.
+
+Named exports, default exports, callbacks, promises, and literal dynamic imports work. Imports wait for asynchronous preload initialization.
+The page has no direct access to Node APIs or private preload variables. Export only the API that the page needs.
+`<script type="preload">` scripts and `contextBridge.exposeInMainWorld()` also work.
+
 WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by default. Turn them on with `features` in `package.json`:
 
 ```json

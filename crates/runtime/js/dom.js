@@ -1759,7 +1759,7 @@
     }
   };
 
-  globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), marked: composing } : null;
+  globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
   const blockOf = (host, node) => { let block = node.nodeType === 3 ? node.parentNode : node; while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode; return block; };
   // WARNING: like Chromium, Enter in a contenteditable splits the paragraph into a new `div` (or the block's own tag), and an empty line holds a `br`.
   const paragraph = (host, range) => {

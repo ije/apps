@@ -809,14 +809,21 @@ fn dispatch(
         }
         return Ok(result);
     }
-    if op == "bridge.expose" {
+    if matches!(op, "bridge.expose" | "bridge.preload") {
         let Role::Preload(id) = role else {
             bail!("Only preload can expose APIs")
         };
-        let name = values[0].as_str().context("Expected exposed name")?;
+        let (name, value) = if op == "bridge.preload" {
+            ("__appsPreload", &values[0])
+        } else {
+            (
+                values[0].as_str().context("Expected exposed name")?,
+                &values[1],
+            )
+        };
         anyhow::ensure!(
             !matches!(name, "__proto__" | "constructor" | "prototype")
-                && !name.starts_with("__apps"),
+                && (!name.starts_with("__apps") || op == "bridge.preload"),
             "Reserved bridge name"
         );
         host.try_borrow_mut()
@@ -826,7 +833,7 @@ fn dispatch(
             .or_default()
             .insert(
                 name.to_owned(),
-                crate::jsc::payload::Payload::snapshot(values[1].clone()),
+                crate::jsc::payload::Payload::snapshot(value.clone()),
             );
         return Ok(serde_json::Value::Null);
     }

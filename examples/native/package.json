@@ -3,6 +3,7 @@
   "productName": "Native",
   "private": true,
   "main": "main.js",
+  "preload": "./preload.js",
   "files": [
     "./build/Release/math.dylib"
   ],

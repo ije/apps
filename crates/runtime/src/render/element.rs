@@ -3104,18 +3104,6 @@ pub(super) fn element(
             };
         if let Some(grid) = &grid {
             el = el.flex().flex_col();
-            // Layout sees no items in the grid, so an empty first line gives it its baseline.
-            if let Some(baseline) = grid.first_baseline {
-                let baseline = baseline.max(0.);
-                el = el.child(
-                    div()
-                        .w(px(0.))
-                        .h(px(baseline))
-                        .mb(px(-baseline))
-                        .flex_shrink_0()
-                        .baseline(renderer::Baseline::Bottom),
-                );
-            }
             // A shrunk grid stretches; a spacer gives it its max-content width.
             el = match widest {
                 Some(widest) => el.child(div().w(px(widest)).h(px(0.)).flex_shrink_0()),
@@ -3361,6 +3349,21 @@ pub(super) fn element(
             if !culled.is_empty() {
                 el = el.child(cull::anchor(culled.clone(), zone.clone(), view.clone()));
             }
+            // A culled first item gives the grid's baseline from its last layout, as an empty first line.
+            if let Some(baseline) = grid.first_baseline.filter(|_| {
+                grid.first_item
+                    .is_some_and(|item| culled.binary_search_by_key(&item, |&(id, _)| id).is_ok())
+            }) {
+                let baseline = baseline.max(0.);
+                let mut line = div()
+                    .w(px(0.))
+                    .h(px(baseline))
+                    .mb(px(-baseline))
+                    .flex_shrink_0()
+                    .baseline(renderer::Baseline::Bottom);
+                line.style().baseline_source = true;
+                el = el.child(line);
+            }
         }
         macro_rules! place {
             ($element:expr, $child:expr) => {{
@@ -3432,7 +3435,7 @@ pub(super) fn element(
                         .cells
                         .binary_search_by_key(&child, |(id, ..)| *id)
                         .ok()?;
-                    let (_, [column, row, columns, rows], mut bounds, baseline) =
+                    let (item, [column, row, columns, rows], mut bounds, baseline) =
                         *grid.cells.get(index)?;
                     bounds[0] += padding[3];
                     bounds[1] += padding[0];
@@ -3443,6 +3446,7 @@ pub(super) fn element(
                             rows: grid.rows.get(row..row + rows)?.to_vec(),
                             gap: grid.gap,
                             baseline,
+                            first_item: grid.first_item.filter(|&first| first == item),
                             ..Default::default()
                         },
                     ))
@@ -3639,7 +3643,8 @@ pub(super) fn element(
             el.style().justify_content = align;
         }
     }
-    if let Some((bounds, _)) = &slot {
+    if let Some((bounds, grid)) = &slot {
+        el.style().baseline_source = grid.first_item.is_some();
         el = el
             .absolute()
             .left(px(bounds[0]))
@@ -3838,9 +3843,10 @@ pub(super) fn element(
         ],
         margin,
         cell: slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]),
-        grid: node
-            .parent
-            .filter(|_| slot.as_ref().is_some_and(|(_, grid)| grid.baseline)),
+        grid: slot
+            .as_ref()
+            .filter(|(_, grid)| grid.baseline || grid.first_item.is_some())
+            .and_then(|(_, grid)| Some((node.parent?, grid.baseline))),
         shared: (matches!(node.tag.as_str(), "td" | "th")
             && std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
                 .find(|&parent| doc.nodes[parent].tag == "table")

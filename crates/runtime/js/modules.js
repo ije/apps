@@ -91,7 +91,7 @@ const setup = root => {
     const definition = definitionOf(id);
     if (!definition) throw Error('Missing module: ' + id);
     const commonjs = definition.commonjs ? { exports: {} } : null;
-    const module = { namespace: null, commonjs, definition, state: 0, dynamicStars: !!commonjs };
+    const module = { namespace: null, commonjs, definition, state: 0, dynamicStars: !!commonjs || !!definition.preload };
     const exported = () => module.commonjs.exports;
     module.namespace = commonjs ? new Proxy(Object.create(null), {
       get: (_, name) => name === 'default' || name === 'module.exports' ? exported() : exported()?.[name],
@@ -105,7 +105,7 @@ const setup = root => {
   }
   for (const module of fresh) {
     const { definition, namespace } = module, factory = definition.factory;
-    if (module.commonjs) continue;
+    if (module.commonjs || definition.preload) continue;
     if (definition.linked === false) {
       const scope = Object.create(null);
       scope.$appsImport = $appsImport;
@@ -141,6 +141,13 @@ const load = (id, ancestors = new Set()) => {
   if (module.state === 2 && module.commonjs?.filename !== undefined && cache[module.commonjs.filename] !== module.commonjs) module.state = 0;
   if (module.state) return ancestors.has(id) ? module.namespace : module.promise ?? module.namespace;
   module.state = 1;
+  if (module.definition.preload) {
+    const publish = api => { for (const name of Object.keys(api)) Object.defineProperty(module.namespace, name, { enumerable: true, value: api[name] }); Object.preventExtensions(module.namespace); module.state = 2; refreshStars(id); };
+    const result = globalThis.__appsImportPreload();
+    if (result instanceof Promise) module.promise = result.then(publish);
+    else publish(result);
+    return module.promise ?? module.namespace;
+  }
   if (module.commonjs) {
     const { definition } = module, filename = absolute(definition.file);
     const dirname = filename && (globalThis.__apps?.path.dirname(filename) ?? (filename.replace(/[\\/][^\\/]*$/, '') || '/'));

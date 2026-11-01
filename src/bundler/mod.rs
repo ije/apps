@@ -53,6 +53,7 @@ struct Shared {
     /// Features that package.json disables, as bits by `apps_runtime::bundle::FEATURES` index.
     disabled: u32,
     aliases: Option<(PathBuf, Vec<String>)>,
+    preload: Option<PathBuf>,
 }
 
 impl Shared {
@@ -1794,6 +1795,15 @@ impl Builder {
             self.lines.resize(id + 1, None);
             self.modules.resize(id + 1, Value::Null);
         }
+        if self.realm == Realm::Renderer && self.shared.preload.as_ref() == Some(&path) {
+            let module = json!({"id":id,"preload":true,"code":"","deps":[],"imports":[],"exports":[],"stars":[],"commonjs":false,"linked":true,"async":0});
+            if self.production {
+                self.modules[id] = module;
+            } else {
+                self.lines[id] = Some(format!("$appsDefine({});\n", ascii_json(&module)?).into());
+            }
+            return Ok(id);
+        }
         let dependency = path.components().any(|p| p.as_os_str() == "node_modules")
             || self.package_roots.iter().any(|root| path.starts_with(root));
         if inline.is_none()
@@ -2345,13 +2355,24 @@ pub fn compile(
         .map(|directory| directory.join("package.json"))
         .find(|path| path.is_file());
     let package = manifest.as_ref().map(fs::read_to_string).transpose()?;
-    let aliases = package
-        .as_deref()
-        .and_then(|source| serde_json::from_str::<Value>(source).ok())
-        .and_then(|package| {
-            let keys: Vec<_> = package
-                .get("imports")?
-                .as_object()?
+    let metadata: Value =
+        serde_json::from_str(package.as_deref().unwrap_or("{}")).context("Invalid package.json")?;
+    let preload = metadata
+        .get("preload")
+        .map(|value| {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .context("package.json preload must be a non-empty string")?;
+            resolve_file(&manifest.as_ref().unwrap().parent().unwrap().join(value))
+                .context("Cannot resolve package.json preload")
+        })
+        .transpose()?;
+    let aliases = metadata
+        .get("imports")
+        .and_then(Value::as_object)
+        .and_then(|imports| {
+            let keys: Vec<_> = imports
                 .keys()
                 .filter(|key| !key.starts_with('#'))
                 .cloned()
@@ -2362,6 +2383,7 @@ pub fn compile(
     let shared = Rc::new(Shared {
         disabled: apps_runtime::bundle::disabled_features(package.as_deref())?,
         aliases,
+        preload,
         root,
         cache,
         ..Shared::default()
@@ -2456,7 +2478,7 @@ fn bundle(
             .collect();
         let mut dynamic_stars: Vec<_> = modules
             .iter()
-            .map(|module| module["commonjs"] == true)
+            .map(|module| module["commonjs"] == true || module["preload"] == true)
             .collect();
         loop {
             let mut changed = false;
@@ -2698,6 +2720,9 @@ fn bundle(
             if !stars.is_empty() {
                 let _ = write!(line, ",stars:{}", json!(stars));
             }
+            if module["preload"] == true {
+                line.push_str(",preload:1");
+            }
             if module["commonjs"] == true {
                 line.push_str(",commonjs:1");
                 for field in ["file", "resolved"] {
@@ -2728,6 +2753,26 @@ fn bundle(
                     ascii_json(&json!(imports))?
                 );
                 factory = format!("function($scope){{with($scope)return {factory}}}");
+            } else if realm == Realm::Renderer
+                && builder.shared.preload.is_some()
+                && module["linked"] == true
+            {
+                let imports: Vec<_> = module["imports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|import| {
+                        let target = import["id"].as_u64().unwrap() as usize;
+                        dynamic_stars[target]
+                            && !pruned[target]
+                            && import["local"]
+                                .as_str()
+                                .is_some_and(|local| used_imports[id].contains(local))
+                    })
+                    .collect();
+                if !imports.is_empty() {
+                    let _ = write!(line, ",imports:{}", ascii_json(&json!(imports))?);
+                }
             }
             // WARNING: codegen cannot escape some text, like raw template strings. Those modules compile from a string, so the bundle stays ASCII.
             if factory.is_ascii() {
@@ -3347,6 +3392,33 @@ fn html(
         }
     }
     scripts[0].splice(0..0, blocking);
+    if let Some(preload) = &shared.preload {
+        let parent = doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "head")
+            .unwrap_or(0);
+        let index = doc.nodes.len();
+        let mut node = apps_runtime::dom::Node::default();
+        node.tag = "script".into();
+        node.attrs.insert("type".into(), "preload".into());
+        node.parent = Some(parent);
+        doc.nodes.push(node);
+        doc.nodes[parent].children.insert(0, index);
+        scripts[1].insert(
+            0,
+            (
+                index,
+                (
+                    PathBuf::from("apps:preload"),
+                    Some(format!(
+                        "import * as api from {};globalThis.__appsPublishPreload(api);",
+                        json!(preload)
+                    )),
+                ),
+            ),
+        );
+    }
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
         let Some(&(first, _)) = list.first() else {
             continue;

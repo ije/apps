@@ -61,6 +61,7 @@ pub struct LayoutId(NodeId);
 struct Node {
     style: taffy::Style,
     baseline: Baseline,
+    baseline_source: bool,
     children: Vec<NodeId>,
     cache: Cache,
     /// The unrounded layout, relative to the parent.
@@ -165,6 +166,7 @@ impl LayoutEngine {
                     let old = &self.tree[usize::from(node)];
                     old.style == taffy
                         && old.baseline == style.baseline
+                        && old.baseline_source == style.baseline_source
                         && old.children == self.children
                         && same(old.state.as_ref())
                 } =>
@@ -176,6 +178,7 @@ impl LayoutEngine {
                 let node = Node {
                     style: taffy,
                     baseline: style.baseline,
+                    baseline_source: style.baseline_source,
                     children: self.children.clone(),
                     cache: Cache::new(),
                     layout: Layout::new(),
@@ -471,6 +474,19 @@ impl Tree<'_> {
                 child.style.position != Position::Absolute && child.style.display != Display::None
             });
         let at = |child: &Node, value: f32| child.layout.location.y + value;
+        // A grid places its items out of flow, so it takes its baseline from the marked item. An item
+        // without one gives its bottom border edge.
+        let source = node
+            .children
+            .iter()
+            .map(|&child| &self.nodes[usize::from(child)])
+            .find(|child| child.baseline_source)
+            .map(|child| {
+                at(
+                    child,
+                    child.baselines.first.unwrap_or(child.layout.size.height),
+                )
+            });
         let row = style.display == Display::Flex
             && matches!(
                 style.flex_direction,
@@ -478,6 +494,7 @@ impl Tree<'_> {
             );
         let (first, last) = match node.baseline {
             _ if style.contain.suppresses_baseline() => (None, None),
+            _ if source.is_some() => (source, source),
             Baseline::First => (first, first),
             Baseline::FirstOnly => (first, None),
             _ if row => {

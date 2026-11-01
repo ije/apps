@@ -1,4 +1,3 @@
-import { contextBridge } from '@pierre/apps';
 import { dlopen, suffix } from 'node:ffi';
 import { join } from 'node:path';
 import addon from './build/Release/addon.node';
@@ -9,8 +8,6 @@ const { lib, functions } = dlopen(join(import.meta.dirname, `build/Release/math.
 });
 const double = lib.registerCallback({ arguments: ['int32'], return: 'int32' }, value => value * 2);
 
-contextBridge.exposeInMainWorld('native', {
-  napiAdd: addon.add,
-  ffiAdd: functions.add,
-  ffiDouble: value => functions.apply(double, value),
-});
+export const napiAdd = addon.add;
+export const ffiAdd = functions.add;
+export const ffiDouble = value => functions.apply(double, value);

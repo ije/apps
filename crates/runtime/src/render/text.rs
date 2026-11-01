@@ -22,6 +22,7 @@ pub(super) fn paint_text(
     rows: &[crate::dom::Row],
     text: &str,
     ink: Option<renderer::Rgba>,
+    strut: renderer::FontId,
     window: &mut Window,
 ) {
     let smoothing = window.text_style().font_smoothing;
@@ -45,23 +46,14 @@ pub(super) fn paint_text(
             ),
         ),
         |window| {
-            // Larger first-letter or first-line runs must not move the baseline of the other rows.
-            let baseline = line
-                .runs
-                .iter()
-                .rev()
-                .find(|run| run.font_size == line.font_size)
-                .map_or(
-                    (line_height - line.ascent - line.descent) / 2. + line.ascent,
-                    |run| {
-                        window.text_system().baseline(
-                            run.font_id,
-                            run.font_size,
-                            line_height,
-                            window.scale_factor(),
-                        )
-                    },
-                );
+            // The strut sets the baseline, so fallback fonts (emoji) and larger first-letter or
+            // first-line runs don't move it. Taller runs move their row down with `drop`.
+            let baseline = window.text_system().baseline(
+                strut,
+                line.font_size,
+                line_height,
+                window.scale_factor(),
+            );
             let drop = |row: usize| rows.get(row).map_or(px(0.), |row| row.drop);
             let top = |row: usize| origin.y + line_height * row + drop(row);
             let mask = window.content_mask().bounds;
@@ -260,9 +252,11 @@ pub(super) fn spaces(text: &str) -> f32 {
 }
 
 /// How much space each row needs above and below the paragraph's strut, like Chrome's line boxes: every
-/// run's font sits centered in its own line height, in device pixels.
+/// run's font sits centered in its own line height, in device pixels. Like browsers, fallback fonts (emoji)
+/// count only with `line-height: normal`; other heights center the run's own font.
 fn row_extents<'a>(
     lines: impl IntoIterator<Item = &'a renderer::WrappedLineLayout>,
+    runs: &[renderer::TextRun],
     heights: &[(usize, style::LineHeight)],
     strut: (renderer::FontId, Pixels, Pixels),
     system: &renderer::TextSystem,
@@ -275,6 +269,13 @@ fn row_extents<'a>(
         [above, line - above]
     };
     let root = inline(strut.0, strut.1, Some(f32::from(strut.2) * scale));
+    let run_ends: Vec<usize> = runs
+        .iter()
+        .scan(0, |end, run| {
+            *end += run.len;
+            Some(*end)
+        })
+        .collect();
     let mut rows = Vec::new();
     let mut offset = 0;
     for line in lines {
@@ -290,16 +291,21 @@ fn row_extents<'a>(
             let mut last = None;
             for glyph in &run.glyphs {
                 let row = first + ends.partition_point(|&end| end <= glyph.index);
+                let at = offset + glyph.index;
                 let kind = heights
-                    .get(heights.partition_point(|(end, _)| *end <= offset + glyph.index))
+                    .get(heights.partition_point(|(end, _)| *end <= at))
                     .map_or(style::LineHeight::Normal, |(_, kind)| *kind);
-                if last == Some((row, kind)) {
+                let source = (kind != style::LineHeight::Normal)
+                    .then(|| run_ends.partition_point(|&end| end <= at));
+                if last == Some((row, kind, source)) {
                     continue;
                 }
-                last = Some((row, kind));
+                last = Some((row, kind, source));
                 let size = f32::from(run.font_size);
                 let [above, below] = inline(
-                    run.font_id,
+                    source
+                        .and_then(|index| runs.get(index))
+                        .map_or(run.font_id, |styled| system.resolve_font(&styled.font)),
                     run.font_size,
                     match kind {
                         style::LineHeight::Normal => None,
@@ -571,6 +577,7 @@ impl renderer::Element for InlineText {
                 let scale = window.scale_factor();
                 let extents = row_extents(
                     lines.iter().map(|line| &**line),
+                    &runs,
                     &data.line_heights,
                     strut,
                     &system,
@@ -629,6 +636,7 @@ impl renderer::Element for InlineText {
         let indent = style.text_indent;
         let extents = row_extents(
             layout.line_layouts().iter().map(|line| &**line),
+            self.runs.as_deref().unwrap_or(&self.data.runs),
             &self.data.line_heights,
             (
                 window.text_system().resolve_font(&style.font()),
@@ -967,6 +975,9 @@ impl renderer::Element for InlineText {
         }
         let layout = self.inner.layout();
         let runs = self.runs.as_deref().unwrap_or(&self.data.runs);
+        let strut = window
+            .text_system()
+            .resolve_font(&window.text_style().font());
         let passes = self
             .data
             .shadows
@@ -997,6 +1008,7 @@ impl renderer::Element for InlineText {
                             rows.get(row..row + count).unwrap_or_default(),
                             &self.data.text,
                             ink,
+                            strut,
                             window,
                         );
                     }

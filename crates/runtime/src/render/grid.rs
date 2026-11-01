@@ -11,12 +11,16 @@ pub(crate) type Measurements = rustc_hash::FxHashMap<(usize, Option<u32>, Option
 pub(crate) struct Grid {
     pub columns: Vec<f32>,
     pub rows: Vec<f32>,
-    /// Each item, its cell, its margin box, and whether the grid uses its baselines.
+    /// Each item, its cell, its margin box, and whether it aligns baselines.
     pub cells: Vec<(usize, [usize; 4], [f32; 4], bool)>,
     pub gap: [f32; 2],
-    /// In an item's slot: the grid uses the item's baselines, so its layout reports them.
+    /// In an item's slot: the item aligns baselines, which the grid reads from its last layout.
     pub baseline: bool,
-    /// The grid's first baseline from its content box top, once its items' baselines are known.
+    /// The item that gives the grid its first baseline, which layout reads from that item. In an item's slot:
+    /// that item.
+    pub first_item: Option<usize>,
+    /// The grid's first baseline from its content box top, from the first item's last layout. Only a culled
+    /// first item, which did not change, uses it.
     pub first_baseline: Option<f32>,
 }
 
@@ -1586,8 +1590,8 @@ pub(crate) fn layout(
         .filter(|(_, cell)| Some(cell[1]) == top)
         .min_by_key(|(index, cell)| (derived[*index].baseline != Some(false), cell[0]))
     {
-        let (child, _, [_, y, _, height], ref mut used) = grid.cells[index];
-        *used = true;
+        let (child, _, [_, y, _, height], _) = grid.cells[index];
+        grid.first_item = Some(child);
         if let Some(&[first, _]) = baselines.and_then(|baselines| baselines.get(&child)) {
             let area = grid.columns.iter().skip(cell[0]).take(cell[2]).sum::<f32>()
                 + cell[2].saturating_sub(1) as f32 * grid.gap[0];

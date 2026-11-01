@@ -110,11 +110,17 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     return{pending:true};
   };
   globalThis.__appsBridgeClosed=source=>{const recipient=peer(source);for(const[id,request]of pending)if(request.recipient===recipient){pending.delete(id);request.reject(new Error('Bridge target closed'));}for(const[id,capability]of functions)if(capability.recipient===recipient&&!capability.persistent)functions.delete(id);};
+  let preloadExports,preloadReady;
+  globalThis.__appsImportPreload=()=>preloadExports??(preloadExports=new Promise(resolve=>{preloadReady=resolve;}));
   globalThis.__appsSyncBridge=()=>{
     if(typeof role!=='object'||!('renderer'in role))return;
-    for(const[name,value]of Object.entries(call('bridge.exposures')))if(!Object.hasOwn(globalThis,name))Object.defineProperty(globalThis,name,{value:decode(value,{preload:role.renderer}),configurable:true});
+    for(const[name,value]of Object.entries(call('bridge.exposures'))){
+      if(name==='__appsPreload'){if(!preloadExports||preloadReady){preloadExports=decode(value,{preload:role.renderer});preloadReady?.(preloadExports);preloadReady=undefined;}continue;}
+      if(!Object.hasOwn(globalThis,name))Object.defineProperty(globalThis,name,{value:decode(value,{preload:role.renderer}),configurable:true});
+    }
   };
   const preload=typeof role==='object'&&'preload'in role,page={renderer:role?.preload};
+  if(preload)globalThis.__appsPublishPreload=value=>{call('bridge.preload',encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}};
   const contextBridge={exposeInMainWorld(name,value){if(!preload)throw new Error('contextBridge requires a preload context');call('bridge.expose',String(name),encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}}};
   const ipcMain=emitter;
   if(role==='main')Object.assign(ipcMain,{handle(channel,fn){if(handlers.has(channel))throw new Error(`Attempted to register a second handler for '${channel}'`);handlers.set(channel,fn);},handleOnce(channel,fn){this.handle(channel,(...args)=>{handlers.delete(channel);return fn(...args);});},removeHandler:channel=>handlers.delete(channel)});
