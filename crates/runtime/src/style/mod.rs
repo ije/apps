@@ -122,7 +122,7 @@ button,select,meter,progress{user-select:none}
 label,button,select,input[type=button i],input[type=submit i],input[type=reset i],input[type=checkbox i],input[type=radio i],input[type=range i],input[type=color i],input[type=file i]{cursor:default}
 svg:not(:root){overflow:hidden}
 input{padding:1px 2px;border:2px inset light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b)}
-textarea{font-family:monospace;padding:2px;border:1px solid light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b)}
+textarea{font-family:monospace;padding:2px;overflow:auto;border:1px solid light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b)}
 select{border:1px solid light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b);box-sizing:border-box;white-space:pre}
 button,input[type=button i],input[type=submit i],input[type=reset i]{padding:1px 6px;border:2px outset light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box;text-align:center}
 input[type=checkbox i],input[type=radio i]{width:13px;height:13px;margin:3px 3px 3px 4px;padding:0;border:0;background-color:transparent;box-sizing:border-box}
@@ -185,6 +185,8 @@ struct StyleKey {
     columns: usize,
     host: Option<Style>,
     selection: Option<Style>,
+    /// `::slotted()` and `::part()` declarations from the outer tree.
+    shadowed: [Option<Vec<Declared>>; 2],
 }
 
 struct CachedNode {
@@ -193,6 +195,7 @@ struct CachedNode {
     root: [u32; 6],
     host: Option<Style>,
     selection: Option<Style>,
+    shadowed: [Option<Vec<Declared>>; 2],
     value: Rc<CachedStyle>,
 }
 
@@ -204,6 +207,7 @@ impl CachedNode {
             root: key.root,
             host: key.host.clone(),
             selection: key.selection.clone(),
+            shadowed: key.shadowed.clone(),
             value,
         }
     }
@@ -228,6 +232,8 @@ struct CachedStyle {
 
 /// A bucket key: id, class, tag or attribute name.
 type Key = Option<(u8, String)>;
+/// Marks pseudo-element selectors in the buckets, by index in `StyleScope.pseudos`.
+const PSEUDO: usize = 1 << (usize::BITS - 1);
 struct StyleScope {
     id: usize,
     used: u64,
@@ -241,7 +247,7 @@ struct StyleScope {
     arguments: FxHashMap<usize, Rc<str>>,
     /// Element selectors of each rule, by index in the rule's list.
     elements: Vec<Vec<(usize, Key)>>,
-    /// Rules by the key one of their selectors requires, per key kind.
+    /// Rules, and pseudo-element selectors with `PSEUDO`, by the key they require, per key kind.
     buckets: [FxHashMap<String, Vec<usize>>; 4],
     universal: Vec<usize>,
     containers: Vec<Option<ContainerQuery>>,
@@ -293,7 +299,15 @@ impl StyleScope {
                                 selector.pseudo_argument().unwrap_or_default().trim().into(),
                             );
                         }
-                        let key = pseudo.key().map(|(kind, name)| (kind, name.into()));
+                        let key: Key = pseudo.key().map(|(kind, name)| (kind, name.into()));
+                        let index = PSEUDO | self.pseudos.len();
+                        match &key {
+                            Some((kind, name)) => self.buckets[*kind as usize]
+                                .entry(name.clone())
+                                .or_default()
+                                .push(index),
+                            None => self.universal.push(index),
+                        }
                         self.pseudos.push((kind, pseudo, order, key));
                         return None;
                     }
@@ -517,6 +531,7 @@ pub(crate) struct StyleCache {
     sized: std::collections::HashSet<usize>,
     queries: QueryCache,
     queried: bool,
+    tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
     pub(crate) scripted: Registry,
@@ -526,6 +541,14 @@ pub(crate) struct StyleCache {
 type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
 type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, FontUnits)>;
+/// A collapsed table: the pass that used it, the styles and columns of its parts, the viewport,
+/// and the styles its borders adjusted.
+type CollapsedTable = (
+    u64,
+    Vec<(usize, StyleRef, usize)>,
+    [f32; 2],
+    Vec<(usize, Rc<Style>)>,
+);
 
 impl StyleCache {
     pub(crate) fn set_containers(&mut self, sizes: HashMap<usize, [f32; 2]>) -> bool {
@@ -632,19 +655,21 @@ impl StyleCache {
             Some((text, sheet)) => (text.clone(), sheet.clone()),
             None => {
                 let previous = self.sheets.get(&id).filter(|(_, old, _)| {
-                    let (mut depth, mut quote, mut comment, mut escaped) =
-                        (0i32, 0u8, false, false);
+                    let (mut depth, mut quote, mut comment, mut escaped) = (0i32, 0u8, None, false);
                     let bytes = old.as_bytes();
                     for (index, &byte) in bytes.iter().enumerate() {
                         match byte {
                             _ if escaped => escaped = false,
                             b'\\' => escaped = true,
-                            b'/' if comment && index > 0 && bytes[index - 1] == b'*' => {
-                                comment = false
+                            b'/' if comment.is_some_and(|open| {
+                                index > open + 1 && bytes[index - 1] == b'*'
+                            }) =>
+                            {
+                                comment = None
                             }
-                            _ if comment => {}
+                            _ if comment.is_some() => {}
                             b'*' if quote == 0 && index > 0 && bytes[index - 1] == b'/' => {
-                                comment = true
+                                comment = Some(index)
                             }
                             b'"' | b'\'' if quote == 0 => quote = byte,
                             _ if quote == byte => quote = 0,
@@ -656,7 +681,7 @@ impl StyleCache {
                     text.starts_with(&**old)
                         && depth == 0
                         && quote == 0
-                        && !comment
+                        && comment.is_none()
                         && !escaped
                         && old.trim_end().ends_with(['}', ';'])
                 });
@@ -747,6 +772,7 @@ impl StyleCache {
             self.queries.retain(|key, _| live.contains(&key.0));
         }
         self.sheets.retain(|_, (used, ..)| *used == pass);
+        self.tables.retain(|_, (used, ..)| *used == pass);
         self.derived.clear();
         self.cssom.retain(|_, (used, ..)| *used >= pass);
         if self.values.len() > 4096 {
@@ -771,8 +797,9 @@ enum Declaration {
     Apply(Vec<String>),
 }
 
+/// Top-level rules are shared, so a sheet that changes or grows copies only the rules it edits.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub(crate) struct Stylesheet(Vec<Rule>);
+pub(crate) struct Stylesheet(Vec<Rc<Rule>>);
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 enum Rule {
@@ -2405,7 +2432,10 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
 
 pub(crate) fn supports_condition(condition: &str) -> bool {
     let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
-        [Rule::Supports(_, supported, _)] => Some(*supported),
+        [rule] => match **rule {
+            Rule::Supports(_, supported, _) => Some(supported),
+            _ => None,
+        },
         _ => None,
     };
     evaluate(format!("@supports {condition}{{}}"))
@@ -3133,8 +3163,12 @@ pub(crate) fn cascade(
         style_cache
             .values
             .retain(|_, value| resized && !value.viewport);
-        style_cache.queries.clear();
-        style_cache.queried = false;
+        // WARNING: kept nodes don't evaluate their container queries again, so their results stay
+        // for `set_containers`.
+        if !resized {
+            style_cache.queries.clear();
+            style_cache.queried = false;
+        }
         // Selector matches stay valid while every `@media` rule keeps its result.
         style_cache.scopes.retain_mut(|scope| {
             let mut media = Vec::new();
@@ -3155,6 +3189,8 @@ pub(crate) fn cascade(
             }
             media == scope.media
         });
+        let live: Vec<_> = style_cache.scopes.iter().map(|scope| scope.id).collect();
+        style_cache.queries.retain(|key, _| live.contains(&key.0));
     }
     let tailwind = style_cache.tailwind.update(&mut sheets, doc, &order);
     if let Some(update) = &tailwind
@@ -3409,6 +3445,25 @@ pub(crate) fn cascade(
                         key.scope != cached.id || !stale(&key.rules, &key.pseudos)
                     });
                 }
+                if cached.keyframes != keyframes {
+                    // WARNING: cached styles hold animations built from the old keyframes.
+                    let animated = |value: &CachedStyle| {
+                        value.style.contains(Prop::ANIMATION)
+                            || value.style.contains(Prop::ANIMATION_NAME)
+                    };
+                    for node in cached.nodes.iter_mut().flatten() {
+                        if node
+                            .cached
+                            .as_ref()
+                            .is_some_and(|node| animated(&node.value))
+                        {
+                            node.cached = None;
+                        }
+                    }
+                    style_cache
+                        .values
+                        .retain(|key, value| key.scope != cached.id || !animated(value));
+                }
                 cached.sheets = sheets.clone();
                 cached.media = media;
                 cached.keyframes = keyframes;
@@ -3567,6 +3622,10 @@ pub(crate) fn cascade(
         let root_font = [root.em, root.ch, root.ex, root.cap, root.ic, root.lh].map(f32::to_bits);
         let host = context.and_then(|context| context.hosts.get(&id));
         let selection = node.parent.and_then(|parent| selections.get(&parent));
+        let shadowed = [
+            context.and_then(|context| context.slotted.get(&id)),
+            context.and_then(|context| context.parts.get(&id)),
+        ];
         let animated = context.and_then(|context| context.animated.get(&id));
         let mut key = None;
         let cached = scoped.nodes[id]
@@ -3582,6 +3641,7 @@ pub(crate) fn cascade(
                     && cached.root == root_font
                     && cached.host.as_ref() == host
                     && cached.selection.as_ref() == selection
+                    && cached.shadowed.each_ref().map(Option::as_ref) == shadowed
             })
             .map(|cached| cached.value.clone())
             .or_else(|| {
@@ -3613,7 +3673,8 @@ pub(crate) fn cascade(
                         candidates.dedup();
                     }
                     let has = |key: &Key| has_key(node, key);
-                    let matched: Vec<_> = candidates
+                    let split = candidates.partition_point(|&order| order < PSEUDO);
+                    let matched: Vec<_> = candidates[..split]
                         .iter()
                         .filter_map(|&order| {
                             let selectors = &rules[order].0;
@@ -3627,19 +3688,11 @@ pub(crate) fn cascade(
                                 .map(|specificity| (order, specificity))
                         })
                         .collect();
-                    let matched_pseudos: Vec<_> = if node.tag.starts_with('#') {
-                        Vec::new()
-                    } else {
-                        scoped
-                            .pseudos
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, (_, selector, _, key))| {
-                                (has(key) && selector.matches_reusing(doc, id, matches))
-                                    .then_some(index)
-                            })
-                            .collect()
-                    };
+                    let matched_pseudos: Vec<_> = candidates[split..]
+                        .iter()
+                        .map(|&index| index & !PSEUDO)
+                        .filter(|&index| scoped.pseudos[index].1.matches_reusing(doc, id, matches))
+                        .collect();
                     let mut columns = 0;
                     if node.tag == "table" {
                         matches.depend(id, 2);
@@ -3739,6 +3792,7 @@ pub(crate) fn cascade(
                     columns,
                     host: host.cloned(),
                     selection: selection.cloned(),
+                    shadowed: shadowed.map(Option::<&Vec<Declared>>::cloned),
                 };
                 let value = style_cache
                     .values
@@ -4236,10 +4290,10 @@ pub(crate) fn cascade(
             viewport: [width, height],
             container: None,
         };
-        if [Prop::FONT_SIZE, Prop::LINE_HEIGHT]
+        let queried = [Prop::FONT_SIZE, Prop::LINE_HEIGHT]
             .into_iter()
-            .any(|prop| style.get(prop).is_some_and(|value| value.contains("cq")))
-        {
+            .any(|prop| style.get(prop).is_some_and(|value| value.contains("cq")));
+        if queried {
             let mut ancestor = node.parent;
             while let Some(id) = ancestor {
                 if styles[id]
@@ -4255,15 +4309,17 @@ pub(crate) fn cascade(
                 units.container = style_cache.containers.get(&container).copied();
             }
         }
-        let viewport = [Prop::FONT_SIZE, Prop::LINE_HEIGHT]
-            .into_iter()
-            .any(|prop| {
-                style.get(prop).is_some_and(|value| {
-                    ["vw", "vh", "vi", "vb", "vmin", "vmax"]
-                        .iter()
-                        .any(|unit| value.contains(unit))
-                })
-            });
+        // WARNING: container units without a container use the viewport, so a resize changes them.
+        let viewport = queried && units.container.is_none()
+            || [Prop::FONT_SIZE, Prop::LINE_HEIGHT]
+                .into_iter()
+                .any(|prop| {
+                    style.get(prop).is_some_and(|value| {
+                        ["vw", "vh", "vi", "vb", "vmin", "vmax"]
+                            .iter()
+                            .any(|unit| value.contains(unit))
+                    })
+                });
         let size = match style.get(Prop::FONT_SIZE).unwrap_or("medium") {
             "xx-small" => Some(9.),
             "x-small" => Some(10.),
@@ -4624,7 +4680,10 @@ pub(crate) fn cascade(
             if let Some(node) = scoped.nodes[id].as_mut() {
                 node.cached = Some(CachedNode::new(&key, cached.clone()));
             }
-            style_cache.values.insert(key, cached);
+            // WARNING: the key doesn't hold the container, so styles with container units are not shared.
+            if !queried {
+                style_cache.values.insert(key, cached);
+            }
         }
         styles[id] = style;
         lengths[id] = units;
@@ -4903,6 +4962,55 @@ pub(crate) fn cascade(
             })
             .filter(|(_, _, cells): &(_, _, Vec<usize>)| !cells.is_empty())
             .collect();
+        let spans: Vec<Vec<std::ops::Range<usize>>> = lines
+            .iter()
+            .map(|(_, _, cells)| {
+                let mut start = 0;
+                cells
+                    .iter()
+                    .map(|&cell| {
+                        let span = doc.nodes[cell]
+                            .attrs
+                            .get("colspan")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        start += span;
+                        start - span..start
+                    })
+                    .collect()
+            })
+            .collect();
+        // WARNING: the key must hold every input of the adjustment: the styles of the table, rows,
+        // groups and cells, the cell columns and the viewport.
+        let inputs: Vec<(usize, StyleRef, usize)> = std::iter::once((table, 0))
+            .chain(
+                lines
+                    .iter()
+                    .zip(&spans)
+                    .flat_map(|((row, group, cells), spans)| {
+                        std::iter::once((*row, 0))
+                            .chain(group.map(|group| (group, 0)))
+                            .chain(
+                                cells
+                                    .iter()
+                                    .zip(spans)
+                                    .map(|(&cell, span)| (cell, span.end)),
+                            )
+                    }),
+            )
+            .map(|(id, column)| (id, StyleRef(styles[id].clone()), column))
+            .collect();
+        if let Some((pass, old, size, adjusted)) = style_cache.tables.get_mut(&table)
+            && *old == inputs
+            && *size == [width, height]
+        {
+            *pass = style_cache.pass;
+            for (id, style) in adjusted.iter() {
+                authored.insert(*id, std::mem::replace(&mut styles[*id], style.clone()));
+            }
+            continue;
+        }
         // Each shared edge takes the widest border of its cells, rows and row groups, then the strongest style.
         let edge = |id: usize, side: usize| {
             let rank = match styles[id].get(SIDES[side][0]).unwrap_or("none") {
@@ -4949,25 +5057,6 @@ pub(crate) fn cascade(
                     .collect(),
             );
         }
-        let spans: Vec<Vec<std::ops::Range<usize>>> = lines
-            .iter()
-            .map(|(_, _, cells)| {
-                let mut start = 0;
-                cells
-                    .iter()
-                    .map(|&cell| {
-                        let span = doc.nodes[cell]
-                            .attrs
-                            .get("colspan")
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or(1)
-                            .max(1);
-                        start += span;
-                        start - span..start
-                    })
-                    .collect()
-            })
-            .collect();
         for row in 0..resolved.len() {
             for column in 1..resolved[row].len() {
                 let shared = wins(resolved[row][column - 1][1], resolved[row][column][3]);
@@ -4986,31 +5075,28 @@ pub(crate) fn cascade(
                 }
             }
         }
-        let rows: Vec<Vec<usize>> = lines.iter().map(|(_, _, cells)| cells.clone()).collect();
-        let mut cells: Vec<(usize, [Edge; 4])> = rows
-            .iter()
-            .flatten()
-            .copied()
-            .zip(resolved.into_iter().flatten())
-            .collect();
         // The table's border is one more contender for each outer cell edge, which the cell then draws.
         let mut edges = [0f32; 4];
-        for (cell, sides) in &mut cells {
-            for (index, widest) in edges.iter_mut().enumerate() {
-                let outer = match index {
-                    0 => rows.first().is_some_and(|row| row.contains(cell)),
-                    2 => rows.last().is_some_and(|row| row.contains(cell)),
-                    1 => rows.iter().any(|row| row.last() == Some(cell)),
-                    _ => rows.iter().any(|row| row.first() == Some(cell)),
-                };
-                if outer {
-                    sides[index] = wins(sides[index], edge(table, index));
-                    *widest = widest.max(sides[index].0);
+        let mut cells: Vec<(usize, [Edge; 4])> = Vec::with_capacity(inputs.len());
+        for (index, ((_, _, row), sides)) in lines.iter().zip(resolved).enumerate() {
+            for (column, (&cell, mut sides)) in row.iter().zip(sides).enumerate() {
+                for (side, widest) in edges.iter_mut().enumerate() {
+                    let outer = match side {
+                        0 => index == 0,
+                        1 => column + 1 == row.len(),
+                        2 => index + 1 == lines.len(),
+                        _ => column == 0,
+                    };
+                    if outer {
+                        sides[side] = wins(sides[side], edge(table, side));
+                        *widest = widest.max(sides[side].0);
+                    }
                 }
+                cells.push((cell, sides));
             }
         }
         // The table and its cells were styled again in this pass, so their old authored styles are stale.
-        for id in rows.iter().flatten().chain([&table]) {
+        for (id, ..) in &inputs {
             authored.remove(id);
         }
         // A cell takes the winning border of each side, from wherever it came.
@@ -5056,13 +5142,18 @@ pub(crate) fn cascade(
             style.insert(width, "0");
             style.insert(padding, format!("{}px", widest / 2.));
         }
+        let mut adjusted = vec![(table, styles[table].clone())];
         for (cell, sides) in cells {
             authored.entry(cell).or_insert_with(|| styles[cell].clone());
             let style = Rc::make_mut(&mut styles[cell]);
             for ([_, _, margin, _], (width, ..)) in SIDES.into_iter().zip(sides) {
                 style.insert(margin, format!("{}px", -width / 2.));
             }
+            adjusted.push((cell, styles[cell].clone()));
         }
+        style_cache
+            .tables
+            .insert(table, (style_cache.pass, inputs, [width, height], adjusted));
     }
 }
 
@@ -5150,6 +5241,7 @@ fn substitute(
     value: &str,
     lookup: &mut dyn FnMut(Prop) -> Option<Rc<str>>,
     out: &mut String,
+    nesting: u8,
 ) -> bool {
     let word = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '%' | '#');
     let mut rest = value;
@@ -5189,7 +5281,10 @@ fn substitute(
         {
             Some(resolved) => out.push_str(&resolved),
             None => match comma {
-                Some(comma) if substitute(body[comma + 1..end].trim(), lookup, out) => {}
+                // WARNING: nested fallbacks recurse, and so do the references in them, so their depth is capped.
+                Some(comma)
+                    if nesting < 32
+                        && substitute(body[comma + 1..end].trim(), lookup, out, nesting + 1) => {}
                 _ => return false,
             },
         }
@@ -5291,7 +5386,7 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
                     "*" => !value.is_empty(),
                     _ if kind.ends_with('(') => {
                         value.len() > kind.len()
-                            && value[..kind.len()].eq_ignore_ascii_case(kind)
+                            && value.as_bytes()[..kind.len()].eq_ignore_ascii_case(kind.as_bytes())
                             && value.ends_with(')')
                     }
                     _ => value.eq_ignore_ascii_case(kind),
@@ -5365,7 +5460,7 @@ impl Substitution<'_> {
                         self.state[index] = (1, depth, None);
                         (self.depth, self.cycle) = (depth + 1, usize::MAX);
                         let mut out = String::new();
-                        let ok = substitute(&raw, &mut |prop| self.get(prop), &mut out);
+                        let ok = substitute(&raw, &mut |prop| self.get(prop), &mut out, 0);
                         let reached = self.cycle;
                         self.depth = depth;
                         self.cycle = outer.min(if reached < depth { reached } else { usize::MAX });
@@ -5441,6 +5536,7 @@ fn resolve_style(
                         .or_else(|| registry.get(&name)?.2.clone())
                 },
                 &mut out,
+                0,
             );
             (prop, ok.then_some(out))
         })
@@ -5490,26 +5586,62 @@ fn resolve_style(
         if prop.is_custom() || !slot.contains("light-dark(") {
             return true;
         }
-        let mut value = slot.to_string();
-        while let Some(start) = value.rfind("light-dark(") {
-            let mut depth = 1;
-            let Some(end) = value[start + 11..].char_indices().find_map(|(i, c)| {
-                if c == '(' {
-                    depth += 1;
-                } else if c == ')' {
-                    depth -= 1;
+        // WARNING: replacing each call in place is quadratic, so one pass marks the dropped text as
+        // ranges (+1 at the start, -1 at the end) and a second pass copies the rest.
+        let bytes = slot.as_bytes();
+        let mut dropped = vec![0i32; bytes.len() + 1];
+        let mut open: Vec<(usize, Option<usize>, u32)> = Vec::new();
+        let (mut quote, mut index) = (0u8, 0);
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' => index += 1,
+                byte if quote != 0 => quote = if byte == quote { 0 } else { quote },
+                byte @ (b'"' | b'\'') => quote = byte,
+                b'(' => open.push((index, None, 0)),
+                b',' => {
+                    if let Some((_, comma, commas)) = open.last_mut() {
+                        comma.get_or_insert(index);
+                        *commas += 1;
+                    }
                 }
-                (depth == 0).then_some(start + 11 + i)
-            }) else {
-                break;
-            };
-            let parts = components(&value[start + 11..end], ',');
-            if parts.len() != 2 {
-                break;
+                b')' => {
+                    if let Some((start, Some(comma), 1)) = open.pop()
+                        && slot[..start].ends_with("light-dark")
+                    {
+                        let parts = [start + 1..comma, comma + 1..index];
+                        if parts
+                            .iter()
+                            .all(|part| !slot[part.clone()].trim().is_empty())
+                        {
+                            let kept = parts[usize::from(dark)].clone();
+                            let text = &slot[kept.clone()];
+                            dropped[start - 10] += 1;
+                            dropped[kept.start + text.len() - text.trim_start().len()] -= 1;
+                            dropped[kept.start + text.trim_end().len()] += 1;
+                            dropped[index + 1] -= 1;
+                        }
+                    }
+                }
+                _ => {}
             }
-            let selected = parts[usize::from(dark)].trim().to_owned();
-            value.replace_range(start..=end, &selected);
+            index += 1;
         }
+        let mut value = String::with_capacity(slot.len());
+        let (mut depth, mut from) = (0, 0);
+        for (index, &change) in dropped
+            .iter()
+            .enumerate()
+            .filter(|(_, change)| **change != 0)
+        {
+            if depth == 0 {
+                value.push_str(&slot[from..index]);
+            }
+            depth += change;
+            if depth == 0 {
+                from = index;
+            }
+        }
+        value.push_str(&slot[from..]);
         *slot = value.into();
         true
     });
@@ -5773,18 +5905,21 @@ pub(crate) enum Edit<'a> {
 
 impl Stylesheet {
     pub(crate) fn cssom(&self) -> serde_json::Value {
-        serde_json::Value::Array(self.0.iter().map(Rule::cssom).collect())
+        serde_json::Value::Array(self.0.iter().map(|rule| rule.cssom()).collect())
     }
 
     pub(crate) fn property(&self) -> Option<(Rc<str>, bool, Option<Rc<str>>)> {
-        match self.0.as_slice() {
-            [Rule::Property(_, syntax, inherits, initial)] => Some((
-                syntax.as_str().into(),
-                *inherits,
-                initial.as_deref().map(Rc::from),
-            )),
-            _ => None,
-        }
+        let [rule] = self.0.as_slice() else {
+            return None;
+        };
+        let Rule::Property(_, syntax, inherits, initial) = &**rule else {
+            return None;
+        };
+        Some((
+            syntax.as_str().into(),
+            *inherits,
+            initial.as_deref().map(Rc::from),
+        ))
     }
 
     pub(crate) fn edit(
@@ -5793,103 +5928,23 @@ impl Stylesheet {
         edit: Edit,
     ) -> Result<serde_json::Value, &'static str> {
         let (&last, path) = path.split_last().ok_or("IndexSizeError")?;
-        let mut rules = &mut self.0;
+        let Some((&first, path)) = path.split_first() else {
+            return edit_rules(&mut self.0, last, edit, None, Rc::make_mut);
+        };
         let mut parent = None;
+        let index = position(&self.0, first).ok_or("IndexSizeError")?;
+        let mut rules = children(Rc::make_mut(&mut self.0[index]), &mut parent)?;
         for &index in path {
-            let index = rules
-                .iter()
-                .enumerate()
-                .filter(|(_, rule)| !matches!(rule, Rule::Declarations(_)))
-                .nth(index)
-                .ok_or("IndexSizeError")?
-                .0;
-            rules = match &mut rules[index] {
-                Rule::Style(selectors, children) => {
-                    parent = Some(selectors.clone());
-                    children
-                }
-                Rule::Media(_, children)
-                | Rule::Supports(_, _, children)
-                | Rule::Layer(_, children)
-                | Rule::Container(.., children) => children,
-                _ => return Err("HierarchyRequestError"),
-            };
+            let index = position(rules, index).ok_or("IndexSizeError")?;
+            rules = children(&mut rules[index], &mut parent)?;
         }
-        let positions: Vec<usize> = rules
-            .iter()
-            .enumerate()
-            .filter(|(_, rule)| !matches!(rule, Rule::Declarations(_)))
-            .map(|(index, _)| index)
-            .collect();
-        if let Edit::Insert(text) = edit {
-            let at = match last.cmp(&positions.len()) {
-                std::cmp::Ordering::Less => positions[last],
-                std::cmp::Ordering::Equal => rules.len(),
-                std::cmp::Ordering::Greater => return Err("IndexSizeError"),
-            };
-            let mut parsed = match &parent {
-                Some(parent) => Rule::parse_nested(text, parent),
-                None => Stylesheet::parse(text).0,
-            };
-            if parsed.len() != 1 || matches!(parsed[0], Rule::Declarations(_)) {
-                return Err("SyntaxError");
-            }
-            let rule = parsed.remove(0);
-            let tree = rule.cssom();
-            rules.insert(at, rule);
-            return Ok(tree);
-        }
-        let index = *positions.get(last).ok_or("IndexSizeError")?;
-        match (edit, &mut rules[index]) {
-            (Edit::Delete, _) => {
-                rules.remove(index);
-            }
-            (Edit::Declarations(text), Rule::Style(_, children)) => {
-                children.retain(|rule| !matches!(rule, Rule::Declarations(_)));
-                children.insert(0, Rule::Declarations(Declarations::parse(text)));
-            }
-            (Edit::Declarations(text), Rule::FontFace(values)) => {
-                *values = Declarations::parse(text)
-            }
-            (Edit::Selector(text), Rule::Style(selectors, children)) => {
-                let parsed = Selector::parse(text, parent.as_ref());
-                if !parsed.is_empty() {
-                    *selectors = Rc::new(parsed);
-                    for child in children {
-                        let _ = child.bind_parent(Some(selectors));
-                    }
-                }
-            }
-            (Edit::Keyframe(text), Rule::Keyframes(name, frames)) => {
-                let parsed = Stylesheet::parse(&format!("@keyframes {name}{{{text}}}"));
-                match text.split_once('{') {
-                    Some(_) => match parsed.0.into_iter().next() {
-                        Some(Rule::Keyframes(_, mut added)) if !added.is_empty() => {
-                            let tree =
-                                Rule::Keyframes(String::new(), added.clone()).cssom()[2].clone();
-                            frames.append(&mut added);
-                            return Ok(tree);
-                        }
-                        _ => return Err("SyntaxError"),
-                    },
-                    None => {
-                        let index: usize = text.parse().map_err(|_| "IndexSizeError")?;
-                        if index >= frames.len() {
-                            return Err("IndexSizeError");
-                        }
-                        frames.remove(index);
-                    }
-                }
-            }
-            _ => return Err("InvalidModificationError"),
-        }
-        Ok(serde_json::Value::Null)
+        edit_rules(rules, last, edit, parent, |rule| rule)
     }
 
     /// The `font-family` and `src` of each `@font-face` rule.
     pub(crate) fn font_faces(&self) -> impl Iterator<Item = (String, String)> + '_ {
         self.0.iter().filter_map(|rule| {
-            let Rule::FontFace(values) = rule else {
+            let Rule::FontFace(values) = &**rule else {
                 return None;
             };
             let values = values.resolve();
@@ -5903,19 +5958,126 @@ impl Stylesheet {
 
     pub(crate) fn matches_media(&self, width: f32, height: f32, theme: u32) -> bool {
         let reduced_motion = reduced_motion();
-        matches!(self.0.as_slice(), [Rule::Media(queries, _)] if queries.is_empty() || queries.iter().any(|query| {
+        let [rule] = self.0.as_slice() else {
+            return false;
+        };
+        matches!(&**rule, Rule::Media(queries, _) if queries.is_empty() || queries.iter().any(|query| {
             query.matches(width, height, reduced_motion, theme, FontUnits::new(16.)) == Some(true)
         }))
     }
 
     pub(crate) fn bind_parents(&mut self) -> anyhow::Result<()> {
         for rule in &mut self.0 {
-            rule.bind_parent(None)?;
+            Rc::make_mut(rule).bind_parent(None)?;
         }
         Ok(())
     }
 
     pub(crate) fn source(&self) -> String {
-        self.0.iter().map(Rule::source).collect()
+        self.0.iter().map(|rule| rule.source()).collect()
     }
+}
+
+/// The index of the `n`th rule that is not a block of declarations, as CSSOM counts them.
+fn position<R: std::borrow::Borrow<Rule>>(rules: &[R], n: usize) -> Option<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| !matches!((*rule).borrow(), Rule::Declarations(_)))
+        .nth(n)
+        .map(|(index, _)| index)
+}
+
+/// The rules in a grouping rule. A style rule's selector becomes their parent.
+fn children<'a>(
+    rule: &'a mut Rule,
+    parent: &mut Option<SelectorList>,
+) -> Result<&'a mut Vec<Rule>, &'static str> {
+    match rule {
+        Rule::Style(selectors, children) => {
+            *parent = Some(selectors.clone());
+            Ok(children)
+        }
+        Rule::Media(_, children)
+        | Rule::Supports(_, _, children)
+        | Rule::Layer(_, children)
+        | Rule::Container(.., children) => Ok(children),
+        _ => Err("HierarchyRequestError"),
+    }
+}
+
+/// Applies a CSSOM edit to the `last`th rule of a top-level or nested rule list.
+fn edit_rules<R: std::borrow::Borrow<Rule> + From<Rule>>(
+    rules: &mut Vec<R>,
+    last: usize,
+    edit: Edit,
+    parent: Option<SelectorList>,
+    rule_mut: fn(&mut R) -> &mut Rule,
+) -> Result<serde_json::Value, &'static str> {
+    let at = position(rules, last);
+    if let Edit::Insert(text) = edit {
+        let at = match at {
+            Some(at) => at,
+            None if last == 0 || position(rules, last - 1).is_some() => rules.len(),
+            None => return Err("IndexSizeError"),
+        };
+        let mut parsed = match &parent {
+            Some(parent) => Rule::parse_nested(text, parent),
+            None => Stylesheet::parse(text)
+                .0
+                .into_iter()
+                .map(Rc::unwrap_or_clone)
+                .collect(),
+        };
+        if parsed.len() != 1 || matches!(parsed[0], Rule::Declarations(_)) {
+            return Err("SyntaxError");
+        }
+        let rule = parsed.remove(0);
+        let tree = rule.cssom();
+        rules.insert(at, R::from(rule));
+        return Ok(tree);
+    }
+    let index = at.ok_or("IndexSizeError")?;
+    if matches!(edit, Edit::Delete) {
+        rules.remove(index);
+        return Ok(serde_json::Value::Null);
+    }
+    match (edit, rule_mut(&mut rules[index])) {
+        (Edit::Declarations(text), Rule::Style(_, children)) => {
+            children.retain(|rule| !matches!(rule, Rule::Declarations(_)));
+            children.insert(0, Rule::Declarations(Declarations::parse(text)));
+        }
+        (Edit::Declarations(text), Rule::FontFace(values)) => *values = Declarations::parse(text),
+        (Edit::Selector(text), Rule::Style(selectors, children)) => {
+            let parsed = Selector::parse(text, parent.as_ref());
+            if !parsed.is_empty() {
+                *selectors = Rc::new(parsed);
+                for child in children {
+                    let _ = child.bind_parent(Some(selectors));
+                }
+            }
+        }
+        (Edit::Keyframe(text), Rule::Keyframes(name, frames)) => {
+            let parsed = Stylesheet::parse(&format!("@keyframes {name}{{{text}}}"));
+            match text.split_once('{') {
+                Some(_) => match parsed.0.into_iter().next().map(Rc::unwrap_or_clone) {
+                    Some(Rule::Keyframes(_, mut added)) if !added.is_empty() => {
+                        let tree = Rule::Keyframes(String::new(), added.clone()).cssom()[2].clone();
+                        frames.append(&mut added);
+                        return Ok(tree);
+                    }
+                    _ => return Err("SyntaxError"),
+                },
+                None => {
+                    let index: usize = text.parse().map_err(|_| "IndexSizeError")?;
+                    if index >= frames.len() {
+                        return Err("IndexSizeError");
+                    }
+                    frames.remove(index);
+                }
+            }
+        }
+        _ => return Err("InvalidModificationError"),
+    }
+    Ok(serde_json::Value::Null)
 }

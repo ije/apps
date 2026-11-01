@@ -8,8 +8,9 @@ use super::{
 };
 use crate::{
     Bounds, CursorStyle, FileDropEvent, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, Scene,
-    Size, WindowChange, WindowOptions, WindowState, app::Callbacks, point, px, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
+    PlatformInput, Point, Scene, Size, WindowChange, WindowOptions, WindowState, app::Callbacks,
+    point, px, size,
 };
 use anyhow::Result;
 use core_foundation::base::{CFRelease, CFTypeRef};
@@ -369,6 +370,18 @@ impl State {
             .contains(NSWindowOcclusionState::Visible)
     }
 
+    fn request_frames(&mut self) {
+        if !self.wants_frames
+            || !self
+                .frame_source
+                .as_ref()
+                .is_some_and(WindowFrameSource::is_running)
+        {
+            self.wants_frames = true;
+            self.start_display_link();
+        }
+    }
+
     fn start_display_link(&mut self) {
         if !self.wants_frames || !self.is_visible() {
             return;
@@ -653,17 +666,15 @@ impl Window {
 
     /// Starts display link frames until a frame wants no more.
     pub fn request_frame(&self) {
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            return;
-        };
-        if !state.wants_frames
-            || !state
-                .frame_source
-                .as_ref()
-                .is_some_and(WindowFrameSource::is_running)
-        {
-            state.wants_frames = true;
-            state.start_display_link();
+        match self.state.try_borrow_mut() {
+            Ok(mut state) => state.request_frames(),
+            // WARNING: an AppKit callback up the stack holds the state, and a dropped request would
+            // leave the window dirty without frames, so it runs after that callback.
+            Err(_) => self.later(|_, state| {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.request_frames();
+                }
+            }),
         }
     }
 
@@ -947,8 +958,10 @@ impl Drop for Window {
 
 /// Tells the view about a window change after the current event.
 fn report_change(state: &Shared) {
-    if let Ok(state) = state.try_borrow() {
-        state.callbacks.changed();
+    // WARNING: the callback can run app code that closes the window, so it runs without a borrow.
+    let callbacks = state.try_borrow().map(|state| state.callbacks);
+    if let Ok(callbacks) = callbacks {
+        callbacks.changed();
     }
 }
 
@@ -1369,7 +1382,14 @@ fn synthetic_drag(state: Weak<RefCell<State>>, id: usize, event: MouseMoveEvent)
             }
             // A menu can take the mouse up, so the button must still be down.
             let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
-            if event.pressed_button == Some(MouseButton::Left) && pressed & 1 == 0 {
+            let bit = match event.pressed_button {
+                Some(MouseButton::Left) | None => 0,
+                Some(MouseButton::Right) => 1,
+                Some(MouseButton::Middle) => 2,
+                Some(MouseButton::Navigate(NavigationDirection::Back)) => 3,
+                Some(MouseButton::Navigate(NavigationDirection::Forward)) => 4,
+            };
+            if pressed & (1 << bit) == 0 {
                 lock.synthetic_drag_counter += 1;
                 return;
             }

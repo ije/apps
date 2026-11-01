@@ -92,3 +92,45 @@ fn native_events_wake_the_loop_without_polling() {
     }
     assert_eq!(engine.eval("done", "wake").unwrap(), "woken!");
 }
+
+#[test]
+fn stalled_stream_responses_wait_for_the_client_without_polling() {
+    use std::io::{Read, Write};
+    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let port: u16 = engine.eval("const chunk=new Uint8Array(1<<16);globalThis.sent=0;__apps.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response(new ReadableStream({pull(c){sent++;c.enqueue(chunk);}}))}).port", "stall").unwrap().parse().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut last, mut quiet) = (String::new(), 0);
+    while quiet < 20 {
+        let delay = engine.tick().unwrap();
+        let sent = engine.eval("sent", "stall").unwrap();
+        quiet = if delay == -1 && sent == last {
+            quiet + 1
+        } else {
+            0
+        };
+        last = sent;
+        assert!(
+            Instant::now() < deadline,
+            "a stalled response kept the loop polling"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .unwrap();
+    let (mut bytes, mut total) = (vec![0; 1 << 16], 0);
+    while engine.eval("sent", "stall").unwrap() == last {
+        if let Ok(size) = stream.read(&mut bytes) {
+            total += size;
+        }
+        engine.tick().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "reading did not resume the response after {total} bytes"
+        );
+    }
+}

@@ -15,9 +15,11 @@
     if (errors) for (const error of errors) console.error('DOM: ' + error);
   };
   const drain = () => { scheduled = false; flush(); };
+  // WARNING: queued strings are joined, so a part that ends in a lone high surrogate sends U+FFFD in its place, as it would alone; otherwise it pairs with the next part and the UTF-16 lengths stop matching.
+  const alone = value => { const last = value.charCodeAt(value.length - 1); return last >= 0xd800 && last < 0xdc00 ? value.slice(0, -1) + '\u{fffd}' : value; };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
-    changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(b), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(c), c.length) : c; size += 4;
+    changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
   const call = (name, ...args) => { flush(); if (name === 'dom.html') changed = true; if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
@@ -82,18 +84,29 @@
     return rec.tag[0] !== '#' || rec.tag === '#text' ? find(parent._shadow._m, slot => slot.tag === 'slot' && (slot.attrs.get('name') ?? '') === name) : null;
   };
   const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
+  // WARNING: observers key their targets by the wrapper's `WeakRef` and targets hold their observers, as in browsers, so observers that are never disconnected don't keep removed trees alive. The global sets hold `WeakRef`s too, and loops over them drop dead entries.
+  const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
+  const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
+  const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
   const change = record => {
     if (!observers.size || quiet) return;
-    for (const observer of observers) for (const [target, options] of observer.targets) {
-      if (target !== record.target && !(options.subtree && target.contains(record.target))) continue;
-      if (!options[record.type] || (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName))) continue;
-      const old = record.type === 'attributes' ? options.attributeOldValue : record.type === 'characterData' && options.characterDataOldValue;
-      observer.records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, ...record, oldValue: old ? record.oldValue ?? null : null });
-      break;
+    for (const ref of observers) {
+      const observer = ref.deref();
+      if (!observer) { observers.delete(ref); continue; }
+      for (const [key, options] of observer.targets) {
+        const target = key.deref();
+        if (!target) { observer.targets.delete(key); continue; }
+        if (target !== record.target && !(options.subtree && target.contains(record.target))) continue;
+        if (!options[record.type] || (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName))) continue;
+        const old = record.type === 'attributes' ? options.attributeOldValue : record.type === 'characterData' && options.characterDataOldValue;
+        observer.records.push({ addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null, attributeName: null, attributeNamespace: null, ...record, oldValue: old ? record.oldValue ?? null : null });
+        break;
+      }
     }
     if (!mutationQueued) {
       mutationQueued = true;
-      queueMicrotask(() => { mutationQueued = false; for (const observer of observers) { const records = observer.takeRecords(); if (records.length) observer.callback(records, observer); } });
+      // WARNING: a throwing callback is reported and the other observers still get their records.
+      queueMicrotask(() => { mutationQueued = false; for (const ref of observers) { const observer = ref.deref(), records = observer?.takeRecords(); if (records?.length) try { observer.callback(records, observer); } catch (error) { console.error(error); } } });
     }
   };
   const dispatch = (target, event, ancestors = path(target)) => {
@@ -183,8 +196,22 @@
     for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
     return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (voids.test(rec.tag) ? '' : '</' + rec.tag + '>');
   };
-  // WARNING: custom element callbacks run in tree order after the change, like CEReactions.
-  const reactions = (root, name) => { const stack = [root]; while (stack.length) { const rec = stack.pop(), node = rec.ref?.deref(); if (node) { if (name === 'connectedMoveCallback' && !node[name]) { node.disconnectedCallback?.(); node.connectedCallback?.(); } else node[name]?.(); } if (rec.shadow) stack.push(rec.shadow); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } };
+  // WARNING: custom element callbacks run in shadow-including tree order after the change, like CEReactions. A connected element with a definition that is not upgraded yet upgrades instead.
+  const reactions = (root, name) => {
+    const stack = [root];
+    while (stack.length) {
+      const rec = stack.pop(), Type = name === 'connectedCallback' && definitions.get(rec.tag), node = Type ? of(rec) : rec.ref?.deref();
+      if (Type && !(node instanceof Type)) upgrade(node, Type);
+      else if (node) { if (name === 'connectedMoveCallback' && !node[name]) { node.disconnectedCallback?.(); node.connectedCallback?.(); } else node[name]?.(); }
+      if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]);
+      if (rec.shadow) stack.push(rec.shadow);
+    }
+  };
+  const upgrade = (node, Type) => {
+    constructing = { node }; try { new Type(); } catch (error) { console.error(error); return; } finally { constructing = null; }
+    for (const attr of Type.observedAttributes ?? []) if (node.hasAttribute(attr)) node.attributeChangedCallback?.(attr, null, node.getAttribute(attr));
+    if (node.isConnected) node.connectedCallback?.();
+  };
   const slotChanges = new Set();
   const queueSlot = slot => { if (!slotChanges.size) queueMicrotask(() => { const slots = [...slotChanges]; slotChanges.clear(); for (const slot of slots) dispatch(slot, new Event('slotchange', { bubbles: true })); }); slotChanges.add(slot); };
   const slotted = (host, name) => host._m.kids.some(kid => (kid.attrs?.get('slot') ?? '') === name && (kid.tag[0] !== '#' || kid.tag === '#text'));
@@ -207,23 +234,47 @@
   const rangesRemove = (parent, child, index) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, node => child.contains(node), parent, () => index) || moved(range, side, (node, at) => node === parent && at > index, parent, at => at - 1)).includes(true)); };
   const rangesInsert = (parent, index, count) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, at) => node === parent && at > index, parent, at => at + count)).includes(true)); };
   const rangesClear = node => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (other, at) => other === node ? at > 0 : node.contains(other), node, () => 0)).includes(true)); };
-  const blurRemoved = () => { if (!active || active.isConnected) return; const previous = active; active = null; call('dom.focus', []); dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true })); };
-  // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it.
+  // WARNING: removing the focused element blurs it, and removing a pointer capture target releases the capture at the document, as in browsers.
+  const forgetRemoved = () => {
+    if (captures.size) for (const [id, node] of captures) if (!node.isConnected) { captures.delete(id); dispatch(document, new PointerEvent('lostpointercapture', { pointerId: id, bubbles: true, composed: true })); }
+    if (!active || active.isConnected) return;
+    const previous = active; active = null; call('dom.focus', []); dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true }));
+  };
+  const ignore = () => {};
+  // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it. A `replace` that inserts calls `removed` once the old children left both trees, so their disconnected callbacks run before re-inserted ones connect again.
   const replaceAll = (node, replace) => {
     const rec = node._m, observed = observers.size > 0;
-    if (!rec.kids.length && !observed && !shadows) { replace(); return; }
+    if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
     const connected = definitions.size > 0 && node.isConnected, old = rec.kids.length && (observed || connected) ? rec.kids.map(of) : [];
     if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); rangesClear(node); }
-    replace();
-    if (connected) for (const child of old) reactions(child._m, 'disconnectedCallback');
-    blurRemoved();
+    let pending = connected && old.length > 0;
+    const removed = () => { if (pending) { pending = false; for (const child of old) reactions(child._m, 'disconnectedCallback'); } };
+    replace(removed); removed();
+    forgetRemoved();
     if (shadows) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); slotsIn(node.getRootNode(), rec); }
     if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: node.childNodes });
   };
+  const convert = children => children.map(child => child instanceof Node ? child : document.createTextNode(String(child)));
+  // WARNING: `before`, `after`, `prepend` and `replaceWith` move their nodes out before they insert them, so the reference is the first sibling that is not one of them.
+  const viable = (node, nodes) => { while (node && nodes.includes(node)) node = node.nextSibling; return node; };
+  // WARNING: like the DOM's "convert nodes into a node", several nodes leave their parents first and then insert with one record, which also lists a replaced node.
+  const insertNodes = (parent, nodes, before, replaced = null) => {
+    if (!observers.size || quiet || nodes.length < 2 && !replaced) {
+      for (const node of nodes) parent.insertBefore(node, before);
+      if (replaced && !nodes.includes(replaced) && replaced.parentNode === parent) parent.removeChild(replaced);
+      return;
+    }
+    nodes = nodes.flatMap(node => node.nodeType === 11 ? node.childNodes : [node]);
+    for (const node of nodes) node.parentNode?.removeChild(node);
+    const removed = replaced?.parentNode === parent ? [replaced] : [], previousSibling = removed.length ? replaced.previousSibling : before ? before.previousSibling : parent.lastChild;
+    quiet++;
+    try { for (const node of nodes) parent.insertBefore(node, before); if (removed.length) parent.removeChild(replaced); } finally { quiet--; }
+    if (nodes.length || removed.length) change({ type: 'childList', target: parent, addedNodes: listOf(NodeList, nodes), removedNodes: listOf(NodeList, removed), previousSibling, nextSibling: before });
+  };
   const parseFragment = (source, context) => { const fragment = document.createDocumentFragment(); load(call('dom.html', fragment._id, String(source), context)); __appsImages(fragment); if (definitions.size) customElements.upgrade(fragment); return fragment; };
-  const setHTML = (node, value, inert = false) => replaceAll(node, () => {
+  const setHTML = (node, value, inert = false) => replaceAll(node, removed => {
     const list = call('dom.html', node._id, String(value));
-    release(node); detach(node._m); load(list);
+    release(node); detach(node._m); load(list); removed();
     if (!inert) { __appsImages(node); if (definitions.size) customElements.upgrade(node); }
   });
   class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
@@ -289,7 +340,7 @@
       if (child.nodeType === 9 || this.nodeType !== 1 && this.nodeType !== 11 && this._id !== 0) throw new DOMException(child.nodeType === 9 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
       if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
       for (let up = rec; up; up = up.up ?? up.host) if (up === kid) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
-      const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected;
+      const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected, parented = !!kid.up;
       let removal = null;
       if (kid.up && (observed || shadows || ranges.size)) {
         const from = of(kid.up);
@@ -304,6 +355,7 @@
       if (connected && moving && child.isConnected) reactions(kid, 'connectedMoveCallback');
       else { if (connected) reactions(kid, 'disconnectedCallback'); if (definitions.size && child.isConnected) reactions(kid, 'connectedCallback'); }
       if (shadows) { if (this._shadow) signal(this, child); slotsIn(this.getRootNode(), kid, true); }
+      if (parented) forgetRemoved();
       if (removal) change(removal);
       if (observed) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling });
       return child;
@@ -314,9 +366,9 @@
       const record = observed ? { type: 'childList', target: this, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling } : null;
       if (this._shadow) signal(this, child);
       rangesRemove(this, child, i);
-      op(3, this._id, child._id, i); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
+      op(3, this._id, child._id); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
       if (connected) reactions(kid, 'disconnectedCallback');
-      blurRemoved();
+      forgetRemoved();
       if (record) change(record);
       return child;
     }
@@ -329,9 +381,9 @@
       if (observed) change({ type: 'childList', target: this, addedNodes, removedNodes: listOf(NodeList, [old]), previousSibling, nextSibling });
       return old;
     }
-    before(...children) { for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), this); }
-    after(...children) { const before = this.nextSibling; for (const child of children) this.parentNode?.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
-    replaceWith(...children) { this.before(...children); this.remove(); }
+    before(...children) { const parent = this.parentNode; if (!parent) return; const nodes = convert(children); let previous = this.previousSibling; while (previous && nodes.includes(previous)) previous = previous.previousSibling; const before = viable(previous ? previous.nextSibling : parent.firstChild, nodes); insertNodes(parent, nodes, before); }
+    after(...children) { const parent = this.parentNode; if (!parent) return; const nodes = convert(children), before = viable(this.nextSibling, nodes); insertNodes(parent, nodes, before); }
+    replaceWith(...children) { const parent = this.parentNode; if (!parent) return; const nodes = convert(children), before = viable(this.nextSibling, nodes); insertNodes(parent, nodes, before, this); }
     remove() { this.parentNode?.removeChild(this); }
     hasChildNodes() { return this._m.kids.length > 0; }
     contains(node) { for (let rec = node?._m; rec; rec = rec.up) if (rec === this._m) return true; return false; }
@@ -554,7 +606,7 @@
     get shadowRoot() { return this._shadow?.mode === 'open' ? this._shadow : null; }
     setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
     hasPointerCapture(id) { return captures.get(id) === this; }
-    releasePointerCapture(id) { if (captures.get(id) === this) { captures.delete(id); dispatch(this, new PointerEvent('lostpointercapture', { pointerId: id })); } }
+    releasePointerCapture(id) { if (captures.get(id) === this) { captures.delete(id); dispatch(this, new PointerEvent('lostpointercapture', { pointerId: id, bubbles: true, composed: true })); } }
     insertAdjacentElement(position, node) { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!this.parentNode) return null; if (position === 'beforebegin') this.before(node); else this.after(node); } else if (position === 'afterbegin') this.prepend(node); else if (position === 'beforeend') this.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; }
     insertAdjacentText(position, text) { this.insertAdjacentElement(position, document.createTextNode(String(text))); }
     insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.insertAdjacentElement(position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context.localName : 'body')); }
@@ -1144,7 +1196,7 @@
     get activeElement() { for (let node = active; node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
     get styleSheets() { return styleSheetsOf(this); }
   }
-  const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root._m];while(stack.length){const rec=stack.pop(),Type=definitions.get(rec.tag),node=Type&&of(rec);if(Type&&!(node instanceof Type)){constructing={node};try{new Type();}finally{constructing=null;}for(const attr of Type.observedAttributes??[])if(node.hasAttribute(attr))node.attributeChangedCallback?.(attr,null,node.getAttribute(attr));if(node.isConnected)node.connectedCallback?.();}if(rec.tag!=='template')stack.push(...rec.kids);if(rec.shadow)stack.push(rec.shadow);}}};
+  const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root._m];while(stack.length){const rec=stack.pop(),Type=definitions.get(rec.tag),node=Type&&of(rec);if(Type&&!(node instanceof Type))upgrade(node,Type);if(rec.tag!=='template')for(let i=rec.kids.length;i--;)stack.push(rec.kids[i]);if(rec.shadow)stack.push(rec.shadow);}}};
   const filterNode = (walker, node) => !(walker.whatToShow & (1 << (node.nodeType - 1))) ? 3 : walker.filter == null ? 1 : typeof walker.filter === 'function' ? walker.filter(node) : walker.filter.acceptNode(node);
   class TreeWalker {
     constructor(root, whatToShow = 0xffffffff, filter = null) { Object.assign(this, { root, whatToShow: whatToShow >>> 0, filter, currentNode: root }); }
@@ -1271,9 +1323,9 @@
     get childElementCount() { return this._m.kids.filter(rec => rec.tag[0] !== '#').length; }
     get firstElementChild() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
     get lastElementChild() { return of(this._m.kids.findLast(rec => rec.tag[0] !== '#')); }
-    append(...children) { for (const child of children) this.appendChild(child instanceof Node ? child : document.createTextNode(String(child))); }
-    prepend(...children) { const before = this.firstChild; for (const child of children) this.insertBefore(child instanceof Node ? child : document.createTextNode(String(child)), before); }
-    replaceChildren(...children) { const nodes = children.map(child => child instanceof Node ? child : document.createTextNode(String(child))); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); quiet++; try { for (const node of nodes) this.insertBefore(node, null); } finally { quiet--; } }); }
+    append(...children) { insertNodes(this, convert(children), null); }
+    prepend(...children) { const nodes = convert(children), before = viable(this.firstChild, nodes); insertNodes(this, nodes, before); }
+    replaceChildren(...children) { const nodes = convert(children); replaceAll(this, removed => { release(this); detach(this._m); op(1, this._id, ''); removed(); quiet++; try { for (const node of nodes) this.insertBefore(node, null); } finally { quiet--; } }); }
     moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); moving = true; try { this.insertBefore(node, child); } finally { moving = false; } }
     querySelector(selector) { return wrap(selectors('dom.queryWithin', this._id, selector, true)); }
     querySelectorAll(selector) { return listOf(NodeList, selectors('dom.queryWithin', this._id, selector).map(wrap)); }
@@ -1416,23 +1468,23 @@
     toString() { return call('dom.selectionText', 0, this.ranges.flatMap(range => rangeNodes(range).map(({node,start,end}) => [node._id,start,end]))); }
   }
   class MutationObserver {
-    constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this.records = []; }
+    constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this.records = []; this._ref = null; }
     observe(target, options = {}) {
       if (!(target instanceof Node)) throw new TypeError('Expected a Node');
       const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined), characterData = options.characterData ?? options.characterDataOldValue !== undefined;
       if (!options.childList && !attributes && !characterData) throw new TypeError('The options must set childList, attributes or characterData');
       if (!attributes && (options.attributeOldValue || options.attributeFilter) || !characterData && options.characterDataOldValue) throw new TypeError('Old values and filters need their kind of record');
-      this.targets.set(target, { ...options, attributes, characterData, attributeFilter: options.attributeFilter === undefined ? undefined : Array.from(options.attributeFilter, String) }); observers.add(this);
+      watch(this, target, { ...options, attributes, characterData, attributeFilter: options.attributeFilter === undefined ? undefined : Array.from(options.attributeFilter, String) }, observers);
     }
-    disconnect() { this.targets.clear(); this.records = []; observers.delete(this); } takeRecords() { return this.records.splice(0); }
+    disconnect() { unwatchAll(this, observers); this.records = []; } takeRecords() { return this.records.splice(0); }
   }
   const intersectionObservers=new Set();
   class IntersectionObserver {
-    constructor(callback,options={}){this.callback=callback;this.root=options.root??null;this.rootMargin=options.rootMargin??'0px';this.thresholds=[...new Set(Array.isArray(options.threshold)?options.threshold:[options.threshold??0])].sort((a,b)=>a-b);if(this.thresholds.some(v=>v<0||v>1))throw new RangeError('Invalid intersection threshold');this.targets=new Map();this.records=[];}
-    observe(target){this.targets.set(target,null);intersectionObservers.add(this);}unobserve(target){this.targets.delete(target);if(!this.targets.size)intersectionObservers.delete(this);}disconnect(){this.targets.clear();this.records=[];intersectionObservers.delete(this);}takeRecords(){return this.records.splice(0);}
+    constructor(callback,options={}){this.callback=callback;this.root=options.root??null;this.rootMargin=options.rootMargin??'0px';this.thresholds=[...new Set(Array.isArray(options.threshold)?options.threshold:[options.threshold??0])].sort((a,b)=>a-b);if(this.thresholds.some(v=>v<0||v>1))throw new RangeError('Invalid intersection threshold');this.targets=new Map();this.records=[];this._ref=null;}
+    observe(target){watch(this,target,null,intersectionObservers);}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
-  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); } observe(target) { this.targets.set(target, null); resizeObservers.add(this); } unobserve(target) { this.targets.delete(target); if (!this.targets.size) resizeObservers.delete(this); } disconnect() { this.targets.clear(); resizeObservers.delete(this); } }
+  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
     if (node || !rec) return node ?? null;
@@ -1445,19 +1497,29 @@
     }
     return node;
   };
-  let sweepAt = 0;
+  let sweepAt = 0, cursor = 0;
   globalThis.__appsDomSweep = (force = false) => {
     scheduled = false; flush();
-    if (!force && Date.now() < sweepAt) return;
-    sweepAt = Date.now() + 250;
+    if (!force && performance.now() < sweepAt) return;
+    sweepAt = performance.now() + 250;
     const dead = [];
-    for (let i = 0; i < wrapped.length;) { const rec = wrapped[i]; if (rec.ref?.deref()) { i++; continue; } dead.push(rec.id); orphans.push(rec); rec.ref = null; wrapped[i] = wrapped[wrapped.length - 1]; wrapped.pop(); }
+    if (force) cursor = 0;
+    // WARNING: timed sweeps check a slice of the wrappers and continue where the last one stopped, so their cost doesn't grow with the page.
+    for (let budget = force ? wrapped.length : 4096; budget-- && wrapped.length;) {
+      if (cursor >= wrapped.length) cursor = 0;
+      const rec = wrapped[cursor];
+      if (rec.ref?.deref()) { cursor++; continue; }
+      dead.push(rec.id); orphans.push(rec); rec.ref = null; wrapped[cursor] = wrapped[wrapped.length - 1]; wrapped.pop();
+    }
     if (dead.length || registered.length || changed) { changed = false; call('dom.release', dead, registered.splice(0)); }
-    // WARNING: Rust frees detached trees without live wrappers in the release above, so their records go too.
-    for (let root of orphans.splice(0)) {
-      while (root.up ?? root.host) root = root.up ?? root.host;
+    if (!orphans.length) return;
+    // WARNING: Rust frees detached trees without live wrappers in the release above, so their records go too. Each tree is walked once.
+    const seen = new Set(), roots = [];
+    for (let rec of orphans) for (; !seen.has(rec); rec = rec.up ?? rec.host) { seen.add(rec); if (!(rec.up ?? rec.host)) { roots.push(rec); break; } }
+    orphans.length = 0;
+    for (const root of roots) {
       const stack = [root], gone = [];
-      while (stack.length) { const rec = stack.pop(); if (rec.ref?.deref()) { gone.length = 0; break; } gone.push(rec); stack.push(...rec.kids); if (rec.shadow) stack.push(rec.shadow); }
+      while (stack.length) { const rec = stack.pop(); if (rec.ref?.deref()) { gone.length = 0; break; } gone.push(rec); for (const kid of rec.kids) stack.push(kid); if (rec.shadow) stack.push(rec.shadow); }
       for (const rec of gone) if (records[rec.id] === rec) records[rec.id] = undefined;
     }
   };
@@ -1480,7 +1542,7 @@
     resetTransform() { this._op(3, 1, 0, 0, 1, 0, 0); } transform(a, b, c, d, e, f) { this._op(2, a, b, c, d, e, f); }
     scale(x, y) { this._op(2, x, 0, 0, y, 0, 0); } translate(x, y) { this._op(2, 1, 0, 0, 1, x, y); } rotate(a) { const cos = Math.cos(a), sin = Math.sin(a); this._op(2, cos, sin, -sin, cos, 0, 0); }
     fillRect(x, y, width, height) { this._op(21, x, y, width, height); } strokeRect(x, y, width, height) { this._op(22, x, y, width, height); } clearRect(x, y, width, height) { this._op(23, x, y, width, height); }
-    fillText(text, x, y) { text = String(text); this._texts.push(text); this._op(24, text.length, x, y); }
+    fillText(text, x, y) { text = String(text); this._texts.push(alone(text)); this._op(24, text.length, x, y); }
     measureText(text) { return call('dom.measureText', this.canvas._id, String(text), this.font); }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
     getImageData(x,y,width,height) { this._flush(); if (!width || !height) throw new DOMException('Image dimensions must be nonzero','IndexSizeError'); return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels',this.canvas._id,x,y,Math.abs(width),Math.abs(height))),Math.abs(width),Math.abs(height)); }
@@ -1495,16 +1557,18 @@
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
     if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
     if (this._state[name] === value) return;
-    this._state[name] = value; if (code < 9) { this._texts.push(value); this._op(code, value.length); } else this._op(code, value);
+    this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);
   } });
   class ImageData {
     constructor(data,width,height) { if (typeof data==='number') {height=width;width=data;data=new Uint8ClampedArray(width*height*4);} else {if (!(data instanceof Uint8ClampedArray)) throw new TypeError('Expected Uint8ClampedArray');height??=data.length/(width*4);} if(!Number.isInteger(width)||!Number.isInteger(height)||width<=0||height<=0||data.length!==width*height*4) throw new DOMException('Invalid image dimensions','IndexSizeError');Object.assign(this,{data,width,height,colorSpace:'srgb'}); }
   }
+  // WARNING: like `dimension()` in render, sizes parse as HTML non-negative integers: leading digits after whitespace and an optional `+`.
+  const canvasSize = (value, fallback) => { const digits = /^[\t\n\f\r ]*\+?(\d+)/.exec(value ?? '')?.[1], size = digits ? Number(digits) : NaN; return size <= 2147483647 ? size : fallback; };
   class HTMLCanvasElement extends HTMLElement {
     get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
     get clientHeight(){const height=this.getBoundingClientRect().height;if(height)return height;const value=getComputedStyle(this).height;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.height;}
-    get width() { const v = this.getAttribute('width'); return v !== null && /^\d+$/.test(v) ? Number(v) : 300; } set width(v) { this.setAttribute('width', Number(v) >>> 0); }
-    get height() { const v = this.getAttribute('height'); return v !== null && /^\d+$/.test(v) ? Number(v) : 150; } set height(v) { this.setAttribute('height', Number(v) >>> 0); }
+    get width() { return canvasSize(this.getAttribute('width'), 300); } set width(v) { this.setAttribute('width', Number(v) >>> 0); }
+    get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { this.setAttribute('height', Number(v) >>> 0); }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
     toDataURL(type='image/png') { if (type!=='image/png') throw new DOMException('Only PNG encoding is supported','NotSupportedError');this._context?._flush?.();return call('dom.canvasURL',this._id); }
     toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.from(atob(data),c=>c.charCodeAt(0))],{type:'image/png'}))); }
@@ -1648,7 +1712,7 @@
     removeListener(callback) { this.removeEventListener('change', callback); }
   }
   Object.assign(globalThis, { MediaQueryList, MediaQueryListEvent, matchMedia: query => new MediaQueryList(query) });
-  globalThis.__appsLayout = () => { for (const observer of resizeObservers) { const entries = []; for (const [target, previous] of observer.targets) { const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(target, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } if (entries.length) observer.callback(entries, observer); } }; 
+  globalThis.__appsLayout = () => { for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -1671,13 +1735,17 @@
     if(!intersectionObservers.size)return;
     call('dom.layout',false,true);
     let viewport;
-    for(const observer of intersectionObservers){
+    for(const ref of intersectionObservers){
+      const observer=ref.deref();
+      if(!observer){intersectionObservers.delete(ref);continue;}
       const m=layout(),root=observer.root?.getBoundingClientRect()??new DOMRect(0,0,...(viewport??=host('dom.viewport')));
       const margins=observer.rootMargin.trim().split(/\s+/).map(value=>value.endsWith('%')?parseFloat(value)*root.width/100:parseFloat(value));
       if(margins.some(v=>!Number.isFinite(v)))throw new DOMException('Invalid rootMargin','SyntaxError');
       const [top,right=top,bottom=top,left=right]=margins,stop=observer.root?._m;
       const rootBounds=new DOMRect(root.x-left,root.y-top,root.width+left+right,root.height+top+bottom),rl=rootBounds.left,rt=rootBounds.top,rr=rootBounds.right,rb=rootBounds.bottom;
-      for(const [target,previous]of observer.targets){
+      for(const [key,previous]of observer.targets){
+        const target=key.deref();
+        if(!target){observer.targets.delete(key);continue;}
         const i=4+target._id*8,inside=i<limit&&!(marks[target._id]&16),bx=inside?m[i]:0,by=inside?m[i+1]:0,bw=inside?m[i+2]:0,bh=inside?m[i+3]:0;
         let x=Math.max(bx,rl),y=Math.max(by,rt),r=Math.min(bx+bw,rr),b=Math.min(by+bh,rb);
         for(let rec=target._m.up;rec&&rec.tag[0]!=='#'&&rec!==stop;rec=rec.up){if(marks[rec.id]&4){const j=4+rec.id*8;x=Math.max(x,m[j]);y=Math.max(y,m[j+1]);r=Math.min(r,m[j]+m[j+2]);b=Math.min(b,m[j+1]+m[j+3]);}}
@@ -1685,7 +1753,7 @@
         let changed=previous===null||previous.isIntersecting!==isIntersecting;
         for(let k=0;!changed&&k<observer.thresholds.length;k++)changed=(previous.ratio<observer.thresholds[k])!==(ratio<observer.thresholds[k]);
         if(changed)observer.records.push({time:performance.now(),target,rootBounds,boundingClientRect:new DOMRect(bx,by,bw,bh),intersectionRect:new DOMRect(x,y,Math.max(0,r-x),Math.max(0,b-y)),isIntersecting,intersectionRatio:ratio});
-        if(previous===null)observer.targets.set(target,{ratio,isIntersecting});else{previous.ratio=ratio;previous.isIntersecting=isIntersecting;}
+        if(previous===null)observer.targets.set(key,{ratio,isIntersecting});else{previous.ratio=ratio;previous.isIntersecting=isIntersecting;}
       }
       const entries=observer.takeRecords();if(entries.length)observer.callback(entries,observer);
     }

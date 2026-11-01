@@ -4,7 +4,7 @@ use super::{
     cull,
     paint::{DomBox, PaintLayers, Stacked, Turned, paint_layers},
     scrollbar,
-    text::{InlineText, TextHighlight, paint_text},
+    text::InlineText,
 };
 use crate::style::Prop;
 use crate::{
@@ -15,7 +15,7 @@ use renderer::{
     AnyElement, Bounds, MouseButton, SharedString, div, img, point, prelude::*, px, relative, rgba,
     size,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 pub(super) struct Build<'a> {
     pub(super) doc: &'a Document,
@@ -43,6 +43,13 @@ pub(super) struct Build<'a> {
 }
 
 type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
+/// An inline SVG's style, its size and content hash, its source, and its parsed boxes.
+pub(super) type Svg = (
+    Rc<style::Style>,
+    ([f32; 2], u64),
+    String,
+    crate::dom::SvgBoxes,
+);
 pub(super) type Margins = (
     rustc_hash::FxHashMap<usize, Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>>,
     rustc_hash::FxHashMap<usize, ([f32; 2], [f32; 2], bool)>,
@@ -412,17 +419,13 @@ pub(super) fn element(
         }
     }
     if node.tag == "canvas" {
-        el = el
-            .w(px(node
-                .attrs
-                .get("width")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300.)))
-            .h(px(node
-                .attrs
-                .get("height")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(150.)));
+        let size = |name: &str, default: f32| {
+            node.attrs
+                .get(name)
+                .and_then(|value| dimension(value, true))
+                .unwrap_or(default)
+        };
+        el = el.w(px(size("width", 300.))).h(px(size("height", 150.)));
         if let Some(image) = view.images.borrow().get(&id) {
             el = el.child(img(image.clone()).size_full());
         }
@@ -464,8 +467,7 @@ pub(super) fn element(
             let attr = |name: &str| {
                 node.attrs
                     .get(name)
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .filter(|value| value.is_finite() && *value >= 0.)
+                    .and_then(|value| dimension(value, false))
             };
             let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
             if image.is_none() && vector.is_none() {
@@ -516,8 +518,7 @@ pub(super) fn element(
                     && let Some(length) = node
                         .attrs
                         .get(name)
-                        .and_then(|value| value.parse::<f32>().ok())
-                        .filter(|value| value.is_finite() && *value >= 0.)
+                        .and_then(|value| dimension(value, false))
                 {
                     el = if horizontal {
                         el.w(px(length))
@@ -532,68 +533,59 @@ pub(super) fn element(
         let width = style
             .get(Prop::WIDTH)
             .and_then(|v| units.resolve(v, containing[0]))
-            .or_else(|| node.attrs.get("width").and_then(|v| v.parse().ok()))
+            .or_else(|| node.attrs.get("width").and_then(|v| dimension(v, false)))
             .unwrap_or(24.)
             .clamp(1., 4096.);
         let height = style
             .get(Prop::HEIGHT)
             .and_then(|v| units.resolve(v, containing[1]))
-            .or_else(|| node.attrs.get("height").and_then(|v| v.parse().ok()))
+            .or_else(|| node.attrs.get("height").and_then(|v| dimension(v, false)))
             .unwrap_or(24.)
             .clamp(1., 4096.);
-        let color = style.get(Prop::COLOR).unwrap_or("");
+        let paint = [
+            Prop::FILL,
+            Prop::FILL_OPACITY,
+            Prop::FILL_RULE,
+            Prop::STROKE,
+            Prop::STROKE_WIDTH,
+            Prop::STROKE_OPACITY,
+            Prop::STROKE_LINECAP,
+            Prop::STROKE_LINEJOIN,
+            Prop::COLOR,
+        ];
+        // WARNING: a source embeds the SVG's subtree, the paint values above and which attributes the style
+        // overrides, so any node change checks it again below, while an animated transform keeps it.
+        let latest = doc.nodes.latest();
         let cached = view
             .host
             .borrow()
             .dom
             .get(&view.id)
             .and_then(|state| state.svg_sources.get(&id))
-            .is_some_and(|(size, old, _)| *size == [width, height] && old == color);
+            .is_some_and(|(size, revision, old, _)| {
+                *size == [width, height]
+                    && *revision == latest
+                    && (Rc::ptr_eq(old, style)
+                        || paint.iter().all(|&prop| old.get(prop) == style.get(prop))
+                            && node.attrs.keys().all(|key| {
+                                Prop::find(key)
+                                    .is_none_or(|prop| old.contains(prop) == style.contains(prop))
+                            }))
+            });
         if !cached {
-            let mut source = format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\""
-            );
-            for (key, value) in &node.attrs {
-                if !matches!(
-                    key.as_str(),
-                    "width" | "height" | "xmlns" | "xmlns:xlink" | "style"
-                ) && Prop::find(key).is_none_or(|prop| !style.contains(prop))
-                {
-                    source.push_str(&format!(" {key}=\"{}\"", crate::dom::escape(value)));
-                }
-            }
-            source.push_str(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
-            for prop in [
-                Prop::FILL,
-                Prop::FILL_OPACITY,
-                Prop::FILL_RULE,
-                Prop::STROKE,
-                Prop::STROKE_WIDTH,
-                Prop::STROKE_OPACITY,
-                Prop::STROKE_LINECAP,
-                Prop::STROKE_LINEJOIN,
-                Prop::COLOR,
-            ] {
-                if let Some(value) = style.get(prop) {
-                    source.push_str(&format!(
-                        " {}=\"{}\"",
-                        prop.name(),
-                        crate::dom::escape(value)
-                    ));
-                }
-            }
-            source.push('>');
             let mut scope = id;
             while let Some(parent) = doc.nodes[scope].parent {
                 scope = parent;
             }
             let mut pending = vec![id];
             let mut visited = std::collections::HashSet::new();
-            source.push_str("<defs>");
+            let mut targets = Vec::new();
+            let mut hasher = rustc_hash::FxHasher::default();
             while let Some(child) = pending.pop() {
                 if !visited.insert(child) {
                     continue;
                 }
+                std::hash::Hash::hash(&(child, doc.nodes.revision(child)), &mut hasher);
                 let child = &doc.nodes[child];
                 pending.extend(&child.children);
                 if child.tag == "use"
@@ -619,9 +611,47 @@ pub(super) fn element(
                             })
                     && !visited.contains(&target)
                 {
-                    source.push_str(&doc.serialize(target));
+                    targets.push(target);
                     pending.push(target);
                 }
+            }
+            // WARNING: a source and its parsed boxes are kept while the style, the size and the elements it copies are unchanged.
+            let key = ([width, height], std::hash::Hasher::finish(&hasher));
+            let kept = view
+                .svgs
+                .borrow()
+                .get(&id)
+                .and_then(|(old, at, source, boxes)| {
+                    (*at == key && (Rc::ptr_eq(old, style) || **old == **style))
+                        .then(|| (source.clone(), boxes.clone()))
+                });
+            let (source, boxes) = kept.unwrap_or_else(|| {
+            let mut source = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\""
+            );
+            for (key, value) in &node.attrs {
+                if !matches!(
+                    key.as_str(),
+                    "width" | "height" | "xmlns" | "xmlns:xlink" | "style"
+                ) && Prop::find(key).is_none_or(|prop| !style.contains(prop))
+                {
+                    source.push_str(&format!(" {key}=\"{}\"", crate::dom::escape(value)));
+                }
+            }
+            source.push_str(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+            for prop in paint {
+                if let Some(value) = style.get(prop) {
+                    source.push_str(&format!(
+                        " {}=\"{}\"",
+                        prop.name(),
+                        crate::dom::escape(value)
+                    ));
+                }
+            }
+            source.push('>');
+            source.push_str("<defs>");
+            for &target in &targets {
+                source.push_str(&doc.serialize(target));
             }
             source.push_str("</defs>");
             for child in &node.children {
@@ -652,7 +682,12 @@ pub(super) fn element(
                 end = start + "currentcolor".len();
             }
             replaced.push_str(&source[end..]);
-            source = replaced;
+            let boxes = (String::new(), names, [0.; 2], Vec::new(), [0.; 4]);
+            view.svgs
+                .borrow_mut()
+                .insert(id, (style.clone(), key, replaced.clone(), boxes.clone()));
+            (replaced, boxes)
+            });
             let mut host = view.host.borrow_mut();
             let state = host.dom.entry(view.id).or_default();
             // WARNING: paint only checks the raster size of inline SVGs, so a changed source drops the raster here.
@@ -661,12 +696,10 @@ pub(super) fn element(
             {
                 state.retired.push(image);
             }
-            state
-                .svg_boxes
-                .insert(id, (String::new(), names, [0.; 2], Vec::new(), [0.; 4]));
+            state.svg_boxes.insert(id, boxes);
             state
                 .svg_sources
-                .insert(id, ([width, height], color.to_owned(), source));
+                .insert(id, ([width, height], latest, style.clone(), source));
         }
         el = el
             .w(px(width))
@@ -810,121 +843,86 @@ pub(super) fn element(
                 0x757575ff
             }));
         let single_line = node.tag != "textarea";
-        // The text is drawn in the content box.
         let padding = units.edges(style, style::PADDING, containing[0]);
-        let entity = view.clone();
-        el = el.cursor(renderer::CursorStyle::IBeam).child(
-            renderer::canvas(
-                |_, _| (),
-                move |bounds, _, window| {
-                    let view = &*entity;
-                    let host = view.host.borrow();
-                    let state = host.dom.get(&view.id);
-                    let selected = state.and_then(|s| s.selection.get(&id).copied());
-                    let focused = state.and_then(|s| s.focus) == Some(id);
-                    drop(host);
-                    let shown = if text.is_empty() {
-                        placeholder.clone()
-                    } else {
-                        text.clone()
-                    };
-                    let color = if text.is_empty() {
-                        placeholder_color
-                    } else {
-                        text_color
-                    };
-                    let mut offset = 0;
-                    for (row, text) in shown.split('\n').enumerate() {
-                        let run = renderer::TextRun {
-                            len: text.len(),
-                            font: face.clone(),
-                            color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                            letter_spacing: renderer::px(0.),
-                            word_spacing: renderer::px(0.),
-                            font_size: None,
-                        };
-                        let line = window.text_system().shape_line(
-                            text.to_owned().into(),
-                            px(font_size),
-                            std::slice::from_ref(&run),
-                            None,
-                        );
-                        let length = text.encode_utf16().count();
-                        // A single-line input centers its line, like browsers.
-                        let middle = if single_line {
-                            ((bounds.size.height - px(line_height)) / 2.).max(px(0.))
-                        } else {
-                            px(0.)
-                        };
-                        let top = bounds.top() + middle + px(row as f32 * line_height);
-                        let mut highlights = Vec::new();
-                        if focused
-                            && let Some([start, end]) = selected
-                            && start.min(end) <= offset + length
-                            && start.max(end) >= offset
-                        {
-                            let left = crate::dom::utf16_index(
-                                text,
-                                start.min(end).saturating_sub(offset),
-                            );
-                            let right = crate::dom::utf16_index(
-                                text,
-                                start.max(end).saturating_sub(offset),
-                            );
-                            let x = line.x_for_index(left);
-                            let end_x = line.x_for_index(right);
-                            if start == end {
-                                window.paint_quad(renderer::fill(
-                                    Bounds::new(
-                                        point(bounds.left() + x, top),
-                                        size(px(1.), px(line_height)),
-                                    ),
-                                    caret_color,
-                                ));
-                            } else if end_x > x {
-                                highlights.push(TextHighlight {
-                                    range: left..right,
-                                    color: selection_colors.0.map(rgba),
-                                    background: rgba(selection_colors.1),
-                                });
-                            }
-                        }
-                        if highlights.is_empty() {
-                            line.paint(
-                                point(bounds.left(), top),
-                                px(line_height),
-                                renderer::TextAlign::Left,
-                                None,
-                                window,
-                            );
-                        } else {
-                            paint_text(
-                                &line,
-                                &[],
-                                point(bounds.left(), top),
-                                px(line_height),
-                                std::slice::from_ref(&run),
-                                0,
-                                &highlights,
-                                &[],
-                                text,
-                                None,
-                                window,
-                            );
-                        }
-                        offset += length + 1;
-                    }
-                },
-            )
+        let empty = text.is_empty();
+        let shown: Rc<str> = if empty { placeholder } else { text }.into();
+        let run = renderer::TextRun {
+            len: shown.len(),
+            font: face,
+            color: if empty { placeholder_color } else { text_color },
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+            letter_spacing: style::spacing(style, &units, Prop::LETTER_SPACING),
+            word_spacing: px(0.),
+            font_size: None,
+        };
+        // WARNING: the box that clips the text scrolls with the field's handle, so the field itself does not track it.
+        let handle = view
+            .host
+            .borrow_mut()
+            .dom
+            .entry(view.id)
+            .or_default()
+            .scroll
+            .entry(id)
+            .or_default()
+            .clone();
+        let field = super::input::FieldText {
+            inner: renderer::StyledText::new(shown.clone()).with_runs(vec![run.clone()]),
+            id,
+            view: view.clone(),
+            placeholder: empty,
+            password: (node.password() && !empty)
+                .then(|| node.current_value().unwrap_or("").to_owned()),
+            text: shown,
+            run,
+            single_line,
+            caret: caret_color,
+            selection: selection_colors,
+            handle: handle.clone(),
+        };
+        let mut clip = div()
             .absolute()
-            .top(px(padding[0]))
-            .right(px(padding[1]))
-            .bottom(px(padding[2]))
-            .left(px(padding[3])),
-        );
+            .track_scroll(&handle)
+            .text_size(px(font_size))
+            .line_height(px(line_height));
+        clip.style().restrict_scroll_to_axis = true;
+        // Like browsers, an input clips its line to the content box and centers it, while a textarea
+        // wraps its text and scrolls it under its padding.
+        el = el
+            .cursor(renderer::CursorStyle::IBeam)
+            .child(if single_line {
+                let line = div().flex_shrink_0().child(field);
+                clip.top(px(padding[0]))
+                    .right(px(padding[1]))
+                    .bottom(px(padding[2]))
+                    .left(px(padding[3]))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .child(match line_justify {
+                        Some(renderer::JustifyContent::End) => line.ml_auto(),
+                        Some(renderer::JustifyContent::Center) => line.ml_auto().mr_auto(),
+                        _ => line,
+                    })
+            } else {
+                clip.style().overflow.x = renderer::Overflow::Scroll;
+                clip.top_0()
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .left_0()
+                    .pt(px(padding[0]))
+                    .pr(px(padding[1]))
+                    .pb(px(padding[2]))
+                    .pl(px(padding[3]))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(field)
+            });
     }
     if let Some((ink, alpha)) = style.get(Prop::COLOR).and_then(style::color) {
         el = el.text_color(rgba((ink << 8) | alpha as u32));
@@ -1012,8 +1010,14 @@ pub(super) fn element(
     }
     // CSS: `visible` and `clip` compute to `auto` and `hidden` when the other axis scrolls or hides. The root
     // and the body keep theirs, as the page scrolls for them.
-    let overflow =
-        [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| style.get(prop).unwrap_or("visible"));
+    // A textarea scrolls its text like Chrome, whose textareas are `overflow: auto`.
+    let overflow = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
+        style.get(prop).unwrap_or(if node.tag == "textarea" {
+            "auto"
+        } else {
+            "visible"
+        })
+    });
     let page = matches!(node.tag.as_str(), "html" | "body");
     let boxed = !page
         && overflow
@@ -1027,7 +1031,8 @@ pub(super) fn element(
         _ if boxed => renderer::Overflow::Scroll,
         _ => renderer::Overflow::Visible,
     });
-    if overflow != [renderer::Overflow::Visible; 2] {
+    // WARNING: a form field's text clips and scrolls in its own box, so the field keeps its outline unclipped.
+    if overflow != [renderer::Overflow::Visible; 2] && !editable {
         el.style().overflow.x = overflow[0];
         el.style().overflow.y = overflow[1];
     }
@@ -1993,7 +1998,9 @@ pub(super) fn element(
         // padding and border under the text.
         let floor = margin[2].min(0.) + parent
             - match () {
-                _ if matches!(display, "inline-block" | "inline-grid") && !replaced => f32::INFINITY,
+                _ if matches!(display, "inline-block" | "inline-grid") && !replaced => {
+                    f32::INFINITY
+                }
                 _ if edge => 0.,
                 _ if display == "inline" => below(style, units.font),
                 _ => padding[2] + borders[2] + below(style, units.font),
@@ -2046,76 +2053,15 @@ pub(super) fn element(
             };
             el = el.child(image);
         } else if let Some((image, fit)) = cropped {
-            let view = view.clone();
-            // WARNING: the renderer rounds the fitted image bounds, so overflowing fits paint a cached crop of the visible part.
+            // An overflowing fit paints the part of its texture that the box shows, so the pixels are never copied.
             el = el.child(
                 renderer::canvas(
                     |_, _| (),
                     move |bounds, _, window| {
                         let natural = image.size();
-                        let [width, height] = [u32::from(natural.width), u32::from(natural.height)];
-                        let fitted = fit.get_bounds(bounds, natural);
-                        let visible = fitted.intersect(&bounds);
-                        if width == 0
-                            || height == 0
-                            || visible.size.width <= px(0.)
-                            || visible.size.height <= px(0.)
-                        {
-                            return;
-                        }
-                        let scale = [
-                            width as f32 / f32::from(fitted.size.width),
-                            height as f32 / f32::from(fitted.size.height),
-                        ];
-                        let x = ((f32::from(visible.left() - fitted.left()) * scale[0]).round()
-                            as u32)
-                            .min(width - 1);
-                        let y = ((f32::from(visible.top() - fitted.top()) * scale[1]).round()
-                            as u32)
-                            .min(height - 1);
-                        let crop = [
-                            x,
-                            y,
-                            ((f32::from(visible.size.width) * scale[0]).round() as u32)
-                                .clamp(1, width - x),
-                            ((f32::from(visible.size.height) * scale[1]).round() as u32)
-                                .clamp(1, height - y),
-                        ];
-                        let shown = if crop == [0, 0, width, height] {
-                            Some(image.clone())
-                        } else {
-                            let view = &*view;
-                            let mut host = view.host.borrow_mut();
-                            let state = host.dom.entry(view.id).or_default();
-                            let key = {
-                                use std::hash::{Hash, Hasher};
-                                let mut hasher = std::hash::DefaultHasher::new();
-                                (image.id, crop).hash(&mut hasher);
-                                hasher.finish()
-                            };
-                            match state.image_crops.get(&id) {
-                                Some((cached, shown)) if *cached == key => Some(shown.clone()),
-                                _ => Some(image.bytes()).map(|bytes| {
-                                    let row = crop[2] as usize * 4;
-                                    let mut pixels = Vec::with_capacity(row * crop[3] as usize);
-                                    for y in crop[1]..crop[1] + crop[3] {
-                                        let at = (y * width + crop[0]) as usize * 4;
-                                        pixels.extend_from_slice(&bytes[at..at + row]);
-                                    }
-                                    let shown = Arc::new(renderer::RenderImage::new(
-                                        crop[2], crop[3], pixels,
-                                    ));
-                                    if let Some((_, old)) =
-                                        state.image_crops.insert(id, (key, shown.clone()))
-                                    {
-                                        window.drop_image(old);
-                                    }
-                                    shown
-                                }),
-                            }
-                        };
-                        if let Some(shown) = shown {
-                            window.paint_image(visible, visible, corners, shown, false);
+                        if u32::from(natural.width) > 0 && u32::from(natural.height) > 0 {
+                            let fitted = fit.get_bounds(bounds, natural);
+                            window.paint_image(bounds, fitted, corners, image.clone(), false);
                         }
                     },
                 )
@@ -2332,8 +2278,10 @@ pub(super) fn element(
     };
     let mut bars = None;
     if let Some(handle) = handle {
-        el = el.track_scroll(&handle);
-        el.style().restrict_scroll_to_axis = true;
+        if !editable {
+            el = el.track_scroll(&handle);
+            el.style().restrict_scroll_to_axis = true;
+        }
         bars = Some(scrollbar::Scrollbar {
             id,
             handle,
@@ -3034,128 +2982,126 @@ pub(super) fn element(
                 }
             };
         let mut widest = None;
-        let grid = if let Some(display) = style
-            .get(Prop::DISPLAY)
-            .filter(|v| matches!(*v, "grid" | "inline-grid"))
-        {
-            if display == "inline-grid"
-                && slot.is_none()
-                && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
+        let grid =
+            if let Some(display) = style
+                .get(Prop::DISPLAY)
+                .filter(|v| matches!(*v, "grid" | "inline-grid"))
             {
-                let extent =
-                    padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
-                let [min, max, ..] = super::grid::intrinsic(
-                    doc,
-                    id,
-                    styles,
-                    None,
-                    None,
-                    text,
-                    &mut measured.borrow_mut(),
-                );
-                content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
-            }
-            let horizontal = padding[1] + padding[3] + borders[1] + borders[3];
-            let vertical = padding[0] + padding[2] + borders[0] + borders[2];
-            let mut tracked = [None; 2];
-            if shrunk {
-                let [_, max, ..] = super::grid::intrinsic(
-                    doc,
-                    id,
-                    styles,
-                    None,
-                    None,
-                    text,
-                    &mut measured.borrow_mut(),
-                );
-                let max = (max - horizontal - margin[1] - margin[3]).max(0.);
-                widest = Some(max);
-                let last = view.host.borrow().dom.get(&view.id).and_then(|state| {
-                    state
-                        .bounds
-                        .get(&id)
-                        .map(|bounds| (bounds[2] - horizontal).max(0.))
-                });
-                // Laid-out bounds are in layout units, so a fitting grid may look narrower.
-                content[0] = last.map_or(content[0].min(max), |last| {
-                    if last + 0.5 >= max {
-                        last.max(max)
+                if display == "inline-grid"
+                    && slot.is_none()
+                    && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
+                {
+                    let extent =
+                        padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
+                    let [min, max, ..] = super::grid::intrinsic(
+                        doc,
+                        id,
+                        styles,
+                        None,
+                        None,
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
+                }
+                let horizontal = padding[1] + padding[3] + borders[1] + borders[3];
+                let vertical = padding[0] + padding[2] + borders[0] + borders[2];
+                let mut tracked = [None; 2];
+                if shrunk {
+                    let [_, max, ..] = super::grid::intrinsic(
+                        doc,
+                        id,
+                        styles,
+                        None,
+                        None,
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    let max = (max - horizontal - margin[1] - margin[3]).max(0.);
+                    widest = Some(max);
+                    // WARNING: tracks size the untransformed box, so they read its laid-out size, not its window bounds.
+                    let last =
+                        view.host.borrow().dom.get(&view.id).and_then(|state| {
+                            state.cull.widths.get(&id).map(|size| size[0].max(0.))
+                        });
+                    // Laid-out bounds are in layout units, so a fitting grid may look narrower.
+                    content[0] = last.map_or(content[0].min(max), |last| {
+                        if last + 0.5 >= max {
+                            last.max(max)
+                        } else {
+                            last
+                        }
+                    });
+                    tracked[0] = Some((last.unwrap_or(f32::NAN), horizontal));
+                }
+                let height =
+                    if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
+                        Some(content[1])
+                    } else if flexed {
+                        let height = view.host.borrow().dom.get(&view.id).and_then(|state| {
+                            state.cull.widths.get(&id).map(|size| size[1].max(0.))
+                        });
+                        tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
+                        height
                     } else {
-                        last
-                    }
-                });
-                tracked[0] = Some((last.unwrap_or(f32::NAN), horizontal));
-            }
-            let height = if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
-                Some(content[1])
-            } else if flexed {
-                let height = view.host.borrow().dom.get(&view.id).and_then(|state| {
-                    state
-                        .bounds
-                        .get(&id)
-                        .map(|bounds| (bounds[3] - vertical).max(0.))
-                });
-                tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
-                height
+                        None
+                    };
+                if tracked.iter().any(Option::is_some) {
+                    let mut host = view.host.borrow_mut();
+                    host.dom
+                        .entry(view.id)
+                        .or_default()
+                        .flexed_grids
+                        .insert(id, tracked);
+                }
+                let cached = view
+                    .host
+                    .borrow()
+                    .dom
+                    .get(&view.id)
+                    .and_then(|state| state.grids.get(&id))
+                    .filter(|(width, cached, inherited, _)| {
+                        *width == content[0]
+                            && *cached == height
+                            && inherited.as_ref() == slot.as_ref().map(|(_, grid)| grid)
+                    })
+                    .map(|(_, _, _, grid)| grid.clone());
+                Some(cached.unwrap_or_else(|| {
+                    let grid = super::grid::layout(
+                        doc,
+                        id,
+                        styles,
+                        Some(content[0]),
+                        height,
+                        slot.as_ref().map(|(_, grid)| grid),
+                        view.host
+                            .borrow()
+                            .dom
+                            .get(&view.id)
+                            .map(|dom| &dom.baselines),
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    view.host
+                        .borrow_mut()
+                        .dom
+                        .entry(view.id)
+                        .or_default()
+                        .grids
+                        .insert(
+                            id,
+                            (
+                                content[0],
+                                height,
+                                slot.as_ref().map(|(_, grid)| grid.clone()),
+                                grid.clone(),
+                            ),
+                        );
+                    grid
+                }))
             } else {
                 None
             };
-            if tracked.iter().any(Option::is_some) {
-                let mut host = view.host.borrow_mut();
-                host.dom
-                    .entry(view.id)
-                    .or_default()
-                    .flexed_grids
-                    .insert(id, tracked);
-            }
-            let cached = view
-                .host
-                .borrow()
-                .dom
-                .get(&view.id)
-                .and_then(|state| state.grids.get(&id))
-                .filter(|(width, cached, inherited, _)| {
-                    *width == content[0]
-                        && *cached == height
-                        && inherited.as_ref() == slot.as_ref().map(|(_, grid)| grid)
-                })
-                .map(|(_, _, _, grid)| grid.clone());
-            Some(cached.unwrap_or_else(|| {
-                let grid = super::grid::layout(
-                    doc,
-                    id,
-                    styles,
-                    Some(content[0]),
-                    height,
-                    slot.as_ref().map(|(_, grid)| grid),
-                    view.host
-                        .borrow()
-                        .dom
-                        .get(&view.id)
-                        .map(|dom| &dom.baselines),
-                    text,
-                    &mut measured.borrow_mut(),
-                );
-                view.host
-                    .borrow_mut()
-                    .dom
-                    .entry(view.id)
-                    .or_default()
-                    .grids
-                    .insert(
-                        id,
-                        (
-                            content[0],
-                            height,
-                            slot.as_ref().map(|(_, grid)| grid.clone()),
-                            grid.clone(),
-                        ),
-                    );
-                grid
-            }))
-        } else {
-            None
-        };
         if let Some(grid) = &grid {
             el = el.flex().flex_col();
             // Layout sees no items in the grid, so an empty first line gives it its baseline.
@@ -3282,7 +3228,7 @@ pub(super) fn element(
             let host = view.host.borrow();
             if let Some(dom) = host.dom.get(&view.id)
                 && let Some(&[left, ..]) = dom.bounds.get(&id)
-                && let Some(&width) = dom.cull.widths.get(&id)
+                && let Some(&[width, _]) = dom.cull.widths.get(&id)
             {
                 let gap = if flexbox {
                     style
@@ -3886,7 +3832,10 @@ pub(super) fn element(
         perspective: parent_perspective.clone().zip(parent),
         units,
         revision: info[id].revision,
-        sides: padding[1] + padding[3] + borders[1] + borders[3],
+        sides: [
+            padding[1] + padding[3] + borders[1] + borders[3],
+            padding[0] + padding[2] + borders[0] + borders[2],
+        ],
         margin,
         cell: slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]),
         grid: node
@@ -3999,7 +3948,44 @@ pub(super) fn element(
     }
 }
 
-/// Whether a child takes part in its parent's flow: not a comment, blank text, hidden or out of flow.
+/// An HTML `width` or `height` attribute in pixels, parsed like browsers: leading digits after
+/// whitespace, with a fraction unless `integer`, so `100px` is 100 and `1e9` is 1. An `integer`
+/// follows the non-negative integer rules of `<canvas>`, with an optional `+` and up to 2^31 - 1.
+/// Other percentages are not supported.
+pub(crate) fn dimension(value: &str, integer: bool) -> Option<f32> {
+    let value = value.trim_start_matches(['\t', '\n', '\x0c', '\r', ' ']);
+    let value = if integer {
+        value.strip_prefix('+').unwrap_or(value)
+    } else {
+        value
+    };
+    let digits = |from: usize| {
+        value.as_bytes()[from..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    };
+    let whole = digits(0);
+    let end = match value.as_bytes().get(whole) {
+        Some(b'.') if !integer => whole + 1 + digits(whole + 1),
+        _ => whole,
+    };
+    if whole == 0 || !integer && value.as_bytes().get(end) == Some(&b'%') {
+        return None;
+    }
+    if integer {
+        return value[..end]
+            .parse::<u32>()
+            .ok()
+            .filter(|&value| value <= i32::MAX as u32)
+            .map(|value| value as f32);
+    }
+    value[..end]
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 /// Rounds a size up to layout units, so the content it was measured from doesn't wrap.
 fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
     (size * pixel_ratio * 64.).ceil() / 64. / pixel_ratio
@@ -4180,7 +4166,10 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
     };
     let (mut top, mut bottom) = (own(Prop::MARGIN_TOP), own(Prop::MARGIN_BOTTOM));
     let children = flow(build, id);
-    let blocks = container(build, id);
+    // WARNING: this recurses into first and last children, so margins stop collapsing past the stack budget.
+    let marker = 0u8;
+    let blocks =
+        container(build, id) && &raw const marker as usize >= STACK_LIMIT.with(|limit| *limit);
     let [first, last] = [0, 2].map(|side| through(build, id, side, width) && blocks);
     for (open, set, order) in [(first, &mut top, false), (last, &mut bottom, true)] {
         if !open {
@@ -4614,7 +4603,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
             }
             let mut host = geometry.host.borrow_mut();
             let state = host.dom.entry(geometry.id).or_default();
-            if let Some((_, _, source)) = state.svg_sources.get(&id)
+            if let Some((.., source)) = state.svg_sources.get(&id)
                 && let Some(entry) = state.svg_boxes.get_mut(&id)
             {
                 if entry.0 != *source {
@@ -4634,6 +4623,14 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
                         })
                         .collect();
                     entry.0 = source.clone();
+                    if let Some(kept) = geometry
+                        .svgs
+                        .borrow_mut()
+                        .get_mut(&id)
+                        .filter(|kept| kept.2 == *source)
+                    {
+                        kept.3 = entry.clone();
+                    }
                 }
                 let [scale_x, scale_y] =
                     [0, 1].map(|axis| [width, height][axis] / entry.2[axis].max(f32::EPSILON));
@@ -4672,7 +4669,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
                 state
                     .svg_sources
                     .get(&id)
-                    .map(|(_, _, source)| source.as_str())
+                    .map(|(.., source)| source.as_str())
             } else {
                 state.svg_images.get(&id).map(|(source, _)| &**source)
             };
@@ -4703,4 +4700,30 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
     .left_0()
     .size_full()
     .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dimension_attributes_parse_like_html() {
+        for (value, integer, expected) in [
+            ("300", true, Some(300.)),
+            (" 100px", true, Some(100.)),
+            ("1e9", true, Some(1.)),
+            ("2.5", true, Some(2.)),
+            ("2.5", false, Some(2.5)),
+            ("NaN", true, None),
+            ("inf", false, None),
+            ("-50", true, None),
+            ("50%", false, None),
+            ("50%", true, Some(50.)),
+            ("+7", true, Some(7.)),
+            ("+7", false, None),
+            ("2147483648", true, None),
+            ("", true, None),
+            ("99999999999", true, None),
+        ] {
+            assert_eq!(super::dimension(value, integer), expected, "{value}");
+        }
+    }
 }

@@ -38,8 +38,8 @@ pub(crate) struct Cull {
     /// By node, the subtree revision when its bounds were recorded, its size with margins (the
     /// unsnapped cell size for a grid item), and its margins.
     pub(crate) placed: Vec<(u64, [f32; 2], [f32; 4])>,
-    /// The content box width of each box at its last layout.
-    pub(crate) widths: rustc_hash::FxHashMap<usize, f32>,
+    /// The content box width and height of each box at its last layout, before transforms.
+    pub(crate) widths: rustc_hash::FxHashMap<usize, [f32; 2]>,
     /// Set when a parent of a spacer changed its width, so the next frame lays everything out.
     pub(crate) off: bool,
     /// Whether this frame culls, kept for the container query pass of the same frame.
@@ -54,7 +54,11 @@ pub(crate) struct Cull {
     pub(crate) visible: Vec<bool>,
     /// The newest node revision, focus and styles that `info` was built from, without animated paint.
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
+    pub(crate) subtrees: Subtrees,
 }
+
+/// The nodes of each subtree that `shift` moved, by root, and the document revision they were listed at.
+pub(crate) type Subtrees = (u64, rustc_hash::FxHashMap<usize, Vec<usize>>);
 
 /// The visible vertical range of a subtree, from the last frame's bounds of its clipping ancestors.
 pub(super) struct Zone {
@@ -407,23 +411,37 @@ pub(super) fn lines(
 pub(super) fn shift(
     doc: &Document,
     shadows: &rustc_hash::FxHashMap<usize, usize>,
+    subtrees: &mut Subtrees,
     bounds: &mut crate::dom::LayoutMirror,
     roots: &[usize],
     [x, y]: [f32; 2],
 ) {
-    let mut pending = roots.to_vec();
-    while let Some(id) = pending.pop() {
-        if let Some(rect) = bounds.get_mut(&id) {
-            rect[0] += x;
-            rect[1] += y;
+    // WARNING: a scroll moves every culled subtree, so their nodes are listed once per document revision.
+    if subtrees.0 != doc.nodes.latest() {
+        subtrees.0 = doc.nodes.latest();
+        subtrees.1.clear();
+    }
+    for &root in roots {
+        let nodes = subtrees.1.entry(root).or_insert_with(|| {
+            let (mut nodes, mut pending) = (Vec::new(), vec![root]);
+            while let Some(id) = pending.pop() {
+                nodes.push(id);
+                pending.extend(
+                    doc.nodes
+                        .get(id)
+                        .into_iter()
+                        .flat_map(|node| &node.children),
+                );
+                pending.extend(shadows.get(&id));
+            }
+            nodes
+        });
+        for id in nodes {
+            if let Some(rect) = bounds.get_mut(id) {
+                rect[0] += x;
+                rect[1] += y;
+            }
         }
-        pending.extend(
-            doc.nodes
-                .get(id)
-                .into_iter()
-                .flat_map(|node| &node.children),
-        );
-        pending.extend(shadows.get(&id));
     }
 }
 
@@ -462,7 +480,7 @@ pub(super) fn spacer(
                     .cull
                     .widths
                     .get(&parent)
-                    .is_none_or(|now| (now - width).abs() > 0.01);
+                    .is_none_or(|now| (now[0] - width).abs() > 0.01);
             // WARNING: a changed box before a run of wrapped lines may move boxes to other lines, which the spacer cannot follow.
             let reflowed = watch.iter().any(|&(id, width)| {
                 dom.cull
@@ -478,7 +496,14 @@ pub(super) fn spacer(
             if delta != [0., 0.]
                 && let Some(page) = host.pages.get(&view.id)
             {
-                shift(&page.doc, &dom.shadows, &mut dom.bounds, &members, delta);
+                shift(
+                    &page.doc,
+                    &dom.shadows,
+                    &mut dom.cull.subtrees,
+                    &mut dom.bounds,
+                    &members,
+                    delta,
+                );
             }
         },
         |_, _, _| {},
@@ -521,6 +546,7 @@ pub(super) fn anchor(
                     shift(
                         &page.doc,
                         &dom.shadows,
+                        &mut dom.cull.subtrees,
                         &mut dom.bounds,
                         &[id],
                         [x - old_x, y - old_y],
@@ -945,16 +971,21 @@ mod tests {
         for node in [id("a"), id("b"), text, id("c"), id("h"), id("i")] {
             bounds.insert(node, [1., 2., 3., 4.]);
         }
-        shift(
-            &doc,
-            &shadows,
-            &mut bounds,
-            &[id("a"), id("h"), 999],
-            [10., -100.],
-        );
+        let mut subtrees = Subtrees::default();
+        for _ in 0..2 {
+            shift(
+                &doc,
+                &shadows,
+                &mut subtrees,
+                &mut bounds,
+                &[id("a"), id("h"), 999],
+                [10., -100.],
+            );
+        }
         for node in [id("a"), id("b"), text, id("h"), id("i")] {
-            assert_eq!(bounds[&node], [11., -98., 3., 4.]);
+            assert_eq!(bounds[&node], [21., -198., 3., 4.]);
         }
         assert_eq!(bounds[&id("c")], [1., 2., 3., 4.]);
+        assert_eq!(subtrees.1[&id("a")].len(), 3);
     }
 }

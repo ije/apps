@@ -401,6 +401,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     self.path.parent().unwrap_or(Path::new(".")),
                     path,
                     &self.builder.files,
+                    &self.builder.shared.root,
                 )
             {
                 self.cacheable = false;
@@ -436,8 +437,10 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 if matches!(
                     member.object.get_inner_expression(),
                     Expression::ImportMeta(_)
-                ) && member.property.name == "url"
-                {
+                ) && matches!(
+                    member.property.name.as_str(),
+                    "url" | "filename" | "dirname"
+                ) {
                     let url = if is_remote(self.path) {
                         self.path.to_string_lossy().trim_end_matches('#').to_owned()
                     } else if self.builder.production {
@@ -469,14 +472,41 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             })?
                             .into()
                     };
-                    let value = self.allocator.alloc_str(&url);
-                    *expression = Expression::new_string_literal(span, value, None, &self.ast);
+                    // WARNING: like Node, `filename` and `dirname` are paths of file modules, so pages and remote files get undefined.
+                    let code = match member.property.name.as_str() {
+                        "url" => {
+                            let value = self.allocator.alloc_str(&url);
+                            *expression =
+                                Expression::new_string_literal(span, value, None, &self.ast);
+                            return Ok(());
+                        }
+                        _ if self.builder.realm == Realm::Renderer || is_remote(self.path) => {
+                            "void 0".to_owned()
+                        }
+                        "filename" => {
+                            format!("globalThis.__apps.url.fileURLToPath({})", json!(url))
+                        }
+                        _ => format!(
+                            "globalThis.__apps.path.dirname(globalThis.__apps.url.fileURLToPath({}))",
+                            json!(url)
+                        ),
+                    };
+                    *expression = Parser::new(
+                        self.allocator,
+                        self.allocator.alloc_str(&code),
+                        SourceType::mjs(),
+                    )
+                    .parse_expression()
+                    .map_err(|_| {
+                        anyhow::anyhow!("Cannot rewrite import.meta in {}", self.path.display())
+                    })?;
                     return Ok(());
                 }
                 ensure!(
                     self.commonjs
-                        || !(member.object.is_specific_id("module")
-                            && member.property.name == "exports"),
+                        || member.property.name != "exports"
+                        || !matches!(&member.object, Expression::Identifier(module) if module.name == "module"
+                            && self.scoping.get_reference(module.reference_id()).symbol_id().is_none()),
                     "ESM only: module is not supported in {}",
                     self.path.display()
                 );
@@ -1658,14 +1688,15 @@ impl Builder {
                         break;
                     }
                     Value::Array(values) => candidates.extend(values.iter().rev()),
-                    Value::Object(values) => {
-                        if let Some((_, value)) = values
+                    // WARNING: like Node, a matching condition without a target falls back to the next matching key.
+                    Value::Object(values) => candidates.extend(
+                        values
                             .iter()
-                            .find(|(key, _)| conditions.contains(&key.as_str()))
-                        {
-                            candidates.push(value);
-                        }
-                    }
+                            .filter(|(key, _)| conditions.contains(&key.as_str()))
+                            .map(|(_, value)| value)
+                            .rev(),
+                    ),
+                    Value::Null => break,
                     _ => {}
                 }
             }
@@ -2221,17 +2252,27 @@ impl Builder {
     }
 }
 
-fn app_relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
-    path.strip_prefix(root)
-        .ok()
-        .or_else(|| {
-            path.ancestors()
-                .find(|directory| directory.ends_with("node_modules"))
-                .and_then(Path::parent)
-                .and_then(|base| path.strip_prefix(base).ok())
-        })
-        .or_else(|| path.file_name().map(Path::new))
-        .unwrap_or(Path::new(""))
+fn app_relative(root: &Path, path: &Path) -> PathBuf {
+    if let Some(relative) = path.strip_prefix(root).ok().or_else(|| {
+        path.ancestors()
+            .find(|directory| directory.ends_with("node_modules"))
+            .and_then(Path::parent)
+            .and_then(|base| path.strip_prefix(base).ok())
+    }) {
+        return relative.to_owned();
+    }
+    // WARNING: other files outside the app, like linked workspace packages, keep their path from the app folder, so
+    // their names stay unique.
+    match root
+        .ancestors()
+        .find(|directory| path.starts_with(directory))
+    {
+        Some(common) => (0..root.components().count() - common.components().count())
+            .map(|_| Path::new(".."))
+            .collect::<PathBuf>()
+            .join(path.strip_prefix(common).unwrap_or(path)),
+        None => path.file_name().map(PathBuf::from).unwrap_or_default(),
+    }
 }
 
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
@@ -2327,9 +2368,32 @@ fn bundle(
         files,
         shared,
     };
+    let mut classic = false;
     let result = entries
         .into_iter()
-        .map(|(path, inline)| builder.visit(path, inline))
+        .map(|(path, inline)| {
+            let Some(name) = path.to_str().and_then(|path| path.strip_prefix("apps:///")) else {
+                return builder.visit(path, inline);
+            };
+            // WARNING: a classic script runs as its own bundled script through `__appsChunk`, so it gets the global
+            // scope, sloppy mode and the window as `this`. Its entry module only runs it in order.
+            let code = format!("$appsClassic({})", json!(name));
+            classic = true;
+            let next = builder.graph.ids.len();
+            let id = *builder.graph.ids.entry(path.clone()).or_insert(next);
+            builder.ids.insert(path, id);
+            if builder.lines.len() <= id {
+                builder.lines.resize(id + 1, None);
+                builder.modules.resize(id + 1, Value::Null);
+            }
+            if production {
+                builder.modules[id] = json!({"id":id,"deps":[],"code":code,"imports":[],"exports":[],"stars":[],"commonjs":false,"linked":true,"async":0,"pure":false});
+            } else {
+                builder.lines[id] =
+                    Some(format!("$appsDefine({{id:{id},factory:function*(){{yield;{code}}}}});\n").into());
+            }
+            Ok(id)
+        })
         .collect::<Result<Vec<_>>>();
     if let Some(cache) = &builder.shared.cache {
         cache
@@ -2692,8 +2756,11 @@ fn bundle(
             .flatten()
             .map(|line| line.len())
             .sum::<usize>()
-            + 32,
+            + 64,
     );
+    if classic {
+        app.push_str("const $appsClassic=this.__appsChunk;\n");
+    }
     for line in builder.lines.iter().flatten() {
         app.push_str(line);
     }
@@ -2733,7 +2800,7 @@ fn bundle(
         .files
         .borrow()
         .iter()
-        .filter_map(|path| Some((asset_name(path)?, path.clone())))
+        .filter_map(|path| Some((asset_name(&builder.shared.root, path)?, path.clone())))
         .collect();
     if !assets.is_empty() {
         files.insert("assets.json".into(), serde_json::to_string(&assets)?);
@@ -2899,7 +2966,7 @@ fn resolve_file(path: &Path) -> Result<PathBuf> {
     bail!("Cannot resolve {}", path.display())
 }
 
-fn asset_name(path: &Path) -> Option<String> {
+fn asset_name(root: &Path, path: &Path) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if !matches!(
         extension.as_str(),
@@ -2933,12 +3000,22 @@ fn asset_name(path: &Path) -> Option<String> {
     ) {
         return None;
     }
-    let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(path, &mut hasher);
-    Some(format!(
-        "assets/{:016x}.{extension}",
-        std::hash::Hasher::finish(&hasher)
-    ))
+    // WARNING: names hash the path in the app with FNV-1a, so builds of the same app match on every machine.
+    let hash = app_relative(root, path)
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&byte| {
+            if byte == std::path::MAIN_SEPARATOR as u8 {
+                b'/'
+            } else {
+                byte
+            }
+        })
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        });
+    Some(format!("assets/{hash:016x}.{extension}"))
 }
 
 thread_local! {
@@ -3004,6 +3081,7 @@ fn asset(
     directory: &Path,
     reference: &str,
     files: &Rc<RefCell<BTreeSet<PathBuf>>>,
+    root: &Path,
 ) -> Option<String> {
     let reference = reference.trim().trim_matches(['"', '\'']);
     if reference.contains(':') || reference.starts_with('#') {
@@ -3019,25 +3097,58 @@ fn asset(
         .join(reference.split(['?', '#']).next()?)
         .canonicalize()
         .ok()?;
-    let name = asset_name(&path)?;
+    let name = asset_name(root, &path)?;
     files.borrow_mut().insert(path);
     Some(format!("apps:///{name}"))
 }
 
-fn urls(source: &str, directory: &Path, files: &Rc<RefCell<BTreeSet<PathBuf>>>) -> String {
-    let mut result = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(start) = rest.find("url(") {
-        let (head, tail) = rest.split_at(start + 4);
-        result.push_str(head);
-        let end = tail.find(')').unwrap_or(tail.len());
-        match asset(directory, &tail[..end], files) {
-            Some(url) => result.push_str(&format!("\"{url}\"")),
-            None => result.push_str(&tail[..end]),
+fn urls(
+    source: &str,
+    directory: &Path,
+    files: &Rc<RefCell<BTreeSet<PathBuf>>>,
+    root: &Path,
+) -> String {
+    let bytes = source.as_bytes();
+    let string = |start: usize| {
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end] != bytes[start] && bytes[end] != b'\n' {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
         }
-        rest = &tail[end..];
+        (end + 1).min(bytes.len())
+    };
+    let (mut result, mut copied, mut pos) = (String::with_capacity(source.len()), 0, 0);
+    // WARNING: comments and strings are skipped, so a `url(` in them never takes the next `url()`.
+    while pos < bytes.len() {
+        if bytes[pos..].starts_with(b"/*") {
+            pos = source[pos + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |end| pos + end + 4);
+        } else if matches!(bytes[pos], b'"' | b'\'') {
+            pos = string(pos);
+        } else if bytes[pos..].len() >= 4 && bytes[pos..pos + 4].eq_ignore_ascii_case(b"url(") {
+            let start = pos + 4;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            if end < bytes.len() && matches!(bytes[end], b'"' | b'\'') {
+                end = string(end);
+            }
+            pos = source[end..]
+                .find(')')
+                .map_or(bytes.len(), |close| end + close);
+            if let Some(url) = asset(directory, &source[start..pos], files, root) {
+                result.push_str(&source[copied..start]);
+                result.push('"');
+                result.push_str(&url);
+                result.push('"');
+                copied = pos;
+            }
+        } else {
+            pos += 1;
+        }
     }
-    result.push_str(rest);
+    result.push_str(&source[copied..]);
     result
 }
 
@@ -3050,6 +3161,8 @@ fn html(
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
     let http = shared.enabled("httpImport");
+    // WARNING: browsers run classic scripts without defer or async while they parse, before any module, so they go first.
+    let mut blocking = Vec::new();
     let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
     for index in 0..doc.nodes.len() {
         let text = matches!(doc.nodes[index].tag.as_str(), "style" | "script")
@@ -3058,7 +3171,7 @@ fn html(
         let child = doc.nodes.len();
         let node = &mut doc.nodes[index];
         if let Some(style) = node.attrs.get_mut("style") {
-            *style = urls(style, parent, &files);
+            *style = urls(style, parent, &files, &shared.root);
         }
         let references: &[&str] = match node.tag.as_str() {
             "img" | "audio" | "source" => &["src"],
@@ -3066,25 +3179,62 @@ fn html(
             _ => &[],
         };
         for name in references {
-            if let Some(source) = node.attrs.get_mut(*name)
-                && let Some(url) = asset(parent, source, &files)
+            if let Some(source) = node.attrs.get_mut(name)
+                && let Some(url) = asset(parent, source, &files, &shared.root)
             {
                 *source = url;
             }
         }
+        if matches!(node.tag.as_str(), "img" | "source")
+            && let Some(srcset) = node.attrs.get_mut("srcset")
+        {
+            let mut result = String::with_capacity(srcset.len());
+            let mut rest = srcset.as_str();
+            while let Some(start) = rest.find(|c: char| !c.is_ascii_whitespace() && c != ',') {
+                let candidate = &rest[start..];
+                let end = candidate
+                    .find(|c: char| c.is_ascii_whitespace())
+                    .unwrap_or(candidate.len());
+                let url = candidate[..end].trim_end_matches(',');
+                result.push_str(&rest[..start]);
+                result.push_str(
+                    &asset(parent, url, &files, &shared.root).unwrap_or_else(|| url.into()),
+                );
+                let descriptors = &candidate[url.len()..];
+                let next = if url.len() < end {
+                    0
+                } else {
+                    descriptors
+                        .find(',')
+                        .map_or(descriptors.len(), |comma| comma + 1)
+                };
+                result.push_str(&descriptors[..next]);
+                rest = &descriptors[next..];
+            }
+            result.push_str(rest);
+            *srcset = result;
+        }
         let mut sheet = None;
         if node.tag == "style" {
-            sheet = Some(css(path, Some(text), &mut Vec::new(), &files, http)?);
-        } else if node.tag == "link" && node.attrs.get("rel").is_some_and(|v| v == "stylesheet") {
+            sheet = Some(css(path, Some(text), &mut Vec::new(), &files, &shared)?);
+        } else if node.tag == "link"
+            && node.attrs.get("rel").is_some_and(|rel| {
+                let mut tokens = rel.split_ascii_whitespace();
+                tokens
+                    .clone()
+                    .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                    && !tokens.any(|token| token.eq_ignore_ascii_case("alternate"))
+            })
+        {
             let href = node.attrs.get("href").context("Stylesheet has no href")?;
             let text = match remote(parent, href, http)? {
-                Some((path, text)) => css(&path, Some(text), &mut Vec::new(), &files, http)?,
+                Some((path, text)) => css(&path, Some(text), &mut Vec::new(), &files, &shared)?,
                 None => css(
-                    &parent.join(href).canonicalize()?,
+                    &local(&shared.root, parent, href)?,
                     None,
                     &mut Vec::new(),
                     &files,
-                    http,
+                    &shared,
                 )?,
             };
             sheet = Some(match node.attrs.get("media") {
@@ -3094,29 +3244,60 @@ fn html(
             node.tag = "style".into();
             node.attrs.clear();
         } else if node.tag == "script" {
-            let preload = match node
+            let (classic, preload) = match node
                 .attrs
                 .get("type")
                 .map(|kind| kind.trim().to_ascii_lowercase())
                 .as_deref()
             {
-                None | Some("" | "module" | "text/javascript" | "application/javascript") => false,
-                Some("preload") => true,
+                None | Some("" | "text/javascript" | "application/javascript") => (true, false),
+                Some("module") => (false, false),
+                Some("preload") => (false, true),
                 _ => continue,
             };
-            let entry = match node.attrs.remove("src") {
-                Some(src) => match remote(parent, &src, http)? {
-                    Some((path, source)) => (path, Some(source)),
-                    None => (parent.join(src).canonicalize()?, None),
-                },
-                None => (path.to_owned(), Some(text)),
-            };
+            let src = node.attrs.remove("src");
             node.children.clear();
+            // WARNING: like browsers with modules, `nomodule` scripts never run.
+            if classic && node.attrs.contains_key("nomodule") {
+                continue;
+            }
+            let deferred = src.is_some()
+                && (node.attrs.contains_key("defer") || node.attrs.contains_key("async"));
             node.attrs.insert(
                 "type".into(),
                 if preload { "preload" } else { "module" }.into(),
             );
-            scripts[usize::from(preload)].push((index, entry));
+            let entry = match src {
+                Some(src) => match remote(parent, &src, http)? {
+                    Some((path, source)) => (path, Some(source)),
+                    None => (local(&shared.root, parent, &src)?, None),
+                },
+                None => (path.to_owned(), Some(text)),
+            };
+            if !classic {
+                scripts[usize::from(preload)].push((index, entry));
+                continue;
+            }
+            let source = match entry {
+                (_, Some(source)) => source,
+                (file, None) => {
+                    let source = fs::read_to_string(&file)
+                        .with_context(|| format!("Cannot read {}", file.display()))?;
+                    files.borrow_mut().insert(file);
+                    source
+                }
+            };
+            let mut list = shared.scripts.borrow_mut();
+            list.push(source);
+            let entry = (
+                PathBuf::from(format!("apps:///script-{}.js", list.len() - 1)),
+                None,
+            );
+            if deferred {
+                scripts[0].push((index, entry));
+            } else {
+                blocking.push((index, entry));
+            }
         }
         if let Some(sheet) = sheet {
             node.children = vec![child];
@@ -3127,6 +3308,7 @@ fn html(
             doc.nodes.push(text);
         }
     }
+    scripts[0].splice(0..0, blocking);
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
         let Some(&(first, _)) = list.first() else {
             continue;
@@ -3144,6 +3326,23 @@ fn html(
         );
     }
     Ok(doc.serialize(0))
+}
+
+/// Resolves a local `src`, `href` or `@import` path.
+fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
+    // WARNING: like a web server root, `/x` is the app folder, and a path from it cannot leave it.
+    let path = match reference.strip_prefix('/') {
+        Some(rest) => root.join(rest),
+        None => directory.join(reference),
+    };
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("Cannot find {reference} from {}", directory.display()))?;
+    ensure!(
+        !reference.starts_with('/') || path.starts_with(root),
+        "{reference} is outside the app folder"
+    );
+    Ok(path)
 }
 
 /// Resolves `@import "package"` to the stylesheet of an npm package, like postcss-import.
@@ -3177,7 +3376,7 @@ fn css(
     inline: Option<String>,
     stack: &mut Vec<PathBuf>,
     files: &Rc<RefCell<BTreeSet<PathBuf>>>,
-    http: bool,
+    shared: &Shared,
 ) -> Result<String> {
     ensure!(
         !stack.contains(&path.to_owned()),
@@ -3202,6 +3401,7 @@ fn css(
         &source,
         path.parent().context("Missing CSS directory")?,
         files,
+        &shared.root,
     );
     let mut result = String::new();
     let mut rest = source.as_str();
@@ -3299,15 +3499,15 @@ fn css(
             continue;
         }
         let directory = path.parent().unwrap();
-        let mut imported = match remote(directory, name, http)? {
-            Some((target, text)) => css(&target, Some(text), stack, files, http)?,
+        let mut imported = match remote(directory, name, shared.enabled("httpImport"))? {
+            Some((target, text)) => css(&target, Some(text), stack, files, shared)?,
             None => {
-                let target = if name.starts_with('.') || Path::new(name).is_absolute() {
-                    directory.join(name)
+                let target = if name.starts_with(['.', '/']) || Path::new(name).is_absolute() {
+                    local(&shared.root, directory, name)?
                 } else {
-                    css_package(directory, name)?
+                    css_package(directory, name)?.canonicalize()?
                 };
-                css(&target.canonicalize()?, None, stack, files, http)?
+                css(&target, None, stack, files, shared)?
             }
         };
         let mut options = options;

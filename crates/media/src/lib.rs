@@ -11,7 +11,7 @@ use std::{
 };
 
 /// Version of the C ABI. The runtime rejects a library with another version.
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 
 /// Returns a runtime buffer of `length` bytes that the library fills.
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
@@ -23,7 +23,8 @@ pub struct Host {
     pub waker: extern "C" fn() -> *mut c_void,
     pub wake: extern "C" fn(waker: *mut c_void),
     pub drop_waker: extern "C" fn(waker: *mut c_void),
-    /// Returns `length` bytes for pixels, which the runtime owns once `apps_media_frame` returns them.
+    /// Returns `length` bytes for pixels, which the runtime owns once `apps_media_frame` returns them,
+    /// until it gives them back with `apps_media_recycle`.
     pub alloc: extern "C" fn(length: usize) -> *mut u8,
     pub free: extern "C" fn(bytes: *mut u8, length: usize),
 }
@@ -376,6 +377,8 @@ struct State {
     /// Counts seeks, so a decode that started before one is dropped.
     generation: u64,
     frames: VecDeque<Pixels>,
+    /// Buffers of frames that were never shown or that the runtime gave back, for the next frames.
+    spare: Vec<Pixels>,
     /// Shows the next frame at once, as after a load or a seek.
     show: bool,
     /// The loop was woken for the first frame in `frames`.
@@ -430,6 +433,13 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         lock(&shared.state).events.push(text);
         waker.wake();
     };
+    let fail = |message: String| {
+        let mut state = lock(&shared.state);
+        state.ready = false;
+        shared.update(&state);
+        state.events.push(format!("\"error\",3,{message:?}"));
+        waker.wake();
+    };
     let mut info = Info::default();
     let mut error = [0 as c_char; 256];
     let (path, data, size) = match &source {
@@ -472,6 +482,8 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     let (mut audio_end, mut last_frame) = (0., -1. / 30.);
     // The seek target that frames and samples before it are dropped for, and whether it was reported.
     let (mut target, mut loaded) = (Some(0.), false);
+    // WARNING: a blocked track waits behind the other track's full packet queue until that track decodes, so it counts as ready.
+    let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);
     let mut tick = Instant::now();
     loop {
         let mut state = lock(&shared.state);
@@ -484,6 +496,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             unsafe { apps_ffmpeg_seek(media, time) };
             (video_done, audio_done) = (!has_video, !has_audio);
             (audio_end, last_frame, target) = (time, time - 1. / 30., Some(time));
+            (blocked, converted) = (0, f64::NEG_INFINITY);
             continue;
         }
         if let Some(value) = state.speed.take() {
@@ -496,7 +509,8 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         }
         let buffered = audio.queued as f64 / samples_per_second;
         drop(audio);
-        let ready = (video_done || !state.frames.is_empty()) && (audio_done || buffered >= AHEAD / 2.);
+        let ready = (video_done || !state.frames.is_empty() || blocked & 1 != 0)
+            && (audio_done || buffered >= AHEAD / 2. || blocked & 2 != 0);
         if target.is_some() && ready && state.generation == generation {
             target = None;
             state.ready = true;
@@ -506,8 +520,9 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             shared.update(&state);
             waker.wake();
         }
-        let want = c_int::from(!video_done && state.frames.len() < FRAMES)
-            | c_int::from(!audio_done && buffered < AHEAD) << 1;
+        let want = (c_int::from(!video_done && state.frames.len() < FRAMES)
+            | c_int::from(!audio_done && buffered < AHEAD) << 1)
+            & !blocked;
         // WARNING: paused elements decode only up to their first frame, so play starts at once and idle pages use no CPU.
         if want != 0 && (state.playing || target.is_some()) {
             drop(state);
@@ -526,35 +541,58 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             };
             match kind {
                 1 => {
+                    blocked = 0;
                     let time = if time.is_finite() {
                         time
                     } else {
                         last_frame + 1. / 30.
                     };
+                    let next = time + (time - last_frame).max(0.);
                     last_frame = time;
                     if target.is_some_and(|target| time < target - 0.02) {
                         continue;
                     }
-                    let length = width as usize * height as usize * 4;
-                    let bytes = (host().alloc)(length);
-                    if bytes.is_null() {
+                    // WARNING: a frame is not converted when the next one is due too, but one is every 0.1 s, so slow decoding still shows frames.
+                    let audio = lock(&shared.audio);
+                    let late = audio.clock.running && next <= audio.clock.now();
+                    drop(audio);
+                    if late && time - converted < 0.1 {
                         continue;
                     }
-                    let pixels = Pixels {
-                        bytes,
-                        width: width as u32,
-                        height: height as u32,
-                        time,
+                    let (width, height) = (width as u32, height as u32);
+                    let spare = lock(&shared.state)
+                        .spare
+                        .pop()
+                        .filter(|pixels| pixels.width == width && pixels.height == height);
+                    let pixels = spare.or_else(|| {
+                        let bytes = (host().alloc)(width as usize * height as usize * 4);
+                        (!bytes.is_null()).then_some(Pixels {
+                            bytes,
+                            width,
+                            height,
+                            time,
+                        })
+                    });
+                    let Some(mut pixels) = pixels
+                        .filter(|pixels| unsafe { apps_ffmpeg_pixels(media, pixels.bytes) >= 0 })
+                    else {
+                        failures += 1;
+                        if failures == 3 {
+                            fail("Cannot convert the video frames".into());
+                            break;
+                        }
+                        continue;
                     };
-                    if unsafe { apps_ffmpeg_pixels(media, bytes) } < 0 {
-                        continue;
-                    }
+                    (pixels.time, failures, converted) = (time, 0, time);
                     let mut state = lock(&shared.state);
                     if state.generation == generation {
                         state.frames.push_back(pixels);
+                    } else {
+                        state.spare.push(pixels);
                     }
                 }
                 2 => {
+                    blocked = 0;
                     let mut time = if time.is_finite() { time } else { audio_end };
                     let step = speed / rate as f64;
                     let mut samples = unsafe {
@@ -581,16 +619,13 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     }
                 }
                 3 => {}
+                4 => blocked = want,
                 0 => {
                     video_done |= want & 1 != 0;
                     audio_done |= want & 2 != 0;
                 }
                 error => {
-                    let mut state = lock(&shared.state);
-                    state.ready = false;
-                    shared.update(&state);
-                    state.events.push(format!("\"error\",3,\"Cannot decode the media ({error})\""));
-                    waker.wake();
+                    fail(format!("Cannot decode the media ({error})"));
                     break;
                 }
             }
@@ -619,7 +654,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     waker.wake();
                 }
             }
-            if !audio_done {
+            if !audio_done && blocked & 2 == 0 {
                 until((buffered - AHEAD / 2.).max(0.005));
             } else if buffered > 0. {
                 until(buffered + 0.005);
@@ -663,6 +698,7 @@ impl Media {
             let mut state = lock(&player.shared.state);
             state.closed = true;
             state.frames.clear();
+            state.spare.clear();
             player.shared.update(&state);
             player.shared.signal.notify_one();
         }
@@ -770,7 +806,8 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
             state.generation += 1;
             state.seek = Some(time);
             state.ready = false;
-            state.frames.clear();
+            let State { frames, spare, .. } = &mut *state;
+            spare.extend(frames.drain(..));
             state.woken = false;
             let mut audio = lock(&shared.audio);
             audio.clear();
@@ -865,7 +902,10 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
         && (state.show || head.time <= now)
     {
         state.show = false;
-        shown = state.frames.pop_front();
+        let next = state.frames.pop_front();
+        if let Some(late) = std::mem::replace(&mut shown, next) {
+            state.spare.push(late);
+        }
     }
     state.woken = false;
     player.shared.signal.notify_one();
@@ -881,4 +921,32 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
     };
     std::mem::forget(pixels);
     true
+}
+
+/// Gives the pixels of a frame from `apps_media_frame` back to element `id`, so its next frames reuse
+/// them. They are freed when the element is closed or keeps enough buffers.
+///
+/// # Safety
+/// `media` comes from `apps_media_new`, and `pixels` comes from `apps_media_frame` with its size.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn apps_media_recycle(
+    media: *mut c_void,
+    id: u64,
+    pixels: *mut u8,
+    width: u32,
+    height: u32,
+) {
+    let media = unsafe { &*media.cast::<Media>() };
+    let pixels = Pixels {
+        bytes: pixels,
+        width,
+        height,
+        time: 0.,
+    };
+    if let Some(player) = media.players.get(&id) {
+        let mut state = lock(&player.shared.state);
+        if state.spare.len() < FRAMES {
+            state.spare.push(pixels);
+        }
+    }
 }

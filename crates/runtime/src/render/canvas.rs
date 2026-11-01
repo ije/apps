@@ -86,6 +86,7 @@ pub fn line(
         .split_whitespace()
         .last()
         .and_then(|v| v.parse::<f32>().ok())
+        .filter(|size| size.is_finite() && *size > 0.)
         .unwrap_or(10.);
     system.layout_line(&text, renderer::px(font_size), &[run], None)
 }
@@ -383,13 +384,16 @@ impl Canvas {
                     if !scale.is_finite() || scale <= 1e-3 {
                         continue;
                     }
+                    // WARNING: glyphs rasterize at most 1024 pixels per em and larger text scales the layer up, so a huge font or transform cannot allocate huge glyphs.
+                    let raster = scale.min(1024. / f32::from(line.font_size));
                     // Glyphs rasterize at the device scale into a layer, which an upright transform places on whole pixels, so text stays as sharp as page text.
-                    let upright = t.kx == 0. && t.ky == 0. && t.sx > 0. && t.sx == t.sy;
+                    let upright =
+                        raster == scale && t.kx == 0. && t.ky == 0. && t.sx > 0. && t.sx == t.sy;
                     let (fx, fy, to_canvas) = if upright {
                         let [x, y] = [t.tx.floor(), t.ty.floor()];
                         (t.tx - x, t.ty - y, skia::Transform::from_translate(x, y))
                     } else {
-                        (0., 0., t.pre_scale(1. / scale, 1. / scale))
+                        (0., 0., t.pre_scale(1. / raster, 1. / raster))
                     };
                     // WARNING: glyphs far outside the canvas are skipped, so a long or huge text cannot make a huge layer.
                     let Some(visible) = to_canvas.invert().and_then(|t| {
@@ -407,14 +411,14 @@ impl Canvas {
                         [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
                     for run in &line.runs {
                         for glyph in &run.glyphs {
-                            let x = f32::from(glyph.position.x) * scale + fx;
+                            let x = f32::from(glyph.position.x) * raster + fx;
                             let variants = f32::from(renderer::SUBPIXEL_VARIANTS_X);
                             let x = if glyph.is_emoji {
                                 x.round()
                             } else {
                                 (x * variants).round() / variants
                             };
-                            let reach = f32::from(run.font_size) * scale * 2.;
+                            let reach = f32::from(run.font_size) * raster * 2.;
                             if x + reach < visible.left()
                                 || x - reach > visible.right()
                                 || fy + reach < visible.top()
@@ -426,7 +430,7 @@ impl Canvas {
                                 run.font_id.0,
                                 glyph.id.0,
                                 f32::from(run.font_size).to_bits(),
-                                scale.to_bits(),
+                                raster.to_bits(),
                                 ((x - x.floor()) * variants) as u8,
                                 glyph.is_emoji,
                             );
@@ -435,7 +439,7 @@ impl Canvas {
                                     run.font_id,
                                     glyph.id,
                                     run.font_size,
-                                    scale,
+                                    raster,
                                     key.4,
                                     key.5,
                                 );
@@ -445,7 +449,7 @@ impl Canvas {
                             }
                             if let Some((origin, size, _)) = &self.glyphs[&key] {
                                 let x = x.floor() as i32 + origin.x.0;
-                                let y = (fy + f32::from(glyph.position.y) * scale).round() as i32
+                                let y = (fy + f32::from(glyph.position.y) * raster).round() as i32
                                     + origin.y.0;
                                 [left, top] = [left.min(x), top.min(y)];
                                 [right, bottom] =
@@ -747,5 +751,23 @@ mod tests {
         };
         assert!(inked(140..160) && !inked(0..130) && !inked(170..200));
         assert_eq!(canvas.glyphs.len(), 2);
+    }
+
+    #[test]
+    fn huge_text_rasterizes_small_glyphs() {
+        let system = renderer::TextSystem::new();
+        let aliases = Default::default();
+        let mut canvas = Canvas::new(64, 64).unwrap();
+        #[rustfmt::skip]
+        let ops = [
+            6., 11., 24., 1., 0., 100.,
+            6., 11., 24., 1., 0., 10.,
+            6., 10., 2., 1e5, 0., 0., 1e5, 0., 0., 24., 1., 0., 0.,
+        ];
+        let strings = "1e7px serifWNaNpx serifW10px serifW";
+        canvas
+            .draw(&ops, strings, &[], &|_| None, Some((&system, &aliases)))
+            .unwrap();
+        assert!(canvas.glyph_bytes < 3 * (1100 * 1100 * 4 + 64));
     }
 }

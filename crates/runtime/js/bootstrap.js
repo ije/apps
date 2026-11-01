@@ -1,5 +1,5 @@
 (() => {
-  const native = globalThis.__appsNative;
+  const native = globalThis.__appsNative, clock = globalThis.__appsNow;
   const role = globalThis.__appsRole, disabled = new Set(globalThis.__appsDisabled);
   delete globalThis.__appsNative;
   delete globalThis.__appsRole;
@@ -90,9 +90,9 @@
       write('log', [line('┌', '┬', '┐'), cells(header), line('├', '┼', '┤'), ...rows.map(row => cells(header.map(name => row[name] ?? ''))), line('└', '┴', '┘')].join('\n'));
     },
   });
-  // WARNING: `next` is never later than the earliest timer, and it is exact unless `stale`, so ticks skip the timer scan until one is due.
+  // WARNING: `next` is never later than the earliest timer, and it is exact unless `stale`, so ticks skip the timer scan until one is due. Timers use the monotonic `clock`, because the wall clock can jump.
   const timers = new Map();
-  let timerID = 0, next = Infinity, stale = false;
+  let timerID = 0, next = Infinity, stale = false, nesting = 0;
   const earliest = () => { if (stale) { stale = false; next = Infinity; for (const timer of timers.values()) if (timer.at < next) next = timer.at; } return next; };
   class Timeout {
     #id;
@@ -100,7 +100,7 @@
     ref() { const timer = timers.get(this.#id); if (timer) timer.ref = true; return this; }
     unref() { const timer = timers.get(this.#id); if (timer) timer.ref = false; return this; }
     hasRef() { return timers.get(this.#id)?.ref ?? false; }
-    refresh() { const timer = timers.get(this.#id); if (timer) { timer.at = Date.now() + timer.delay; stale = true; } return this; }
+    refresh() { const timer = timers.get(this.#id); if (timer) { timer.at = clock() + timer.delay; stale = true; } return this; }
     close() { clearTimeout(this.#id); return this; }
     [Symbol.toPrimitive]() { return this.#id; }
     [Symbol.dispose]() { clearTimeout(this.#id); }
@@ -110,9 +110,11 @@
     const id = ++timerID;
     delay = Number(delay);
     delay = delay >= 0 && delay <= 2147483647 ? delay : delay > 0 ? 1 : 0;
+    // WARNING: like browsers, pages clamp timers nested more than 5 levels deep to 4 ms.
     if (nodeRole && delay < 1) delay = 1;
-    const at = Date.now() + delay;
-    timers.set(id, { fn, args, delay, at, ref: true });
+    else if (!nodeRole && nesting > 5 && delay < 4) delay = 4;
+    const at = clock() + delay;
+    timers.set(id, { fn, args, delay, at, ref: true, level: nesting + 1 });
     if (at < next) next = at;
     return nodeRole ? new Timeout(id) : id;
   };
@@ -123,7 +125,14 @@
     return id;
   };
   globalThis.clearInterval = clearTimeout;
-  globalThis.queueMicrotask = fn => Promise.resolve().then(fn);
+  // WARNING: internal tasks (IndexedDB events) are not timers, so they skip the timer clamps and reset the nesting level.
+  const task = fn => { const id = ++timerID, at = clock(); timers.set(id, { fn, args: [], delay: 0, at, ref: true, level: 0 }); if (at < next) next = at; };
+  const resolved = Promise.resolve();
+  // WARNING: errors that `fail` throws in main are thrown by the next tick, like a failed timer.
+  globalThis.queueMicrotask = fn => {
+    if (typeof fn !== 'function') throw new TypeError('The "callback" argument must be of type function');
+    resolved.then(() => { try { fn(); } catch (error) { try { fail(error); } catch (error) { moduleErrors.push(error); } } });
+  };
   // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs; __appsTick returns -2 after each one, so the engine drains microtasks and calls it again.
   const ticks = [], immediates = new Map();
   let phase = 0, now = 0, due = [], checks = [];
@@ -153,7 +162,7 @@
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
   const workers = globalThis.__appsWorkers(call, !(typeof role === "object" && "renderer" in role));
   delete globalThis.__appsWorkers;
-  globalThis.__appsBrowserEnvironment(call);
+  globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
   const hooks = {}, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
   delete globalThis.__appsBridge;
@@ -164,15 +173,16 @@
     if (moduleErrors.length) throw moduleErrors.shift();
     if (ticks.length) { runTicks(); return -2; }
     if (phase === 0) {
-      phase = 1; now = Date.now();
+      phase = 1; now = clock();
       if (now >= earliest()) { stale = true; due = [...timers].filter(([, timer]) => timer.at <= now).sort((a, b) => a[1].at - b[1].at); }
     }
     while (phase === 1 && due.length) {
       const [id, timer] = due.shift();
       if (timers.get(id) !== timer || timer.at > now) continue;
-      if (timer.interval) timer.at = Date.now() + timer.interval;
+      nesting = timer.level;
+      if (timer.interval) { if (!nodeRole && timer.level++ > 5 && timer.interval < 4) timer.interval = 4; timer.at = clock() + timer.interval; }
       else timers.delete(id);
-      try { timer.fn(...timer.args); } catch (error) { fail(error); }
+      try { timer.fn(...timer.args); } catch (error) { fail(error); } finally { nesting = 0; }
       runTicks();
       return -2;
     }
@@ -212,11 +222,14 @@
   };
   globalThis.__appsDelay = () => {
     if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
-    const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - Date.now());
+    const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - clock());
     // WARNING: native producers wake the loop when they queue events and bridge replies arrive in a call, so only module errors poll here.
     return moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
-  globalThis.__appsAlive = () => timers.size > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
+  globalThis.__appsAlive = () => {
+    for (const timer of timers.values()) if (timer.ref) return true;
+    return ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
+  };
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
@@ -403,7 +416,7 @@
   const destroyed = () => Error('Object has been destroyed');
   const state = win => { if (win.isDestroyed()) throw destroyed(); return states.get(win); };
   const loadError = (code, description, url) => Object.assign(new Error(`${description} (${code}) loading '${url}'`), { code: description, errno: code, url });
-  const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win }); call('window', op, win, id, ...args); });
+  const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win, op }); call('window', op, win, id, ...args); });
   class WebContents extends events.EventEmitter {
     constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null }); }
     #page() { const page = pages.get(this); if (!windows.has(page.win)) throw destroyed(); return page; }
@@ -472,9 +485,8 @@
     const page = pages.get(win.webContents);
     page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
     for (const [id, request] of captures) if (request.win === win.id) { captures.delete(id); request.reject(destroyed()); }
-    win.webContents.emit('destroyed');
-    win.emit('closed');
-    app.emit('window-close');
+    // WARNING: a throwing listener must not stop the app from quitting after its last window.
+    for (const [target, name] of [[win.webContents, 'destroyed'], [win, 'closed'], [app, 'window-close']]) try { target.emit(name); } catch (error) { hooks.report(error); }
     if (windows.size) return;
     if (closing) willQuit();
     else if (quitting) return;
@@ -691,9 +703,12 @@
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
     else if (name === 'executed') {
-      const request = captures.get(data.request), result = parse(data.data);
+      // WARNING: any page can send `executed`, so it settles only a pending executeJavaScript() of its own window.
+      const request = captures.get(data.request);
+      if (request?.win !== id || request.op !== 'execute') return;
       captures.delete(data.request);
-      if (result.error !== undefined) request?.reject(new Error(result.error)); else request?.resolve(result.value);
+      const result = parse(data.data);
+      if (result.error !== undefined) request.reject(new Error(result.error)); else request.resolve(result.value);
     }
     else if (name === 'captured') {
       const request = captures.get(data.id);

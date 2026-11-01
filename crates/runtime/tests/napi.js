@@ -7,6 +7,7 @@ assert(addon.text('a\0b') === 'a\0b', 'embedded null');
 const bytes = new Uint8Array([1,2,3,4]);
 const copy = addon.mutate(bytes.subarray(1, 3));
 assert(bytes.join() === '1,3,4,4' && copy.join() === '3,4', 'buffer offsets and copying');
+assert(Buffer.isBuffer(copy) && copy.toString('base64') === 'AwQ=', 'addon buffers are Node buffers');
 const viewBytes = new Uint8Array([1, 2, 3, 4]);
 assert(addon.view(new DataView(viewBytes.buffer, 1, 2)) === 2 && viewBytes.join() === '1,3,4,4', 'dataview info');
 for (const fake of [{ __proto__: DataView.prototype, buffer: 1 }, { __proto__: DataView.prototype, buffer: viewBytes.buffer, byteOffset: 2, byteLength: 1e9 }]) {

@@ -103,15 +103,19 @@ impl Node {
         }
     }
 
-    /// The text a field shows: a password shows a bullet for each UTF-16 unit, so text offsets stay the same.
-    pub(crate) fn shown_text(&self, text: String) -> String {
-        if self.tag == "input"
+    /// Whether the node is a password field, which shows a bullet for each code point like Chrome.
+    pub(crate) fn password(&self) -> bool {
+        self.tag == "input"
             && self
                 .attrs
                 .get("type")
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
-        {
-            "\u{2022}".repeat(text.encode_utf16().count())
+    }
+
+    /// The text a field shows, see [`bullets`] for the offsets of a password.
+    pub(crate) fn shown_text(&self, text: String) -> String {
+        if self.password() {
+            "\u{2022}".repeat(text.chars().count())
         } else {
             text
         }
@@ -208,7 +212,11 @@ impl LayoutMirror {
     pub(crate) fn touch(&mut self) {
         self.reserve(0);
         if let Some(memory) = &self.memory {
-            unsafe { *memory.0.as_ptr().add(2) += 1. };
+            // WARNING: an f32 stops counting at 2^24, so the count wraps. Pages only compare it for equality.
+            unsafe {
+                let count = memory.0.as_ptr().add(2);
+                *count = (*count + 1.) % 16_777_216.;
+            }
         }
     }
 
@@ -325,22 +333,24 @@ pub struct State {
     pub(crate) hosts: HashMap<usize, usize>,
     /// Replaced or removed images whose GPU atlas tiles the renderer must drop.
     pub retired: Vec<Arc<renderer::RenderImage>>,
-    /// Canvases and videos with a replaced image in `retired`.
+    /// Canvases and videos with a replaced image in `retired` or `recycled`.
     pub(crate) retired_canvases: HashSet<usize>,
+    /// Replaced video frames by node, whose pixels go back to the media library once the renderer dropped them.
+    pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
     /// Images that workers decoded, by node and request.
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     /// The latest decode request by node.
     decoding: HashMap<usize, u64>,
     /// Empty nodes that the page reserved for `dom.batch` creates.
     pub(crate) reserved: HashSet<usize>,
-    pub(crate) svg_sources: HashMap<usize, ([f32; 2], String, String)>,
+    /// Inline SVG sources by `<svg>` node, with the size, the newest node revision and the style they were built at.
+    pub(crate) svg_sources: HashMap<usize, ([f32; 2], u64, Rc<style::Style>, String)>,
     /// Inline SVG geometry by `<svg>` node: the source it came from, the nodes of elements with their own
     /// ids, the SVG's size, and each element's node with its canvas box and object box.
     pub(crate) svg_boxes: HashMap<usize, SvgBoxes>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
     pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
-    pub(crate) image_crops: HashMap<usize, (u64, Arc<renderer::RenderImage>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
@@ -355,6 +365,8 @@ pub struct State {
     pub(crate) motion: style::Motion,
     pub(crate) animated: HashMap<usize, style::Style>,
     pub(crate) animating: HashMap<usize, Rc<style::Style>>,
+    /// Nodes with an animated color in the last frame, whose paragraphs draw it from their inline text.
+    pub(crate) recolored: Vec<usize>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
@@ -416,9 +428,10 @@ impl State {
                     .user_select
                     .resize(doc.nodes.len(), (style::UserSelect::None, 0));
                 computed.user_select[id] = (style::UserSelect::None, 0);
-            } else {
+            } else if id >= cached.values.len() {
                 self.computed = None;
             }
+            // WARNING: a frame keeps a clone of the styles, so they can't grow in place. Detached nodes have empty styles in them, and new nodes are detached, so only a new id makes them stale.
         }
     }
 }
@@ -467,9 +480,13 @@ fn pixmap(image: &renderer::RenderImage) -> Option<resvg::tiny_skia::Pixmap> {
     Some(pixels)
 }
 
-/// Shows a new frame of video `id`, or none.
-pub(crate) fn show_frame(state: &mut State, id: usize, image: Option<Arc<renderer::RenderImage>>) {
-    if state.retired.is_empty() {
+/// Shows a new frame of video `id`, or none. Returns the replaced frame when no window drew it.
+pub(crate) fn show_frame(
+    state: &mut State,
+    id: usize,
+    image: Option<Arc<renderer::RenderImage>>,
+) -> Option<Arc<renderer::RenderImage>> {
+    if state.recycled.is_empty() {
         state.retired_canvases.clear();
     }
     // WARNING: a poster that decodes later must not replace the frame.
@@ -485,13 +502,15 @@ pub(crate) fn show_frame(state: &mut State, id: usize, image: Option<Arc<rendere
         *node = None;
         state.cull.seen = None;
     }
-    // WARNING: only the first frame replaced since the renderer drained `retired` can be on the GPU; later ones are dropped so unrendered windows do not grow it.
-    if let Some(old) = old
-        && state.retired_canvases.insert(id)
-    {
-        state.retired.push(old);
-    }
     state.dirty = true;
+    // WARNING: only the first frame replaced since the renderer drained `recycled` can be on the GPU; later ones are returned so unrendered windows do not grow it.
+    match old {
+        Some(old) if state.retired_canvases.insert(id) => {
+            state.recycled.push((id, old));
+            None
+        }
+        old => old,
+    }
 }
 
 pub(crate) fn load_image(
@@ -717,15 +736,20 @@ pub fn call(
                         args[2].as_bool().unwrap_or(false),
                         initial.map_or(String::new(), |value| format!("initial-value:{value}"))
                     );
-                    let prop = style::Prop::new(name);
                     let registered = style::Stylesheet::parse(&rule).property();
+                    // WARNING: `Prop::new` leaks the names it interns, so only a valid new registration interns one.
                     match registered {
                         _ if !name.starts_with("--") => Err("SyntaxError"),
-                        _ if state.style_cache.scripted.contains_key(&prop) => {
+                        _ if style::Prop::find(name)
+                            .is_some_and(|prop| state.style_cache.scripted.contains_key(&prop)) =>
+                        {
                             Err("InvalidModificationError")
                         }
                         Some(value) => {
-                            state.style_cache.scripted.insert(prop, value);
+                            state
+                                .style_cache
+                                .scripted
+                                .insert(style::Prop::new(name), value);
                             Ok(Value::Null)
                         }
                         None => Err("SyntaxError"),
@@ -776,18 +800,18 @@ pub fn call(
             return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
         }
         if op == "dom.release" {
+            // WARNING: the page already forgot these lists, so a bad id is skipped instead of failing the rest.
             for value in args[1].as_array().context("Expected live nodes")? {
-                let id = value.as_u64().context("Invalid node id")? as usize;
-                ensure!(
-                    doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty()),
-                    "Invalid node id"
-                );
-                state.live.insert(id);
+                if let Some(id) = value.as_u64().map(|id| id as usize)
+                    && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
+                {
+                    state.live.insert(id);
+                }
             }
             for value in args[0].as_array().context("Expected dead nodes")? {
-                state
-                    .live
-                    .remove(&(value.as_u64().context("Invalid node id")? as usize));
+                if let Some(id) = value.as_u64() {
+                    state.live.remove(&(id as usize));
+                }
             }
             let mut roots = std::mem::take(&mut state.detached);
             roots.sort_unstable();
@@ -850,9 +874,6 @@ pub fn call(
                     state
                         .retired
                         .extend(state.masks.remove(&id).map(|(_, image)| image));
-                    state
-                        .retired
-                        .extend(state.image_crops.remove(&id).map(|(_, image)| image));
                     state.svg_sources.remove(&id);
                     state.svg_boxes.remove(&id);
                     state.svg_images.remove(&id);
@@ -1526,13 +1547,13 @@ pub fn call(
                             doc.nodes[id]
                                 .attrs
                                 .get("width")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(300),
+                                .and_then(|v| crate::render::dimension(v, true))
+                                .map_or(300, |v| v as u32),
                             doc.nodes[id]
                                 .attrs
                                 .get("height")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(150),
+                                .and_then(|v| crate::render::dimension(v, true))
+                                .map_or(150, |v| v as u32),
                         )?,
                     };
                     let old = canvas.image.clone();
@@ -1578,13 +1599,13 @@ pub fn call(
                     let width = doc.nodes[id]
                         .attrs
                         .get("width")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(300);
+                        .and_then(|v| crate::render::dimension(v, true))
+                        .map_or(300, |v| v as u32);
                     let height = doc.nodes[id]
                         .attrs
                         .get("height")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(150);
+                        .and_then(|v| crate::render::dimension(v, true))
+                        .map_or(150, |v| v as u32);
                     crate::render::canvas::Canvas::new(width, height)?
                         .pixels
                         .encode_png()?
@@ -1599,13 +1620,13 @@ pub fn call(
                     let width = doc.nodes[id]
                         .attrs
                         .get("width")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(300);
+                        .and_then(|v| crate::render::dimension(v, true))
+                        .map_or(300, |v| v as u32);
                     let height = doc.nodes[id]
                         .attrs
                         .get("height")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(150);
+                        .and_then(|v| crate::render::dimension(v, true))
+                        .map_or(150, |v| v as u32);
                     entry.insert(crate::render::canvas::Canvas::new(width, height)?);
                 }
                 let canvas = state.canvases.get(&id).unwrap();
@@ -1679,16 +1700,20 @@ pub fn call(
                     let current = &doc.nodes[node];
                     if op == "dom.textOffset" && node == target {
                         let index = args[2].as_u64().unwrap_or(0) as usize;
-                        offset += if current.tag == "#text" {
-                            index
-                        } else {
-                            current
-                                .children
-                                .iter()
-                                .take(index)
-                                .map(|child| doc.text(*child).encode_utf16().count())
-                                .sum()
-                        };
+                        if current.tag == "#text" {
+                            return Ok(json!(offset + index));
+                        }
+                        // WARNING: count only text nodes, like the walk above, so comments before the boundary add nothing.
+                        pending.clear();
+                        pending.extend(current.children.iter().take(index));
+                        while let Some(node) = pending.pop() {
+                            let current = &doc.nodes[node];
+                            if current.tag == "#text" {
+                                offset += current.text.encode_utf16().count();
+                            } else {
+                                pending.extend(&current.children);
+                            }
+                        }
                         return Ok(json!(offset));
                     }
                     if current.tag == "#text" {
@@ -1732,6 +1757,22 @@ pub fn call(
                         json!(0)
                     });
                 };
+                // WARNING: a password shows bullets, so offsets go from its value to the bullets and back.
+                let password = doc.nodes[id]
+                    .password()
+                    .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
+                let shown = |offset| {
+                    password
+                        .as_deref()
+                        .map_or(offset, |value| bullets(value, offset))
+                };
+                let real = |index| {
+                    password
+                        .as_deref()
+                        .map_or(index, |value| unbullet(value, index))
+                };
+                let start = shown(args[1].as_u64().unwrap_or(0) as usize);
+                let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
                 if let Some((layout, text, range, rows)) = state.text_layouts.get(&id) {
                     let content = &text[range.clone()];
                     if op == "dom.textIndex" {
@@ -1742,10 +1783,8 @@ pub fn call(
                         let index = crate::render::text::text_index(layout, text, rows, position)
                             .unwrap_or_else(|index| index)
                             .clamp(range.start, range.end);
-                        return Ok(json!(text[range.start..index].encode_utf16().count()));
+                        return Ok(json!(real(text[range.start..index].encode_utf16().count())));
                     }
-                    let start = args[1].as_u64().unwrap_or(0) as usize;
-                    let end = args[2].as_u64().unwrap_or(start as u64) as usize;
                     let a = crate::render::text::text_position(
                         layout,
                         text,
@@ -1773,30 +1812,45 @@ pub fn call(
                     .text_system
                     .clone()
                     .context("Text geometry requires a displayed window")?;
-                let bounds = *bounds;
+                let [x, y, width, full] = *bounds;
                 // WARNING: a focus change just before a click can drop the cached styles, so they are computed again here.
                 let computed = styles(doc, state, viewport, Some((&system, state.pixel_ratio)));
-                let style = &computed.values[id];
-                let text = doc.nodes[id].shown_text(
-                    doc.nodes[id]
-                        .current_value()
+                let (style, units) = (&computed.values[id], &computed.lengths[id]);
+                let node = &doc.nodes[id];
+                let text = node.shown_text(
+                    node.current_value()
                         .map_or_else(|| doc.text(id), str::to_owned),
                 );
-                let font_size = style::length(
-                    style.get(Prop::FONT_SIZE).unwrap_or("16px"),
-                    16.,
-                    16.,
-                    viewport[0],
-                    viewport[1],
-                );
-                let height = style::length(
-                    style.get(Prop::LINE_HEIGHT).unwrap_or("20px"),
-                    font_size,
-                    font_size,
-                    viewport[0],
-                    viewport[1],
-                )
-                .max(1.);
+                let (font_size, height) = (units.font.em, units.font.lh.max(1.));
+                // WARNING: like render, the text starts in the content box, and an input centers its line there.
+                let padding = units.edges(style, style::PADDING, width);
+                let [top, right, bottom, left] = [0, 1, 2, 3].map(|side| {
+                    let [size, kind, _] = style::BORDERS[side];
+                    padding[side].max(0.)
+                        + if style
+                            .get(kind)
+                            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                        {
+                            0.
+                        } else {
+                            style
+                                .get(size)
+                                .map_or(Some(3.), |size| units.resolve(size, width))
+                                .unwrap_or(0.)
+                                .max(0.)
+                        }
+                });
+                let single = node.tag == "input";
+                let bounds = [
+                    x + left,
+                    y + top
+                        + if single {
+                            (full - top - bottom - height) / 2.
+                        } else {
+                            0.
+                        },
+                    width - left - right,
+                ];
                 let run = renderer::TextRun {
                     len: text.len(),
                     font: style::font(style),
@@ -1808,9 +1862,10 @@ pub fn call(
                     word_spacing: renderer::px(0.),
                     font_size: None,
                 };
-                let wrap = (!style
-                    .get(Prop::WHITE_SPACE)
-                    .is_some_and(|s| matches!(s, "pre" | "nowrap")))
+                let wrap = (!single
+                    && !style
+                        .get(Prop::WHITE_SPACE)
+                        .is_some_and(|s| matches!(s, "pre" | "nowrap")))
                 .then_some(renderer::px(bounds[2]));
                 let lines = system.shape_text(
                     text.clone().into(),
@@ -1823,8 +1878,6 @@ pub fn call(
                 let mut top = 0.;
                 let mut offset = 0;
                 let mut rects: Vec<[f32; 4]> = Vec::new();
-                let start = args[1].as_u64().unwrap_or(0) as usize;
-                let end = args[2].as_u64().unwrap_or(start as u64) as usize;
                 for line in lines {
                     let rows = line.wrap_boundaries.len() + 1;
                     if op == "dom.textIndex" {
@@ -1838,7 +1891,9 @@ pub fn call(
                                 renderer::px(height),
                             );
                             let index = index.unwrap_or_else(|index| index);
-                            return Ok(json!(offset + line.text[..index].encode_utf16().count()));
+                            return Ok(json!(real(
+                                offset + line.text[..index].encode_utf16().count()
+                            )));
                         }
                     } else {
                         let length = line.text.encode_utf16().count();
@@ -1873,7 +1928,7 @@ pub fn call(
                 Ok(if op == "dom.textRect" {
                     json!(rects)
                 } else {
-                    json!(text.encode_utf16().count())
+                    json!(real(text.encode_utf16().count()))
                 })
             }
             "dom.measureText" => {
@@ -2229,8 +2284,6 @@ pub(crate) fn styles(
     {
         return computed.clone();
     }
-    state.svg_sources.clear();
-    state.svg_boxes.clear();
     let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
     let mut context = style::StyleContext {
         reduced_motion,
@@ -2529,6 +2582,16 @@ fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
     }
 }
 
+/// The bullets that a password field shows before UTF-16 offset `offset` of its `value`.
+pub(crate) fn bullets(value: &str, offset: usize) -> usize {
+    value[..utf16_index(value, offset)].chars().count()
+}
+
+/// The UTF-16 offset in a password `value` after `bullets` of its bullets.
+pub(crate) fn unbullet(value: &str, bullets: usize) -> usize {
+    value.chars().take(bullets).map(char::len_utf16).sum()
+}
+
 pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
     let mut offset = 0;
     for (byte, c) in text.char_indices() {
@@ -2542,6 +2605,76 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_fields_show_a_bullet_per_code_point() {
+        let doc = Document::parse("<input type=password><input>");
+        let [password, text] = [1, 2].map(|nth| {
+            doc.nodes
+                .iter()
+                .filter(|node| node.tag == "input")
+                .nth(nth - 1)
+                .unwrap()
+        });
+        let value = "a\u{1F600}b";
+        assert_eq!(password.shown_text(value.into()), "\u{2022}".repeat(3));
+        assert_eq!(text.shown_text(value.into()), value);
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|offset| bullets(value, offset)),
+            [0, 1, 2, 2, 3]
+        );
+        assert_eq!(
+            [0, 1, 2, 3].map(|index| unbullet(value, index)),
+            [0, 1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn layout_count_wraps_before_f32_stops_counting() {
+        let mut mirror = LayoutMirror::default();
+        mirror.touch();
+        let count =
+            |mirror: &LayoutMirror| unsafe { mirror.memory.as_ref().unwrap().0.as_ptr().add(2) };
+        assert_eq!(unsafe { *count(&mirror) }, 1.);
+        unsafe { *count(&mirror) = 16_777_215. };
+        mirror.touch();
+        assert_eq!(unsafe { *count(&mirror) }, 0.);
+    }
+
+    #[test]
+    fn detached_nodes_keep_styles_that_a_frame_holds() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{Api, Engine},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse("<html><body><div id='editor'></div></body></html>"),
+                dirty: false,
+            },
+        );
+        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        engine
+            .eval(
+                "const editor=document.getElementById('editor');document.createElement('i');getComputedStyle(editor).color;",
+                "test",
+            )
+            .unwrap();
+        let held = host.borrow().dom[&1].computed.clone().unwrap();
+        engine
+            .eval(
+                "for(let i=0;i<20;i++)document.createElement('b').textContent='x';getComputedStyle(editor).color",
+                "test",
+            )
+            .unwrap();
+        assert!(Rc::ptr_eq(
+            &held,
+            host.borrow().dom[&1].computed.as_ref().unwrap()
+        ));
+    }
     use super::*;
 
     #[test]
@@ -2635,14 +2768,13 @@ mod tests {
         );
         let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
         let computed = || host.borrow().dom[&1].computed.as_ref().map(Rc::as_ptr);
-        let [p, svg] = ["p", "svg"].map(|tag| {
-            host.borrow().pages[&1]
-                .doc
-                .nodes
-                .iter()
-                .position(|node| node.tag == tag)
-                .unwrap()
-        });
+        let p = host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "p")
+            .unwrap();
+        let revision = || host.borrow().pages[&1].doc.nodes.latest();
         let hover = |ids: &[usize]| {
             host.borrow_mut()
                 .call(Role::Renderer(1), "dom.hover", json!([ids]))
@@ -2656,12 +2788,7 @@ mod tests {
             .unwrap();
         let cached = computed();
         assert!(cached.is_some());
-        host.borrow_mut()
-            .dom
-            .get_mut(&1)
-            .unwrap()
-            .svg_sources
-            .insert(svg, ([1., 1.], String::new(), String::new()));
+        let built = revision();
         engine
             .eval(
                 "p.firstChild.data='other';document.querySelector('svg text').firstChild.data='b';",
@@ -2671,7 +2798,7 @@ mod tests {
         hover(&[p]);
         hover(&[]);
         assert_eq!(computed(), cached);
-        assert!(!host.borrow().dom[&1].svg_sources.contains_key(&svg));
+        assert_ne!(revision(), built);
         engine
             .eval(
                 r#"

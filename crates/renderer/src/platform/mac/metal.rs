@@ -1,6 +1,6 @@
 use crate::{
     DevicePixels, Size,
-    atlas::{Atlas, AtlasBackend, Packer, TextureList},
+    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
     frame::{Cmd, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -33,7 +33,11 @@ const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
 const MAX_TEXTURE_SIZE: u32 = 16384;
 /// Metal requires buffers to be bound at 256-byte aligned offsets.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
+const MIN_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// After this many frames in a row that use at most a quarter of the instance buffer size, the
+/// size halves.
+const SHRINK_FRAMES: u32 = 120;
 /// Unused layer textures are kept this many frames, for layers that come back.
 const SPARE_FRAMES: u8 = 3;
 
@@ -47,12 +51,15 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 struct BufferPool {
     size: usize,
     buffers: Vec<(Buffer, usize)>,
+    /// Frames in a row whose instance data fit in a quarter of `size`.
+    small: u32,
 }
 
 thread_local! {
     static POOL: Rc<RefCell<BufferPool>> = Rc::new(RefCell::new(BufferPool {
-        size: 2 * 1024 * 1024,
+        size: MIN_INSTANCE_BUFFER_SIZE,
         buffers: Vec::new(),
+        small: 0,
     }));
 }
 
@@ -75,6 +82,15 @@ impl BufferPool {
             .newBufferWithLength_options(self.size, options)
             .with_context(|| format!("allocating {}-byte instance buffer", self.size))?;
         Ok((buffer, self.size))
+    }
+
+    /// Sets the buffer size and drops the pooled buffers of the old size.
+    fn resize(&mut self, size: usize) {
+        if size != self.size {
+            self.size = size;
+            self.buffers.clear();
+        }
+        self.small = 0;
     }
 }
 
@@ -245,12 +261,24 @@ impl Renderer {
         self.layer.setOpaque(!transparent);
     }
 
-    /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
-    /// Frees the layer textures the last frame did not use, for a window that stops drawing.
+    /// Frees the layer textures the last frame did not use, the removed and kept atlas textures
+    /// and big instance buffers, for a window that stops drawing.
     pub fn trim(&mut self) {
         self.pool.retain(|(_, _, idle)| *idle == 0);
+        // WARNING: command buffers of one queue complete in order, so an empty one waits for the frames in flight.
+        self.atlas.free_retired(|| {
+            if let Some(commands) = self.queue.commandBuffer() {
+                commands.commit();
+                commands.waitUntilCompleted();
+            }
+        });
+        let textures = &mut *self.atlas.backend.borrow_mut();
+        textures.mono.trim(|texture| texture.packer.is_empty());
+        textures.poly.trim(|texture| texture.packer.is_empty());
+        POOL.with(|pool| pool.borrow_mut().resize(MIN_INSTANCE_BUFFER_SIZE));
     }
 
+    /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         let size = self.layer.drawableSize();
         let window = [size.width.ceil() as u32, size.height.ceil() as u32];
@@ -687,10 +715,7 @@ impl Writer {
             size >= required && size > self.current.1,
             "frame instance data exceeds {MAX_INSTANCE_BUFFER_SIZE} bytes"
         );
-        if size != pool.size {
-            pool.size = size;
-            pool.buffers.clear();
-        }
+        pool.resize(size);
         let buffer = pool.acquire(&self.device, self.unified)?;
         drop(pool);
         let filled = mem::replace(&mut self.current, buffer);
@@ -700,6 +725,22 @@ impl Writer {
     }
 
     fn finish(self) -> (Buffer, usize) {
+        let used = self.offset
+            + self
+                .filled
+                .iter()
+                .map(|(_, written)| written)
+                .sum::<usize>();
+        let mut pool = self.pool.borrow_mut();
+        if used > pool.size / 4 || pool.size <= MIN_INSTANCE_BUFFER_SIZE {
+            pool.small = 0;
+        } else if pool.small + 1 < SHRINK_FRAMES {
+            pool.small += 1;
+        } else {
+            let size = pool.size / 2;
+            pool.resize(size);
+        }
+        drop(pool);
         if !self.unified {
             for ((buffer, _), written) in &self.filled {
                 if *written > 0 {
@@ -762,7 +803,7 @@ impl AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let side = |value: i32| value.clamp(1024, MAX_TEXTURE_SIZE as i32);
+                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIZE as i32);
                 let texture_size = Size::new(
                     DevicePixels(side(size.width.0)),
                     DevicePixels(side(size.height.0)),
@@ -875,8 +916,7 @@ impl AtlasBackend for AtlasTextures {
             .and_then(Option::as_mut)
             .is_some_and(|texture| texture.packer.free(tile.tile_id));
         if empty {
-            list.textures[index] = None;
-            list.free.push(index);
+            list.emptied(index, |texture| texture.packer.is_empty());
         }
     }
 }

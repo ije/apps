@@ -1170,3 +1170,52 @@ fn relative_has_selectors_match_and_invalid_candidates_emit_nothing() {
         None
     );
 }
+
+#[test]
+fn hostile_classes_stay_linear_and_bounded() {
+    let start = std::time::Instant::now();
+    let classes = [
+        format!("{}flex", "marker:".repeat(12)),
+        format!("{}flex", "[&&&&]:".repeat(12)),
+        format!(
+            "[color:{}x{}]",
+            "--alpha(--theme(theme(".repeat(9),
+            ")".repeat(27)
+        ),
+        format!("[x:{}]", "a-theme(".repeat(20_000)),
+        format!(
+            "[color:{}x{}]",
+            "--alpha(".repeat(14_000),
+            ")".repeat(14_000)
+        ),
+        "a-".repeat(40_000) + "a",
+    ];
+    let classes: Vec<_> = classes.iter().map(String::as_str).collect();
+    let css = generated("", &classes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(css[..2], ["", ""]);
+    assert_eq!(
+        generated("", &["marker:flex"]),
+        [
+            ".marker\\:flex *::marker,.marker\\:flex::marker,.marker\\:flex *::-webkit-details-marker,.marker\\:flex::-webkit-details-marker{display:flex;}"
+        ]
+    );
+}
+
+#[test]
+fn custom_utilities_never_expand_forever() {
+    assert_generated(
+        "@utility tab-* { tab-size: --value(integer, [integer]); }
+        @utility loop { @apply loop; color: red; }
+        @utility a { @apply b; color: red; }
+        @utility b { @apply a; width: 1px; }",
+        &[
+            (
+                "tab-[integer:--value([integer])]",
+                ".tab-\\[integer\\:--value\\(\\[integer\\]\\)\\]{tab-size:--value([integer]);}",
+            ),
+            ("loop", ".loop{color:red;}"),
+            ("a", ".a{width:1px;color:red;}"),
+        ],
+    );
+}

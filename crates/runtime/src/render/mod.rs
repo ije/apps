@@ -14,6 +14,7 @@ pub(crate) mod text;
 
 use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
+pub(crate) use element::dimension;
 use element::{Build, element};
 use renderer::{
     App, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
@@ -34,6 +35,18 @@ pub(crate) struct ViewData {
     pub(crate) host: Rc<RefCell<Host>>,
     pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
+    /// By browser, the bounds it was given and the node revision its source was checked at.
+    pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64)>>,
+    /// The `canvas` and `iframe` nodes, found again when the document changes.
+    tagged: RefCell<(u64, Vec<usize>, Vec<usize>)>,
+    /// The `id` index of the document, kept while the document is unchanged.
+    ids: RefCell<(u64, Rc<effects::Ids>)>,
+    /// By inline SVG: its style, size and content hash, its source, and its parsed boxes.
+    svgs: RefCell<HashMap<usize, element::Svg>>,
+    /// By form field, the selection while focused and the text length it drew last, to scroll a moved caret into view.
+    fields: RefCell<HashMap<usize, input::Caret>>,
+    /// Background image files that workers decode, with the node that wants them and the bitmap once it is done.
+    decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
     /// A drag area was pressed, so the next drag moves the window.
     pub(crate) moving: Cell<bool>,
     /// The files dragged over the window.
@@ -43,7 +56,12 @@ pub(crate) struct ViewData {
     window: WindowId,
     /// A script read geometry, so this build only lays the page out.
     reflowing: Cell<bool>,
+    /// Boxes whose animations wait until they come into view, with their clipping ancestors.
+    parked: RefCell<Vec<(usize, Clips)>>,
 }
+
+/// Clipping ancestors with their clipped axes, see [`clips`].
+type Clips = Vec<(usize, [bool; 2])>;
 
 thread_local! {
     /// The app and the window of the page scripts that run now.
@@ -161,11 +179,18 @@ impl WebView {
             host,
             images: RefCell::default(),
             browsers: RefCell::default(),
+            frames: RefCell::default(),
+            tagged: RefCell::default(),
+            ids: RefCell::default(),
+            svgs: RefCell::default(),
+            fields: RefCell::default(),
+            decoding: RefCell::default(),
             moving: Cell::new(false),
             dropped: RefCell::default(),
             buttons: Cell::new(0),
             window,
             reflowing: Cell::new(false),
+            parked: RefCell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);
@@ -187,6 +212,20 @@ impl WebView {
         let data = self.0.clone();
         // WARNING: presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
         let pointer_events = renderer::canvas(|_, _| (), move |_, _, window| {
+            // WARNING: the page was laid out by now, so a parked box that came into view animates from the next frame.
+            let parked = data.parked.take();
+            let size = window.viewport_size();
+            if !parked.is_empty()
+                && data.host.try_borrow().is_ok_and(|host| {
+                    host.dom.get(&data.id).is_some_and(|dom| {
+                        parked.iter().any(|(id, clips)| {
+                            in_view(&dom.bounds, [f32::from(size.width), f32::from(size.height)], *id, clips.iter().copied())
+                        })
+                    })
+                })
+            {
+                window.request_animation_frame();
+            }
             let view = data.clone();
             window.on_mouse_event(move |event: &MouseExitEvent, phase, window, cx| {
                 if phase.capture() {
@@ -240,18 +279,24 @@ impl WebView {
             let runtime = self.runtime.clone();
             cx.defer(move |cx| Desktop::drive(runtime, cx));
         }
+        let mut tagged = self.tagged.borrow_mut();
+        if let Some(page) = host.pages.get(&self.id)
+            && tagged.0 != page.doc.nodes.latest()
+        {
+            tagged.0 = page.doc.nodes.latest();
+            tagged.1.clear();
+            tagged.2.clear();
+            for (id, node) in page.doc.nodes.iter().enumerate() {
+                match node.tag.as_str() {
+                    "canvas" => tagged.1.push(id),
+                    "iframe" => tagged.2.push(id),
+                    _ => {}
+                }
+            }
+        }
         let mut images = HashMap::new();
-        if let (Some(gpu), Some(page)) = {
-            let host = &mut *host;
-            (host.graphics.get_mut(&self.id), host.pages.get(&self.id))
-        } {
-            for (id, _) in page
-                .doc
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| n.tag == "canvas")
-            {
+        if let Some(gpu) = host.graphics.get_mut(&self.id) {
+            for &id in &tagged.1 {
                 match gpu.image(id) {
                     Ok(Some(image)) => {
                         images.insert(id, image);
@@ -261,6 +306,7 @@ impl WebView {
                 }
             }
         }
+        drop(tagged);
         let old = std::mem::replace(&mut *self.images.borrow_mut(), images);
         for (id, old) in old {
             if self
@@ -273,7 +319,13 @@ impl WebView {
             }
         }
         if let Some((browser, _)) = self.browsers.borrow().get(&usize::MAX) {
-            let _ = browser.set_bounds([0., 0., width as f64, height as f64]);
+            let bounds = [0., 0., width as f64, height as f64];
+            let mut frames = self.frames.borrow_mut();
+            let set = &mut frames.entry(usize::MAX).or_insert(([f64::NAN; 4], 0)).0;
+            if *set != bounds {
+                *set = bounds;
+                let _ = browser.set_bounds(bounds);
+            }
         }
         let inspectable = !host.packaged;
         let Some(page) = host.pages.get_mut(&self.id) else {
@@ -285,6 +337,15 @@ impl WebView {
         let dom = state.dom.entry(self.id).or_default();
         for image in dom.retired.drain(..) {
             window.drop_image(image);
+        }
+        // WARNING: the atlas copied the pixels of a drawn frame, so the media library can reuse them for its next frames.
+        for (node, image) in dom.recycled.drain(..) {
+            window.drop_image(image.clone());
+            if let Ok(image) = Arc::try_unwrap(image)
+                && let Some(media) = state.media.get_mut(&self.id)
+            {
+                media.recycle(node as u64, image);
+            }
         }
         dom.retired_canvases.clear();
         let cached = dom.computed.clone();
@@ -309,10 +370,17 @@ impl WebView {
             .iter()
             .map(|(&node, children)| (node, doc.nodes.compose_children(node, children.clone())))
             .collect();
+        let seen = (doc.nodes.latest(), dom.focus);
+        // WARNING: `cull.seen` holds the styles only between frames, so animated values swap in and out of them without a copy.
+        let same = dom
+            .cull
+            .seen
+            .take()
+            .is_some_and(|(latest, focus, computed)| {
+                (latest, focus) == seen && Rc::ptr_eq(&computed, &styles)
+            });
         let mut visible = std::mem::take(&mut dom.cull.visible);
-        if dom.cull.seen.as_ref().is_none_or(|(latest, _, computed)| {
-            *latest != doc.nodes.latest() || !Rc::ptr_eq(computed, &styles)
-        }) {
+        if !same {
             let mut shown = std::mem::take(&mut visible);
             visible.clear();
             visible.resize(doc.nodes.len(), false);
@@ -350,14 +418,22 @@ impl WebView {
         }
         let mut events = Vec::new();
         let now = std::time::Instant::now();
+        let bounds = &dom.bounds;
         let (mut animated, next) = dom.motion.update(
             &doc,
             &styles,
             &visible,
+            &|id| in_view(bounds, [width, height], id, clips(&doc, &styles, id)),
             now,
             dom.container_pass,
             &mut events,
         );
+        *self.parked.borrow_mut() = dom
+            .motion
+            .parked
+            .iter()
+            .map(|&id| (id, clips(&doc, &styles, id).collect()))
+            .collect();
         // WARNING: an animated custom property can change any value that uses it, so the frame cascades the animated values again.
         if !dom.motion.custom.is_empty() {
             dom.animated = std::mem::take(&mut dom.motion.custom);
@@ -435,37 +511,34 @@ impl WebView {
                 }
             }
         }
+        let relaid = !restore.is_empty();
         retire(dom, &visible, &styles, |image| window.drop_image(image));
-        let frame_nodes: Vec<_> = doc
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|&(id, node)| node.tag == "iframe" && visible[id])
-            .map(|(id, node)| {
-                (
-                    id,
-                    node.attrs.get("srcdoc").cloned(),
-                    node.attrs
-                        .get("src")
-                        .cloned()
-                        .unwrap_or_else(|| "about:blank".into()),
-                    node.attrs.get("sandbox").cloned(),
-                )
-            })
-            .collect();
+        self.svgs
+            .borrow_mut()
+            .retain(|&id, _| visible.get(id) == Some(&true));
+        self.fields
+            .borrow_mut()
+            .retain(|&id, _| visible.get(id) == Some(&true));
+        self.decoding
+            .borrow_mut()
+            .retain(|_, (id, _)| visible.get(*id) == Some(&true));
+        // WARNING: iframe bounds are set where they are laid out, see `paint.rs`.
+        let tagged = self.tagged.borrow();
+        let frame_nodes = || tagged.2.iter().copied().filter(|&id| visible[id]);
         let mut browsers = self.browsers.borrow_mut();
-        browsers.retain(|id, _| {
-            *id == usize::MAX || frame_nodes.iter().any(|(node, _, _, _)| node == id)
-        });
-        for (node, html, url, sandbox) in frame_nodes {
-            let source = html.clone().unwrap_or_else(|| url.clone());
+        let mut frames = self.frames.borrow_mut();
+        browsers.retain(|id, _| *id == usize::MAX || frame_nodes().any(|node| node == *id));
+        frames.retain(|id, _| browsers.contains_key(id));
+        for node in frame_nodes() {
+            let (attrs, revision) = (&doc.nodes[node].attrs, doc.nodes.revision(node));
             if let std::collections::hash_map::Entry::Vacant(entry) = browsers.entry(node) {
                 match crate::desktop::browser::Browser::new(
                     window,
-                    &serde_json::json!({"javascript":sandbox.as_ref().is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
+                    &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
                 ) {
                     Ok(browser) => {
                         entry.insert((browser, String::new()));
+                        frames.insert(node, ([f64::NAN; 4], 0));
                     }
                     Err(error) => {
                         eprintln!("apps: iframe: {error}");
@@ -473,24 +546,30 @@ impl WebView {
                     }
                 }
             }
-            let Some((browser, loaded)) = browsers.get_mut(&node) else {
+            let (Some((browser, loaded)), Some(frame)) =
+                (browsers.get_mut(&node), frames.get_mut(&node))
+            else {
                 continue;
             };
-            if source != *loaded {
-                let result = if let Some(html) = html {
-                    browser.load_html(&html, "about:blank")
-                } else {
-                    browser.load_url(&url)
+            if frame.1 == revision {
+                continue;
+            }
+            frame.1 = revision;
+            let html = attrs.get("srcdoc");
+            let url = attrs.get("src").map_or("about:blank", String::as_str);
+            let source = html.map_or(url, String::as_str);
+            if source != loaded {
+                let result = match html {
+                    Some(html) => browser.load_html(html, "about:blank"),
+                    None => browser.load_url(url),
                 };
                 if let Err(error) = result {
                     eprintln!("apps: iframe: {error}");
                 }
-                *loaded = source;
+                *loaded = source.to_owned();
             }
-            let bounds = dom.bounds.get(&node).copied().unwrap_or([0.; 4]);
-            let _ = browser.set_bounds(bounds.map(f64::from));
         }
-        drop(browsers);
+        drop((browsers, frames, tagged));
         let root = doc.nodes[0]
             .children
             .iter()
@@ -527,18 +606,16 @@ impl WebView {
         let frame = [width, height, window.scale_factor(), dom.font_loads as f32];
         let mut changed = Vec::new();
         let mut info = std::mem::take(&mut dom.cull.info);
-        // WARNING: scroll-only frames change no node, style or focus, so last frame's flags hold
-        // without its per-frame change bits.
-        let seen = (doc.nodes.latest(), dom.focus);
-        let unchanged = paint.is_empty()
-            && dom
-                .cull
-                .seen
-                .as_ref()
-                .is_some_and(|(latest, focus, computed)| {
-                    (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
-                });
-        dom.cull.seen = paint.is_empty().then(|| (seen.0, seen.1, styles.clone()));
+        // WARNING: scroll-only and paint animation frames change no node, style or focus, so last
+        // frame's flags hold without its per-frame change bits, while they have the animated flags.
+        let unchanged = same
+            && !relaid
+            && paint.iter().all(|(id, style)| {
+                let flags = cull::flags(&doc.nodes[*id].tag, style, &styles.lengths[*id], height)
+                    & (cull::MOVED | cull::BLOCKED);
+                info.get(*id)
+                    .is_some_and(|info| info.flags & flags == flags)
+            });
         if unchanged {
             for info in &mut info {
                 info.flags &= !(cull::CHANGED | cull::RELISTED | cull::STALE);
@@ -711,10 +788,28 @@ impl WebView {
                 };
             }
         }
+        // WARNING: the inline text of a paragraph holds the colors of its text, so a new color drops it this
+        // frame and the next, which draws the color without animation again.
+        let mut recolored = std::mem::take(&mut dom.recolored);
         if !paint.is_empty() {
             let values = &mut Rc::make_mut(&mut styles).values;
             for (id, style) in paint {
+                if style.get(Prop::COLOR) != values[id].get(Prop::COLOR) {
+                    dom.recolored.push(id);
+                }
                 restore.push((id, std::mem::replace(&mut values[id], style)));
+            }
+        }
+        recolored.extend(&dom.recolored);
+        for id in recolored {
+            let mut node = Some(id).filter(|&id| id < styles.values.len());
+            while let Some(id) = node {
+                dom.inline_text.remove(&id);
+                node = doc.nodes[id].parent.filter(|_| {
+                    styles.values[id]
+                        .get(Prop::DISPLAY)
+                        .is_none_or(|value| matches!(value, "inline" | "contents"))
+                });
             }
         }
         // WARNING: fonts, the viewport and container sizes change measurements without moving any box's geometry revision.
@@ -921,6 +1016,13 @@ impl WebView {
         }
         drop(host);
         let text_system = window.text_system().clone();
+        let ids = {
+            let mut ids = self.ids.borrow_mut();
+            if ids.0 != doc.nodes.latest() {
+                *ids = (doc.nodes.latest(), Rc::default());
+            }
+            ids.1.clone()
+        };
         let root = element(
             &Build {
                 doc: &doc,
@@ -937,7 +1039,7 @@ impl WebView {
                 perspective: None,
                 siblings: &RefCell::default(),
                 margins: &RefCell::default(),
-                ids: &Rc::default(),
+                ids: &ids,
                 info: &info,
                 zone,
             },
@@ -960,12 +1062,17 @@ impl WebView {
             dom.measurements = measured.into_inner();
             dom.inline_text = inline_text.into_inner();
             dom.animating.clear();
-            if !restore.is_empty() {
+            let restored = !restore.is_empty();
+            if restored {
                 let values = &mut Rc::make_mut(&mut styles).values;
                 for (id, style) in restore {
                     dom.animating
                         .insert(id, std::mem::replace(&mut values[id], style));
                 }
+            }
+            // WARNING: animated layout values change the boxes again next frame, so its flags are not kept.
+            dom.cull.seen = (!relaid).then(|| (seen.0, seen.1, styles.clone()));
+            if restored {
                 dom.computed = Some(styles);
             }
             // WARNING: one extra pass per frame at most, so container queries that resize their container cannot loop.
@@ -1035,6 +1142,60 @@ impl WebView {
     }
 }
 
+/// Whether box `id` was in the viewport and in its clipping ancestors `clips` on their clipped axes at
+/// the last layout. A box without bounds or without area counts as seen.
+fn in_view(
+    bounds: &crate::dom::LayoutMirror,
+    [width, height]: [f32; 2],
+    id: usize,
+    mut clips: impl Iterator<Item = (usize, [bool; 2])>,
+) -> bool {
+    let Some(&[x, y, w, h]) = bounds.get(&id).filter(|rect| rect[2] > 0. && rect[3] > 0.) else {
+        return true;
+    };
+    // WARNING: a box that rotates or scales up to 2x around its center stays within half its larger side around it.
+    let pad = w.max(h) / 2.;
+    let [left, top, right, bottom] = [x - pad, y - pad, x + w + pad, y + h + pad];
+    let overlaps = |[a, b, c, d]: [f32; 4], [horizontal, vertical]: [bool; 2]| {
+        (!horizontal || left.max(a) < right.min(a + c))
+            && (!vertical || top.max(b) < bottom.min(b + d))
+    };
+    overlaps([0., 0., width, height], [true; 2])
+        && clips.all(|(clip, axes)| bounds.get(&clip).is_none_or(|&rect| overlaps(rect, axes)))
+}
+
+/// The ancestors that clip box `id`, with their clipped axes. The list ends at a positioned box, which can escape them.
+fn clips<'a>(
+    doc: &'a crate::dom::Document,
+    styles: &'a style::ComputedStyles,
+    id: usize,
+) -> impl Iterator<Item = (usize, [bool; 2])> + 'a {
+    let mut node = Some(id);
+    std::iter::from_fn(move || {
+        loop {
+            let child = node?;
+            node = doc.nodes[child].parent.filter(|_| {
+                !matches!(
+                    styles.values[child].get(Prop::POSITION),
+                    Some("absolute" | "fixed")
+                )
+            });
+            let parent = node?;
+            let style = &styles.values[parent];
+            let axes = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                .map(|prop| style.get(prop).is_some_and(|value| value != "visible"));
+            if axes != [false; 2]
+                && !matches!(doc.nodes[parent].tag.as_str(), "html" | "body")
+                && style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| !matches!(value, "inline" | "contents"))
+            {
+                return Some((parent, axes));
+            }
+        }
+    })
+}
+
 /// Drops the cached images of nodes that are not displayed. Canvases keep their pixels.
 fn retire(
     dom: &mut crate::dom::State,
@@ -1054,22 +1215,17 @@ fn retire(
             false
         }
     });
-    dom.image_crops.retain(|id, (_, image)| {
-        visible.get(*id) == Some(&true) || {
-            release(image.clone());
-            false
-        }
-    });
     for (id, canvas) in &dom.canvases {
         if visible.get(*id) != Some(&true) {
             release(canvas.image.clone());
         }
     }
     // WARNING: `url()` layers share one decoded image per file, kept under `usize::MAX` while a layer uses it.
+    // Control layers are kept under `usize::MAX` minus their kind.
     dom.backgrounds.retain(|&(id, layer), (_, image)| {
         let keep = if id == usize::MAX {
             Arc::strong_count(image) > 1
-        } else if layer == usize::MAX {
+        } else if layer > usize::MAX - 64 {
             visible.get(id) == Some(&true)
         } else {
             visible.get(id) == Some(&true)
@@ -1093,6 +1249,47 @@ fn retire(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boxes_out_of_view_or_in_closed_clips_are_not_in_view() {
+        let mut doc = crate::dom::Document::parse(
+            "<div id=panel style='height:0;overflow:hidden'><i id=a></i><i id=b style='position:absolute'></i></div><b id=c></b><span style='overflow:hidden'><b id=d></b></span>",
+        );
+        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.], None);
+        let id = |name: &str| {
+            (0..doc.nodes.len())
+                .find(|&id| {
+                    doc.nodes[id]
+                        .attrs
+                        .get("id")
+                        .is_some_and(|value| value == name)
+                })
+                .unwrap()
+        };
+        let mut bounds = crate::dom::LayoutMirror::default();
+        let check = |bounds: &crate::dom::LayoutMirror, name| {
+            in_view(
+                bounds,
+                [800., 600.],
+                id(name),
+                clips(&doc, &styles, id(name)),
+            )
+        };
+        assert!(check(&bounds, "a"));
+        bounds.insert(id("panel"), [0., 0., 800., 0.]);
+        for name in ["a", "b", "c", "d"] {
+            bounds.insert(id(name), [10., 10., 16., 16.]);
+        }
+        assert_eq!(
+            ["a", "b", "c", "d"].map(|name| check(&bounds, name)),
+            [false, true, true, true]
+        );
+        bounds.insert(id("panel"), [0., 0., 800., 40.]);
+        bounds.insert(id("c"), [10., 620., 16., 16.]);
+        assert!(check(&bounds, "a") && !check(&bounds, "c"));
+        bounds.insert(id("c"), [10., 600., 16., 0.]);
+        assert!(check(&bounds, "c"));
+    }
 
     #[test]
     fn hidden_nodes_release_textures_but_canvases_keep_pixels() {

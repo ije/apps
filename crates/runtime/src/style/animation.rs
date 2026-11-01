@@ -10,6 +10,7 @@ use std::{
 };
 
 const PAINT: &[Prop] = &[
+    Prop::COLOR,
     Prop::OPACITY,
     Prop::TRANSFORM,
     Prop::TRANSLATE,
@@ -338,6 +339,8 @@ pub(crate) struct Motion {
     pub custom: HashMap<usize, Style>,
     /// The timer that wakes the view for the next animation change.
     pub wake: Option<(Instant, renderer::Timer)>,
+    /// Nodes whose animations wait until their box comes into view, from the last update.
+    pub parked: Vec<usize>,
 }
 
 impl Motion {
@@ -349,11 +352,15 @@ impl Motion {
         self.transitions.remove(&id);
     }
 
+    /// Samples the animations and transitions at `now`. `shown` tells whether a node's box was in view
+    /// at the last layout; animations that can't move an unshown box don't wake the view.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         doc: &Document,
         styles: &ComputedStyles,
         visible: &[bool],
+        shown: &dyn Fn(usize) -> bool,
         now: Instant,
         repass: bool,
         events: &mut Vec<(usize, &'static str, String, f64)>,
@@ -540,7 +547,7 @@ impl Motion {
             kept
         });
         let mut animated: HashMap<usize, Style> = HashMap::new();
-        let mut wakes: Vec<(usize, bool, f64, f64)> = Vec::new();
+        let mut wakes: Vec<(usize, bool, bool, f64, f64)> = Vec::new();
         for (&id, effects) in &styles.animations {
             if visible.get(id) != Some(&true) {
                 continue;
@@ -624,6 +631,9 @@ impl Motion {
                 wakes.push((
                     id,
                     effect.tracks.iter().all(|(key, _)| PAINT.contains(key)),
+                    effect.tracks.iter().all(|(key, frames)| {
+                        still(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                    }),
                     if effect.tracks.is_empty() {
                         end
                     } else {
@@ -666,6 +676,10 @@ impl Motion {
                     wakes.push((
                         id,
                         PAINT.contains(&transition.property),
+                        still(
+                            transition.property,
+                            [transition.from.as_str(), transition.to.as_str()].into_iter(),
+                        ),
                         (-time).max(0.),
                         transition.duration - time,
                     ));
@@ -714,25 +728,30 @@ impl Motion {
                 }
             }
         }
-        let mut layout: HashSet<usize> = inherited.iter().map(|(id, ..)| *id).collect();
         for (id, key, value) in inherited {
             animated.entry(id).or_default().insert(key, value);
         }
-        for (&id, values) in &animated {
-            if styles.values[id]
-                .get(Prop::DISPLAY)
-                .is_none_or(|value| matches!(value, "inline" | "contents"))
-                || values.iter().any(|(key, _)| !PAINT.contains(&key))
-            {
-                layout.insert(id);
-            }
-        }
+        // WARNING: the inline text of a paragraph holds the paint of its inline boxes, so render rebuilds it only for a new color.
+        let layout: HashSet<usize> = animated
+            .iter()
+            .filter(|(id, values)| {
+                values.iter().any(|(key, _)| {
+                    !PAINT.contains(&key)
+                        || key != Prop::COLOR
+                            && styles.values[**id]
+                                .get(Prop::DISPLAY)
+                                .is_none_or(|value| matches!(value, "inline" | "contents"))
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
         // WARNING: paint-only changes under a non-animated `opacity: 0` or inside a fully hidden
         // subtree can't be seen, so they only wake the view for their end events.
         let fixed =
             |id: usize, key: Prop| animated.get(&id).is_none_or(|values| !values.contains(key));
         let mut next = f64::INFINITY;
-        for (id, paint, change, end) in wakes {
+        self.parked.clear();
+        for (id, paint, still, change, end) in wakes {
             let unseen = paint && {
                 let mut faded = false;
                 let mut chain = Some(id);
@@ -763,7 +782,13 @@ impl Motion {
                 }
                 faded || hidden
             };
-            next = next.min(if unseen { end } else { change });
+            // WARNING: scrolls, resizes and DOM changes draw a frame, and render checks parked boxes after
+            // it lays them out, so their animations go on once they come into view.
+            let parked = !unseen && still && change < end && !shown(id);
+            if parked && self.parked.last() != Some(&id) {
+                self.parked.push(id);
+            }
+            next = next.min(if unseen || parked { end } else { change });
         }
         self.styled.retain(|id, _| animated.contains_key(id));
         let animated = animated
@@ -790,6 +815,19 @@ impl Motion {
             .ok()
             .and_then(|delay| now.checked_add(delay));
         (animated, next)
+    }
+}
+
+/// Whether animated paint values keep the box where it is, so they can't move it into view.
+fn still<'a>(prop: Prop, mut values: impl Iterator<Item = &'a str>) -> bool {
+    match prop {
+        Prop::TRANSLATE => false,
+        Prop::TRANSFORM => values.all(|value| {
+            !["translate", "matrix", "perspective"]
+                .iter()
+                .any(|name| value.contains(name))
+        }),
+        _ => PAINT.contains(&prop),
     }
 }
 
@@ -1338,8 +1376,15 @@ mod tests {
         let mut events = Vec::new();
         let mut update =
             |motion: &mut Motion, doc: &Document, styles: &ComputedStyles, time: f64| {
-                let (animated, next) =
-                    motion.update(doc, styles, &visible, at(time), false, &mut events);
+                let (animated, next) = motion.update(
+                    doc,
+                    styles,
+                    &visible,
+                    &|_| true,
+                    at(time),
+                    false,
+                    &mut events,
+                );
                 let running = next.is_some();
                 let values: HashMap<usize, Rc<Style>> = animated
                     .into_iter()
@@ -1386,9 +1431,25 @@ mod tests {
         let start = Instant::now();
         let mut motion = Motion::default();
         let styles = computed_styles(&doc);
-        motion.update(&doc, &styles, &visible, start, false, &mut Vec::new());
+        motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            start,
+            false,
+            &mut Vec::new(),
+        );
         let at = start + Duration::from_millis(500);
-        motion.update(&doc, &styles, &visible, at, false, &mut Vec::new());
+        motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            at,
+            false,
+            &mut Vec::new(),
+        );
         assert_eq!(motion.custom[&div].get(Prop::new("--w")), Some("50px"));
         let restyle = |doc: &Document, animated: HashMap<usize, Style>| {
             super::super::compute_styles(
@@ -1410,11 +1471,12 @@ mod tests {
         assert_eq!(styles.values[div].get(Prop::WIDTH), Some("0px"));
         doc.nodes[p].attrs.insert("class".into(), "on".into());
         let on = computed_styles(&doc);
-        motion.update(&doc, &on, &visible, at, false, &mut Vec::new());
+        motion.update(&doc, &on, &visible, &|_| true, at, false, &mut Vec::new());
         motion.update(
             &doc,
             &on,
             &visible,
+            &|_| true,
             at + Duration::from_millis(500),
             false,
             &mut Vec::new(),
@@ -1438,11 +1500,20 @@ mod tests {
         let mut events = Vec::new();
         let styles = computed_styles(&doc);
         assert_eq!(styles.starting[&p].get(Prop::OPACITY), Some("0"));
-        motion.update(&doc, &styles, &visible, start, false, &mut events);
+        motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            start,
+            false,
+            &mut events,
+        );
         let (animated, _) = motion.update(
             &doc,
             &styles,
             &visible,
+            &|_| true,
             start + Duration::from_millis(500),
             false,
             &mut events,
@@ -1459,6 +1530,7 @@ mod tests {
             &doc,
             &computed_styles(&doc),
             &visible,
+            &|_| true,
             start + Duration::from_secs(2),
             false,
             &mut events,
@@ -1468,6 +1540,7 @@ mod tests {
             &doc,
             &computed_styles(&doc),
             &visible,
+            &|_| true,
             start + Duration::from_secs(3),
             false,
             &mut events,
@@ -1476,6 +1549,7 @@ mod tests {
             &doc,
             &computed_styles(&doc),
             &visible,
+            &|_| true,
             start + Duration::from_millis(3250),
             false,
             &mut events,
@@ -1503,6 +1577,7 @@ mod tests {
                 doc,
                 &computed_styles(doc),
                 &visible,
+                &|_| true,
                 start + Duration::from_secs_f64(time),
                 false,
                 &mut events,
@@ -1550,7 +1625,15 @@ mod tests {
         let (mut frame, mut count, mut wakes) = (0, 0, Vec::new());
         while frame < (seconds * 120.).round() as u64 {
             let now = start + Duration::from_nanos(frame * 1_000_000_000 / 120);
-            let (_, next) = motion.update(&doc, &styles, &visible, now, false, &mut Vec::new());
+            let (_, next) = motion.update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| true,
+                now,
+                false,
+                &mut Vec::new(),
+            );
             count += 1;
             wakes.push(next.map(|next| (next - now).as_secs_f64()));
             let Some(next) = next else { break };
@@ -1599,6 +1682,111 @@ mod tests {
     }
 
     #[test]
+    fn animations_of_unshown_boxes_wait_unless_they_move_the_box() {
+        let page = |html: &str| {
+            Document::parse(&format!(
+                "<style>@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes slide{{to{{transform:translateX(9px)}}}}@keyframes blink{{50%{{opacity:0}}}}@keyframes grow{{to{{width:10px}}}}</style>{html}"
+            ))
+        };
+        let start = Instant::now();
+        for (html, parked) in [
+            ("<p style='animation:spin 1s linear infinite'></p>", true),
+            ("<p style='animation:blink 1s infinite'></p>", true),
+            ("<p style='animation:slide 1s linear infinite'></p>", false),
+            ("<p style='animation:grow 1s infinite'></p>", false),
+        ] {
+            let doc = page(html);
+            let styles = computed_styles(&doc);
+            let visible = vec![true; doc.nodes.len()];
+            let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+            let mut motion = Motion::default();
+            let (_, next) = motion.update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| false,
+                start,
+                false,
+                &mut Vec::new(),
+            );
+            assert_eq!(
+                (next.is_none(), motion.parked == [p]),
+                (parked, parked),
+                "{html}"
+            );
+        }
+        let doc = page("<p style='animation:spin 1s linear infinite'></p>");
+        let styles = computed_styles(&doc);
+        let visible = vec![true; doc.nodes.len()];
+        let mut motion = Motion::default();
+        motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| false,
+            start,
+            false,
+            &mut Vec::new(),
+        );
+        let later = start + Duration::from_millis(250);
+        let (animated, next) = motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            later,
+            false,
+            &mut Vec::new(),
+        );
+        assert_eq!(next, Some(later));
+        assert_eq!(&animated[0].1["transform"], "rotate(90deg)");
+    }
+
+    #[test]
+    fn inherited_colors_animate_without_layout() {
+        let mut doc = Document::parse(
+            "<html><style>body{color:blue;transition:color 1s linear}body.on{color:red}span{transition:background-color 1s linear}span.on{background-color:red}</style><body><p>a <span>b</span></p></body></html>",
+        );
+        let find =
+            |doc: &Document, tag: &str| doc.nodes.iter().position(|node| node.tag == tag).unwrap();
+        let (body, span) = (find(&doc, "body"), find(&doc, "span"));
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut update = |doc: &Document, time: u64| {
+            motion
+                .update(
+                    doc,
+                    &computed_styles(doc),
+                    &visible,
+                    &|_| true,
+                    start + Duration::from_millis(time),
+                    false,
+                    &mut Vec::new(),
+                )
+                .0
+        };
+        update(&doc, 0);
+        doc.nodes[body].attrs.insert("class".into(), "on".into());
+        update(&doc, 0);
+        let animated = update(&doc, 500);
+        assert_eq!(animated.len(), 5);
+        assert!(
+            animated
+                .iter()
+                .all(|(_, style, layout)| !layout && &style["color"] == "#800080ff")
+        );
+        doc.nodes[span].attrs.insert("class".into(), "on".into());
+        update(&doc, 500);
+        let animated = update(&doc, 750);
+        assert!(
+            animated
+                .iter()
+                .any(|(id, _, layout)| *id == span && *layout)
+        );
+    }
+
+    #[test]
     fn filled_animations_keep_one_style_while_unchanged() {
         let doc = Document::parse(
             "<style>@keyframes grow{to{width:10px}}p{width:0px;animation:grow 1s forwards}</style><p></p>",
@@ -1609,7 +1797,15 @@ mod tests {
         let mut motion = Motion::default();
         let mut style = |time: f64| {
             let now = start + Duration::from_secs_f64(time);
-            let (animated, _) = motion.update(&doc, &styles, &visible, now, false, &mut Vec::new());
+            let (animated, _) = motion.update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| true,
+                now,
+                false,
+                &mut Vec::new(),
+            );
             animated[0].1.clone()
         };
         let (half, end, later) = (style(0.5), style(2.), style(3.));

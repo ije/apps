@@ -109,6 +109,42 @@ fn audio_plays_to_the_end_and_loops() {
 }
 
 #[test]
+fn audio_survives_layout_and_rate_changes() {
+    let (_host, engine, base) = page(0);
+    engine
+        .eval(
+            &format!("globalThis.media = new Audio('{base}switch.mp3'); {EVENTS} media.play()"),
+            "media-test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(&engine, "media.ended ? [media.error, media.currentTime > 0.9, events.includes('error')].join() : media.error?.message ?? 'pending'"),
+        ",true,false"
+    );
+}
+
+#[test]
+fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
+    let (host, engine, base) = page(0);
+    engine
+        .eval(
+            &format!("globalThis.media = document.createElement('video'); document.body.replaceChildren(media); media.src = '{base}wide.mp4'"),
+            "media-test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(&engine, "media.readyState === 4 ? [media.videoWidth, media.videoHeight].join() : media.error?.message ?? 'pending'"),
+        "8192,32"
+    );
+    let id: usize = engine.eval("media._id", "media-test").unwrap().parse().unwrap();
+    let image = host.borrow().dom[&1].images[&id].clone();
+    assert_eq!(
+        [u32::from(image.size().width), u32::from(image.size().height)],
+        [8192, 32]
+    );
+}
+
+#[test]
 fn media_features_are_disabled_by_default() {
     let (_host, engine, base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
     engine

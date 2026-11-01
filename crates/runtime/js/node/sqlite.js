@@ -237,13 +237,13 @@ globalThis.__appsSQLite = native => {
     const pages = options.rate ?? 100;
     if (!Number.isInteger(pages) || pages <= 0) throw new RangeError('Backup rate must be positive');
     const id = call('sqlite.backup.start', source, String(path), options.source ?? 'main', options.target ?? 'main');
-    const deadline = Date.now() + 30000;
+    const deadline = performance.now() + 30000;
     try {
       while (true) {
         const state = call('sqlite.backup.step', id, pages);
         options.progress?.({ totalPages: state.totalPages, remainingPages: state.remainingPages });
         if (state.done) return state.totalPages;
-        if (Date.now() > deadline) throw new Error('SQLite backup timed out');
+        if (performance.now() > deadline) throw new Error('SQLite backup timed out');
         await new Promise(resolve => setTimeout(resolve, 4));
       }
     } finally { call('sqlite.backup.finish', id); }

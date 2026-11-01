@@ -160,10 +160,30 @@ impl Host {
                 .filter(|&id| doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty()))
                 .context("Invalid node")
         };
+        /// Drops the children that left `parent` while its list was stale.
+        fn prune(doc: &mut Document, parent: usize) {
+            let mut children = std::mem::take(&mut doc.nodes[parent].children);
+            children.retain(|&child| doc.nodes[child].parent == Some(parent));
+            doc.nodes[parent].children = children;
+        }
+        /// Inserts the children of a run before `before`, or at the end.
+        fn insert(
+            doc: &mut Document,
+            (parent, before): (usize, Option<usize>),
+            run: &mut Vec<usize>,
+        ) {
+            let children = &mut doc.nodes[parent].children;
+            let index = before
+                .and_then(|before| children.iter().position(|&id| id == before))
+                .unwrap_or(children.len());
+            children.splice(index..index, run.drain(..));
+        }
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let state = self.dom.entry(id).or_default();
         let doc = &mut page.doc;
         let mut errors = Vec::new();
+        // WARNING: removals from one parent and inserts at one place edit the children list once per run, so emptying or filling a list is O(n). Parent links are always current, while `stale` still lists children that left it and `run` holds children not in their parent's list yet.
+        let (mut stale, mut run, mut runs) = (None, None, Vec::new());
         'ops: for op in codes.as_chunks::<16>().0 {
             let [code, a, b, c] =
                 [0, 4, 8, 12].map(|i| i32::from_ne_bytes([op[i], op[i + 1], op[i + 2], op[i + 3]]));
@@ -219,20 +239,22 @@ impl Host {
                     }
                     1 => {
                         let (id, value) = (node(doc, a)?, parts[0]);
+                        if let Some(pending) = run.take_if(|&mut (parent, _)| parent == id) {
+                            insert(doc, pending, &mut runs);
+                        }
+                        if stale.take_if(|&mut parent| parent == id).is_some() {
+                            prune(doc, id);
+                        }
                         let current = &doc.nodes[id];
-                        // WARNING: selectors only see whether text is empty and layout diffs the text itself, so other text edits keep the styles; SVG sources embed the text.
-                        if current.tag == "#text"
+                        // WARNING: selectors only see whether text is empty and layout diffs the text itself, so other text edits keep the styles.
+                        if !(current.tag == "#text"
                             && current.text.is_empty() == value.is_empty()
                             && current
                                 .parent
-                                .is_none_or(|parent| doc.nodes[parent].tag != "style")
+                                .is_none_or(|parent| doc.nodes[parent].tag != "style"))
+                            && state.computed.is_some()
+                            && connected(doc, &state.hosts, id)
                         {
-                            let mut parent = current.parent;
-                            while let Some(id) = parent {
-                                state.svg_sources.remove(&id);
-                                parent = doc.nodes[id].parent;
-                            }
-                        } else if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.computed = None;
                         }
                         doc.nodes[id].text = value.into();
@@ -253,8 +275,10 @@ impl Host {
                         );
                         let before = usize::try_from(c).ok();
                         ensure!(
-                            before
-                                .is_none_or(|before| doc.nodes[parent].children.contains(&before)),
+                            before.is_none_or(|before| doc
+                                .nodes
+                                .get(before)
+                                .is_some_and(|node| node.parent == Some(parent))),
                             "Reference is not a child"
                         );
                         let mut ancestor = Some(parent);
@@ -273,34 +297,62 @@ impl Host {
                         if before == Some(child) {
                             return Ok(false);
                         }
-                        if let Some(old) = doc.nodes[child].parent
-                            && let Some(index) =
-                                doc.nodes[old].children.iter().position(|&id| id == child)
-                        {
-                            doc.nodes[old].children.remove(index);
+                        if let Some(pending) = run.take_if(|&mut key| key != (parent, before)) {
+                            insert(doc, pending, &mut runs);
                         }
-                        let children = &mut doc.nodes[parent].children;
-                        let index = before
-                            .and_then(|before| children.iter().position(|&id| id == before))
-                            .unwrap_or(children.len());
-                        children.insert(index, child);
+                        if stale.take_if(|&mut stale| stale == parent).is_some() {
+                            prune(doc, parent);
+                        }
+                        match doc.nodes[child].parent {
+                            Some(old) if old == parent => {
+                                if let Some(pending) = run.take() {
+                                    insert(doc, pending, &mut runs);
+                                }
+                                let children = &mut doc.nodes[parent].children;
+                                if let Some(index) = children.iter().position(|&id| id == child) {
+                                    children.remove(index);
+                                }
+                                let index = before
+                                    .and_then(|before| children.iter().position(|&id| id == before))
+                                    .unwrap_or(children.len());
+                                children.insert(index, child);
+                                return Ok(true);
+                            }
+                            Some(old) => {
+                                if let Some(previous) = stale.replace(old)
+                                    && previous != old
+                                {
+                                    prune(doc, previous);
+                                }
+                            }
+                            None => {}
+                        }
                         doc.nodes[child].parent = Some(parent);
+                        run = Some((parent, before));
+                        runs.push(child);
                         true
                     }
                     3 => {
                         let parent = node(doc, a)?;
-                        let child = usize::try_from(b).context("Node is not a child")?;
-                        // WARNING: `c` is the child's index in the page mirror, so check it before the scan.
-                        let children = &doc.nodes[parent].children;
-                        let index = usize::try_from(c)
+                        let child = usize::try_from(b)
                             .ok()
-                            .filter(|&index| children.get(index) == Some(&child))
-                            .or_else(|| children.iter().position(|&id| id == child))
+                            .filter(|&child| {
+                                doc.nodes
+                                    .get(child)
+                                    .is_some_and(|node| node.parent == Some(parent))
+                            })
                             .context("Node is not a child")?;
+                        if let Some(pending) = run.take() {
+                            insert(doc, pending, &mut runs);
+                        }
+                        if let Some(previous) = stale.replace(parent)
+                            && previous != parent
+                        {
+                            prune(doc, previous);
+                        }
                         if state.computed.is_some() && connected(doc, &state.hosts, parent) {
                             state.computed = None;
                         }
-                        doc.nodes[parent].children.remove(index);
                         doc.nodes[child].parent = None;
                         state.detached.push(child);
                         true
@@ -404,6 +456,12 @@ impl Host {
                 Err(error) => errors.push(error.to_string()),
             }
         }
+        if let Some(pending) = run {
+            insert(doc, pending, &mut runs);
+        }
+        if let Some(parent) = stale {
+            prune(doc, parent);
+        }
         Ok(if errors.is_empty() {
             Value::Null
         } else {
@@ -434,8 +492,14 @@ impl Host {
                 if event[1] == "frame"
                     && let Some(node) = event[0].as_u64()
                     && let Some(image) = media.frame(node)
+                    && let Some(old) = crate::dom::show_frame(
+                        state,
+                        node as usize,
+                        Some(std::sync::Arc::new(image)),
+                    )
+                    && let Ok(old) = std::sync::Arc::try_unwrap(old)
                 {
-                    crate::dom::show_frame(state, node as usize, Some(std::sync::Arc::new(image)));
+                    media.recycle(node, old);
                 }
             }
             page.dirty |= std::mem::take(&mut state.dirty);

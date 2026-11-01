@@ -72,16 +72,22 @@ pub fn write_bundle(
     let media = if enabled("video") || enabled("audio") {
         let folder = runtime.canonicalize()?;
         let folder = folder.parent().context("Missing runtime directory")?;
-        let mut names = vec![
-            apps_runtime::media::library_name(target.platform).to_owned(),
-            "FFmpeg.LICENSE".to_owned(),
-        ];
+        let library = apps_runtime::media::library_name(target.platform);
+        // WARNING: older builds can leave other FFmpeg versions next to the runtime, so each file must be the name
+        // that the media library links, which it keeps as a NUL-terminated string.
+        let linked = fs::read(folder.join(library)).unwrap_or_default();
+        let mut names = vec![library.to_owned(), "FFmpeg.LICENSE".to_owned()];
         for stem in apps_runtime::media::FFMPEG {
             names.push(
                 fs::read_dir(folder)?
                     .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-                    .find(|name| apps_runtime::media::is_ffmpeg(target.platform, stem, name))
-                    .context("The video and audio features need FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release.")?,
+                    .find(|name| {
+                        apps_runtime::media::is_ffmpeg(target.platform, stem, name) && {
+                            let needle = [name.as_bytes(), b"\0"].concat();
+                            linked.windows(needle.len()).any(|window| window == needle)
+                        }
+                    })
+                    .context("The video and audio features need the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release.")?,
             );
         }
         names
@@ -625,6 +631,12 @@ mod tests {
             )
             .unwrap();
         }
+        let stale = match target.platform {
+            "macos" => "libavcodec.1.dylib",
+            "windows" => "avcodec-1.dll",
+            _ => "libavcodec.so.1",
+        };
+        fs::write(dir.path().join(stale), b"stale").unwrap();
         for (features, shipped) in [
             ("[]", false),
             (r#"["audio"]"#, true),
@@ -635,6 +647,7 @@ mod tests {
             for name in &names {
                 assert_eq!(libraries.join(name).is_file(), shipped, "{features} {name}");
             }
+            assert!(!libraries.join(stale).exists(), "{features}");
         }
     }
 

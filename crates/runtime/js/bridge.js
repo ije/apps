@@ -1,5 +1,5 @@
 globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
-  const pending=new Map(),functions=new Map(),functionIds=new WeakMap(),handlers=new Map(),queue=[],refs=[null],refIds=new WeakMap(),facades=new Map(),emitter=EventEmitter?new EventEmitter():null;
+  const pending=new Map(),functions=new Map(),functionIds=new WeakMap(),handlers=new Map(),queue=[],refs=new Map(),refIds=new WeakMap(),facades=new Map(),emitter=EventEmitter?new EventEmitter():null;
   const random=crypto.randomUUID.bind(crypto),errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError};
   const peer=role=>role==='main'?'main':typeof role==='object'&&role!==null?'preload'in role?'preload:'+role.preload:'renderer'in role?'renderer:'+role.renderer:null:null;
   const send=(target,message)=>call('bridge.dispatch',target,message);
@@ -79,12 +79,13 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     return{pending:true};
   };
   const reply=(message,result)=>{try{send(message.sender,{kind:'reply',id:message.id,...(result.thrown?{error:result.thrown}:{value:result.immediate})});}catch{}};
+  let lastRef=0;
   const out=value=>{
     if(typeof value==='function')return{$method:1};
     if(Array.isArray(value))return value.map(out);
     if(value===null||typeof value!=='object'||Object.getPrototypeOf(value)===Object.prototype)return value;
     let ref=refIds.get(value);
-    if(ref===undefined){ref=refs.push(value)-1;refIds.set(value,ref);}
+    if(ref===undefined){ref=++lastRef;refs.set(ref,value);refIds.set(value,ref);}
     return{$ref:ref};
   };
   globalThis.__appsBridgeReceive=message=>{
@@ -94,7 +95,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(message.kind==='expose'){__appsSyncBridge();return null;}
     if(message.kind==='dom'){
       if(typeof role!=='object'||!('renderer'in role)||message.sender?.preload!==role.renderer)throw new Error('DOM access is only available to the preload');
-      try{const[op,ref,key,value]=decode(message.args,message.sender),object=ref?refs[ref]:globalThis.document;if(!object)throw new Error('Unknown DOM object');return{immediate:encode(op==='set'?void(object[key]=value):out(op==='call'?object[key](...value):object[key]),message.sender)};}
+      try{const[op,ref,key,value]=decode(message.args,message.sender),object=ref?refs.get(ref):globalThis.document;if(op==='release'){for(const id of value){refIds.delete(refs.get(id));refs.delete(id);}return{immediate:encode(undefined,message.sender)};}if(!object)throw new Error('Unknown DOM object');return{immediate:encode(op==='set'?void(object[key]=value):out(op==='call'?object[key](...value):object[key]),message.sender)};}
       catch(error){return{thrown:encode(error,message.sender)};}
     }
     if(message.kind==='call'){
@@ -123,7 +124,10 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     // WARNING: page objects never enter the preload realm: the preload `document` is a proxy, and the page answers with clones and object handles.
     const remote=(...args)=>answer(send(page,{kind:'dom',args:encode(args,page)}),page);
     const read=value=>Array.isArray(value)?value.map(read):value&&typeof value==='object'&&'$ref'in value?facade(value.$ref):value;
-    const facade=ref=>{let proxy=facades.get(ref);if(!proxy)facades.set(ref,proxy=new Proxy({},{get:(_,key)=>{if(typeof key!=='string'||key==='then')return undefined;const value=remote('get',ref,key);return value?.$method?(...args)=>read(remote('call',ref,key,args)):read(value);},set:(_,key,value)=>{if(typeof key!=='string')return false;remote('set',ref,key,value);return true;}}));return proxy;};
+    // WARNING: the page keeps each object handle until the preload proxy for it is collected, then forgets it in one batch.
+    const released=new Set(),flush=()=>{if(!released.size)return;const ids=[...released];released.clear();try{remote('release',0,null,ids);}catch{}};
+    const handles=new __appsFinalizers(ref=>{if(facades.get(ref)?.deref())return;facades.delete(ref);if(released.add(ref).size===1)queueMicrotask(flush);});
+    const facade=ref=>{let proxy=facades.get(ref)?.deref();if(!proxy){proxy=new Proxy({},{get:(_,key)=>{if(typeof key!=='string'||key==='then')return undefined;const value=remote('get',ref,key);return value?.$method?(...args)=>read(remote('call',ref,key,args)):read(value);},set:(_,key,value)=>{if(typeof key!=='string')return false;remote('set',ref,key,value);return true;}});facades.set(ref,new WeakRef(proxy));handles.register(proxy,ref);released.delete(ref);}return proxy;};
     globalThis.window??=globalThis;
     Object.defineProperty(globalThis,'document',{get:()=>facade(0),configurable:true});
   }

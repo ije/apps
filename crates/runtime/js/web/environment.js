@@ -1,6 +1,6 @@
-globalThis.__appsBrowserEnvironment = call => {
-  const codec = globalThis.__appsStorageClone;
-  delete globalThis.__appsStorageClone;
+globalThis.__appsBrowserEnvironment = (call, task) => {
+  const codec = globalThis.__appsStorageClone, retries = globalThis.__appsRetries;
+  delete globalThis.__appsStorageClone; delete globalThis.__appsRetries;
   const clone = value => codec.decode(codec.encode(value));
   const fail = (name, message = name) => new DOMException(message, name);
   const native = (op, ...args) => {
@@ -47,7 +47,8 @@ globalThis.__appsBrowserEnvironment = call => {
     static bound(lower, upper, lowerOpen = false, upperOpen = false) { keyWire(lower); keyWire(upper); return new this(lower, upper, !!lowerOpen, !!upperOpen); }
   }
   const names = values => Object.assign([...values].sort(), { contains(value) { return this.includes(String(value)); }, item(index) { return this[index] ?? null; } });
-  const connections = new Map(), transactions = [];
+  const connections = new Map(), transactions = [], blocked = new Set();
+  const unblock = () => { if (blocked.size) queueMicrotask(() => { for (const retry of [...blocked]) { blocked.delete(retry); retry(); } }); };
   let running = false;
   const schedule = () => {
     if (running || !transactions.length) return;
@@ -55,10 +56,11 @@ globalThis.__appsBrowserEnvironment = call => {
     const tx = transactions[0];
     const begin = () => {
       if (tx._done) { running = false; transactions.shift(); schedule(); return; }
-      try { const result = native('begin', tx.db.name, tx.mode); if (result.busy) { setTimeout(begin, 4); return; } tx._id = result.id; tx._start?.(); tx._drain(); }
+      // WARNING: a transaction that ends in this process wakes the loop, and the timer covers other processes.
+      try { const result = native('begin', tx.db.name, tx.mode); if (result.busy) { retries.add(begin); setTimeout(() => { if (retries.delete(begin)) begin(); }, 50); return; } tx._id = result.id; tx._start?.(); tx._drain(); }
       catch (error) { tx._abort(error); }
     };
-    setTimeout(begin, 0);
+    task(begin);
   };
   class IDBRequest extends EventTarget {
     constructor(source = null, transaction = null) { super(); Object.assign(this, { source, transaction, readyState: 'pending', result: undefined, error: null }); }
@@ -79,7 +81,7 @@ globalThis.__appsBrowserEnvironment = call => {
     _drain() {
       if (this._scheduled || this._done || this._id === null) return;
       this._scheduled = true;
-      setTimeout(() => {
+      task(() => {
         this._scheduled = false; if (this._done) return;
         const next = this._queue.shift();
         if (next) {
@@ -90,9 +92,9 @@ globalThis.__appsBrowserEnvironment = call => {
           try { native('commit', this._id); this._finish(); this.dispatchEvent(new Event('complete')); }
           catch (error) { this._abort(error); }
         }
-      }, 0);
+      });
     }
-    _finish() { this._done = true; this.db._transactions.delete(this); if (this.db._closed && !this.db._transactions.size) connections.get(this.db.name)?.delete(this.db); if (transactions[0] === this) { transactions.shift(); running = false; schedule(); } }
+    _finish() { this._done = true; this.db._transactions.delete(this); unblock(); if (this.db._closed && !this.db._transactions.size) connections.get(this.db.name)?.delete(this.db); if (transactions[0] === this) { transactions.shift(); running = false; schedule(); } }
     _abort(error) {
       if (this._done) return;
       if (this._id !== null) { try { native('abort', this._id); } catch {} }
@@ -107,16 +109,17 @@ globalThis.__appsBrowserEnvironment = call => {
     get keyPath() { return this.transaction.db._stores[this.name].keyPath; }
     get autoIncrement() { return !!this.transaction.db._stores[this.name].autoIncrement; }
     get indexNames() { return names([]); }
-    _rows(query, direction = 'next') {
-      const range = query === undefined || query === null ? null : query instanceof IDBKeyRange ? query : IDBKeyRange.only(query);
-      const rows = native('scan', this.transaction._id, this.name).map(([k, v]) => [JSON.parse(k), v]).filter(([key]) => !range || range.includes(keyValue(key))).sort((a, b) => compare(a[0], b[0]));
-      if (direction.startsWith('prev')) rows.reverse(); return rows;
+    _range(query) {
+      if (query === undefined || query === null) return [null, null, false, false];
+      const range = query instanceof IDBKeyRange ? query : IDBKeyRange.only(query), wire = key => key === undefined ? null : JSON.stringify(keyWire(key));
+      return [wire(range.lower), wire(range.upper), !!range.lowerOpen, !!range.upperOpen];
     }
-    get(query) { if (query === undefined || query === null) throw fail('DataError'); const key = query instanceof IDBKeyRange ? null : JSON.stringify(keyWire(query)); return this.transaction._request(this, () => { const value = key === null ? this._rows(query)[0]?.[1] : native('get', this.transaction._id, this.name, key); return value == null ? undefined : codec.decode(JSON.parse(value)); }); }
-    getKey(query) { if (query === undefined || query === null) throw fail('DataError'); return this.transaction._request(this, () => { const row = this._rows(query)[0]; return row ? keyValue(row[0]) : undefined; }); }
-    getAll(query, count) { return this.transaction._request(this, () => this._rows(query).slice(0, count ?? Infinity).map(row => codec.decode(JSON.parse(row[1])))); }
-    getAllKeys(query, count) { return this.transaction._request(this, () => this._rows(query).slice(0, count ?? Infinity).map(row => keyValue(row[0]))); }
-    count(query) { return this.transaction._request(this, () => this._rows(query).length); }
+    _scan(range, kind, count = 0, reverse = false) { return native('scan', this.transaction._id, this.name, ...range, reverse, count, kind); }
+    get(query) { if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { const value = this._scan(range, 'values', 1)[0]; return value === undefined ? undefined : codec.decode(JSON.parse(value)); }); }
+    getKey(query) { if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { const key = this._scan(range, 'keys', 1)[0]; return key === undefined ? undefined : keyValue(key); }); }
+    getAll(query, count) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'values', count).map(value => codec.decode(JSON.parse(value)))); }
+    getAllKeys(query, count) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'keys', count).map(key => keyValue(key))); }
+    count(query) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'count')); }
     _write(op, value, key) {
       if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError');
       if (this.keyPath !== null) { if (key !== undefined) throw fail('DataError'); const read = path => path === '' ? value : String(path).split('.').reduce((v, part) => v?.[part], value); key = Array.isArray(this.keyPath) ? this.keyPath.map(read) : read(this.keyPath); }
@@ -125,17 +128,20 @@ globalThis.__appsBrowserEnvironment = call => {
     }
     put(value, key) { return this._write('put', value, key); }
     add(value, key) { return this._write('add', value, key); }
-    delete(query) { if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError'); if (query === undefined || query === null) throw fail('DataError'); const key = query instanceof IDBKeyRange ? null : JSON.stringify(keyWire(query)); return this.transaction._request(this, () => { if (key !== null) native('delete', this.transaction._id, this.name, key); else for (const [key] of this._rows(query)) native('delete', this.transaction._id, this.name, JSON.stringify(key)); }); }
+    delete(query) { if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError'); if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { native('delete', this.transaction._id, this.name, ...range); }); }
     clear() { if (this.transaction.mode === 'readonly') throw fail('ReadOnlyError'); return this.transaction._request(this, () => { native('clear', this.transaction._id, this.name); }); }
     openCursor(query, direction = 'next') { return this._cursor(query, direction, false); }
     openKeyCursor(query, direction = 'next') { return this._cursor(query, direction, true); }
     _cursor(query, direction, keyOnly) {
       if (!['next', 'nextunique', 'prev', 'prevunique'].includes(direction)) throw new TypeError('Invalid cursor direction');
-      const request = new IDBRequest(this, this.transaction); let rows, index = 0;
+      const request = new IDBRequest(this, this.transaction), range = this._range(query), reverse = direction.startsWith('prev');
+      const from = (wire, open) => { range[reverse ? 1 : 0] = JSON.stringify(wire); range[reverse ? 3 : 2] = open; };
+      // WARNING: each step reads the next row after the last key, so writes made during the walk show up like in browsers.
       const step = () => {
-        rows ??= this._rows(query, direction); const row = rows[index++]; if (!row) return null;
-        const cursor = new IDBCursor(this, request, direction, keyValue(row[0]), keyOnly ? undefined : codec.decode(JSON.parse(row[1])));
-        cursor._continue = key => { if (key !== undefined) { const target = keyWire(key), order = compare(target, row[0]); if (direction.startsWith('prev') ? order >= 0 : order <= 0) throw fail('DataError'); while (index < rows.length && (direction.startsWith('prev') ? compare(rows[index][0], target) > 0 : compare(rows[index][0], target) < 0)) index++; } this.transaction._request(this, step, request); };
+        const row = this._scan(range, keyOnly ? 'keys' : 'rows', 1, reverse)[0]; if (!row) return null;
+        const key = keyOnly ? row : row[0], cursor = new IDBCursor(this, request, direction, keyValue(key), keyOnly ? undefined : codec.decode(JSON.parse(row[1])));
+        from(key, true);
+        cursor._continue = target => { if (target !== undefined) { const wire = keyWire(target), order = compare(wire, key); if (reverse ? order >= 0 : order <= 0) throw fail('DataError'); from(wire, false); } this.transaction._request(this, step, request); };
         return cursor;
       };
       return this.transaction._request(this, step, request);
@@ -157,7 +163,7 @@ globalThis.__appsBrowserEnvironment = call => {
     }
     deleteObjectStore(name) { const tx = this._upgrade; if (!tx || tx._done) throw fail('InvalidStateError'); if (!Object.hasOwn(this._stores, name)) throw fail('NotFoundError'); native('deleteStore', tx._id, name); delete this._stores[name]; tx.objectStoreNames = this.objectStoreNames; }
     transaction(stores, mode = 'readonly') { if (this._closed || this._upgrade && !this._upgrade._done) throw fail('InvalidStateError'); stores = typeof stores === 'string' ? [stores] : Array.from(stores); if (!stores.length) throw fail('InvalidAccessError'); for (const name of stores) if (!Object.hasOwn(this._stores, name)) throw fail('NotFoundError'); const tx = new IDBTransaction(this, stores, mode); this._transactions.add(tx); return tx; }
-    close() { this._closed = true; if (!this._transactions.size) connections.get(this.name)?.delete(this); }
+    close() { this._closed = true; if (!this._transactions.size) connections.get(this.name)?.delete(this); unblock(); }
   }
   class IDBFactory {
     cmp(a, b) { return compare(keyWire(a), keyWire(b)); }
@@ -165,16 +171,16 @@ globalThis.__appsBrowserEnvironment = call => {
     open(name, version) {
       name = String(name); if (version !== undefined && (!Number.isSafeInteger(version) || version <= 0)) throw new TypeError('Invalid database version');
       const request = new IDBOpenDBRequest();
-      setTimeout(() => {
+      task(() => {
         try {
           const info = native('open', name), target = version ?? (info.version || 1);
           if (target < info.version) throw fail('VersionError');
           if (target === info.version) { request._success(new IDBDatabase(name, target, info.stores)); return; }
           const prior = [...connections.get(name) ?? []];
           for (const db of prior) if (!db._closed) db.dispatchEvent(Object.assign(new Event('versionchange'), { oldVersion: info.version, newVersion: target }));
-          let blocked = false;
+          let waited = false;
           const upgrade = () => {
-            if (prior.some(db => !db._closed || db._transactions.size)) { if (!blocked) { request.dispatchEvent(Object.assign(new Event('blocked'), { oldVersion: info.version, newVersion: target })); blocked = true; } setTimeout(upgrade, 4); return; }
+            if (prior.some(db => !db._closed || db._transactions.size)) { if (!waited) { request.dispatchEvent(Object.assign(new Event('blocked'), { oldVersion: info.version, newVersion: target })); waited = true; } blocked.add(upgrade); return; }
             const db = new IDBDatabase(name, target, info.stores), tx = new IDBTransaction(db, Object.keys(info.stores), 'versionchange', () => {
               native('version', tx._id, target); request.result = db; request.transaction = tx; request.readyState = 'done'; request.dispatchEvent(Object.assign(new Event('upgradeneeded'), { oldVersion: info.version, newVersion: target }));
             });
@@ -183,22 +189,22 @@ globalThis.__appsBrowserEnvironment = call => {
             tx.addEventListener('abort', () => { db.close(); request._error(tx.error); });
           }; upgrade();
         } catch (error) { request._error(error); }
-      }, 0); return request;
+      }); return request;
     }
     deleteDatabase(name) {
       name = String(name); const request = new IDBOpenDBRequest();
-      setTimeout(() => {
+      task(() => {
         try {
           const info = native('open', name), prior = [...connections.get(name) ?? []];
           for (const db of prior) if (!db._closed) db.dispatchEvent(Object.assign(new Event('versionchange'), { oldVersion: info.version, newVersion: null }));
-          let blocked = false;
+          let waited = false;
           const remove = () => {
-            if (prior.some(db => !db._closed || db._transactions.size)) { if (!blocked) { request.dispatchEvent(new Event('blocked')); blocked = true; } setTimeout(remove, 4); return; }
+            if (prior.some(db => !db._closed || db._transactions.size)) { if (!waited) { request.dispatchEvent(new Event('blocked')); waited = true; } blocked.add(remove); return; }
             const db = new IDBDatabase(name, info.version, info.stores), tx = new IDBTransaction(db, [], 'versionchange', () => native('deleteDatabase', tx._id));
             tx.addEventListener('complete', () => { db.close(); request._success(undefined); }); tx.addEventListener('abort', () => { db.close(); request._error(tx.error); });
           }; remove();
         } catch (error) { request._error(error); }
-      }, 0); return request;
+      }); return request;
     }
   }
   Object.assign(globalThis, { Storage, IDBFactory, IDBDatabase, IDBTransaction, IDBRequest, IDBOpenDBRequest, IDBObjectStore, IDBCursor, IDBCursorWithValue: IDBCursor, IDBKeyRange, indexedDB: new IDBFactory() });

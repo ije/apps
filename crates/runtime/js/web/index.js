@@ -9,6 +9,8 @@ globalThis.__appsWeb = call => {
   const encodeBytes = value => value;
   const decodeBytes = value => typeof value === 'string' ? (Uint8Array.fromBase64 ? Uint8Array.fromBase64(value) : Uint8Array.from(atob(value), c => c.charCodeAt(0))) : value instanceof Uint8Array ? value : new Uint8Array(value);
   globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes, memory: body => memoryBodies.get(body) };
+  // WARNING: work that waits for a native wake without an event of its own, like an IndexedDB transaction on a busy database, runs again on each poll.
+  const retries = globalThis.__appsRetries = new Set();
   class DOMException extends Error {
     constructor(message = '', name = 'Error') { super(String(message)); this.name = String(name); }
     get code() { return ({ InvalidCharacterError: 5, NotFoundError: 8, TypeMismatchError: 17, NoModificationAllowedError: 7, InvalidModificationError: 13, AbortError: 20, QuotaExceededError: 22, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, TimeoutError: 23, DataCloneError: 25 })[this.name] ?? 0; }
@@ -105,7 +107,7 @@ globalThis.__appsWeb = call => {
       delay = Number(delay);
       if (!Number.isSafeInteger(delay) || delay < 0) throw new RangeError('Invalid timeout');
       const signal = new AbortSignal(signals);
-      setTimeout(() => abort(signal, new DOMException('The operation timed out', 'TimeoutError')), delay);
+      setTimeout(() => abort(signal, new DOMException('The operation timed out', 'TimeoutError')), delay).unref?.();
       return signal;
     }
     static any(inputs) {
@@ -126,31 +128,41 @@ globalThis.__appsWeb = call => {
     get signal() { return this.#signal; }
     abort(reason) { abort(this.#signal, reason); }
   }
+  const utf8 = (text, read, output, written) => {
+    const length = text.length, size = output.length;
+    while (read < length) {
+      let code = text.charCodeAt(read), units = 1;
+      if (code < 128) { if (written === size) break; output[written++] = code; read++; continue; }
+      if ((code & 0xF800) === 0xD800) { const next = text.charCodeAt(read + 1); if (code < 0xDC00 && (next & 0xFC00) === 0xDC00) { code = 0x10000 + ((code & 0x3FF) << 10) + (next & 0x3FF); units = 2; } else code = 0xFFFD; }
+      const bytes = code < 2048 ? 2 : code < 65536 ? 3 : 4;
+      if (written + bytes > size) break;
+      if (bytes === 2) output[written++] = 0xC0 | code >> 6;
+      else { if (bytes === 4) { output[written++] = 0xF0 | code >> 18; output[written++] = 0x80 | code >> 12 & 63; } else output[written++] = 0xE0 | code >> 12; output[written++] = 0x80 | code >> 6 & 63; }
+      output[written++] = 0x80 | code & 63;
+      read += units;
+    }
+    return { read, written };
+  };
   class TextEncoder {
     get encoding() { return 'utf-8'; }
     encode(input = '') {
-      const text = String(input), output = new Uint8Array(text.length * 3);
-      const { written } = this.encodeInto(text, output);
-      return output.slice(0, written);
+      const text = String(input), length = text.length, output = new Uint8Array(length);
+      for (let i = 0; i < length; i++) {
+        const code = text.charCodeAt(i);
+        if (code < 128) { output[i] = code; continue; }
+        // WARNING: count the exact size, so long text needs no 3x buffer and no copy of it.
+        let size = i;
+        for (let j = i; j < length; j++) { const c = text.charCodeAt(j); size += c < 128 ? 1 : c < 2048 ? 2 : (c & 0xFC00) === 0xD800 && (text.charCodeAt(j + 1) & 0xFC00) === 0xDC00 ? (j++, 4) : 3; }
+        const wide = new Uint8Array(size);
+        if (i) wide.set(output.subarray(0, i));
+        utf8(text, i, wide, i);
+        return wide;
+      }
+      return output;
     }
     encodeInto(input, output) {
       if (!(output instanceof Uint8Array)) throw new TypeError('Expected Uint8Array');
-      const text = String(input);
-      let read = 0, written = 0;
-      while (read < text.length) {
-        let point = text.codePointAt(read);
-        const units = point > 65535 ? 2 : 1;
-        if (point >= 0xD800 && point <= 0xDFFF) point = 0xFFFD;
-        const length = point < 128 ? 1 : point < 2048 ? 2 : point < 65536 ? 3 : 4;
-        if (written + length > output.length) break;
-        if (length === 1) output[written++] = point;
-        else {
-          output[written++] = (length === 2 ? 192 : length === 3 ? 224 : 240) | (point >> (6 * (length - 1)));
-          for (let shift = 6 * (length - 2); shift >= 0; shift -= 6) output[written++] = 128 | ((point >> shift) & 63);
-        }
-        read += units;
-      }
-      return { read, written };
+      return utf8(String(input), 0, output, 0);
     }
   }
   class TextDecoder {
@@ -588,6 +600,7 @@ globalThis.__appsWeb = call => {
     return true;
   };
   const poll = () => {
+    for (const retry of [...retries]) { retries.delete(retry); retry(); }
     if (sockets.size) for (const event of call('web.socket.poll')) {
       const socket = sockets.get(event.id); if (!socket) continue;
       if (event.kind === 'open') { socket.readyState = 1; socket.protocol = event.protocol; socket.dispatchEvent(new Event('open')); }
@@ -637,7 +650,7 @@ globalThis.__appsWeb = call => {
     }
     return poll.pending();
   };
-  poll.pending = () => sockets.size > 0 || waiting();
+  poll.pending = () => sockets.size > 0 || retries.size > 0 || waiting();
   poll.eventState = event => eventStates.get(event);
   Object.assign(globalThis, { DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
     TextDecoderStream, URL, URLSearchParams, crypto, Headers, Request, Response, Blob, File, FormData, fetch, WebSocket, MessageEvent, CloseEvent });

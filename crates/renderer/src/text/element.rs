@@ -1,9 +1,16 @@
-use super::{SharedString, TextAlign, TextRun, WhiteSpace, WrappedLine, WrappedLineLayout};
+use super::{
+    SharedString, TextAlign, TextRun, TextWrap, WhiteSpace, WordBreak, WrapBoundary, WrappedLine,
+    WrappedLineLayout,
+};
 use crate::{
     AvailableSpace, Bounds, Element, IntoElement, LayoutId, Pixels, Point, Size, Style, TextStyle,
     Window, px,
 };
-use std::{borrow::Cow, cell::RefCell, rc::Rc};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 /// Text in the inherited text style, or with its own runs.
 pub struct StyledText {
@@ -111,7 +118,11 @@ struct Measured {
     style: TextStyle,
     scale: f32,
     layout: TextLayout,
+    /// The min-content and max-content sizes and baselines of wrapping text.
+    probes: Cell<[Option<Probe>; 2]>,
 }
+
+type Probe = (Size<Pixels>, [Pixels; 2]);
 
 impl PartialEq for Measured {
     fn eq(&self, other: &Self) -> bool {
@@ -137,6 +148,7 @@ impl TextLayout {
             style,
             scale: window.scale_factor(),
             layout: self.clone(),
+            probes: Cell::default(),
         };
         let (id, measured) = window.request_measured_layout(
             &Style::default(),
@@ -147,6 +159,7 @@ impl TextLayout {
                     runs,
                     style,
                     layout,
+                    probes,
                     ..
                 } = measured;
                 let line_height = style.line_height;
@@ -155,17 +168,25 @@ impl TextLayout {
                     _ => None,
                 };
                 let width = known.width.or(definite(available.width));
-                let wrap_width = width.filter(|_| style.white_space == WhiteSpace::Normal);
+                let wraps = style.white_space == WhiteSpace::Normal;
+                let wrap_width = width.filter(|_| wraps);
                 let truncate = style.text_overflow.clone().zip(width);
-                // A truncated layout answers an unconstrained probe with the truncated size, so it is
-                // never reused.
-                if let Some(inner) = layout.0.borrow().as_ref()
-                    && (wrap_width.is_none() || wrap_width == inner.wrap_width)
+                let probe = (wraps && width.is_none())
+                    .then(|| (available.width != AvailableSpace::MinContent) as usize);
+                if let Some(probe) = probe {
+                    if let Some((size, baselines)) = probes.get()[probe] {
+                        return (size, Some(baselines));
+                    }
+                } else if let Some(inner) = layout.0.borrow().as_ref()
+                    && wrap_width == inner.wrap_width
                     && truncate.is_none()
+                    // A truncated layout answers an unconstrained probe with the truncated size,
+                    // so it is never reused.
                     && !inner.truncated
                 {
                     return (inner.size, Some(inner.baselines));
                 }
+                let min_content = probe == Some(0);
                 let system = window.text_system().clone();
                 let (text, runs, truncated) = match truncate {
                     Some((affix, width)) => {
@@ -176,16 +197,28 @@ impl TextLayout {
                     None => (text.clone(), Cow::Borrowed(runs), false),
                 };
                 let len = text.len();
+                // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
                 let lines = system
                     .shape_text_indented(
                         text,
                         style.font_size,
                         &runs,
-                        wrap_width,
-                        style.line_clamp,
+                        if min_content {
+                            Some(px(0.))
+                        } else {
+                            wrap_width
+                        },
+                        style.line_clamp.filter(|_| !min_content),
                         style.text_indent,
-                        style.text_wrap,
-                        style.word_break,
+                        if min_content {
+                            TextWrap::Wrap
+                        } else {
+                            style.text_wrap
+                        },
+                        match style.word_break {
+                            WordBreak::BreakWord if min_content => WordBreak::Normal,
+                            word_break => word_break,
+                        },
                     )
                     .unwrap_or_default();
                 let mut size = Size::<Pixels>::default();
@@ -194,6 +227,36 @@ impl TextLayout {
                     size.height += line.height;
                     size.width = size.width.max(line.width);
                 }
+                if min_content {
+                    size.width = px(0.);
+                    let mut start = px(0.) - style.text_indent;
+                    for line in &lines {
+                        let unwrapped = &line.unwrapped_layout;
+                        let mut breaks = line.wrap_boundaries.iter().peekable();
+                        let mut glyphs = unwrapped
+                            .runs
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(run_ix, run)| {
+                                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                                    (WrapBoundary { run_ix, glyph_ix }, glyph)
+                                })
+                            })
+                            .peekable();
+                        while let Some((boundary, glyph)) = glyphs.next() {
+                            if breaks.next_if(|next| **next == boundary).is_some() {
+                                start = glyph.position.x;
+                            }
+                            let end = glyphs
+                                .peek()
+                                .map_or(unwrapped.width, |(_, next)| next.position.x);
+                            if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
+                                size.width = size.width.max(end - start);
+                            }
+                        }
+                        start = px(0.);
+                    }
+                }
                 let baseline = system.baseline(
                     system.resolve_font(&style.font()),
                     style.font_size,
@@ -201,16 +264,24 @@ impl TextLayout {
                     window.scale_factor(),
                 );
                 let baselines = [baseline, baseline + size.height - line_height];
-                *layout.0.borrow_mut() = Some(TextLayoutInner {
-                    len,
-                    lines,
-                    line_height,
-                    wrap_width,
-                    truncated,
-                    size,
-                    baselines,
-                    bounds: None,
-                });
+                if let Some(probe) = probe {
+                    let mut kept = probes.get();
+                    kept[probe] = Some((size, baselines));
+                    probes.set(kept);
+                }
+                // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
+                if probe.is_none() || layout.0.borrow().is_none() {
+                    *layout.0.borrow_mut() = Some(TextLayoutInner {
+                        len,
+                        lines,
+                        line_height,
+                        wrap_width,
+                        truncated,
+                        size,
+                        baselines,
+                        bounds: None,
+                    });
+                }
                 (size, Some(baselines))
             },
         );

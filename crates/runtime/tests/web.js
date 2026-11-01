@@ -23,6 +23,7 @@ globalThis.testStep = 'start';
   const encoder = new TextEncoder(), decoder = new TextDecoder();
   assert(decoder.decode(encoder.encode('a😀é\ud800')) === 'a😀é�', 'UTF-8 encode');
   assert(JSON.stringify(encoder.encodeInto('😀', new Uint8Array(3))) === '{"read":0,"written":0}', 'encodeInto boundary');
+  assert(encoder.encode('a\ud800b\udc00€😀é').join() === '97,239,191,189,98,239,191,189,226,130,172,240,159,152,128,195,169' && JSON.stringify(encoder.encodeInto('é😀a', new Uint8Array(5))) === '{"read":1,"written":2}', 'UTF-8 lone surrogates and exact sizes');
   assert(decoder.decode(new Uint8Array([0xEF]), { stream: true }) === '', 'partial BOM');
   assert(decoder.decode(new Uint8Array([0xBB, 0xBF, 0xF0, 0x9F]), { stream: true }) === '', 'partial codepoint');
   assert(decoder.decode(new Uint8Array([0x98, 0x80])) === '😀', 'split codepoint');

@@ -81,7 +81,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
       if(request.headers.get('upgrade')?.toLowerCase()==='websocket'&&this.listenerCount('upgrade')){req.upgrade=true;this.emit('upgrade',req,socket,Buffer.alloc(0));}else this.emit('request',req,res);
     });}
     address(){return this.listening?{address:this._server.hostname,family:this._server.hostname.includes(':')?'IPv6':'IPv4',port:this._server.port}:null;}
-    close(callback){if(!this.listening){if(callback)queueMicrotask(()=>callback(fail(Error,'ERR_SERVER_NOT_RUNNING','Server is not running.')));return this;}this._server.stop();this.listening=false;queueMicrotask(()=>{this.emit('close');callback?.();});return this;}
+    close(callback){if(!this.listening){if(callback)queueMicrotask(()=>callback(fail(Error,'ERR_SERVER_NOT_RUNNING','Server is not running.')));return this;}this.listening=false;this._server.stop().then(()=>{this.emit('close');callback?.();});return this;}
     closeAllConnections(){for(const socket of this._active)socket.destroy();}
     closeIdleConnections(){}
     setTimeout(ms,callback){this.timeout=ms;if(callback)this.on('timeout',callback);return this;}

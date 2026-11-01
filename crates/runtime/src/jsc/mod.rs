@@ -286,6 +286,10 @@ impl Api {
             let mut buffer = Vec::<u8>::with_capacity((self.string_size)(string));
             let size = (self.string_utf8)(string, buffer.as_mut_ptr().cast(), buffer.capacity());
             buffer.set_len(size.saturating_sub(1));
+            // WARNING: the buffer has room for 3 bytes per UTF-16 unit, so large texts give back what they did not use.
+            if buffer.capacity() >= 1024 && buffer.len() < buffer.capacity() / 2 {
+                buffer.shrink_to_fit();
+            }
             if buffer.len() == length && buffer.is_ascii() {
                 (self.string_release)(string);
                 return String::from_utf8_unchecked(buffer);
@@ -516,6 +520,23 @@ unsafe extern "C" fn chunk(
     result
 }
 
+/// Turns the `\udXXX` escapes that `JSON.stringify` writes for lone surrogates into `\ufffd`
+/// in place, because serde_json rejects them.
+fn well_formed(json: &mut str) {
+    let mut from = 0;
+    while let Some(at) = json.get(from..).and_then(|rest| rest.find('\\')) {
+        let at = from + at;
+        // WARNING: ASCII bytes replace ASCII bytes here, so the text stays UTF-8.
+        if let Some(escape) = unsafe { json.as_bytes_mut() }.get_mut(at + 1..at + 6)
+            && escape[..2] == *b"ud"
+            && matches!(escape[2], b'8'..=b'9' | b'a'..=b'f')
+        {
+            escape[1..].copy_from_slice(b"fffd");
+        }
+        from = at + 2;
+    }
+}
+
 /// Host calls: `native(op, ...args)` takes primitive and binary arguments directly, and
 /// `native(0, op, json, buffers?)` takes the rest as JSON. Results come back as JavaScript values,
 /// and failures throw an `Error` with the I/O `code`.
@@ -576,11 +597,14 @@ unsafe extern "C" fn call(
             }
         };
         if generic {
-            let buffers = match values.get(3) {
-                Some(&buffers) => crate::jsc::payload::input(&api, ctx, buffers)?,
-                None => Vec::new(),
-            };
-            let json = api.text(ctx, *values.get(2).context("Expected JSON arguments")?);
+            let (buffers, _roots) = values
+                .get(3)
+                .map(|&buffers| crate::jsc::payload::input(&api, ctx, buffers))
+                .transpose()?
+                .unzip();
+            let buffers = buffers.unwrap_or_default();
+            let mut json = api.text(ctx, *values.get(2).context("Expected JSON arguments")?);
+            well_formed(&mut json);
             // WARNING: GPU command lists can be large, so only the WebGPU library parses their JSON.
             if let (Role::Renderer(id), Some(op)) = (binding.2, op.strip_prefix("gpu.")) {
                 return run(buffers, &mut || gpu(&binding, ctx, id, op, json.as_bytes()));
@@ -890,13 +914,16 @@ fn dispatch(
             unsafe {
                 (target_api.string_release)(name);
             }
-            let value = serde_json::from_str(&target_api.text(context, json))?;
+            let mut json = target_api.text(context, json);
+            well_formed(&mut json);
+            let value = serde_json::from_str(&json)?;
             let name = target_api.string("buffers");
             let buffers = unsafe { (target_api.get)(context, result, name, &mut error) };
             unsafe {
                 (target_api.string_release)(name);
             }
             let buffers = crate::jsc::payload::input(&target_api, context, buffers)?
+                .0
                 .iter()
                 .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
                 .collect();
@@ -1647,7 +1674,8 @@ impl Engine {
             })
             .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
-                return Ok(if delay.is_finite() { delay as i64 } else { -1 });
+                // WARNING: delays can be fractional, so round up or the loop wakes before the timer is due.
+                return Ok(if delay.is_finite() { delay.ceil() as i64 } else { -1 });
             }
         }
     }
@@ -1921,5 +1949,154 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert_eq!(engine.tick().unwrap(), -1);
         assert_eq!(engine.eval("fired", "test").unwrap(), "1");
+        engine
+            .eval("Date.now=()=>0;setTimeout(()=>fired++,5.5)", "test")
+            .unwrap();
+        let delay = engine.tick().unwrap();
+        assert!((1..=6).contains(&delay), "{delay}");
+        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+        assert_eq!(engine.eval("__appsDelay()", "test").unwrap(), "0");
+        assert_eq!(engine.tick().unwrap(), -1);
+        assert_eq!(engine.eval("fired", "test").unwrap(), "2");
+        assert_eq!(
+            engine
+                .eval("try{queueMicrotask(1)}catch(e){e.constructor.name}", "test")
+                .unwrap(),
+            "TypeError"
+        );
+        engine
+            .eval("queueMicrotask(()=>{throw new Error('boom')})", "test")
+            .unwrap();
+        assert!(engine.tick().unwrap_err().to_string().contains("boom"));
+        engine
+            .eval("process.on('uncaughtException',e=>globalThis.caught=e.message);queueMicrotask(()=>{throw new Error('again')})", "test")
+            .unwrap();
+        engine.tick().unwrap();
+        assert_eq!(engine.eval("caught", "test").unwrap(), "again");
+    }
+
+    #[test]
+    fn page_timers_clamp_deep_nesting() {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let page = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+        page.eval(
+            "globalThis.runs=0;const loop=()=>{runs++;setTimeout(loop,0)};setTimeout(loop,0);queueMicrotask(()=>{throw new Error('reported')})",
+            "test",
+        )
+        .unwrap();
+        for _ in 0..5 {
+            assert_eq!(page.tick().unwrap(), 0);
+        }
+        let started = std::time::Instant::now();
+        let delay = page.tick().unwrap();
+        assert!(
+            delay >= 3 || started.elapsed() >= std::time::Duration::from_millis(3),
+            "{delay}"
+        );
+        assert_eq!(page.eval("runs", "test").unwrap(), "6");
+    }
+
+    #[test]
+    fn json_from_lone_surrogates_and_rooted_bytes() {
+        let mut json = r#"["a\ud83d","\\ud83d","\n\udfff","\u001f"]"#.to_owned();
+        well_formed(&mut json);
+        assert_eq!(json, r#"["a\ufffd","\\ud83d","\n\ufffd","\u001f"]"#);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&json).unwrap(),
+            ["a\u{fffd}", "\\ud83d", "\n\u{fffd}", "\u{1f}"]
+        );
+        let api = Api::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        let page = Engine::new(api.clone(), host, Role::Renderer(1)).unwrap();
+        preload
+            .eval(
+                "__apps.contextBridge.exposeInMainWorld('api',{text:'a\\ud83d',echo:value=>value+'\\udc00'})",
+                "test",
+            )
+            .unwrap();
+        page.eval("__appsSyncBridge()", "test").unwrap();
+        assert_eq!(
+            page.eval("JSON.stringify([api.text, api.echo('b')])", "test")
+                .unwrap(),
+            "[\"a\u{fffd}\",\"b\u{fffd}\"]"
+        );
+        // WARNING: getters can hand out arrays that nothing else holds, so `input` must keep them alive.
+        page.eval(
+            "globalThis.items=[];Object.defineProperty(items,0,{get:()=>new Uint8Array(1<<16).fill(7)});Object.defineProperty(items,1,{get:()=>new Uint8Array(4)})",
+            "test",
+        )
+        .unwrap();
+        let items = unsafe {
+            let name = api.string("items");
+            let items = (api.get)(page.ctx, (api.global)(page.ctx), name, ptr::null_mut());
+            (api.string_release)(name);
+            items
+        };
+        let (buffers, roots) = payload::input(&api, page.ctx, items).unwrap();
+        page.eval("delete globalThis.items", "test").unwrap();
+        page.collect_garbage();
+        page.eval(
+            "globalThis.junk=Array.from({length:64},()=>new Uint8Array(1<<16).fill(1))",
+            "test",
+        )
+        .unwrap();
+        assert!(buffers[0].len() == 1 << 16 && buffers[0].iter().all(|&byte| byte == 7));
+        drop(roots);
+    }
+
+    #[test]
+    fn preload_document_handles_are_released() {
+        let api = Api::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        let page = Engine::new(api, host, Role::Renderer(1)).unwrap();
+        page.eval("globalThis.made=[];const create=document.createElement.bind(document);document.createElement=name=>{const node=create(name);made.push(new WeakRef(node));return node}", "test").unwrap();
+        preload
+            .eval("(()=>{for(let i=0;i<1000;i++)document.createElement('div').id='x'+i})();document.body===document.body", "test")
+            .map(|same| assert_eq!(same, "true"))
+            .unwrap();
+        let live = || {
+            page.eval("made.filter(made=>made.deref()).length", "test")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        };
+        assert_eq!(live(), 1000);
+        for _ in 0..20 {
+            preload.collect_garbage();
+            preload.tick().unwrap();
+            page.collect_garbage();
+            page.eval("__appsDomSweep?.(true)", "test").unwrap();
+            if live() < 500 {
+                break;
+            }
+        }
+        assert!(live() < 500, "{}", live());
+        assert_eq!(
+            preload.eval("document.body.tagName", "test").unwrap(),
+            "BODY"
+        );
     }
 }

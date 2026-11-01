@@ -212,6 +212,15 @@ impl RenderFrame {
         self.max_texture = max_texture as f32;
         self.copy = copy;
         self.record_layer(scene, 0, Target::Frame, true, 0);
+        // WARNING: shelf textures grow while the frame is recorded, so composites read their final size.
+        if !self.shelves.is_empty() {
+            for cmd in 0..self.cmds.len() {
+                if let Cmd::Composite { src, index, .. } = self.cmds[cmd] {
+                    let rect = self.rect(src);
+                    self.composites[index as usize].source_rect = rect;
+                }
+            }
+        }
     }
 
     /// The pooled texture of a target, `None` for the window.
@@ -281,8 +290,9 @@ impl RenderFrame {
             Some(index) => self.free.swap_remove(index),
             None => {
                 // Round up so textures can be reused by later frames.
+                let max = self.max_texture as u32;
                 self.textures
-                    .push(size.map(|value| value.div_ceil(256) * 256));
+                    .push(size.map(|value| (value.div_ceil(256) * 256).min(max)));
                 self.textures.len() - 1
             }
         };
@@ -318,7 +328,7 @@ impl RenderFrame {
         let shelf = match &mut self.shelves[depth] {
             Some(shelf) => shelf,
             slot => {
-                self.textures.push(size.map(|value| value as u32));
+                self.textures.push([0, 0]);
                 clear = true;
                 slot.insert(Shelf {
                     texture: self.textures.len() - 1,
@@ -341,7 +351,9 @@ impl RenderFrame {
         let offset = [shelf.x + 1, shelf.y + 1];
         shelf.x += w;
         shelf.row = shelf.row.max(h);
-        let texture = shelf.texture;
+        let (texture, used) = (shelf.texture, [shelf.x, shelf.y + shelf.row]);
+        let grown = &mut self.textures[texture];
+        *grown = [0, 1].map(|axis| grown[axis].max((used[axis] as u32).div_ceil(256) * 256));
         self.layers.push(Layer {
             texture,
             origin: [region[0] - offset[0], region[1] - offset[1]],
@@ -421,18 +433,19 @@ impl RenderFrame {
     }
 
     /// The integer `[x, y, width, height]` region covering `bounds`, limited to what can be seen
-    /// and to the maximum texture size.
+    /// and to the maximum texture size with a border pixel on each side.
     fn region(&self, bounds: Bounds<ScaledPixels>, limit: [f32; 4]) -> Option<[i32; 4]> {
+        let max = self.max_texture - 2.;
         let x0 = bounds.origin.x.0.floor().max(limit[0]);
         let y0 = bounds.origin.y.0.floor().max(limit[1]);
         let x1 = (bounds.origin.x.0 + bounds.size.width.0)
             .ceil()
             .min(limit[0] + limit[2])
-            .min(x0 + self.max_texture);
+            .min(x0 + max);
         let y1 = (bounds.origin.y.0 + bounds.size.height.0)
             .ceil()
             .min(limit[1] + limit[3])
-            .min(y0 + self.max_texture);
+            .min(y0 + max);
         (x1 > x0 && y1 > y0).then_some([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
     }
 
@@ -706,9 +719,72 @@ impl RenderFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blur, Composite, Globals};
-    use crate::scene::{MonochromeSprite, PolychromeSprite, Quad, Shadow, Underline};
+    use super::{Blur, Cmd, Composite, Globals, RenderFrame};
+    use crate::{
+        Bounds, ContentMask, ScaledPixels, Size,
+        scene::{
+            EffectState, MonochromeSprite, PolychromeSprite, Primitive, Quad, Scene, Shadow,
+            Underline,
+        },
+    };
     use std::mem::size_of;
+
+    /// A frame of one `opacity` group around a quad at `[x, y, width, height]`, scaled by `scale`.
+    fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
+        let bounds = |[x, y, w, h]: [f32; 4]| {
+            Bounds::new(
+                crate::point(ScaledPixels(x), ScaledPixels(y)),
+                Size::new(ScaledPixels(w), ScaledPixels(h)),
+            )
+        };
+        let mask = ContentMask {
+            bounds: bounds([-1e6, -1e6, 2e6, 2e6]),
+            ..Default::default()
+        };
+        let mut transform = super::IDENTITY;
+        transform[0] = scale;
+        let mut scene = Scene::default();
+        scene.push_effect(EffectState {
+            transform: (scale != 1.).then_some(transform),
+            opacity: 0.5,
+            color_matrix: None,
+            blur: 0.,
+            shadow: None,
+            blend_mode: Default::default(),
+            clip: None,
+            mask: None,
+            backdrop: None,
+            content_mask: mask,
+        });
+        scene.insert(Primitive::Quad(Quad {
+            bounds: bounds(quad),
+            content_mask: mask,
+            ..Default::default()
+        }));
+        scene.pop_effect();
+        scene.finish();
+        let mut frame = RenderFrame::default();
+        frame.record(&scene, window, 16384, true);
+        frame
+    }
+
+    #[test]
+    fn small_tiles_get_a_small_texture() {
+        let frame = record([3072, 2048], [100., 100., 24., 24.], 1.);
+        assert_eq!(frame.textures, [[256, 256]]);
+        let source = frame.cmds.iter().find_map(|cmd| match cmd {
+            Cmd::Composite { index, .. } => Some(frame.composites[*index as usize].source_rect),
+            _ => None,
+        });
+        assert_eq!(source.map(|rect| [rect[2], rect[3]]), Some([256., 256.]));
+    }
+
+    #[test]
+    fn wide_layers_fit_the_maximum_texture() {
+        let frame = record([6144, 3456], [-2048., 0., 8000., 100.], 3.);
+        assert!(!frame.textures.is_empty());
+        assert!(frame.textures.iter().flatten().all(|side| *side <= 16384));
+    }
 
     #[test]
     fn shaders_match_instance_layouts() {

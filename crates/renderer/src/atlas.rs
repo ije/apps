@@ -13,6 +13,12 @@ use std::{
 /// Past this many glyph pixels, glyphs unused for `MAX_AGE` frames are dropped.
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
 const MAX_AGE: u32 = 60;
+/// Removed tiles are freed this many frames later, when no frame in flight reads them.
+// WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
+// one to read a tile, is done before the frame after the free paints. More drawables need more.
+const IN_FLIGHT: u32 = 2;
+/// The smallest side of an atlas texture.
+pub(crate) const MIN_TEXTURE_SIDE: i32 = 1024;
 
 /// What an atlas tile holds.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -53,6 +59,8 @@ struct Entry {
 /// Glyphs and images packed into GPU textures, by key.
 pub(crate) struct Atlas<B> {
     tiles: RefCell<FxHashMap<AtlasKey, Entry>>,
+    /// Removed tiles with the frame they were removed in.
+    retired: RefCell<Vec<(u32, AtlasTile)>>,
     frame: Cell<u32>,
     glyph_pixels: Cell<usize>,
     pub(crate) backend: RefCell<B>,
@@ -71,6 +79,7 @@ impl<B: AtlasBackend> Atlas<B> {
     pub fn new(backend: B) -> Self {
         Self {
             tiles: RefCell::default(),
+            retired: RefCell::default(),
             frame: Cell::new(0),
             glyph_pixels: Cell::new(0),
             backend: RefCell::new(backend),
@@ -114,13 +123,26 @@ impl<B: AtlasBackend> Atlas<B> {
             tile: Some(tile), ..
         }) = self.tiles.borrow_mut().remove(key)
         {
-            self.backend.borrow_mut().remove(tile);
+            self.retired.borrow_mut().push((self.frame.get(), tile));
         }
     }
 
-    /// Ends a frame, and drops the glyphs unused for a while once there are too many.
+    /// Ends a frame, frees the removed tiles that no frame reads anymore, and drops the glyphs
+    /// unused for a while once there are too many.
     pub fn finish_frame(&self) {
         let frame = self.frame.replace(self.frame.get().wrapping_add(1));
+        let mut retired = self.retired.borrow_mut();
+        if !retired.is_empty() {
+            let mut backend = self.backend.borrow_mut();
+            retired.retain(|(removed, tile)| {
+                let keep = frame.wrapping_sub(*removed) < IN_FLIGHT;
+                if !keep {
+                    backend.remove(*tile);
+                }
+                keep
+            });
+        }
+        drop(retired);
         let mut glyph_pixels = self.glyph_pixels.get();
         if glyph_pixels <= MAX_GLYPH_PIXELS {
             return;
@@ -141,10 +163,26 @@ impl<B: AtlasBackend> Atlas<B> {
         self.glyph_pixels.set(glyph_pixels);
     }
 
+    /// Frees the removed tiles now, for a renderer that stops drawing. `wait` returns once no
+    /// frame in flight reads them, and runs only when there are some.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn free_retired(&self, wait: impl FnOnce()) {
+        let mut retired = self.retired.borrow_mut();
+        if retired.is_empty() {
+            return;
+        }
+        wait();
+        let mut backend = self.backend.borrow_mut();
+        for (_, tile) in retired.drain(..) {
+            backend.remove(tile);
+        }
+    }
+
     /// Drops every tile, for a lost device.
     #[allow(dead_code)]
     pub fn clear(&self, reset: impl FnOnce(&mut B)) {
         self.tiles.borrow_mut().clear();
+        self.retired.borrow_mut().clear();
         self.glyph_pixels.set(0);
         reset(&mut self.backend.borrow_mut());
     }
@@ -154,6 +192,8 @@ impl<B: AtlasBackend> Atlas<B> {
 pub(crate) struct TextureList<T> {
     pub textures: Vec<Option<T>>,
     pub free: Vec<usize>,
+    /// A texture whose tiles were all freed, kept for the next texture of its size.
+    spare: Option<usize>,
 }
 
 impl<T> Default for TextureList<T> {
@@ -161,6 +201,7 @@ impl<T> Default for TextureList<T> {
         Self {
             textures: Vec::new(),
             free: Vec::new(),
+            spare: None,
         }
     }
 }
@@ -168,6 +209,29 @@ impl<T> Default for TextureList<T> {
 impl<T> TextureList<T> {
     pub fn get(&self, index: usize) -> Option<&T> {
         self.textures.get(index)?.as_ref()
+    }
+
+    /// Keeps the texture at `index`, which has no tiles left, and drops the one kept before if
+    /// it is still `empty`.
+    pub fn emptied(&mut self, index: usize, empty: impl Fn(&T) -> bool) {
+        if let Some(old) = self.spare.replace(index)
+            && old != index
+            && self.get(old).is_some_and(empty)
+        {
+            self.textures[old] = None;
+            self.free.push(old);
+        }
+    }
+
+    /// Drops the kept texture if it is still `empty`, for a renderer that stops drawing.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn trim(&mut self, empty: impl Fn(&T) -> bool) {
+        if let Some(index) = self.spare.take()
+            && self.get(index).is_some_and(empty)
+        {
+            self.textures[index] = None;
+            self.free.push(index);
+        }
     }
 
     /// Stores a texture and returns its index.
@@ -189,6 +253,7 @@ impl<T> TextureList<T> {
 /// One atlas texture's space, packed by etagere.
 pub(crate) struct Packer {
     allocator: etagere::BucketedAtlasAllocator,
+    size: Size<DevicePixels>,
     live: usize,
 }
 
@@ -199,15 +264,27 @@ impl Packer {
                 size.width.0,
                 size.height.0,
             )),
+            size,
             live: 0,
         }
     }
 
-    /// The tile bounds and id, or `None` when the texture is full.
+    pub fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// The tile bounds and id, or `None` when the texture is full. An empty texture only takes
+    /// a tile that would get a new texture of its size, so a kept image texture is not filled
+    /// with glyphs.
     pub fn allocate(
         &mut self,
         size: Size<DevicePixels>,
     ) -> Option<(crate::Bounds<DevicePixels>, u32)> {
+        if self.live == 0
+            && size.map(|side| DevicePixels(side.0.max(MIN_TEXTURE_SIDE))) != self.size
+        {
+            return None;
+        }
         let allocation = self
             .allocator
             .allocate(etagere::size2(size.width.0, size.height.0))?;
@@ -227,5 +304,107 @@ impl Packer {
         self.allocator.deallocate(etagere::AllocId::deserialize(id));
         self.live = self.live.saturating_sub(1);
         self.live == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::AtlasTextureId;
+
+    /// Packers in place of textures, counting the textures made and the tiles freed.
+    #[derive(Default)]
+    struct Fake {
+        list: TextureList<Packer>,
+        made: usize,
+        freed: Vec<AtlasTile>,
+    }
+
+    impl AtlasBackend for Fake {
+        fn insert(
+            &mut self,
+            kind: AtlasTextureKind,
+            size: Size<DevicePixels>,
+            _: &[u8],
+        ) -> Result<AtlasTile> {
+            let hit = self
+                .list
+                .textures
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(index, packer)| Some((index, packer.as_mut()?.allocate(size)?)));
+            let (index, (bounds, tile_id)) = match hit {
+                Some(hit) => hit,
+                None => {
+                    self.made += 1;
+                    let side = size.map(|side| DevicePixels(side.0.max(MIN_TEXTURE_SIDE)));
+                    let index = self.list.push(|_| Packer::new(side));
+                    let tile = self.list.textures[index].as_mut().unwrap().allocate(size);
+                    (index, tile.unwrap())
+                }
+            };
+            Ok(AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: index as u32,
+                    kind,
+                },
+                tile_id,
+                padding: 0,
+                bounds,
+            })
+        }
+
+        fn remove(&mut self, tile: AtlasTile) {
+            self.freed.push(tile);
+            let index = tile.texture_id.index as usize;
+            if self.list.textures[index]
+                .as_mut()
+                .is_some_and(|packer| packer.free(tile.tile_id))
+            {
+                self.list.emptied(index, Packer::is_empty);
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_frames_reuse_textures_after_frames_in_flight() {
+        let atlas = Atlas::new(Fake::default());
+        let size = Size::new(DevicePixels(1920), DevicePixels(1080));
+        let mut inserted = Vec::new();
+        for frame in 0..30u64 {
+            if frame > 0 {
+                atlas.remove(&AtlasKey::Image(frame - 1));
+            }
+            let tile = atlas
+                .get_or_insert_with(&AtlasKey::Image(frame), &mut || {
+                    Ok(Some((Point::default(), size, Cow::Borrowed(&[]))))
+                })
+                .unwrap()
+                .unwrap()
+                .0;
+            inserted.push(tile);
+            atlas.finish_frame();
+            // A tile is freed only once the frames that drew it are done.
+            let backend = atlas.backend.borrow();
+            assert!(backend.freed.len() as u64 <= frame.saturating_sub(IN_FLIGHT as u64));
+            assert_eq!(&backend.freed[..], &inserted[..backend.freed.len()]);
+        }
+        assert!(atlas.backend.borrow().made <= IN_FLIGHT as usize + 2);
+        // A small glyph does not land in the kept image texture.
+        let glyph = Size::new(DevicePixels(10), DevicePixels(10));
+        let tile = atlas
+            .get_or_insert_with(&AtlasKey::Image(1000), &mut || {
+                Ok(Some((Point::default(), glyph, Cow::Borrowed(&[]))))
+            })
+            .unwrap()
+            .unwrap()
+            .0;
+        let backend = atlas.backend.borrow();
+        let texture = backend.list.get(tile.texture_id.index as usize).unwrap();
+        assert_eq!(
+            texture.size,
+            Size::new(DevicePixels(1024), DevicePixels(1024))
+        );
     }
 }

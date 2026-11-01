@@ -928,7 +928,7 @@ fn mirror_follows_random_mutations_and_releases() {
           const pick = () => {{ const list = all().slice(1).concat(pool); return list.length ? list[rand(list.length)] : document.createElement('s'); }};
           const el = () => {{ const list = all().concat(pool).filter(n => n.nodeType === 1); return list[rand(list.length)]; }};
           globalThis.step = () => {{ for (let i = 0; i < 400; i++) try {{
-            switch (rand(15)) {{
+            switch (rand(19)) {{
               case 0: pool.push(document.createElement(['div','span','b','i'][rand(4)])); break;
               case 1: pool.push(document.createTextNode('t' + rand(100))); break;
               case 2: el().appendChild(pick()); break;
@@ -944,6 +944,10 @@ fn mirror_follows_random_mutations_and_releases() {
               case 12: pool.push(el().cloneNode(true)); break;
               case 13: {{ const n = el(); n.firstChild?.nextSibling?.previousSibling; n.lastChild?.remove(); if (!rand(4)) pool.length = 0; break; }}
               case 14: {{ const h = el(); if (h !== root && !h.shadowRoot && h.localName !== 'em') {{ const r = h.attachShadow({{ mode: 'open' }}); r.innerHTML = '<b>s<i>t</i></b>'; pool.push(r.firstChild, r); }} break; }}
+              case 15: {{ const p = el(), f = document.createDocumentFragment(); for (let k = rand(4); k--;) f.append(pick()); p.insertBefore(f, p.childNodes[rand(p.childNodes.length + 1)] ?? null); break; }}
+              case 16: {{ const p = el(); while (p.firstChild && rand(4)) p.removeChild(rand(2) ? p.firstChild : p.lastChild); if (rand(2)) p.append(pick(), pick()); break; }}
+              case 17: {{ const n = el(), k = [pick(), pick(), 'w' + rand(9)]; if (n === root) break; [() => n.after(...k), () => n.before(...k), () => n.prepend(...k), () => n.replaceWith(...k)][rand(4)](); break; }}
+              case 18: {{ const t = pick(), u = pick(); if (t.nodeType === 3 && u.nodeType === 3) {{ const s = 'a\u{{1F600}}b'; t.data = s.slice(0, 2); u.data = s.slice(2); }} break; }}
             }}
           }} catch (e) {{ if (!(e instanceof DOMException)) throw e; }} }};
           globalThis.dumpMirror = () => {{ let out = ''; const walk = n => {{ out += '(' + (n.nodeType === 1 ? n.localName : n.nodeType === 11 ? '#fragment' : n.nodeName); if (n.nodeType === 3 || n.nodeType === 8) out += '|' + n.data; if (n.nodeType === 1) for (const name of n.getAttributeNames()) out += ' ' + name + '=' + n.getAttribute(name); if (n.shadowRoot) {{ out += '['; walk(n.shadowRoot); out += ']'; }} for (const c of n.childNodes) walk(c); out += ')'; }}; walk(document); return out; }};
@@ -1662,6 +1666,181 @@ fn custom_element_reactions_and_slot_changes() {
 }
 
 #[test]
+fn child_node_methods_reactions_and_observers_follow_the_standard() {
+    let (_, engine) = checked_page(
+        "<html><body><div id='box'></div></body></html>",
+        r#"
+        const p = document.createElement('p'), [a, b, c] = ['a', 'b', 'c'].map(tag => document.createElement(tag));
+        p.append(a, b);
+        a.after(b, c);
+        check('after skips its own nodes', () => p.innerHTML === '<a></a><b></b><c></c>');
+        p.prepend(p.firstChild, 'x');
+        check('prepend skips its own nodes', () => p.innerHTML === '<a></a>x<b></b><c></c>');
+        b.replaceWith(b, c);
+        check('replaceWith keeps itself', () => p.innerHTML === '<a></a>x<b></b><c></c>');
+        a.replaceWith(a, b);
+        check('replaceWith moves the rest', () => p.innerHTML === '<a></a><b></b>x<c></c>');
+        c.before(c, a);
+        check('before skips its own nodes', () => p.innerHTML === '<b></b>x<c></c><a></a>');
+        globalThis.log = [];
+        const box = document.getElementById('box');
+        box.innerHTML = '<x-order id="1"><x-order id="2"></x-order></x-order><x-order id="3"></x-order>';
+        const early = document.createElement('x-late');
+        customElements.define('x-order', class extends HTMLElement { connectedCallback() { log.push('in' + this.id); } disconnectedCallback() { log.push('out' + this.id); } });
+        check('upgrades run in tree order', () => log.join() === 'in1,in2,in3');
+        log.length = 0;
+        box.replaceChildren(...[...box.children].reverse());
+        check('replaceChildren disconnects before it connects again', () => log.length === 6 && ['1', '2', '3'].every(id => log.lastIndexOf('out' + id) < log.lastIndexOf('in' + id)) && box.firstChild.id === '3');
+        customElements.define('x-late', class extends HTMLElement { connectedCallback() { log.push('late'); } });
+        check('detached element waits for its upgrade', () => !(early instanceof customElements.get('x-late')));
+        box.append(early);
+        check('insertion upgrades', () => early instanceof customElements.get('x-late') && log.at(-1) === 'late');
+        check(':scope in a document is the root element', () => document.querySelector(':scope > body') === document.body && document.querySelector(':scope') === document.documentElement);
+        globalThis.seen = [];
+        new MutationObserver(() => { seen.push(1); throw Error('observer failure'); }).observe(box, { attributes: true });
+        new MutationObserver(() => seen.push(2)).observe(box, { attributes: true });
+        box.setAttribute('data-x', '1');
+        __appsDispatch('pointerdown', [early._id], { pointerId: 1, pointerType: 'mouse', clientX: 0, clientY: 0, buttons: 1 });
+        early.setPointerCapture(1);
+        globalThis.lost = 0;
+        document.addEventListener('lostpointercapture', () => lost++);
+        early.remove();
+        check('removal releases the pointer capture', () => !early.hasPointerCapture(1) && lost === 1);
+        const target = document.createElement('i'), detached = document.createElement('div');
+        box.append(target); target.setPointerCapture(1);
+        let bubbled = false; box.addEventListener('lostpointercapture', () => bubbled = true);
+        target.releasePointerCapture(1);
+        check('release fires a bubbling lostpointercapture', () => bubbled && lost === 2);
+        target.setPointerCapture(1); detached.append(target);
+        check('a move into a detached tree releases the pointer capture', () => !target.hasPointerCapture(1) && lost === 3);
+        const field = document.createElement('input'); box.append(field); field.focus();
+        let blurred = false; field.addEventListener('blur', () => blurred = true);
+        detached.insertBefore(field, null);
+        check('a move into a detached tree blurs', () => blurred && document.activeElement !== field);
+        const sized = document.createElement('canvas'); sized.setAttribute('width', ' +100px'); sized.setAttribute('height', '1e9');
+        check('canvas sizes parse as HTML integers', () => sized.width === 100 && sized.height === 1);
+        sized.setAttribute('width', 'x'); sized.setAttribute('height', '2147483648');
+        check('invalid canvas sizes use the defaults', () => sized.width === 300 && sized.height === 150);
+        "#,
+    );
+    engine.tick().unwrap();
+    assert_eq!(engine.eval("seen.join()", "test").unwrap(), "1,2");
+}
+
+#[test]
+fn observers_hold_targets_weakly_and_batches_keep_split_surrogates() {
+    let (host, engine) = checked_page(
+        "<html><body><p id='one'>a</p><p id='two'>b</p><ul id='list'></ul></body></html>",
+        r#"
+        const [one, two] = ['one', 'two'].map(id => document.getElementById(id).firstChild), text = 'a\u{1F600}b';
+        one.data = text.slice(0, 2); two.data = text.slice(2); one.parentNode.setAttribute('data-after', 'kept');
+        const list = document.getElementById('list'), rows = document.createDocumentFragment();
+        for (let i = 0; i < 3000; i++) { const row = document.createElement('li'); row.textContent = i; rows.append(row); }
+        list.append(rows); list.prepend(...['x', 'y'].map(id => Object.assign(document.createElement('li'), { id })));
+        check('mirror order', () => list.firstChild.id === 'x' && list.children[2].textContent === '0' && list.childElementCount === 3002);
+        "#,
+    );
+    {
+        let host = host.borrow();
+        let doc = &host.pages[&1].doc;
+        let text = |id: &str| {
+            let p = doc
+                .nodes
+                .iter()
+                .position(|node| node.attrs.get("id").is_some_and(|value| value == id))
+                .unwrap();
+            doc.nodes[doc.nodes[p].children[0]].text.clone()
+        };
+        assert_eq!(
+            (text("one"), text("two")),
+            ("a\u{fffd}".to_owned(), "\u{fffd}b".to_owned())
+        );
+        assert!(doc.nodes.iter().any(|node| {
+            node.attrs
+                .get("data-after")
+                .is_some_and(|value| value == "kept")
+        }));
+        let list = doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
+            .unwrap();
+        let children = &doc.nodes[list].children;
+        assert_eq!(children.len(), 3002);
+        assert!(
+            children
+                .iter()
+                .all(|&child| doc.nodes[child].parent == Some(list))
+        );
+        assert_eq!(
+            doc.nodes[children[0]].attrs.get("id").map(String::as_str),
+            Some("x")
+        );
+        assert_eq!(doc.nodes[doc.nodes[children[2]].children[0]].text, "0");
+    }
+    engine.eval("const list = document.getElementById('list'); while (list.firstChild) list.removeChild(list.firstChild); list.append(document.createElement('hr'))", "test").unwrap();
+    {
+        let host = host.borrow();
+        let doc = &host.pages[&1].doc;
+        let list = doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").is_some_and(|value| value == "list"))
+            .unwrap();
+        assert_eq!(doc.nodes[list].children.len(), 1);
+        assert_eq!(doc.nodes[doc.nodes[list].children[0]].tag, "hr");
+    }
+    for _ in 0..5 {
+        engine.eval("(() => { for (let i = 0; i < 2000; i++) { const el = document.createElement('div'); el.innerHTML = '<span>x</span>'; new MutationObserver(() => el.id).observe(el, { attributes: true }); new ResizeObserver(() => el.id).observe(el); new IntersectionObserver(() => el.id).observe(el); } })()", "test").unwrap();
+        engine.collect_garbage();
+        engine
+            .eval(
+                "__appsDomSweep(true); __appsLayout(); document.body.setAttribute('data-x', '1')",
+                "test",
+            )
+            .unwrap();
+    }
+    let nodes = host.borrow().pages[&1].doc.nodes.len();
+    assert!(nodes < 20000, "{nodes} nodes");
+}
+
+#[test]
+fn text_offsets_skip_comments_like_text_points() {
+    let (host, _engine) = checked_page(
+        "<html><body><div id='e' contenteditable>ab<!--?lit$123$-->cd<p>e<!--x-->f</p></div></body></html>",
+        "",
+    );
+    let editor = host.borrow().pages[&1]
+        .doc
+        .nodes
+        .iter()
+        .position(|node| node.tag == "div")
+        .unwrap();
+    let offset = |index: usize| {
+        host.borrow_mut()
+            .call(
+                Role::Renderer(1),
+                "dom.textOffset",
+                serde_json::json!([editor, editor, index]),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        (offset(3), offset(4)),
+        (serde_json::json!(4), serde_json::json!(6))
+    );
+    let point = host
+        .borrow_mut()
+        .call(
+            Role::Renderer(1),
+            "dom.textPoint",
+            serde_json::json!([editor, 6]),
+        )
+        .unwrap();
+    assert_eq!(point[1], serde_json::json!(1));
+}
+
+#[test]
 fn invalid_selectors_throw_and_html_names_ignore_case() {
     checked_page(
         "<html><body><ul><li data-v='1'>x</li></ul><svg><linearGradient id='g'></linearGradient><rect id='r'></rect></svg></body></html>",
@@ -1716,6 +1895,17 @@ fn mutation_records_and_live_ranges_follow_the_dom_standard() {
         p.append(fragment);
         const inserted = observer.takeRecords();
         check('fragment insert is one record', () => inserted.length === 1 && inserted[0].addedNodes.length === 2);
+        p.append(document.createElement('q'), 'text', document.createElement('em'));
+        const appended = observer.takeRecords();
+        check('append of several nodes is one record', () => appended.length === 1 && appended[0].addedNodes.length === 3 && appended[0].nextSibling === null);
+        const first = p.firstChild, next = first.nextSibling;
+        first.replaceWith(document.createElement('dd'), document.createElement('dt'));
+        const replaced = observer.takeRecords();
+        check('replaceWith is one record', () => replaced.length === 1 && replaced[0].addedNodes.length === 2 && replaced[0].removedNodes[0] === first && replaced[0].previousSibling === null && replaced[0].nextSibling === next);
+        const head = p.firstChild;
+        p.lastChild.before(head, document.createElement('kbd'));
+        const moved2 = observer.takeRecords();
+        check('before moves out, then inserts as one record', () => moved2.length === 2 && moved2[0].removedNodes[0] === head && moved2[1].addedNodes.length === 2 && moved2[1].addedNodes[0] === head);
         observer.disconnect();
         const text = document.getElementById('t').firstChild, range = document.createRange();
         range.setStart(text, 4); range.setEnd(text, 5);

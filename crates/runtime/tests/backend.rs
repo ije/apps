@@ -163,7 +163,7 @@ fn tcp_half_close_and_peer_addresses() {
         await new Promise((resolve,reject)=>{local.on('error',reject);local.on('connect',resolve)});local.setNoDelay(true);local.setKeepAlive(true,1000);local.write(payload);
         for(let i=0;i<500&&echoed.reduce((n,c)=>n+c.length,0)<payload.length;i++)await new Promise(resolve=>setTimeout(resolve,2));
         const joined=__apps.buffer.Buffer.concat(echoed);assert(joined.length===payload.length&&joined.every((v,i)=>v===payload[i]),'Unix socket options and binary echo');
-        local.destroy();await new Promise(resolve=>ipc.close(resolve));__apps.fs.unlinkSync(path);
+        local.destroy();await new Promise(resolve=>ipc.close(resolve));assert(!__apps.fs.existsSync(path),'Closing removes the socket file');
     "#);
 }
 
@@ -210,11 +210,27 @@ fn durable_browser_storage_crypto_keys_and_transactions() {
         tx=db.transaction('keys','readwrite');completed=new Promise(resolve=>tx.onabort=resolve);tx.objectStore('keys').put('should rollback','abort').onsuccess=()=>tx.abort();await completed;
         tx=db.transaction('keys','readwrite');completed=done(tx);const cursor=tx.objectStore('keys').openCursor(IDBKeyRange.bound('env:','env:\uffff'));cursor.onsuccess=()=>{if(cursor.result){cursor.result.delete();cursor.result.continue()}};await completed;
         tx=db.transaction('keys');assert(await req(tx.objectStore('keys').count())===1,'Cursor deletes and transaction rollback');
+        const ordered=indexedDB.open('order',1);ordered.onupgradeneeded=()=>ordered.result.createObjectStore('items');const odb=await req(ordered);
+        tx=odb.transaction('items','readwrite');completed=done(tx);
+        for(const key of [[1],new Uint8Array([2]),'b','a','',new Date(5),10,-Infinity,2,Infinity,-0.5,'é','😀',[1,'x'],[]])tx.objectStore('items').put(key instanceof Uint8Array?'buf':String(key),key);await completed;
+        const label=k=>k instanceof ArrayBuffer?'buf'+new Uint8Array(k):k instanceof Date?'date'+(+k):Array.isArray(k)?'arr'+JSON.stringify(k):String(k);
+        const walk=(source,step)=>new Promise((resolve,reject)=>{const out=[];source.onsuccess=()=>{const cursor=source.result;if(!cursor)return resolve(out);out.push(label(cursor.key));const next=step(cursor,out);if(next===false)resolve(out);else cursor.continue(next);};source.onerror=()=>reject(source.error);});
+        tx=odb.transaction('items');const items=tx.objectStore('items');
+        assert((await req(items.getAllKeys())).map(label).join()==='-Infinity,-0.5,2,10,Infinity,date5,,a,b,é,😀,buf2,arr[],arr[1],arr[1,"x"]','IndexedDB key order');
+        assert(await req(items.count())===15&&await req(items.count(IDBKeyRange.bound(2,10)))===2&&await req(items.count(-0.5))===1,'Counts in SQL');
+        assert((await req(items.getAll(IDBKeyRange.lowerBound('a',true),2))).join()==='b,é'&&(await req(items.getAllKeys(null,3))).map(label).join()==='-Infinity,-0.5,2','Ranges and limits');
+        assert(label(await req(items.getKey(IDBKeyRange.lowerBound(new Date(0)))))==='date5'&&await req(items.get(IDBKeyRange.bound('a','b',true,false)))==='b'&&await req(items.get('zzz'))===undefined,'First key in a range');
+        assert((await walk(items.openKeyCursor(IDBKeyRange.bound('','￿'),'prev'),()=>{})).join()==='😀,é,b,a,','Reverse key cursor');
+        assert((await walk(items.openCursor(IDBKeyRange.lowerBound(0)),(cursor,seen)=>seen.length===1?Infinity:seen.length<3?undefined:false)).join()==='2,Infinity,date5','Cursor continue to a key');
+        tx=odb.transaction('items','readwrite');completed=done(tx);tx.objectStore('items').delete(IDBKeyRange.bound('a','é'));const left=req(tx.objectStore('items').count());await completed;
+        assert(await left===12,'Range delete');
+        const later=indexedDB.open('order',2);await new Promise(resolve=>later.onblocked=resolve);
+        assert(__appsDelay()===-1,'A blocked upgrade waits without polling');odb.close();assert((await req(later)).version===2,'Upgrade after close');later.result.close();
         db.close();
         __appsSetLocation('https://app.test/start');history.pushState({n:1},'', '/next?q=1');assert(location.pathname==='/next'&&history.state.n===1,'History push');
         const popped=new Promise(resolve=>addEventListener('popstate',resolve,{once:true}));history.back();await popped;assert(location.pathname==='/start','History back');
         const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));location.hash='chat';await changed;assert(location.hash==='#chat','Hash change');
-        assert(globalThis.__appsStorageClone===undefined&&globalThis.__appsCryptoCodec===undefined&&globalThis.__appsBytes===undefined,'Private key codecs hidden');
+        assert(globalThis.__appsStorageClone===undefined&&globalThis.__appsCryptoCodec===undefined&&globalThis.__appsBytes===undefined&&globalThis.__appsRetries===undefined,'Private key codecs hidden');
     "#);
     run(r#"
         const assert=(v,m)=>{if(!v)throw Error(m)};

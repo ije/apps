@@ -435,7 +435,13 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return Object.assign(error, { errno: constants.errno[error.code] ? -constants.errno[error.code] : undefined, syscall }, file === undefined ? {} : { path: file }, dest === undefined ? {} : { dest });
   };
   const files = { constants: S, promises: { constants: S }, Stats, Dirent, openAsBlob: async (file, o = {}) => new Blob([await files.promises.readFile(file)], { type: o.type ?? '' }) };
-  const chunk = (buffer, offset, length, position) => { if (typeof buffer === 'string') return [new Uint8Array(Buffer.from(buffer, length)), offset ?? null]; const bytes = view(buffer); if (offset !== null && typeof offset === 'object') ({ offset, length, position } = offset); offset ??= 0; return [bytes.subarray(offset, offset + (length ?? bytes.length - offset)), position ?? null]; };
+  // WARNING: reads and writes check their range before the call, because a failure after it would still move the file position.
+  const span = (size, offset, length, write) => {
+    if (!write) integer(offset, 'offset', 0, Number.MAX_SAFE_INTEGER);
+    else if (offset > size) throw rangeError('offset', `<= ${size}`, offset);
+    if (length < 0 || offset + length > size) throw rangeError('length', length < 0 ? '>= 0' : `<= ${size - offset}`, length);
+  };
+  const chunk = (buffer, offset, length, position) => { if (typeof buffer === 'string') return [new Uint8Array(Buffer.from(buffer, length)), offset ?? null]; const bytes = view(buffer); if (offset !== null && typeof offset === 'object') ({ offset, length, position } = offset); offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : bytes.length - offset; span(bytes.length, offset, length, true); return [bytes.subarray(offset, offset + length), position ?? null]; };
   const seconds = value => value instanceof Date ? value.getTime() / 1000 : Number(value);
   const finish = (name, result, args) => {
     if (name === 'readFile') { const encoding = options(args[1]).encoding; return utf8.test(encoding) ? result : encoding && encoding !== 'buffer' ? bytes(result).toString(encoding) : bytes(result); }
@@ -456,7 +462,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     constructor(fd) { this.#fd = fd; handles.register(this, fd, this); }
     get fd() { return this.#fd; }
     async close() { const fd = this.#fd; if (fd < 0) return; this.#fd = -1; handles.unregister(this); await asyncCall('close', fd); }
-    async read(buffer = Buffer.alloc(16384), offset = 0, length = buffer.length - offset, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length = buffer.length - offset, position = null } = buffer ?? {}); const data = bytes(await asyncCall('read', this.#fd, length, position)); buffer.set(data, offset); return { bytesRead: data.length, buffer }; }
+    async read(buffer = Buffer.alloc(16384), offset = 0, length, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length, position = null } = buffer ?? {}); else if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); const data = bytes(await asyncCall('read', this.#fd, length, position)); view(buffer).set(data, offset); return { bytesRead: data.length, buffer }; }
     async write(buffer, ...args) { return { bytesWritten: await asyncCall('write', this.#fd, ...chunk(buffer, ...args)), buffer }; }
     async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const b = await asyncCall('read', this.#fd, 1048576, null); if (!b.length) break; chunks.push(bytes(b)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
     async writeFile(data, o) { const { encoding, signal } = options(o), bytes = view(data, encoding); let at = 0; do { aborted(signal); at += await asyncCall('write', this.#fd, bytes.subarray(at, at + 1048576), null); } while (at < bytes.length); }
@@ -505,13 +511,14 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   }
   files.realpathSync.native = files.realpathSync; files.realpath.native = files.realpath;
   files.existsSync = value => { try { sync('access', pathArg(value)); return true; } catch { return false; } };
-  files.readSync = (fd, buffer, offset = 0, length = buffer.byteLength - offset, position = null) => { if (offset !== null && typeof offset === 'object') ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset); let data; try { data = bytes(sync('read', fd, length, position)); } catch (error) { throw failure(error, 'read', [fd]); } view(buffer).set(data, offset); return data.length; };
+  files.readSync = (fd, buffer, offset = 0, length, position = null) => { if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); let data; try { data = bytes(sync('read', fd, length, position)); } catch (error) { throw failure(error, 'read', [fd]); } view(buffer).set(data, offset); return data.length; };
   files.writeSync = (fd, ...args) => { try { return sync('write', fd, ...chunk(...args)); } catch (error) { throw failure(error, 'write', [fd]); } };
   files.read = (fd, buffer, offset, length, position, callback) => {
     callback = [buffer, offset, length, position, callback].findLast(value => typeof value === 'function');
     if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length = buffer.byteLength - offset, position = null } = typeof buffer === 'object' ? buffer : {});
     else if (typeof offset === 'object' && offset !== null) ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
     offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : buffer.byteLength - offset; position = typeof position === 'number' || typeof position === 'bigint' ? Number(position) : null;
+    span(buffer.byteLength, offset, length);
     asyncCall('read', fd, length, position).then(data => { data = bytes(data); view(buffer).set(data, offset); callback(null, data.length, buffer); }, error => callback(failure(error, 'read', [fd])));
   };
   files.write = (fd, buffer, ...args) => { const callback = args.pop(); asyncCall('write', fd, ...chunk(buffer, ...args)).then(written => callback(null, written, buffer), error => callback(failure(error, 'write', [fd]))); };

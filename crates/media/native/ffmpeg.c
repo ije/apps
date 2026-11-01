@@ -17,6 +17,7 @@ typedef struct {
   AVCodecContext *codec;
   AVStream *stream;
   AVPacket **queue;
+  int64_t bytes;
   int head, length, capacity, sent_end, ended;
 } Track;
 
@@ -32,8 +33,8 @@ typedef struct {
   AVPacket *packet;
   struct SwsContext *scale;
   SwrContext *resample;
-  AVChannelLayout layout;
-  int rate, width, height, read_end;
+  AVChannelLayout layout, input;
+  int rate, input_format, input_rate, width, height, read_end;
   double speed;
   float *samples;
   int capacity;
@@ -139,12 +140,19 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
   if ((status = avformat_open_input(&m->format, data ? NULL : path, NULL, NULL)) < 0) goto fail;
   if ((status = avformat_find_stream_info(m->format, NULL)) < 0) goto fail;
   if (video && open_track(m, &m->video, AVMEDIA_TYPE_VIDEO)) {
-    AVCodecParameters *parameters = m->video.stream->codecpar;
     AVRational aspect = av_guess_sample_aspect_ratio(m->format, m->video.stream, NULL);
-    m->width = parameters->width;
-    m->height = parameters->height;
-    if (aspect.num > 0 && aspect.den > 0 && aspect.num != aspect.den)
-      m->width = (int)lrint(m->width * av_q2d(aspect));
+    double width = m->video.stream->codecpar->width, height = m->video.stream->codecpar->height;
+    if (aspect.num > 0 && aspect.den > 0) width *= av_q2d(aspect);
+    // WARNING: the file sets the size and the pixel aspect, so frames are scaled to fit 8192 pixels per side.
+    double fit = fmin(1, 8192 / fmax(width, height));
+    if (width > 0 && height > 0) {
+      m->width = (int)fmax(1, lrint(width * fit));
+      m->height = (int)fmax(1, lrint(height * fit));
+    } else {
+      // WARNING: without a size the caller never wants video, so its packets must not queue.
+      avcodec_free_context(&m->video.codec);
+      m->video.stream = NULL;
+    }
   }
   if (rate > 0) open_track(m, &m->audio, AVMEDIA_TYPE_AUDIO);
   status = AVERROR_DECODER_NOT_FOUND;
@@ -181,6 +189,7 @@ static void clear(Track *track) {
     track->head = (track->head + 1) % track->capacity;
   }
   track->head = 0;
+  track->bytes = 0;
   track->sent_end = track->ended = 0;
   if (track->codec) avcodec_flush_buffers(track->codec);
 }
@@ -198,6 +207,7 @@ static int push(Track *track, AVPacket *packet) {
   }
   AVPacket *copy = av_packet_alloc();
   if (!copy) return AVERROR(ENOMEM);
+  track->bytes += packet->size;
   av_packet_move_ref(copy, packet);
   track->queue[(track->head + track->length++) % track->capacity] = copy;
   return 0;
@@ -211,6 +221,7 @@ static int feed(AppsMedia *m, Track *track) {
     if (status == AVERROR(EAGAIN)) return 1;
     track->head = (track->head + 1) % track->capacity;
     track->length--;
+    track->bytes -= packet->size;
     av_packet_free(&packet);
     // WARNING: a corrupt packet only drops its frame.
     return status < 0 && status != AVERROR_INVALIDDATA ? status : 1;
@@ -230,12 +241,20 @@ static double seconds(AppsMedia *m, Track *track, int64_t time) {
 
 static int audio(AppsMedia *m, const float **samples, int *count, double *time) {
   AVFrame *frame = m->frame;
+  // WARNING: swr_convert reads the planes of the layout it was set up with, so a format change needs a new one.
+  if (m->resample && (frame->format != m->input_format || frame->sample_rate != m->input_rate ||
+                      av_channel_layout_compare(&frame->ch_layout, &m->input)))
+    swr_free(&m->resample);
   if (!m->resample) {
     int rate = (int)lrint(m->rate / m->speed);
     if (swr_alloc_set_opts2(&m->resample, &m->layout, AV_SAMPLE_FMT_FLT, rate, &frame->ch_layout,
                             frame->format, frame->sample_rate, 0, NULL) < 0 ||
-        swr_init(m->resample) < 0)
+        swr_init(m->resample) < 0 || av_channel_layout_copy(&m->input, &frame->ch_layout) < 0) {
+      swr_free(&m->resample);
       return AVERROR(EINVAL);
+    }
+    m->input_format = frame->format;
+    m->input_rate = frame->sample_rate;
   }
   int needed = swr_get_out_samples(m->resample, frame->nb_samples);
   if (needed > m->capacity) {
@@ -247,7 +266,6 @@ static int audio(AppsMedia *m, const float **samples, int *count, double *time) 
   uint8_t *out = (uint8_t *)m->samples;
   int converted = swr_convert(m->resample, &out, needed, (const uint8_t **)frame->extended_data, frame->nb_samples);
   if (converted < 0) {
-    // WARNING: a stream can change its format, so the resampler starts over.
     swr_free(&m->resample);
     return 3;
   }
@@ -258,7 +276,8 @@ static int audio(AppsMedia *m, const float **samples, int *count, double *time) 
 }
 
 // Decodes the next frame of a wanted track (1 video, 2 audio). Returns 1 for a video frame (convert it with
-// apps_ffmpeg_pixels), 2 for interleaved float samples, 3 to call again, 0 when the wanted tracks ended, or an error.
+// apps_ffmpeg_pixels), 2 for interleaved float samples, 3 to call again, 4 when the wanted tracks wait behind
+// the full packet queue of the other track, 0 when the wanted tracks ended, or an error.
 int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *height, const float **samples, int *count) {
   for (;;) {
     int waiting = 0;
@@ -295,6 +314,9 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
                                                                                            : NULL;
     if (track && (status = push(track, m->packet)) < 0) return status;
     av_packet_unref(m->packet);
+    // WARNING: packets of a track that is not wanted stay in memory, so the caller decodes that track first.
+    if (track && !(want & (track == &m->video ? 1 : 2)) && (track->length >= 4096 || track->bytes >= 32 << 20))
+      return 4;
   }
 }
 
@@ -361,6 +383,7 @@ void apps_ffmpeg_close(AppsMedia *m) {
   sws_freeContext(m->scale);
   swr_free(&m->resample);
   av_channel_layout_uninit(&m->layout);
+  av_channel_layout_uninit(&m->input);
   av_free(m->samples);
   av_free(m);
 }

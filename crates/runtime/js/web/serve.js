@@ -1,5 +1,5 @@
 globalThis.__appsServe = call => {
-  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), { encode, decode, memory } = globalThis.__appsBytes;
+  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), drains = new Map(), { encode, decode, memory } = globalThis.__appsBytes;
   return {
     serve(options) {
       if (!options || typeof options.fetch !== 'function') throw new TypeError('Expected a fetch handler');
@@ -7,6 +7,8 @@ globalThis.__appsServe = call => {
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new RangeError('Invalid port');
       if (typeof hostname !== 'string' || !hostname) throw new TypeError('Invalid hostname');
       const address = call('web.serve.start', { port, hostname });
+      let close;
+      const closed = new Promise(resolve => close = resolve);
       const server = Object.freeze({
         port: address.port, hostname,
         requestIP(request) { const pending = requests.get(request); return pending?.server === address.id ? { ...pending.peer } : null; },
@@ -25,16 +27,19 @@ globalThis.__appsServe = call => {
           socket.binaryType = 'arraybuffer';
           return socket;
         },
-        stop() { call('web.serve.stop', address.id); servers.delete(address.id); },
+        stop(force = false) { call('web.serve.stop', address.id, !!force); if (force && servers.delete(address.id)) close(); return closed; },
       });
-      servers.set(address.id, { handler, server });
+      servers.set(address.id, { handler, server, close });
       return server;
     },
     poll() {
+      for (const resolve of drains.values()) resolve();
+      drains.clear();
       if (!servers.size) return;
       for (const event of call('web.serve.poll')) {
         const state = servers.get(event.server);
         if (!state) continue;
+        if (event.kind === 'closed') { servers.delete(event.server); state.close(); continue; }
         const key=event.server+':'+event.id;
         if(event.kind==='body'||event.kind==='cancel'){
           if(event.kind==='cancel'||event.error)signals.get(key)?.abort(new TypeError(event.error??'Client disconnected'));
@@ -78,7 +83,7 @@ globalThis.__appsServe = call => {
                   if (signal.signal.aborted) break;
                   if (!done && !(value instanceof Uint8Array)) throw new TypeError('Response chunks must be Uint8Array');
                   const chunk = done ? null : encode(value);
-                  while (!call('web.serve.write', event.server, event.id, chunk)) await new Promise(resolve => setTimeout(resolve, 4));
+                  while (!signal.signal.aborted && !call('web.serve.write', event.server, event.id, chunk)) await new Promise(resolve => drains.set(key, resolve));
                   if (done) break;
                 }
               } catch (error) { await reader.cancel(error); throw error; }

@@ -1162,15 +1162,21 @@ impl Gpu {
                     usage,
                     view_formats: &[],
                 });
+                // WARNING: 32768×32768 pixels need 4 GiB, so the readback size is computed in u64.
+                let size = u64::from(
+                    (width * 4).div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
+                        * COPY_BYTES_PER_ROW_ALIGNMENT,
+                ) * u64::from(height);
+                ensure!(
+                    size <= device.limits().max_buffer_size,
+                    "Canvas is too large to read back"
+                );
                 let key = self.insert(id, Resource::Texture(texture));
-                let size = (width * 4).div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
-                    * COPY_BYTES_PER_ROW_ALIGNMENT
-                    * height;
-                self.allocated += width as u64 * height as u64 * 4 + 2 * size as u64;
+                self.allocated += u64::from(width) * u64::from(height) * 4 + 2 * size;
                 let readback = || {
                     let buffer = device.create_buffer(&BufferDescriptor {
                         label: Some("canvas readback"),
-                        size: size as u64,
+                        size,
                         usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
                         mapped_at_creation: false,
                     });

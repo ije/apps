@@ -653,6 +653,47 @@ fn node_http_classes_ports_and_errors() {
     "#);
 }
 
+#[test]
+fn node_http_close_finishes_requests_and_streams_large_bodies() {
+    run(r#"
+        const {assert,http}=__apps,listen=server=>new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`)));
+        const loopback=http.createServer((req,res)=>{res.end('<html>done</html>');loopback.close();}),events=[];
+        loopback.on('close',()=>events.push('close'));
+        assert.strictEqual(await fetch(await listen(loopback)+'/callback').then(r=>r.text()),'<html>done</html>');
+        while(!events.length)await new Promise(resolve=>setTimeout(resolve,5));assert.ok(!loopback.listening);
+        let release;const slow=http.createServer((req,res)=>{release=()=>res.end('late');});const url=await listen(slow);
+        const pending=fetch(url).then(r=>r.text());while(!release)await new Promise(resolve=>setTimeout(resolve,5));
+        let closed=false;slow.close(()=>closed=true);await new Promise(resolve=>setTimeout(resolve,20));
+        assert.ok(!closed,'close waits for requests in flight');release();
+        assert.strictEqual(await pending,'late');while(!closed)await new Promise(resolve=>setTimeout(resolve,5));
+        const upload=http.createServer((req,res)=>{let size=0;req.on('data',chunk=>size+=chunk.length);req.on('end',()=>res.end(String(size)));});
+        assert.strictEqual(await fetch(await listen(upload),{method:'POST',body:new Uint8Array(20<<20)}).then(r=>r.text()),String(20<<20));
+        upload.close();
+    "#);
+}
+
+#[test]
+fn node_net_reads_while_writing_and_reuses_socket_paths() {
+    run(r#"
+        const {assert,net,os,path,fs}=__apps,size=16<<20;
+        const echo=net.createServer(socket=>socket.pipe(socket));await new Promise(resolve=>echo.listen(0,'127.0.0.1',resolve));
+        const client=net.connect(echo.address().port,'127.0.0.1');let received=0;
+        client.on('data',chunk=>{received+=chunk.length;if(received===size)client.end();});client.write(Buffer.alloc(size,7));
+        await new Promise(resolve=>client.on('close',resolve));assert.strictEqual(received,size);echo.close();
+        if(process.platform==='win32')return;
+        const http=__apps.http.createServer(),wss=new __apps.ws.WebSocketServer({server:http});wss.on('connection',ws=>ws.on('message',data=>ws.send(data)));
+        await new Promise(resolve=>http.listen(0,'127.0.0.1',resolve));
+        const ws=new __apps.ws.WebSocket(`ws://127.0.0.1:${http.address().port}/`);let echoed=0;
+        await new Promise((resolve,reject)=>{ws.on('open',()=>{for(let i=0;i<16;i++)ws.send(new Uint8Array(1<<20));});ws.on('message',()=>{if(++echoed===16)resolve();});ws.on('error',reject);});
+        ws.close();wss.close();http.close();
+        const file=path.join(os.tmpdir(),`apps-${process.pid}-${Date.now()}.sock`),server=net.createServer(socket=>socket.end('hi'));
+        await new Promise(resolve=>server.listen(file,resolve));server.close();assert.ok(!fs.existsSync(file),'close removes the socket file');
+        await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(file,resolve);});
+        const text=await new Promise((resolve,reject)=>{let data='';const socket=net.connect(file);socket.setEncoding('utf8');socket.on('data',chunk=>data+=chunk);socket.on('end',()=>resolve(data));socket.on('error',reject);});
+        assert.strictEqual(text,'hi');server.close();assert.ok(!fs.existsSync(file));
+    "#);
+}
+
 #[cfg(unix)]
 #[test]
 fn terminal_has_real_tty_and_can_resize() {
@@ -792,10 +833,16 @@ fn node_fs_descriptors_handles_and_streams() {
         fs.fchmodSync(fd,'600');fs.futimesSync(fd,1,new Date(2000));fs.fdatasyncSync(fd);fs.fchownSync(fd,-1,-1);
         const stats=fs.fstatSync(fd);assert.strictEqual((stats.mode&0o777).toString(8),'600');assert.strictEqual(stats.mtimeMs,2000);
         await new Promise((resolve,reject)=>fs.fchmod(fd,0o644,error=>error?reject(error):fs.fdatasync(fd,error=>error?reject(error):resolve())));
+        assert.throws(()=>fs.read(fd,Buffer.alloc(4),0,10,0,()=>{{}}),{{code:'ERR_OUT_OF_RANGE',message:'The value of "length" is out of range. It must be <= 4. Received 10'}});
+        assert.throws(()=>fs.readSync(fd,Buffer.alloc(4),-1,1,0),{{code:'ERR_OUT_OF_RANGE',message:'The value of "offset" is out of range. It must be >= 0 && <= 9007199254740991. Received -1'}});
+        assert.throws(()=>fs.writeSync(fd,Buffer.alloc(4),5),{{code:'ERR_OUT_OF_RANGE',message:'The value of "offset" is out of range. It must be <= 4. Received 5'}});
+        assert.throws(()=>fs.write(fd,Buffer.alloc(4),1,4,()=>{{}}),{{code:'ERR_OUT_OF_RANGE',message:'The value of "length" is out of range. It must be <= 3. Received 4'}});
+        assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),{{offset:1,length:3,position:1}}),3);
         fs.closeSync(fd);
         assert.throws(()=>fs.closeSync(fd),{{code:'EBADF',syscall:'close',message:'EBADF: bad file descriptor, close'}});
         assert.throws(()=>fs.readSync(fd,Buffer.alloc(1)),{{code:'EBADF',syscall:'read'}});
         const handle=await fsp.open(file,'r+');
+        await assert.rejects(handle.read(Buffer.alloc(4),0,10),{{code:'ERR_OUT_OF_RANGE'}});
         assert.strictEqual(await fsp.readFile(handle,'utf8'),'hello worldHELLO!');
         await fsp.writeFile(handle,'+');await handle.chmod(0o640);await handle.utimes(3,4);await handle.datasync();
         assert.strictEqual((await handle.stat()).mtimeMs,4000);await handle.close();assert.strictEqual(handle.fd,-1);

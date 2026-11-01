@@ -587,7 +587,7 @@ pub(crate) fn intrinsic(
         let [width, height] = [0, 1].map(|axis| {
             node.attrs
                 .get(["width", "height"][axis])
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| super::element::dimension(v, node.tag == "canvas"))
                 .unwrap_or(default[axis])
         });
         content = [width, width, height];

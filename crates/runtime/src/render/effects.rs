@@ -769,10 +769,10 @@ pub(crate) fn gradient_svg(
         .collect();
     let (first, space) = match words.iter().position(|word| *word == "in") {
         Some(index) => {
-            let end = words
+            let end = words[index + 1..]
                 .iter()
                 .position(|word| *word == "hue")
-                .map_or(index + 2, |hue| hue + 1)
+                .map_or(index + 2, |hue| index + hue + 2)
                 .min(words.len());
             let rest = words[..index].iter().chain(&words[end..]);
             (
@@ -806,6 +806,9 @@ pub(crate) fn gradient_svg(
             } else if let Some(degrees) = angle(first) {
                 prelude = true;
                 degrees
+            } else if space.is_some() && !first.is_empty() {
+                // Like browsers, an interpolation space with words that are no direction makes the gradient invalid.
+                return None;
             } else {
                 prelude = space.is_some();
                 180.
@@ -1201,6 +1204,24 @@ mod tests {
         assert!(matrix.is_some());
         assert_eq!(blend_mode("multiply"), BlendMode::Multiply);
         assert_eq!(blend_mode("unknown"), BlendMode::Normal);
+    }
+
+    #[test]
+    fn gradient_interpolation_spaces_parse_in_any_order() {
+        let units = Lengths::new(16., 800., 600.);
+        for (body, valid) in [
+            ("hue in hsl, red, blue", false),
+            ("in hsl longer hue, red, blue", true),
+            ("to right in oklch longer hue, red, blue", true),
+        ] {
+            let svg = gradient_svg("linear-gradient", body, "auto", "", "", units, 10., 10.);
+            assert_eq!(svg.is_some(), valid, "{body}");
+        }
+        for kind in ["radial-gradient", "conic-gradient"] {
+            for body in ["hue in hsl, red, blue", "in, red, blue"] {
+                gradient_svg(kind, body, "auto", "", "", units, 10., 10.);
+            }
+        }
     }
 
     #[test]

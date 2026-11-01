@@ -26,7 +26,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       this.signalCode = null;
       this.killed = false;
       this.stdin = options.stdio[0] === 'pipe' ? input(result.id) : null;
-      const output = name => options.stdio[name === 'stdout' ? 1 : 2] === 'pipe' ? new stream.Readable({ read() { if (this._paused) { this._paused = false; call('child.pause', result.id, name, false); } } }) : null;
+      const output = name => options.stdio[name === 'stdout' ? 1 : 2] === 'pipe' ? new stream.Readable({ read() { if (this._paused) { this._paused = false; call('child.pause', result.id, name, false); } }, destroy(error, callback) { call('child.destroy', result.id, name); callback(error); } }) : null;
       this.stdout = output('stdout');
       this.stderr = output('stderr');
       this.stdio = [this.stdin, this.stdout, this.stderr];
@@ -116,10 +116,10 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
     for (const event of call('child.poll')) {
       const child = children.get(event.id)?.child;
       if (!child) continue;
-      if (event.event === 'data') { const output=child[event.stream], data=view(event.data); if(!output.push(data)&&!output._paused){output._paused=true;call('child.pause',event.id,event.stream,true);} }
+      if (event.event === 'data') { const output=child[event.stream]; if(!output.destroyed&&!output.push(view(event.data))&&!output._paused){output._paused=true;call('child.pause',event.id,event.stream,true);} }
       else if (event.event === 'written') child.stdin?._childWritten();
       else if (event.event === 'finish') child.stdin?._childEnded();
-      else if (event.event === 'end') child[event.stream].push(null);
+      else if (event.event === 'end') { if (!child[event.stream].destroyed) child[event.stream].push(null); }
       else if (event.event === 'error') child[event.stream]?.destroy(Object.assign(new Error(`${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`), event.error, { message: `${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`, syscall: event.stream === 'stdin' ? 'write' : 'read' }));
       else if (event.event === 'exit' || event.event === 'close') {
         child.exitCode = event.code;

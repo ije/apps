@@ -2,9 +2,31 @@ use super::paint::Effected;
 use crate::style;
 use crate::style::Prop;
 use renderer::{AnyElement, div, prelude::*, px, rgba};
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 type Backgrounds = HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>;
+
+/// The bitmap of a file once a worker decoded it, empty when the file is no bitmap.
+pub(super) type Decoding = Arc<Mutex<Option<renderer::RenderImage>>>;
+
+/// Draws the window again once `decoding` is done, checking on each frame.
+fn landed(decoding: Decoding) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
+    move |window, _| {
+        if decoding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            window.refresh();
+        } else {
+            window.on_next_frame(landed(decoding));
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn css_background(
@@ -105,22 +127,78 @@ pub(super) fn css_background(
                                         && [image.size().width, image.size().height].map(u32::from)
                                             != raster
                             }) {
-                                let bitmap = decoded(backgrounds).unwrap_or_else(|| {
-                                    let image = Arc::new(
-                                        (|| -> anyhow::Result<_> {
-                                            anyhow::ensure!(
-                                                std::fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
-                                                "Image is too large"
-                                            );
-                                            super::image::decode(&std::fs::read(&path)?)
-                                        })()
-                                        .unwrap_or_else(|_| {
-                                            renderer::RenderImage::new(0, 0, Vec::new())
-                                        }),
-                                    );
-                                    backgrounds.insert(shared, (file.clone(), image.clone()));
-                                    image
-                                });
+                                // WARNING: files decode on workers like `<img>`. A decoded bitmap is taken
+                                // here, where a layer holds it at once, since `retire` drops unheld bitmaps.
+                                let bitmap = match decoded(backgrounds) {
+                                    Some(bitmap) => bitmap,
+                                    None => {
+                                        let mut decoding = view.decoding.borrow_mut();
+                                        let done = decoding.get(&file).and_then(|(_, slot)| {
+                                            slot.lock()
+                                                .unwrap_or_else(PoisonError::into_inner)
+                                                .take()
+                                        });
+                                        let Some(image) = done else {
+                                            if !decoding.contains_key(&file) {
+                                                let slot = Decoding::default();
+                                                decoding.insert(file.clone(), (id, slot.clone()));
+                                                let (path, done) = (path.clone(), slot.clone());
+                                                type Job = Box<dyn FnOnce() + Send>;
+                                                static JOBS: Mutex<(VecDeque<Job>, usize)> =
+                                                    Mutex::new((VecDeque::new(), 0));
+                                                let mut jobs = JOBS
+                                                    .lock()
+                                                    .unwrap_or_else(PoisonError::into_inner);
+                                                jobs.0.push_back(Box::new(move || {
+                                                    let image = (|| -> anyhow::Result<_> {
+                                                        anyhow::ensure!(
+                                                            std::fs::metadata(&path)?.len()
+                                                                <= 64 * 1024 * 1024,
+                                                            "Image is too large"
+                                                        );
+                                                        super::image::decode(&std::fs::read(&path)?)
+                                                    })(
+                                                    )
+                                                    .unwrap_or_else(|_| {
+                                                        renderer::RenderImage::new(0, 0, Vec::new())
+                                                    });
+                                                    *done
+                                                        .lock()
+                                                        .unwrap_or_else(PoisonError::into_inner) =
+                                                        Some(image);
+                                                }));
+                                                // WARNING: at most two files decode at once to bound their memory, and idle workers exit.
+                                                if jobs.1 < 2
+                                                    && std::thread::Builder::new()
+                                                        .name("apps-image".into())
+                                                        .spawn(|| {
+                                                            while let Some(job) = {
+                                                                let mut jobs =
+                                                                    JOBS.lock().unwrap_or_else(
+                                                                        PoisonError::into_inner,
+                                                                    );
+                                                                let job = jobs.0.pop_front();
+                                                                jobs.1 -=
+                                                                    usize::from(job.is_none());
+                                                                job
+                                                            } {
+                                                                job();
+                                                            }
+                                                        })
+                                                        .is_ok()
+                                                {
+                                                    jobs.1 += 1;
+                                                }
+                                                window.on_next_frame(landed(slot));
+                                            }
+                                            return;
+                                        };
+                                        decoding.remove(&file);
+                                        let image = Arc::new(image);
+                                        backgrounds.insert(shared, (file.clone(), image.clone()));
+                                        image
+                                    }
+                                };
                                 let image = if u32::from(bitmap.size().width) > 0 {
                                     bitmap
                                 } else {

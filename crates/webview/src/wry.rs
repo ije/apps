@@ -34,8 +34,10 @@ impl Events {
             event = json!({"type":"evaluation", "id":event["id"], "error":"Browser result exceeds 4 MiB"});
         }
         let mut queue = self.0.lock().unwrap();
-        if queue.len() == 4096 {
-            queue.pop_front();
+        // WARNING: only page events can flood the queue. Results and navigation events always queue, or their callers never settle.
+        if queue.len() >= 4096 && matches!(event["type"].as_str(), Some("message" | "window-open"))
+        {
+            return;
         }
         queue.push_back(event);
         drop(queue);

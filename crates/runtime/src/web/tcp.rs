@@ -1,18 +1,22 @@
 use crate::jsc::payload::Payload;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 
 enum Command {
     Write(Vec<u8>),
     End,
-    Pause(bool),
     NoDelay(bool),
     KeepAlive(bool, u64),
 }
@@ -67,6 +71,7 @@ fn failure((error, syscall, mut details): Failure) -> Value {
 async fn run<T: Transport>(
     stream: T,
     mut commands: mpsc::UnboundedReceiver<Command>,
+    mut paused: watch::Receiver<bool>,
     output: mpsc::Sender<Payload>,
     wake: &crate::host::Waker,
 ) -> Result<(), Failure> {
@@ -79,35 +84,59 @@ async fn run<T: Transport>(
     if !events(json!({"kind":"connect","address":stream.address()}).into()).await {
         return Ok(());
     }
-    let mut paused = false;
-    let mut reading = true;
-    let mut ended = false;
-    let mut bytes = [0; 16384];
     let control = stream.control().map_err(io("connect"))?;
     let (mut reader, mut writer) = tokio::io::split(stream);
-    loop {
-        tokio::select! {
-            command = commands.recv() => {
-                match command {
-                    Some(Command::Write(data)) => { writer.write_all(&data).await.map_err(io("write"))?; if !events(json!({"kind":"written","bytes":data.len()}).into()).await { break; } }
-                    Some(Command::End) => { writer.shutdown().await.map_err(io("shutdown"))?; ended=true; if !events(json!({"kind":"finish"}).into()).await || !reading { break; } }
-                    Some(Command::Pause(value)) => paused=value,
-                    Some(Command::NoDelay(value)) => { let _ = control.set_tcp_nodelay(value); }
-                    Some(Command::KeepAlive(value, delay)) => {
-                        let _ = control.set_keepalive(value);
-                        if value && delay > 0 { let _ = control.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_millis(delay))); }
-                    }
-                    None => break,
-                }
+    // WARNING: reads go on while a write waits for the peer, or two sockets piped into each other deadlock.
+    let read = async {
+        let mut bytes = [0; 16384];
+        loop {
+            let _ = paused.wait_for(|paused| !paused).await;
+            let size = reader.read(&mut bytes).await.map_err(io("read"))?;
+            if size == 0 {
+                events(json!({"kind":"end"}).into()).await;
+                return Ok(());
             }
-            result = reader.read(&mut bytes), if !paused && reading => {
-                let size = result.map_err(io("read"))?;
-                if size == 0 { reading=false; if !events(json!({"kind":"end"}).into()).await || ended { break; } }
-                else if !events(Payload::with_bytes(json!({"kind":"data"}), "bytes", bytes[..size].to_vec())).await { break; }
+            if !events(Payload::with_bytes(
+                json!({"kind":"data"}),
+                "bytes",
+                bytes[..size].to_vec(),
+            ))
+            .await
+            {
+                return Ok(());
             }
         }
-    }
-    Ok(())
+    };
+    let write = async {
+        while let Some(command) = commands.recv().await {
+            match command {
+                Command::Write(data) => {
+                    writer.write_all(&data).await.map_err(io("write"))?;
+                    if !events(json!({"kind":"written","bytes":data.len()}).into()).await {
+                        break;
+                    }
+                }
+                Command::End => {
+                    writer.shutdown().await.map_err(io("shutdown"))?;
+                    events(json!({"kind":"finish"}).into()).await;
+                    break;
+                }
+                Command::NoDelay(value) => {
+                    let _ = control.set_tcp_nodelay(value);
+                }
+                Command::KeepAlive(value, delay) => {
+                    let _ = control.set_keepalive(value);
+                    if value && delay > 0 {
+                        let _ = control.set_tcp_keepalive(
+                            &socket2::TcpKeepalive::new().with_time(Duration::from_millis(delay)),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    tokio::try_join!(read, write).map(|_| ())
 }
 
 enum Accepted {
@@ -117,6 +146,7 @@ enum Accepted {
 }
 struct Connection {
     commands: mpsc::UnboundedSender<Command>,
+    paused: watch::Sender<bool>,
     events: mpsc::Receiver<Payload>,
     task: JoinHandle<()>,
 }
@@ -125,12 +155,26 @@ impl Drop for Connection {
         self.task.abort();
     }
 }
+enum Listener {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener, String),
+}
 struct Server {
     events: mpsc::Receiver<Accepted>,
+    listener: Arc<Mutex<Option<Listener>>>,
     task: JoinHandle<()>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        // WARNING: the listener closes here, on the JavaScript thread, so `close()` frees the address before `listen()` runs again.
+        if let Ok(mut listener) = self.listener.lock() {
+            #[cfg(unix)]
+            if let Some(Listener::Unix(_, path)) = listener.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+            listener.take();
+        }
         self.task.abort();
     }
 }
@@ -147,14 +191,19 @@ impl State {
         future: impl std::future::Future<Output = Result<Accepted, Failure>> + Send + 'static,
     ) -> Result<u64> {
         let (commands, incoming) = mpsc::unbounded_channel();
+        let (paused, pausing) = watch::channel(false);
         let (output, events) = mpsc::channel(64);
         let wake = crate::host::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result = async {
                 match future.await? {
-                    Accepted::Tcp(stream) => run(stream, incoming, output.clone(), &wake).await,
+                    Accepted::Tcp(stream) => {
+                        run(stream, incoming, pausing, output.clone(), &wake).await
+                    }
                     #[cfg(unix)]
-                    Accepted::Unix(stream) => run(stream, incoming, output.clone(), &wake).await,
+                    Accepted::Unix(stream) => {
+                        run(stream, incoming, pausing, output.clone(), &wake).await
+                    }
                 }
             }
             .await;
@@ -172,6 +221,7 @@ impl State {
             self.next_id,
             Connection {
                 commands,
+                paused,
                 events,
                 task,
             },
@@ -246,38 +296,19 @@ impl State {
                 let options = &args[0];
                 let runtime = crate::web::network()?;
                 let _guard = runtime.enter();
-                let (sender, events) = mpsc::channel(64);
-                let wake = crate::host::Waker::current();
-                let (address, task) = if let Some(path) = options["path"].as_str() {
+                let (listener, address) = if let Some(path) = options["path"].as_str() {
                     #[cfg(unix)]
                     {
-                        let listener = match tokio::net::UnixListener::bind(path) {
-                            Ok(listener) => listener,
+                        match tokio::net::UnixListener::bind(path) {
+                            Ok(listener) => {
+                                (Listener::Unix(listener, path.into()), json!({"path":path}))
+                            }
                             Err(error) => {
                                 return Ok(
                                     json!({"error":failure((error, "listen", json!({"address":path})))}),
                                 );
                             }
-                        };
-                        let path = path.to_owned();
-                        (
-                            json!({"path":path}),
-                            runtime.spawn(async move {
-                                loop {
-                                    match listener.accept().await {
-                                        Ok((stream, _)) => {
-                                            if sender.send(Accepted::Unix(stream)).await.is_err() {
-                                                break;
-                                            }
-                                            wake.wake();
-                                        }
-                                        Err(_) => {
-                                            tokio::time::sleep(Duration::from_millis(100)).await
-                                        }
-                                    }
-                                }
-                            }),
-                        )
+                        }
                     }
                     #[cfg(not(unix))]
                     {
@@ -297,26 +328,49 @@ impl State {
                     };
                     let address = listener.local_addr()?;
                     listener.set_nonblocking(true)?;
-                    let listener = tokio::net::TcpListener::from_std(listener)?;
                     (
+                        Listener::Tcp(tokio::net::TcpListener::from_std(listener)?),
                         json!({"address":address.ip().to_string(),"family":if address.is_ipv4(){"IPv4"}else{"IPv6"},"port":address.port()}),
-                        runtime.spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((stream, _)) => {
-                                        if sender.send(Accepted::Tcp(stream)).await.is_err() {
-                                            break;
-                                        }
-                                        wake.wake();
-                                    }
-                                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                                }
-                            }
-                        }),
                     )
                 };
+                let listener = Arc::new(Mutex::new(Some(listener)));
+                let accepting = listener.clone();
+                let (sender, events) = mpsc::channel(64);
+                let wake = crate::host::Waker::current();
+                let task = runtime.spawn(async move {
+                    loop {
+                        let accepted =
+                            std::future::poll_fn(|cx| match accepting.lock().as_deref() {
+                                Ok(Some(Listener::Tcp(listener))) => listener
+                                    .poll_accept(cx)
+                                    .map_ok(|(stream, _)| Accepted::Tcp(stream)),
+                                #[cfg(unix)]
+                                Ok(Some(Listener::Unix(listener, _))) => listener
+                                    .poll_accept(cx)
+                                    .map_ok(|(stream, _)| Accepted::Unix(stream)),
+                                _ => Poll::Pending,
+                            })
+                            .await;
+                        match accepted {
+                            Ok(stream) => {
+                                if sender.send(stream).await.is_err() {
+                                    break;
+                                }
+                                wake.wake();
+                            }
+                            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        }
+                    }
+                });
                 self.next_id += 1;
-                self.servers.insert(self.next_id, Server { events, task });
+                self.servers.insert(
+                    self.next_id,
+                    Server {
+                        events,
+                        listener,
+                        task,
+                    },
+                );
                 Ok(json!({"id":self.next_id,"address":address}))
             }
             "write" | "end" | "pause" | "noDelay" | "keepAlive" => {
@@ -327,7 +381,10 @@ impl State {
                 let command = match op {
                     "write" => Command::Write(crate::web::bytes(&args[1])?),
                     "end" => Command::End,
-                    "pause" => Command::Pause(args[1] == true),
+                    "pause" => {
+                        socket.paused.send_replace(args[1] == true);
+                        return Ok(Value::Null);
+                    }
                     "noDelay" => Command::NoDelay(args[1] == true),
                     _ => Command::KeepAlive(args[1] == true, args[2].as_u64().unwrap_or(0)),
                 };

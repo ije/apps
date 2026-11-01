@@ -1,16 +1,21 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use bytes::Bytes;
-use http_body_util::{
-    BodyExt, Full, LengthLimitError, Limited, StreamBody, combinators::UnsyncBoxBody,
-};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{collections::HashMap, convert::Infallible, net::TcpListener, sync::Arc, time::Duration};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::TcpListener,
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
+};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
@@ -34,13 +39,18 @@ struct Server {
     events: mpsc::Receiver<RequestEvent>,
     replies: HashMap<u64, Reply>,
     task: JoinHandle<()>,
-    streams: HashMap<u64, mpsc::Sender<Option<Bytes>>>,
+    listener: Arc<Mutex<Option<tokio::net::TcpListener>>>,
+    stop: watch::Sender<bool>,
+    streams: HashMap<u64, (mpsc::Sender<Option<Bytes>>, Arc<AtomicBool>)>,
     sockets: Vec<u64>,
     uploads: HashMap<u64, mpsc::Sender<()>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if let Ok(mut listener) = self.listener.lock() {
+            listener.take();
+        }
         self.task.abort();
     }
 }
@@ -70,23 +80,37 @@ impl State {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let (sender, events) = mpsc::channel(64);
                 let wake = crate::host::Waker::current();
+                // WARNING: `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
+                let listener = Arc::new(Mutex::new(Some(listener)));
+                let (stop, stopping) = watch::channel(false);
+                let accepting = listener.clone();
                 let task = network.spawn(async move {
+                    let _closed = crate::host::WakeOnDrop(wake.clone());
                     let next_id = Arc::new(AtomicU64::new(0));
                     let mut connections = JoinSet::new();
+                    let mut stopped = stopping.clone();
                     loop {
+                        let accepted = tokio::select! {
+                            accepted = std::future::poll_fn(|cx| match accepting.lock().as_deref() {
+                                Ok(Some(listener)) => listener.poll_accept(cx).map(Some),
+                                _ => Poll::Ready(None),
+                            }) => accepted,
+                            _ = stopped.wait_for(|stop| *stop) => None,
+                        };
                         while connections.try_join_next().is_some() {}
-                        if connections.len() >= 64 { connections.join_next().await; }
-                        let (stream, peer) = match listener.accept().await {
-                            Ok(accepted) => accepted,
-                            Err(_) => {
+                        let (stream, peer) = match accepted {
+                            Some(Ok(accepted)) => accepted,
+                            Some(Err(_)) => {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
+                            None => break,
                         };
                         let _ = stream.set_nodelay(true);
                         let sender = sender.clone();
                         let next_id = next_id.clone();
                         let wake = wake.clone();
+                        let mut stopped = stopping.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |mut request: Request<Incoming>| {
                                 let sender = sender.clone();
@@ -94,9 +118,8 @@ impl State {
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                                 async move {
                                     let upgrade = request.headers().get("upgrade").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket")).then(|| hyper::upgrade::on(&mut request));
-                                    let (parts, body) = request.into_parts();
+                                    let (parts, mut body) = request.into_parts();
                                     let has_body = !hyper::body::Body::is_end_stream(&body);
-                                    let mut body = Limited::new(body, 16 * 1024 * 1024);
                                     let authority = parts.uri.authority().map(|value| value.as_str())
                                         .or_else(|| parts.headers.get("host").and_then(|value| value.to_str().ok()))
                                         .map(str::to_owned).unwrap_or_else(|| address.to_string());
@@ -123,7 +146,7 @@ impl State {
                                                 Ok(Some(Ok(frame))) => { if let Ok(bytes)=frame.into_data() { buffer.extend_from_slice(&bytes); } },
                                                 Ok(None) => ended=true,
                                                 error => {
-                                                    let (status,message)=match error { Err(_)=>(408,"Request body timed out".to_owned()),Ok(Some(Err(error)))=>(if error.is::<LengthLimitError>(){413}else{400},error.to_string()),_=>unreachable!() };
+                                                    let (status,message)=match error { Err(_)=>(408,"Request body timed out".to_owned()),Ok(Some(Err(error)))=>(400,error.to_string()),_=>unreachable!() };
                                                     let _=sender.send((json!({"kind":"body","id":id,"error":message}).into(),None)).await;
                                                     wake.wake();
                                                     let _=failed.send(status); return;
@@ -148,12 +171,23 @@ impl State {
                                     Ok(response.unwrap_or_else(|_|Response::builder().status(503).body(full(Bytes::new())).unwrap()))
                                 }
                             });
-                            let _ = http1::Builder::new()
+                            let connection = http1::Builder::new()
                                 .timer(TokioTimer::new())
                                 .header_read_timeout(Duration::from_secs(5))
-                                .serve_connection(TokioIo::new(stream), service).with_upgrades().await;
+                                .serve_connection(TokioIo::new(stream), service).with_upgrades();
+                            tokio::pin!(connection);
+                            // WARNING: a stopping server closes idle connections and lets requests in flight finish, like Node's `server.close()`.
+                            let stop = tokio::select! {
+                                _ = connection.as_mut() => false,
+                                _ = stopped.wait_for(|stop| *stop) => true,
+                            };
+                            if stop {
+                                connection.as_mut().graceful_shutdown();
+                                let _ = connection.await;
+                            }
                         });
                     }
+                    while connections.join_next().await.is_some() {}
                 });
                 self.next_id += 1;
                 self.servers.insert(
@@ -165,12 +199,14 @@ impl State {
                         sockets: Vec::new(),
                         uploads: HashMap::new(),
                         task,
+                        listener,
+                        stop,
                     },
                 );
                 Ok(json!({"id": self.next_id, "port": address.port()}))
             }
             "poll" => {
-                let mut events = Vec::new();
+                let (mut events, mut closed) = (Vec::new(), Vec::new());
                 for (&id, server) in &mut self.servers {
                     server.replies.retain(|request, reply| {
                         if reply.0.is_closed() {
@@ -181,7 +217,7 @@ impl State {
                         }
                     });
                     server.uploads.retain(|_, upload| !upload.is_closed());
-                    server.streams.retain(|request, stream| {
+                    server.streams.retain(|request, (stream, _)| {
                         let closed = stream.is_closed();
                         if closed {
                             events.push(json!({"server":id,"id":request,"kind":"cancel"}));
@@ -211,6 +247,13 @@ impl State {
                         event["server"] = json!(id);
                         events.push(event);
                     }
+                    if server.task.is_finished() && server.events.is_empty() {
+                        events.push(json!({"server":id,"kind":"closed"}));
+                        closed.push(id);
+                    }
+                }
+                for id in closed {
+                    self.servers.remove(&id);
                 }
                 Ok(json!(events))
             }
@@ -270,15 +313,20 @@ impl State {
                 }
                 let body = if value["stream"] == true {
                     let (sender, receiver) = mpsc::channel::<Option<Bytes>>(16);
-                    server.streams.insert(id, sender);
+                    let full = Arc::new(AtomicBool::new(false));
+                    server.streams.insert(id, (sender, full.clone()));
                     let closed = crate::host::WakeOnDrop(crate::host::Waker::current());
                     StreamBody::new(futures_util::stream::unfold(
-                        (receiver, closed),
-                        |(mut receiver, closed)| async move {
+                        (receiver, closed, full),
+                        |(mut receiver, closed, full)| async move {
                             let bytes = receiver.recv().await.flatten()?;
+                            // WARNING: a writer that found the queue full waits for this wake.
+                            if full.swap(false, Ordering::AcqRel) {
+                                closed.0.wake();
+                            }
                             Some((
                                 Ok::<_, std::io::Error>(hyper::body::Frame::data(bytes)),
-                                (receiver, closed),
+                                (receiver, closed, full),
                             ))
                         },
                     ))
@@ -296,7 +344,7 @@ impl State {
                     .get_mut(&args[0].as_u64().context("Expected server ID")?)
                     .context("Server is closed")?;
                 let id = args[1].as_u64().context("Expected request ID")?;
-                let stream = server
+                let (stream, full) = server
                     .streams
                     .get(&id)
                     .context("Response stream is closed")?;
@@ -305,8 +353,10 @@ impl State {
                 } else {
                     Some(Bytes::from(crate::web::bytes(&args[2])?))
                 };
+                full.store(true, Ordering::Release);
                 match stream.try_send(chunk) {
                     Ok(()) => {
+                        full.store(false, Ordering::Release);
                         if args[2].is_null() {
                             server.streams.remove(&id);
                         }
@@ -357,10 +407,15 @@ impl State {
                 Ok(json!(socket))
             }
             "stop" => {
-                if let Some(server) = self
-                    .servers
-                    .remove(&args[0].as_u64().context("Expected server ID")?)
-                {
+                let id = args[0].as_u64().context("Expected server ID")?;
+                if args[1] != true {
+                    if let Some(server) = self.servers.get(&id) {
+                        if let Ok(mut listener) = server.listener.lock() {
+                            listener.take();
+                        }
+                        server.stop.send_replace(true);
+                    }
+                } else if let Some(server) = self.servers.remove(&id) {
                     for id in &server.sockets {
                         sockets.call("abort", &json!([id]), false)?;
                     }

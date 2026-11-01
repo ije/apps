@@ -234,7 +234,8 @@ impl State {
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
-                            if native && delay < 0 && engine.eval("__appsAlive()", "apps:worker")? != "true" { break; }
+                            // WARNING: a native worker ends when only unreferenced timers are left, like in Node, so it checks before each wait.
+                            if native && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
                             let message = if delay < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(delay as u64)) };
                             match message {
                                 Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {

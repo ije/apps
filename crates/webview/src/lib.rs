@@ -54,10 +54,12 @@ unsafe extern "C" fn receive(context: *mut c_void, message: *const c_char) {
     if bytes.len() > 4 * 1024 * 1024 {
         return;
     }
-    if let Ok(value) = serde_json::from_slice(bytes) {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         let mut events = events.borrow_mut();
-        if events.len() == 4096 {
-            events.pop_front();
+        // WARNING: only page events can flood the queue. Results and navigation events always queue, or their callers never settle.
+        if events.len() >= 4096 && matches!(value["type"].as_str(), Some("message" | "window-open"))
+        {
+            return;
         }
         events.push_back(value);
         drop(events);
@@ -372,5 +374,9 @@ mod tests {
         }
         assert_eq!(queue.borrow().len(), 4096);
         assert_eq!(queue.borrow()[0]["data"]["text"], "你好");
+        let result = CString::new(r#"{"type":"evaluation","id":7,"value":1}"#).unwrap();
+        unsafe { receive(context, result.as_ptr()) };
+        assert_eq!(queue.borrow().len(), 4097);
+        assert_eq!(queue.borrow()[4096]["id"], 7);
     }
 }

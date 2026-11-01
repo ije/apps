@@ -70,6 +70,35 @@ mod tests {
     }
 
     #[test]
+    fn json_keys_move_to_ordered_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("browser.sqlite");
+        let old = Database::open(&path).unwrap();
+        old.query("CREATE TABLE records (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))", &[]).unwrap();
+        for key in [r#"[2,"b"]"#, "[0,10]", "[0,2]"] {
+            old.query("INSERT INTO records VALUES('db','items',?,'1')", &[key])
+                .unwrap();
+        }
+        drop(old);
+        let mut state = State {
+            path,
+            ..State::default()
+        };
+        let id = state.call("begin", &json!(["db", "readonly"])).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            state
+                .call(
+                    "scan",
+                    &json!([id, "items", null, null, false, false, false, 0, "keys"])
+                )
+                .unwrap(),
+            json!([[0, 2.0], [0, 10.0], [2, "b"]])
+        );
+    }
+
+    #[test]
     fn transactions_reuse_connections_after_commit_and_abort() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = State {
@@ -96,6 +125,34 @@ mod tests {
             );
             state.call(operation, &json!([id])).unwrap();
         }
+    }
+
+    #[test]
+    fn busy_writers_wake_when_the_other_writer_ends() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("browser.sqlite");
+        let [mut first, mut second] = [0, 1].map(|_| State {
+            path: path.clone(),
+            ..State::default()
+        });
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        crate::host::Waker::install(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let id = first.call("begin", &json!(["a", "readwrite"])).unwrap()["id"].clone();
+        let seen = wakes.load(Ordering::Relaxed);
+        assert_eq!(
+            second.call("begin", &json!(["b", "readwrite"])).unwrap(),
+            json!({"busy":true})
+        );
+        first.call("commit", &json!([id])).unwrap();
+        assert!(wakes.load(Ordering::Relaxed) > seen);
+        assert!(second.call("begin", &json!(["b", "readwrite"])).unwrap()["id"].is_u64());
     }
 }
 impl Database {
@@ -196,10 +253,146 @@ impl Database {
     }
 }
 
+/// Writes an IndexedDB key as bytes whose order is the key order: numbers, dates, strings, binary, then arrays.
+/// Strings and binary use Firefox's code unit encoding, which never starts a unit with 0, so 0 ends them.
+fn encode_key(key: &Value, out: &mut Vec<u8>) -> Result<()> {
+    let unit = |out: &mut Vec<u8>, unit: u32| {
+        if unit < 0x7f {
+            out.push(unit as u8 + 1);
+        } else if unit < 0x407f {
+            out.extend(((unit - 0x7f + 0x8000) as u16).to_be_bytes());
+        } else {
+            out.extend(&((unit << 6) | 0xc0_0000).to_be_bytes()[1..]);
+        }
+    };
+    let invalid = || anyhow::anyhow!("Invalid IndexedDB key");
+    match key[0].as_u64() {
+        Some(tag @ (0 | 1)) => {
+            let number = match &key[1] {
+                Value::String(sign) if sign == "-" => f64::NEG_INFINITY,
+                Value::String(_) => f64::INFINITY,
+                value => value.as_f64().ok_or_else(invalid)?,
+            } + 0.;
+            let bits = number.to_bits();
+            let flip = if bits >> 63 == 1 { u64::MAX } else { 1 << 63 };
+            out.push(0x10 << tag);
+            out.extend((bits ^ flip).to_be_bytes());
+        }
+        Some(2) => {
+            out.push(0x30);
+            for code in key[1].as_str().ok_or_else(invalid)?.encode_utf16() {
+                unit(out, code.into());
+            }
+            out.push(0);
+        }
+        Some(3) => {
+            out.push(0x40);
+            for byte in key[1].as_array().ok_or_else(invalid)? {
+                unit(
+                    out,
+                    byte.as_u64()
+                        .filter(|byte| *byte < 256)
+                        .ok_or_else(invalid)? as u32,
+                );
+            }
+            out.push(0);
+        }
+        Some(4) => {
+            out.push(0x50);
+            for item in key[1].as_array().ok_or_else(invalid)? {
+                encode_key(item, out)?;
+            }
+            out.push(0);
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn decode_key(bytes: &[u8], at: &mut usize) -> Option<Value> {
+    let tag = *bytes.get(*at)?;
+    *at += 1;
+    let mut units = Vec::new();
+    if matches!(tag, 0x30 | 0x40) {
+        loop {
+            let first = *bytes.get(*at)?;
+            let (code, size) = match first {
+                0 => break,
+                1..=0x7f => (u32::from(first) - 1, 1),
+                0x80..=0xbf => {
+                    let pair = u16::from_be_bytes([first, *bytes.get(*at + 1)?]);
+                    (u32::from(pair) - 0x8000 + 0x7f, 2)
+                }
+                _ => {
+                    let triple =
+                        u32::from_be_bytes([0, first, *bytes.get(*at + 1)?, *bytes.get(*at + 2)?]);
+                    ((triple & 0x3f_ffff) >> 6, 3)
+                }
+            };
+            units.push(code);
+            *at += size;
+        }
+        *at += 1;
+    }
+    Some(match tag {
+        0x10 | 0x20 => {
+            let bits = u64::from_be_bytes(bytes.get(*at..*at + 8)?.try_into().ok()?);
+            *at += 8;
+            let flip = if bits >> 63 == 1 { 1 << 63 } else { u64::MAX };
+            let number = f64::from_bits(bits ^ flip);
+            let value = if number.is_infinite() {
+                json!(if number > 0. { "+" } else { "-" })
+            } else {
+                json!(number)
+            };
+            json!([tag >> 5, value])
+        }
+        0x30 => json!([
+            2,
+            String::from_utf16_lossy(&units.iter().map(|&unit| unit as u16).collect::<Vec<_>>())
+        ]),
+        0x40 => json!([3, units]),
+        0x50 => {
+            let mut items = Vec::new();
+            while *bytes.get(*at)? != 0 {
+                items.push(decode_key(bytes, at)?);
+            }
+            *at += 1;
+            json!([4, items])
+        }
+        _ => return None,
+    })
+}
+
+/// The stored form of an IndexedDB key: hex keeps the byte order in a TEXT column.
+fn hex_key(wire: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    encode_key(&serde_json::from_str(wire)?, &mut bytes)?;
+    Ok(bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                b"0123456789abcdef"[usize::from(byte >> 4)] as char,
+                b"0123456789abcdef"[usize::from(byte & 15)] as char,
+            ]
+        })
+        .collect())
+}
+
+fn wire_key(hex: Option<String>) -> Value {
+    let hex = hex.unwrap_or_default();
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|index| u8::from_str_radix(hex.get(index * 2..index * 2 + 2)?, 16).ok())
+        .collect();
+    decode_key(&bytes, &mut 0).unwrap_or(Value::Null)
+}
+
 type SessionKey = (String, u64);
 /// The values of a window's session storage, with their total size in bytes.
 type Session = (usize, BTreeMap<String, String>);
 static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
+/// Contexts whose IndexedDB transaction found the database busy, woken when a write transaction ends.
+static WAITING: Mutex<Vec<crate::host::Waker>> = Mutex::new(Vec::new());
 struct Transaction {
     database: Database,
     name: String,
@@ -317,7 +510,23 @@ impl State {
             database.query("PRAGMA synchronous=NORMAL", &[])?;
             database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name))",&[])?;
-            database.query("CREATE TABLE IF NOT EXISTS records (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
+            database.query("CREATE TABLE IF NOT EXISTS entries (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
+            // WARNING: older builds kept JSON keys in `records`, which SQL cannot order like IndexedDB.
+            if !database
+                .query("SELECT 1 FROM sqlite_master WHERE name='records'", &[])?
+                .is_empty()
+            {
+                database.query("BEGIN IMMEDIATE", &[])?;
+                let moved = database.query("SELECT db,store,key,value FROM records", &[]).and_then(|rows| {
+                    for row in rows {
+                        let [db, store, key, value] = [0, 1, 2, 3].map(|index| row[index].as_deref().unwrap_or_default());
+                        database.query("INSERT OR REPLACE INTO entries(db,store,key,value) VALUES(?,?,?,?)", &[db, store, &hex_key(key)?, value])?;
+                    }
+                    database.query("DROP TABLE records", &[])
+                });
+                database.query(if moved.is_ok() { "COMMIT" } else { "ROLLBACK" }, &[])?;
+                moved?;
+            }
             self.database = Some(database);
         }
         let db = self.database.as_ref().unwrap();
@@ -417,33 +626,47 @@ impl State {
             }
             "begin"=>{
                 let name=args[0].as_str().context("Expected database name")?.to_owned();let writable=args[1]!="readonly";
-                if self.transactions.values().any(|transaction| transaction.name == name) { return Ok(json!({"busy":true})); }
+                let busy=||{if let Ok(mut waiting)=WAITING.lock(){waiting.push(crate::host::Waker::current());}Ok(json!({"busy":true}))};
+                if self.transactions.values().any(|transaction| transaction.name == name) { return busy(); }
                 let database=match self.idle.pop(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
                 match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => {
                     if self.idle.len() < 4 { self.idle.push(database); }
-                    if error.to_string().contains("locked") { return Ok(json!({"busy":true})); } return Err(error); }}
+                    if error.to_string().contains("locked") { return busy(); } return Err(error); }}
                 self.next_id+=1;self.transactions.insert(self.next_id,Transaction{database,name,writable});Ok(json!({"id":self.next_id}))
             }
             "commit"|"abort"=>{
                 let id=args[0].as_u64().context("Expected transaction ID")?;
                 let transaction=self.transactions.remove(&id).context("Transaction is inactive")?;
-                transaction.database.query(if op=="commit"{"COMMIT"}else{"ROLLBACK"},&[])?;if self.idle.len() < 4 { self.idle.push(transaction.database); }Ok(Value::Null)
+                let ended=transaction.database.query(if op=="commit"{"COMMIT"}else{"ROLLBACK"},&[]);
+                if ended.is_ok() && self.idle.len() < 4 { self.idle.push(transaction.database); }
+                for waker in WAITING.lock().map(|mut waiting|std::mem::take(&mut *waiting)).unwrap_or_default() { waker.wake(); }
+                ended.map(|_|Value::Null)
             }
             "databases"=>Ok(json!(db.query("SELECT name,version FROM databases",&[])?.into_iter().map(|r|json!({"name":r[0],"version":r[1].as_deref().and_then(|v|v.parse::<u64>().ok())})).collect::<Vec<_>>())),
             _=>{
                 let id=args[0].as_u64().context("Expected transaction ID")?;let tx=self.transactions.get(&id).context("Transaction is inactive")?;
-                let store=args[1].as_str().unwrap_or("");let key=args[2].as_str().unwrap_or("");
-                if !matches!(op,"get"|"scan") {ensure!(tx.writable,"ReadOnlyError: transaction is readonly");}
+                let store=args[1].as_str().unwrap_or("");
+                if op!="scan" {ensure!(tx.writable,"ReadOnlyError: transaction is readonly");}
                 match op {
                     "version"=>{tx.database.query("INSERT INTO databases(name,version) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET version=excluded.version",&[&tx.name,&args[1].to_string()])?;},
                     "createStore"=>{tx.database.query("INSERT INTO stores(db,name,options) VALUES(?,?,?)",&[&tx.name,store,&args[2].to_string()])?;},
-                    "deleteStore"=>{tx.database.query("DELETE FROM records WHERE db=? AND store=?",&[&tx.name,store])?;tx.database.query("DELETE FROM stores WHERE db=? AND name=?",&[&tx.name,store])?;},
-                    "deleteDatabase"=>{tx.database.query("DELETE FROM records WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM stores WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM databases WHERE name=?",&[&tx.name])?;},
-                    "get"=>return Ok(json!(tx.database.query("SELECT value FROM records WHERE db=? AND store=? AND key=?",&[&tx.name,store,key])?.first().and_then(|r|r[0].as_ref()))),
-                    "scan"=>return Ok(json!(tx.database.query("SELECT key,value FROM records WHERE db=? AND store=?",&[&tx.name,store])?.into_iter().map(|r|json!([r[0],r[1]])).collect::<Vec<_>>())),
-                    "put"|"add"=>{let value=args[3].as_str().context("Expected record value")?;tx.database.query(if op=="put"{"INSERT INTO records(db,store,key,value) VALUES(?,?,?,?) ON CONFLICT(db,store,key) DO UPDATE SET value=excluded.value"}else{"INSERT INTO records(db,store,key,value) VALUES(?,?,?,?)"},&[&tx.name,store,key,value])?;},
-                    "delete"=>{tx.database.query("DELETE FROM records WHERE db=? AND store=? AND key=?",&[&tx.name,store,key])?;},
-                    "clear"=>{tx.database.query("DELETE FROM records WHERE db=? AND store=?",&[&tx.name,store])?;},
+                    "deleteStore"=>{tx.database.query("DELETE FROM entries WHERE db=? AND store=?",&[&tx.name,store])?;tx.database.query("DELETE FROM stores WHERE db=? AND name=?",&[&tx.name,store])?;},
+                    "deleteDatabase"=>{tx.database.query("DELETE FROM entries WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM stores WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM databases WHERE name=?",&[&tx.name])?;},
+                    "scan"|"delete"=>{
+                        // WARNING: stored keys never prefix each other, so a key with `00` appended is the smallest key above it.
+                        let bound=|index:usize,after:bool,end:&str|args[index].as_str().map_or(Ok(end.to_owned()),|key|hex_key(key).map(|mut hex|{if after{hex.push_str("00")}hex}));
+                        let (lower,upper)=(bound(2,args[4]==true,"")?,bound(3,args[5]!=true,"z")?);
+                        let range=[tx.name.as_str(),store,&lower,&upper];
+                        if op=="delete" {tx.database.query("DELETE FROM entries WHERE db=? AND store=? AND key>=? AND key<?",&range)?;return Ok(Value::Null);}
+                        let kind=args[8].as_str().unwrap_or("rows");
+                        if kind=="count" {return Ok(json!(tx.database.query("SELECT count(*) FROM entries WHERE db=? AND store=? AND key>=? AND key<?",&range)?.first().and_then(|row|row[0].as_deref()?.parse::<u64>().ok())));}
+                        let limit=args[7].as_u64().filter(|count|*count>0).map_or_else(||"-1".to_owned(),|count|count.to_string());
+                        let columns=match kind {"keys"=>"key","values"=>"value",_=>"key,value"};
+                        let rows=tx.database.query(&format!("SELECT {columns} FROM entries WHERE db=? AND store=? AND key>=? AND key<? ORDER BY key {} LIMIT ?",if args[6]==true{"DESC"}else{"ASC"}),&[&tx.name,store,&lower,&upper,&limit])?;
+                        return Ok(rows.into_iter().map(|mut row|match kind {"keys"=>wire_key(row[0].take()),"values"=>row[0].take().into(),_=>Value::Array(vec![wire_key(row[0].take()),row[1].take().into()])}).collect());
+                    }
+                    "put"|"add"=>{let (key,value)=(hex_key(args[2].as_str().context("Expected record key")?)?,args[3].as_str().context("Expected record value")?);tx.database.query(if op=="put"{"INSERT INTO entries(db,store,key,value) VALUES(?,?,?,?) ON CONFLICT(db,store,key) DO UPDATE SET value=excluded.value"}else{"INSERT INTO entries(db,store,key,value) VALUES(?,?,?,?)"},&[&tx.name,store,&key,value])?;},
+                    "clear"=>{tx.database.query("DELETE FROM entries WHERE db=? AND store=?",&[&tx.name,store])?;},
                     _=>bail!("Unknown browser storage operation: {op}"),
                 }Ok(Value::Null)
             }

@@ -189,11 +189,27 @@ pub(crate) fn view<'a>(
     })
 }
 
-pub(crate) fn input(
-    api: &crate::jsc::Api,
+/// Keeps the values that `input` borrowed bytes from alive until it drops.
+pub(crate) struct Roots<'a> {
+    api: &'a crate::jsc::Api,
+    ctx: crate::jsc::Ptr,
+    values: Vec<crate::jsc::Ptr>,
+}
+
+impl Drop for Roots<'_> {
+    fn drop(&mut self) {
+        for &value in &self.values {
+            unsafe { (self.api.unprotect)(self.ctx, value) };
+        }
+    }
+}
+
+/// The bytes of each item of array `values`. They stay valid while the returned `Roots` live.
+pub(crate) fn input<'a>(
+    api: &'a crate::jsc::Api,
     ctx: crate::jsc::Ptr,
     values: crate::jsc::Ptr,
-) -> Result<Vec<Bytes>> {
+) -> Result<(Vec<Bytes>, Roots<'a>)> {
     ensure!(
         unsafe { (api.value_type)(ctx, values) } == 5,
         "Invalid binary arguments"
@@ -212,18 +228,28 @@ pub(crate) fn input(
             && count.fract() == 0.,
         "Invalid binary arguments"
     );
-    let mut buffers = Vec::with_capacity(count as usize);
-    let mut total = 0usize;
+    // WARNING: reading an item can run a getter that drops and collects earlier items, and the call can run JavaScript too, so all items are read and protected before any bytes are borrowed.
+    let mut roots = Roots {
+        api,
+        ctx,
+        values: Vec::with_capacity(count as usize),
+    };
     for index in 0..count as u32 {
         let value = unsafe { (api.get_index)(ctx, values, index, &mut error) };
         ensure!(error.is_null(), "Expected typed bytes");
+        unsafe { (api.protect)(ctx, value) };
+        roots.values.push(value);
+    }
+    let mut buffers = Vec::with_capacity(count as usize);
+    let mut total = 0usize;
+    for &value in &roots.values {
         let bytes = view(api, ctx, value)?;
         total += bytes.len();
         ensure!(total <= 1 << 31, "Binary arguments are too large");
         // WARNING: these borrow the arguments of the running call, so callers that keep them must copy them first.
         buffers.push(Bytes::from_static(bytes));
     }
-    Ok(buffers)
+    Ok((buffers, roots))
 }
 
 pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {

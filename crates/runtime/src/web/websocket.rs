@@ -43,43 +43,69 @@ async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     written: Arc<AtomicUsize>,
     wake: crate::host::Waker,
 ) -> Result<()> {
-    let (mut writer, mut reader) = socket.split();
-    loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { break };
-                let size = command.len();
-                writer.send(command).await?;
-                written.fetch_add(size, Ordering::Relaxed);
-                // WARNING: `bufferedAmount` only needs a wake once the queue drains; ticks read the count meanwhile.
-                if commands.is_empty() {
+    let (writer, mut reader) = socket.split();
+    let writer = tokio::sync::Mutex::new(writer);
+    // WARNING: reads go on while a send waits for the peer, so both sides can stream at once.
+    let read = async {
+        while let Some(message) = reader.next().await {
+            let event = match message? {
+                Message::Text(text) => json!({"kind":"message","text":text.as_str()}).into(),
+                Message::Binary(bytes) => crate::jsc::payload::Payload::with_bytes(
+                    json!({"kind":"message"}),
+                    "bytes",
+                    bytes,
+                ),
+                Message::Close(frame) => {
+                    let (code, reason) = frame
+                        .map(|f| (u16::from(f.code), f.reason.to_string()))
+                        .unwrap_or((1005, String::new()));
+                    let _ = writer.lock().await.close().await;
+                    let _ = events
+                        .send(
+                            json!({"kind":"close","code":code,"reason":reason,"clean":true}).into(),
+                        )
+                        .await;
                     wake.wake();
+                    return Ok(());
                 }
+                _ => continue,
+            };
+            if events.send(event).await.is_err() {
+                return Ok(());
             }
-            message = reader.next() => {
-                let Some(message) = message else {
-                    let _ = events.send(json!({"kind":"close","code":1006,"reason":"","clean":false}).into()).await;
-                    wake.wake();
-                    break;
-                };
-                let event = match message? {
-                    Message::Text(text) => json!({"kind":"message","text":text.as_str()}).into(),
-                    Message::Binary(bytes) => crate::jsc::payload::Payload::with_bytes(json!({"kind":"message"}), "bytes", bytes),
-                    Message::Close(frame) => {
-                        let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1005,String::new()));
-                        let _ = writer.close().await;
-                        let _ = events.send(json!({"kind":"close","code":code,"reason":reason,"clean":true}).into()).await;
-                        wake.wake();
-                        break;
-                    }
-                    _ => continue,
-                };
-                if events.send(event).await.is_err() { break; }
+            wake.wake();
+        }
+        let _ = events
+            .send(json!({"kind":"close","code":1006,"reason":"","clean":false}).into())
+            .await;
+        wake.wake();
+        Ok(())
+    };
+    let write = async {
+        while let Some(command) = commands.recv().await {
+            let (size, closing) = (command.len(), command.is_close());
+            writer.lock().await.send(command).await?;
+            written.fetch_add(size, Ordering::Relaxed);
+            // WARNING: `bufferedAmount` only needs a wake once the queue drains; ticks read the count meanwhile.
+            if commands.is_empty() {
                 wake.wake();
             }
+            if closing {
+                // WARNING: a peer that never answers the close frame would keep the socket CLOSING forever.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let _ = events
+                    .send(json!({"kind":"close","code":1006,"reason":"","clean":false}).into())
+                    .await;
+                wake.wake();
+                break;
+            }
         }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        result = read => result,
+        result = write => result,
     }
-    Ok(())
 }
 
 fn limits() -> WebSocketConfig {

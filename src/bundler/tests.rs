@@ -327,8 +327,9 @@ fn html_and_css_images_become_bundled_assets() {
     let assets: std::collections::BTreeMap<String, PathBuf> =
         serde_json::from_str(&files["assets.json"]).unwrap();
     assert_eq!(assets.len(), 5);
-    let logo = asset_name(&dir.path().join("img/logo.png").canonicalize().unwrap()).unwrap();
-    let icon = asset_name(&dir.path().join("img/icon.svg").canonicalize().unwrap()).unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let logo = asset_name(&root, &root.join("img/logo.png")).unwrap();
+    let icon = asset_name(&root, &root.join("img/icon.svg")).unwrap();
     assert!(logo.starts_with("assets/") && logo.ends_with(".png"));
     assert_eq!(
         assets[&icon],
@@ -337,7 +338,7 @@ fn html_and_css_images_become_bundled_assets() {
     let page = &files["page-0.html"];
     assert_eq!(page.matches(&format!("apps:///{logo}")).count(), 3);
     for name in ["clip.mp4", "clip.webm", "tone.mp3"] {
-        let media = asset_name(&dir.path().join("img").join(name).canonicalize().unwrap()).unwrap();
+        let media = asset_name(&root, &root.join("img").join(name)).unwrap();
         assert!(page.contains(&format!("src=\"apps:///{media}\"")), "{page}");
     }
     assert!(page.contains(&format!("url(\"apps:///{icon}\")")));
@@ -1533,9 +1534,8 @@ fn import_meta_url_preserves_non_utf8_paths() {
     use std::os::unix::ffi::OsStrExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let entry = dir
-        .path()
-        .join(std::ffi::OsStr::from_bytes(b"module-\xff.js"));
+    let base = dir.path().canonicalize().unwrap();
+    let entry = base.join(std::ffi::OsStr::from_bytes(b"module-\xff.js"));
     for production in [false, true] {
         let files = compile(
             &entry,
@@ -1560,7 +1560,7 @@ fn import_meta_url_preserves_non_utf8_paths() {
             } else {
                 format!(
                     "{}module-%FF.js",
-                    url::Url::from_directory_path(dir.path()).unwrap()
+                    url::Url::from_directory_path(&base).unwrap()
                 )
             },
         );
@@ -2200,7 +2200,7 @@ fn resolves_dotted_files_package_imports_browser_fields_and_type_only_imports() 
             None,
             &mut Vec::new(),
             &Rc::default(),
-            false
+            &Shared::default()
         )
         .is_err()
     );
@@ -2935,4 +2935,187 @@ fn http_imports_download_with_the_feature() {
             format!("42 {origin}/lib/a.js")
         );
     }
+}
+
+#[test]
+fn classic_scripts_share_the_global_scope_and_run_before_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("app");
+    for folder in ["web/vendor", "src"] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    for (name, source) in [
+        (
+            "web/vendor/lib.umd.js",
+            "(function (root, factory) { if (typeof module === 'object' && module.exports) module.exports = factory(); else root.Lib = factory(); })(this, function () { return { answer: 42 }; });",
+        ),
+        (
+            "web/a.js",
+            "function helper() { return 'helper'; } var shared = 1; implicit = 2;",
+        ),
+        (
+            "web/b.js",
+            "if (helper() !== 'helper' || shared !== 1 || implicit !== 2 || this !== globalThis || Lib.answer !== 42 || (function () { return this; })() !== globalThis) throw Error('classic'); try { eval('1'); throw Error('eval'); } catch (error) { if (!(error instanceof EvalError)) throw error; } order.push('classic');",
+        ),
+        (
+            "src/main.ts",
+            "const order: string[] = (globalThis as any).order; if (order.join() !== 'inline,classic') throw Error('module ' + order); order.push('module');",
+        ),
+        ("web/deferred.js", "order.push('deferred');"),
+        ("web/style.css", "@import '/web/base.css';"),
+        ("web/base.css", "#color { color: rgb(1, 2, 3) }"),
+        ("web/alt.css", "#color { color: rgb(9, 9, 9) }"),
+    ] {
+        fs::write(root.join(name), source).unwrap();
+    }
+    fs::write(dir.path().join("outside.js"), "").unwrap();
+    fs::write(root.join("web/index.html"), r#"<link rel="Preload  Stylesheet" href="/web/style.css"><link rel="alternate stylesheet" href="/web/alt.css"><p id="color">x</p><script type="module" src="/src/main.ts"></script><script>globalThis.order = ['inline'];</script><script src="vendor/lib.umd.js"></script><script src="a.js"></script><script src="b.js"></script><script nomodule>throw Error('nomodule');</script><script defer src="deferred.js"></script><script type="module">if (order.join() !== 'inline,classic,module,deferred' || getComputedStyle(document.getElementById('color')).color !== 'rgb(1, 2, 3)') throw Error('order ' + order);</script>"#).unwrap();
+    let entry = root.join("main.ts");
+    fs::write(&entry, "import {app, BrowserWindow} from '@pierre/apps'; app.whenReady().then(() => new BrowserWindow().loadFile(import.meta.resolve('./web/index.html')));").unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        assert!(!files.values().any(|file| file.contains("nomodule')")));
+        assert_eq!(
+            apps_runtime::desktop::Desktop::new(&files)
+                .unwrap()
+                .check()
+                .unwrap(),
+            0,
+            "production={production}"
+        );
+    }
+    fs::write(
+        root.join("web/index.html"),
+        r#"<script src="/../outside.js"></script>"#,
+    )
+    .unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
+    assert!(
+        error.to_string().contains("outside the app folder"),
+        "{error}"
+    );
+}
+
+#[test]
+fn exports_fall_back_to_the_next_condition_and_module_bindings_are_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let modules = dir.path().join("node_modules");
+    fs::create_dir_all(modules.join("fallback")).unwrap();
+    fs::create_dir_all(modules.join("consumer")).unwrap();
+    for (path, source) in [
+        (
+            "fallback/package.json",
+            r#"{"exports":{".":{"node":{"import":"./a.mjs"},"default":"./b.cjs"}}}"#,
+        ),
+        ("fallback/a.mjs", "export default 'a';"),
+        ("fallback/b.cjs", "module.exports = 'b';"),
+        ("consumer/package.json", r#"{"main":"index.js"}"#),
+        ("consumer/index.js", "module.exports = require('fallback');"),
+    ] {
+        fs::write(modules.join(path), source).unwrap();
+    }
+    let entry = dir.path().join("app.js");
+    fs::write(&entry, "import a from 'fallback'; import b from 'consumer'; const plugins = [{exports: new Set([1, 2])}]; let size = 0; for (const module of plugins) size += module.exports.size; globalThis.result = [a, b, size].join(':');").unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        let engine = apps_runtime::jsc::Engine::new(
+            apps_runtime::jsc::Api::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.bundle(&files, "app.js").unwrap();
+        assert_eq!(engine.eval("result", "test").unwrap(), "a:b:2");
+    }
+}
+
+#[test]
+fn import_meta_filename_and_dirname_follow_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let entry = root.join("app.js");
+    fs::write(&entry, "globalThis.result = typeof import.meta.filename === 'string' ? JSON.stringify([import.meta.filename === globalThis.__apps.url.fileURLToPath(import.meta.url), import.meta.dirname === globalThis.__apps.path.dirname(import.meta.filename), import.meta.filename]) : typeof import.meta.dirname;").unwrap();
+    for production in [false, true] {
+        for (realm, role) in [
+            (Realm::Main, apps_runtime::host::Role::Main),
+            (Realm::Preload, apps_runtime::host::Role::Preload(1)),
+            (Realm::Renderer, apps_runtime::host::Role::Renderer(1)),
+        ] {
+            let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
+            let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
+            host.borrow_mut().pages.insert(
+                1,
+                apps_runtime::host::Page {
+                    doc: Document::parse("<body></body>"),
+                    dirty: false,
+                },
+            );
+            let engine =
+                apps_runtime::jsc::Engine::new(apps_runtime::jsc::Api::load().unwrap(), host, role)
+                    .unwrap();
+            engine.bundle(&files, "app.js").unwrap();
+            let result = engine.eval("result", "test").unwrap();
+            let expected = match realm {
+                Realm::Renderer => "undefined".to_owned(),
+                _ if production => result.clone(),
+                _ => json!([true, true, entry]).to_string(),
+            };
+            assert_eq!(result, expected, "production={production}, realm={realm:?}");
+            assert!(
+                realm == Realm::Renderer || result.starts_with("[true,true,"),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("img")).unwrap();
+    fs::create_dir_all(root.join("web")).unwrap();
+    fs::write(root.join("img/a.png"), b"a").unwrap();
+    fs::write(root.join("img/b.png"), b"b").unwrap();
+    let a = asset_name(&root, &root.join("img/a.png")).unwrap();
+    let b = asset_name(&root, &root.join("img/b.png")).unwrap();
+    assert_eq!(a, "assets/5e9e943b2565fff5.png");
+    assert_eq!(
+        asset_name(Path::new("/elsewhere"), Path::new("/elsewhere/img/a.png")).unwrap(),
+        a
+    );
+    assert_eq!(
+        app_relative(
+            Path::new("/repo/app"),
+            Path::new("/repo/packages/a/index.js")
+        ),
+        Path::new("../packages/a/index.js")
+    );
+    let css = urls(
+        "/* url( */ .a{background:URL( '../img/a.png' )} .b::after{content:'url('} .c{background:url(../img/b.png)}",
+        &root.join("web"),
+        &Rc::default(),
+        &root,
+    );
+    assert_eq!(
+        css,
+        format!(
+            "/* url( */ .a{{background:URL(\"apps:///{a}\")}} .b::after{{content:'url('}} .c{{background:url(\"apps:///{b}\")}}"
+        )
+    );
+    fs::write(root.join("web/index.html"), r#"<img srcset="../img/a.png 1x,../img/b.png, data:image/png;base64,AA== 3x"><picture><source srcset=" ../img/b.png 2x"></picture>"#).unwrap();
+    let entry = root.join("app.js");
+    fs::write(
+        &entry,
+        "console.log(import.meta.resolve('./web/index.html'));",
+    )
+    .unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+    let page = &files["page-0.html"];
+    assert!(
+        page.contains(&format!(
+            "srcset=\"apps:///{a} 1x,apps:///{b}, data:image/png;base64,AA== 3x\""
+        )) && page.contains(&format!("srcset=\" apps:///{b} 2x\"")),
+        "{page}"
+    );
 }

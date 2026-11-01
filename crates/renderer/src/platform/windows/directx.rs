@@ -3,7 +3,7 @@
 
 use crate::{
     DevicePixels, Rgba, Size,
-    atlas::{Atlas, AtlasBackend, Packer, TextureList},
+    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
     frame::{Cmd, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -622,13 +622,12 @@ impl Renderer {
     fn encode(&mut self, frame: &RenderFrame) -> Result<()> {
         let gpu = &*self.gpu;
         let context = &gpu.context;
-        self.pool.truncate(frame.textures.len());
         for (index, size) in frame.textures.iter().enumerate() {
-            if self
-                .pool
-                .get(index)
-                .is_some_and(|layer| layer.size == *size)
+            if let Some(found) = self.pool[index..]
+                .iter()
+                .position(|layer| layer.size == *size)
             {
+                self.pool.swap(index, index + found);
                 continue;
             }
             let desc = D3D11_TEXTURE2D_DESC {
@@ -656,18 +655,16 @@ impl Renderer {
                 gpu.device
                     .CreateShaderResourceView(texture, None, Some(&mut srv))?;
             }
-            let layer = Layer {
+            self.pool.push(Layer {
                 texture: texture.context("missing layer texture")?,
                 view,
                 srv,
                 size: *size,
-            };
-            if index < self.pool.len() {
-                self.pool[index] = layer;
-            } else {
-                self.pool.push(layer);
-            }
+            });
+            let last = self.pool.len() - 1;
+            self.pool.swap(index, last);
         }
+        self.pool.truncate(frame.textures.len());
         let views = [
             gpu.upload(QUADS, bytes(&frame.quads), size_of::<crate::scene::Quad>())?,
             gpu.upload(
@@ -969,7 +966,7 @@ impl AtlasBackend for AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let side = |value: i32| value.clamp(1024, self.max);
+                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, self.max);
                 let texture_size = Size::new(
                     DevicePixels(side(size.width.0)),
                     DevicePixels(side(size.height.0)),
@@ -1057,8 +1054,7 @@ impl AtlasBackend for AtlasTextures {
             .and_then(Option::as_mut)
             .is_some_and(|texture| texture.packer.free(tile.tile_id));
         if empty {
-            list.textures[index] = None;
-            list.free.push(index);
+            list.emptied(index, |texture| texture.packer.is_empty());
         }
     }
 }

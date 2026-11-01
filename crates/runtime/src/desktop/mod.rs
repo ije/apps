@@ -536,11 +536,19 @@ impl Desktop {
                                 eprintln!("apps: page script: {error:#}");
                             }
                         }
-                        if let Some(preload) = &preload
-                            && let Err(error) = preload
-                                .eval("dispatchEvent(new Event('DOMContentLoaded'))", "apps:ready")
-                        {
-                            eprintln!("apps: preload script: {error:#}");
+                        if let Some(preload) = &preload {
+                            let ready = || {
+                                preload.eval(
+                                    "dispatchEvent(new Event('DOMContentLoaded'))",
+                                    "apps:ready",
+                                )
+                            };
+                            if let Err(error) = match cx.as_deref_mut() {
+                                Some(cx) => crate::render::scripted(cx, None, ready),
+                                None => ready(),
+                            } {
+                                eprintln!("apps: preload script: {error:#}");
+                            }
                         }
                         view.preload = preload;
                         view.renderer = Some(renderer);
@@ -585,8 +593,12 @@ impl Desktop {
                             self.host.borrow_mut().dom.remove(&id);
                             self.host.borrow_mut().bridge.remove(&id);
                             crate::web::storage::forget(id);
-                            self.main
-                                .eval(&format!("__appsEvent('closed',{id})"), "apps:closed")?;
+                            if let Err(error) = self
+                                .main
+                                .eval(&format!("__appsEvent('closed',{id})"), "apps:closed")
+                            {
+                                eprintln!("apps: {error}");
+                            }
                         }
                     }
                     "capture" => {
@@ -940,8 +952,12 @@ impl Desktop {
                     }
                     for (node, event) in events {
                         if let Some(renderer) = &view.renderer
-                            && let Err(error) = renderer
-                                .eval(&format!("__appsFrameEvent({node},{event})"), "apps:iframe")
+                            && let Err(error) = crate::render::scripted(cx, None, || {
+                                renderer.eval(
+                                    &format!("__appsFrameEvent({node},{event})"),
+                                    "apps:iframe",
+                                )
+                            })
                         {
                             eprintln!("apps: page script: {error:#}");
                         }
@@ -965,10 +981,10 @@ impl Desktop {
             ) {
                 if let Ok(next) = engine
                     .call("__appsDelay", &[])
-                    .map(|next| next.parse().unwrap_or(-1))
-                    && next >= 0
+                    .map(|next| next.parse::<f64>().unwrap_or(-1.))
+                    && next >= 0.
                 {
-                    delay = delay.min(next);
+                    delay = delay.min(next.ceil() as i64);
                 }
             }
             for (&id, view) in &app.views {
@@ -1012,15 +1028,7 @@ impl Desktop {
         }
         match result {
             Ok(Some(delay)) => {
-                // WARNING: JS timers are due when `Date.now()` reaches a whole millisecond, so wake at that boundary, not up to 1 ms after it.
-                let wait = Duration::from_millis(delay).saturating_sub(Duration::from_nanos(
-                    u64::from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos(),
-                    ) % 1_000_000,
-                ));
+                let wait = Duration::from_millis(delay);
                 let at = Instant::now() + wait;
                 let mut app = runtime.borrow_mut();
                 // WARNING: a replaced timer stays registered until it fires, so keep the armed one unless the new deadline is earlier.
@@ -1695,6 +1703,49 @@ mod tests {
             .commands
             .push(serde_json::json!({"op":"window","args":["title",2,"stale"]}));
         desktop.pump(None, None).unwrap();
+    }
+
+    #[test]
+    fn pages_cannot_settle_other_windows_and_closed_errors_never_quit() {
+        let code = r#"
+            const {app, BrowserWindow} = __apps;
+            globalThis.log = [];
+            process.on('uncaughtException', error => log.push(error.message));
+            app.on('window-all-closed', () => log.push('all-closed'));
+            app.whenReady().then(() => {
+                globalThis.a = new BrowserWindow({title: 'a\ud83d'});
+                globalThis.b = new BrowserWindow();
+                a.load('<p>a</p>');
+                b.load('<p>b</p>');
+                a.on('closed', () => { throw new Error('closed failed'); });
+            });
+        "#;
+        let mut desktop = app(code, &[], std::path::PathBuf::new());
+        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        eval(
+            &desktop,
+            "globalThis.results = []; for (const contents of [a.webContents, a.webContents]) contents.executeJavaScript('new Promise(() => {})').then(value => results.push(value)); a.webContents.capturePage().then(value => results.push(typeof value), error => results.push(error.message))",
+        );
+        desktop.pump(None, None).unwrap();
+        let page = |id: u64| desktop.views[&id].renderer.clone().unwrap();
+        page(2)
+            .eval("__appsExecuted(1, 'forged', false)", "test")
+            .unwrap();
+        page(1)
+            .eval("__appsExecuted(3, 'capture', false)", "test")
+            .unwrap();
+        page(1).eval("__appsExecuted(2, 'own', false)", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        desktop.main.tick().unwrap();
+        assert_eq!(eval(&desktop, "results.join()"), "own");
+        assert_eq!(eval(&desktop, "a.getTitle()"), "a\u{fffd}");
+        eval(&desktop, "a.close(); b.close()");
+        desktop.pump(None, None).unwrap();
+        assert_eq!(
+            eval(&desktop, "log.join('|')"),
+            "closed failed|all-closed"
+        );
+        assert!(!desktop.quit);
     }
 
     #[test]

@@ -41,7 +41,7 @@
   deref: ref => ref.deref(),
   freeze: Object.freeze,
   seal: Object.seal,
-  buffer: buffer => new Uint8Array(buffer),
+  buffer: buffer => globalThis.Buffer ? Buffer.from(buffer) : new Uint8Array(buffer),
   typed: (type, buffer, offset, length) => new ([Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array][type])(buffer, offset, length),
   dataview: (buffer, offset, length) => new DataView(buffer, offset, length),
   date: value => new Date(value),

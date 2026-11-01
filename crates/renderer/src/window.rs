@@ -628,7 +628,13 @@ impl Window {
             self.next.clear();
             self.scene.clear();
             self.next_hitbox = 0;
-            self.next_states.clear();
+            if self.redraw[1] {
+                // WARNING: the first pass moved its states out of `states`, so they go back for this one.
+                let states = mem::take(&mut self.next_states);
+                self.states.extend(states);
+            } else {
+                self.next_states.clear();
+            }
             if let Some(layout) = &mut self.layout {
                 layout.begin_frame(self.scale_factor, self.text_system.generation());
             }
@@ -652,12 +658,14 @@ impl Window {
                 root.paint(self);
             }
             self.drawing = false;
-            if mem::take(&mut self.redraw[0]) && !self.redraw[1] {
+            let again = mem::take(&mut self.redraw[0]);
+            if again && !self.redraw[1] {
                 self.redraw[1] = true;
                 continue;
             }
-            if mem::take(&mut self.redraw[1]) {
-                self.redraw[0] = false;
+            self.redraw[1] = false;
+            if again {
+                self.refresh();
             }
             break;
         }
@@ -695,6 +703,7 @@ impl Window {
             return false;
         }
         self.drawing = true;
+        let mut again = false;
         for _ in 0..2 {
             self.next.clear();
             self.next_hitbox = 0;
@@ -718,11 +727,15 @@ impl Window {
             // WARNING: the next draw starts from `states`, so states taken by this pass go back there.
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
-            if !mem::take(&mut self.redraw[0]) {
+            again = mem::take(&mut self.redraw[0]);
+            if !again {
                 break;
             }
         }
         self.drawing = false;
+        if again {
+            self.refresh();
+        }
         true
     }
 

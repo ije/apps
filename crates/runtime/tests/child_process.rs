@@ -292,6 +292,23 @@ fn child_output_applies_backpressure() {
     "#);
 }
 
+#[cfg(unix)]
+#[test]
+fn destroyed_child_output_closes_the_pipe() {
+    run(r#"
+        const { spawn } = __apps.child_process;
+        const child = spawn('yes'), closed = __apps.events.once(child, 'close');
+        for await (const chunk of child.stdout) break;
+        const [code, signal] = await closed;
+        if (code !== null || signal !== 'SIGPIPE' || !child.stdout.destroyed) throw Error(`Closed with ${code} ${signal}`);
+        const paused = spawn('/bin/sh', ['-c', 'exec head -c 1048576 /dev/zero']);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        paused.stdout.destroy();
+        const [status, killed] = await __apps.events.once(paused, 'close');
+        if (status !== null || killed !== 'SIGPIPE') throw Error(`Paused output closed with ${status} ${killed}`);
+    "#);
+}
+
 #[test]
 fn synchronous_children_honor_stdio_modes() {
     run(

@@ -1,6 +1,6 @@
 use crate::{
     DevicePixels, Size,
-    atlas::{Atlas, AtlasBackend, Packer, TextureList},
+    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
     frame::{Cmd, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -712,13 +712,12 @@ impl Renderer {
     /// Uploads the frame's globals and instances, and returns a bind group for each instance array.
     fn prepare(&mut self, frame: &RenderFrame) -> Result<[wgpu::BindGroup; 7]> {
         let gpu = &self.gpu;
-        self.pool.truncate(frame.textures.len());
         for (index, size) in frame.textures.iter().enumerate() {
-            if self
-                .pool
-                .get(index)
-                .is_some_and(|(texture, _)| [texture.width(), texture.height()] == *size)
+            if let Some(found) = self.pool[index..]
+                .iter()
+                .position(|(texture, _)| [texture.width(), texture.height()] == *size)
             {
+                self.pool.swap(index, index + found);
                 continue;
             }
             let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -739,12 +738,11 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
-            if index < self.pool.len() {
-                self.pool[index] = (texture, view);
-            } else {
-                self.pool.push((texture, view));
-            }
+            self.pool.push((texture, view));
+            let last = self.pool.len() - 1;
+            self.pool.swap(index, last);
         }
+        self.pool.truncate(frame.textures.len());
 
         // One globals entry for the window, then one for each offscreen layer.
         let stride = self.globals_stride as usize;
@@ -1131,7 +1129,7 @@ impl AtlasTextures {
             Some(hit) => hit,
             None => {
                 let max = self.gpu.device.limits().max_texture_dimension_2d as i32;
-                let side = |value: i32| value.clamp(1024, max);
+                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, max);
                 let texture_size = Size::new(
                     DevicePixels(side(size.width.0)),
                     DevicePixels(side(size.height.0)),
@@ -1257,8 +1255,7 @@ impl AtlasBackend for AtlasTextures {
             .and_then(Option::as_mut)
             .is_some_and(|texture| texture.packer.free(tile.tile_id));
         if empty {
-            list.textures[index] = None;
-            list.free.push(index);
+            list.emptied(index, |texture| texture.packer.is_empty());
         }
     }
 }

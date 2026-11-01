@@ -119,8 +119,8 @@ pub(super) struct DomBox {
     pub(super) units: style::Lengths,
     /// The subtree revision to record with the bounds.
     pub(super) revision: u64,
-    /// The horizontal padding and borders.
-    pub(super) sides: f32,
+    /// The horizontal and vertical padding and borders.
+    pub(super) sides: [f32; 2],
     /// The margins after collapsing.
     pub(super) margin: [f32; 4],
     /// The size of the grid cell the box fills, before layout snaps it to pixels.
@@ -303,10 +303,11 @@ impl renderer::Element for DomBox {
             {
                 let mut host = view.host.borrow_mut();
                 let dom = host.dom.entry(view.id).or_default();
+                // WARNING: grid tracks are sized before transforms, so they compare with the untransformed box.
                 if let Some(axes) = dom.flexed_grids.get(&self.id)
                     && axes
                         .iter()
-                        .zip([window_bounds.size.width, window_bounds.size.height])
+                        .zip([bounds.size.width, bounds.size.height])
                         .any(|(axis, size)| {
                             axis.is_some_and(|(used, extent)| {
                                 let gap = (f32::from(size) - extent - used).abs();
@@ -349,22 +350,37 @@ impl renderer::Element for DomBox {
                     ]),
                     self.margin,
                 );
-                cull.widths.insert(self.id, width - self.sides);
+                cull.widths.insert(
+                    self.id,
+                    [
+                        width - self.sides[0],
+                        f32::from(bounds.size.height) - self.sides[1],
+                    ],
+                );
                 if let Some(grid) = self.grid {
-                    let baselines = window.layout_baselines(*id).map(|value| value.map(f32::from));
+                    let baselines = window
+                        .layout_baselines(*id)
+                        .map(|value| value.map(f32::from));
                     if dom.baselines.insert(self.id, baselines) != Some(baselines) {
                         dom.grids.remove(&grid);
                         window.redraw();
                     }
                 }
             }
-            if let Some((browser, _)) = view.browsers.borrow().get(&self.id) {
-                let _ = browser.set_bounds([
-                    f32::from(window_bounds.origin.x) as f64,
-                    f32::from(window_bounds.origin.y) as f64,
-                    f32::from(window_bounds.size.width) as f64,
-                    f32::from(window_bounds.size.height) as f64,
-                ]);
+            if let Some((browser, _)) = view.browsers.borrow().get(&self.id)
+                && let Some((set, _)) = view.frames.borrow_mut().get_mut(&self.id)
+            {
+                let bounds = [
+                    window_bounds.origin.x,
+                    window_bounds.origin.y,
+                    window_bounds.size.width,
+                    window_bounds.size.height,
+                ]
+                .map(|value| f32::from(value) as f64);
+                if *set != bounds {
+                    *set = bounds;
+                    let _ = browser.set_bounds(bounds);
+                }
             }
             window.with_element_offset(offset, |window| {
                 inner.prepaint(window);

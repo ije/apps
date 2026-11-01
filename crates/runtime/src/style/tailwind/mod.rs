@@ -1570,6 +1570,8 @@ struct Config {
     cleared: Vec<String>,
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
+    /// The `@utility` rules being expanded, by index.
+    expanding: std::cell::RefCell<Vec<usize>>,
     /// `Some(preflight)` when a sheet imports Tailwind, `None` with only `@reference`.
     import: Option<bool>,
     classes: FxHashMap<String, bool>,
@@ -1601,9 +1603,12 @@ impl Compiler {
         doc: &Document,
         order: &[usize],
     ) -> Option<Update<'_>> {
-        let index = sheets
-            .iter()
-            .position(|sheet| sheet.0.iter().any(|rule| matches!(rule, Rule::Tailwind(_))))?;
+        let index = sheets.iter().position(|sheet| {
+            sheet
+                .0
+                .iter()
+                .any(|rule| matches!(**rule, Rule::Tailwind(_)))
+        })?;
         let same = |list: &Vec<Rc<Stylesheet>>| {
             list.len() == sheets.len()
                 && list
@@ -1623,14 +1628,14 @@ impl Compiler {
                     .flat_map(|sheet| &sheet.0)
                     .filter(|rule| {
                         matches!(
-                            rule,
+                            ***rule,
                             Rule::Tailwind(_)
                                 | Rule::Theme(..)
                                 | Rule::Variant(..)
                                 | Rule::Utility(..)
                         )
                     })
-                    .map(Rule::source)
+                    .map(|rule| rule.source())
                     .collect();
                 let at = self
                     .0
@@ -1665,7 +1670,7 @@ impl Config {
             ..Self::default()
         };
         for rule in sheets.iter().flat_map(|sheet| &sheet.0) {
-            match rule {
+            match &**rule {
                 Rule::Tailwind(Some(preflight)) => {
                     config.import = Some(config.import == Some(true) || *preflight);
                 }
@@ -1754,7 +1759,8 @@ impl Config {
                     if let Some(compiled) = compiled {
                         let css = css(&compiled.rules);
                         used.push_str(&css);
-                        fresh.push((compiled.sort, Stylesheet::parse(&css).0));
+                        let rules = Stylesheet::parse(&css).0.into_iter();
+                        fresh.push((compiled.sort, rules.map(Rc::unwrap_or_clone).collect()));
                     }
                 }
             }
@@ -1772,7 +1778,10 @@ impl Config {
                 continue;
             }
             let rules = self.apply(&sheet.0, None, &mut used);
-            let applied = rules.map_or_else(|| sheet.clone(), |rules| Rc::new(Stylesheet(rules)));
+            let applied = rules.map_or_else(
+                || sheet.clone(),
+                |rules| Rc::new(Stylesheet(rules.into_iter().map(Rc::new).collect())),
+            );
             for rule in &applied.0 {
                 used.push_str(&rule.source());
             }
@@ -2020,10 +2029,16 @@ impl Config {
 
     /// Expands `@apply`, `@variant` and Tailwind's functions in `rules`; `None` when nothing
     /// changed. Generated CSS is added to `used`.
-    fn apply(&self, rules: &[Rule], parent: Option<&str>, used: &mut String) -> Option<Vec<Rule>> {
+    fn apply<R: std::borrow::Borrow<Rule>>(
+        &self,
+        rules: &[R],
+        parent: Option<&str>,
+        used: &mut String,
+    ) -> Option<Vec<Rule>> {
         let mut changed = false;
         let mut result = Vec::with_capacity(rules.len());
         for rule in rules {
+            let rule = rule.borrow();
             let rewritten = match rule {
                 Rule::Style(selectors, children) => {
                     let base: Vec<_> = selectors
@@ -2080,12 +2095,20 @@ impl Config {
                     }
                     used.push_str(&extra);
                     let mut rules = vec![Rule::Declarations(Declarations(declarations))];
-                    rules.extend(Stylesheet::parse(&extra).0);
+                    rules.extend(
+                        Stylesheet::parse(&extra)
+                            .0
+                            .into_iter()
+                            .map(Rc::unwrap_or_clone),
+                    );
                     Some(rules)
                 }
                 Rule::Variant(name, body) if parent.is_some() && body.starts_with('{') => {
                     let base = parent.unwrap_or_default();
-                    let body = &body[1..body.len() - 1];
+                    let body = body
+                        .strip_prefix('{')
+                        .and_then(|body| body.strip_suffix('}'))
+                        .unwrap_or_default();
                     let mut css = String::new();
                     let branches = self.variant(name, 0).map(|(_, variant)| variant.branches);
                     for (at, selector) in branches.into_iter().flatten() {
@@ -2097,7 +2120,11 @@ impl Config {
                         let _ = write!(css, "{selector}{{{body}}}");
                         css.push_str(&"}".repeat(at.len()));
                     }
-                    let parsed = Stylesheet::parse(&css).0;
+                    let parsed: Vec<_> = Stylesheet::parse(&css)
+                        .0
+                        .into_iter()
+                        .map(Rc::unwrap_or_clone)
+                        .collect();
                     Some(self.apply(&parsed, None, used).unwrap_or(parsed))
                 }
                 Rule::Media(queries, children) => self
@@ -2150,6 +2177,9 @@ impl Config {
         let mut branches = vec![(Vec::<String>::new(), vec![base.to_owned()])];
         let mut ranks = Vec::new();
         let mut content = false;
+        // WARNING: each variant multiplies the selectors by its comma parts and their `&`s, so
+        // their total size is capped.
+        let (mut size, limit) = (0, (base.len() + 64) * 256);
         for name in parts {
             let (rank, variant) = self.variant(name, 0)?;
             if variant.relative {
@@ -2166,14 +2196,18 @@ impl Config {
                         None => selectors.clone(),
                         Some(template) => {
                             let parts = split(template, ',');
-                            selectors
-                                .iter()
-                                .flat_map(|selector| {
-                                    parts
-                                        .iter()
-                                        .map(move |part| part.trim().replace('&', selector))
-                                })
-                                .collect()
+                            let mut list = Vec::with_capacity(selectors.len() * parts.len());
+                            for selector in selectors {
+                                for part in &parts {
+                                    let part = part.trim();
+                                    size += part.len() + part.matches('&').count() * selector.len();
+                                    if size > limit {
+                                        return None;
+                                    }
+                                    list.push(part.replace('&', selector));
+                                }
+                            }
+                            list
                         }
                     };
                     next.push((at, selectors));
@@ -2555,20 +2589,32 @@ impl Config {
     /// An `@utility` from the author CSS, with `--value()` and `--modifier()` resolved.
     fn custom(&self, class: &str) -> Option<Body> {
         let (candidate, modifier) = modifier(class);
-        self.utilities.iter().rev().find_map(|(name, body)| {
-            let value = match name.strip_suffix('*') {
-                Some(prefix) => Some(
-                    candidate
-                        .strip_prefix(prefix)
-                        .filter(|value| !value.is_empty())?,
-                ),
-                None if name == class => None,
-                None => return None,
-            };
-            let mut resolved = false;
-            let body = self.expand(body, value, modifier, &mut resolved, 0)?;
-            (value.is_none() || resolved).then_some(body)
-        })
+        self.utilities
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, (name, body))| {
+                let value = match name.strip_suffix('*') {
+                    Some(prefix) => Some(
+                        candidate
+                            .strip_prefix(prefix)
+                            .filter(|value| !value.is_empty())?,
+                    ),
+                    None if name == class => None,
+                    None => return None,
+                };
+                // WARNING: `@apply` compiles classes again, so a utility that applies itself, or a long
+                // chain of them, would never end.
+                let expanding = self.expanding.borrow().len();
+                if expanding > 16 || self.expanding.borrow().contains(&index) {
+                    return None;
+                }
+                self.expanding.borrow_mut().push(index);
+                let mut resolved = false;
+                let body = self.expand(body, value, modifier, &mut resolved, 0);
+                self.expanding.borrow_mut().truncate(expanding);
+                (value.is_none() || resolved).then_some(body?)
+            })
     }
 
     fn expand(
@@ -2605,18 +2651,27 @@ impl Config {
                 };
                 let mut raw = raw.trim().to_owned();
                 let mut valid = true;
-                for (function, input) in [("--value", value), ("--modifier", modifier)] {
-                    while let Some((start, open, close)) = call(&raw, function) {
-                        let result = (close < raw.len())
-                            .then(|| input.and_then(|input| self.resolve(&raw[open..close], input)))
-                            .flatten();
-                        let Some(result) = result else {
-                            valid = false;
-                            break;
-                        };
-                        raw.replace_range(start..=close, &result);
-                        *resolved |= function == "--value";
-                    }
+                // WARNING: results come from the class, so they are never scanned again.
+                let mut from = 0;
+                while let Some(((start, open, close), function, input)) =
+                    [("--value", value), ("--modifier", modifier)]
+                        .into_iter()
+                        .filter_map(|(function, input)| {
+                            Some((call(&raw[from..], function)?, function, input))
+                        })
+                        .min_by_key(|((start, ..), ..)| *start)
+                {
+                    let (start, open, close) = (from + start, from + open, from + close);
+                    let result = (close < raw.len())
+                        .then(|| input.and_then(|input| self.resolve(&raw[open..close], input)))
+                        .flatten();
+                    let Some(result) = result else {
+                        valid = false;
+                        break;
+                    };
+                    raw.replace_range(start..=close, &result);
+                    from = start + result.len();
+                    *resolved |= function == "--value";
                 }
                 if valid {
                     body.declarations
@@ -2724,38 +2779,55 @@ impl Config {
 
     /// Resolves `--spacing()`, `--alpha()`, `--theme()` and the legacy `theme()`.
     fn functions(&self, value: &str) -> String {
-        if !value.contains("theme(") && !value.contains("--spacing(") && !value.contains("--alpha(")
-        {
+        if !calls(value) {
             return value.to_owned();
         }
-        let mut value = value.to_owned();
-        for function in ["--spacing", "--alpha", "--theme", "theme"] {
-            let mut from = 0;
-            while let Some((start, open, close)) = call(&value[from..], function) {
-                let (start, open, close) = (from + start, from + open, from + close);
-                // WARNING: `theme(` also matches inside `--theme(` and names like `x-theme(`.
-                if function == "theme"
-                    && value[..start]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c == '-' || c.is_alphanumeric())
-                {
-                    from = open;
-                    continue;
+        // WARNING: one pass resolves the innermost calls first, at their `)`. Scanning again per
+        // function and per failed call was exponential.
+        let mut out = String::with_capacity(value.len());
+        let mut open: Vec<(usize, Option<&str>)> = Vec::new();
+        // WARNING: each call reads all of its arguments, so calls nested past this depth stay as written.
+        let mut nested = 0;
+        let (mut quote, mut chars) = (None, value.chars());
+        while let Some(character) = chars.next() {
+            out.push(character);
+            match character {
+                '\\' => out.extend(chars.next()),
+                _ if quote.is_some() => {
+                    if quote == Some(character) {
+                        quote = None;
+                    }
                 }
-                if close == value.len() {
-                    break;
+                '"' | '\'' => quote = Some(character),
+                '(' => {
+                    let before = &out[..out.len() - 1];
+                    // WARNING: `theme(` also ends `--theme(` and names like `x-theme(`.
+                    let function = ["--spacing", "--alpha", "--theme", "theme"]
+                        .into_iter()
+                        .find(|name| {
+                            before.strip_suffix(name).is_some_and(|rest| {
+                                *name != "theme"
+                                    || !rest.ends_with(|c: char| c == '-' || c.is_alphanumeric())
+                            })
+                        })
+                        .filter(|_| nested < 16);
+                    nested += usize::from(function.is_some());
+                    open.push((before.len() - function.map_or(0, str::len), function));
                 }
-                let arguments = self.functions(&value[open..close]);
-                let Some(result) = self.function(function, arguments.trim()) else {
-                    from = close;
-                    continue;
-                };
-                value.replace_range(start..=close, &result);
-                from = start + result.len();
+                ')' => {
+                    if let Some((start, Some(function))) = open.pop() {
+                        nested -= 1;
+                        let arguments = &out[start + function.len() + 1..out.len() - 1];
+                        if let Some(result) = self.function(function, arguments.trim()) {
+                            out.truncate(start);
+                            out.push_str(&result);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        value
+        out
     }
 
     fn function(&self, function: &str, arguments: &str) -> Option<String> {
@@ -2890,17 +2962,18 @@ impl Config {
             let index = class.find(open)?;
             return functional(&class[..index], Some(&class[index + 1..]));
         }
+        // WARNING: a value is a named value, so only dashes after the last character it can't hold
+        // start one. Checking each suffix again was quadratic.
+        let named = class
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '%' | '-')))
+            .map_or(0, |index| index + 1);
         functional(class, None).or_else(|| {
             class
                 .match_indices('-')
                 .rev()
-                .filter(|(index, _)| *index > 0)
-                .find_map(|(index, _)| {
-                    let value = &class[index + 1..];
-                    named_value(value)
-                        .then(|| functional(&class[..index], Some(value)))
-                        .flatten()
-                })
+                .take_while(|(index, _)| *index >= named)
+                .filter(|(index, _)| *index > 0 && index + 1 < class.len())
+                .find_map(|(index, _)| functional(&class[..index], Some(&class[index + 1..])))
         })
     }
 
@@ -5080,10 +5153,10 @@ fn chunk(utilities: &[(Sort, u32, Vec<Rule>)]) -> Rc<Stylesheet> {
         .iter()
         .flat_map(|(.., rules)| rules.iter().cloned())
         .collect();
-    Rc::new(Stylesheet(vec![Rule::Layer(
+    Rc::new(Stylesheet(vec![Rc::new(Rule::Layer(
         vec!["utilities".into()],
         rules,
-    )]))
+    ))]))
 }
 
 /// Calls `visit` with the selector list of every style rule in `rule`, in order.

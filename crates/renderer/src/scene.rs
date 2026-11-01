@@ -541,6 +541,10 @@ impl RenderImage {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    /// The pixels, to reuse their memory once the image is dropped from the window.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl std::fmt::Debug for RenderImage {

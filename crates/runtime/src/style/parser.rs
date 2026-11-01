@@ -38,7 +38,7 @@ impl Stylesheet {
         Self(
             StyleSheetParser::new(&mut input, &mut parser)
                 .filter_map(|item| match item.ok()? {
-                    Item::Rule(rule) => Some(rule),
+                    Item::Rule(rule) => Some(Rc::new(rule)),
                     _ => None,
                 })
                 .collect(),
@@ -1428,7 +1428,10 @@ mod tests {
     fn media_queries_follow_level_4_grammar_and_serialize() {
         let evaluate = |query: &str| {
             let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
-            let [Rule::Media(queries, _)] = sheet.0.as_slice() else {
+            let [rule] = sheet.0.as_slice() else {
+                return None;
+            };
+            let Rule::Media(queries, _) = &**rule else {
                 return None;
             };
             let matched = queries.is_empty()
@@ -1556,7 +1559,10 @@ mod tests {
         }
         let retina = |query: &str| {
             let sheet = Stylesheet::parse(&format!("@media {query}{{}}"));
-            let [Rule::Media(queries, _)] = sheet.0.as_slice() else {
+            let [rule] = sheet.0.as_slice() else {
+                return None;
+            };
+            let Rule::Media(queries, _) = &**rule else {
                 return None;
             };
             queries[0].matches(800., 600., false, 200 << 16 | 64, FontUnits::new(16.))
@@ -1579,7 +1585,10 @@ mod tests {
         .0
         .as_slice()
         {
-            [Rule::Supports(_, supported, _)] => Some(*supported),
+            [rule] => match **rule {
+                Rule::Supports(_, supported, _) => Some(supported),
+                _ => None,
+            },
             _ => None,
         };
         for (condition, expected) in [

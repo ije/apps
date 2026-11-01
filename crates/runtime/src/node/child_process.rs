@@ -7,7 +7,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
@@ -25,7 +25,8 @@ struct Process {
     child: Child,
     input: Option<Sender<Option<Vec<u8>>>>,
     events: Receiver<Event>,
-    readers: Vec<(&'static str, Arc<AtomicBool>, std::thread::Thread)>,
+    /// Output readers with their state: flowing, `PAUSED` or `CLOSED`.
+    readers: Vec<(&'static str, Arc<AtomicU8>, std::thread::Thread)>,
     status: Option<ExitStatus>,
     open_streams: usize,
     spawned: bool,
@@ -57,11 +58,14 @@ impl Process {
     }
 }
 
+const PAUSED: u8 = 1;
+const CLOSED: u8 = 2;
+
 impl Drop for Process {
     fn drop(&mut self) {
         self.input.take();
-        for (_, paused, reader) in &self.readers {
-            paused.store(false, Ordering::Release);
+        for (_, state, reader) in &self.readers {
+            state.store(CLOSED, Ordering::Release);
             reader.unpark();
         }
         if self.status.is_none() && !(self.detached && self.unreferenced) {
@@ -298,18 +302,23 @@ impl State {
                     if let Some(mut pipe) = pipe {
                         process.open_streams += 1;
                         let (sender, wake) = (sender.clone(), wake.clone());
-                        let paused = Arc::new(AtomicBool::new(false));
-                        let gate = paused.clone();
+                        let state = Arc::new(AtomicU8::new(0));
+                        let gate = state.clone();
                         let reader = std::thread::Builder::new()
                             .name(format!("apps-{name}"))
                             .spawn(move || {
                                 let mut bytes = [0; 16384];
                                 loop {
-                                    while gate.load(Ordering::Acquire) {
+                                    while gate.load(Ordering::Acquire) == PAUSED {
                                         std::thread::park();
+                                    }
+                                    // WARNING: a destroyed stream closes its pipe here, so the child gets SIGPIPE like in Node.
+                                    if gate.load(Ordering::Acquire) == CLOSED {
+                                        break;
                                     }
                                     match pipe.read(&mut bytes) {
                                         Ok(0) => break,
+                                        Ok(_) if gate.load(Ordering::Acquire) == CLOSED => break,
                                         Ok(size) => {
                                             if sender
                                                 .send(Event::Data(name, bytes[..size].to_vec()))
@@ -330,13 +339,12 @@ impl State {
                                         }
                                     }
                                 }
+                                drop(pipe);
                                 if sender.send(Event::End(name)).is_ok() {
                                     wake.wake();
                                 }
                             })?;
-                        process
-                            .readers
-                            .push((name, paused, reader.thread().clone()));
+                        process.readers.push((name, state, reader.thread().clone()));
                     }
                 }
                 #[cfg(unix)]
@@ -382,14 +390,19 @@ impl State {
                 wake.wake();
                 Ok(json!({"id": self.next_id, "pid": pid}))
             }
-            "pause" => {
-                if let Some(process) = self
-                    .children
-                    .get_mut(&args[0].as_u64().context("Expected child ID")?)
-                    && let Some((_, paused, reader)) =
+            "pause" | "destroy" => {
+                if let Some(process) = args[0].as_u64().and_then(|id| self.children.get(&id))
+                    && let Some((_, state, reader)) =
                         process.readers.iter().find(|(name, ..)| args[1] == *name)
                 {
-                    paused.store(args[2] == true, Ordering::Release);
+                    let next = if op == "destroy" {
+                        CLOSED
+                    } else {
+                        u8::from(args[2] == true)
+                    };
+                    let _ = state.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        (current != CLOSED).then_some(next)
+                    });
                     reader.unpark();
                 }
                 Ok(Value::Null)

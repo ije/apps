@@ -148,6 +148,8 @@ type Matches =
 /// Element children positions of one parent: index, count, index among the same tag, count of that tag.
 type Positions = Rc<HashMap<usize, [usize; 4]>>;
 
+type NthPositions = Rc<(rustc_hash::FxHashMap<usize, usize>, Vec<(usize, u64)>)>;
+
 /// A node as selectors last saw it, with a revision per dependency kind.
 type Snapshot = Box<(Node, [u64; 6])>;
 
@@ -160,6 +162,9 @@ pub(crate) struct SelectorCache {
     /// Dependencies stored in `values`, to bound its memory.
     size: usize,
     positions: rustc_hash::FxHashMap<usize, (u64, Positions)>,
+    /// `:nth-child(An+B of S)` positions by selector list, parent and scope: each matching child's index,
+    /// and what matching S on the children depends on.
+    nth: rustc_hash::FxHashMap<(usize, usize, Option<usize>), NthPositions>,
     pub(crate) dependencies: Vec<(usize, u64)>,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<usize>)>,
@@ -239,6 +244,40 @@ impl SelectorCache {
             if let Some(slot) = self.nodes.get_mut(parent) {
                 slot.get_or_insert_default().1[2] += 1;
                 changes.push(parent * 6 + 2);
+            }
+        }
+        // WARNING: `:nth-child(An+B of S)` results depend only on their parent's children, so a change to anything
+        // that S read on the siblings drops the cached positions and counts as a children change. Never drop
+        // positions without that change.
+        let mut checked = 0;
+        while checked < changes.len() && !self.nth.is_empty() {
+            let mut fresh = changes[checked..].to_vec();
+            fresh.sort_unstable();
+            checked = changes.len();
+            let all = self.nth.len() > 65536;
+            let mut stale = Vec::new();
+            self.nth.retain(|&(_, parent, _), positions| {
+                let dependencies = &positions.1;
+                let keep = !all
+                    && !if fresh.len() < dependencies.len() {
+                        fresh
+                            .iter()
+                            .any(|id| dependencies.binary_search_by_key(id, |&(id, _)| id).is_ok())
+                    } else {
+                        dependencies
+                            .iter()
+                            .any(|(id, _)| fresh.binary_search(id).is_ok())
+                    };
+                if !keep {
+                    stale.push(parent);
+                }
+                keep
+            });
+            for parent in stale {
+                if let Some(slot) = self.nodes.get_mut(parent) {
+                    slot.get_or_insert_default().1[2] += 1;
+                    changes.push(parent * 6 + 2);
+                }
             }
         }
         if !changes.is_empty() {
@@ -987,13 +1026,40 @@ impl Selector {
                             }
                         }),
                     SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
-                        "scope" => scope.map_or(node.tag == "html", |scope| scope == id),
+                        // WARNING: a document scope matches its root element, as in browsers.
+                        "scope" => scope.map_or(node.tag == "html", |scope| {
+                            scope == id
+                                || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
+                        }),
                         "has" => {
-                            memo.depend(id, 2);
-                            let mut pending = node.children.clone();
-                            if argument
-                                .split(',')
-                                .any(|part| part.trim_start().starts_with(['+', '~']))
+                            // A relative selector starts at the children (`>`, ` `) or at the next element
+                            // siblings (one per leading `+`, all after a `~`), and each later `>` or ` ` goes one
+                            // level or any number of levels deeper.
+                            let (mut children, mut siblings, mut depth) = (false, 0usize, 0usize);
+                            for selector in parsed {
+                                let (mut levels, mut steps, mut current) =
+                                    (0usize, 0usize, selector);
+                                while let Some((combinator, previous)) = &current.previous {
+                                    (levels, steps) = match combinator {
+                                        '+' => (levels, steps.saturating_add(1)),
+                                        '~' => (levels, usize::MAX),
+                                        '>' => (levels.saturating_add(1), 0),
+                                        _ => (usize::MAX, 0),
+                                    };
+                                    if previous.previous.is_none() {
+                                        children |= matches!(combinator, '>' | ' ');
+                                        siblings = siblings.max(steps);
+                                    }
+                                    current = previous;
+                                }
+                                depth = depth.max(levels);
+                            }
+                            let mut pending = Vec::new();
+                            if children {
+                                memo.depend(id, 2);
+                                pending.extend(node.children.iter().map(|&child| (child, 1)));
+                            }
+                            if siblings > 0
                                 && let Some(parent) = node.parent
                             {
                                 memo.depend(id, 1);
@@ -1003,19 +1069,31 @@ impl Selector {
                                         .children
                                         .iter()
                                         .skip_while(|&&sibling| sibling != id)
-                                        .skip(1),
+                                        .skip(1)
+                                        .filter(|&&sibling| {
+                                            !doc.nodes[sibling].tag.starts_with('#')
+                                        })
+                                        .take(siblings)
+                                        .map(|&sibling| (sibling, 0)),
                                 );
                             }
                             let mut found = false;
-                            while let Some(child) = pending.pop() {
+                            while let Some((child, level)) = pending.pop() {
                                 if parsed.iter().any(|selector| {
                                     selector.matches_cached(doc, child, Some(id), memo)
                                 }) {
                                     found = true;
                                     break;
                                 }
-                                memo.depend(child, 2);
-                                pending.extend(&doc.nodes[child].children);
+                                if level < depth {
+                                    memo.depend(child, 2);
+                                    pending.extend(
+                                        doc.nodes[child]
+                                            .children
+                                            .iter()
+                                            .map(|&grandchild| (grandchild, level + 1)),
+                                    );
+                                }
                             }
                             found
                         }
@@ -1304,22 +1382,37 @@ impl Selector {
                                     {
                                         return false;
                                     }
-                                    let matched: Vec<_> = siblings
-                                        .iter()
-                                        .filter(|&&child| {
-                                            !doc.nodes[child].tag.starts_with('#')
-                                                && (child == id
-                                                    || parsed.iter().any(|s| {
+                                    // WARNING: siblings match S once per parent, and the result depends on the
+                                    // parent's children only; `update` turns changes of the positions into those.
+                                    let key = (parsed.as_ptr() as usize, parent, scope);
+                                    let positions = match memo.nth.get(&key) {
+                                        Some(positions) => positions.clone(),
+                                        None => {
+                                            let start = memo.dependencies.len();
+                                            memo.depend(parent, 2);
+                                            let mut indices = rustc_hash::FxHashMap::default();
+                                            for &child in siblings {
+                                                if !doc.nodes[child].tag.starts_with('#')
+                                                    && parsed.iter().any(|s| {
                                                         s.matches_cached(doc, child, scope, memo)
-                                                    }))
-                                        })
-                                        .collect();
-                                    let Some(index) =
-                                        matched.iter().position(|&&child| child == id)
-                                    else {
+                                                    })
+                                                {
+                                                    indices.insert(child, indices.len());
+                                                }
+                                            }
+                                            let mut dependencies =
+                                                memo.dependencies.split_off(start);
+                                            dependencies.sort_unstable();
+                                            dependencies.dedup();
+                                            let positions = Rc::new((indices, dependencies));
+                                            memo.nth.insert(key, positions.clone());
+                                            positions
+                                        }
+                                    };
+                                    let Some(&index) = positions.0.get(&id) else {
                                         return false;
                                     };
-                                    (index, matched.len())
+                                    (index, positions.0.len())
                                 };
                                 match name.as_str() {
                                     "first-child" | "first-of-type" => index == 0,
@@ -1467,6 +1560,103 @@ mod tests {
         assert!(!doc.matches(empty, ":has(.separator)"));
         assert!(doc.matches(id, ":has(+ #empty)") && doc.matches(id, ":has(~ main:empty)"));
         assert!(!doc.matches(empty, ":has(+ main)") && !doc.matches(id, ":has(+ code)"));
+        let doc = Document::parse(
+            "<ul><li id=a><b></b></li><li id=b class=x><i><b></b></i></li><li id=c></li></ul>",
+        );
+        for (selector, expected) in [
+            ("li:has(> b)", "a"),
+            ("li:has(b)", "a,b"),
+            ("li:has(> i b)", "b"),
+            ("li:has(+ .x)", "a"),
+            ("li:has(+ li > i)", "a"),
+            ("li:has(+ li b)", "a"),
+            ("li:has(+ li + li)", "a"),
+            ("li:has(~ #c)", "a,b"),
+            ("li:has(> b, + #c)", "a,b"),
+        ] {
+            assert_eq!(matched(&doc, selector), expected, "{selector}");
+        }
+        let doc = Document::parse("<html><body><p></p></body></html>");
+        let body = doc.nodes.iter().position(|n| n.tag == "body").unwrap();
+        let html = doc.nodes.iter().position(|n| n.tag == "html").unwrap();
+        let selector = &Selector::parse(":scope > body", None)[0];
+        assert!(selector.matches_scope(&doc, body, Some(0)));
+        assert!(Selector::parse(":scope", None)[0].matches_scope(&doc, html, Some(0)));
+    }
+
+    #[test]
+    fn nth_child_of_selector_follows_class_and_child_changes() {
+        let mut doc = Document::parse(&format!(
+            "<style>li:nth-child(odd of :not(.hidden)){{color:red}}li:nth-last-child(1 of :not(.hidden)){{width:1px}}li:nth-child(even of :has(> b)){{height:2px}}</style><ul><li><b></b></li><li><b></b></li>{}</ul>",
+            "<li></li>".repeat(6)
+        ));
+        let [items, marks] = ["li", "b"].map(|tag| {
+            (0..doc.nodes.len())
+                .filter(|&id| doc.nodes[id].tag == tag)
+                .collect::<Vec<_>>()
+        });
+        let (mut sheets, mut cache) = (HashMap::new(), crate::style::StyleCache::default());
+        for (step, (hidden, owners)) in [
+            (&[][..], [0, 1]),
+            (&[0, 3], [0, 4]),
+            (&[3], [2, 4]),
+            (&[7], [2, 5]),
+            (&[], [6, 7]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (index, &id) in items.iter().enumerate() {
+                let value = if hidden.contains(&index) {
+                    "hidden"
+                } else {
+                    ""
+                };
+                if doc.nodes[id].attrs.get("class").map_or("", String::as_str) != value {
+                    doc.nodes[id].attrs.set("class", value);
+                }
+            }
+            for (&mark, owner) in marks.iter().zip(owners) {
+                let (old, new) = (doc.nodes[mark].parent.unwrap(), items[owner]);
+                if old != new {
+                    doc.nodes[old].children.retain(|&child| child != mark);
+                    doc.nodes[new].children.push(mark);
+                    doc.nodes[mark].parent = Some(new);
+                }
+            }
+            let cached =
+                crate::style::compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+            let fresh = crate::style::compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut sheets,
+                &mut crate::style::StyleCache::default(),
+                None,
+            );
+            assert_eq!(cached.values, fresh.values, "step {step}");
+            let shown: Vec<_> = (0..8).filter(|index| !hidden.contains(index)).collect();
+            for (index, &id) in items.iter().enumerate() {
+                let style = &cached.values[id];
+                let position = shown.iter().position(|&shown| shown == index);
+                assert_eq!(
+                    style.get(crate::style::Prop::COLOR) == Some("red"),
+                    position.is_some_and(|position| position % 2 == 0),
+                    "step {step}: item {index}"
+                );
+                assert_eq!(
+                    style.get(crate::style::Prop::WIDTH) == Some("1px"),
+                    shown.last() == Some(&index),
+                    "step {step}: last {index}"
+                );
+                assert_eq!(
+                    style.get(crate::style::Prop::HEIGHT) == Some("2px"),
+                    index == owners[1],
+                    "step {step}: marked {index}"
+                );
+            }
+        }
     }
 
     #[test]

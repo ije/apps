@@ -6,7 +6,175 @@ use renderer::{
     App, Bounds, FileDropEvent, Pixels, PlatformInput, Point, Utf16Selection, Window, point, px,
     size,
 };
-use std::ops::Range;
+use std::{ops::Range, rc::Rc};
+
+/// A field's selection while focused, and the length of the text it drew.
+pub(super) type Caret = (Option<[usize; 2]>, usize);
+
+/// The text of an `input` or `textarea`: its value or placeholder, the selection and the caret. It
+/// scrolls its box to keep a moved caret in view, and records its layout for hit tests and IME.
+pub(super) struct FieldText {
+    pub(super) inner: renderer::StyledText,
+    pub(super) id: usize,
+    pub(super) view: Rc<ViewData>,
+    pub(super) text: Rc<str>,
+    /// The value of a password field, whose `text` shows a bullet for each code point.
+    pub(super) password: Option<String>,
+    pub(super) run: renderer::TextRun,
+    pub(super) placeholder: bool,
+    pub(super) single_line: bool,
+    pub(super) caret: renderer::Rgba,
+    pub(super) selection: (Option<u32>, u32),
+    /// The scroll position of the box that clips the text.
+    pub(super) handle: renderer::ScrollHandle,
+}
+
+impl renderer::IntoElement for FieldText {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl renderer::Element for FieldText {
+    type RequestLayoutState = ();
+    /// The selection while the field has focus.
+    type PrepaintState = Option<[usize; 2]>;
+
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
+        self.inner.request_layout(window)
+    }
+
+    fn prepaint(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+    ) -> Option<[usize; 2]> {
+        self.inner.prepaint(bounds, &mut (), window);
+        let layout = self.inner.layout();
+        let view = &*self.view;
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        // An empty field shows its caret before the placeholder.
+        let selected = dom
+            .selection
+            .get(&self.id)
+            .filter(|_| dom.focus == Some(self.id))
+            .map(|&selected| match &self.password {
+                _ if self.placeholder => [0; 2],
+                Some(value) => selected.map(|offset| crate::dom::bullets(value, offset)),
+                None => selected,
+            });
+        if !self.placeholder {
+            dom.text_layouts.insert(
+                self.id,
+                (
+                    layout.clone(),
+                    self.text.clone(),
+                    0..self.text.len(),
+                    Rc::default(),
+                ),
+            );
+        }
+        drop(host);
+        // Like browsers, a moved caret scrolls into view, and a single-line field scrolls back when it loses focus.
+        let state = (selected, self.text.len());
+        if view.fields.borrow_mut().insert(self.id, state) != Some(state) {
+            let (shown, old) = (self.handle.bounds(), self.handle.offset());
+            let mut offset = old;
+            match selected {
+                Some([_, end]) => {
+                    if let Some(caret) =
+                        layout.position_for_index(crate::dom::utf16_index(&self.text, end))
+                    {
+                        let line = layout.line_height();
+                        if caret.x < shown.left() {
+                            offset.x += shown.left() - caret.x;
+                        } else if caret.x + px(1.) > shown.right() {
+                            offset.x -= caret.x + px(1.) - shown.right();
+                        }
+                        if caret.y < shown.top() {
+                            offset.y += shown.top() - caret.y;
+                        } else if caret.y + line > shown.bottom() {
+                            offset.y -= caret.y + line - shown.bottom();
+                        }
+                    }
+                }
+                None if self.single_line => offset = Point::default(),
+                None => {}
+            }
+            let max = self.handle.max_offset();
+            offset.x = offset.x.clamp(-max.x, px(0.));
+            offset.y = offset.y.clamp(-max.y, px(0.));
+            if offset != old {
+                self.handle.set_offset(offset);
+                window.redraw();
+            }
+        }
+        selected
+    }
+
+    fn paint(
+        &mut self,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        selected: &mut Option<[usize; 2]>,
+        window: &mut Window,
+    ) {
+        let layout = self.inner.layout();
+        let text = &*self.text;
+        let line_height = layout.line_height();
+        let selected = selected.map(|[a, b]| {
+            [a.min(b), a.max(b), b].map(|index| crate::dom::utf16_index(text, index))
+        });
+        let highlights: Vec<_> = selected
+            .filter(|[start, end, _]| start < end)
+            .map(|[start, end, _]| super::text::TextHighlight {
+                range: start..end,
+                color: self.selection.0.map(renderer::rgba),
+                background: renderer::rgba(self.selection.1),
+            })
+            .into_iter()
+            .collect();
+        // WARNING: a long field shapes all its text once, but paints only the rows its box shows.
+        let mask = window.content_mask().bounds;
+        let mut origin = layout.bounds().origin;
+        let mut offset = 0;
+        for line in layout.line_layouts() {
+            let height = line_height * (line.wrap_boundaries.len() + 1);
+            if origin.y >= mask.bottom() {
+                break;
+            }
+            if origin.y + height > mask.top() {
+                super::text::paint_text(
+                    &line.unwrapped_layout,
+                    &line.wrap_boundaries,
+                    origin,
+                    line_height,
+                    std::slice::from_ref(&self.run),
+                    offset,
+                    &highlights,
+                    &[],
+                    text,
+                    None,
+                    window,
+                );
+            }
+            origin.y += height;
+            offset += line.len() + 1;
+        }
+        if let Some([start, end, caret]) = selected
+            && start == end
+            && let Some(at) = layout.position_for_index(caret)
+        {
+            window.paint_quad(renderer::fill(
+                Bounds::new(at, size(px(1.), line_height)),
+                self.caret,
+            ));
+        }
+    }
+}
 
 impl ViewData {
     pub(super) fn evaluate(&self, script: &str) -> Result<String> {
@@ -94,6 +262,22 @@ impl ViewData {
         self.drive(cx);
         window.refresh();
     }
+}
+
+/// The edited value of field `id` when it is a password, whose layout shows bullets.
+fn password<'a>(
+    host: &crate::host::Host,
+    view: u64,
+    id: usize,
+    state: &'a serde_json::Value,
+) -> Option<&'a str> {
+    host.pages
+        .get(&view)?
+        .doc
+        .nodes
+        .get(id)?
+        .password()
+        .then(|| state["text"].as_str())?
 }
 
 impl renderer::View for WebView {
@@ -309,14 +493,29 @@ impl renderer::View for WebView {
 
     fn bounds_for_range(
         &mut self,
-        _: Range<usize>,
+        range: Range<usize>,
         _: &mut Window,
         _: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let state = self.editing()?;
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
-        let bounds = host.dom.get(&self.id)?.bounds.get(&id)?;
+        let dom = host.dom.get(&self.id)?;
+        let password = password(&host, self.id, id, &state);
+        // A field's text has a layout, so the range gets its own rectangle, where the IME shows its candidates.
+        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&id) {
+            let content = &text[span.clone()];
+            let [start, end] = [range.start, range.end].map(|index| {
+                let index = password.map_or(index, |value| crate::dom::bullets(value, index));
+                span.start + crate::dom::utf16_index(content, index)
+            });
+            let at = super::text::text_position(layout, text, rows, start)?;
+            let to = super::text::text_position(layout, text, rows, end)
+                .filter(|to| to.y == at.y && to.x >= at.x)
+                .unwrap_or(at);
+            return Some(Bounds::new(at, size(to.x - at.x, layout.line_height())));
+        }
+        let bounds = dom.bounds.get(&id)?;
         Some(Bounds::new(
             point(px(bounds[0]), px(bounds[1])),
             size(px(bounds[2]), px(bounds[3])),
@@ -333,6 +532,16 @@ impl renderer::View for WebView {
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
+        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&id) {
+            let index = super::text::text_index(layout, text, rows, point)
+                .unwrap_or_else(|index| index)
+                .clamp(span.start, span.end);
+            let index = text[span.start..index].encode_utf16().count();
+            return Some(
+                password(&host, self.id, id, &state)
+                    .map_or(index, |value| crate::dom::unbullet(value, index)),
+            );
+        }
         let bounds = dom.bounds.get(&id)?;
         let style = dom.computed.as_ref()?.values.get(id)?;
         let face = style::font(style);

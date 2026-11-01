@@ -11,7 +11,7 @@ use std::{
     sync::OnceLock,
 };
 
-const ABI: u32 = 1;
+const ABI: u32 = 2;
 
 /// The FFmpeg libraries that the media library links, by name stem.
 pub const FFMPEG: [&str; 5] = ["avformat", "avcodec", "swscale", "swresample", "avutil"];
@@ -35,7 +35,13 @@ static HOST: Host = Host {
 
 // WARNING: player threads allocate frames ahead of time, and the renderer frees the ones they show.
 extern "C" fn alloc_pixels(length: usize) -> *mut u8 {
-    Box::into_raw(Box::<[u8]>::new_uninit_slice(length)).cast()
+    // WARNING: media files pick the frame size, so a failed allocation returns null instead of aborting.
+    let mut pixels = Vec::<MaybeUninit<u8>>::new();
+    if pixels.try_reserve_exact(length).is_err() {
+        return std::ptr::null_mut();
+    }
+    unsafe { pixels.set_len(length) };
+    Box::into_raw(pixels.into_boxed_slice()).cast()
 }
 
 extern "C" fn free_pixels(bytes: *mut u8, length: usize) {
@@ -63,6 +69,7 @@ struct Library {
     time: unsafe extern "C" fn(*mut c_void, u64) -> f64,
     poll: unsafe extern "C" fn(*mut c_void, *mut c_void, Alloc),
     frame: unsafe extern "C" fn(*mut c_void, u64, *mut Frame) -> bool,
+    recycle: unsafe extern "C" fn(*mut c_void, u64, *mut u8, u32, u32),
 }
 
 /// The file name of the media library.
@@ -119,6 +126,7 @@ fn load() -> Result<Library> {
             time: *library.get(b"apps_media_time\0")?,
             poll: *library.get(b"apps_media_poll\0")?,
             frame: *library.get(b"apps_media_frame\0")?,
+            recycle: *library.get(b"apps_media_recycle\0")?,
         };
         // WARNING: player and audio threads may outlive every page, so the library is never unloaded.
         std::mem::forget(library);
@@ -217,6 +225,24 @@ impl Media {
             frame.height,
             pixels.into_vec(),
         ))
+    }
+
+    /// Gives the pixels of a frame of element `id` back, for its next frames.
+    pub fn recycle(&mut self, id: u64, image: renderer::RenderImage) {
+        let Some((raw, library)) = self.raw else {
+            return;
+        };
+        let size = image.size();
+        let pixels = Box::into_raw(image.into_bytes().into_boxed_slice());
+        unsafe {
+            (library.recycle)(
+                raw.as_ptr(),
+                id,
+                pixels.cast(),
+                size.width.0 as u32,
+                size.height.0 as u32,
+            )
+        };
     }
 }
 
