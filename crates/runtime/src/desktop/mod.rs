@@ -120,7 +120,7 @@ impl Desktop {
         });
         apps_webview::on_event(|| crate::host::Waker::current().wake());
         let package = files.get("package.json").map(String::as_str);
-        let (_, name, version) = crate::bundle::package_metadata(package)?;
+        let (_, name, version, _) = crate::bundle::package_metadata(package)?;
         let host = Rc::new(RefCell::new(Host {
             app_version: Some(version),
             disabled: crate::bundle::disabled_features(package)?,

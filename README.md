@@ -16,6 +16,7 @@ To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.clau
 
 `apps run` keeps source maps in memory and reads assets and native addons from their original paths. It does not create `.apps/`.
 `apps build` writes to `dist/` by default and does not generate source maps.
+On macOS, `identifier` in `package.json` sets the bundle ID (`CFBundleIdentifier`). It defaults to `com.apps.<name>`, with `_` changed to `-`.
 It packs imported `.node` addons into the app bundle and writes each one to the user's cache folder the first time it loads.
 It copies the contents of `public/` into the app folder, and the files and folders in `files` of `package.json` at their path in the app, so `join(import.meta.dirname, './lib/math.dylib')` finds the same file in `apps run` and built apps:
 

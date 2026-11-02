@@ -23,7 +23,7 @@ pub struct Bundle {
     pub scripts: HashMap<String, bytes::Bytes>,
 }
 
-pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)> {
+pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
     ensure!(package.is_object(), "Expected an object in package.json");
@@ -83,7 +83,24 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String)
                     || matches!(byte, b'.' | b'_' | b'-'))),
         r"Invalid package version {version:?}; expected ^\d+\.\d+\.\d+(-[a-z0-9._-]+)?$"
     );
-    Ok((name.into(), product_name.into(), version.into()))
+    let identifier = match package.get("identifier") {
+        Some(value) => value
+            .as_str()
+            .context("package.json identifier must be a string")?
+            .to_owned(),
+        None => format!("com.apps.{}", name.replace('_', "-")),
+    };
+    ensure!(
+        identifier.contains('.')
+            && identifier.split('.').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }),
+        r"Invalid identifier {identifier:?}; expected ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$"
+    );
+    Ok((name.into(), product_name.into(), version.into(), identifier))
 }
 
 /// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
@@ -468,38 +485,68 @@ mod tests {
 
     #[test]
     fn package_metadata_uses_product_name_and_defaults() {
-        for (source, name, product_name, version) in [
-            (None, "App", "App", "0.0.0"),
-            (Some("{}"), "App", "App", "0.0.0"),
+        for (source, name, product_name, version, identifier) in [
+            (None, "App", "App", "0.0.0", "com.apps.App"),
+            (Some("{}"), "App", "App", "0.0.0", "com.apps.App"),
             (
                 Some(r#"{"name":"package_name","version":"1.2.3"}"#),
                 "package_name",
                 "package_name",
                 "1.2.3",
+                "com.apps.package-name",
             ),
             (
                 Some(r#"{"productName":"My App","name":"package_name","version":"2.0.0"}"#),
                 "package_name",
                 "My App",
                 "2.0.0",
+                "com.apps.package-name",
             ),
             (
-                Some(r#"{"name":"package_name"}"#),
+                Some(r#"{"name":"package_name","identifier":"dev.Tea-Code.app2"}"#),
                 "package_name",
                 "package_name",
                 "0.0.0",
+                "dev.Tea-Code.app2",
             ),
             (
                 Some(r#"{"productName":"My App"}"#),
                 "App",
                 "My App",
                 "0.0.0",
+                "com.apps.App",
             ),
         ] {
             assert_eq!(
                 package_metadata(source).unwrap(),
-                (name.into(), product_name.into(), version.into())
+                (
+                    name.into(),
+                    product_name.into(),
+                    version.into(),
+                    identifier.into()
+                )
             );
+        }
+        for identifier in [
+            "",
+            "app",
+            ".app",
+            "com.",
+            "com..app",
+            "com.my_app",
+            "com.my app",
+            "com.aé",
+            "com/app",
+        ] {
+            let error =
+                package_metadata(Some(&json!({"identifier":identifier}).to_string())).unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid identifier"),
+                "{identifier:?}"
+            );
+        }
+        for value in [json!(null), json!(42), json!([])] {
+            assert!(package_metadata(Some(&json!({"identifier":value}).to_string())).is_err());
         }
         for name in ["Aa", "a_", "A1", "my_App12"] {
             assert_eq!(

@@ -60,7 +60,8 @@ pub fn write_bundle(
     target: Target,
 ) -> Result<(usize, PathBuf)> {
     let package = files.get("package.json").map(String::as_str);
-    let (name, product_name, version) = apps_runtime::bundle::package_metadata(package)?;
+    let (name, product_name, version, identifier) =
+        apps_runtime::bundle::package_metadata(package)?;
     let library_name = apps_runtime::jsc::library_name(target.platform)?;
     let disabled = apps_runtime::bundle::disabled_features(package)?;
     let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
@@ -209,7 +210,6 @@ pub fn write_bundle(
     };
     fs::create_dir_all(executable.parent().unwrap())?;
     if target.platform == "macos" {
-        let identifier = name.replace('_', "-");
         let name = apps_runtime::dom::escape(&name);
         let product_name = apps_runtime::dom::escape(&product_name);
         let build = version.split('-').next().unwrap();
@@ -217,7 +217,7 @@ pub fn write_bundle(
         fs::write(
             app_directory.join("Contents/Info.plist"),
             format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>{name}</string><key>CFBundleIdentifier</key><string>dev.pierre.apps.{identifier}</string><key>CFBundleName</key><string>{product_name}</string><key>CFBundleDisplayName</key><string>{product_name}</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>{build}</string><key>CFBundleShortVersionString</key><string>{version}</string><key>NSHighResolutionCapable</key><true/></dict></plist>"#
+                r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>{name}</string><key>CFBundleIdentifier</key><string>{identifier}</string><key>CFBundleName</key><string>{product_name}</string><key>CFBundleDisplayName</key><string>{product_name}</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>{build}</string><key>CFBundleShortVersionString</key><string>{version}</string><key>NSHighResolutionCapable</key><true/></dict></plist>"#
             ),
         )?;
         #[cfg(unix)]
@@ -415,19 +415,21 @@ mod tests {
             fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let out = dir.path().join("dist");
-        for (package, name, product_name, version) in [
-            (serde_json::json!({}), "App", "App", "0.0.0"),
+        for (package, name, product_name, version, identifier) in [
+            (serde_json::json!({}), "App", "App", "0.0.0", "com.apps.App"),
             (
                 serde_json::json!({"name":"package_name","version":"1.2.3"}),
                 "package_name",
                 "package_name",
                 "1.2.3",
+                "com.apps.package-name",
             ),
             (
-                serde_json::json!({"name":"tea_code","productName":"Tea & Code","version":"2.3.4-beta_1"}),
+                serde_json::json!({"name":"tea_code","productName":"Tea & Code","version":"2.3.4-beta_1","identifier":"dev.tea.Code"}),
                 "tea_code",
                 "Tea & Code",
                 "2.3.4-beta_1",
+                "dev.tea.Code",
             ),
         ] {
             let files = BBTreeMap::from([
@@ -475,7 +477,12 @@ mod tests {
                 assert_eq!(
                     apps_runtime::bundle::package_metadata(Some(&bundle.files["package.json"]))
                         .unwrap(),
-                    (name.into(), product_name.into(), version.into())
+                    (
+                        name.into(),
+                        product_name.into(),
+                        version.into(),
+                        identifier.into()
+                    )
                 );
                 #[cfg(target_os = "macos")]
                 {
@@ -486,8 +493,7 @@ mod tests {
                         "<key>CFBundleExecutable</key><string>{escaped}</string>"
                     )));
                     assert!(plist.contains(&format!(
-                        "<key>CFBundleIdentifier</key><string>dev.pierre.apps.{}</string>",
-                        name.replace('_', "-")
+                        "<key>CFBundleIdentifier</key><string>{identifier}</string>"
                     )));
                     let escaped = apps_runtime::dom::escape(product_name);
                     for key in ["CFBundleName", "CFBundleDisplayName"] {

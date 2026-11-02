@@ -1572,6 +1572,14 @@ fn nearest_package_version_reaches_dev_and_production_apps() {
                     "App"
                 }
             );
+            assert_eq!(
+                metadata["identifier"],
+                if local_package.is_none() {
+                    "com.apps.package-name"
+                } else {
+                    "com.apps.App"
+                }
+            );
             if !production {
                 assert_eq!(
                     apps_runtime::desktop::Desktop::new(&files)

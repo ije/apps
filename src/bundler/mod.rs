@@ -2934,9 +2934,10 @@ fn bundle(
             }
         }
         let source = package.to_string();
-        let (name, product_name, version) = apps_runtime::bundle::package_metadata(Some(&source))?;
+        let (name, product_name, version, identifier) =
+            apps_runtime::bundle::package_metadata(Some(&source))?;
         apps_runtime::bundle::disabled_features(Some(&source))?;
-        let mut metadata = json!({"name":name,"productName":product_name,"version":version});
+        let mut metadata = json!({"name":name,"productName":product_name,"version":version,"identifier":identifier});
         if let Some(features) = package.get("features") {
             metadata["features"] = features.clone();
         }
