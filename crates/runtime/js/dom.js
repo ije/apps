@@ -289,8 +289,14 @@
   }
   const token = value => { value = String(value); if (!value) throw new DOMException('Token is empty', 'SyntaxError'); if (/[\t\n\f\r ]/.test(value)) throw new DOMException('Token contains whitespace', 'InvalidCharacterError'); return value; };
   const tokens = list => { const value = list.value; if (value !== list._source) { list._source = value; list._tokens = [...new Set(value.split(/[\t\n\f\r ]+/).filter(Boolean))]; } return list._tokens; };
+  // A token list reads indexes like `classList[0]` from its live tokens, as the DOM's indexed property getter.
+  const tokenIndex = key => { if (typeof key !== 'string') return -1; const i = +key; return i >>> 0 === i && String(i) === key ? i : -1; };
+  const indexed = {
+    get(list, key, receiver) { const i = tokenIndex(key); return i < 0 ? Reflect.get(list, key, receiver) : tokens(list)[i]; },
+    has(list, key) { const i = tokenIndex(key); return i < 0 ? Reflect.has(list, key) : i < tokens(list).length; },
+  };
   class DOMTokenList {
-    constructor(element, name) { this._element = element; this._name = name; this._source = null; this._tokens = null; }
+    constructor(element, name) { this._element = element; this._name = name; this._source = null; this._tokens = null; return new Proxy(this, indexed); }
     get value() { return this._element.getAttribute(this._name) ?? ''; } set value(value) { this._element.setAttribute(this._name, value); }
     get length() { return tokens(this).length; }
     item(index) { return tokens(this)[index] ?? null; }

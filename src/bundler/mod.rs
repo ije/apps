@@ -3174,13 +3174,17 @@ fn asset(
     if let Some(base) = remote_base(directory) {
         return base.join(reference).ok().map(String::from);
     }
-    if reference.starts_with('/') {
+    if reference.starts_with("//") {
         return None;
     }
-    let path = directory
-        .join(reference.split(['?', '#']).next()?)
-        .canonicalize()
-        .ok()?;
+    let file = reference.split(['?', '#']).next()?;
+    let path = match file.strip_prefix('/') {
+        Some(rest) => root.join(rest),
+        None => directory.join(file),
+    }
+    .canonicalize()
+    .ok()
+    .filter(|path| !reference.starts_with('/') || path.starts_with(root))?;
     let name = asset_name(root, &path)?;
     files.borrow_mut().insert(path);
     Some(format!("apps:///{name}"))

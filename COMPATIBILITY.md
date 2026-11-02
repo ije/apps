@@ -16,7 +16,7 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 | `import()` | A string literal imports a bundled module. Other specifiers stay in the code and load when they run: `data:` and `blob:` URLs with the `jsExecute` feature, `http` and `https` URLs with `httpImport`. Remote modules can import other modules only by URL |
 | Remote scripts and stylesheets | `<script src>`, `<link rel="stylesheet">`, JavaScript imports and CSS `@import` with `http` or `https` URLs need the `httpImport` feature. `apps build` downloads them into the app |
 | Classic scripts | `<script>` without `type="module"` runs as a classic script, with global `var` and `function`, sloppy mode and `this` as `window`. Scripts without `defer` or `async` run before module scripts. Classic scripts are bundled as written: no TypeScript or JSX, and their `import()` is not bundled. `nomodule` scripts don't run |
-| Root-relative paths | In `src`, `href` and CSS `@import`, a path that starts with `/` is relative to the app folder and cannot leave it |
+| Root-relative paths | In `src`, `srcset`, `href`, CSS `@import` and `url()`, a path that starts with `/` is relative to the app folder and cannot leave it |
 | Inline event attributes (`onclick="..."`) | Not run. `el.onclick = fn` and `addEventListener` work |
 | HTML parsing | Follows the HTML5 tree builder, except misnested formatting tags (`<b><p></b>` keeps `p` in `b`), MathML and framesets |
 | Navigation | Pages can go to bundled `apps:///` pages and local `file:///` files only. Other URLs throw. Use `WebContentsView` or `shell.openExternal()` for websites |
@@ -43,7 +43,8 @@ These parts differ from browsers. The ones that don't work show an error in the 
 | `filter: url()` | Only `<filter>` elements in the page, with `feGaussianBlur`, `feColorMatrix`, `feOffset` and `feDropShadow` |
 | `clip-path: shape()` | Not supported |
 | `line-height`, `vertical-align` in `::first-letter` and `::first-line` | Ignored. Sizes, colors and font styles work |
-| `float` | Text next to a float doesn't move under it when the float ends |
+| `float` | Text next to a float doesn't move under it when the float ends. A block that holds only floats is as tall as they are |
+| `inline-block` in text | Text around an inline-block wraps as separate pieces, so a paragraph that starts with one breaks its first line before the text instead of next to the box |
 | Multi-column layout | Columns break between child blocks. One paragraph doesn't split across columns |
 | `writing-mode: vertical-lr` | Lines are ordered right to left, like `vertical-rl` |
 | Tailwind CSS v4 | `@import "tailwindcss"` compiles the classes in the page when they appear, with `@theme`, `@custom-variant`, `@utility` and `@apply`. `@plugin`, `@source`, `@config` and the `prefix()`, `source()` and `important` import options are not supported. An `@utility` that applies itself, directly or through other utilities, skips that `@apply`, where Tailwind reports an error |

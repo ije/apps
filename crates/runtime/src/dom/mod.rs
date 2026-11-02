@@ -370,6 +370,7 @@ pub struct State {
     pub(crate) containers: HashMap<usize, [f32; 2]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
+    /// The padding boxes of containing blocks. They stay between frames, so absolute boxes size in last frame's.
     pub(crate) blocks: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
 }

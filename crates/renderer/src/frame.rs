@@ -577,6 +577,7 @@ impl RenderFrame {
             };
             let mut composite = base;
             composite.flags = COMPOSITE_BACKDROP | COMPOSITE_CLIP;
+            composite.opacity = effect.opacity;
             composite.bounds = rect(backdrop.bounds);
             composite.clip = composite.bounds;
             composite.clip_radii = radii(&backdrop.corner_radii);

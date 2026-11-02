@@ -1007,7 +1007,6 @@ impl WebView {
             })
         });
         dom.containers.clear();
-        dom.blocks.clear();
         dom.flexed_grids.clear();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));

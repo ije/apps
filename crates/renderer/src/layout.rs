@@ -390,7 +390,7 @@ impl Tree<'_> {
             let mut output = match tree.nodes[index].style.display {
                 Display::None => taffy::compute_hidden_layout(tree, node),
                 _ if leaf => tree.measure(index, inputs),
-                Display::Flex => taffy::compute_flexbox_layout(tree, node, inputs),
+                Display::Flex => tree.flexbox(node, inputs),
                 Display::Grid => taffy::compute_grid_layout(tree, node, inputs),
                 _ => taffy::compute_block_layout(tree, node, inputs, block),
             };
@@ -402,6 +402,50 @@ impl Tree<'_> {
         });
         if inputs.run_mode == RunMode::PerformLayout {
             self.nodes[usize::from(node)].baselines = output.baselines;
+        }
+        output
+    }
+
+    /// Lays out a flex container. A row container sized by its content in a definite width fits it, between
+    /// its min-content and max-content widths, like Chrome; taffy gives a one-line container its max-content
+    /// width, which overflows.
+    fn flexbox(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
+        let output = taffy::compute_flexbox_layout(self, node, inputs);
+        let style = &self.nodes[usize::from(node)].style;
+        if inputs.known_dimensions.width.is_none()
+            && matches!(
+                style.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            )
+            && let taffy::AvailableSpace::Definite(available) = inputs.available_space.width
+            && output.size.width > available
+        {
+            let min = taffy::compute_flexbox_layout(
+                self,
+                node,
+                LayoutInput {
+                    run_mode: RunMode::ComputeSize,
+                    available_space: taffy::Size {
+                        width: taffy::AvailableSpace::MinContent,
+                        ..inputs.available_space
+                    },
+                    ..inputs
+                },
+            );
+            let width = available.max(min.size.width);
+            if width < output.size.width {
+                return taffy::compute_flexbox_layout(
+                    self,
+                    node,
+                    LayoutInput {
+                        known_dimensions: taffy::Size {
+                            width: Some(width),
+                            ..inputs.known_dimensions
+                        },
+                        ..inputs
+                    },
+                );
+            }
         }
         output
     }

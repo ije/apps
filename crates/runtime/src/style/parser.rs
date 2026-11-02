@@ -134,6 +134,9 @@ impl<'i> DeclarationParser<'i> for Rules {
         };
         input.parse_until_before(delimiters, |input| source(input, &mut value))?;
         value.truncate(value.trim_end().len());
+        if value.contains("env(") {
+            value = environment(&value);
+        }
         if value.is_empty() && !custom {
             return Err(ParseError::unexpected_token());
         }
@@ -769,6 +772,62 @@ fn condition(
     } else {
         MediaQuery::Or(items)
     })
+}
+
+/// Replaces `env()`: a desktop window has no safe area or keyboard insets, so they are `0px`, and other
+/// names take their fallback. One without a fallback stays and makes the value invalid.
+fn environment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("env(") {
+        let body = &rest[start + 4..];
+        let (mut depth, mut comma, mut end) = (1, None, None);
+        for (index, c) in body.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                ',' if depth == 1 && comma.is_none() => comma = Some(index),
+                _ => {}
+            }
+        }
+        let name = body[..comma.or(end).unwrap_or(body.len())].trim();
+        let replacement =
+            if rest[..start].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_')) {
+                None
+            } else if [
+                "safe-area-inset-",
+                "safe-area-max-inset-",
+                "keyboard-inset-",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            {
+                Some("0px")
+            } else {
+                comma
+                    .zip(end)
+                    .map(|(comma, end)| body[comma + 1..end].trim())
+            };
+        match (replacement, end) {
+            (Some(replacement), Some(end)) => {
+                out.push_str(&rest[..start]);
+                out.push_str(replacement);
+                rest = &body[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..start + 4]);
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn source(input: &mut Parser<'_>, output: &mut String) -> Result<(), ParseError<()>> {

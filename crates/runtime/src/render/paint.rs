@@ -76,6 +76,8 @@ impl renderer::Element for Turned {
 pub(super) struct Effected {
     pub(super) effect: renderer::PaintEffect,
     pub(super) child: AnyElement,
+    /// The corner radii of the effect's backdrop, which covers the child's box.
+    pub(super) backdrop: Option<renderer::Radii<renderer::Length>>,
 }
 
 impl IntoElement for Effected {
@@ -94,8 +96,15 @@ impl renderer::Element for Effected {
     fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), window: &mut Window) {
         self.child.prepaint(window);
     }
-    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
-        window.paint_effect(self.effect.clone(), |window| self.child.paint(window));
+    fn paint(&mut self, bounds: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
+        let mut effect = self.effect.clone();
+        if let Some(backdrop) = effect.backdrop.as_mut()
+            && let Some(radii) = &self.backdrop
+        {
+            backdrop.bounds = bounds;
+            backdrop.corner_radii = radii.resolve(bounds.size);
+        }
+        window.paint_effect(effect, |window| self.child.paint(window));
     }
 }
 
@@ -109,7 +118,10 @@ pub(super) struct DomBox {
     pub(super) sticky: Option<(renderer::ScrollHandle, [f32; 4], Option<usize>)>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
+    /// The containing block of an absolute box when it is not the parent, `0` for the initial one.
     pub(super) container: Option<usize>,
+    /// The containing block size the box was laid out in, taken from the last frame.
+    pub(super) sized: Option<[f32; 2]>,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
     /// The group opacity, when the box paints through an effect layer.
@@ -228,11 +240,25 @@ impl renderer::Element for DomBox {
             && let Some(block) = {
                 let view = &*self.view;
                 let host = view.host.borrow();
-                host.dom
-                    .get(&view.id)
-                    .and_then(|dom| dom.blocks.get(&container).copied())
+                host.dom.get(&view.id).and_then(|dom| match container {
+                    0 => dom.scroll.get(&0).map(|scroll| {
+                        let [width, height] = self.units.viewport;
+                        Bounds::new(
+                            scroll.bounds().origin + scroll.offset(),
+                            renderer::size(px(width), px(height)),
+                        )
+                    }),
+                    _ => dom.blocks.get(&container).copied(),
+                })
             }
         {
+            // WARNING: the box was sized in last frame's block, so a block that changed size draws again.
+            if self.sized.is_some_and(|[width, height]| {
+                (f32::from(block.size.width) - width).abs() > 0.5
+                    || (f32::from(block.size.height) - height).abs() > 0.5
+            }) {
+                window.redraw();
+            }
             let [top, right, bottom, left] = self.inset;
             let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
             let mut shift = point(px(0.), px(0.));
@@ -540,7 +566,13 @@ impl DomBox {
             }
             masks.get(&self.id).map(|(_, image)| (image.clone(), bounds))
         });
+        // A hidden or transparent box filters nothing, so it skips the copy and blur of what is behind it.
+        let shown = self.effects.unwrap_or(1.) > 0.
+            && style
+                .get(Prop::VISIBILITY)
+                .is_none_or(|value| value == "visible");
         let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
+            .filter(|_| shown)
             .and_then(|value| effects::backdrop(value, &units))
             .map(|(blur, color_matrix)| renderer::Backdrop {
                 bounds,

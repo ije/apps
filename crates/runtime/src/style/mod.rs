@@ -19,8 +19,8 @@ pub use color::color;
 pub(crate) use parser::{DROPPED, FontUnits, Lengths};
 use shorthand::expand;
 pub(crate) use text::{
-    InlineText, LineHeight, cursor, font, inline_text, line_height, restyle, selection_colors,
-    spacing, text_transform, word_break,
+    InlineText, LineHeight, cursor, font, inline_text, line_height, phantom, restyle,
+    selection_colors, spacing, splits, text_run, text_transform, word_break,
 };
 pub use value::length;
 pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, clip_path, components};
@@ -4111,24 +4111,7 @@ pub(crate) fn cascade(
                 _ => {}
             }
         }
-        if LOGICAL
-            .iter()
-            .any(|(logical, ..)| cascade.contains_key(logical))
-        {
-            let rtl = match cascade.get(&Prop::DIRECTION).map(|(_, value)| &**value) {
-                Some("rtl") => true,
-                Some("ltr") => false,
-                _ => style.get(Prop::DIRECTION) == Some("rtl"),
-            };
-            for (logical, ltr, rtl_side) in LOGICAL {
-                if let Some((rank, value)) = cascade.remove(&logical) {
-                    let physical = if rtl { rtl_side } else { ltr };
-                    if cascade.get(&physical).is_none_or(|(old, _)| rank >= *old) {
-                        cascade.insert(physical, (rank, value));
-                    }
-                }
-            }
-        }
+        physical(&mut cascade, &style);
         let explicit_size = cascade.contains_key(&Prop::FONT_SIZE);
         let mut declared = Vec::new();
         style.extend(cascade.into_iter().filter_map(|(prop, (_, value))| {
@@ -4499,8 +4482,9 @@ pub(crate) fn cascade(
             starts.insert(id, values.clone());
             values
         });
-        let derive = |cascade: BTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
+        let derive = |mut cascade: BTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
             (!cascade.is_empty()).then(|| {
+                physical(&mut cascade, &style);
                 let mut values: Style = style
                     .own()
                     .filter(|(prop, _)| prop.inherited())
@@ -5167,6 +5151,32 @@ pub(crate) fn cascade(
 }
 
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
+
+/// Moves logical sides in a cascade to the physical sides of its direction, or of the parent's.
+fn physical<V: AsRef<str>>(cascade: &mut BTreeMap<Prop, (CascadeRank, V)>, parent: &Style) {
+    if !LOGICAL
+        .iter()
+        .any(|(logical, ..)| cascade.contains_key(logical))
+    {
+        return;
+    }
+    let rtl = match cascade
+        .get(&Prop::DIRECTION)
+        .map(|(_, value)| value.as_ref())
+    {
+        Some("rtl") => true,
+        Some("ltr") => false,
+        _ => parent.get(Prop::DIRECTION) == Some("rtl"),
+    };
+    for (logical, ltr, rtl_side) in LOGICAL {
+        if let Some((rank, value)) = cascade.remove(&logical) {
+            let physical = if rtl { rtl_side } else { ltr };
+            if cascade.get(&physical).is_none_or(|(old, _)| rank >= *old) {
+                cascade.insert(physical, (rank, value));
+            }
+        }
+    }
+}
 
 const LOGICAL: [(Prop, Prop, Prop); 16] = [
     (

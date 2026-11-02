@@ -241,6 +241,125 @@ pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::P
     )
 }
 
+/// CSS 2.1 9.4.2: an inline box without content and without inline padding, border or margin makes no line.
+pub(crate) fn phantom(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    let node = &doc.nodes[id];
+    let style = &styles.values[id];
+    match node.tag.as_str() {
+        "#comment" => return true,
+        "#text" => {
+            return node.text.trim_ascii().is_empty()
+                && style.get(Prop::WHITE_SPACE).is_none_or(|value| {
+                    !matches!(value, "pre" | "pre-wrap" | "pre-line" | "break-spaces")
+                });
+        }
+        "br" | "img" | "svg" | "canvas" | "video" | "audio" | "iframe" | "embed" | "object"
+        | "input" | "button" | "select" | "textarea" | "progress" | "meter" => return false,
+        _ => {}
+    }
+    if style.get(Prop::DISPLAY) == Some("none")
+        || style
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+    {
+        return true;
+    }
+    let units = &styles.lengths[id];
+    style
+        .get(Prop::DISPLAY)
+        .is_none_or(|value| value == "inline")
+        && !styles.pseudos.contains_key(&id)
+        && [super::PADDING, super::MARGIN].iter().all(|edges| {
+            [1, 3]
+                .iter()
+                .all(|&side| units.edges(style, *edges, 0.)[side] == 0.)
+        })
+        && super::BORDERS
+            .iter()
+            .enumerate()
+            .all(|(side, [width, kind, _])| {
+                side % 2 == 0
+                    || style
+                        .get(*kind)
+                        .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                    || style
+                        .get(*width)
+                        .is_some_and(|width| units.resolve(width, 0.) == Some(0.))
+            })
+        && node
+            .children
+            .iter()
+            .all(|&child| phantom(doc, styles, child))
+}
+
+/// Removes the last character of inline text, a space or a line break, from its run and ranges.
+fn pop(
+    text: &mut String,
+    runs: &mut Vec<renderer::TextRun>,
+    ranges: &mut [(usize, std::ops::Range<usize>)],
+) {
+    text.pop();
+    if let Some(run) = runs.last_mut() {
+        run.len -= 1;
+        if run.len == 0 {
+            runs.pop();
+        }
+    }
+    for (_, range) in ranges {
+        range.start = range.start.min(text.len());
+        range.end = range.end.min(text.len());
+    }
+}
+
+/// Whether an inline box holds a block-level box. The block splits it into the lines before and after it, so
+/// the box lays out as a block.
+pub(crate) fn splits(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    let inline = |id: usize| {
+        let tag = doc.nodes[id].tag.as_str();
+        !tag.starts_with('#')
+            && styles.values[id]
+                .get(Prop::DISPLAY)
+                .is_none_or(|value| value == "inline")
+            && !matches!(
+                tag,
+                "svg"
+                    | "canvas"
+                    | "video"
+                    | "audio"
+                    | "iframe"
+                    | "object"
+                    | "embed"
+                    | "select"
+                    | "textarea"
+            )
+    };
+    if !inline(id) {
+        return false;
+    }
+    let mut pending: Vec<usize> = doc.nodes[id].children.clone();
+    while let Some(child) = pending.pop() {
+        let style = &styles.values[child];
+        // A `<br>` is a line break whatever its display.
+        if doc.nodes[child].tag.starts_with('#')
+            || doc.nodes[child].tag == "br"
+            || style
+                .get(Prop::POSITION)
+                .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+        {
+            continue;
+        }
+        match style.get(Prop::DISPLAY) {
+            Some("none") => {}
+            Some("contents") => pending.extend(&doc.nodes[child].children),
+            _ if inline(child) => pending.extend(&doc.nodes[child].children),
+            Some(value) if !value.starts_with("inline") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Builds one text layout for an element whose content is only text and plain inline elements.
 pub(crate) fn inline_text(
     doc: &Document,
@@ -272,25 +391,49 @@ pub(crate) fn inline_text(
     let inline_sibling = |sibling: Option<&usize>| {
         own && !item
             && sibling.is_some_and(|&sibling| {
-                !doc.nodes[sibling].tag.starts_with('#')
-                    && doc.nodes[sibling].tag != "br"
-                    && styles.values[sibling]
-                        .get(Prop::DISPLAY)
-                        .is_none_or(|value| value.starts_with("inline"))
+                doc.nodes[sibling].tag == "#text"
+                    || !doc.nodes[sibling].tag.starts_with('#')
+                        && doc.nodes[sibling].tag != "br"
+                        && styles.values[sibling]
+                            .get(Prop::DISPLAY)
+                            .is_none_or(|value| value.starts_with("inline"))
+                        && !splits(doc, styles, sibling)
             })
     };
-    let trailing = inline_sibling(siblings.get(position + 1));
+    // Boxes that make no line, like empty inlines, keep no spaces around them.
+    let trailing = inline_sibling(
+        siblings
+            .get(position + 1..)
+            .and_then(|rest| rest.iter().find(|&&sibling| !phantom(doc, styles, sibling))),
+    );
     let mut text = String::new();
     let mut runs: Vec<renderer::TextRun> = Vec::new();
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
     let mut backgrounds = Vec::new();
     let mut cursors = Vec::new();
-    let mut space = !inline_sibling(
-        position
-            .checked_sub(1)
-            .and_then(|index| siblings.get(index)),
-    );
+    // Inline `::before` and `::after` boxes are content of the line, so spaces next to them stay.
+    let [before, after] = [0, 1].map(|index| {
+        !own && styles.pseudos.get(&id).is_some_and(|pseudos| {
+            let pseudo = &pseudos[index];
+            pseudo
+                .get(Prop::CONTENT)
+                .is_some_and(|value| !matches!(value, "none" | "normal"))
+                && pseudo
+                    .get(Prop::DISPLAY)
+                    .is_none_or(|value| value.starts_with("inline"))
+                && !pseudo
+                    .get(Prop::POSITION)
+                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+        })
+    });
+    let trailing = trailing || after;
+    let mut space = !before
+        && !inline_sibling(siblings.get(..position).and_then(|rest| {
+            rest.iter()
+                .rev()
+                .find(|&&sibling| !phantom(doc, styles, sibling))
+        }));
     let mut pending: Vec<_> = if own {
         vec![(id, None, None)]
     } else {
@@ -309,10 +452,21 @@ pub(crate) fn inline_text(
         }
         let node = &doc.nodes[child];
         let style = &styles.values[child];
-        if node.tag == "#comment" {
+        // Comments and hidden boxes, like a hidden `<br>`, add nothing to the text.
+        if node.tag == "#comment"
+            || !node.tag.starts_with('#') && style.get(Prop::DISPLAY) == Some("none")
+        {
             continue;
         }
         if node.tag == "br" {
+            // A collapsible space before a forced break hangs, so it takes no room in its line.
+            if text.ends_with(' ')
+                && !style
+                    .get(Prop::WHITE_SPACE)
+                    .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
+            {
+                pop(&mut text, &mut runs, &mut ranges);
+            }
             // An empty range gives the `<br>` a box at the end of its line, like Chrome.
             ranges.push((child, text.len()..text.len()));
             text.push('\n');
@@ -355,6 +509,16 @@ pub(crate) fn inline_text(
             || style.iter().any(|(key, value)| {
                 !key.is_custom()
                     && parent.value(key) != Some(value)
+                    // A relative box that is not moved lays out like a static one.
+                    && !(key == Prop::POSITION
+                        && &**value == "relative"
+                        && [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT, Prop::Z_INDEX]
+                            .into_iter()
+                            .all(|prop| {
+                                style
+                                    .get(prop)
+                                    .is_none_or(|value| matches!(value, "auto" | "0" | "0px"))
+                            }))
                     && !matches!(
                         &**value,
                         "" | "0"
@@ -509,17 +673,7 @@ pub(crate) fn inline_text(
             .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
         || text.ends_with('\n')
     {
-        text.pop();
-        if let Some(run) = runs.last_mut() {
-            run.len -= 1;
-            if run.len == 0 {
-                runs.pop();
-            }
-        }
-        for (_, range) in &mut ranges {
-            range.start = range.start.min(text.len());
-            range.end = range.end.min(text.len());
-        }
+        pop(&mut text, &mut runs, &mut ranges);
     }
     if text.is_empty() {
         return None;

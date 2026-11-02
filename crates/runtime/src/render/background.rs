@@ -367,12 +367,14 @@ pub(super) fn css_background(
                 ..Default::default()
             },
             child: layer,
+            backdrop: None,
         });
     }
     vec![
         Effected {
             effect: renderer::PaintEffect::default(),
             child: group.into_any_element(),
+            backdrop: None,
         }
         .into_any_element(),
     ]

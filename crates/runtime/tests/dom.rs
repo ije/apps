@@ -673,6 +673,7 @@ fn core_dom_interfaces_follow_the_standard() {
       check('classList.forEach', () => { let n = 0; a.classList.forEach(() => n++); return n === 2; });
       check('classList identity', () => a.classList === a.classList);
       check('DOMTokenList', () => a.classList instanceof DOMTokenList);
+      check('classList index', () => a.classList[0] === 'x' && a.classList[1] === 'y' && a.classList[2] === undefined && 1 in a.classList && !(2 in a.classList));
       check('textContent skips comments', () => a.textContent === 'tu');
       check('template content', () => { const t = document.getElementById('t'); return t.content instanceof DocumentFragment && t.content.firstChild?.localName === 'p' && t.childNodes.length === 0; });
       check('template innerHTML', () => { const t = document.createElement('template'); t.innerHTML = '<b>x</b>'; return t.content.firstChild.localName === 'b' && t.innerHTML === '<b>x</b>' && t.cloneNode(true).content.firstChild?.localName === 'b'; });

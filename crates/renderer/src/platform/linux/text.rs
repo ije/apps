@@ -298,11 +298,6 @@ impl State {
             let font = system
                 .get_font(id, fontdb::Weight::NORMAL)
                 .context("Could not load font")?;
-            // A primary font must have `m`, which text measures with. Faces without Latin
-            // glyphs stay in the database for cosmic-text to fall back to.
-            if font.as_swash().charmap().map('m') == 0 {
-                continue;
-            }
             let font_id = FontId(self.loaded.len());
             ids.push(font_id);
             self.loaded

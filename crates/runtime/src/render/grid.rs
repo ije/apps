@@ -585,7 +585,7 @@ pub(crate) fn intrinsic(
     if matches!(node.tag.as_str(), "svg" | "img" | "canvas" | "video") {
         let default = match node.tag.as_str() {
             "svg" => [24., 24.],
-            "canvas" => [300., 150.],
+            "canvas" | "video" => [300., 150.],
             _ => [0., 0.],
         };
         let [width, height] = [0, 1].map(|axis| {
@@ -719,6 +719,7 @@ pub(crate) fn intrinsic(
             if styles.values[child]
                 .get(Prop::POSITION)
                 .is_some_and(|v| matches!(v, "absolute" | "fixed"))
+                || styles.values[child].get(Prop::DISPLAY) == Some("none")
                 || !preserve
                     && doc.nodes[child].tag == "#text"
                     && doc.nodes[child].text.trim_ascii().is_empty()
@@ -780,6 +781,100 @@ pub(crate) fn intrinsic(
         }
         content[1] = content[1].max(run);
         content[2] += line[1];
+    }
+    // `::before` and `::after` boxes take room in the first and last line, or stack as blocks.
+    if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| {
+        !matches!(
+            node.tag.as_str(),
+            "img" | "svg" | "canvas" | "video" | "input" | "textarea" | "select"
+        )
+    }) {
+        for pseudo in pseudos.iter() {
+            let Some(value) = pseudo
+                .get(Prop::CONTENT)
+                .filter(|value| !matches!(*value, "none" | "normal"))
+            else {
+                continue;
+            };
+            if pseudo.get(Prop::DISPLAY) == Some("none")
+                || pseudo
+                    .get(Prop::POSITION)
+                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            {
+                continue;
+            }
+            let mut units = *units;
+            if let Some(size) = pseudo
+                .get(Prop::FONT_SIZE)
+                .and_then(|value| units.resolve(value, units.font.em))
+            {
+                units.font = style::FontUnits::new(size);
+            }
+            let [padding, margin] =
+                [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
+            let border = style::BORDERS.map(|[width, kind, _]| {
+                if pseudo
+                    .get(kind)
+                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                {
+                    return 0.;
+                }
+                pseudo
+                    .get(width)
+                    .map_or(Some(3.), |value| units.resolve(value, base))
+                    .unwrap_or(0.)
+                    .max(0.)
+            });
+            let sides = |axis: usize| {
+                let inner =
+                    padding[1 - axis] + padding[3 - axis] + border[1 - axis] + border[3 - axis];
+                let outer = margin[1 - axis] + margin[3 - axis];
+                match pseudo.get(Prop::BOX_SIZING) {
+                    Some("border-box") => [outer, outer + inner],
+                    _ => [inner + outer; 2],
+                }
+            };
+            let string = super::element::pseudo_content(doc, id, pseudo, value);
+            let [width, height] = [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
+                pseudo
+                    .get(prop)
+                    .and_then(|value| units.resolve(value, base))
+            });
+            let width = match width {
+                Some(width) => width + sides(0)[0],
+                None if string.is_empty() => sides(0)[1],
+                None => {
+                    let run = style::text_run(pseudo, &units, string.len());
+                    let shaped = text
+                        .shape_text(
+                            string.into(),
+                            renderer::px(units.font.em),
+                            &[run],
+                            None,
+                            None,
+                            style::word_break(pseudo),
+                        )
+                        .unwrap_or_default();
+                    shaped
+                        .iter()
+                        .map(|line| f32::from(line.unwrapped_layout.width))
+                        .fold(0., f32::max)
+                        + sides(0)[1]
+                }
+            };
+            if pseudo
+                .get(Prop::DISPLAY)
+                .is_none_or(|value| value.starts_with("inline"))
+            {
+                content[0] = content[0].max(width);
+                content[1] += width;
+            } else {
+                content[0] = content[0].max(width);
+                content[1] = content[1].max(width);
+                content[2] +=
+                    height.map_or(units.font.lh + sides(1)[1], |height| height + sides(1)[0]);
+            }
+        }
     }
     let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
     // Like Chrome, replaced boxes sized against their container add nothing to the min-content width.

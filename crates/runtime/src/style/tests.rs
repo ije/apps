@@ -2492,3 +2492,54 @@ fn nested_var_fallbacks_resolve_and_stay_bounded() {
     assert_eq!(computed[element(&doc, "#a")]["color"], "red");
     assert!(computed[element(&doc, "#b")].contains_key("color"));
 }
+
+#[test]
+fn env_safe_area_insets_are_zero_and_other_names_take_their_fallback() {
+    let style = declarations(
+        "padding-left: max(22px, env(safe-area-inset-left)); margin-top: env(titlebar-area-height, 7px); --x: var(--y, env(safe-area-inset-right)); width: env(unknown)",
+    );
+    assert_eq!(style.get(Prop::PADDING_LEFT), Some("max(22px, 0px)"));
+    assert_eq!(style.get(Prop::MARGIN_TOP), Some("7px"));
+    assert_eq!(style.get(Prop::new("--x")), Some("var(--y, 0px)"));
+    assert_eq!(style.get(Prop::WIDTH), Some("env(unknown)"));
+}
+
+#[test]
+fn block_in_inline_splits_and_empty_inlines_make_no_line() {
+    let doc = Document::parse(
+        "<div id=h style='all:unset'><aside style='display:none'>x</aside><nav style='position:absolute'></nav><div id=p></div></div>\
+         <span id=s> <i></i> <b style='position:absolute'>x</b> </span><span id=t style='padding-left:1px'></span><em id=u>x</em>\
+         <p id=q>a <br class=x>b <br>c</p><style>br.x{display:none}</style>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let id = |name: &str| {
+        (0..doc.nodes.len())
+            .find(|&id| {
+                doc.nodes[id]
+                    .attrs
+                    .get("id")
+                    .is_some_and(|value| value == name)
+            })
+            .unwrap()
+    };
+    assert!(splits(&doc, &computed, id("h")));
+    assert!(!splits(&doc, &computed, id("s")));
+    assert!(phantom(&doc, &computed, id("s")));
+    assert!(!phantom(&doc, &computed, id("t")));
+    assert!(!phantom(&doc, &computed, id("u")));
+    // A hidden `<br>` breaks nothing, and the space before a break hangs.
+    let inline = inline_text(&doc, &computed, id("q")).unwrap();
+    assert_eq!(&*inline.text, "a b\nc");
+    assert_eq!(
+        inline.runs.iter().map(|run| run.len).sum::<usize>(),
+        inline.text.len()
+    );
+}

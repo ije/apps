@@ -119,6 +119,11 @@ pub(super) fn element(
             } else {
                 "inline"
             });
+    let display = if display == "inline" && style::splits(doc, styles, id) {
+        "block"
+    } else {
+        display
+    };
     let order = style
         .get(Prop::Z_INDEX)
         .and_then(|value| value.parse::<i32>().ok());
@@ -206,6 +211,66 @@ pub(super) fn element(
     let build = &child_build;
     let mut units = styles.lengths[id];
     units.container = Some(container);
+    let position = style.get(Prop::POSITION).unwrap_or("static");
+    let mut parent = node.parent;
+    while let Some(ancestor) = parent
+        && styles.values[ancestor]
+            .get(Prop::DISPLAY)
+            .is_some_and(|value| value == "contents")
+    {
+        parent = doc.nodes[ancestor].parent;
+    }
+    let contains = |style: &style::Style, fixed: bool| {
+        !fixed
+            && style
+                .get(Prop::POSITION)
+                .is_some_and(|value| value != "static")
+            || [
+                Prop::TRANSFORM,
+                Prop::FILTER,
+                Prop::PERSPECTIVE,
+                Prop::BACKDROP_FILTER,
+            ]
+            .into_iter()
+            .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
+            || style.get(Prop::CONTAIN).is_some_and(|value| {
+                ["paint", "layout", "strict", "content"]
+                    .iter()
+                    .any(|kind| value.contains(kind))
+            })
+            || style
+                .get(Prop::WILL_CHANGE)
+                .is_some_and(|value| value.contains("transform"))
+    };
+    // The containing block of an absolute box: its nearest positioned ancestor, or `0` for the initial
+    // containing block, the viewport at the top of the page.
+    let positioner = matches!(position, "absolute" | "fixed")
+        .then(|| {
+            ancestors
+                .iter()
+                .rev()
+                .copied()
+                .find(|&ancestor| contains(&styles.values[ancestor], position == "fixed"))
+                .or((position == "absolute" && id != 0).then_some(0))
+        })
+        .flatten();
+    // Layout sizes a box in its parent, so a containing block that is not the parent gives the size here: the
+    // viewport, or the block's padding box in the last frame.
+    let block_size = if position == "fixed" && positioner.is_none() {
+        Some(units.viewport)
+    } else {
+        positioner
+            .filter(|&block| Some(block) != parent)
+            .and_then(|block| {
+                if block == 0 {
+                    return Some(units.viewport);
+                }
+                let host = view.host.borrow();
+                let bounds = host.dom.get(&view.id)?.blocks.get(&block)?.size;
+                Some([f32::from(bounds.width), f32::from(bounds.height)])
+            })
+    };
+    let containing = block_size.unwrap_or(containing);
     // WARNING: element building and layout recurse per level, so deep pages must not overflow the stack.
     if chain.len() > 256 || style.get(Prop::DISPLAY).is_some_and(|s| s == "none") {
         return div().hidden().into_any_element();
@@ -363,7 +428,11 @@ pub(super) fn element(
             .is_some_and(|value| value == "contents")
         {
             pending.extend(doc.nodes[child].children.iter().rev());
-        } else if doc.nodes[child].tag != "#comment" {
+        } else if doc.nodes[child].tag != "#comment"
+            // A hidden `<br>` breaks no line.
+            && !(doc.nodes[child].tag == "br"
+                && styles.values[child].get(Prop::DISPLAY) == Some("none"))
+        {
             flat.push(child);
         }
     }
@@ -375,10 +444,12 @@ pub(super) fn element(
     };
     let inline_level = |child: usize| {
         doc.nodes[child].tag.starts_with('#')
+            || doc.nodes[child].tag == "br"
             || !floated(child)
                 && styles.values[child]
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| value.starts_with("inline"))
+                && !style::splits(doc, styles, child)
             || styles.values[child]
                 .get(Prop::POSITION)
                 .is_some_and(|value| matches!(value, "absolute" | "fixed"))
@@ -392,8 +463,13 @@ pub(super) fn element(
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
             .is_none();
-    let all_inline =
-        flow && !flat.is_empty() && !breaks && flat.iter().all(|&child| inline_level(child));
+    // Boxes with `display: none` generate nothing, so they keep the content inline.
+    let all_inline = flow
+        && !flat.is_empty()
+        && !breaks
+        && flat.iter().all(|&child| {
+            inline_level(child) || styles.values[child].get(Prop::DISPLAY) == Some("none")
+        });
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     let line_justify = match (style.get(Prop::TEXT_ALIGN), rtl) {
         (Some("right" | "-webkit-right"), _)
@@ -407,12 +483,22 @@ pub(super) fn element(
         el = el.flex_row().flex_wrap();
         el.style().justify_content = line_justify;
         el.style().align_items = line_align;
+        // Text merged into one layout has the strut in its line metrics, so only lines of separate boxes get one.
+        let merged = !text_field(node)
+            && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
+            && inline_text
+                .borrow_mut()
+                .entry(id)
+                .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
+                .is_some();
         if display != "inline"
+            && !merged
             && flat.iter().any(|&child| {
                 !doc.nodes[child].tag.starts_with('#')
                     && doc.nodes[child].tag != "br"
                     && styles.values[child].get(Prop::DISPLAY) != Some("inline")
                     && in_flow(doc, info, child)
+                    && !style::phantom(doc, styles, child)
             })
         {
             el = el.child(strut());
@@ -530,18 +616,31 @@ pub(super) fn element(
         }
     }
     if node.tag == "svg" {
-        let width = style
-            .get(Prop::WIDTH)
-            .and_then(|v| units.resolve(v, containing[0]))
-            .or_else(|| node.attrs.get("width").and_then(|v| dimension(v, false)))
-            .unwrap_or(24.)
-            .clamp(1., 4096.);
-        let height = style
-            .get(Prop::HEIGHT)
-            .and_then(|v| units.resolve(v, containing[1]))
-            .or_else(|| node.attrs.get("height").and_then(|v| dimension(v, false)))
-            .unwrap_or(24.)
-            .clamp(1., 4096.);
+        // CSS `width` and `height` override the attributes, and `auto` leaves the side to the other one.
+        let [width, height] = [(Prop::WIDTH, "width"), (Prop::HEIGHT, "height")]
+            .into_iter()
+            .enumerate()
+            .map(|(axis, (prop, attr))| match style.get(prop) {
+                Some(value) => units.resolve(value, containing[axis]),
+                None => node.attrs.get(attr).and_then(|v| dimension(v, false)),
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            unreachable!()
+        };
+        let ratio = node.attrs.get("viewBox").and_then(|value| {
+            let parts: Vec<f32> = value
+                .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                .filter_map(|part| part.parse().ok())
+                .collect();
+            (parts.len() == 4 && parts[2] > 0. && parts[3] > 0.).then(|| parts[2] / parts[3])
+        });
+        let [width, height] = match (width, height, ratio) {
+            (None, Some(height), Some(ratio)) => [height * ratio, height],
+            (Some(width), None, Some(ratio)) => [width, width / ratio],
+            _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
+        }
+        .map(|value| value.clamp(1., 4096.));
         let paint = [
             Prop::FILL,
             Prop::FILL_OPACITY,
@@ -714,15 +813,7 @@ pub(super) fn element(
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
-    let editable = node.tag == "textarea"
-        || input.is_some_and(|kind| {
-            ![
-                "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
-                "range", "hidden",
-            ]
-            .iter()
-            .any(|other| kind.eq_ignore_ascii_case(other))
-        });
+    let editable = text_field(node);
     if input.is_some_and(|kind| kind.eq_ignore_ascii_case("file")) {
         // Chrome's file input: a button, 4px, then the file status, at least as wide as 34 zeros.
         let dark = style::dark(style);
@@ -1527,7 +1618,6 @@ pub(super) fn element(
         }
     }
     let flexbox = matches!(display, "flex" | "inline-flex");
-    let position = style.get(Prop::POSITION).unwrap_or("static");
     let basis = || {
         [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
             let base = containing[usize::from(prop == Prop::HEIGHT)];
@@ -1577,19 +1667,25 @@ pub(super) fn element(
                     .and_then(|s| s.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    if extra[axis] > 0. && base > 0. {
+                    if block_size.is_some() || extra[axis] > 0. && base > 0. {
                         px(percent.max(0.) / 100. * base + extra[axis]).into()
                     } else {
                         relative(percent.max(0.) / 100.)
                     }
                 } else if let Some(length) = length() {
                     px(length.max(0.) + extra[axis]).into()
-                } else if matches!(prop, Prop::WIDTH | Prop::HEIGHT) && value == "auto"
+                } else if matches!(prop, Prop::WIDTH | Prop::HEIGHT)
+                    && value == "auto"
+                    && node.tag != "svg"
                     // A table's automatic width shrinks to fit, unless it stretches in a flex column.
                     || prop == Prop::WIDTH
                         && node.tag == "table"
                         && value == "fit-content"
                         && stretched
+                    // An absolute box shrinks to fit in layout, which sizes replaced content from its used height.
+                    || prop == Prop::WIDTH
+                        && value == "fit-content"
+                        && matches!(position, "absolute" | "fixed")
                 {
                     renderer::Length::Auto
                 } else if matches!(value, "stretch" | "-webkit-fill-available") {
@@ -1673,7 +1769,8 @@ pub(super) fn element(
                     _ => renderer::FlexWrap::NoWrap,
                 }
             }
-            Prop::FLEX_GROW | Prop::FLEX_SHRINK => {
+            // Flex item properties apply only in flex containers, not in blocks laid out as columns.
+            Prop::FLEX_GROW | Prop::FLEX_SHRINK if flex_parent => {
                 if let Some(factor) = value
                     .parse::<f32>()
                     .ok()
@@ -1686,7 +1783,7 @@ pub(super) fn element(
                     }
                 }
             }
-            Prop::FLEX_BASIS => {
+            Prop::FLEX_BASIS if flex_parent => {
                 // The basis runs along the parent's main axis.
                 let axis = usize::from(node.parent.is_some_and(|parent| {
                     styles.values[parent]
@@ -1761,7 +1858,10 @@ pub(super) fn element(
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    relative(percent / 100.)
+                    match block_size {
+                        Some(_) => px(percent / 100. * base).into(),
+                        None => relative(percent / 100.),
+                    }
                 } else if let Some(length) = length() {
                     px(length).into()
                 } else {
@@ -1806,6 +1906,30 @@ pub(super) fn element(
                 }
             }
             _ => {}
+        }
+    }
+    // An absolute box with an auto size and both insets fills its containing block between them.
+    if block_size.is_some() {
+        for (axis, size, sides) in [(0, Prop::WIDTH, [3, 1]), (1, Prop::HEIGHT, [0, 2])] {
+            let [start, end] = sides.map(|side| {
+                style
+                    .get([Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT][side])
+                    .and_then(|value| units.resolve(value, containing[axis]))
+            });
+            if style.get(size).is_none_or(|value| value == "auto")
+                && let (Some(start), Some(end)) = (start, end)
+            {
+                let length =
+                    px(
+                        (containing[axis] - start - end - margin[sides[0]] - margin[sides[1]])
+                            .max(0.),
+                    );
+                el = if axis == 0 {
+                    el.w(length)
+                } else {
+                    el.h(length)
+                };
+            }
         }
     }
     // A block with an auto width fills its line, so auto side margins only center it when
@@ -2006,7 +2130,9 @@ pub(super) fn element(
                 _ => padding[2] + borders[2] + below(style, units.font),
             };
         // WARNING: the margin reserves the shift so the line box grows instead of overlapping its neighbors.
-        if raise != 0. || reserve > margin[0] || margin[2] < floor {
+        if !style::phantom(doc, styles, id)
+            && (raise != 0. || reserve > margin[0] || margin[2] < floor)
+        {
             el = el
                 .mt(px((margin[0] + raise).max(reserve)))
                 .mb(px((margin[2] - raise).max(floor)));
@@ -2508,68 +2634,7 @@ pub(super) fn element(
             {
                 continue;
             }
-            let mut text = String::new();
-            for part in style::components(content, ' ') {
-                if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
-                    text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));
-                } else if let Some(close) = match part {
-                    "open-quote" => Some(false),
-                    "close-quote" => Some(true),
-                    _ => None,
-                } {
-                    // `quotes` gives a pair per nesting level; `auto` is English curly quotes.
-                    let depth =
-                        std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
-                            .filter(|&parent| doc.nodes[parent].tag == "q")
-                            .count();
-                    let quotes: Vec<String> = match pseudo.get(Prop::QUOTES) {
-                        None | Some("auto") => ["\u{201c}", "\u{201d}", "\u{2018}", "\u{2019}"]
-                            .map(str::to_owned)
-                            .to_vec(),
-                        Some(value) => style::components(value, ' ')
-                            .into_iter()
-                            .filter_map(|part| {
-                                let mut input = cssparser::Parser::new(part);
-                                input.expect_string().ok().map(|string| string.to_string())
-                            })
-                            .collect(),
-                    };
-                    let pair = (depth * 2).min(quotes.len().saturating_sub(2));
-                    text.push_str(
-                        quotes
-                            .get(pair + usize::from(close))
-                            .map_or("", String::as_str),
-                    );
-                } else if let Some(string) = part
-                    .strip_prefix(['"', '\''])
-                    .and_then(|v| v.strip_suffix(['"', '\'']))
-                {
-                    let mut chars = string.chars().peekable();
-                    while let Some(c) = chars.next() {
-                        if c != '\\' {
-                            text.push(c);
-                            continue;
-                        }
-                        let mut code = String::new();
-                        while code.len() < 6
-                            && let Some(digit) = chars.next_if(char::is_ascii_hexdigit)
-                        {
-                            code.push(digit);
-                        }
-                        if code.is_empty() {
-                            text.extend(chars.next());
-                            continue;
-                        }
-                        chars.next_if_eq(&' ');
-                        text.push(
-                            u32::from_str_radix(&code, 16)
-                                .ok()
-                                .and_then(char::from_u32)
-                                .unwrap_or('\u{fffd}'),
-                        );
-                    }
-                }
-            }
+            let text = pseudo_content(doc, id, pseudo, content);
             let mut pseudo_units = units;
             if let Some(size) = pseudo
                 .get(Prop::FONT_SIZE)
@@ -2585,6 +2650,13 @@ pub(super) fn element(
                 .text_size(px(pseudo_units.font.em))
                 .font_family(face.family)
                 .font_weight(face.weight);
+            match style::line_height(pseudo) {
+                style::LineHeight::Fixed(height) => decoration = decoration.line_height(px(height)),
+                style::LineHeight::Scale(scale) => {
+                    decoration = decoration.line_height(px(scale * pseudo_units.font.em))
+                }
+                style::LineHeight::Normal => {}
+            }
             if let Some((ink, alpha)) = pseudo.get(Prop::COLOR).and_then(style::color) {
                 decoration = decoration.text_color(rgba(ink << 8 | alpha as u32));
             }
@@ -2728,9 +2800,43 @@ pub(super) fn element(
                 decoration =
                     decoration.child(inset_shadows(pseudo_shadows, pseudo_radius, pseudo_borders));
             }
-            if !text.is_empty() {
+            // Collapsible spaces alone make no line in a block, like the `content: " "` of a clearfix.
+            let collapsed = text.trim_ascii().is_empty()
+                && pseudo
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| !value.starts_with("inline"))
+                && pseudo.get(Prop::WHITE_SPACE).is_none_or(|value| {
+                    !matches!(value, "pre" | "pre-wrap" | "pre-line" | "break-spaces")
+                });
+            if !text.is_empty() && !collapsed {
                 decoration = decoration.child(SharedString::from(text));
             }
+            let decoration = match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
+                .into_iter()
+                .find_map(|prop| pseudo.get(prop))
+                .filter(|_| {
+                    pseudo
+                        .get(Prop::VISIBILITY)
+                        .is_none_or(|value| value == "visible")
+                })
+                .and_then(|value| super::effects::backdrop(value, &pseudo_units))
+            {
+                Some((blur, color_matrix)) => super::paint::Effected {
+                    effect: renderer::PaintEffect {
+                        backdrop: Some(renderer::Backdrop {
+                            bounds: Bounds::default(),
+                            corner_radii: Default::default(),
+                            blur,
+                            color_matrix,
+                        }),
+                        ..Default::default()
+                    },
+                    child: decoration.into_any_element(),
+                    backdrop: Some(pseudo_radius),
+                }
+                .into_any_element(),
+                None => decoration.into_any_element(),
+            };
             let order = pseudo
                 .get(Prop::Z_INDEX)
                 .and_then(|value| value.parse::<i32>().ok())
@@ -2761,7 +2867,8 @@ pub(super) fn element(
         .get(Prop::WHITE_SPACE)
         .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"))
         || node.tag == "pre";
-    if node.tag == "#text"
+    // Text and inline boxes in a line wrap within its width.
+    if (node.tag == "#text" || display == "inline" && !flex_parent && slot.is_none())
         && style
             .get(Prop::WHITE_SPACE)
             .is_none_or(|value| !matches!(value, "pre" | "nowrap"))
@@ -2780,6 +2887,12 @@ pub(super) fn element(
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
             .clone()
+            // Text that collapses to nothing makes no line, except where editing puts a caret in it.
+            .filter(|data| {
+                !data.text.is_empty()
+                    || std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
+                        .any(|node| doc.nodes[node].attrs.contains_key("contenteditable"))
+            })
     };
     let hit_test = inline.is_some();
     let drag = style
@@ -3509,9 +3622,32 @@ pub(super) fn element(
                     let block = child_style
                         .get(Prop::DISPLAY)
                         .is_some_and(|value| !value.starts_with("inline"));
+                    // A block's static position follows the bottom margin of the block before it, also when that
+                    // margin collapsed out through this box's bottom.
+                    let pending = flat
+                        [..flat.iter().position(|&other| other == child).unwrap_or(0)]
+                        .iter()
+                        .rev()
+                        .find(|&&other| in_flow(doc, info, other) && !floated(other))
+                        .filter(|&&other| {
+                            block && line.is_none() && !all_inline && self::block(build, other)
+                        })
+                        .map_or(0., |&other| {
+                            let (_, [positive, negative], _) = adjoining(build, other, content[0]);
+                            let used = margins(
+                                build,
+                                other,
+                                &styles.lengths[other],
+                                content[0],
+                                false,
+                                false,
+                            )[2];
+                            (positive + negative - used).max(0.)
+                        });
                     let entity = view.clone();
                     let mut placeholder = renderer::canvas(
-                        move |bounds, _| {
+                        move |mut bounds, _| {
+                            bounds.origin.y += px(pending);
                             let view = &*entity;
                             view.host
                                 .borrow_mut()
@@ -3549,7 +3685,21 @@ pub(super) fn element(
                         }
                     }
                 }
-                if flow && !all_inline && grid.is_none() && inline_level(child) && !out_of_flow {
+                if flow
+                    && !all_inline
+                    && grid.is_none()
+                    && line.is_none()
+                    && !out_of_flow
+                    && style::phantom(doc, styles, child)
+                {
+                    // A box that makes no line sits in a row without a strut.
+                    place!(div().flex().flex_row().child(child_element), None);
+                } else if flow
+                    && !all_inline
+                    && grid.is_none()
+                    && inline_level(child)
+                    && !out_of_flow
+                {
                     let mut next = line
                         .take()
                         .unwrap_or_else(|| div().flex().flex_row().flex_wrap().child(strut()));
@@ -3677,14 +3827,6 @@ pub(super) fn element(
                 }
             });
     }
-    let mut parent = node.parent;
-    while let Some(ancestor) = parent
-        && styles.values[ancestor]
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| value == "contents")
-    {
-        parent = doc.nodes[ancestor].parent;
-    }
     let parent_display = parent
         .and_then(|parent| styles.values[parent].get(Prop::DISPLAY))
         .unwrap_or("block");
@@ -3796,42 +3938,14 @@ pub(super) fn element(
         }
         None => el,
     };
-    let contains = |style: &style::Style, fixed: bool| {
-        !fixed
-            && style
-                .get(Prop::POSITION)
-                .is_some_and(|value| value != "static")
-            || [
-                Prop::TRANSFORM,
-                Prop::FILTER,
-                Prop::PERSPECTIVE,
-                Prop::BACKDROP_FILTER,
-            ]
-            .into_iter()
-            .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
-            || style.get(Prop::CONTAIN).is_some_and(|value| {
-                ["paint", "layout", "strict", "content"]
-                    .iter()
-                    .any(|kind| value.contains(kind))
-            })
-            || style
-                .get(Prop::WILL_CHANGE)
-                .is_some_and(|value| value.contains("transform"))
-    };
-    let container = matches!(position, "absolute" | "fixed")
-        .then(|| {
-            ancestors
-                .iter()
-                .rev()
-                .copied()
-                .find(|&ancestor| contains(&styles.values[ancestor], position == "fixed"))
-        })
-        .flatten();
     let element = DomBox {
         inner: Some(el),
         anchor,
         block: contains(style, false).then_some(borders),
-        container: container.filter(|&container| position == "fixed" || Some(container) != parent),
+        container: positioner.filter(|&block| position == "fixed" || Some(block) != parent),
+        sized: positioner
+            .filter(|&block| block != 0 && Some(block) != parent)
+            .map(|_| containing),
         style: style.clone(),
         effects: effect_layer,
         perspective: parent_perspective.clone().zip(parent),
@@ -3925,19 +4039,12 @@ pub(super) fn element(
         ids: ids.clone(),
         view: view.clone(),
         sticky,
-        fixed: position == "fixed" && container.is_none(),
+        fixed: position == "fixed" && positioner.is_none(),
         inset: [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT].map(|prop| {
             let axis = usize::from(matches!(prop, Prop::TOP | Prop::BOTTOM));
-            style.get(prop).and_then(|v| {
-                units.resolve(
-                    v,
-                    if position == "fixed" && container.is_none() {
-                        units.viewport[axis]
-                    } else {
-                        containing[axis]
-                    },
-                )
-            })
+            style
+                .get(prop)
+                .and_then(|v| units.resolve(v, containing[axis]))
         }),
     }
     .into_any_element();
@@ -3952,6 +4059,78 @@ pub(super) fn element(
     } else {
         element
     }
+}
+
+/// The text of a `::before` or `::after` box from its `content`: strings, `attr()` and quotes.
+pub(super) fn pseudo_content(
+    doc: &Document,
+    id: usize,
+    pseudo: &style::Style,
+    content: &str,
+) -> String {
+    let node = &doc.nodes[id];
+    let mut text = String::new();
+    for part in style::components(content, ' ') {
+        if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
+            text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));
+        } else if let Some(close) = match part {
+            "open-quote" => Some(false),
+            "close-quote" => Some(true),
+            _ => None,
+        } {
+            // `quotes` gives a pair per nesting level; `auto` is English curly quotes.
+            let depth = std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
+                .filter(|&parent| doc.nodes[parent].tag == "q")
+                .count();
+            let quotes: Vec<String> = match pseudo.get(Prop::QUOTES) {
+                None | Some("auto") => ["\u{201c}", "\u{201d}", "\u{2018}", "\u{2019}"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                Some(value) => style::components(value, ' ')
+                    .into_iter()
+                    .filter_map(|part| {
+                        let mut input = cssparser::Parser::new(part);
+                        input.expect_string().ok().map(|string| string.to_string())
+                    })
+                    .collect(),
+            };
+            let pair = (depth * 2).min(quotes.len().saturating_sub(2));
+            text.push_str(
+                quotes
+                    .get(pair + usize::from(close))
+                    .map_or("", String::as_str),
+            );
+        } else if let Some(string) = part
+            .strip_prefix(['"', '\''])
+            .and_then(|v| v.strip_suffix(['"', '\'']))
+        {
+            let mut chars = string.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    text.push(c);
+                    continue;
+                }
+                let mut code = String::new();
+                while code.len() < 6
+                    && let Some(digit) = chars.next_if(char::is_ascii_hexdigit)
+                {
+                    code.push(digit);
+                }
+                if code.is_empty() {
+                    text.extend(chars.next());
+                    continue;
+                }
+                chars.next_if_eq(&' ');
+                text.push(
+                    u32::from_str_radix(&code, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{fffd}'),
+                );
+            }
+        }
+    }
+    text
 }
 
 /// An HTML `width` or `height` attribute in pixels, parsed like browsers: leading digits after
@@ -3990,6 +4169,20 @@ pub(crate) fn dimension(value: &str, integer: bool) -> Option<f32> {
         .parse::<f32>()
         .ok()
         .filter(|value| value.is_finite())
+}
+
+/// Whether the element is a text field: a textarea, or an input that edits text.
+pub(super) fn text_field(node: &crate::dom::Node) -> bool {
+    node.tag == "textarea"
+        || node.tag == "input"
+            && !node.attrs.get("type").is_some_and(|kind| {
+                [
+                    "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
+                    "range", "hidden",
+                ]
+                .iter()
+                .any(|other| kind.eq_ignore_ascii_case(other))
+            })
 }
 
 /// Rounds a size up to layout units, so the content it was measured from doesn't wrap.
@@ -4096,9 +4289,11 @@ fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
 
 fn block(build: &Build<'_>, id: usize) -> bool {
     !build.doc.nodes[id].tag.starts_with('#')
+        && build.doc.nodes[id].tag != "br"
         && build.styles.values[id]
             .get(Prop::DISPLAY)
             .is_some_and(|value| !value.starts_with("inline") && value != "contents")
+        || style::splits(build.doc, build.styles, id)
 }
 
 fn container(build: &Build<'_>, id: usize) -> bool {
