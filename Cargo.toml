@@ -32,6 +32,7 @@ oxc_codegen = "=0.155.0"
 oxc_minifier = "=0.155.0"
 oxc_parser = { version = "=0.155.0", default-features = false }
 oxc_semantic = "=0.155.0"
+oxc_sourcemap = "=9.0.0"
 oxc_span = "=0.155.0"
 oxc_transformer = "=0.155.0"
 serde_json.workspace = true
@@ -43,7 +44,6 @@ zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2
 [dev-dependencies]
 apps-media = { path = "crates/media" }
 apps-webgpu = { path = "crates/webgpu" }
-oxc_sourcemap = "=9.0.0"
 
 [build-dependencies]
 cc = "1"

@@ -64,6 +64,28 @@ Named exports, default exports, callbacks, promises, and literal dynamic imports
 The page has no direct access to Node APIs or private preload variables. Export only the API that the page needs.
 `<script type="preload">` scripts and `contextBridge.exposeInMainWorld()` also work.
 
+Set `loaders` in `package.json` to import other file types. Each key is a file extension, and each value is a module path relative to `package.json` or a package name:
+
+```json
+{
+  "name": "my-app",
+  "loaders": {
+    ".vue": "./vue-loader.ts"
+  }
+}
+```
+
+```ts
+// vue-loader.ts
+export default {
+  load({ filename, content }) {
+    return { type: 'ts', code: '...', map: { /* source map */ } }
+  }
+}
+```
+
+`apps run` and `apps build` run the loaders with Node APIs. `load()` gets the absolute path and the text of each imported file with that extension, in main, preload and page scripts, `node_modules` included. It returns `type` (`js`, `jsx`, `ts` or `tsx`), `code` and an optional source map, as an object or a JSON string, or a Promise of them. Errors and stack traces map to the original file. See [examples/vue](examples/vue).
+
 WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by default. Turn them on with `features` in `package.json`:
 
 ```json

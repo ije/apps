@@ -298,6 +298,99 @@ fn development_maps_runtime_locations_to_original_sources() {
 }
 
 #[test]
+fn package_loaders_transform_files_with_source_maps() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"loaders":{".txt":"./loader.ts"}}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("note.txt"), "hello\nsecond\nthird").unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(
+        &entry,
+        "import text, {fail} from './note.txt';globalThis.text=text;globalThis.fail=fail;",
+    )
+    .unwrap();
+    let cache = Rc::new(Cache::default());
+    for version in ["first", "second"] {
+        fs::write(dir.path().join("loader.ts"), format!("import {{basename}} from 'node:path';\nexport default {{\n  async load({{filename, content}}: {{filename: string; content: string}}) {{\n    await new Promise(resolve => setTimeout(resolve, 1));\n    const text = basename(filename) + ':' + content + ':{version}';\n    return {{type: 'ts', code: `const text: string = ${{JSON.stringify(text)}};\\nexport default text;\\nexport function fail() {{ throw new Error(text) }}`, map: {{version: 3, sources: ['note.txt'], sourcesContent: [content], names: [], mappings: 'AAAA;AACA;AACA'}}}};\n  }},\n}};\n")).unwrap();
+        for production in [false, true] {
+            let files = compile(
+                &entry,
+                Realm::Main,
+                None,
+                Rc::default(),
+                production,
+                (!production).then(|| cache.clone()),
+            )
+            .unwrap();
+            let engine = apps_runtime::jsc::Engine::new(
+                apps_runtime::jsc::Api::load().unwrap(),
+                Rc::default(),
+                apps_runtime::host::Role::Main,
+            )
+            .unwrap();
+            engine.bundle(&files, "app.js").unwrap();
+            assert_eq!(
+                engine.eval("globalThis.text", "apps:test").unwrap(),
+                format!("note.txt:hello\nsecond\nthird:{version}")
+            );
+            if production {
+                continue;
+            }
+            let stack = engine
+                .eval(
+                    "(()=>{try{fail()}catch(error){return error.stack}})()",
+                    "apps:test",
+                )
+                .unwrap();
+            let mut location = stack.lines().next().unwrap().rsplitn(3, ':');
+            let column: u32 = location.next().unwrap().parse().unwrap();
+            let line: u32 = location.next().unwrap().parse().unwrap();
+            let definition: Value = files["app.js"]
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(
+                        line.strip_prefix("$appsDefine(")
+                            .unwrap()
+                            .strip_suffix(");")
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .find(|definition| {
+                    definition["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("note.txt"))
+                })
+                .unwrap();
+            let json = definition["map"].to_string();
+            let map = oxc_sourcemap::SourceMap::from_json_string(&json).unwrap();
+            let token = map
+                .lookup_token(&map.generate_lookup_table(), line - 1, column - 1)
+                .unwrap();
+            assert_eq!(token.get_src_line(), 2, "{stack}");
+            assert_eq!(
+                map.get_source_content(token.get_source_id().unwrap()),
+                Some("hello\nsecond\nthird")
+            );
+        }
+    }
+    fs::write(
+        dir.path().join("loader.ts"),
+        "export default {load() { throw new TypeError('bad note') }}",
+    )
+    .unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), false, Some(cache)).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("Loader ./loader.ts failed on") && message.contains("TypeError: bad note"),
+        "{message}"
+    );
+}
+
+#[test]
 fn html_and_css_images_become_bundled_assets() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("main.ts");

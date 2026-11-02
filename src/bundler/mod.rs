@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, bail, ensure};
-use apps_runtime::{bundle_source, dom::Document};
+use apps_runtime::{
+    bundle_source,
+    dom::Document,
+    host::{Role, Waker},
+    jsc::{Api, Engine},
+};
 use bbtree::unsync::BBTreeMap;
 use oxc_allocator::{Allocator, ArenaVec, TakeIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
@@ -54,6 +59,15 @@ struct Shared {
     disabled: u32,
     aliases: Option<(PathBuf, Vec<String>)>,
     preload: Option<PathBuf>,
+    loaders: Option<Rc<Loaders>>,
+}
+
+/// The package.json `loaders`, as file name suffixes and module specifiers, running in one main engine.
+struct Loaders {
+    modules: Vec<(String, String)>,
+    files: BBTreeMap<String, String>,
+    engine: Engine,
+    woken: std::sync::mpsc::Receiver<()>,
 }
 
 impl Shared {
@@ -82,6 +96,7 @@ impl Shared {
 #[derive(Default)]
 pub struct Cache {
     graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
+    loaders: RefCell<Option<Rc<Loaders>>>,
     pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
 }
 
@@ -1850,8 +1865,76 @@ impl Builder {
             }
         }
         let outer = std::mem::take(&mut self.requests);
+        let mut loaded = None;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let loader = self
+            .shared
+            .loaders
+            .clone()
+            .filter(|_| inline.is_none())
+            .and_then(|loaders| {
+                let (index, (_, module)) = loaders
+                    .modules
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (suffix, _))| name.ends_with(suffix.as_str()))
+                    .max_by_key(|(_, (suffix, _))| suffix.len())?;
+                Some((index, module.clone(), loaders))
+            });
         let source = if let Some(source) = inline {
             source
+        } else if let Some((index, module, loaders)) = loader {
+            self.files.borrow_mut().insert(path.clone());
+            let (code, source_type, map) = (|| -> Result<_> {
+                let content = fs::read_to_string(&path)?;
+                let args = json!({"filename": path.to_string_lossy(), "content": content});
+                loaders
+                    .engine
+                    .call("__appsLoad", &[&index.to_string(), &args.to_string()])?;
+                let mut delay = 0;
+                let result = loop {
+                    let result = loaders.engine.call("__appsLoaded", &[])?;
+                    if result != "undefined" {
+                        break result;
+                    }
+                    if delay < 0 {
+                        ensure!(
+                            loaders.engine.call("__appsAlive", &[])? == "true",
+                            "load() did not settle"
+                        );
+                        let _ = loaders.woken.recv();
+                    } else if delay > 0 {
+                        let _ = loaders
+                            .woken
+                            .recv_timeout(std::time::Duration::from_millis(delay as u64));
+                    }
+                    delay = loaders.engine.tick()?;
+                };
+                let mut result: Value = serde_json::from_str(&result)?;
+                if let Some(error) = result["error"].as_str() {
+                    bail!("{error}");
+                }
+                let value = result["value"].take();
+                let source_type = match value["type"].as_str() {
+                    Some("js") => SourceType::mjs(),
+                    Some("jsx") => SourceType::jsx(),
+                    Some("ts") => SourceType::ts(),
+                    Some("tsx") => SourceType::tsx(),
+                    _ => bail!("load() must return a type of js, jsx, ts or tsx"),
+                };
+                let code = value["code"]
+                    .as_str()
+                    .context("load() must return code as a string")?;
+                let map = match &value["map"] {
+                    Value::Null => None,
+                    Value::String(map) => Some(map.clone()),
+                    map => Some(map.to_string()),
+                };
+                Ok((code.to_owned(), source_type, map))
+            })()
+            .with_context(|| format!("Loader {module} failed on {}", path.display()))?;
+            loaded = Some((source_type, map));
+            code
         } else {
             self.files.borrow_mut().insert(path.clone());
             match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
@@ -1889,6 +1972,8 @@ impl Builder {
         let allocator = Allocator::default();
         let source_type = if inline_html {
             SourceType::tsx()
+        } else if let Some((source_type, _)) = loaded {
+            source_type
         } else {
             SourceType::from_path(&path).unwrap_or(SourceType::mjs())
         };
@@ -2225,7 +2310,19 @@ impl Builder {
             }
         }
         if let Some(map) = output.map {
-            let mut map: Value = serde_json::from_str(&map.to_json_string())?;
+            let map = match loaded.as_ref().and_then(|(_, map)| map.as_deref()) {
+                Some(input) => map
+                    .compose(
+                        oxc_sourcemap::SourceMap::from_json_string(input)
+                            .map_err(|error| anyhow::anyhow!("{error:?}"))
+                            .with_context(|| {
+                                format!("Invalid source map from the loader of {}", path.display())
+                            })?,
+                    )
+                    .to_json_string(),
+                None => map.to_json_string(),
+            };
+            let mut map: Value = serde_json::from_str(&map)?;
             // WARNING: The runtime adds one line before the module body.
             map["mappings"] = format!(";{}", map["mappings"].as_str().unwrap()).into();
             module["map"] = map;
@@ -2377,13 +2474,98 @@ pub fn compile(
                 .filter(|key| !key.starts_with('#'))
                 .cloned()
                 .collect();
-            Some((manifest?.parent()?.to_owned(), keys))
+            Some((manifest.as_ref()?.parent()?.to_owned(), keys))
         })
         .filter(|(_, keys)| !keys.is_empty());
+    let disabled = apps_runtime::bundle::disabled_features(package.as_deref())?;
+    let mut loaders = None;
+    if let Some(value) = metadata.get("loaders") {
+        let mut modules = Vec::new();
+        let mut code = String::new();
+        for (index, (suffix, module)) in value
+            .as_object()
+            .context("package.json loaders must map file extensions to modules")?
+            .iter()
+            .enumerate()
+        {
+            let module = module
+                .as_str()
+                .filter(|module| !module.is_empty() && suffix.len() > 1 && suffix.starts_with('.'))
+                .with_context(|| {
+                    format!("package.json loaders must map file extensions like .vue to modules: {suffix}")
+                })?;
+            write!(code, "import l{index} from {};", json!(module))?;
+            modules.push((suffix.clone(), module.to_owned()));
+        }
+        write!(
+            code,
+            "const loaders=[{}];let result;globalThis.__appsLoad=(index,args)=>{{result=undefined;Promise.resolve(loaders[index]).then(loader=>{{if(typeof loader?.load!=='function')throw new TypeError('A loader must export default an object with a load() function');return loader.load(args);}}).then(value=>{{result=JSON.stringify({{value}});}},error=>{{result=JSON.stringify({{error:String(error)+(error?.stack?'\\n'+error.stack:'')}});}});}};globalThis.__appsLoaded=()=>result;",
+            (0..modules.len())
+                .map(|index| format!("l{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
+        // WARNING: the entry is inline, so its path only names it and must not be a file that a loader imports.
+        let entry = manifest
+            .as_ref()
+            .unwrap()
+            .with_file_name("package.json#loaders");
+        let shared = Rc::new(Shared {
+            disabled,
+            aliases: aliases.clone(),
+            root: root.clone(),
+            cache: cache.clone(),
+            ..Shared::default()
+        });
+        let mut output = bundle(
+            vec![(entry, Some(code))],
+            Realm::Main,
+            files.clone(),
+            shared.clone(),
+            false,
+        )?;
+        for (index, code) in shared.scripts.take().into_iter().enumerate() {
+            output.insert(format!("script-{index}.js"), code);
+        }
+        let cached = cache
+            .as_ref()
+            .and_then(|cache| cache.loaders.borrow().clone())
+            .filter(|loaders| loaders.modules == modules && loaders.files == output);
+        loaders = Some(match cached {
+            Some(loaders) => loaders,
+            None => {
+                let (wake, woken) = std::sync::mpsc::channel();
+                Waker::install(move || {
+                    let _ = wake.send(());
+                });
+                let engine = Engine::new(Api::load()?, Rc::default(), Role::Main)?;
+                engine
+                    .bundle(&output, "apps:loaders")
+                    .context("Cannot start the package.json loaders")?;
+                Rc::new(Loaders {
+                    modules,
+                    files: output,
+                    engine,
+                    woken,
+                })
+            }
+        });
+    }
+    if let Some(cache) = &cache {
+        let previous = cache.loaders.replace(loaders.clone());
+        // WARNING: cached modules keep the output of the loaders that compiled them.
+        if previous.as_ref().map(Rc::as_ptr) != loaders.as_ref().map(Rc::as_ptr) {
+            cache
+                .graphs
+                .borrow_mut()
+                .retain(|(_, entry), _| entry.ends_with("package.json#loaders"));
+        }
+    }
     let shared = Rc::new(Shared {
-        disabled: apps_runtime::bundle::disabled_features(package.as_deref())?,
+        disabled,
         aliases,
         preload,
+        loaders,
         root,
         cache,
         ..Shared::default()
