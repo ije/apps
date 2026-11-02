@@ -1,6 +1,6 @@
 use apps_runtime::{
     host::Role,
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     net::{TcpListener, TcpStream},
@@ -10,7 +10,8 @@ use std::{
 
 #[test]
 fn serve_requests_and_lifecycle() {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine
         .eval(include_str!("serve.js"), "serve-tests")
         .unwrap();
@@ -29,7 +30,8 @@ fn serve_requests_and_lifecycle() {
 
 #[test]
 fn serve_closes_sockets_with_context() {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     let port: u16 = engine.eval("__apps.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('hello') }).port", "serve-test").unwrap().parse().unwrap();
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     drop(engine);
@@ -49,7 +51,12 @@ fn serve_closes_sockets_with_context() {
 
 #[test]
 fn serve_is_main_only() {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Preload(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::default(),
+        Role::Preload(1),
+    )
+    .unwrap();
     assert!(
         engine
             .eval(
@@ -73,7 +80,8 @@ fn native_events_wake_the_loop_without_polling() {
     apps_runtime::host::Waker::install(move || {
         counter.fetch_add(1, Ordering::Relaxed);
     });
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval("globalThis.done='pending';const server=__apps.serve({hostname:'127.0.0.1',port:0,fetch:async request=>new Response(await request.text()+'!')});fetch(`http://127.0.0.1:${server.port}`,{method:'POST',body:'woken'}).then(r=>r.text()).then(text=>{done=text;server.stop()},error=>done=String(error))", "wake").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -96,7 +104,8 @@ fn native_events_wake_the_loop_without_polling() {
 #[test]
 fn stalled_stream_responses_wait_for_the_client_without_polling() {
     use std::io::{Read, Write};
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     let port: u16 = engine.eval("const chunk=new Uint8Array(1<<16);globalThis.sent=0;__apps.serve({hostname:'127.0.0.1',port:0,fetch:()=>new Response(new ReadableStream({pull(c){sent++;c.enqueue(chunk);}}))}).port", "stall").unwrap().parse().unwrap();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream

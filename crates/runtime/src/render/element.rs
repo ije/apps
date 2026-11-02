@@ -1,5 +1,5 @@
 use super::{
-    ViewData,
+    PageState,
     background::css_background,
     cull,
     paint::{DomBox, PaintLayers, Stacked, Turned, paint_layers},
@@ -22,7 +22,7 @@ pub(super) struct Build<'a> {
     pub(super) styles: &'a ComputedStyles,
     pub(super) text: &'a renderer::TextSystem,
     pub(super) pixel_ratio: f32,
-    pub(super) view: &'a Rc<ViewData>,
+    pub(super) view: &'a Rc<PageState>,
     pub(super) layers: PaintLayers,
     /// The boxes from the root to the parent.
     pub(super) ancestors: Rc<[usize]>,
@@ -4686,7 +4686,7 @@ fn fieldset_border(
     widths: [f32; 4],
     colors: [renderer::Rgba; 4],
     kinds: [&str; 4],
-    view: Rc<super::ViewData>,
+    view: Rc<super::PageState>,
 ) -> AnyElement {
     let kinds = kinds.map(str::to_owned);
     renderer::canvas(
@@ -4855,7 +4855,7 @@ fn inset_shadows(
 }
 
 /// Paints the inline `<svg>` or the SVG `<img>` source of a node, rasterized at the box size.
-fn svg_layer(id: usize, inline: bool, view: Rc<super::ViewData>) -> AnyElement {
+fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement {
     let geometry = view.clone();
     renderer::canvas(
         // The elements of an inline SVG get boxes, like browsers lay out SVG content.

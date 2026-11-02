@@ -23,6 +23,20 @@ pub struct Bundle {
     pub scripts: HashMap<String, bytes::Bytes>,
 }
 
+// WARNING: module code must stay outside the loader function, or it could see loader internals such as
+// `compile`. Definitions run in a second function whose only binding is `$appsDefine`.
+pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
+    let modules = js!("modules.js");
+    let app = files.get("app.js").map_or("", String::as_str);
+    let mut source = String::with_capacity(modules.len() + app.len() + 64);
+    source.push_str("(()=>{");
+    source.push_str(&modules);
+    source.push_str("})()(($appsDefine)=>{\n");
+    source.push_str(app);
+    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
+    source
+}
+
 pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
@@ -204,8 +218,9 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
                 validate_native_path(&relative)?;
                 owned.push((
                     relative.clone(),
-                    fs::read(&source)
-                        .with_context(|| format!("Cannot read native addon {}", source.display()))?,
+                    fs::read(&source).with_context(|| {
+                        format!("Cannot read native addon {}", source.display())
+                    })?,
                 ));
                 output.insert(name, relative);
             }
@@ -224,9 +239,11 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
             bundle.files.push((name.as_str(), source.as_bytes()));
         }
     }
-    bundle
-        .files
-        .extend(owned.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
+    bundle.files.extend(
+        owned
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
     // WARNING: running apps map app.h2o, so a new bundle replaces the file instead of rewriting it.

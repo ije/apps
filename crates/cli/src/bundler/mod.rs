@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use apps_runtime::{
-    bundle_source,
+    bundle::script_source,
     dom::Document,
     host::{Role, Waker},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use bbtree::unsync::BBTreeMap;
 use oxc_allocator::{Allocator, ArenaVec, TakeIn};
@@ -66,7 +66,7 @@ struct Shared {
 struct Loaders {
     modules: Vec<(String, String)>,
     files: BBTreeMap<String, String>,
-    engine: Engine,
+    engine: JsContext,
     woken: std::sync::mpsc::Receiver<()>,
 }
 
@@ -407,7 +407,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             shared.clone(),
                             self.builder.production,
                         )?;
-                        shared.scripts.borrow_mut()[index] = bundle_source(&files, true);
+                        shared.scripts.borrow_mut()[index] = script_source(&files, true);
                         index
                     }
                 };
@@ -1627,7 +1627,9 @@ impl Builder {
         }
         let alias = self.shared.aliased(specifier);
         let imports = alias || specifier.starts_with('#');
-        let (directory, key) = if let Some((directory, _)) = self.shared.aliases.as_ref().filter(|_| alias) {
+        let (directory, key) = if let Some((directory, _)) =
+            self.shared.aliases.as_ref().filter(|_| alias)
+        {
             (directory.canonicalize()?, specifier.to_owned())
         } else if imports {
             (
@@ -2538,9 +2540,9 @@ pub fn compile(
                 Waker::install(move || {
                     let _ = wake.send(());
                 });
-                let engine = Engine::new(Api::load()?, Rc::default(), Role::Main)?;
+                let engine = JsContext::new(JavaScriptCore::load()?, Rc::default(), Role::Main)?;
                 engine
-                    .bundle(&output, "apps:loaders")
+                    .load_bundle(&output, "apps:loaders")
                     .context("Cannot start the package.json loaders")?;
                 Rc::new(Loaders {
                     modules,
@@ -3611,7 +3613,7 @@ fn html(
             continue;
         };
         let entries = list.into_iter().map(|(_, entry)| entry).collect();
-        let code = bundle_source(
+        let code = script_source(
             &bundle(entries, realm, files.clone(), shared.clone(), production)?,
             true,
         );

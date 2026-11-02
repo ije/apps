@@ -1,17 +1,17 @@
-mod build;
+mod build_target;
 mod bundler;
-mod run;
-mod target;
+mod commands;
+mod packaging;
 
 use anyhow::{Context, Result, bail, ensure};
+use build_target::BuildTarget;
 use std::path::PathBuf;
-use target::Target;
 
 fn main() {
     // WARNING: Bundling recurses once per import depth. The main thread stack is too small for deep graphs.
     let result = std::thread::Builder::new()
         .stack_size(256 << 20)
-        .spawn(run)
+        .spawn(run_cli)
         .map_err(anyhow::Error::from)
         .and_then(|thread| {
             thread
@@ -27,7 +27,7 @@ fn main() {
     });
 }
 
-fn run() -> Result<i32> {
+fn run_cli() -> Result<i32> {
     let mut args = std::env::args_os()
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -46,7 +46,7 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
     if command == "skill" {
-        print!("{}", include_str!("../skills/apps-devtools/SKILL.md"));
+        print!("{}", include_str!("../../../skills/apps-devtools/SKILL.md"));
         return Ok(0);
     }
     if command == "--version" {
@@ -59,7 +59,7 @@ fn run() -> Result<i32> {
     );
     let mut entry = None;
     let mut out = None;
-    let host = Target::new(std::env::consts::OS, std::env::consts::ARCH)?;
+    let host = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)?;
     let mut target = host;
     let mut explicit_target = false;
     let mut watch = false;
@@ -89,11 +89,11 @@ fn run() -> Result<i32> {
                 )?);
             }
             "--platform" if command == "build" => {
-                target = Target::new(&args.next().context("Expected platform")?, target.arch)?;
+                target = BuildTarget::new(&args.next().context("Expected platform")?, target.arch)?;
                 explicit_target = true;
             }
             "--arch" if command == "build" => {
-                target = Target::new(
+                target = BuildTarget::new(
                     target.platform,
                     &args.next().context("Expected architecture")?,
                 )?;
@@ -157,7 +157,7 @@ fn run() -> Result<i32> {
                 ),
                 (true, port) => Some(port),
             };
-            run::run(&entry, &runtime, watch, devtools, mcp, &app_args)
+            commands::run::run(&entry, &runtime, watch, devtools, mcp, &app_args)
         }
         "build" => {
             let out = out.unwrap_or_else(|| {
@@ -172,7 +172,7 @@ fn run() -> Result<i32> {
                 out != root && !entry.starts_with(&out),
                 "Output must be separate from source files"
             );
-            build::run(&entry, &out, &runtime, target).map(|_| 0)
+            commands::build::run(&entry, &out, &runtime, target).map(|_| 0)
         }
         _ => unreachable!(),
     }

@@ -6,7 +6,7 @@ use std::{borrow::Cow, collections::HashMap, rc::Rc};
 mod animation;
 mod color;
 pub(crate) mod parser;
-mod props;
+mod properties;
 mod shorthand;
 mod tailwind;
 #[cfg(test)]
@@ -25,8 +25,8 @@ pub(crate) use text::{
 pub use value::length;
 pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components};
 
-pub(crate) use props::Prop;
-pub use props::Style;
+pub(crate) use properties::Prop;
+pub use properties::Style;
 
 pub(crate) const DISPLAY_NONE: u8 = 1;
 pub(crate) const DISPLAY_CONTENTS: u8 = 2;
@@ -3565,7 +3565,8 @@ pub(crate) fn cascade(
     }
     let registry = style_cache.registry.clone();
     out.registry = registry.clone();
-    let mut inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, props::Vars> = FxHashMap::default();
+    let mut inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, properties::Vars> =
+        FxHashMap::default();
     let scoped = &mut style_cache.scopes[scope];
     let scope = scoped.id;
     scoped.used = style_cache.pass;

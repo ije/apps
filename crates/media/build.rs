@@ -33,7 +33,11 @@ fn main() {
         link(format!("-L{}", ffmpeg.join("lib").display()));
     }
     for name in ["avformat", "avcodec", "swscale", "swresample", "avutil"] {
-        link(if msvc { format!("{name}.lib") } else { format!("-l{name}") });
+        link(if msvc {
+            format!("{name}.lib")
+        } else {
+            format!("-l{name}")
+        });
     }
     let lib = ffmpeg.join(if os == "windows" { "bin" } else { "lib" });
     match os.as_str() {
@@ -50,7 +54,10 @@ fn main() {
             let shared = match os.as_str() {
                 "macos" => name.matches('.').count() == 2 && name.ends_with(".dylib"),
                 "windows" => name.ends_with(".dll"),
-                _ => name.matches(".so.").count() == 1 && !name[name.find(".so.").unwrap() + 4..].contains('.'),
+                _ => {
+                    name.matches(".so.").count() == 1
+                        && !name[name.find(".so.").unwrap() + 4..].contains('.')
+                }
             };
             let target = folder.join(&name);
             // WARNING: macOS kills processes that load a library rewritten in place, so copy to a new file.

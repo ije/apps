@@ -453,7 +453,7 @@ pub(super) fn spacer(
     parent: usize,
     [left, width]: [f32; 2],
     zone: Rc<Zone>,
-    view: Rc<super::ViewData>,
+    view: Rc<super::PageState>,
 ) -> AnyElement {
     let Run {
         members,
@@ -522,7 +522,7 @@ pub(super) fn spacer(
 pub(super) fn anchor(
     items: Vec<(usize, [f32; 4])>,
     zone: Rc<Zone>,
-    view: Rc<super::ViewData>,
+    view: Rc<super::PageState>,
 ) -> AnyElement {
     renderer::canvas(
         move |bounds, window| {

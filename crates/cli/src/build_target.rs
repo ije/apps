@@ -3,12 +3,12 @@ use object::{Architecture, BinaryFormat, Object, read::macho::FatArch};
 use std::{fs, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Target {
+pub struct BuildTarget {
     pub platform: &'static str,
     pub arch: &'static str,
 }
 
-impl Target {
+impl BuildTarget {
     pub fn new(platform: &str, arch: &str) -> Result<Self> {
         Ok(Self {
             platform: match platform {
@@ -25,7 +25,7 @@ impl Target {
         })
     }
 
-    pub fn validate(self, path: &Path) -> Result<()> {
+    pub fn validate_binary(self, path: &Path) -> Result<()> {
         let data = object::ReadCache::new(
             fs::File::open(path).with_context(|| format!("Cannot read {}", path.display()))?,
         );

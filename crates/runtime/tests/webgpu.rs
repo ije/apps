@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -20,7 +20,7 @@ fn canvas_identity_and_webgl_errors() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
         const parsed = document.getElementById('parsed');
         const canvas = document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');
@@ -52,7 +52,7 @@ fn canvas_identity_and_webgl_errors() {
     "#, "canvas-test").unwrap();
 }
 
-fn page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
+fn page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -61,11 +61,16 @@ fn page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     (host, engine)
 }
 
-fn wait(engine: &Engine, ready: &str) -> String {
+fn wait(engine: &JsContext, ready: &str) -> String {
     for _ in 0..5000 {
         let value = engine.eval(ready, "gpu-test").unwrap();
         if value != "pending" {

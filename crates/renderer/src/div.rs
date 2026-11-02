@@ -419,7 +419,10 @@ impl ScrollHandle {
     /// Where the box stops: the end of a smooth scroll, or the offset.
     pub fn target(&self) -> Point<Pixels> {
         let state = self.0.borrow();
-        state.animation.as_ref().map_or(state.offset, |animation| animation.to)
+        state
+            .animation
+            .as_ref()
+            .map_or(state.offset, |animation| animation.to)
     }
 
     /// Scrolls smoothly to `offset` from the current position and speed. The box's next frame
@@ -583,11 +586,18 @@ mod tests {
         assert!(handle.0.borrow().animation.is_none());
 
         let past = Instant::now() - Duration::from_millis(50);
-        handle.0.borrow_mut().animation = Some(Animation { start: past, ..curve(0.) });
+        handle.0.borrow_mut().animation = Some(Animation {
+            start: past,
+            ..curve(0.)
+        });
         handle.animate_to(point(px(0.), px(-400.)), false);
         let state = handle.0.borrow();
         let new = state.animation.as_ref().unwrap();
-        let old = Animation { start: past, ..curve(0.) }.at(new.start);
+        let old = Animation {
+            start: past,
+            ..curve(0.)
+        }
+        .at(new.start);
         assert_eq!(state.offset, new.from);
         assert!((f32::from(new.from.y - old.0.y)).abs() < 1e-3);
         assert!((new.at(new.start).1.y - old.1.y).abs() < 1e-2);

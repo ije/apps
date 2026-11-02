@@ -1,7 +1,7 @@
 use crate::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine, payload::Payload},
+    jsc::{JavaScriptCore, JsContext, payload::Payload},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -226,7 +226,7 @@ impl State {
                             host.borrow_mut().pages.insert(0, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
                             Role::Renderer(0)
                         };
-                        let engine = Engine::new_interruptible(Api::load()?, host, role, Some(cancelled.clone()))?;
+                        let engine = JsContext::new_interruptible(JavaScriptCore::load()?, host, role, Some(cancelled.clone()))?;
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = name => { const key = name.replace(/^node:/, ''); const value = globalThis.__apps[key]; if (!value) throw new Error('Unsupported worker module: ' + name); return value; };", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());

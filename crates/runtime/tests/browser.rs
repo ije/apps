@@ -2,10 +2,10 @@
 fn browser_window_rejects_url_loads() {
     use apps_runtime::{
         host::Role,
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
     let host = std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default()));
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Main).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
     assert!(engine.eval("new __apps.WebContentsView()", "test").is_err());
     engine
         .eval(
@@ -37,8 +37,8 @@ fn browser_window_rejects_url_loads() {
 
 #[test]
 fn web_contents_view_matches_electron_api() {
-    let engine = apps_runtime::jsc::Engine::new(
-        apps_runtime::jsc::Api::load().unwrap(),
+    let engine = apps_runtime::jsc::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
         apps_runtime::host::Role::Main,
     )

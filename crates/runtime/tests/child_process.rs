@@ -1,6 +1,6 @@
 use apps_runtime::{
     host::{Host, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -9,8 +9,8 @@ use std::{
 };
 
 fn run(source: &str) {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Preload(1),
     )
@@ -149,8 +149,8 @@ fn child_process_streams_large_output_without_blocking_timers() {
 #[cfg(unix)]
 #[test]
 fn child_process_context_cleanup_reaps_running_children() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )
@@ -211,8 +211,8 @@ fn native_events_wake_the_event_loop() {
     apps_runtime::host::Waker::install(move || {
         counter.fetch_add(1, Ordering::SeqCst);
     });
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )
@@ -246,8 +246,8 @@ fn native_events_wake_the_event_loop() {
 #[cfg(unix)]
 #[test]
 fn closing_terminals_does_not_block_on_kill() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )

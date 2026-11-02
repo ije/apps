@@ -25,17 +25,3 @@ pub mod style;
 mod web;
 pub use web::download;
 pub use web::{gpu, media};
-
-// WARNING: module code must stay outside the loader function, or it could see loader internals such as
-// `compile`. Definitions run in a second function whose only binding is `$appsDefine`.
-pub fn bundle_source(files: &bbtree::unsync::BBTreeMap<String, String>, execute: bool) -> String {
-    let modules = js!("modules.js");
-    let app = files.get("app.js").map_or("", String::as_str);
-    let mut source = String::with_capacity(modules.len() + app.len() + 64);
-    source.push_str("(()=>{");
-    source.push_str(&modules);
-    source.push_str("})()(($appsDefine)=>{\n");
-    source.push_str(app);
-    source.push_str(if execute { "\n},true);" } else { "\n},false);" });
-    source
-}

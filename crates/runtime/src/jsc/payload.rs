@@ -153,7 +153,7 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
 
 /// The bytes of an `ArrayBuffer` or typed array. JavaScriptCore pins them, so they stay valid while the value lives.
 pub(crate) fn view<'a>(
-    api: &crate::jsc::Api,
+    api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
     value: crate::jsc::Ptr,
 ) -> Result<&'a [u8]> {
@@ -191,7 +191,7 @@ pub(crate) fn view<'a>(
 
 /// Keeps the values that `input` borrowed bytes from alive until it drops.
 pub(crate) struct Roots<'a> {
-    api: &'a crate::jsc::Api,
+    api: &'a crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
     values: Vec<crate::jsc::Ptr>,
 }
@@ -206,7 +206,7 @@ impl Drop for Roots<'_> {
 
 /// The bytes of each item of array `values`. They stay valid while the returned `Roots` live.
 pub(crate) fn input<'a>(
-    api: &'a crate::jsc::Api,
+    api: &'a crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
     values: crate::jsc::Ptr,
 ) -> Result<(Vec<Bytes>, Roots<'a>)> {
@@ -257,7 +257,7 @@ pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate:
 }
 
 pub(crate) fn output(
-    api: &crate::jsc::Api,
+    api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
     mut payload: Payload,
 ) -> crate::jsc::Ptr {

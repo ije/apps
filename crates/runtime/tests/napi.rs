@@ -3,7 +3,7 @@
 fn native_addons_values_callbacks_and_contexts() {
     use apps_runtime::{
         host::{Host, Role},
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
     use std::{cell::RefCell, process::Command, rc::Rc};
     let dir = tempfile::tempdir().unwrap();
@@ -33,7 +33,12 @@ fn native_addons_values_callbacks_and_contexts() {
             .insert("fixture/addon.node".into(), library.clone());
         host.native_modules
             .insert("fixture/second.node".into(), second.clone());
-        let engine = Engine::new(Api::load().unwrap(), Rc::new(RefCell::new(host)), role).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            Rc::new(RefCell::new(host)),
+            role,
+        )
+        .unwrap();
         engine.eval(include_str!("napi.js"), "napi-test").unwrap();
         assert_eq!(engine.eval("napiPromise", "test").unwrap(), "true");
         assert_eq!(
@@ -96,8 +101,8 @@ fn native_addons_values_callbacks_and_contexts() {
             dirty: false,
         },
     );
-    let renderer = Engine::new(
-        Api::load().unwrap(),
+    let renderer = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(host)),
         Role::Renderer(1),
     )

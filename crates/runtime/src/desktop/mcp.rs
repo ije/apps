@@ -1639,12 +1639,13 @@ mod tests {
     use super::*;
     use crate::{
         host::Host,
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
 
     #[test]
     fn inspector_evaluates_pauses_and_disconnects() {
-        let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+        let engine =
+            JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
         let ctx = jsc::context(Role::Main).unwrap();
         let response = request(
             ctx,

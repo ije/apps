@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -12,7 +12,12 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         doc: Document::parse("<html><body><main><div id='left'></div><div id='right'></div></main></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const left = document.getElementById('left'), right = document.getElementById('right');
         const received = [];
@@ -60,7 +65,12 @@ fn window_scroll_moves_the_page() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const received = [];
         addEventListener('scroll', e => received.push([e.target === document, e.bubbles, scrollX, scrollY]));
@@ -95,7 +105,12 @@ fn utility_classes_follow_dom_changes() {
         doc: Document::parse("<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval("const dot = document.getElementById('dot'); dot.setAttribute('class', 'h-' + 8 + ' w-' + 8 + ' bg-[#123456]');", "test").unwrap();
     {
         let host = host.borrow();
@@ -135,7 +150,12 @@ fn mutations_preserve_tree_and_event_order() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const root = document.getElementById('root');
         const old = root.firstChild;
@@ -208,7 +228,12 @@ fn editing_fragments_observers_and_layout() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const root = document.getElementById('root');
         const fragment = document.createDocumentFragment();
@@ -281,7 +306,12 @@ fn media_queries_follow_viewport_changes() {
         doc: Document::parse("<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const query = matchMedia('(min-width:40em)');
         if (!(query instanceof MediaQueryList) || !query.matches || query.media !== '(min-width:40em)') throw Error('Media query result');
@@ -318,7 +348,7 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
       const canvas=document.createElement('canvas');canvas.width=8;canvas.height=8;
       const ctx=canvas.getContext('2d');ctx.fillStyle='#ff0000';ctx.fillRect(0,0,8,8);
@@ -340,7 +370,7 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
 fn custom_elements_shadow_styles_and_lifecycle() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>"), dirty: false });
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
       const path=document.createElementNS('http://www.w3.org/2000/svg','path');svg.append(path);
@@ -375,7 +405,12 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
         doc: Document::parse("<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const host = document.querySelector('test-slots');
         const root = host.attachShadow({mode:'open'});
@@ -438,7 +473,7 @@ fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
         const host = document.querySelector('test-editor');
         const root = host.attachShadow({mode:'open'});
@@ -473,7 +508,12 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
         doc: Document::parse("<html><body><div id='back'></div><div id='front'></div><div id='clip' style='overflow:hidden'><span id='child'></span></div><test-hit></test-hit></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval("const shadowHost=document.querySelector('test-hit');shadowHost.attachShadow({mode:'open'}).innerHTML='<span id=\"inside\"></span>';", "test").unwrap();
     {
         let mut host = host.borrow_mut();
@@ -523,7 +563,12 @@ fn hit_testing_takes_the_box_painted_last() {
         doc: Document::parse("<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     let ids: Vec<usize> = ["body", "#panel", "#button", "#code", "#line"]
         .iter()
         .map(|selector| {
@@ -569,7 +614,7 @@ fn aria_properties_reflect_and_select_focuses_fields() {
         doc: Document::parse("<html><body><button id='toggle'></button><input id='field' value='text'></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
         const toggle = document.getElementById('toggle'), field = document.getElementById('field');
         if (toggle.ariaExpanded !== null || toggle.role !== null) throw Error('Missing attributes reflect as null');
@@ -590,7 +635,12 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
         doc: Document::parse("<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     let ids: Vec<usize> = ["#box", "#caret", "#plain"]
         .iter()
         .map(|selector| {
@@ -631,7 +681,12 @@ fn computed_styles_follow_mutations_and_resize() {
         doc: Document::parse("<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
     host.borrow_mut().viewports.insert(1, [1000., 600.]);
     engine.eval(r#"
@@ -659,7 +714,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
         doc: Document::parse("<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
         const deep=':not('.repeat(100000)+'li'+')'.repeat(100000);
         if(document.querySelector(deep)!==null||document.querySelector(':is(:not(#a))#c')?.id!=='c'||document.querySelectorAll('li:not(:first-child)').length!==2)throw Error('Selector nesting');
@@ -687,7 +742,12 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
         doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const [outer, inner, other, card] = ['#outer', '#inner', '#other', 'test-card'].map(s => document.querySelector(s));
         card.attachShadow({mode:'open'}).innerHTML = '<style>:host(:hover){color:purple}</style><span id="part"></span>';
@@ -755,7 +815,7 @@ fn core_dom_interfaces_follow_the_standard() {
         doc: Document::parse("<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
       const fails = [];
       const check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (e) { fails.push(name + ': ' + e.message); } };
@@ -844,7 +904,12 @@ fn shadow_cycles_child_access_release_and_retired_images() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const el = document.createElement('div'); document.body.append(el);
         const root = el.attachShadow({mode:'open'}), inner = document.createElement('span'); root.append(inner);
@@ -944,7 +1009,12 @@ fn images_decode_on_workers_and_load_after_a_wake() {
     );
     let base = url::Url::from_directory_path(directory.path()).unwrap();
     host.borrow_mut().dom.entry(1).or_default().base = Some(base.clone());
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     let settle = |count: usize| {
         let started = std::time::Instant::now();
         while engine
@@ -1014,7 +1084,7 @@ fn sibling_walks_follow_mutations() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
         const list = document.querySelector('ul'), other = document.querySelector('ol');
         for (let i = 0; i < 6; i++) { const li = document.createElement('li'); li.id = 'i' + i; li.append('x'); list.append(li); }
@@ -1036,7 +1106,12 @@ fn mirror_follows_random_mutations_and_releases() {
     for seed in 1..17u32 {
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id=a class='x y'>t<!--c-->u<p>p</p></div><ul><li>1</li><li>2</li></ul></body></html>"), dirty: false });
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         engine.eval(&format!(r#"
           let seed = {seed};
           const rand = n => {{ seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }};
@@ -1125,7 +1200,12 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     let place = |rects: &[(&str, [f32; 4])]| {
         let mut host = host.borrow_mut();
         let host = &mut *host;
@@ -1174,7 +1254,7 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
     "#, "test").unwrap();
 }
 
-fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, Engine) {
+fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -1183,7 +1263,12 @@ fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, Engine) {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     let result = engine
         .eval(
             &format!(
@@ -1565,7 +1650,7 @@ fn offset_parent_follows_cssom_view() {
     "#, "test").unwrap();
 }
 
-fn css_page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
+fn css_page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -1574,7 +1659,12 @@ fn css_page(html: &str) -> (Rc<RefCell<Host>>, Engine) {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     (host, engine)
 }
 

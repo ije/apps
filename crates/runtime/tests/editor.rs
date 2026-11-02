@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -21,7 +21,7 @@ fn editor_selection_keyboard_and_input_events() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine
         .eval(include_str!("editor.js"), "editor-tests")
         .unwrap();
@@ -45,7 +45,12 @@ fn page_text_selection_respects_user_select() {
         doc: Document::parse("<html><body><p id='first'>alpha beta</p><p id='blocked' style='user-select:none'>hidden<span id='override' style='user-select:text'>visible</span></p><p id='last'>gamma delta</p><p id='all' style='user-select:all'>whole <span>group</span></p><p id='alias' style='-webkit-user-select:none'>alias</p><button>button</button></body></html>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"
         const assert=(value,message)=>{if(!value)throw Error(message)};
         const first=document.getElementById('first').firstChild, last=document.getElementById('last').firstChild;
@@ -114,7 +119,12 @@ fn selection_paint_ranges_and_native_text_offsets() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval("const editor=document.querySelector('div');editor.focus();const a=editor.firstChild.firstChild,b=editor.children[1].firstChild,c=editor.lastChild.firstChild;getSelection().setBaseAndExtent(c,1,a,1)", "test").unwrap();
     let ranges = host.borrow().dom[&1].selection.clone();
     for (name, expected) in [("a", [1, 3]), ("b", [0, 2]), ("c", [0, 1])] {
@@ -154,7 +164,12 @@ fn empty_selection_fragments_are_not_carets() {
         doc: Document::parse("<div contenteditable><span>A</span><span></span><span>\n</span><span>B</span></div><textarea>A\n\nB</textarea><pre>read only</pre>"),
         dirty: false,
     });
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval("const editor=document.querySelector('div');editor.children[1].append(document.createTextNode(''));editor.focus();getSelection().selectAllChildren(editor)", "test").unwrap();
     let empty: usize = engine
         .eval("editor.children[1].firstChild._id", "test")

@@ -2,7 +2,7 @@ use crate::bundler;
 use anyhow::{Context, Result};
 use apps_runtime::{
     host::Role,
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use notify::Watcher;
 use std::{
@@ -230,9 +230,13 @@ pub fn run(
                 )
                 .and_then(|bundle| {
                     if validator.is_none() {
-                        validator = Some(Engine::new(Api::load()?, Rc::default(), Role::Main)?);
+                        validator = Some(JsContext::new(
+                            JavaScriptCore::load()?,
+                            Rc::default(),
+                            Role::Main,
+                        )?);
                     }
-                    validator.as_ref().unwrap().validate(&bundle)?;
+                    validator.as_ref().unwrap().validate_bundle(&bundle)?;
                     Ok(bundle)
                 });
                 match rebuilt {

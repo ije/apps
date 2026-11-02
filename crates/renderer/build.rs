@@ -67,7 +67,7 @@ fn hlsl() {
 }
 
 fn metal() {
-    let source = "src/platform/mac/shaders.metal";
+    let source = "src/platform/macos/shaders.metal";
     println!("cargo::rerun-if-changed={source}");
     if !Command::new("xcrun")
         .args(["-sdk", "macosx", "-f", "metal"])

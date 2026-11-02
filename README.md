@@ -2,6 +2,18 @@
  
 A tiny(small bundle), high performance, low memory usage and memory-safe electron alternative with compatible API design.
 
+The Cargo workspace keeps each component in `crates/`:
+
+- `cli`: The `apps` command, JavaScript bundler, and app packages. `src/commands` contains the command handlers. `src/packaging.rs` creates app directories and archives.
+- `runtime`: JavaScriptCore contexts, desktop APIs, DOM, CSS, and page views.
+- `renderer`: Native windows, text layout, and GPU rendering.
+- `webview`: System webviews.
+- `webgpu`, `media`, and `perfhud`: WebGPU, media playback, and the FPS HUD.
+
+The workspace root selects `cli` by default. Use `--workspace` to build or check all crates.
+The Rust APIs use `jsc::JavaScriptCore` for the shared JavaScriptCore library and `jsc::JsContext` for each JavaScript context.
+`JsContext::load_bundle()` executes a bundle, and `JsContext::validate_bundle()` checks it without execution.
+
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps run --watch` / `-W`: Restart when the entry or its imports change. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.

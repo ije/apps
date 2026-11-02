@@ -259,11 +259,11 @@ mod tests {
     use crate::{
         dom::Document,
         host::{Host, Page, Role},
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
     use std::{cell::RefCell, rc::Rc};
 
-    fn page() -> (Rc<RefCell<Host>>, Engine) {
+    fn page() -> (Rc<RefCell<Host>>, JsContext) {
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
             1,
@@ -272,7 +272,12 @@ mod tests {
                 dirty: false,
             },
         );
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         (host, engine)
     }
 

@@ -1,7 +1,7 @@
 //! The FPS HUD that `apps run` shows on Cmd+Alt+F. The apps_perfhud library next to the runtime measures and
 //! lays it out. `apps build` doesn't ship the library, so built apps can't show it.
 
-use super::ViewData;
+use super::PageState;
 use anyhow::{Context, Result, ensure};
 use renderer::{Bounds, TextAlign, TextRun, Timer, Window, point, px, size};
 use std::{
@@ -53,7 +53,7 @@ pub(crate) struct Hud {
 
 impl Hud {
     /// Shows or hides the HUD of `view`.
-    pub(crate) fn toggle(view: &Rc<ViewData>, window: &mut Window) {
+    pub(crate) fn toggle(view: &Rc<PageState>, window: &mut Window) {
         if view.hud.take().is_none() {
             static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
             match LIBRARY.get_or_init(|| load().map_err(|error| format!("{error:#}"))) {
@@ -126,7 +126,7 @@ fn load() -> Result<Library> {
 }
 
 /// Ticks the HUD of `view` every half second while it is shown, and draws a frame when the page is idle.
-fn tick(view: Weak<ViewData>, window: &Window) -> Timer {
+fn tick(view: Weak<PageState>, window: &Window) -> Timer {
     window.timer(Duration::from_millis(500), move |window, _| {
         let Some(data) = view.upgrade() else {
             return;

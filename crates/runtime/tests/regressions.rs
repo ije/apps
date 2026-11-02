@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn page() -> (Engine, Rc<RefCell<Host>>) {
+fn page() -> (JsContext, Rc<RefCell<Host>>) {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -19,7 +19,12 @@ fn page() -> (Engine, Rc<RefCell<Host>>) {
         },
     );
     (
-        Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap(),
+        JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap(),
         host,
     )
 }
@@ -27,7 +32,7 @@ fn page() -> (Engine, Rc<RefCell<Host>>) {
 #[test]
 fn page_networks_are_public_except_own_servers() {
     let (renderer, host) = page();
-    let main = Engine::new(Api::load().unwrap(), host, Role::Main).unwrap();
+    let main = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Main).unwrap();
     let port = main
         .eval(
             "globalThis.server=__apps.serve({port:0,fetch:()=>new Response('ok')});server.port",
@@ -73,7 +78,8 @@ fn weak_sweeps_free_detached_nodes_and_preserve_live_subtrees() {
 
 #[test]
 fn weak_finalizers_run_without_finalization_registry() {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval("globalThis.released=0;globalThis.registry=new __appsFinalizers(()=>released++);(()=>{for(let i=0;i<10000;i++)registry.register({},i)})()", "test").unwrap();
     for _ in 0..20 {
         engine.collect_garbage();
@@ -107,7 +113,8 @@ fn weak_finalizers_run_without_finalization_registry() {
 #[test]
 fn binary_files_and_compression_preserve_views_and_large_data() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine
         .eval(
             &format!(
@@ -130,7 +137,8 @@ fn binary_files_and_compression_preserve_views_and_large_data() {
 #[test]
 fn node_bytes_lines_and_handles() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval(&format!("globalThis.file={};globalThis.failure='';globalThis.handles=null;(async()=>{{{}}})().catch(e=>failure=String(e)+e.stack)", serde_json::json!(dir.path().join("file")), r#"
         const {assert,fs,stream,readline,crypto,sqlite}=__apps;
         const input=new stream.PassThrough(),lines=[];readline.createInterface({input}).on('line',line=>lines.push(line));
@@ -179,18 +187,19 @@ fn node_bytes_lines_and_handles() {
 
 #[test]
 fn event_emitters_support_legacy_constructors_and_prepend() {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     assert_eq!(engine.eval(r#"(()=>{const E=__apps.events.EventEmitter;function Old(){E.call(this)}Object.setPrototypeOf(Old.prototype,E.prototype);const e=new Old(),out=[];e.setMaxListeners(20).on('x',()=>out.push('last')).prependListener('x',()=>out.push('first')).prependOnceListener('x',()=>out.push('once'));e.emit('x');e.emit('x');return e.getMaxListeners()+':'+out.join(',')})()"#, "test").unwrap(), "20:once,first,last,first,last");
 }
 
 #[test]
 fn published_binary_bridge_values_survive_reload_without_aliasing() {
     let (_, host) = page();
-    let api = Api::load().unwrap();
-    let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+    let api = JavaScriptCore::load().unwrap();
+    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
     preload.eval("__apps.contextBridge.exposeInMainWorld('first',new Uint8Array([1,2,3]).subarray(1));__apps.contextBridge.exposeInMainWorld('second',new Uint8Array([4,5]));", "test").unwrap();
     for _ in 0..2 {
-        let page = Engine::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
+        let page = JsContext::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
         assert_eq!(
             page.eval("[...first,...second].join(',')", "test").unwrap(),
             "2,3,4,5"

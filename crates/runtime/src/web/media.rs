@@ -3,13 +3,7 @@
 
 use super::gpu::{Alloc, Output, alloc, drop_waker, wake, waker};
 use anyhow::{Context, Result, anyhow, ensure};
-use std::{
-    ffi::c_void,
-    mem::MaybeUninit,
-    path::Path,
-    ptr::NonNull,
-    sync::OnceLock,
-};
+use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLock};
 
 const ABI: u32 = 2;
 
@@ -116,7 +110,11 @@ fn load() -> Result<Library> {
         let library = libloading::Library::new(&path)
             .with_context(|| format!("Cannot load the media library from {}", path.display()))?;
         let abi: libloading::Symbol<extern "C" fn() -> u32> = library.get(b"apps_media_abi\0")?;
-        ensure!(abi() == ABI, "{} does not match this runtime", path.display());
+        ensure!(
+            abi() == ABI,
+            "{} does not match this runtime",
+            path.display()
+        );
         let functions = Library {
             new: *library.get(b"apps_media_new\0")?,
             free: *library.get(b"apps_media_free\0")?,
@@ -160,7 +158,9 @@ impl Media {
         let (raw, library) = self.raw()?;
         let (data, file) = match source {
             Ok(path) => (
-                path.to_str().context("The media path is not UTF-8")?.as_bytes(),
+                path.to_str()
+                    .context("The media path is not UTF-8")?
+                    .as_bytes(),
                 true,
             ),
             Err(bytes) => (bytes, false),
@@ -169,7 +169,11 @@ impl Media {
             (library.open)(
                 raw.as_ptr(),
                 id,
-                if file { data.as_ptr() } else { std::ptr::null() },
+                if file {
+                    data.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
                 data.as_ptr(),
                 data.len(),
                 video,
@@ -191,8 +195,9 @@ impl Media {
     }
 
     pub fn time(&self, id: u64) -> f64 {
-        self.raw
-            .map_or(0., |(raw, library)| unsafe { (library.time)(raw.as_ptr(), id) })
+        self.raw.map_or(0., |(raw, library)| unsafe {
+            (library.time)(raw.as_ptr(), id)
+        })
     }
 
     /// The events since the last poll as JSON text.
@@ -217,9 +222,8 @@ impl Media {
             return None;
         }
         let length = frame.width as usize * frame.height as usize * 4;
-        let pixels = unsafe {
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(frame.pixels, length))
-        };
+        let pixels =
+            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(frame.pixels, length)) };
         Some(renderer::RenderImage::new(
             frame.width,
             frame.height,

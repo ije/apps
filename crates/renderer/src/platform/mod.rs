@@ -1,9 +1,9 @@
 //! One module per OS. Each provides `Platform`, `Window`, `TextSystem`, `Atlas` and `post`.
 
 #[cfg(target_os = "macos")]
-mod mac;
+mod macos;
 #[cfg(target_os = "macos")]
-pub(crate) use mac::*;
+pub(crate) use macos::*;
 
 #[cfg(target_os = "windows")]
 mod windows;

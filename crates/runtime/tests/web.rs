@@ -1,6 +1,6 @@
 use apps_runtime::{
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -10,7 +10,7 @@ use std::{
 
 #[test]
 fn web_apis_in_every_context() {
-    let api = Api::load().unwrap();
+    let api = JavaScriptCore::load().unwrap();
     for role in [Role::Main, Role::Preload(1), Role::Renderer(1)] {
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
@@ -20,7 +20,7 @@ fn web_apis_in_every_context() {
                 dirty: false,
             },
         );
-        let engine = Engine::new(api.clone(), host, role).unwrap();
+        let engine = JsContext::new(api.clone(), host, role).unwrap();
         for script in [
             include_str!("web.js"),
             include_str!("web_standards.js"),
@@ -201,8 +201,8 @@ fn fetch_streams_redirects_and_abort() {
             });
         }
     });
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )
@@ -236,8 +236,8 @@ fn fetch_streams_redirects_and_abort() {
 #[test]
 #[ignore = "Manual stream throughput measurement"]
 fn stream_throughput() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )
@@ -296,7 +296,7 @@ fn runtime_imports_follow_features() {
             );
         }
     });
-    let api = Api::load().unwrap();
+    let api = JavaScriptCore::load().unwrap();
     let run = |disabled: u32, role: Role, code: &str| {
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().disabled = disabled;
@@ -307,7 +307,7 @@ fn runtime_imports_follow_features() {
                 dirty: false,
             },
         );
-        let engine = Engine::new(api.clone(), host, role).unwrap();
+        let engine = JsContext::new(api.clone(), host, role).unwrap();
         engine
             .eval(
                 &format!("globalThis.result='pending';Promise.resolve().then(()=>{code}).then(v=>result=String(v),e=>result=e.message)"),

@@ -3,11 +3,11 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
-fn page(disabled: u32) -> (Rc<RefCell<Host>>, Engine, String) {
+fn page(disabled: u32) -> (Rc<RefCell<Host>>, JsContext, String) {
     let host = Rc::new(RefCell::new(Host::default()));
     let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/");
     let base = url::Url::from_directory_path(&folder).unwrap();
@@ -23,12 +23,17 @@ fn page(disabled: u32) -> (Rc<RefCell<Host>>, Engine, String) {
         );
         host.dom.entry(1).or_default().base = Some(base.clone());
     }
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     (host, engine, base.to_string())
 }
 
 // WARNING: CoreAudio reads the folder of the executable once per process, and target/debug/deps can make that take seconds.
-fn wait(engine: &Engine, ready: &str) -> String {
+fn wait(engine: &JsContext, ready: &str) -> String {
     for _ in 0..30000 {
         engine.tick().unwrap();
         let value = engine.eval(ready, "media-test").unwrap();
@@ -60,30 +65,56 @@ fn videos_decode_frames_seek_and_end() {
             .map(|value| assert_eq!(value, "probably"))
             .unwrap();
         assert_eq!(
-            wait(&engine, "media.readyState === 4 ? [media.duration.toFixed(1), media.videoWidth, media.videoHeight, media.currentTime].join() : media.error?.message ?? 'pending'"),
+            wait(
+                &engine,
+                "media.readyState === 4 ? [media.duration.toFixed(1), media.videoWidth, media.videoHeight, media.currentTime].join() : media.error?.message ?? 'pending'"
+            ),
             "1.0,64,48,0"
         );
-        let id: usize = engine.eval("media._id", "media-test").unwrap().parse().unwrap();
+        let id: usize = engine
+            .eval("media._id", "media-test")
+            .unwrap()
+            .parse()
+            .unwrap();
         let image = host.borrow().dom[&1].images[&id].clone();
         assert_eq!(
-            [u32::from(image.size().width), u32::from(image.size().height)],
+            [
+                u32::from(image.size().width),
+                u32::from(image.size().height)
+            ],
             [64, 48]
         );
         for (value, expected) in image.bytes()[..4].iter().zip([32, 128, 224, 255]) {
             assert!(value.abs_diff(expected) <= 6, "{:?}", &image.bytes()[..4]);
         }
-        engine.eval("media.currentTime = 0.5", "media-test").unwrap();
+        engine
+            .eval("media.currentTime = 0.5", "media-test")
+            .unwrap();
         assert_eq!(
-            wait(&engine, "media.seeking ? 'pending' : media.currentTime.toFixed(1)"),
+            wait(
+                &engine,
+                "media.seeking ? 'pending' : media.currentTime.toFixed(1)"
+            ),
             "0.5"
         );
-        engine.eval("media.play().then(() => globalThis.started = true)", "media-test").unwrap();
+        engine
+            .eval(
+                "media.play().then(() => globalThis.started = true)",
+                "media-test",
+            )
+            .unwrap();
         assert_eq!(
-            wait(&engine, "media.ended ? [started, media.paused, media.currentTime.toFixed(1)].join() : 'pending'"),
+            wait(
+                &engine,
+                "media.ended ? [started, media.paused, media.currentTime.toFixed(1)].join() : 'pending'"
+            ),
             "true,true,1.0"
         );
         assert_eq!(
-            wait(&engine, "events.includes('ended') ? events.join() : 'pending'"),
+            wait(
+                &engine,
+                "events.includes('ended') ? events.join() : 'pending'"
+            ),
             "loadstart,durationchange,resize,loadedmetadata,loadeddata,canplay,canplaythrough,seeking,seeked,play,playing,pause,ended"
         );
         assert!(!std::sync::Arc::ptr_eq(
@@ -103,7 +134,10 @@ fn audio_plays_to_the_end_and_loops() {
         )
         .unwrap();
     assert_eq!(
-        wait(&engine, "media.ended ? [loops, media.duration > 0.9, media instanceof HTMLAudioElement].join() : media.error?.message ?? 'pending'"),
+        wait(
+            &engine,
+            "media.ended ? [loops, media.duration > 0.9, media instanceof HTMLAudioElement].join() : media.error?.message ?? 'pending'"
+        ),
         "2,true,true"
     );
 }
@@ -118,7 +152,10 @@ fn audio_survives_layout_and_rate_changes() {
         )
         .unwrap();
     assert_eq!(
-        wait(&engine, "media.ended ? [media.error, media.currentTime > 0.9, events.includes('error')].join() : media.error?.message ?? 'pending'"),
+        wait(
+            &engine,
+            "media.ended ? [media.error, media.currentTime > 0.9, events.includes('error')].join() : media.error?.message ?? 'pending'"
+        ),
         ",true,false"
     );
 }
@@ -133,13 +170,23 @@ fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
         )
         .unwrap();
     assert_eq!(
-        wait(&engine, "media.readyState === 4 ? [media.videoWidth, media.videoHeight].join() : media.error?.message ?? 'pending'"),
+        wait(
+            &engine,
+            "media.readyState === 4 ? [media.videoWidth, media.videoHeight].join() : media.error?.message ?? 'pending'"
+        ),
         "8192,32"
     );
-    let id: usize = engine.eval("media._id", "media-test").unwrap().parse().unwrap();
+    let id: usize = engine
+        .eval("media._id", "media-test")
+        .unwrap()
+        .parse()
+        .unwrap();
     let image = host.borrow().dom[&1].images[&id].clone();
     assert_eq!(
-        [u32::from(image.size().width), u32::from(image.size().height)],
+        [
+            u32::from(image.size().width),
+            u32::from(image.size().height)
+        ],
         [8192, 32]
     );
 }
@@ -151,7 +198,10 @@ fn media_features_are_disabled_by_default() {
         .eval(&format!("globalThis.media = document.createElement('video'); {EVENTS} media.src = '{base}clip.mp4'; globalThis.rejected = ''; media.play().catch(error => rejected = error.name)"), "media-test")
         .unwrap();
     assert_eq!(
-        wait(&engine, "rejected ? [rejected, media.error.code, media.canPlayType('video/mp4'), events.join()].join() : 'pending'"),
+        wait(
+            &engine,
+            "rejected ? [rejected, media.error.code, media.canPlayType('video/mp4'), events.join()].join() : 'pending'"
+        ),
         "NotSupportedError,4,,loadstart,error"
     );
     assert!(
@@ -169,8 +219,10 @@ fn broken_media_reports_an_error() {
         .eval(&format!("globalThis.media = document.createElement('audio'); {EVENTS} media.src = 'data:audio/mpeg;base64,AAAAAAAA'"), "media-test")
         .unwrap();
     assert_eq!(
-        wait(&engine, "events.includes('error') ? [media.error.code, media.networkState, events.join()].join() : 'pending'"),
+        wait(
+            &engine,
+            "events.includes('error') ? [media.error.code, media.networkState, events.join()].join() : 'pending'"
+        ),
         "4,3,loadstart,error"
     );
 }
-

@@ -6,8 +6,8 @@ pub(crate) mod native;
 use crate::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
-    render::WebView,
+    jsc::{JavaScriptCore, JsContext},
+    render::PageView,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
@@ -23,16 +23,16 @@ use std::{
 
 pub(crate) struct View {
     pub(crate) handle: Option<WindowId>,
-    pub(crate) data: Weak<crate::render::ViewData>,
+    pub(crate) data: Weak<crate::render::PageState>,
     pub(crate) title: Option<String>,
-    pub(crate) preload: Option<Rc<Engine>>,
-    pub(crate) renderer: Option<Rc<Engine>>,
+    pub(crate) preload: Option<Rc<JsContext>>,
+    pub(crate) renderer: Option<Rc<JsContext>>,
 }
 
 pub struct Desktop {
-    api: Rc<Api>,
+    api: Rc<JavaScriptCore>,
     host: Rc<RefCell<Host>>,
-    pub(crate) main: Engine,
+    pub(crate) main: JsContext,
     pub(crate) views: HashMap<u64, View>,
     devtools: HashMap<u64, devtools::DevTools>,
     files: BBTreeMap<String, String>,
@@ -108,7 +108,7 @@ impl Desktop {
         packaged: bool,
         root: std::path::PathBuf,
     ) -> Result<Self> {
-        let api = Api::load()?;
+        let api = JavaScriptCore::load()?;
         let waker = Arc::new(OnceLock::<renderer::Waker>::new());
         crate::host::Waker::install({
             let waker = waker.clone();
@@ -141,8 +141,8 @@ impl Desktop {
             ..Host::default()
         }));
         host.borrow_mut().browsers.application = name;
-        let main = Engine::new(api.clone(), host.clone(), Role::Main)?;
-        main.bundle(files, "app.js")?;
+        let main = JsContext::new(api.clone(), host.clone(), Role::Main)?;
+        main.load_bundle(files, "app.js")?;
         Ok(Self {
             pages: BBTreeMap::new(),
             api,
@@ -269,7 +269,7 @@ impl Desktop {
                                 movable: options["movable"] != false,
                             };
                             let handle = cx.open_window(window_options, |window, _| {
-                                let view = WebView::new(id, runtime, host, window.id());
+                                let view = PageView::new(id, runtime, host, window.id());
                                 data = Rc::downgrade(&view.0);
                                 Box::new(view)
                             })?;
@@ -483,11 +483,11 @@ impl Desktop {
                         let preload = (trusted
                             && scripts.iter().any(|(kind, _)| *kind == "preload"))
                         .then(|| {
-                            Engine::new(self.api.clone(), self.host.clone(), Role::Preload(id))
+                            JsContext::new(self.api.clone(), self.host.clone(), Role::Preload(id))
                         })
                         .transpose()?
                         .map(Rc::new);
-                        let renderer = Rc::new(Engine::new(
+                        let renderer = Rc::new(JsContext::new(
                             self.api.clone(),
                             self.host.clone(),
                             Role::Renderer(id),
@@ -1273,7 +1273,7 @@ impl Desktop {
 }
 
 /// Collects garbage once JS has been quiet for a second.
-fn shrink_when_quiet(api: Rc<Api>, cx: &mut App) {
+fn shrink_when_quiet(api: Rc<JavaScriptCore>, cx: &mut App) {
     let busy = api.busy.get();
     cx.timer(Duration::from_secs(1), move |cx| {
         if api.busy.get() == busy {
@@ -1734,17 +1734,16 @@ mod tests {
         page(1)
             .eval("__appsExecuted(3, 'capture', false)", "test")
             .unwrap();
-        page(1).eval("__appsExecuted(2, 'own', false)", "test").unwrap();
+        page(1)
+            .eval("__appsExecuted(2, 'own', false)", "test")
+            .unwrap();
         desktop.pump(None, None).unwrap();
         desktop.main.tick().unwrap();
         assert_eq!(eval(&desktop, "results.join()"), "own");
         assert_eq!(eval(&desktop, "a.getTitle()"), "a\u{fffd}");
         eval(&desktop, "a.close(); b.close()");
         desktop.pump(None, None).unwrap();
-        assert_eq!(
-            eval(&desktop, "log.join('|')"),
-            "closed failed|all-closed"
-        );
+        assert_eq!(eval(&desktop, "log.join('|')"), "closed failed|all-closed");
         assert!(!desktop.quit);
     }
 

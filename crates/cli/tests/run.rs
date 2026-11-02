@@ -143,11 +143,11 @@ mod process {
     fn resolves_default_entries_and_forwards_devtools_and_exit_status() {
         let app = App::new();
         fs::write(
-            app.root.join("main.ts"),
+            app.root.join("index.ts"),
             "const n: number = 42; console.log(n);",
         )
         .unwrap();
-        fs::write(app.root.join("main.js"), "invalid javascript !!!").unwrap();
+        fs::write(app.root.join("index.js"), "invalid javascript !!!").unwrap();
         let output = app.command().output().unwrap();
         assert!(
             output.status.success(),
@@ -163,13 +163,13 @@ mod process {
         assert!(!bundle.packaged);
         assert!(!app.root.join(".apps").exists());
         assert!(!app.root.join("dist").exists());
-        fs::remove_file(app.root.join("main.ts")).unwrap();
-        fs::write(app.root.join("main.js"), "console.log(42);").unwrap();
+        fs::remove_file(app.root.join("index.ts")).unwrap();
+        fs::write(app.root.join("index.js"), "console.log(42);").unwrap();
         for args in [
             vec!["-D"],
-            vec!["--devtools", "main.js"],
-            vec!["main.js", "-D"],
-            vec!["main.js", "a", "--flag", "--", "-W"],
+            vec!["--devtools", "index.js"],
+            vec!["index.js", "-D"],
+            vec!["index.js", "a", "--flag", "--", "-W"],
         ] {
             let output = app
                 .command()
@@ -184,7 +184,7 @@ mod process {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let (ts, js) = (app.root.join("main.ts"), app.root.join("main.js"));
+        let (ts, js) = (app.root.join("index.ts"), app.root.join("index.js"));
         let (ts, js) = (ts.display(), js.display());
         assert_eq!(
             app.launches(),
@@ -198,7 +198,11 @@ mod process {
     fn streams_large_bundles_from_read_only_projects() {
         let app = App::new();
         let value = "large bundle 🫖".repeat(16384);
-        fs::write(app.root.join("main.js"), format!("console.log({value:?});")).unwrap();
+        fs::write(
+            app.root.join("index.js"),
+            format!("console.log({value:?});"),
+        )
+        .unwrap();
         fs::create_dir(app.root.join("public")).unwrap();
         fs::write(app.root.join("public/asset.txt"), "asset").unwrap();
         fs::set_permissions(&app.root, fs::Permissions::from_mode(0o555)).unwrap();
@@ -245,7 +249,7 @@ mod process {
         )
         .unwrap();
         fs::write(package.join("index.js"), "export const other = 2;").unwrap();
-        let entry = app.root.join("main.ts");
+        let entry = app.root.join("index.ts");
         let source = "import {value} from '../shared.ts'; import {other} from 'dep'; console.log(value, other);";
         fs::write(&entry, source).unwrap();
         app.child = Some(
@@ -289,7 +293,7 @@ mod process {
     #[test]
     fn watch_waits_for_a_fix_when_the_first_build_fails() {
         let mut app = App::new();
-        let entry = app.root.join("main.js");
+        let entry = app.root.join("index.js");
         fs::write(&entry, "invalid javascript !!!").unwrap();
         app.child = Some(
             app.command()
@@ -328,7 +332,7 @@ mod process {
     #[test]
     fn watches_public_assets_without_copying_them() {
         let mut app = App::new();
-        fs::write(app.root.join("main.js"), "console.log(1);").unwrap();
+        fs::write(app.root.join("index.js"), "console.log(1);").unwrap();
         fs::create_dir(app.root.join("public")).unwrap();
         let asset = app.root.join("public/asset.txt");
         fs::write(&asset, "before").unwrap();
@@ -355,7 +359,7 @@ mod process {
         )
         .unwrap();
         fs::write(
-            app.root.join("main.js"),
+            app.root.join("index.js"),
             format!("console.log({:?});", "large bundle".repeat(16384)),
         )
         .unwrap();
@@ -373,7 +377,7 @@ mod process {
                 "#!/bin/sh\ncat > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$$\" >> \"$APPS_RUN_LOG\"\nexec sleep 30\n",
             )
             .unwrap();
-            let entry = app.root.join("main.js");
+            let entry = app.root.join("index.js");
             fs::write(&entry, "console.log(1);").unwrap();
             app.child = Some(
                 app.command()

@@ -122,7 +122,7 @@ pub(super) struct DomBox {
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
     pub(super) ids: Rc<super::effects::Ids>,
-    pub(super) view: Rc<super::ViewData>,
+    pub(super) view: Rc<super::PageState>,
     pub(super) sticky: Option<Sticky>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,

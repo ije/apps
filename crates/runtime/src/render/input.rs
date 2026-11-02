@@ -1,4 +1,4 @@
-use super::{ViewData, WebView};
+use super::{PageState, PageView};
 use crate::style::Prop;
 use crate::{desktop::Desktop, style};
 use anyhow::{Context as _, Result, ensure};
@@ -21,7 +21,7 @@ pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 /// Paints the caret of a collapsed selection. Like browsers, it shows for 500 ms after it moves,
 /// then blinks every 500 ms. Inactive windows and `caret-color: transparent` show no caret.
 pub(super) fn paint_caret(
-    view: &ViewData,
+    view: &PageState,
     key: [usize; 3],
     bounds: Bounds<Pixels>,
     color: renderer::Rgba,
@@ -53,7 +53,7 @@ pub(super) fn paint_caret(
 pub(super) struct FieldText {
     pub(super) inner: renderer::StyledText,
     pub(super) id: usize,
-    pub(super) view: Rc<ViewData>,
+    pub(super) view: Rc<PageState>,
     pub(super) text: Rc<str>,
     /// The value of a password field, whose `text` shows a bullet for each code point.
     pub(super) password: Option<String>,
@@ -249,7 +249,7 @@ impl renderer::Element for FieldText {
     }
 }
 
-impl ViewData {
+impl PageState {
     pub(super) fn evaluate(&self, script: &str) -> Result<String> {
         let renderer = self
             .runtime
@@ -353,7 +353,7 @@ fn password<'a>(
         .then(|| state["text"].as_str())?
 }
 
-impl renderer::View for WebView {
+impl renderer::View for PageView {
     fn render(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
         if !window.redrawing()
             && let Some(hud) = &*self.hud.borrow()

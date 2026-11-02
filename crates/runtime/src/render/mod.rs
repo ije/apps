@@ -30,7 +30,7 @@ use std::{
 };
 
 /// The page of one window, shared with the elements that paint it.
-pub(crate) struct ViewData {
+pub(crate) struct PageState {
     pub(crate) id: u64,
     pub(crate) runtime: Rc<RefCell<Desktop>>,
     pub(crate) host: Rc<RefCell<Host>>,
@@ -71,7 +71,7 @@ type Clips = Vec<(usize, [bool; 2])>;
 thread_local! {
     /// The app and the window of the page scripts that run now.
     static SCRIPTS: Cell<Option<(*mut App, Option<*mut Window>)>> = const { Cell::new(None) };
-    static VIEWS: RefCell<HashMap<u64, std::rc::Weak<ViewData>>> = RefCell::default();
+    static VIEWS: RefCell<HashMap<u64, std::rc::Weak<PageState>>> = RefCell::default();
 }
 
 /// Runs page script `f`, which may lay out its page with `cx` and `window`, see [`reflow`].
@@ -101,7 +101,7 @@ pub(crate) fn reflow(id: u64) {
     let run = |window: &mut Window, cx: &mut App| {
         view.reflowing.set(true);
         window.layout(cx, |window, cx| {
-            WebView(view.clone()).render_page(window, cx)
+            PageView(view.clone()).render_page(window, cx)
         });
         view.reflowing.set(false);
         window.refresh();
@@ -118,7 +118,7 @@ pub(crate) fn reflow(id: u64) {
 
 /// Runs the page's animation frame callbacks before the frame lays out, and again on the next
 /// frame while the page asks for one.
-pub(crate) fn animation_frame(view: Rc<ViewData>, window: &mut Window, cx: &mut App) {
+pub(crate) fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     let renderer = view.runtime.try_borrow().ok().and_then(|app| {
         app.views
             .get(&view.id)
@@ -162,23 +162,23 @@ fn button(button: MouseButton) -> u8 {
 }
 
 /// The view of a window.
-pub(crate) struct WebView(pub(crate) Rc<ViewData>);
+pub(crate) struct PageView(pub(crate) Rc<PageState>);
 
-impl std::ops::Deref for WebView {
-    type Target = ViewData;
-    fn deref(&self) -> &ViewData {
+impl std::ops::Deref for PageView {
+    type Target = PageState;
+    fn deref(&self) -> &PageState {
         &self.0
     }
 }
 
-impl WebView {
+impl PageView {
     pub(crate) fn new(
         id: u64,
         runtime: Rc<RefCell<Desktop>>,
         host: Rc<RefCell<Host>>,
         window: WindowId,
     ) -> Self {
-        let view = Rc::new(ViewData {
+        let view = Rc::new(PageState {
             id,
             runtime,
             host,

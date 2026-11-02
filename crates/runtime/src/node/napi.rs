@@ -1,6 +1,6 @@
 use crate::{
     host::Host,
-    jsc::{Api, Ptr},
+    jsc::{JavaScriptCore, Ptr},
 };
 use anyhow::{Context, Result, ensure};
 use libloading::Library;
@@ -82,7 +82,7 @@ unsafe extern "C" fn release_holder(_: Ptr, holder: Ptr) {
 }
 
 pub(crate) struct State {
-    api: Rc<Api>,
+    api: Rc<JavaScriptCore>,
     ctx: Ptr,
     host: Weak<RefCell<Host>>,
     owner: Weak<State>,
@@ -115,7 +115,7 @@ thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<State>>> = RefCell:
 
 impl State {
     pub(crate) fn new(
-        api: Rc<Api>,
+        api: Rc<JavaScriptCore>,
         ctx: Ptr,
         host: &Rc<RefCell<Host>>,
         addon: bool,
@@ -573,13 +573,17 @@ impl State {
                 } else if cfg!(windows) {
                     std::env::var_os("LOCALAPPDATA").map_or(home, Into::into)
                 } else {
-                    std::env::var_os("XDG_CACHE_HOME").map_or_else(|| home.join(".cache"), Into::into)
+                    std::env::var_os("XDG_CACHE_HOME")
+                        .map_or_else(|| home.join(".cache"), Into::into)
                 }
                 .join(host.borrow().app_name.as_deref().unwrap_or("apps"));
-                let hash = name.bytes().chain([0]).chain(bytes.iter().copied()).fold(
-                    0xcbf2_9ce4_8422_2325_u64,
-                    |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3),
-                );
+                let hash = name
+                    .bytes()
+                    .chain([0])
+                    .chain(bytes.iter().copied())
+                    .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+                    });
                 let file = folder.join(format!("{hash:016x}.node"));
                 if std::fs::read(&file).ok().as_deref() != Some(&bytes[..]) {
                     let temporary = file.with_extension(format!(
@@ -2144,10 +2148,10 @@ mod tests {
 
     #[test]
     fn reused_addresses_and_short_calls_are_rejected() {
-        let api = Api::load().unwrap();
+        let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let _engine =
-            crate::jsc::Engine::new(api.clone(), host.clone(), crate::host::Role::Main).unwrap();
+            crate::jsc::JsContext::new(api.clone(), host.clone(), crate::host::Role::Main).unwrap();
         let root = CONTEXTS
             .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
             .unwrap();

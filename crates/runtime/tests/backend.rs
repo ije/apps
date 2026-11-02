@@ -1,6 +1,6 @@
 use apps_runtime::{
     host::Role,
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     rc::Rc,
@@ -8,7 +8,8 @@ use std::{
 };
 
 fn run(source: &str) {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval(&format!("globalThis.result='pending'; (async()=>{{{source}}})().then(()=>result='ok',error=>result=String(error)+'\\n'+String(error.stack??''));"), "backend-tests").unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {

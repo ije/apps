@@ -64,7 +64,7 @@ fn resolves_default_entries_with_build_options() {
     let runtime = dir.path().join("runtime");
     let out = dir.path().join("output");
     fs::write(&runtime, binary("windows", "x64")).unwrap();
-    fs::write(dir.path().join("main.js"), "invalid javascript !!!").unwrap();
+    fs::write(dir.path().join("index.js"), "invalid javascript !!!").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_apps"));
     command
         .args([
@@ -80,8 +80,11 @@ fn resolves_default_entries_with_build_options() {
         .env("APPS_RUNTIME", &runtime)
         .env("APPS_JSC_LIBRARY", &runtime);
     for (entry, source) in [
-        ("main.ts", "const answer: number = 42; console.log(answer);"),
-        ("main.js", "console.log(42);"),
+        (
+            "index.ts",
+            "const answer: number = 42; console.log(answer);",
+        ),
+        ("index.js", "console.log(42);"),
     ] {
         fs::write(dir.path().join(entry), source).unwrap();
         let result = command.output().unwrap();

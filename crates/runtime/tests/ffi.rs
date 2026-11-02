@@ -3,7 +3,7 @@
 fn native_calls_callbacks_memory_and_lifecycle() {
     use apps_runtime::{
         host::{Host, Role},
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
     use std::{cell::RefCell, process::Command, rc::Rc};
 
@@ -30,8 +30,8 @@ fn native_calls_callbacks_memory_and_lifecycle() {
         String::from_utf8_lossy(&output.stderr)
     );
     for role in [Role::Main, Role::Preload(1)] {
-        let engine = Engine::new(
-            Api::load().unwrap(),
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
             Rc::new(RefCell::new(Host::default())),
             role,
         )

@@ -1,4 +1,4 @@
-use crate::{desktop::browser::Browser, host::Host, jsc::Engine};
+use crate::{desktop::browser::Browser, host::Host, jsc::JsContext};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -97,7 +97,7 @@ impl DevTools {
 
 pub fn dispatch(
     command: &Value,
-    engine: &Engine,
+    engine: &JsContext,
     host: &Rc<RefCell<Host>>,
     window: u64,
 ) -> Result<Value> {
@@ -164,7 +164,7 @@ mod tests {
     use crate::{
         dom::Document,
         host::{Page, Role},
-        jsc::Api,
+        jsc::JavaScriptCore,
     };
 
     #[test]
@@ -173,7 +173,8 @@ mod tests {
             packaged: true,
             ..Host::default()
         }));
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Main).unwrap();
+        let engine =
+            JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
         engine.eval("globalThis.answer = 42", "app.js").unwrap();
         assert!(engine.sources().is_empty());
         assert!(dispatch(&json!({"method":"Sources.list"}), &engine, &host, 0).is_err());
@@ -216,7 +217,12 @@ mod tests {
                 dirty: false,
             },
         );
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         let command = json!({"method":"Runtime.evaluate","params":{"expression":"document.querySelector('#value').textContent = 'changed'"}});
         assert_eq!(dispatch(&command, &engine, &host, 1).unwrap(), "changed");
         let document = dispatch(

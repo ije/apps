@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{
     cell::RefCell,
@@ -10,7 +10,8 @@ use std::{
 };
 
 fn run(source: &str) {
-    let engine = Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+    let engine =
+        JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
     engine.eval(&format!("globalThis.result='pending';(async()=>{{{source}}})().then(()=>result='ok',e=>result=String(e)+'\\n'+e.stack);"),"compatibility").unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -267,7 +268,7 @@ fn node_stream_helpers_match_node() {
 
 #[test]
 fn bridge_preload_calls_main_and_publishes_events() {
-    let api = Api::load().unwrap();
+    let api = JavaScriptCore::load().unwrap();
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -276,11 +277,11 @@ fn bridge_preload_calls_main_and_publishes_events() {
             dirty: false,
         },
     );
-    let main = Engine::new(api.clone(), host.clone(), Role::Main).unwrap();
-    let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
     main.eval("__apps.ipcMain.handle('sum',(_e,a,b)=>a+b);__apps.ipcMain.handle('double',(_e,v)=>v.map(x=>x*2));__apps.ipcMain.on('version',e=>e.returnValue='v1')","test").unwrap();
     preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{sum:(a,b)=>__apps.ipcRenderer.invoke('sum',a,b),double:v=>__apps.ipcRenderer.invoke('double',v),version:__apps.ipcRenderer.sendSync('version'),subscribe:callback=>{const listener=(_event,data)=>callback(data);__apps.ipcRenderer.on('change',listener);return()=>__apps.ipcRenderer.off('change',listener);}});","test").unwrap();
-    let page = Engine::new(api, host, Role::Renderer(1)).unwrap();
+    let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
     assert_eq!(page.eval("desktop.version", "test").unwrap(), "v1");
     page.eval(
         "globalThis.result='pending';desktop.sum(3,4).then(v=>result=v,e=>result=String(e));globalThis.bytes='pending';desktop.double(new Float32Array([1.5,-2,0.25])).then(v=>bytes=v.constructor.name+':'+[...v],e=>bytes=String(e));",
@@ -314,7 +315,7 @@ fn bridge_preload_calls_main_and_publishes_events() {
 
 #[test]
 fn bridge_capabilities_failures_and_closed_contexts() {
-    let api = Api::load().unwrap();
+    let api = JavaScriptCore::load().unwrap();
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -323,8 +324,8 @@ fn bridge_capabilities_failures_and_closed_contexts() {
             dirty: false,
         },
     );
-    let main = Engine::new(api.clone(), host.clone(), Role::Main).unwrap();
-    let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
     main.eval("__apps.ipcMain.handle('wait',()=>new Promise(()=>{}));const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{globalThis.lastMessage=message;return receive(message)};", "test").unwrap();
     preload.eval("__apps.contextBridge.exposeInMainWorld('desktop',{value:()=>7,callback:fn=>fn(),fail:()=>Promise.reject(0),wait:()=>__apps.ipcRenderer.invoke('wait')});", "test").unwrap();
     let token = host.borrow().bridge[&1]["desktop"].value["items"]["value"]["id"]
@@ -337,7 +338,7 @@ fn bridge_capabilities_failures_and_closed_contexts() {
     );
     let denied=preload.eval(&format!("__appsBridgeReceive({{kind:'call',function:{},sender:{{renderer:2}},args:{{type:'array',id:0,items:[]}}}})",serde_json::to_string(&token).unwrap()),"test").unwrap_err();
     assert!(denied.to_string().contains("unavailable to this context"));
-    let page = Engine::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
+    let page = JsContext::new(api.clone(), host.clone(), Role::Renderer(1)).unwrap();
     assert_eq!(page.eval("desktop.value()", "test").unwrap(), "7");
     assert!(page.eval("(()=>{try{desktop.callback(()=>{throw Error('callback failed')})}catch(e){return e.message}})()","test").unwrap().ends_with("callback failed"));
     page.eval(
@@ -371,7 +372,7 @@ fn bridge_capabilities_failures_and_closed_contexts() {
     }
     assert_eq!(page.eval("result", "test").unwrap(), "Bridge target closed");
     drop(page);
-    let page = Engine::new(api, host.clone(), Role::Renderer(1)).unwrap();
+    let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
     assert_eq!(
         page.eval("desktop.value()", "test").unwrap(),
         "7",
@@ -390,8 +391,8 @@ fn bridge_capabilities_failures_and_closed_contexts() {
     );
 }
 
-fn contexts() -> (Rc<RefCell<Host>>, Engine, Engine) {
-    let api = Api::load().unwrap();
+fn contexts() -> (Rc<RefCell<Host>>, JsContext, JsContext) {
+    let api = JavaScriptCore::load().unwrap();
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
         1,
@@ -400,13 +401,13 @@ fn contexts() -> (Rc<RefCell<Host>>, Engine, Engine) {
             dirty: false,
         },
     );
-    let main = Engine::new(api.clone(), host.clone(), Role::Main).unwrap();
+    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
     main.eval(
         "__appsEvent('ready');globalThis.win=new __apps.BrowserWindow();globalThis.log=[];",
         "test",
     )
     .unwrap();
-    let preload = Engine::new(api, host.clone(), Role::Preload(1)).unwrap();
+    let preload = JsContext::new(api, host.clone(), Role::Preload(1)).unwrap();
     (host, main, preload)
 }
 
@@ -509,7 +510,7 @@ fn context_bridge_exposes_late_values_promises_and_the_page_dom() {
             ipcRenderer.send('dom', [node.textContent, document.querySelectorAll('span').length, node.getAttribute('class'), document.getElementById('missing'), process.type, process.versions.electron].join());
         });
     "#, "test").unwrap();
-    let page = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     page.eval("__appsSyncBridge();globalThis.out=[];early.ready.then(v=>out.push('ready:'+v));try{early.fail()}catch(e){out.push(e.name+':'+e.message)}early.later().catch(e=>out.push(e.name+':'+e.message))", "test").unwrap();
     preload
         .eval("dispatchEvent(new Event('DOMContentLoaded'))", "test")
@@ -544,7 +545,7 @@ fn renderer_cannot_forge_native_worker_requests() {
             dirty: false,
         },
     );
-    let page = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     page.eval(r#"
         (()=>{
             const original=JSON.stringify;

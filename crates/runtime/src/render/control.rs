@@ -116,7 +116,7 @@ pub(super) struct Look {
 }
 
 /// A layer over the padding box that draws the control's marks.
-pub(super) fn layer(id: usize, look: Look, view: Rc<super::ViewData>) -> AnyElement {
+pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> AnyElement {
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {

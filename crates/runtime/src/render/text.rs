@@ -470,7 +470,7 @@ fn first_line(
 pub(super) struct InlineText {
     pub(super) inner: renderer::StyledText,
     pub(super) data: Rc<style::InlineText>,
-    pub(super) view: Rc<super::ViewData>,
+    pub(super) view: Rc<super::PageState>,
     pub(super) runs: Option<Vec<renderer::TextRun>>,
     /// For justified text, whether the last row is justified too.
     pub(super) justify: Option<bool>,

@@ -461,7 +461,10 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     };
     if media.is_null() {
         let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
-        return event(format!("\"error\",4,{:?}", format!("Cannot open the media: {message}")));
+        return event(format!(
+            "\"error\",4,{:?}",
+            format!("Cannot open the media: {message}")
+        ));
     }
     let duration = info.duration;
     event(format!(
@@ -515,7 +518,9 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             target = None;
             state.ready = true;
             state.show = true;
-            state.events.push(if loaded { "\"seeked\"" } else { "\"loaded\"" }.into());
+            state
+                .events
+                .push(if loaded { "\"seeked\"" } else { "\"loaded\"" }.into());
             loaded = true;
             shared.update(&state);
             waker.wake();
@@ -595,9 +600,8 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     blocked = 0;
                     let mut time = if time.is_finite() { time } else { audio_end };
                     let step = speed / rate as f64;
-                    let mut samples = unsafe {
-                        std::slice::from_raw_parts(samples, count as usize * channels)
-                    };
+                    let mut samples =
+                        unsafe { std::slice::from_raw_parts(samples, count as usize * channels) };
                     if let Some(target) = target
                         && time < target
                     {

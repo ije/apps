@@ -1,63 +1,18 @@
-use crate::{bundler, target::Target};
+use crate::build_target::BuildTarget;
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
 use std::{
     fs,
     path::{Path, PathBuf},
-    rc::Rc,
-    time::Instant,
 };
 
-pub fn run(entry: &Path, out: &Path, runtime: &Path, target: Target) -> Result<()> {
-    let started = Instant::now();
-    target.validate(runtime).context(
-        "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
-    )?;
-    let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true, None)?;
-    if let Some(source) = files.get("native.json") {
-        let addons: std::collections::BTreeMap<String, PathBuf> = serde_json::from_str(source)?;
-        for path in addons.values() {
-            target
-                .validate(path)
-                .context("Native addon does not match the build target")?;
-        }
-    }
-    let app = (
-        "app.js".to_owned(),
-        apps_runtime::bundle_source(&files, false),
-    );
-    for (name, source) in files
-        .iter()
-        .filter(|(name, _)| name.starts_with("script-"))
-        .chain([(&app.0, &app.1)])
-    {
-        let allocator = oxc_allocator::Allocator::default();
-        let parsed =
-            oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::cjs()).parse();
-        ensure!(
-            parsed.diagnostics.is_empty(),
-            "Invalid app bundle {name}: {:?}",
-            parsed.diagnostics
-        );
-    }
-    let root = entry.parent().context("Missing project directory")?;
-    let (bytes, _) = write_bundle(out, &files, runtime, root, true, target)?;
-    println!(
-        "apps: built {} bytes in {} ms → {}",
-        bytes,
-        started.elapsed().as_millis(),
-        out.display()
-    );
-    Ok(())
-}
-
-pub fn write_bundle(
+pub fn package_app(
     out: &Path,
     files: &BBTreeMap<String, String>,
     runtime: &Path,
     root: &Path,
     production: bool,
-    target: Target,
+    target: BuildTarget,
 ) -> Result<(usize, PathBuf)> {
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version, identifier) =
@@ -128,7 +83,11 @@ pub fn write_bundle(
     let root = root.canonicalize()?;
     let mut copies = Vec::new();
     if root.join("public").try_exists()? {
-        copies.push(("public".to_owned(), root.join("public").canonicalize()?, PathBuf::new()));
+        copies.push((
+            "public".to_owned(),
+            root.join("public").canonicalize()?,
+            PathBuf::new(),
+        ));
     }
     if let Some(manifest) = root
         .ancestors()
@@ -139,12 +98,18 @@ pub fn write_bundle(
             .with_context(|| format!("Invalid package metadata in {}", manifest.display()))?;
         for item in package
             .get("files")
-            .map(|files| files.as_array().context("package.json files must be an array"))
+            .map(|files| {
+                files
+                    .as_array()
+                    .context("package.json files must be an array")
+            })
             .transpose()?
             .into_iter()
             .flatten()
         {
-            let item = item.as_str().context("package.json files must be strings")?;
+            let item = item
+                .as_str()
+                .context("package.json files must be strings")?;
             let source = manifest
                 .parent()
                 .unwrap()
@@ -155,7 +120,9 @@ pub fn write_bundle(
                 .strip_prefix(&root)
                 .ok()
                 .filter(|relative| !relative.as_os_str().is_empty())
-                .with_context(|| format!("{item} of package.json files must be inside the app folder"))?
+                .with_context(|| {
+                    format!("{item} of package.json files must be inside the app folder")
+                })?
                 .to_owned();
             copies.push((item.to_owned(), source, relative));
         }
@@ -234,7 +201,7 @@ pub fn write_bundle(
     }
     let jsc = apps_runtime::jsc::library_path(runtime, target.platform)?;
     target
-        .validate(&jsc)
+        .validate_binary(&jsc)
         .context("JavaScriptCore does not match the build target")?;
     let libraries = if target.platform == "macos" {
         app_directory.join("Contents/Frameworks")
@@ -259,7 +226,7 @@ pub fn write_bundle(
     }
     if let Some(name) = webgpu {
         let source = runtime.canonicalize()?.with_file_name(name);
-        target.validate(&source).context(
+        target.validate_binary(&source).context(
             "The webgpu feature needs the WebGPU library next to the runtime. Build the workspace first with cargo build --workspace --release.",
         )?;
         let destination = libraries.join(name);
@@ -270,7 +237,7 @@ pub fn write_bundle(
     for name in &media {
         let source = folder.with_file_name(name);
         if name != "FFmpeg.LICENSE" {
-            target.validate(&source).context(
+            target.validate_binary(&source).context(
                 "The video and audio features need the media library next to the runtime. Build the workspace first with cargo build --workspace --release.",
             )?;
         }
@@ -403,6 +370,7 @@ pub fn write_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundler;
 
     #[test]
     fn package_metadata_names_executables_and_mac_bundles() {
@@ -437,13 +405,13 @@ mod tests {
                 ("package.json".into(), package.to_string()),
             ]);
             for production in [false, true] {
-                let (_, executable) = write_bundle(
+                let (_, executable) = package_app(
                     &out,
                     &files,
                     &runtime,
                     dir.path(),
                     production,
-                    Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
                 .unwrap();
                 let filename = if cfg!(windows) {
@@ -595,13 +563,13 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let (_, executable) = write_bundle(
+                let (_, executable) = package_app(
                     &out,
                     &files,
                     &runtime,
                     dir.path(),
                     production,
-                    Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
                 .unwrap();
                 assert_eq!(executable.file_stem().unwrap(), name);
@@ -619,7 +587,7 @@ mod tests {
 
     #[test]
     fn media_libraries_ship_only_with_the_features() {
-        let target = Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let target = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         fs::write(&runtime, b"runtime").unwrap();
@@ -637,7 +605,7 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            write_bundle(&out, &files, &runtime, dir.path(), true, target)
+            package_app(&out, &files, &runtime, dir.path(), true, target)
         };
         let error = build(r#"["video"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
@@ -684,7 +652,7 @@ mod tests {
 
     #[test]
     fn webgpu_library_ships_only_with_the_feature() {
-        let target = Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let target = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
         let Some(name) = apps_runtime::gpu::library_name(target.platform) else {
             return;
         };
@@ -705,14 +673,7 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            write_bundle(
-                &out,
-                &files,
-                &runtime,
-                dir.path(),
-                true,
-                target,
-            )
+            package_app(&out, &files, &runtime, dir.path(), true, target)
         };
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
@@ -749,14 +710,13 @@ mod tests {
         } else {
             out.clone()
         };
-        let public = dir.path().join("public");
-        write_bundle(
+        package_app(
             &out,
             &files,
             &runtime,
             dir.path(),
             false,
-            Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
         .unwrap();
         assert!(assets.join("app.js").is_file());
@@ -764,13 +724,13 @@ mod tests {
         assert!(!assets.join("apps.json").exists());
         assert!(apps_runtime::bundle::read(&out).unwrap().pages.is_empty());
         fs::write(assets.join("apps.json"), b"old manifest").unwrap();
-        write_bundle(
+        package_app(
             &out,
             &files,
             &runtime,
             dir.path(),
             true,
-            Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
         .unwrap();
         assert!(assets.join("app.h2o").is_file());
@@ -778,13 +738,13 @@ mod tests {
         assert!(!assets.join("page-0.html").exists());
         assert!(!assets.join("apps.json").exists());
         assert_eq!(apps_runtime::bundle::read(&out).unwrap().pages.len(), 1);
-        write_bundle(
+        package_app(
             &out,
             &files,
             &runtime,
             dir.path(),
             false,
-            Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
         .unwrap();
         assert!(!assets.join("app.h2o").exists());
@@ -823,13 +783,13 @@ mod tests {
         };
         for production in [false, true] {
             fs::write(public.join("message.txt"), "first").unwrap();
-            write_bundle(
+            package_app(
                 &out,
                 &files,
                 &runtime,
                 dir.path(),
                 production,
-                Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
             .unwrap();
             assert_eq!(
@@ -854,13 +814,13 @@ mod tests {
 
             fs::remove_file(public.join("message.txt")).unwrap();
             fs::write(public.join("new.txt"), "second").unwrap();
-            write_bundle(
+            package_app(
                 &out,
                 &files,
                 &runtime,
                 dir.path(),
                 production,
-                Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
             .unwrap();
             assert!(!assets.join("message.txt").exists());
@@ -878,13 +838,13 @@ mod tests {
         let out = dir.path().join("dist");
         let files = BBTreeMap::from([("app.js".into(), String::new())]);
         for production in [false, true] {
-            let (_, executable) = write_bundle(
+            let (_, executable) = package_app(
                 &out,
                 &files,
                 &runtime,
                 dir.path(),
                 production,
-                Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             )
             .unwrap();
             for name in [
@@ -897,13 +857,13 @@ mod tests {
             ] {
                 let source = public.join(name);
                 fs::write(&source, "conflict").unwrap();
-                let error = write_bundle(
+                let error = package_app(
                     &out,
                     &files,
                     &runtime,
                     dir.path(),
                     production,
-                    Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
                 .unwrap_err();
                 assert!(
@@ -923,26 +883,26 @@ mod tests {
                 if fs::write(&source, "escape").is_err() {
                     continue;
                 }
-                let error = write_bundle(
+                let error = package_app(
                     &out,
                     &files,
                     &runtime,
                     dir.path(),
                     production,
-                    Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("without backslashes"), "{error}");
                 fs::remove_file(source).unwrap();
             }
         }
-        let error = write_bundle(
+        let error = package_app(
             &public.join("dist"),
             &files,
             &runtime,
             dir.path(),
             true,
-            Target::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside public"), "{error}");

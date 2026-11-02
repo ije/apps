@@ -1,6 +1,6 @@
 use crate::{
     host::Role,
-    jsc::{Api, Ptr},
+    jsc::{JavaScriptCore, Ptr},
 };
 use anyhow::{Context, Result, bail, ensure};
 use libffi::{
@@ -41,9 +41,9 @@ impl Drop for Active<'_> {
     }
 }
 
-struct Protected<'a>(&'a Api, Ptr, Ptr);
+struct Protected<'a>(&'a JavaScriptCore, Ptr, Ptr);
 impl<'a> Protected<'a> {
-    fn new(api: &'a Api, ctx: Ptr, value: Ptr) -> Self {
+    fn new(api: &'a JavaScriptCore, ctx: Ptr, value: Ptr) -> Self {
         unsafe {
             (api.protect)(ctx, value);
         }
@@ -81,7 +81,7 @@ struct CallbackData {
     foreign_thread: Arc<AtomicBool>,
     active: Cell<usize>,
     owner: Weak<NativeLibrary>,
-    api: Rc<Api>,
+    api: Rc<JavaScriptCore>,
     ctx: Ptr,
     function: Ptr,
     errors: Rc<RefCell<Vec<Option<String>>>>,
@@ -156,7 +156,7 @@ unsafe extern "C" fn free_buffer(_bytes: Ptr, context: Ptr) {
         drop(Box::from_raw(context as *mut Vec<u8>));
     }
 }
-fn buffer(api: &Api, ctx: Ptr, bytes: Vec<u8>) -> Result<Ptr> {
+fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: Vec<u8>) -> Result<Ptr> {
     let mut bytes = Box::new(bytes);
     let data = bytes.as_mut_ptr();
     let length = bytes.len();
@@ -179,7 +179,7 @@ fn buffer(api: &Api, ctx: Ptr, bytes: Vec<u8>) -> Result<Ptr> {
     ensure!(!result.is_null(), "Cannot create FFI buffer");
     Ok(result)
 }
-fn bytes(api: &Api, ctx: Ptr, view: Ptr) -> Result<(*mut u8, usize)> {
+fn bytes(api: &JavaScriptCore, ctx: Ptr, view: Ptr) -> Result<(*mut u8, usize)> {
     let mut exception = ptr::null_mut();
     unsafe {
         let length = (api.typed_length)(ctx, view, &mut exception);
@@ -304,7 +304,7 @@ pub(crate) struct State {
 impl State {
     pub(crate) fn call(
         &self,
-        api: &Rc<Api>,
+        api: &Rc<JavaScriptCore>,
         ctx: Ptr,
         role: Role,
         request: &Value,
@@ -577,7 +577,8 @@ mod tests {
     #[test]
     fn callback_outside_a_call_does_not_poison_the_next_call() {
         let engine =
-            crate::jsc::Engine::new(Api::load().unwrap(), Rc::default(), Role::Main).unwrap();
+            crate::jsc::JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main)
+                .unwrap();
         let address = engine.eval("globalThis.lib=new __apps.ffi.DynamicLibrary(null);String(lib.registerCallback(()=>{throw Error('outside call')}))", "test").unwrap().parse::<usize>().unwrap();
         let callback: unsafe extern "C" fn() = unsafe { std::mem::transmute(address) };
         unsafe {

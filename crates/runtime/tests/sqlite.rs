@@ -1,13 +1,13 @@
 use apps_runtime::{
     host::{Host, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::{cell::RefCell, rc::Rc};
 
 #[test]
 fn sqlite_statements_values_and_lifecycle() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )
@@ -126,8 +126,8 @@ fn sqlite_statements_values_and_lifecycle() {
 
 #[test]
 fn sqlite_iterators_release_statements_and_read_incrementally() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Preload(1),
     )
@@ -169,8 +169,8 @@ fn sqlite_iterators_release_statements_and_read_incrementally() {
 
 #[test]
 fn sqlite_errors_match_node() {
-    let engine = Engine::new(
-        Api::load().unwrap(),
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
         Rc::new(RefCell::new(Host::default())),
         Role::Main,
     )

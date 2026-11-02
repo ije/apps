@@ -35,7 +35,7 @@ pub(super) fn css_background(
     id: usize,
     slot: usize,
     radius: renderer::Radii<renderer::Length>,
-    view: Rc<super::ViewData>,
+    view: Rc<super::PageState>,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
 ) -> Vec<AnyElement> {

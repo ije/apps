@@ -16,7 +16,7 @@ use std::{
 pub(crate) type Ptr = *mut c_void;
 type Callback = unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr;
 
-pub struct Api {
+pub struct JavaScriptCore {
     _library: Library,
     group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
@@ -157,7 +157,7 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     )
 }
 
-impl Api {
+impl JavaScriptCore {
     pub fn load() -> Result<Rc<Self>> {
         let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
         // WARNING: JSC libraries must export the C ABI and unhandled-rejection callback SPI.
@@ -326,14 +326,14 @@ impl Api {
     }
 }
 
-impl Drop for Api {
+impl Drop for JavaScriptCore {
     fn drop(&mut self) {
         unsafe { (self.group_release)(self.group) };
     }
 }
 
 type Binding = (
-    Rc<Api>,
+    Rc<JavaScriptCore>,
     Rc<RefCell<Host>>,
     Role,
     Rc<RefCell<crate::node::sqlite::State>>,
@@ -996,7 +996,7 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
 }
 
 /// Makes an `ArrayBuffer` that owns `bytes`, or a `Uint8Array` over one.
-fn buffer(api: &Api, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
+fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
     let bytes = Box::new(Vec::from(bytes));
     unsafe {
         let array = (api.make_buffer)(
@@ -1016,7 +1016,7 @@ fn buffer(api: &Api, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
 }
 
 /// Converts a host result to a JavaScript value. Small arrays of primitives skip JSON.
-fn output(api: &Api, ctx: Ptr, payload: crate::jsc::payload::Payload) -> Ptr {
+fn output(api: &JavaScriptCore, ctx: Ptr, payload: crate::jsc::payload::Payload) -> Ptr {
     use serde_json::Value;
     let crate::jsc::payload::Payload { value, mut buffers } = payload;
     unsafe {
@@ -1182,7 +1182,7 @@ unsafe extern "C" fn ffi_call(
 }
 
 fn call_json<T>(
-    api: &Api,
+    api: &JavaScriptCore,
     ctx: Ptr,
     name: &str,
     arguments: &[&str],
@@ -1261,8 +1261,8 @@ struct Interrupt {
     limit: unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr),
 }
 
-pub struct Engine {
-    api: Rc<Api>,
+pub struct JsContext {
+    api: Rc<JavaScriptCore>,
     ctx: Ptr,
     napi: Option<Rc<crate::node::napi::State>>,
     interrupt: Option<Box<Interrupt>>,
@@ -1271,13 +1271,13 @@ pub struct Engine {
     scope: Ptr,
 }
 
-impl Engine {
-    pub fn new(api: Rc<Api>, host: Rc<RefCell<Host>>, role: Role) -> Result<Self> {
+impl JsContext {
+    pub fn new(api: Rc<JavaScriptCore>, host: Rc<RefCell<Host>>, role: Role) -> Result<Self> {
         Self::new_interruptible(api, host, role, None)
     }
 
     pub fn new_interruptible(
-        api: Rc<Api>,
+        api: Rc<JavaScriptCore>,
         host: Rc<RefCell<Host>>,
         role: Role,
         interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1682,20 +1682,24 @@ impl Engine {
             .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
                 // WARNING: delays can be fractional, so round up or the loop wakes before the timer is due.
-                return Ok(if delay.is_finite() { delay.ceil() as i64 } else { -1 });
+                return Ok(if delay.is_finite() {
+                    delay.ceil() as i64
+                } else {
+                    -1
+                });
             }
         }
     }
 
-    pub fn validate(&self, files: &BBTreeMap<String, String>) -> Result<()> {
+    pub fn validate_bundle(&self, files: &BBTreeMap<String, String>) -> Result<()> {
         self.install(files)?;
-        self.eval_page(&crate::bundle_source(files, false), "apps:validate")?;
+        self.eval_page(&crate::bundle::script_source(files, false), "apps:validate")?;
         Ok(())
     }
 
-    pub fn bundle(&self, files: &BBTreeMap<String, String>, entry: &str) -> Result<()> {
+    pub fn load_bundle(&self, files: &BBTreeMap<String, String>, entry: &str) -> Result<()> {
         self.install(files)?;
-        self.eval_page(&crate::bundle_source(files, true), entry)
+        self.eval_page(&crate::bundle::script_source(files, true), entry)
             .context("Cannot execute the app bundle")?;
         Ok(())
     }
@@ -1727,7 +1731,7 @@ impl Engine {
     }
 }
 
-impl Drop for Engine {
+impl Drop for JsContext {
     fn drop(&mut self) {
         if let Some(napi) = &self.napi {
             napi.close();
@@ -1786,7 +1790,7 @@ mod tests {
     use super::*;
     #[test]
     fn contexts_isolate_privileges_and_share_dom_only() {
-        let api = Api::load().unwrap();
+        let api = JavaScriptCore::load().unwrap();
         assert!(
             crate::node::ffi::State::default()
                 .call(
@@ -1806,9 +1810,9 @@ mod tests {
                 dirty: false,
             },
         );
-        let main = Engine::new(api.clone(), host.clone(), Role::Main).unwrap();
-        let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-        let page = Engine::new(api, host.clone(), Role::Renderer(1)).unwrap();
+        let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+        let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
         assert_eq!(main.eval("typeof process.cwd", "test").unwrap(), "function");
         assert_eq!(
             preload.eval("process.versions.apps", "test").unwrap(),
@@ -1859,7 +1863,8 @@ mod tests {
                 dirty: false,
             },
         );
-        let page = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+        let page =
+            JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         for code in [
             "eval('1')",
             "globalThis['ev'+'al']('1')",
@@ -1896,7 +1901,7 @@ mod tests {
 
     #[test]
     fn runaway_page_scripts_stop_but_main_keeps_running() {
-        let api = Api::load().unwrap();
+        let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
             1,
@@ -1905,8 +1910,8 @@ mod tests {
                 dirty: false,
             },
         );
-        let main = Engine::new(api.clone(), host.clone(), Role::Main).unwrap();
-        let page = Engine::new(api.clone(), host, Role::Renderer(1)).unwrap();
+        let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+        let page = JsContext::new(api.clone(), host, Role::Renderer(1)).unwrap();
         unsafe {
             (api.execution_limit.unwrap())(api.group, 0.2, Some(page_limit), ptr::null_mut())
         };
@@ -1926,8 +1931,8 @@ mod tests {
 
     #[test]
     fn timers_and_node_path() {
-        let engine = Engine::new(
-            Api::load().unwrap(),
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
             Rc::new(RefCell::new(Host::default())),
             Role::Main,
         )
@@ -1992,7 +1997,8 @@ mod tests {
                 dirty: false,
             },
         );
-        let page = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+        let page =
+            JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         page.eval(
             "globalThis.runs=0;const loop=()=>{runs++;setTimeout(loop,0)};setTimeout(loop,0);queueMicrotask(()=>{throw new Error('reported')})",
             "test",
@@ -2019,7 +2025,7 @@ mod tests {
             serde_json::from_str::<Vec<String>>(&json).unwrap(),
             ["a\u{fffd}", "\\ud83d", "\n\u{fffd}", "\u{1f}"]
         );
-        let api = Api::load().unwrap();
+        let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
             1,
@@ -2028,8 +2034,8 @@ mod tests {
                 dirty: false,
             },
         );
-        let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-        let page = Engine::new(api.clone(), host, Role::Renderer(1)).unwrap();
+        let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        let page = JsContext::new(api.clone(), host, Role::Renderer(1)).unwrap();
         preload
             .eval(
                 "__apps.contextBridge.exposeInMainWorld('api',{text:'a\\ud83d',echo:value=>value+'\\udc00'})",
@@ -2068,7 +2074,7 @@ mod tests {
 
     #[test]
     fn preload_document_handles_are_released() {
-        let api = Api::load().unwrap();
+        let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().pages.insert(
             1,
@@ -2077,8 +2083,8 @@ mod tests {
                 dirty: false,
             },
         );
-        let preload = Engine::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
-        let page = Engine::new(api, host, Role::Renderer(1)).unwrap();
+        let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
         page.eval("globalThis.made=[];const create=document.createElement.bind(document);document.createElement=name=>{const node=create(name);made.push(new WeakRef(node));return node}", "test").unwrap();
         preload
             .eval("(()=>{for(let i=0;i<1000;i++)document.createElement('div').id='x'+i})();document.body===document.body", "test")

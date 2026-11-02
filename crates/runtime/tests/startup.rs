@@ -92,9 +92,9 @@ fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
 fn engine_launch() {
     use apps_runtime::{
         host::Role,
-        jsc::{Api, Engine},
+        jsc::{JavaScriptCore, JsContext},
     };
-    let api = Api::load().unwrap();
+    let api = JavaScriptCore::load().unwrap();
     let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = std::rc::Rc::default();
     let mut times = Vec::new();
     for id in 1..=9 {
@@ -107,8 +107,9 @@ fn engine_launch() {
         );
         let start = std::time::Instant::now();
         let preload =
-            Engine::new(api.clone(), std::rc::Rc::clone(&host), Role::Preload(id)).unwrap();
-        let page = Engine::new(api.clone(), std::rc::Rc::clone(&host), Role::Renderer(id)).unwrap();
+            JsContext::new(api.clone(), std::rc::Rc::clone(&host), Role::Preload(id)).unwrap();
+        let page =
+            JsContext::new(api.clone(), std::rc::Rc::clone(&host), Role::Renderer(id)).unwrap();
         times.push(start.elapsed().as_secs_f64() * 1000.);
         drop((preload, page));
     }

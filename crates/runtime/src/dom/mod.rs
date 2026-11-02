@@ -2693,7 +2693,7 @@ mod tests {
     fn detached_nodes_keep_styles_that_a_frame_holds() {
         use crate::{
             host::{Host, Page, Role},
-            jsc::{Api, Engine},
+            jsc::{JavaScriptCore, JsContext},
         };
         use std::cell::RefCell;
 
@@ -2705,7 +2705,12 @@ mod tests {
                 dirty: false,
             },
         );
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         engine
             .eval(
                 "const editor=document.getElementById('editor');document.createElement('i');getComputedStyle(editor).color;",
@@ -2730,7 +2735,7 @@ mod tests {
     fn detached_editor_overlays_preserve_connected_styles() {
         use crate::{
             host::{Host, Page, Role},
-            jsc::{Api, Engine},
+            jsc::{JavaScriptCore, JsContext},
         };
         use std::cell::RefCell;
 
@@ -2744,7 +2749,12 @@ mod tests {
                 dirty: false,
             },
         );
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         engine
             .eval(
                 "const editor=document.getElementById('editor');getComputedStyle(editor).color;",
@@ -2801,7 +2811,7 @@ mod tests {
     fn invalidation_skips_text_edits_and_unused_states() {
         use crate::{
             host::{Host, Page, Role},
-            jsc::{Api, Engine},
+            jsc::{JavaScriptCore, JsContext},
         };
         use std::cell::RefCell;
 
@@ -2815,7 +2825,12 @@ mod tests {
                 dirty: false,
             },
         );
-        let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
         let computed = || host.borrow().dom[&1].computed.as_ref().map(Rc::as_ptr);
         let p = host.borrow().pages[&1]
             .doc

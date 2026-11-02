@@ -1,0 +1,36 @@
+[package]
+name = "apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apps"
+path = "src/main.rs"
+
+[dependencies]
+apps-runtime = { path = "../runtime" }
+anyhow.workspace = true
+bbtree.workspace = true
+ctrlc = "3"
+notify = "8"
+object = { version = "0.39.1", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
+oxc_allocator = "=0.155.0"
+oxc_ast = "=0.155.0"
+oxc_ast_visit = "=0.155.0"
+oxc_codegen = "=0.155.0"
+oxc_minifier = "=0.155.0"
+oxc_parser = { version = "=0.155.0", default-features = false }
+oxc_semantic = "=0.155.0"
+oxc_sourcemap = "=9.0.0"
+oxc_span = "=0.155.0"
+oxc_transformer = "=0.155.0"
+serde_json.workspace = true
+tempfile = "3"
+url.workspace = true
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# Puts the WebGPU and media libraries next to test executables.
+[dev-dependencies]
+apps-media = { path = "../media" }
+apps-webgpu = { path = "../webgpu" }

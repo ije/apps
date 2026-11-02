@@ -1,7 +1,7 @@
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
-    jsc::{Api, Engine},
+    jsc::{JavaScriptCore, JsContext},
 };
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,12 @@ fn binary_io() {
         .map(|index| (index % 251) as u8)
         .collect();
     std::fs::write(&path, data).unwrap();
-    let engine = Engine::new(Api::load().unwrap(), Default::default(), Role::Main).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Default::default(),
+        Role::Main,
+    )
+    .unwrap();
     engine
         .eval(
             &format!("globalThis.path={}", serde_json::json!(path)),
@@ -86,7 +91,7 @@ fn page(html: &str, script: &str) -> String {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(script, "bench").unwrap()
 }
 
@@ -172,7 +177,7 @@ fn release_sweep() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval("for (const h of document.querySelectorAll('x-h')) h.attachShadow({mode:'open'}).innerHTML = '<b>y</b>'; globalThis.kept = Array.from({length: 2000}, () => document.createElement('i')); __appsDomSweep(true);", "bench").unwrap();
     let started = Instant::now();
     engine
@@ -232,7 +237,7 @@ fn host_calls() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     let source =
         "for(let i=0;i<100000;i++){p.getAttribute('class');p.setAttribute('data-i',String(i&7))}";
     engine
@@ -258,7 +263,7 @@ fn dom_updates() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval("globalThis.main = document.querySelector('main'); globalThis.box = document.querySelector('section'); globalThis.items = []; globalThis.k = 0; for (let i = 0; i < 1000; i++) { const d = document.createElement('div'); d.className = 'item'; d.id = 'i' + i; d.append('x'); main.append(d); items.push(d); }", "bench").unwrap();
     let time = |source: &str| {
         let mut rounds: Vec<f64> = (0..9)
@@ -356,7 +361,7 @@ fn image_decode() {
     );
     host.borrow_mut().dom.entry(1).or_default().base =
         Some(url::Url::from_directory_path(directory.path()).unwrap());
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     let source = url::Url::from_file_path(&path).unwrap();
     let mut rounds = Vec::new();
     for _ in 0..3 {
@@ -388,7 +393,12 @@ fn webgpu_present() {
             dirty: false,
         },
     );
-    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine.eval(r#"(async()=>{const device=await (await navigator.gpu.requestAdapter()).requestDevice();const context=document.getElementById('c').getContext('webgpu');context.configure({device,format:'bgra8unorm'});
       const module=device.createShaderModule({code:`@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i % 2u) * 4 - 1, f32(i / 2u) * 4 - 1, 0, 1); }
         @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f { var v = p.x * 0.001; for (var i = 0; i < 1500; i++) { v = fract(sin(v * 12.9898 + p.y) * 43758.5453); } return vec4f(v, 0, 1, 1); }`});
@@ -449,7 +459,7 @@ fn webgpu_present() {
     }
 }
 
-fn median(engine: &Engine, source: &str) -> f64 {
+fn median(engine: &JsContext, source: &str) -> f64 {
     engine.eval(&format!("{{{source}}}"), "bench").unwrap();
     let mut rounds: Vec<f64> = (0..7)
         .map(|_| {
@@ -466,7 +476,12 @@ fn median(engine: &Engine, source: &str) -> f64 {
 #[ignore = "release performance measurement"]
 fn bridge_calls() {
     let directory = tempfile::tempdir().unwrap();
-    let engine = Engine::new(Api::load().unwrap(), Default::default(), Role::Main).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Default::default(),
+        Role::Main,
+    )
+    .unwrap();
     engine.eval(&format!("globalThis.file={};globalThis.db=new __apps.sqlite.DatabaseSync(':memory:');db.exec('CREATE TABLE t(a INTEGER, b TEXT)');globalThis.insert=db.prepare('INSERT INTO t VALUES (?, ?)');", serde_json::json!(directory.path().join("x.txt"))), "bench").unwrap();
     engine
         .eval("__apps.fs.writeFileSync(file, 'x')", "bench")
@@ -527,7 +542,7 @@ fn layout_reads() {
             .collect();
         host.dom.entry(1).or_default().bounds.extend(bounds);
     }
-    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval("globalThis.targets = [...document.querySelectorAll('.t')]; globalThis.p = targets[0]; if (targets.length !== 2000) throw Error('targets');", "bench").unwrap();
     let rect = median(
         &engine,
