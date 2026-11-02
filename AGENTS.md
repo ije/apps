@@ -2,6 +2,16 @@
  
 A tiny, high performance, memory-safe electron alternative with compatible API.
 
+## Project Strcuture
+
+The Cargo workspace keeps each component in `crates/`:
+
+- `cli`: The `apps` command, JavaScript bundler, and app packages. `src/commands` contains the command handlers. `src/packaging.rs` creates app directories and archives.
+- `runtime`: JavaScriptCore contexts, desktop APIs, DOM, CSS, and page views.
+- `renderer`: Native windows, text layout, and GPU rendering.
+- `webview`: System webviews.
+- `webgpu`, `media`, and `perfhud`: WebGPU, media playback, and the FPS HUD.
+
 ## Goals
 
 - 120FPS, 0 FPS when idle, low CPU load
