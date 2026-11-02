@@ -6,6 +6,7 @@ pub(crate) mod effects;
 mod element;
 mod fonts;
 pub(crate) mod grid;
+mod hud;
 pub mod image;
 mod input;
 mod paint;
@@ -60,6 +61,8 @@ pub(crate) struct ViewData {
     parked: RefCell<Vec<(usize, Clips)>>,
     /// The caret drawn last: its node, offset and text length, when it moved, and its blink timer by phase.
     caret: RefCell<Option<input::Blink>>,
+    /// The FPS HUD of `apps run`.
+    hud: RefCell<Option<hud::Hud>>,
 }
 
 /// Clipping ancestors with their clipped axes, see [`clips`].
@@ -194,6 +197,7 @@ impl WebView {
             reflowing: Cell::new(false),
             parked: RefCell::default(),
             caret: RefCell::default(),
+            hud: RefCell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);
@@ -1137,6 +1141,18 @@ impl WebView {
                 renderer::canvas(
                     |_, _| (),
                     move |_, _, _| crate::desktop::mcp::frame(id, started),
+                )
+                .absolute()
+            }))
+            .children(self.hud.borrow().is_some().then(|| {
+                let data = self.0.clone();
+                renderer::canvas(
+                    |_, _| (),
+                    move |_, _, window| {
+                        if let Some(hud) = &*data.hud.borrow() {
+                            hud.paint(window);
+                        }
+                    },
                 )
                 .absolute()
             }))

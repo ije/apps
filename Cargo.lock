@@ -112,6 +112,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "apps-perfhud"
+version = "0.0.0"
+dependencies = [
+ "core-foundation",
+ "libc",
+ "objc2",
+ "objc2-app-kit",
+ "windows",
+]
+
+[[package]]
 name = "apps-renderer"
 version = "0.0.0"
 dependencies = [

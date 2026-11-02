@@ -69,6 +69,10 @@ bash scripts/build-jsc.sh
 bash scripts/build-ffmpeg.sh
 ```
 
+## FPS HUD
+
+`crates/perfhud` (`apps-perfhud`) is the FPS HUD that `apps run` shows on Cmd+Alt+F. The runtime loads the library next to its executable, and `apps build` never ships it, so built apps keep only the small hook in `crates/runtime/src/render/hud.rs`.
+
 ## Compatibility
 
 @COMPATIBILITY.md

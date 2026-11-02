@@ -324,6 +324,11 @@ fn password<'a>(
 
 impl renderer::View for WebView {
     fn render(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
+        if !window.redrawing()
+            && let Some(hud) = &*self.hud.borrow()
+        {
+            hud.started.set(std::time::Instant::now());
+        }
         self.render_page(window, cx)
     }
 
@@ -351,6 +356,19 @@ impl renderer::View for WebView {
             PlatformInput::KeyDown(event) => {
                 let key = event.keystroke.key.as_str();
                 let modifiers = &event.keystroke.modifiers;
+                if !self.host.borrow().packaged
+                    && key == "f"
+                    && modifiers.alt
+                    && if cfg!(target_os = "macos") {
+                        modifiers.platform
+                    } else {
+                        modifiers.control
+                    }
+                {
+                    super::hud::Hud::toggle(&self.0, window);
+                    cx.stop_propagation();
+                    return;
+                }
                 if !self.host.borrow().packaged
                     && (key == "f12"
                         || (key == "i"
