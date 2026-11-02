@@ -306,6 +306,9 @@ pub struct State {
     pub(crate) baselines: crate::render::grid::Baselines,
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
+    /// When each box last painted, counted across frames. Hit tests take the box painted last.
+    pub painted: Vec<u64>,
+    pub(crate) paint_count: u64,
     pub(crate) inline_text: std::collections::HashMap<usize, Option<Rc<style::InlineText>>>,
     pub(crate) layout_revision: u64,
     /// Counts style recomputes, so `layout_flags` knows when the mirror's style bits are old.
@@ -895,6 +898,9 @@ pub fn call(
                     if state.selection_caret == Some(id) {
                         state.selection_caret = None;
                     }
+                    if let Some(order) = state.painted.get_mut(id) {
+                        *order = 0;
+                    }
                     state.free.push(id);
                     freed.insert(id);
                 }
@@ -902,6 +908,7 @@ pub fn call(
             if !freed.is_empty() {
                 state
                     .measurements
+                    .sizes
                     .retain(|(node, ..), _| !freed.contains(node));
                 state.backgrounds.retain(|(node, _), (_, image)| {
                     let keep = !freed.contains(node);
@@ -992,21 +999,11 @@ pub fn call(
             let first = args[2].as_bool().unwrap_or(false);
             let caret = args[3].as_bool().unwrap_or(false);
             let mut nearest = Vec::new();
-            let mut target = None;
             let mut pending = vec![(0, [0., 0., viewport[0], viewport[1]], false)];
             let mut hits = Vec::new();
             while let Some((id, mut clip, hit)) = pending.pop() {
                 if hit {
-                    if caret {
-                        if doc.nodes[id].tag == "#text" {
-                            return Ok(json!(id));
-                        }
-                        target.get_or_insert(id);
-                    } else if first {
-                        return Ok(json!(id));
-                    } else {
-                        hits.push(id);
-                    }
+                    hits.push(id);
                     continue;
                 }
                 let node = &doc.nodes[id];
@@ -1073,7 +1070,23 @@ pub fn call(
                     pending.extend(children.iter().map(|&child| (child, clip, false)));
                 }
             }
+            // Hits come deepest and last in the tree first. The box painted last is on top, so z-index
+            // and positioned boxes win over later siblings. Text and boxes that don't paint use their
+            // nearest painted ancestor.
+            hits.sort_by_key(|&id| {
+                std::cmp::Reverse(
+                    std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
+                        .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
+                        .unwrap_or(0),
+                )
+            });
             if caret {
+                if let Some(&id) = hits.first()
+                    && doc.nodes[id].tag == "#text"
+                {
+                    return Ok(json!(id));
+                }
+                let target = hits.first().copied();
                 let text = nearest
                     .into_iter()
                     .filter(|(id, _)| {
@@ -1089,6 +1102,9 @@ pub fn call(
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(id, _)| id);
                 return Ok(json!(text.or(target)));
+            }
+            if first && let Some(&id) = hits.first() {
+                return Ok(json!(id));
             }
             if first && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
                 return Ok(json!(
@@ -1513,8 +1529,14 @@ pub fn call(
                     .or_default()
                     .clone();
                 let previous = handle.offset();
+                // Like Chrome, scripts scroll in whole device pixels.
+                let ratio = state.pixel_ratio.max(1.);
                 let axis = |value: &Value, current: renderer::Pixels| {
-                    renderer::px(value.as_f64().map_or(f32::from(current), |v| -v as f32))
+                    renderer::px(
+                        value
+                            .as_f64()
+                            .map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio),
+                    )
                 };
                 let target = scroll_offset(
                     &handle,

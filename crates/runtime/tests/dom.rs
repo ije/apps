@@ -517,6 +517,114 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
 }
 
 #[test]
+fn hit_testing_takes_the_box_painted_last() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id='panel' style='height:0'><button id='button'></button></div><pre id='code'><span id='line'>x</span></pre></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let ids: Vec<usize> = ["body", "#panel", "#button", "#code", "#line"]
+        .iter()
+        .map(|selector| {
+            engine
+                .eval(&format!("document.querySelector('{selector}')._id"), "test")
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    {
+        let mut host = host.borrow_mut();
+        let dom = host.dom.entry(1).or_default();
+        for (&id, bounds) in ids.iter().zip([
+            [0., 0., 100., 100.],
+            [0., 0., 100., 0.],
+            [10., 10., 40., 20.],
+            [0., 0., 100., 100.],
+            [0., 0., 100., 20.],
+        ]) {
+            dom.bounds.insert(id, bounds);
+        }
+        // The panel comes first in the tree but paints last, like a z-index layer.
+        dom.painted = vec![0; ids.iter().max().unwrap() + 1];
+        for (order, id) in [ids[0], ids[3], ids[4], ids[1], ids[2]]
+            .into_iter()
+            .enumerate()
+        {
+            dom.painted[id] = order as u64 + 1;
+        }
+    }
+    engine.eval(r#"
+        if (document.elementFromPoint(20, 15).id !== 'button') throw Error('Later sibling hid a box painted above it');
+        if (document.elementFromPoint(80, 15).id !== 'line') throw Error('Hit outside the button');
+        if (document.elementsFromPoint(20, 15).map(node => node.id).slice(0, 3).join() !== 'button,line,code') throw Error('Stack order');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn aria_properties_reflect_and_select_focuses_fields() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><button id='toggle'></button><input id='field' value='text'></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const toggle = document.getElementById('toggle'), field = document.getElementById('field');
+        if (toggle.ariaExpanded !== null || toggle.role !== null) throw Error('Missing attributes reflect as null');
+        toggle.ariaExpanded = 'false'; toggle.ariaPressed = String(true); toggle.ariaLabel = 'Toggle'; toggle.role = 'switch';
+        if (toggle.getAttribute('aria-expanded') !== 'false' || toggle.getAttribute('aria-pressed') !== 'true' || toggle.getAttribute('aria-label') !== 'Toggle' || toggle.getAttribute('role') !== 'switch') throw Error('ARIA properties set attributes');
+        if (!toggle.matches('[aria-expanded=false][aria-pressed=true]')) throw Error('Selectors see reflected attributes');
+        toggle.ariaPressed = null;
+        if (toggle.hasAttribute('aria-pressed') || toggle.ariaPressed !== null) throw Error('null removes the attribute');
+        toggle.focus(); field.select();
+        if (document.activeElement !== field || field.selectionStart !== 0 || field.selectionEnd !== 4) throw Error('select() focuses the field');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id='box' style='overflow:scroll;scroll-padding:0 10px 0 20%'><i id='caret' style='scroll-margin:0 8px 0 50px'></i><i id='plain'></i></div></body></html>"),
+        dirty: false,
+    });
+    let engine = Engine::new(Api::load().unwrap(), host.clone(), Role::Renderer(1)).unwrap();
+    let ids: Vec<usize> = ["#box", "#caret", "#plain"]
+        .iter()
+        .map(|selector| {
+            engine
+                .eval(&format!("document.querySelector('{selector}')._id"), "test")
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    {
+        let mut host = host.borrow_mut();
+        let dom = host.dom.entry(1).or_default();
+        dom.pixel_ratio = 2.;
+        for (&id, bounds) in
+            ids.iter()
+                .zip([[0., 0., 200., 50.], [300., 0., 2., 20.], [40., 0., 2., 20.]])
+        {
+            dom.bounds.insert(id, bounds);
+        }
+    }
+    engine.eval(r#"
+        const box = document.getElementById('box');
+        for (const [value, snapped] of [[12.367, 12.5], [12.25, 12.5], [12.75, 13]]) {
+            box.scrollLeft = value;
+            if (box.scrollLeft !== snapped) throw Error(`scrollLeft ${value} read ${box.scrollLeft}`);
+        }
+        box.scrollLeft = 0;
+        document.getElementById('caret').scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        if (box.scrollLeft !== 120) throw Error(`Scroll margin and padding: ${box.scrollLeft}`);
+    "#, "test").unwrap();
+}
+
+#[test]
 fn computed_styles_follow_mutations_and_resize() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {

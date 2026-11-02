@@ -611,6 +611,10 @@ impl LayoutPartialTree for Tree<'_> {
         &self.nodes[usize::from(node)].style
     }
 
+    fn resolve_calc_value(&self, handle: *const (), basis: f32) -> f32 {
+        crate::style::resolve_calc(handle, basis)
+    }
+
     fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
         self.nodes[usize::from(node)].layout = *layout;
     }

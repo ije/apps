@@ -576,16 +576,21 @@
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
-      const target = this.getBoundingClientRect(); let left = target.left, top = target.top;
+      // The target grows by its scroll-margin, and each scroller's view shrinks by its scroll-padding.
+      const target = this.getBoundingClientRect(), own = getComputedStyle(this), margin = side => parseFloat(own['scrollMargin' + side]) || 0;
+      let left = target.left - margin('Left'), top = target.top - margin('Top');
+      const width = target.width + margin('Left') + margin('Right'), height = target.height + margin('Top') + margin('Bottom');
       for (let p = this.assignedSlot ?? this.parentElement ?? this.getRootNode().host; p; p = p.assignedSlot ?? p.parentElement ?? p.getRootNode().host) {
         const style = getComputedStyle(p), bounds = p.getBoundingClientRect(), to = [null, null]; let scrollable = false;
-        for (const [axis, align, start, size, edge, extent] of [
-          ['Y', options.block ?? 'start', top, target.height, bounds.top + p.clientTop, p.clientHeight],
-          ['X', options.inline ?? 'nearest', left, target.width, bounds.left + p.clientLeft, p.clientWidth],
+        const padding = (side, extent) => { const value = style['scrollPadding' + side]; return value.endsWith('%') ? parseFloat(value) / 100 * extent : parseFloat(value) || 0; };
+        for (const [axis, align, start, size, edge, client, near, far] of [
+          ['Y', options.block ?? 'start', top, height, bounds.top + p.clientTop, p.clientHeight, 'Top', 'Bottom'],
+          ['X', options.inline ?? 'nearest', left, width, bounds.left + p.clientLeft, p.clientWidth, 'Left', 'Right'],
         ]) {
           if (!['auto','scroll','hidden'].includes(style['overflow' + axis] || style.overflow)) continue;
           scrollable = true;
-          const before = start - edge, after = start + size - edge - extent;
+          const inset = padding(near, client), extent = client - inset - padding(far, client);
+          const before = start - edge - inset, after = start + size - edge - inset - extent;
           let delta = align === 'center' ? (before + after) / 2 : align === 'end' ? after : before;
           if (align === 'nearest') delta = before < 0 && after > 0 ? 0 : before < 0 ? (size <= extent ? before : after) : after > 0 ? (size <= extent ? after : before) : 0;
           if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) + delta;
@@ -634,7 +639,11 @@
   }
   class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI='http://www.w3.org/2000/svg';this.nodeName=this.tagName=tag;}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
   class SVGSVGElement extends SVGElement {}
-  for (const attr of ['title','name','type','placeholder','role','dir','lang','slot']) Object.defineProperty(Element.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
+  for (const attr of ['title','name','type','placeholder','dir','lang','slot']) Object.defineProperty(Element.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
+  for (const name of ['role','ariaAtomic','ariaAutoComplete','ariaBrailleLabel','ariaBrailleRoleDescription','ariaBusy','ariaChecked','ariaColCount','ariaColIndex','ariaColIndexText','ariaColSpan','ariaCurrent','ariaDescription','ariaDisabled','ariaExpanded','ariaHasPopup','ariaHidden','ariaInvalid','ariaKeyShortcuts','ariaLabel','ariaLevel','ariaLive','ariaModal','ariaMultiLine','ariaMultiSelectable','ariaOrientation','ariaPlaceholder','ariaPosInSet','ariaPressed','ariaReadOnly','ariaRelevant','ariaRequired','ariaRoleDescription','ariaRowCount','ariaRowIndex','ariaRowIndexText','ariaRowSpan','ariaSelected','ariaSetSize','ariaSort','ariaValueMax','ariaValueMin','ariaValueNow','ariaValueText']) {
+    const attr = name.replace('aria', 'aria-').toLowerCase();
+    Object.defineProperty(Element.prototype, name, { get() { return this.getAttribute(attr); }, set(value) { if (value === null) this.removeAttribute(attr); else this.setAttribute(attr, value); } });
+  }
   for (const attr of ['hidden','disabled','readOnly','multiple','autofocus','required','noValidate','formNoValidate','inert']) Object.defineProperty(Element.prototype, attr, { get() { return this.hasAttribute(attr.toLowerCase()); }, set(value) { this.toggleAttribute(attr.toLowerCase(), !!value); } });
   class HTMLSlotElement extends HTMLElement {
     assignedNodes(options = {}) { return call('dom.assignedNodes', this._id, !!options.flatten).map(wrap); }
@@ -716,7 +725,8 @@
       if (active === this) call('dom.selection', this._id, start, end);
       if (changed) { selectionChanged(this); setTimeout(() => this.dispatchEvent(new Event('select', { bubbles: true })), 0); }
     }
-    select() { this.setSelectionRange(0, this.value.length); }
+    // WARNING: Chromium and WebKit focus the field in `select()`; editors rely on it to move typing into the field.
+    select() { this.focus(); this.setSelectionRange(0, this.value.length); }
     setRangeText(text, start = this.selectionStart, end = this.selectionEnd, mode = 'preserve') {
       text = String(text); start = Number(start) >>> 0; end = Number(end) >>> 0;
       if (start > end) throw new DOMException('Invalid replacement range', 'IndexSizeError');

@@ -922,17 +922,13 @@ pub(super) fn element(
             .and_then(style::color)
             .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
             .unwrap_or(text_color);
-        // Chrome draws placeholders in gray unless `::placeholder` sets a color.
+        // Chrome draws placeholders in #757575, in dark color schemes too, unless `::placeholder` sets a color.
         let placeholder_color = styles
             .text_pseudos
             .get(&id)
             .and_then(|pseudos| style::color(pseudos[3].as_ref()?.get(Prop::COLOR)?))
             .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
-            .unwrap_or(rgba(if style::dark(style) {
-                0xa9a9a9ff
-            } else {
-                0x757575ff
-            }));
+            .unwrap_or(rgba(0x757575ff));
         let single_line = node.tag != "textarea";
         let padding = units.edges(style, style::PADDING, containing[0]);
         let empty = text.is_empty();
@@ -1520,101 +1516,25 @@ pub(super) fn element(
             padding[1] + padding[3] + borders[1] + borders[3],
             padding[0] + padding[2] + borders[0] + borders[2],
         ];
-        let textarea = node.tag == "textarea";
-        let count = |name, default| {
-            node.attrs
-                .get(name)
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .filter(|&value| value > 0)
-                .unwrap_or(default) as f32
-        };
-        if style.get(Prop::WIDTH).is_none_or(|v| v == "auto") {
-            let face = style::font(style);
-            let em = px(units.font.em);
-            let width = if style
-                .get(Prop::FIELD_SIZING)
-                .is_some_and(|v| v == "content")
-            {
-                // The box fits its text, or the placeholder while empty, plus the caret.
-                let value = node.shown_text(
-                    node.current_value()
-                        .map_or_else(|| doc.text(id), str::to_owned),
-                );
-                let shown = if value.is_empty() {
-                    node.attrs.get("placeholder").cloned().unwrap_or_default()
-                } else {
-                    value
-                };
-                shown
-                    .split('\n')
-                    .map(|line| {
-                        let run = renderer::TextRun {
-                            len: line.len(),
-                            font: face.clone(),
-                            color: renderer::black(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                            letter_spacing: px(0.),
-                            word_spacing: px(0.),
-                            font_size: None,
-                        };
-                        f32::from(
-                            text.shape_line(line.to_owned().into(), em, &[run], None)
-                                .width,
-                        )
-                    })
-                    .fold(0., f32::max)
-                    + 1.
-            } else {
-                // `size` or `cols` characters, in device pixels like Chrome. Fonts with a bad average use
-                // the width of `0`. Others use the width of `x` (the x-height for system fonts), and
-                // inputs add the ascent minus that width.
-                let family = style
-                    .get(Prop::FONT_FAMILY)
-                    .and_then(|value| value.split(',').next())
-                    .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
-                    .unwrap_or_default();
-                let id = text.resolve_font(&face);
-                let scale = pixel_ratio;
-                let (char_width, extra) = if "|american typewriter|arial hebrew|chalkboard|cochin|\
-                    corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|helvetica|hoefler text|\
-                    inaimathi|kai|lucida grande|marker felt|monaco|mshtakan|new peninim mt|osaka|\
-                    raanana|stheiti|symbol|times|apple braille|apple ligothic|apple lisung|\
-                    apple symbols|applegothic|applemyungjo|#gungseo|#headlinea|#pcmyungjo|#pilgi|"
-                    .contains(&format!("|{family}|"))
-                {
-                    let zero = text.ch_advance(id, em).map_or(units.font.em / 2., f32::from);
-                    (zero * scale, 0.)
-                } else {
-                    let average = if face.family.as_ref() == ".SystemUIFont" {
-                        (f32::from(text.x_height(id, em)) * scale).round()
-                    } else {
-                        text.advance(id, em, 'x')
-                            .map_or(units.font.em / 2., |size| f32::from(size.width))
-                            * scale
-                    };
-                    let ascent = f32::from(text.line_metrics(id, em * scale)[0]);
-                    (average, if textarea { 0. } else { ascent - average })
-                };
-                if textarea {
-                    // Chrome always leaves room for a vertical scrollbar.
-                    let bar = match style.get(Prop::SCROLLBAR_WIDTH) {
-                        _ if style.get(Prop::OVERFLOW_Y).is_some_and(|v| v == "hidden") => 0.,
-                        Some("none") => 0.,
-                        Some("thin") => 14.,
-                        _ => 16.,
-                    };
-                    (char_width * count("cols", 20)).ceil() / scale + bar
-                } else {
-                    (char_width * count("size", 20) + extra).ceil() / scale
-                }
-            };
+        let auto =
+            [Prop::WIDTH, Prop::HEIGHT].map(|prop| style.get(prop).is_none_or(|v| v == "auto"));
+        let percent = style.get(Prop::WIDTH).is_some_and(|v| v.ends_with('%'));
+        let [width, height] = field_size(
+            doc,
+            id,
+            style,
+            &units,
+            text,
+            pixel_ratio,
+            auto[0] || percent,
+        );
+        if auto[0] {
             el = el.w(px(width + chrome[0]));
+        } else if percent {
+            el = el.child(super::input::NaturalWidth(px(width)));
         }
-        if style.get(Prop::HEIGHT).is_none_or(|value| value == "auto") {
-            let rows = if textarea { count("rows", 2) } else { 1. };
-            el = el.min_h(px(rows * units.font.lh + chrome[1]));
+        if auto[1] {
+            el = el.min_h(px(height + chrome[1]));
         }
     }
     let flexbox = matches!(display, "flex" | "inline-flex");
@@ -1667,10 +1587,9 @@ pub(super) fn element(
                     .and_then(|s| s.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    if block_size.is_some() || extra[axis] > 0. && base > 0. {
-                        px(percent.max(0.) / 100. * base + extra[axis]).into()
-                    } else {
-                        relative(percent.max(0.) / 100.)
+                    match block_size {
+                        Some(_) => px(percent.max(0.) / 100. * base + extra[axis]).into(),
+                        None => renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis])),
                     }
                 } else if let Some(length) = length() {
                     px(length.max(0.) + extra[axis]).into()
@@ -1796,11 +1715,7 @@ pub(super) fn element(
                     .and_then(|v| v.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                 {
-                    if extra[axis] > 0. && base > 0. {
-                        px(percent.max(0.) / 100. * base + extra[axis]).into()
-                    } else {
-                        relative(percent.max(0.) / 100.)
-                    }
+                    renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis]))
                 } else if let Some(length) = units.resolve(value, base) {
                     px(length.max(0.) + extra[axis]).into()
                 } else {
@@ -1825,9 +1740,26 @@ pub(super) fn element(
                 }
             }
             Prop::ALIGN_CONTENT | Prop::JUSTIFY_CONTENT if flexbox => {
+                let inline = prop == Prop::JUSTIFY_CONTENT
+                    && !style
+                        .get(Prop::FLEX_DIRECTION)
+                        .is_some_and(|v| v.starts_with("column"));
                 let align = match value {
                     "center" => renderer::AlignContent::Center,
-                    "flex-end" | "end" | "right" => renderer::AlignContent::FlexEnd,
+                    "flex-end" => renderer::AlignContent::FlexEnd,
+                    // WARNING: these ignore flex-direction reversal. `Start` is the left or top
+                    // edge (rtl rows are `RowReverse`), and `left`/`right` act as `start` on a column.
+                    "start" | "end" | "left" | "right" => {
+                        if match value {
+                            "left" => false,
+                            "right" => inline,
+                            _ => (value == "end") != (inline && rtl),
+                        } {
+                            renderer::AlignContent::End
+                        } else {
+                            renderer::AlignContent::Start
+                        }
+                    }
                     "space-between" => renderer::AlignContent::SpaceBetween,
                     "space-around" => renderer::AlignContent::SpaceAround,
                     "space-evenly" => renderer::AlignContent::SpaceEvenly,
@@ -1984,9 +1916,10 @@ pub(super) fn element(
                 .get(Prop::FLEX_DIRECTION)
                 .is_none_or(|value| value.starts_with("row"))
         })
-        && let renderer::Length::Px(width) = el.style().size.width
+        && let width @ (renderer::Length::Px(_) | renderer::Length::Calc(..)) =
+            el.style().size.width
     {
-        el.style().flex_basis = renderer::Length::Px(width);
+        el.style().flex_basis = width;
         el.style().size.width = renderer::Length::Auto;
     }
     if !flex_parent
@@ -3866,24 +3799,43 @@ pub(super) fn element(
     let sticky = (style.get(Prop::POSITION).is_some_and(|v| v == "sticky"))
         .then(|| {
             let host = view.host.borrow();
+            // The border widths of an ancestor, plus its padding with `padding`.
+            let insets = |parent: usize, padding: bool| {
+                let (style, units) = (&styles.values[parent], &styles.lengths[parent]);
+                let padding = if padding {
+                    units.edges(style, style::PADDING, containing[0])
+                } else {
+                    [0.; 4]
+                };
+                std::array::from_fn::<f32, 4, _>(|side| {
+                    let [width, kind, _] = style::BORDERS[side];
+                    padding[side]
+                        + if style
+                            .get(kind)
+                            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                        {
+                            0.
+                        } else {
+                            style
+                                .get(width)
+                                .map_or(Some(3.), |v| units.resolve(v, containing[0]))
+                                .unwrap_or(0.)
+                                .max(0.)
+                        }
+                })
+            };
             ancestors.iter().rev().copied().find_map(|parent| {
                 let scroll = host.dom.get(&view.id)?.scroll.get(&parent)?.clone();
-                let style = &styles.values[parent];
-                let border = [
-                    Prop::BORDER_TOP_WIDTH,
-                    Prop::BORDER_RIGHT_WIDTH,
-                    Prop::BORDER_BOTTOM_WIDTH,
-                    Prop::BORDER_LEFT_WIDTH,
-                ]
-                .map(|prop| {
-                    style
-                        .get(prop)
-                        .or_else(|| style.get(Prop::BORDER_WIDTH))
-                        .and_then(|v| styles.lengths[parent].resolve(v, containing[0]))
-                        .unwrap_or(0.)
-                        .max(0.)
-                });
-                Some((scroll, border, node.parent))
+                // The containing block is the content box of the flat tree parent, so a shadow
+                // root child's is the host's.
+                let block = ancestors
+                    .last()
+                    .map(|&parent| (parent, insets(parent, true)));
+                Some(super::paint::Sticky {
+                    scroll,
+                    border: insets(parent, false),
+                    block,
+                })
             })
         })
         .flatten();
@@ -4183,6 +4135,116 @@ pub(super) fn text_field(node: &crate::dom::Node) -> bool {
                 .iter()
                 .any(|other| kind.eq_ignore_ascii_case(other))
             })
+}
+
+/// Content width and height of a text field like WebKit. The width is 0 unless `width` is set.
+pub(super) fn field_size(
+    doc: &Document,
+    id: usize,
+    style: &style::Style,
+    units: &style::Lengths,
+    text: &renderer::TextSystem,
+    pixel_ratio: f32,
+    width: bool,
+) -> [f32; 2] {
+    let node = &doc.nodes[id];
+    let textarea = node.tag == "textarea";
+    let count = |name, default| {
+        node.attrs
+            .get(name)
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(default) as f32
+    };
+    let width = width.then(|| {
+        let face = style::font(style);
+        let em = px(units.font.em);
+        if style
+            .get(Prop::FIELD_SIZING)
+            .is_some_and(|v| v == "content")
+        {
+            // The box fits its text, or the placeholder while empty, plus the caret.
+            let value = node.shown_text(
+                node.current_value()
+                    .map_or_else(|| doc.text(id), str::to_owned),
+            );
+            let shown = if value.is_empty() {
+                node.attrs.get("placeholder").cloned().unwrap_or_default()
+            } else {
+                value
+            };
+            shown
+                .split('\n')
+                .map(|line| {
+                    let run = renderer::TextRun {
+                        len: line.len(),
+                        font: face.clone(),
+                        color: renderer::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                        letter_spacing: px(0.),
+                        word_spacing: px(0.),
+                        font_size: None,
+                    };
+                    f32::from(
+                        text.shape_line(line.to_owned().into(), em, &[run], None)
+                            .width,
+                    )
+                })
+                .fold(0., f32::max)
+                + 1.
+        } else {
+            // `size` or `cols` characters, in device pixels like Chrome. Fonts with a bad average use
+            // the width of `0`. Others use the width of `x` (the x-height for system fonts), and
+            // inputs add the ascent minus that width.
+            let family = style
+                .get(Prop::FONT_FAMILY)
+                .and_then(|value| value.split(',').next())
+                .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+                .unwrap_or_default();
+            let id = text.resolve_font(&face);
+            let scale = pixel_ratio;
+            let (char_width, extra) = if "|american typewriter|arial hebrew|chalkboard|cochin|\
+                corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|helvetica|hoefler text|\
+                inaimathi|kai|lucida grande|marker felt|monaco|mshtakan|new peninim mt|osaka|\
+                raanana|stheiti|symbol|times|apple braille|apple ligothic|apple lisung|\
+                apple symbols|applegothic|applemyungjo|#gungseo|#headlinea|#pcmyungjo|#pilgi|"
+                .contains(&format!("|{family}|"))
+            {
+                let zero = text
+                    .ch_advance(id, em)
+                    .map_or(units.font.em / 2., f32::from);
+                (zero * scale, 0.)
+            } else {
+                let average = if face.family.as_ref() == ".SystemUIFont" {
+                    (f32::from(text.x_height(id, em)) * scale).round()
+                } else {
+                    text.advance(id, em, 'x')
+                        .map_or(units.font.em / 2., |size| f32::from(size.width))
+                        * scale
+                };
+                let ascent = f32::from(text.line_metrics(id, em * scale)[0]);
+                (average, if textarea { 0. } else { ascent - average })
+            };
+            if textarea {
+                // Chrome always leaves room for a vertical scrollbar.
+                let bar = match style.get(Prop::SCROLLBAR_WIDTH) {
+                    _ if style.get(Prop::OVERFLOW_Y).is_some_and(|v| v == "hidden") => 0.,
+                    Some("none") => 0.,
+                    Some("thin") => 14.,
+                    _ => 16.,
+                };
+                (char_width * count("cols", 20)).ceil() / scale + bar
+            } else {
+                (char_width * count("size", 20) + extra).ceil() / scale
+            }
+        }
+    });
+    [
+        width.unwrap_or(0.),
+        if textarea { count("rows", 2) } else { 1. } * units.font.lh,
+    ]
 }
 
 /// Rounds a size up to layout units, so the content it was measured from doesn't wrap.

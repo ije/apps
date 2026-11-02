@@ -821,7 +821,7 @@ impl WebView {
         }
         // WARNING: fonts, the viewport and container sizes change measurements without moving any box's geometry revision.
         if dom.container_pass || dom.cull.frame != frame {
-            dom.measurements.clear();
+            dom.measurements.sizes.clear();
             dom.grids.clear();
         }
         let mut stale = false;
@@ -837,7 +837,7 @@ impl WebView {
             }
         }
         if stale {
-            dom.measurements.retain(|&(id, ..), _| {
+            dom.measurements.sizes.retain(|&(id, ..), _| {
                 info.get(id)
                     .is_none_or(|info| info.flags & cull::STALE == 0)
             });
@@ -1012,6 +1012,7 @@ impl WebView {
         });
         dom.containers.clear();
         dom.flexed_grids.clear();
+        dom.measurements.pixel_ratio = window.scale_factor();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
         for text in warnings {

@@ -72,6 +72,21 @@ pub fn length(value: &str, base: f32, font: f32, vw: f32, vh: f32) -> f32 {
         .unwrap_or(0.)
 }
 
+/// Cells of one `grid-template-areas` row. Like the spec tokenizer, a run of dots is one `.` cell,
+/// and dots end a name, so `".a b."` has four cells.
+pub(crate) fn area_cells(row: &str) -> Vec<&str> {
+    let mut cells = Vec::new();
+    let mut rest = row.trim_start();
+    while let Some(first) = rest.chars().next() {
+        let end = rest
+            .find(|c: char| c.is_whitespace() || (c == '.') != (first == '.'))
+            .unwrap_or(rest.len());
+        cells.push(if first == '.' { "." } else { &rest[..end] });
+        rest = rest[end..].trim_start();
+    }
+    cells
+}
+
 pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     // Most values have no strings, escapes, comments or URLs, so a byte scan splits them like
     // the tokenizer below at a fraction of the cost.
@@ -499,6 +514,16 @@ pub(crate) fn clip_path(
 }
 
 #[cfg(test)]
+#[test]
+fn grid_area_rows_split_dots_from_names() {
+    assert_eq!(
+        area_cells(".replace actions."),
+        [".", "replace", "actions", "."]
+    );
+    assert_eq!(area_cells("  a  ...b  c-1 "), ["a", ".", "b", "c-1"]);
+    assert!(area_cells("   ").is_empty());
+}
+
 #[test]
 fn split_values_like_the_tokenizer() {
     let values = [

@@ -521,6 +521,10 @@ impl ScrollHandle {
         let snap = |length: crate::Length| match length {
             crate::Length::Px(value) => px(crate::geometry::to_layout_unit(value.0, scale) / scale),
             crate::Length::Fraction(fraction) => bounds.size.width * fraction,
+            crate::Length::Calc(fraction, offset) => {
+                bounds.size.width * fraction
+                    + px(crate::geometry::to_layout_unit(offset.0, scale) / scale)
+            }
             crate::Length::Auto => Pixels::ZERO,
         };
         let padding = crate::size(

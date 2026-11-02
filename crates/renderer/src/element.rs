@@ -236,7 +236,8 @@ impl IntoElement for AnyElement {
 type PrepaintFn<T> = Box<dyn FnOnce(Bounds<Pixels>, &mut Window) -> T>;
 type PaintFn<T> = Box<dyn FnOnce(Bounds<Pixels>, T, &mut Window)>;
 
-/// A box that paints with closures.
+/// A box that paints with closures. Prepaint gets the bounds in layout units, so positions it records
+/// match the boxes around it, and paint gets them snapped to device pixels.
 pub struct Canvas<T> {
     prepaint: Option<PrepaintFn<T>>,
     paint: Option<PaintFn<T>>,
@@ -268,27 +269,29 @@ impl<T: 'static> Styled for Canvas<T> {
 }
 
 impl<T: 'static> Element for Canvas<T> {
-    type RequestLayoutState = Style;
+    type RequestLayoutState = (Style, LayoutId);
     type PrepaintState = Option<T>;
 
-    fn request_layout(&mut self, window: &mut Window) -> (LayoutId, Style) {
+    fn request_layout(&mut self, window: &mut Window) -> (LayoutId, (Style, LayoutId)) {
         let style = mem::take(&mut self.style);
-        (window.request_layout(&style, []), style)
+        let id = window.request_layout(&style, []);
+        (id, (style, id))
     }
 
     fn prepaint(
         &mut self,
-        bounds: Bounds<Pixels>,
-        _: &mut Style,
+        _: Bounds<Pixels>,
+        (_, id): &mut (Style, LayoutId),
         window: &mut Window,
     ) -> Option<T> {
+        let bounds = window.exact_layout_bounds(*id);
         Some(self.prepaint.take()?(bounds, window))
     }
 
     fn paint(
         &mut self,
         bounds: Bounds<Pixels>,
-        style: &mut Style,
+        (style, _): &mut (Style, LayoutId),
         state: &mut Option<T>,
         window: &mut Window,
     ) {

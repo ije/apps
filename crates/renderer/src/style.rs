@@ -9,13 +9,14 @@ use crate::{
     },
 };
 
-/// A length: `auto`, logical pixels, or a fraction of the parent's size.
+/// A length: `auto`, logical pixels, a fraction of the parent's size, or a fraction plus pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Length {
     #[default]
     Auto,
     Px(Pixels),
     Fraction(f32),
+    Calc(f32, Pixels),
 }
 
 impl From<Pixels> for Length {
@@ -34,6 +35,7 @@ impl Radii<Length> {
         let pixels = |length: Length, side: Pixels| match length {
             Length::Px(value) => value,
             Length::Fraction(fraction) => side * fraction,
+            Length::Calc(fraction, offset) => side * fraction + offset,
             Length::Auto => Pixels::ZERO,
         };
         Radii {
@@ -50,11 +52,23 @@ impl Length {
     pub fn is_auto(&self) -> bool {
         *self == Self::Auto
     }
+    /// The taffy calc handle of `Calc`, or `None` when it is a plain fraction. Taffy treats the handle as
+    /// opaque, so it holds the fraction's bits and the offset in 1/64 device pixels instead of a pointer.
+    fn calc(fraction: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
+        let offset = (to_layout_unit(offset.0, scale) * 64.) as i32;
+        (offset != 0).then(|| {
+            std::ptr::without_provenance(
+                (u64::from(fraction.to_bits()) << 32 | u64::from((offset << 3) as u32)) as usize,
+            )
+        })
+    }
     fn dimension(self, scale: f32) -> taffy::Dimension {
         match self {
             Self::Auto => taffy::Dimension::auto(),
             Self::Px(value) => taffy::Dimension::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::Dimension::percent(value),
+            Self::Calc(fraction, offset) => Self::calc(fraction, offset, scale)
+                .map_or(taffy::Dimension::percent(fraction), taffy::Dimension::calc),
         }
     }
     fn auto(self, scale: f32) -> taffy::LengthPercentageAuto {
@@ -62,6 +76,10 @@ impl Length {
             Self::Auto => taffy::LengthPercentageAuto::auto(),
             Self::Px(value) => taffy::LengthPercentageAuto::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::LengthPercentageAuto::percent(value),
+            Self::Calc(fraction, offset) => Self::calc(fraction, offset, scale).map_or(
+                taffy::LengthPercentageAuto::percent(fraction),
+                taffy::LengthPercentageAuto::calc,
+            ),
         }
     }
     fn definite(self, scale: f32) -> taffy::LengthPercentage {
@@ -69,8 +87,18 @@ impl Length {
             Self::Auto => taffy::LengthPercentage::length(0.),
             Self::Px(value) => taffy::LengthPercentage::length(to_layout_unit(value.0, scale)),
             Self::Fraction(value) => taffy::LengthPercentage::percent(value),
+            Self::Calc(fraction, offset) => Self::calc(fraction, offset, scale).map_or(
+                taffy::LengthPercentage::percent(fraction),
+                taffy::LengthPercentage::calc,
+            ),
         }
     }
+}
+
+/// Resolves a handle from `Length::calc` against `basis`, in device pixels.
+pub(crate) fn resolve_calc(handle: *const (), basis: f32) -> f32 {
+    let bits = handle.addr() as u64;
+    f32::from_bits((bits >> 32) as u32) * basis + ((bits as u32 as i32) >> 3) as f32 / 64.
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -993,5 +1021,28 @@ pub trait Styled: Sized {
     fn text_right(mut self) -> Self {
         self.text_style().text_align = Some(TextAlign::Right);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Length, resolve_calc, to_layout_unit};
+    use crate::px;
+
+    #[test]
+    fn calc_handles_keep_the_fraction_and_offset() {
+        for (fraction, offset, scale) in [
+            (0.5, 8., 2.),
+            (1., 0.25, 1.),
+            (0.333, 1000.5, 3.),
+            (0., 12., 2.),
+        ] {
+            let handle = Length::calc(fraction, px(offset), scale).unwrap();
+            assert_eq!(
+                resolve_calc(handle, 300.),
+                fraction * 300. + to_layout_unit(offset, scale)
+            );
+        }
+        assert!(Length::calc(0.5, px(0.), 2.).is_none());
     }
 }

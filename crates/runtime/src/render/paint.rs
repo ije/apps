@@ -108,14 +108,22 @@ impl renderer::Element for Effected {
     }
 }
 
+/// Where a sticky box sticks.
+pub(super) struct Sticky {
+    pub(super) scroll: renderer::ScrollHandle,
+    /// The scroll container's border widths.
+    pub(super) border: [f32; 4],
+    /// The containing block, with the borders and padding around its content box.
+    pub(super) block: Option<(usize, [f32; 4])>,
+}
+
 pub(super) struct DomBox {
     pub(super) inner: Option<renderer::Div>,
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
     pub(super) ids: Rc<super::effects::Ids>,
     pub(super) view: Rc<super::ViewData>,
-    /// The scroll container, its borders, and the containing block of a sticky box.
-    pub(super) sticky: Option<(renderer::ScrollHandle, [f32; 4], Option<usize>)>,
+    pub(super) sticky: Option<Sticky>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
     /// The containing block of an absolute box when it is not the parent, `0` for the initial one.
@@ -200,7 +208,12 @@ impl renderer::Element for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some((scroll, border, parent)) = &self.sticky {
+        if let Some(Sticky {
+            scroll,
+            border,
+            block,
+        }) = &self.sticky
+        {
             let mut viewport = scroll.bounds();
             viewport.origin += point(px(border[3]), px(border[0]));
             viewport.size.width -= px(border[1] + border[3]);
@@ -220,11 +233,20 @@ impl renderer::Element for DomBox {
                     .min(viewport.bottom() - px(bottom) - bounds.bottom());
             }
             // A sticky box never leaves its containing block, which was laid out first.
-            if let Some([x, y, width, height]) = parent.and_then(|parent| {
-                let view = &*self.view;
-                let host = view.host.borrow();
-                host.dom.get(&view.id)?.bounds.get(&parent).copied()
-            }) {
+            if let Some([x, y, width, height]) =
+                block.and_then(|(parent, [top, right, bottom, left])| {
+                    let view = &*self.view;
+                    let host = view.host.borrow();
+                    let [x, y, width, height] =
+                        host.dom.get(&view.id)?.bounds.get(&parent).copied()?;
+                    Some([
+                        x + left,
+                        y + top,
+                        width - left - right,
+                        height - top - bottom,
+                    ])
+                })
+            {
                 offset.x = offset
                     .x
                     .min(px(x + width) - bounds.right())
@@ -463,6 +485,15 @@ impl renderer::Element for DomBox {
         (bounds, matrix): &mut Self::PrepaintState,
         window: &mut Window,
     ) {
+        {
+            let mut host = self.view.host.borrow_mut();
+            let dom = host.dom.entry(self.view.id).or_default();
+            if dom.painted.len() <= self.id {
+                dom.painted.resize(self.id + 1, 0);
+            }
+            dom.paint_count += 1;
+            dom.painted[self.id] = dom.paint_count;
+        }
         if matrix.is_none() && self.effects.is_none() {
             return inner.paint(window);
         }

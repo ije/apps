@@ -66,6 +66,37 @@ pub(super) struct FieldText {
     pub(super) handle: renderer::ScrollHandle,
 }
 
+/// The width a field with a percentage width adds to its parent's max-content size. Like Chrome's
+/// compressible controls, it adds nothing to the min-content size, and fills the field once its width is known.
+pub(super) struct NaturalWidth(pub(super) Pixels);
+
+impl renderer::IntoElement for NaturalWidth {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl renderer::Element for NaturalWidth {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
+        let style = renderer::Style::default();
+        let (id, _) =
+            window.request_measured_layout(&style, self.0, |&natural, known, available, _| {
+                let width = known.width.unwrap_or(match available.width {
+                    renderer::AvailableSpace::MinContent => px(0.),
+                    renderer::AvailableSpace::MaxContent => natural,
+                    renderer::AvailableSpace::Definite(space) => px(natural.0.min(space.0)),
+                });
+                (size(width, px(0.)), None)
+            });
+        (id, ())
+    }
+    fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut Window) {}
+    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window) {}
+}
+
 impl renderer::IntoElement for FieldText {
     type Element = Self;
     fn into_element(self) -> Self {

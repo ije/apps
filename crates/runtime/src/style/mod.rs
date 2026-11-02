@@ -23,7 +23,7 @@ pub(crate) use text::{
     selection_colors, spacing, splits, text_run, text_transform, word_break,
 };
 pub use value::length;
-pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, clip_path, components};
+pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components};
 
 pub(crate) use props::Prop;
 pub use props::Style;
@@ -2147,7 +2147,7 @@ pub(crate) fn resolved(
             .split(['"', '\''])
             .map(str::trim)
             .filter(|row| !row.is_empty())
-            .map(|row| format!("\"{row}\""))
+            .map(|row| format!("\"{}\"", area_cells(row).join(" ")))
             .collect::<Vec<_>>()
             .join(" "),
         "font-family" => components(&value, ',')

@@ -5,7 +5,12 @@ use crate::{
 };
 use std::collections::HashMap;
 
-pub(crate) type Measurements = rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>;
+#[derive(Default)]
+pub(crate) struct Measurements {
+    pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
+    /// Fields measure their text in device pixels, like Chrome.
+    pub(crate) pixel_ratio: f32,
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Grid {
@@ -516,7 +521,7 @@ pub(crate) fn intrinsic(
     measured: &mut Measurements,
 ) -> [f32; 4] {
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
-    if let Some(value) = measured.get(&key) {
+    if let Some(value) = measured.sizes.get(&key) {
         return *value;
     }
     let node = &doc.nodes[id];
@@ -594,6 +599,11 @@ pub(crate) fn intrinsic(
                 .and_then(|v| super::element::dimension(v, node.tag == "canvas"))
                 .unwrap_or(default[axis])
         });
+        content = [width, width, height];
+    } else if super::element::text_field(node) {
+        // A percentage width is `auto` for the max-content size, like in Chrome.
+        let [width, height] =
+            super::element::field_size(doc, id, style, units, text, measured.pixel_ratio, true);
         content = [width, width, height];
     } else if let Some(inline) = style::inline_text(doc, styles, id) {
         let wrap = !style
@@ -880,7 +890,7 @@ pub(crate) fn intrinsic(
     // Like Chrome, replaced boxes sized against their container add nothing to the min-content width.
     let min = if matches!(
         node.tag.as_str(),
-        "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object"
+        "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object" | "input" | "textarea"
     ) && [Prop::WIDTH, Prop::MAX_WIDTH]
         .into_iter()
         .any(|prop| style.get(prop).is_some_and(|value| value.contains('%')))
@@ -895,10 +905,10 @@ pub(crate) fn intrinsic(
         available.unwrap_or(max) + outer[0],
         clamp(vertical[0].unwrap_or(content[2]), vertical) + outer[1],
     ];
-    if measured.len() > 65536 {
-        measured.clear();
+    if measured.sizes.len() > 65536 {
+        measured.sizes.clear();
     }
-    measured.insert(key, result);
+    measured.sizes.insert(key, result);
     result
 }
 
@@ -1039,12 +1049,12 @@ pub(crate) fn layout(
         .split(['"', '\''])
         .skip(1)
         .step_by(2)
-        .map(|row| row.split_whitespace().collect())
+        .map(style::area_cells)
         .collect();
     let mut regions: HashMap<&str, [usize; 4]> = HashMap::new();
     for (y, row) in area_rows.iter().enumerate() {
         for (x, &name) in row.iter().enumerate() {
-            if !name.starts_with('.') {
+            if name != "." {
                 let region = regions.entry(name).or_insert([x, y, x + 1, y + 1]);
                 *region = [
                     region[0].min(x),
@@ -1853,6 +1863,36 @@ mod tests {
         assert_eq!(placement("auto", "span 3", &names, 3), (None, 3));
         assert_eq!(placement("99999", "auto", &names, 3), (Some(4095), 1));
         assert_eq!(placement("1", "span 99999", &names, 3), (Some(0), 4096));
+    }
+
+    #[test]
+    fn fields_and_dotted_area_rows_size_the_grid() {
+        let text = renderer::TextSystem::new();
+        let mut doc = Document::parse(
+            "<style>main{display:grid;grid-template-columns:repeat(4,auto);grid-template-areas:'t f m n''.r a.'}div{display:flex;width:200px}input{width:100%;line-height:24px;padding:0 6px;border:1px solid}</style><main><b style='grid-area:t'></b><div style='grid-area:f'><input></div><div style='grid-area:r'><input></div><b style='grid-area:a'></b></main>",
+        );
+        let mut state = crate::dom::State::default();
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let main = doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "main")
+            .unwrap();
+        let grid = layout(
+            &doc,
+            main,
+            &styles,
+            Some(800.),
+            None,
+            None,
+            None,
+            &text,
+            &mut Default::default(),
+        );
+        // The inputs are 24px of text and 2px of border tall, and `.r a.` is four cells.
+        assert_eq!(grid.rows, [26., 26.]);
+        let cells: Vec<_> = grid.cells.iter().map(|(_, cell, ..)| *cell).collect();
+        assert_eq!(cells[2..], [[1, 1, 1, 1], [2, 1, 1, 1]]);
     }
 
     #[test]
