@@ -2,100 +2,14 @@ use super::{
     SharedString, TextAlign, TextRun, TextWrap, WhiteSpace, WordBreak, WrapBoundary, WrappedLine,
     WrappedLineLayout,
 };
-use crate::{
-    AvailableSpace, Bounds, Element, IntoElement, LayoutId, Pixels, Point, Size, Style, TextStyle,
-    Window, px,
-};
+use crate::{AvailableSpace, Bounds, Pixels, Point, Size, TextStyle, Window, px};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     rc::Rc,
 };
 
-/// Text in the inherited text style, or with its own runs.
-pub struct StyledText {
-    text: SharedString,
-    runs: Option<Vec<TextRun>>,
-    layout: TextLayout,
-}
-
-impl StyledText {
-    pub fn new(text: impl Into<SharedString>) -> Self {
-        Self {
-            text: text.into(),
-            runs: None,
-            layout: TextLayout::default(),
-        }
-    }
-
-    /// Runs that cover the whole text.
-    pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
-        debug_assert_eq!(
-            runs.iter().map(|run| run.len).sum::<usize>(),
-            self.text.len(),
-            "invalid text runs"
-        );
-        self.runs = Some(runs);
-        self
-    }
-
-    pub fn layout(&self) -> &TextLayout {
-        &self.layout
-    }
-}
-
-impl Element for StyledText {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn request_layout(&mut self, window: &mut Window) -> (LayoutId, ()) {
-        (
-            self.layout
-                .layout(self.text.clone(), self.runs.take(), window),
-            (),
-        )
-    }
-
-    fn prepaint(&mut self, bounds: Bounds<Pixels>, _: &mut (), _: &mut Window) {
-        if let Some(inner) = self.layout.0.borrow_mut().as_mut() {
-            inner.bounds = Some(bounds);
-        }
-    }
-
-    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
-        self.layout.paint(window);
-    }
-}
-
-impl IntoElement for StyledText {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl IntoElement for SharedString {
-    type Element = StyledText;
-    fn into_element(self) -> StyledText {
-        StyledText::new(self)
-    }
-}
-
-impl IntoElement for String {
-    type Element = StyledText;
-    fn into_element(self) -> StyledText {
-        StyledText::new(self)
-    }
-}
-
-impl IntoElement for &'static str {
-    type Element = StyledText;
-    fn into_element(self) -> StyledText {
-        StyledText::new(self)
-    }
-}
-
-/// The shaped lines of a text element, shared with whoever needs positions in it.
+/// The shaped lines of a text node, shared with whoever needs positions in it.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
@@ -111,19 +25,19 @@ struct TextLayoutInner {
 }
 
 /// What a text layout depends on, with the layout it holds. Equal inputs keep the layout.
-struct Measured {
+pub(crate) struct TextState {
     text: SharedString,
     runs: Vec<TextRun>,
     style: TextStyle,
     scale: f32,
-    layout: TextLayout,
+    pub(crate) layout: TextLayout,
     /// The min-content and max-content sizes and baselines of wrapping text.
     probes: Cell<[Option<Probe>; 2]>,
 }
 
 type Probe = (Size<Pixels>, [Pixels; 2]);
 
-impl PartialEq for Measured {
+impl PartialEq for TextState {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
             && self.runs == other.runs
@@ -132,161 +46,171 @@ impl PartialEq for Measured {
     }
 }
 
-impl TextLayout {
-    fn layout(
-        &mut self,
+impl TextState {
+    pub(crate) fn new(
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        style: &TextStyle,
+        scale: f32,
+    ) -> Self {
+        Self {
+            runs: runs.unwrap_or_else(|| vec![style.to_run(text.len())]),
+            text,
+            style: style.clone(),
+            scale,
+            layout: TextLayout::default(),
+            probes: Cell::default(),
+        }
+    }
+
+    /// The same text in another style. Runs that came from the old style follow the new one.
+    pub(crate) fn restyled(&self, own: bool, style: &TextStyle, scale: f32) -> Self {
+        Self::new(
+            self.text.clone(),
+            own.then(|| self.runs.clone()),
+            style,
+            scale,
+        )
+    }
+
+    pub(crate) fn measure(
+        &self,
+        known: Size<Option<Pixels>>,
+        available: Size<AvailableSpace>,
         window: &mut Window,
-    ) -> LayoutId {
-        let style = window.text_style();
-        let runs = runs.unwrap_or_else(|| vec![style.to_run(text.len())]);
-        let measured = Measured {
+    ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
+        let Self {
             text,
             runs,
             style,
-            scale: window.scale_factor(),
-            layout: self.clone(),
-            probes: Cell::default(),
+            layout,
+            probes,
+            ..
+        } = self;
+        let line_height = style.line_height;
+        let definite = |space: AvailableSpace| match space {
+            AvailableSpace::Definite(width) => Some(width),
+            _ => None,
         };
-        let (id, measured) = window.request_measured_layout(
-            &Style::default(),
-            measured,
-            |measured, known, available, window| {
-                let Measured {
-                    text,
-                    runs,
-                    style,
-                    layout,
-                    probes,
-                    ..
-                } = measured;
-                let line_height = style.line_height;
-                let definite = |space: AvailableSpace| match space {
-                    AvailableSpace::Definite(width) => Some(width),
-                    _ => None,
-                };
-                let width = known.width.or(definite(available.width));
-                let wraps = style.white_space == WhiteSpace::Normal;
-                let wrap_width = width.filter(|_| wraps);
-                let truncate = style.text_overflow.clone().zip(width);
-                let probe = (wraps && width.is_none())
-                    .then(|| (available.width != AvailableSpace::MinContent) as usize);
-                if let Some(probe) = probe {
-                    if let Some((size, baselines)) = probes.get()[probe] {
-                        return (size, Some(baselines));
-                    }
-                } else if let Some(inner) = layout.0.borrow().as_ref()
-                    && wrap_width == inner.wrap_width
-                    && truncate.is_none()
-                    // A truncated layout answers an unconstrained probe with the truncated size,
-                    // so it is never reused.
-                    && !inner.truncated
-                {
-                    return (inner.size, Some(inner.baselines));
-                }
-                let min_content = probe == Some(0);
-                let system = window.text_system().clone();
-                let (text, runs, truncated) = match truncate {
-                    Some((affix, width)) => {
-                        let (text, runs, truncated) =
-                            truncate_text(&system, style, text, runs, &affix, width, wrap_width);
-                        (text, Cow::Owned(runs), truncated)
-                    }
-                    None => (text.clone(), Cow::Borrowed(runs), false),
-                };
-                // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
-                let lines = system
-                    .shape_text_indented(
-                        text,
-                        style.font_size,
-                        &runs,
-                        if min_content {
-                            Some(px(0.))
-                        } else {
-                            wrap_width
-                        },
-                        style.line_clamp.filter(|_| !min_content),
-                        style.text_indent,
-                        if min_content {
-                            TextWrap::Wrap
-                        } else {
-                            style.text_wrap
-                        },
-                        match style.word_break {
-                            WordBreak::BreakWord if min_content => WordBreak::Normal,
-                            word_break => word_break,
-                        },
-                    )
-                    .unwrap_or_default();
-                let mut size = Size::<Pixels>::default();
-                for line in &lines {
-                    let line = line.size(line_height);
-                    size.height += line.height;
-                    size.width = size.width.max(line.width);
-                }
+        let width = known.width.or(definite(available.width));
+        let wraps = style.white_space == WhiteSpace::Normal;
+        let wrap_width = width.filter(|_| wraps);
+        let truncate = style.text_overflow.clone().zip(width);
+        let probe = (wraps && width.is_none())
+            .then(|| (available.width != AvailableSpace::MinContent) as usize);
+        if let Some(probe) = probe {
+            if let Some((size, baselines)) = probes.get()[probe] {
+                return (size, Some(baselines));
+            }
+        } else if let Some(inner) = layout.0.borrow().as_ref()
+            && wrap_width == inner.wrap_width
+            && truncate.is_none()
+            // A truncated layout answers an unconstrained probe with the truncated size,
+            // so it is never reused.
+            && !inner.truncated
+        {
+            return (inner.size, Some(inner.baselines));
+        }
+        let min_content = probe == Some(0);
+        let system = window.text_system().clone();
+        let (text, runs, truncated) = match truncate {
+            Some((affix, width)) => {
+                let (text, runs, truncated) =
+                    truncate_text(&system, style, text, runs, &affix, width, wrap_width);
+                (text, Cow::Owned(runs), truncated)
+            }
+            None => (text.clone(), Cow::Borrowed(runs), false),
+        };
+        // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
+        let lines = system
+            .shape_text_indented(
+                text,
+                style.font_size,
+                &runs,
                 if min_content {
-                    size.width = px(0.);
-                    let mut start = px(0.) - style.text_indent;
-                    for line in &lines {
-                        let unwrapped = &line.unwrapped_layout;
-                        let mut breaks = line.wrap_boundaries.iter().peekable();
-                        let mut glyphs = unwrapped
-                            .runs
-                            .iter()
-                            .enumerate()
-                            .flat_map(|(run_ix, run)| {
-                                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                                    (WrapBoundary { run_ix, glyph_ix }, glyph)
-                                })
-                            })
-                            .peekable();
-                        while let Some((boundary, glyph)) = glyphs.next() {
-                            if breaks.next_if(|next| **next == boundary).is_some() {
-                                start = glyph.position.x;
-                            }
-                            let end = glyphs
-                                .peek()
-                                .map_or(unwrapped.width, |(_, next)| next.position.x);
-                            if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
-                                size.width = size.width.max(end - start);
-                            }
-                        }
-                        start = px(0.);
+                    Some(px(0.))
+                } else {
+                    wrap_width
+                },
+                style.line_clamp.filter(|_| !min_content),
+                style.text_indent,
+                if min_content {
+                    TextWrap::Wrap
+                } else {
+                    style.text_wrap
+                },
+                match style.word_break {
+                    WordBreak::BreakWord if min_content => WordBreak::Normal,
+                    word_break => word_break,
+                },
+            )
+            .unwrap_or_default();
+        let mut size = Size::<Pixels>::default();
+        for line in &lines {
+            let line = line.size(line_height);
+            size.height += line.height;
+            size.width = size.width.max(line.width);
+        }
+        if min_content {
+            size.width = px(0.);
+            let mut start = px(0.) - style.text_indent;
+            for line in &lines {
+                let unwrapped = &line.unwrapped_layout;
+                let mut breaks = line.wrap_boundaries.iter().peekable();
+                let mut glyphs = unwrapped
+                    .runs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(run_ix, run)| {
+                        run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                            (WrapBoundary { run_ix, glyph_ix }, glyph)
+                        })
+                    })
+                    .peekable();
+                while let Some((boundary, glyph)) = glyphs.next() {
+                    if breaks.next_if(|next| **next == boundary).is_some() {
+                        start = glyph.position.x;
+                    }
+                    let end = glyphs
+                        .peek()
+                        .map_or(unwrapped.width, |(_, next)| next.position.x);
+                    if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
+                        size.width = size.width.max(end - start);
                     }
                 }
-                let baseline = system.baseline(
-                    system.resolve_font(&style.font()),
-                    style.font_size,
-                    line_height,
-                    window.scale_factor(),
-                );
-                let baselines = [baseline, baseline + size.height - line_height];
-                if let Some(probe) = probe {
-                    let mut kept = probes.get();
-                    kept[probe] = Some((size, baselines));
-                    probes.set(kept);
-                }
-                // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
-                if probe.is_none() || layout.0.borrow().is_none() {
-                    *layout.0.borrow_mut() = Some(TextLayoutInner {
-                        lines,
-                        line_height,
-                        wrap_width,
-                        truncated,
-                        size,
-                        baselines,
-                        bounds: None,
-                    });
-                }
-                (size, Some(baselines))
-            },
+                start = px(0.);
+            }
+        }
+        let baseline = system.baseline(
+            system.resolve_font(&style.font()),
+            style.font_size,
+            line_height,
+            window.scale_factor(),
         );
-        *self = measured.layout.clone();
-        id
+        let baselines = [baseline, baseline + size.height - line_height];
+        if let Some(probe) = probe {
+            let mut kept = probes.get();
+            kept[probe] = Some((size, baselines));
+            probes.set(kept);
+        }
+        // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
+        if probe.is_none() || layout.0.borrow().is_none() {
+            *layout.0.borrow_mut() = Some(TextLayoutInner {
+                lines,
+                line_height,
+                wrap_width,
+                truncated,
+                size,
+                baselines,
+                bounds: None,
+            });
+        }
+        (size, Some(baselines))
     }
+}
 
-    pub fn paint(&self, window: &mut Window) {
+impl TextLayout {
+    pub fn paint(&self, align: TextAlign, window: &mut Window) {
         let inner = self.0.borrow();
         let Some(inner) = inner.as_ref() else {
             return;
@@ -294,10 +218,6 @@ impl TextLayout {
         let Some(bounds) = inner.bounds else {
             return;
         };
-        let align = window
-            .text_styles
-            .last()
-            .map_or(TextAlign::Left, |style| style.text_align);
         let mut origin = bounds.origin;
         for line in &inner.lines {
             line.paint_background(origin, inner.line_height, align, Some(bounds), window);
@@ -367,6 +287,31 @@ impl TextLayout {
             .as_ref()
             .and_then(|inner| inner.bounds)
             .unwrap_or_default()
+    }
+
+    /// Shapes `text` in `style` to wrap at `width`, outside the tree, with its lines at `bounds`.
+    pub fn shape(
+        text: SharedString,
+        runs: Vec<TextRun>,
+        style: &TextStyle,
+        width: Pixels,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) -> Self {
+        let state = TextState::new(text, Some(runs), style, window.scale_factor());
+        state.measure(
+            Size::default(),
+            Size::new(AvailableSpace::Definite(width), AvailableSpace::MinContent),
+            window,
+        );
+        state.layout.place(bounds);
+        state.layout
+    }
+
+    pub(crate) fn place(&self, bounds: Bounds<Pixels>) {
+        if let Some(inner) = self.0.borrow_mut().as_mut() {
+            inner.bounds = Some(bounds);
+        }
     }
 
     pub fn line_height(&self) -> Pixels {

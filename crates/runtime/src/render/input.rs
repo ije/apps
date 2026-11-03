@@ -51,7 +51,6 @@ pub(super) fn paint_caret(
 /// The text of an `input` or `textarea`: its value or placeholder, the selection and the caret. It
 /// scrolls its box to keep a moved caret in view, and records its layout for hit tests and IME.
 pub(super) struct FieldText {
-    pub(super) inner: renderer::StyledText,
     pub(super) id: usize,
     pub(super) view: Rc<PageState>,
     pub(super) text: Rc<str>,
@@ -64,63 +63,38 @@ pub(super) struct FieldText {
     pub(super) selection: (Option<u32>, u32),
     /// The scroll position of the box that clips the text.
     pub(super) handle: renderer::ScrollHandle,
+    /// The selection while the field has focus, from prepaint.
+    pub(super) selected: std::cell::Cell<Option<[usize; 2]>>,
+}
+
+impl From<FieldText> for renderer::Child {
+    fn from(field: FieldText) -> Self {
+        renderer::text(field.text.clone(), Some(vec![field.run.clone()]))
+            .hooks(field)
+            .into()
+    }
 }
 
 /// The width a field with a percentage width adds to its parent's max-content size. Like Chrome's
 /// compressible controls, it adds nothing to the min-content size, and fills the field once its width is known.
-pub(super) struct NaturalWidth(pub(super) Pixels);
-
-impl renderer::IntoElement for NaturalWidth {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
+pub(super) fn natural_width(natural: Pixels) -> renderer::Node {
+    renderer::node().measure(natural, |&natural, _, known, available, _| {
+        let width = known.width.unwrap_or(match available.width {
+            renderer::AvailableSpace::MinContent => px(0.),
+            renderer::AvailableSpace::MaxContent => natural,
+            renderer::AvailableSpace::Definite(space) => px(natural.0.min(space.0)),
+        });
+        (size(width, px(0.)), None)
+    })
 }
 
-impl renderer::Element for NaturalWidth {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
-        let style = renderer::Style::default();
-        let (id, _) =
-            window.request_measured_layout(&style, self.0, |&natural, known, available, _| {
-                let width = known.width.unwrap_or(match available.width {
-                    renderer::AvailableSpace::MinContent => px(0.),
-                    renderer::AvailableSpace::MaxContent => natural,
-                    renderer::AvailableSpace::Definite(space) => px(natural.0.min(space.0)),
-                });
-                (size(width, px(0.)), None)
-            });
-        (id, ())
-    }
-    fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut Window) {}
-    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window) {}
-}
-
-impl renderer::IntoElement for FieldText {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for FieldText {
-    type RequestLayoutState = ();
-    /// The selection while the field has focus.
-    type PrepaintState = Option<[usize; 2]>;
-
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
-        self.inner.request_layout(window)
-    }
-
-    fn prepaint(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-    ) -> Option<[usize; 2]> {
-        self.inner.prepaint(bounds, &mut (), window);
-        let layout = self.inner.layout();
+impl renderer::Hooks for FieldText {
+    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window);
+        let Some(layout) = cx.text_layout().cloned() else {
+            return;
+        };
+        let window = &mut *cx.window;
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
@@ -180,17 +154,16 @@ impl renderer::Element for FieldText {
                 window.redraw();
             }
         }
-        selected
+        self.selected.set(selected);
     }
 
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        selected: &mut Option<[usize; 2]>,
-        window: &mut Window,
-    ) {
-        let layout = self.inner.layout();
+    // WARNING: the field paints its own rows, so the text node's lines are not painted.
+    fn paint(&self, cx: &mut renderer::NodeCx<'_>, _: &mut dyn FnMut(&mut Window)) {
+        let Some(layout) = cx.text_layout().cloned() else {
+            return;
+        };
+        let window = &mut *cx.window;
+        let selected = self.selected.get();
         let text = &*self.text;
         let line_height = layout.line_height();
         let selected = selected.map(|[a, b]| {
@@ -357,13 +330,18 @@ fn password<'a>(
 }
 
 impl renderer::View for PageView {
-    fn render(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
+    fn render(
+        &mut self,
+        tree: &renderer::Tree,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> renderer::Child {
         if !window.redrawing()
             && let Some(hud) = &*self.hud.borrow()
         {
             hud.started.set(std::time::Instant::now());
         }
-        self.render_page(window, cx)
+        self.render_page(tree, window, cx)
     }
 
     fn window_changed(&mut self, _: &mut Window, cx: &mut App) {

@@ -2,7 +2,7 @@ use super::{
     PageState,
     background::css_background,
     cull,
-    paint::{DomBox, PaintLayers, Stacked, Turned, paint_layers},
+    paint::{DomBox, Turned},
     scrollbar,
     text::InlineText,
 };
@@ -11,10 +11,7 @@ use crate::{
     dom::Document,
     style::{self, ComputedStyles},
 };
-use renderer::{
-    AnyElement, Bounds, MouseButton, SharedString, div, img, point, prelude::*, px, relative, rgba,
-    size,
-};
+use renderer::{Bounds, Child, MouseButton, SharedString, img, point, px, relative, rgba, size};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 pub(super) struct Build<'a> {
@@ -23,10 +20,7 @@ pub(super) struct Build<'a> {
     pub(super) text: &'a renderer::TextSystem,
     pub(super) pixel_ratio: f32,
     pub(super) view: &'a Rc<PageState>,
-    pub(super) layers: PaintLayers,
     pub(super) ancestors: Rc<[usize]>,
-    /// Where the boxes after the stacking context root start in `ancestors`.
-    pub(super) stacking: usize,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
     pub(super) inline_text: &'a RefCell<HashMap<usize, Option<Rc<style::InlineText>>>>,
@@ -41,6 +35,25 @@ pub(super) struct Build<'a> {
     pub(super) zone: Option<Rc<cull::Zone>>,
     /// The boxes of the top layer, which paint over the page instead of in their parents.
     pub(super) top_layer: &'a [usize],
+    /// The window's kept boxes, which unchanged subtrees link instead of building again.
+    pub(super) tree: &'a renderer::Tree,
+    /// How many runs of children were culled so far in this build.
+    pub(super) culls: &'a std::cell::Cell<usize>,
+    /// The viewport has a new size, so subtrees with viewport units build again.
+    pub(super) resized: bool,
+}
+
+/// What an element's boxes were built from, besides its subtree's nodes and styles. Equal inputs keep the boxes.
+#[derive(PartialEq)]
+pub(super) struct Reuse {
+    subtree: u64,
+    containing: [f32; 2],
+    container: [f32; 2],
+    flex_parent: bool,
+    grid_parent: bool,
+    margin: [f32; 4],
+    /// A script scrolled the clipped box, which gave it a scroll handle.
+    scrolled: bool,
 }
 
 type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
@@ -318,22 +331,108 @@ thread_local! {
     };
 }
 
+/// The boxes of an element and its subtree. A subtree whose nodes, styles and place did not change
+/// links the boxes the window kept from the last frame instead of building them again.
 pub(super) fn element(
     build: &Build<'_>,
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
     slot: Option<([f32; 4], super::grid::Grid)>,
-) -> AnyElement {
+) -> Child {
+    let info = build.info[id];
+    // WARNING: a 3D parent resolves the box's transform with its own units, so such boxes build again.
+    if slot.is_some()
+        || build.perspective.is_some()
+        || build.doc.nodes[id].tag.starts_with('#')
+        || build.ancestors.len() >= 256
+        || info.flags
+            & (cull::BLOCKED
+                | cull::VOLATILE
+                | cull::ANIMATED
+                | cull::HIDDEN
+                | cull::MOVED
+                | cull::COMPOSITED
+                | cull::TRANSFORMED
+                | if build.resized { cull::VIEWPORT } else { 0 })
+            != 0
+    {
+        return create(build, id, containing, container, slot);
+    }
+    // WARNING: a kept subtree culls nothing, so while culling is on only subtrees that were within the
+    // culling margin of the visible range keep their boxes. Others build again and cull their offscreen children.
+    if let Some(zone) = &build.zone {
+        let margin = build.styles.lengths[id].viewport[1];
+        let host = build.view.host.borrow();
+        let inside = host
+            .dom
+            .get(&build.view.id)
+            .and_then(|dom| dom.bounds.get(&id))
+            .is_some_and(|&[_, y, _, height]| {
+                y >= zone.top - margin && y + height <= zone.bottom + margin
+            });
+        drop(host);
+        if !inside {
+            return create(build, id, containing, container, slot);
+        }
+    }
+    let mut units = build.styles.lengths[id];
+    units.container = Some(container);
+    let key = Reuse {
+        subtree: info.subtree,
+        containing,
+        container,
+        flex_parent: build.flex_parent,
+        grid_parent: build.doc.nodes[id].parent.is_some_and(|parent| {
+            build.styles.values[parent]
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
+        }),
+        margin: margins(build, id, &units, containing[0], build.flex_parent, false),
+        scrolled: [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+            .into_iter()
+            .any(|prop| {
+                build.styles.values[id]
+                    .get(prop)
+                    .is_some_and(|value| value != "visible")
+            })
+            && build
+                .view
+                .host
+                .borrow()
+                .dom
+                .get(&build.view.id)
+                .is_some_and(|dom| dom.scroll.contains_key(&id)),
+    };
+    if build.tree.contains(id) && build.view.kept.borrow().get(&id) == Some(&key) {
+        return Child::Kept(id.into());
+    }
+    let culls = build.culls.get();
+    let child = create(build, id, containing, container, slot);
+    let mut kept = build.view.kept.borrow_mut();
+    // WARNING: culled runs depend on the scroll position, so a subtree with spacers is built again.
+    if build.culls.get() == culls {
+        kept.insert(id, key);
+    } else {
+        kept.remove(&id);
+    }
+    child
+}
+
+fn create(
+    build: &Build<'_>,
+    id: usize,
+    containing: [f32; 2],
+    container: [f32; 2],
+    slot: Option<([f32; 4], super::grid::Grid)>,
+) -> Child {
     let Build {
         doc,
         styles,
         text,
         pixel_ratio,
         view,
-        ref layers,
         ref ancestors,
-        stacking: stack,
         flex_parent,
         measured,
         inline_text,
@@ -344,6 +443,9 @@ pub(super) fn element(
         info,
         ref zone,
         top_layer,
+        tree,
+        culls,
+        resized,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -409,6 +511,9 @@ pub(super) fn element(
         ids,
         info,
         top_layer,
+        tree,
+        culls,
+        resized,
         zone: zone
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVED) == 0)
@@ -427,12 +532,6 @@ pub(super) fn element(
                     resized: zone.resized,
                 }))
             }),
-        layers: if stacking {
-            Rc::default()
-        } else {
-            layers.clone()
-        },
-        stacking: if stacking { chain.len() } else { stack },
         ancestors: chain.clone(),
         flex_parent: matches!(display, "flex" | "inline-flex"),
         perspective: style
@@ -514,7 +613,7 @@ pub(super) fn element(
     let containing = block_size.unwrap_or(containing);
     // WARNING: element building and layout recurse per level, so deep pages must not overflow the stack.
     if chain.len() > 256 || style.get(Prop::DISPLAY).is_some_and(|s| s == "none") {
-        return div().hidden().into_any_element();
+        return renderer::node().hidden().into();
     }
     let opacity = super::effects::opacity(style);
     // Group opacity and these properties paint the box through an offscreen layer.
@@ -557,14 +656,14 @@ pub(super) fn element(
     };
     let strut = || {
         let above = above();
-        div()
+        renderer::node()
             .w(px(0.))
             .h(px(above))
             .mb(px(line_height - above))
             .flex_shrink_0()
             .baseline(renderer::Baseline::Bottom)
     };
-    let mut el = div()
+    let mut el = renderer::node()
         .id(id)
         .flex()
         .flex_col()
@@ -645,10 +744,10 @@ pub(super) fn element(
         .flex_shrink_0()
         .baseline(renderer::Baseline::Bottom);
         br = if empty { br.w_full() } else { br.w(px(0.)) };
-        return br.into_any_element();
+        return br.into();
     }
     if stacking {
-        el = el.child(paint_layers(build.layers.clone(), true));
+        el = el.stacking().child(renderer::layers(true));
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
     let mut flat = Vec::new();
@@ -1081,7 +1180,7 @@ pub(super) fn element(
         } else {
             [0xefefef, 0x767676]
         };
-        let mut button = div()
+        let mut button = renderer::node()
             .flex_shrink_0()
             .mr(px(4.))
             .pl(px(7.))
@@ -1098,7 +1197,7 @@ pub(super) fn element(
             .items_center()
             .overflow_hidden()
             .child(button)
-            .child(div().whitespace_nowrap().child("No file chosen"));
+            .child(renderer::node().whitespace_nowrap().child("No file chosen"));
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
             let face = text.resolve_font(&style::font(style));
             let em = px(units.font.em);
@@ -1150,7 +1249,7 @@ pub(super) fn element(
         ));
         el.style().justify_content = Some(renderer::JustifyContent::Center);
         el = el.child(
-            div()
+            renderer::node()
                 .w(px(0.))
                 .h(px(above))
                 .mb(px(units.font.lh - above))
@@ -1212,7 +1311,7 @@ pub(super) fn element(
             .or_default()
             .clone();
         let field = super::input::FieldText {
-            inner: renderer::StyledText::new(shown.clone()).with_runs(vec![run.clone()]),
+            selected: Default::default(),
             id,
             view: view.clone(),
             placeholder: empty,
@@ -1225,7 +1324,7 @@ pub(super) fn element(
             selection: selection_colors,
             handle: handle.clone(),
         };
-        let mut clip = div()
+        let mut clip = renderer::node()
             .absolute()
             .track_scroll(&handle)
             .text_size(px(font_size))
@@ -1236,7 +1335,7 @@ pub(super) fn element(
         el = el
             .cursor(renderer::CursorStyle::IBeam)
             .child(if single_line {
-                let line = div().flex_shrink_0().child(field);
+                let line = renderer::node().flex_shrink_0().child(field);
                 clip.top(px(padding[0]))
                     .right(px(padding[1]))
                     .bottom(px(padding[2]))
@@ -1786,7 +1885,7 @@ pub(super) fn element(
         if auto[0] {
             el = el.w(px(width + chrome[0]));
         } else if percent {
-            el = el.child(super::input::NaturalWidth(px(width)));
+            el = el.child(super::input::natural_width(px(width)));
         }
         if auto[1] {
             el = el.min_h(px(height + chrome[1]));
@@ -2433,7 +2532,7 @@ pub(super) fn element(
             .get(Prop::OUTLINE_COLOR)
             .and_then(style::color)
             .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32));
-        let mut outline = div()
+        let mut outline = renderer::node()
             .absolute()
             .top(px(-grow - borders[0]))
             .right(px(-grow - borders[1]))
@@ -2722,7 +2821,7 @@ pub(super) fn element(
                     .map_or(0, |(ink, _)| ink),
                 ..Default::default()
             };
-            let triangle = div()
+            let triangle = renderer::node()
                 .absolute()
                 .left_0()
                 .top(px((leading + ascent - side) / pixel_ratio))
@@ -2730,7 +2829,7 @@ pub(super) fn element(
                 .child(super::control::layer(id, look, view.clone()));
             // In a line, the box ends at the baseline and the rest of the line is margin.
             let above = (leading + ascent) / pixel_ratio;
-            let marker = div()
+            let marker = renderer::node()
                 .flex_shrink_0()
                 .w(px(side / pixel_ratio + space))
                 .h(px(above))
@@ -2743,7 +2842,7 @@ pub(super) fn element(
                 marker.absolute().top(px(top)).right(relative(1.))
             }
         } else if inside {
-            div()
+            renderer::node()
                 .flex_shrink_0()
                 .mr(px(units.font.em * 0.3))
                 .child(marker)
@@ -2759,7 +2858,7 @@ pub(super) fn element(
             let [ascent, descent, _] = metrics;
             let offset = (ascent * 2. / 3.).floor();
             let leading = ((line * pixel_ratio - ascent - descent) / 2.).floor();
-            let dot = div()
+            let dot = renderer::node()
                 .absolute()
                 .left(px(padding[3] - (offset + 7.) / pixel_ratio))
                 .top(px(top
@@ -2775,7 +2874,7 @@ pub(super) fn element(
                 _ => dot.bg(color),
             }
         } else {
-            div()
+            renderer::node()
                 .absolute()
                 .top(px(top))
                 .right(relative(1.))
@@ -2821,7 +2920,7 @@ pub(super) fn element(
                 pseudo_units.font = style::FontUnits::new(size);
             }
             let face = style::font(pseudo);
-            let mut decoration = div()
+            let mut decoration = renderer::node()
                 .flex()
                 .flex_row()
                 .flex_shrink_0()
@@ -3054,7 +3153,7 @@ pub(super) fn element(
                 })
                 .and_then(|value| super::effects::backdrop(value, &pseudo_units))
             {
-                Some((blur, color_matrix)) => super::paint::Effected {
+                Some((blur, color_matrix)) => decoration.hooks(super::paint::Effected {
                     effect: renderer::PaintEffect {
                         backdrop: Some(renderer::Backdrop {
                             bounds: Bounds::default(),
@@ -3064,22 +3163,19 @@ pub(super) fn element(
                         }),
                         ..Default::default()
                     },
-                    child: decoration.into_any_element(),
                     backdrop: Some(pseudo_radius),
-                }
-                .into_any_element(),
-                None => decoration.into_any_element(),
+                }),
+                None => decoration,
             };
             let decoration = if [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
                 .iter()
                 .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
             {
-                super::paint::Transformed {
-                    child: decoration,
+                decoration.hooks(super::paint::Transformed {
                     style: Rc::new(pseudo.clone()),
                     units: pseudo_units,
-                }
-                .into_any_element()
+                    matrix: Default::default(),
+                })
             } else {
                 decoration
             };
@@ -3092,15 +3188,9 @@ pub(super) fn element(
                     .get(Prop::POSITION)
                     .is_some_and(|value| value != "static")
             {
-                Stacked {
-                    inner: Some(decoration.into_any_element()),
-                    layers: build.layers.clone(),
-                    order,
-                    path: build.ancestors[build.stacking..].into(),
-                }
-                .into_any_element()
+                decoration.z_index(order)
             } else {
-                decoration.into_any_element()
+                decoration
             };
             if index == 0 {
                 el = el.child(decoration);
@@ -3178,18 +3268,16 @@ pub(super) fn element(
                 .containers
                 .insert(id, size);
         }
-        let inner = renderer::StyledText::new(data.text.to_string()).with_runs(data.runs.clone());
         el = el.child(
-            div()
+            renderer::node()
                 .min_w(px(0.))
                 .max_w(relative(1.))
                 .flex_shrink(1.)
                 .child(InlineText {
-                    inner,
                     data,
                     view: view.clone(),
-                    runs: None,
-                    measured: None,
+                    shaped: Default::default(),
+                    prepainted: Default::default(),
                     justify: style
                         .get(Prop::TEXT_ALIGN)
                         .is_some_and(|value| value == "justify")
@@ -3463,7 +3551,7 @@ pub(super) fn element(
             el = el.flex().flex_col();
             // A shrunk grid stretches; a spacer gives it its max-content width.
             el = match widest {
-                Some(widest) => el.child(div().w(px(widest)).h(px(0.)).flex_shrink_0()),
+                Some(widest) => el.child(renderer::node().w(px(widest)).h(px(0.)).flex_shrink_0()),
                 None => el.w(px(content[0]
                     + padding[1]
                     + padding[3]
@@ -3513,14 +3601,14 @@ pub(super) fn element(
             })
         };
         let multicol = columns(style, &units, content[0]);
-        let mut line: Option<renderer::Div> = None;
+        let mut line: Option<renderer::Node> = None;
         let mut floating = Vec::new();
         // Floats and the content after them, until a `clear`, share a row: left floats, the
         // content, then right floats. Text does not flow under a float that ends early.
-        let mut group: Option<(Vec<AnyElement>, Vec<AnyElement>, Vec<AnyElement>)> = None;
+        let mut group: Option<(Vec<Child>, Vec<Child>, Vec<Child>)> = None;
         // With multiple columns, block content is collected and split into columns at the end.
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
-        let mut collected: Vec<(Option<usize>, AnyElement)> = Vec::new();
+        let mut collected: Vec<(Option<usize>, Child)> = Vec::new();
         let shown = |index: usize| {
             let child = &doc.nodes[children[index]];
             preserve
@@ -3704,6 +3792,7 @@ pub(super) fn element(
                 }
             }
             if !culled.is_empty() {
+                culls.set(culls.get() + 1);
                 el = el.child(cull::anchor(culled.clone(), zone.clone(), view.clone()));
             }
             // A culled first item gives the grid's baseline from its last layout, as an empty first line.
@@ -3712,7 +3801,7 @@ pub(super) fn element(
                     .is_some_and(|item| culled.binary_search_by_key(&item, |&(id, _)| id).is_ok())
             }) {
                 let baseline = baseline.max(0.);
-                let mut line = div()
+                let mut line = renderer::node()
                     .w(px(0.))
                     .h(px(baseline))
                     .mb(px(-baseline))
@@ -3724,7 +3813,7 @@ pub(super) fn element(
         }
         macro_rules! place {
             ($element:expr, $child:expr) => {{
-                let element = $element.into_any_element();
+                let element = $element.into();
                 match group.as_mut() {
                     Some((_, _, content)) => content.push(element),
                     None if columns.is_some() => collected.push(($child, element)),
@@ -3738,14 +3827,14 @@ pub(super) fn element(
                     place!(open, None);
                 }
                 if let Some((lefts, rights, content)) = group.take() {
-                    let row = div()
+                    let row = renderer::node()
                         .flex()
                         .flex_row()
                         .items_start()
                         .w_full()
                         .children(lefts)
                         .child(
-                            div()
+                            renderer::node()
                                 .flex()
                                 .flex_col()
                                 .flex_1()
@@ -3754,7 +3843,7 @@ pub(super) fn element(
                         )
                         .children(rights.into_iter().rev());
                     if columns.is_some() {
-                        collected.push((None, row.into_any_element()));
+                        collected.push((None, row.into()));
                     } else {
                         el = el.child(row);
                     }
@@ -3764,7 +3853,7 @@ pub(super) fn element(
         // The full-width box that ends a line after a `<br>`. It is no line of its own, so it doesn't align
         // baselines.
         let line_break = || {
-            let mut el = div().w_full();
+            let mut el = renderer::node().w_full();
             el.style().align_self = Some(renderer::AlignSelf::FlexStart);
             el
         };
@@ -3774,6 +3863,7 @@ pub(super) fn element(
                     && let Some(&slot) = slots.get(index).filter(|&&slot| slot > 0)
                 {
                     if let Some(run) = runs[slot - 1].take() {
+                        culls.set(culls.get() + 1);
                         if let Some(open) = line.take() {
                             place!(open, None);
                         }
@@ -3830,13 +3920,13 @@ pub(super) fn element(
                             .get(Prop::WIDTH)
                             .is_none_or(|value| value == "auto")
                         {
-                            div()
+                            renderer::node()
                                 .flex()
                                 .flex_col()
                                 .flex_shrink(1.)
                                 .min_w(px(0.))
                                 .child(child_element)
-                                .into_any_element()
+                                .into()
                         } else {
                             child_element
                         };
@@ -3925,7 +4015,7 @@ pub(super) fn element(
                         Some(open) => line = Some(open.child(placeholder)),
                         None if all_inline || block => place!(placeholder, None),
                         None => {
-                            let mut next = div().flex().flex_row().flex_wrap();
+                            let mut next = renderer::node().flex().flex_row().flex_wrap();
                             next.style().justify_content = line_justify;
                             line = Some(next.child(placeholder));
                         }
@@ -3939,16 +4029,23 @@ pub(super) fn element(
                     && style::phantom(doc, styles, child)
                 {
                     // A box that makes no line sits in a row without a strut.
-                    place!(div().flex().flex_row().child(child_element), None);
+                    place!(
+                        renderer::node().flex().flex_row().child(child_element),
+                        None
+                    );
                 } else if flow
                     && !all_inline
                     && grid.is_none()
                     && inline_level(child)
                     && !out_of_flow
                 {
-                    let mut next = line
-                        .take()
-                        .unwrap_or_else(|| div().flex().flex_row().flex_wrap().child(strut()));
+                    let mut next = line.take().unwrap_or_else(|| {
+                        renderer::node()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .child(strut())
+                    });
                     next.style().justify_content = line_justify;
                     next.style().align_items = line_align;
                     next = next.child(child_element);
@@ -3991,7 +4088,7 @@ pub(super) fn element(
                 })
                 .collect();
             let target = heights.iter().sum::<f32>() / count as f32;
-            let mut columns: Vec<Vec<AnyElement>> = (0..count).map(|_| Vec::new()).collect();
+            let mut columns: Vec<Vec<Child>> = (0..count).map(|_| Vec::new()).collect();
             let (mut column, mut filled) = (0, 0.);
             for ((_, item), height) in collected.into_iter().zip(heights) {
                 if filled > 0. && filled + height / 2. > target && column + 1 < count {
@@ -4001,7 +4098,7 @@ pub(super) fn element(
                 filled += height;
                 columns[column].push(item);
             }
-            let mut row = div()
+            let mut row = renderer::node()
                 .flex()
                 .flex_row()
                 .items_start()
@@ -4009,7 +4106,7 @@ pub(super) fn element(
                 .gap_x(px(gap));
             for items in columns {
                 row = row.child(
-                    div()
+                    renderer::node()
                         .flex()
                         .flex_col()
                         .flex_1()
@@ -4104,7 +4201,7 @@ pub(super) fn element(
         }
     }
     if stacking {
-        el = el.child(paint_layers(build.layers.clone(), false));
+        el = el.child(renderer::layers(false));
     }
     el = el.children(bars);
     let sticky = (style.get(Prop::POSITION).is_some_and(|v| v == "sticky"))
@@ -4181,28 +4278,23 @@ pub(super) fn element(
                 text,
                 &mut measured.borrow_mut(),
             )[3];
-            div()
+            renderer::node()
                 .id(("vertical", id))
                 .relative()
                 .flex_shrink_0()
                 .w(px(block))
                 .h(px(inline))
-                .child(Turned {
-                    child: el
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .w(px(inline))
-                        .into_any_element(),
-                    clockwise: mode != "sideways-lr",
+                .child(Turned::node(
+                    el.absolute().top_0().left_0().w(px(inline)).into(),
+                    mode != "sideways-lr",
                     block,
                     inline,
-                })
+                ))
         }
         None => el,
     };
-    let element = DomBox {
-        inner: Some(el),
+    let element = el.hooks(DomBox {
+        placed: Default::default(),
         anchor,
         block: contains(style, false).then_some(borders),
         container: positioner.filter(|&block| position == "fixed" || Some(block) != parent),
@@ -4311,22 +4403,15 @@ pub(super) fn element(
                 .get(prop)
                 .and_then(|v| units.resolve(v, containing[axis]))
         }),
-    }
-    .into_any_element();
+    });
     // WARNING: `z-index` does nothing in the top layer, whose boxes paint in their own order.
     if layered
         && let Some(order) = order.filter(|order| *order != 0)
         && !top_layer.contains(&id)
     {
-        Stacked {
-            inner: Some(element),
-            layers: layers.clone(),
-            order,
-            path: ancestors[stack..].into(),
-        }
-        .into_any_element()
+        element.z_index(order).into()
     } else {
-        element
+        element.into()
     }
 }
 
@@ -4912,7 +4997,7 @@ fn column_rules(
     width: f32,
     color: renderer::Rgba,
     kind: renderer::BorderStyle,
-) -> AnyElement {
+) -> Child {
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
@@ -4937,7 +5022,7 @@ fn column_rules(
     .top_0()
     .left_0()
     .size_full()
-    .into_any_element()
+    .into()
 }
 
 /// The rendered legend of a square-cornered fieldset, the height its top border takes for the legend's margin
@@ -5014,7 +5099,7 @@ fn fieldset_border(
     colors: [renderer::Rgba; 4],
     kinds: [&str; 4],
     view: Rc<super::PageState>,
-) -> AnyElement {
+) -> Child {
     let kinds = kinds.map(str::to_owned);
     renderer::canvas(
         |_, _| (),
@@ -5109,7 +5194,7 @@ fn fieldset_border(
     .left(px(-widths[3]))
     .right(px(-widths[1]))
     .bottom(px(-widths[2]))
-    .into_any_element()
+    .into()
 }
 
 fn border_style(kind: &str) -> renderer::BorderStyle {
@@ -5157,7 +5242,7 @@ fn inset_shadows(
     shadows: Vec<renderer::BoxShadow>,
     radius: renderer::Radii<renderer::Length>,
     borders: [f32; 4],
-) -> AnyElement {
+) -> Child {
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
@@ -5178,11 +5263,11 @@ fn inset_shadows(
     .top_0()
     .left_0()
     .size_full()
-    .into_any_element()
+    .into()
 }
 
 /// Paints the inline `<svg>` or the SVG `<img>` source of a node, rasterized at the box size.
-fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement {
+fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
     let geometry = view.clone();
     renderer::canvas(
         // The elements of an inline SVG get boxes, like browsers lay out SVG content.
@@ -5297,7 +5382,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement 
     .top_0()
     .left_0()
     .size_full()
-    .into_any_element()
+    .into()
 }
 
 #[cfg(test)]

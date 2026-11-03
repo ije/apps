@@ -69,15 +69,20 @@ pub struct Composite {
     pub blend: u32,
 }
 
-/// The horizontal half of a separable blur; the composite does the vertical half.
+/// One direction of a separable blur, drawn at `scale` window pixels per target pixel.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Blur {
     pub region: [f32; 4],
     pub source_rect: [f32; 4],
+    pub direction: [f32; 2],
     pub sigma: f32,
-    pub pad: [f32; 3],
+    pub scale: f32,
 }
+
+/// Blurs at least this wide, in device pixels, run at half resolution: the gaussian hides the
+/// lost detail, and both passes draw a quarter of the pixels.
+const HALF_RESOLUTION_SIGMA: f32 = 8.;
 
 /// The window, or an offscreen layer covering part of the window.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,10 +92,12 @@ pub enum Target {
 }
 
 /// An offscreen layer: a pooled texture whose first pixel is at `origin` in window device
-/// pixels. Small layers share one texture as tiles, and draw only inside `bounds`.
+/// pixels, with `scale` window pixels per texture pixel. Small layers share one texture as tiles,
+/// and draw only inside `bounds`.
 pub struct Layer {
     pub texture: usize,
     pub origin: [i32; 2],
+    scale: f32,
     bounds: [f32; 4],
 }
 
@@ -266,10 +273,19 @@ impl RenderFrame {
                 [
                     layer.origin[0] as f32,
                     layer.origin[1] as f32,
-                    size[0] as f32,
-                    size[1] as f32,
+                    size[0] as f32 * layer.scale,
+                    size[1] as f32 * layer.scale,
                 ]
             }
+        }
+    }
+
+    /// The size of the target in its own pixels.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn pixels(&self, target: Target) -> [f32; 2] {
+        match target {
+            Target::Frame => self.window.map(|value| value as f32),
+            Target::Layer(index) => self.textures[self.layers[index].texture].map(|v| v as f32),
         }
     }
 
@@ -297,7 +313,12 @@ impl RenderFrame {
 
     /// Returns a target covering the `[x, y, width, height]` region of the window.
     fn acquire(&mut self, region: [i32; 4]) -> Target {
-        let size = [region[2].max(1) as u32, region[3].max(1) as u32];
+        self.acquire_scaled(region, 1)
+    }
+
+    /// Like `acquire`, with `scale` window pixels per texture pixel.
+    fn acquire_scaled(&mut self, region: [i32; 4], scale: i32) -> Target {
+        let size = [region[2], region[3]].map(|side| (side.max(1) as u32).div_ceil(scale as u32));
         let fit = self
             .free
             .iter()
@@ -325,11 +346,12 @@ impl RenderFrame {
         self.layers.push(Layer {
             texture,
             origin: [region[0], region[1]],
+            scale: scale as f32,
             bounds: [
                 region[0] as f32,
                 region[1] as f32,
-                size[0] as f32,
-                size[1] as f32,
+                (size[0] * scale as u32) as f32,
+                (size[1] * scale as u32) as f32,
             ],
         });
         Target::Layer(self.layers.len() - 1)
@@ -382,6 +404,7 @@ impl RenderFrame {
         self.layers.push(Layer {
             texture,
             origin: [region[0] - offset[0], region[1] - offset[1]],
+            scale: 1.,
             bounds: region.map(|value| value as f32),
         });
         Some((Target::Layer(self.layers.len() - 1), clear))
@@ -473,29 +496,49 @@ impl RenderFrame {
         (x1 > x0 && y1 > y0).then_some([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
     }
 
-    fn blur(&mut self, src: Target, region: [i32; 4], sigma: f32, release: bool) -> Target {
-        let source_rect = self.rect(src);
-        let dst = match src {
-            Target::Layer(index) => {
-                let layer = &self.layers[index];
-                let size = self.textures[layer.texture];
-                let origin = layer.origin;
-                self.acquire([origin[0], origin[1], size[0] as i32, size[1] as i32])
-            }
-            Target::Frame => self.acquire(region),
+    /// Blurs `region` of `src` into a new target. Returns it with the sigma that the composite
+    /// still blurs vertically: a narrow blur leaves that half to the composite, while a wide one
+    /// blurs both ways at half resolution, which the composite scales up.
+    fn blur(&mut self, src: Target, region: [i32; 4], sigma: f32, release: bool) -> (Target, f32) {
+        let covered = match src {
+            Target::Layer(_) => self.rect(src).map(|value| value as i32),
+            Target::Frame => region,
         };
-        let index = self.blurs.len() as u32;
-        self.blurs.push(Blur {
-            region: region.map(|value| value as f32),
-            source_rect,
-            sigma,
-            pad: [0.; 3],
-        });
-        self.cmds.push(Cmd::Blur { src, dst, index });
+        let scale = if sigma >= HALF_RESOLUTION_SIGMA { 2 } else { 1 };
+        let horizontal = self.acquire_scaled(covered, scale);
+        self.blur_pass(src, horizontal, region, sigma, [1., 0.]);
         if release {
             self.release(src);
         }
-        dst
+        if scale == 1 {
+            return (horizontal, sigma);
+        }
+        let both = self.acquire_scaled(covered, scale);
+        self.blur_pass(horizontal, both, region, sigma, [0., 1.]);
+        self.release(horizontal);
+        (both, 0.)
+    }
+
+    fn blur_pass(
+        &mut self,
+        src: Target,
+        dst: Target,
+        region: [i32; 4],
+        sigma: f32,
+        direction: [f32; 2],
+    ) {
+        let index = self.blurs.len() as u32;
+        self.blurs.push(Blur {
+            region: region.map(|value| value as f32),
+            source_rect: self.rect(src),
+            direction,
+            sigma,
+            scale: match dst {
+                Target::Layer(index) => self.layers[index].scale,
+                Target::Frame => 1.,
+            },
+        });
+        self.cmds.push(Cmd::Blur { src, dst, index });
     }
 
     fn composite(
@@ -594,10 +637,10 @@ impl RenderFrame {
                 dst: copy,
                 region,
             });
-            let src = if backdrop.blur > 0.25 {
+            let (src, sigma) = if backdrop.blur > 0.25 {
                 self.blur(copy, region, backdrop.blur, true)
             } else {
-                copy
+                (copy, 0.)
             };
             let mut composite = base;
             composite.flags = COMPOSITE_BACKDROP | COMPOSITE_CLIP;
@@ -605,7 +648,7 @@ impl RenderFrame {
             composite.bounds = rect(backdrop.bounds);
             composite.clip = composite.bounds;
             composite.clip_radii = radii(&backdrop.corner_radii);
-            composite.blur = backdrop.blur;
+            composite.blur = sigma;
             composite.source_rect = self.rect(src);
             matrix(&backdrop.color_matrix, &mut composite);
             self.composite(target, src, None, None, composite);
@@ -675,15 +718,15 @@ impl RenderFrame {
         let region_rect = region.map(|value| value as f32);
 
         if let Some((offset, sigma, color)) = effect.shadow {
-            let src = if sigma > 0.25 {
+            let (src, left) = if sigma > 0.25 {
                 self.blur(texture, region, sigma, false)
             } else {
-                texture
+                (texture, 0.)
             };
             let rgba = color;
             let mut composite = base;
             composite.flags |= COMPOSITE_SHADOW;
-            composite.blur = sigma;
+            composite.blur = left;
             composite.shadow = [offset.x, offset.y, sigma, 0.];
             composite.shadow_color = [rgba.r * rgba.a, rgba.g * rgba.a, rgba.b * rgba.a, rgba.a];
             composite.bounds = [
@@ -703,10 +746,10 @@ impl RenderFrame {
             }
         }
 
-        let src = if effect.blur > 0.25 {
+        let (src, sigma) = if effect.blur > 0.25 {
             self.blur(texture, region, effect.blur, true)
         } else {
-            texture
+            (texture, 0.)
         };
         let backdrop = (effect.blend_mode != BlendMode::Normal && self.copy)
             .then(|| self.region(primitive.bounds, visible))
@@ -722,7 +765,7 @@ impl RenderFrame {
             });
         let mut composite = base;
         matrix(&effect.color_matrix, &mut composite);
-        composite.blur = effect.blur;
+        composite.blur = sigma;
         composite.bounds = region_rect;
         composite.blend = effect.blend_mode as u32;
         composite.source_rect = self.rect(src);
@@ -876,6 +919,68 @@ mod tests {
         let mut patched = scene(0.);
         assert!(patched.patch(9, 1., Some(turn(30.))));
         assert_eq!(draw(&patched), draw(&scene(30.)));
+    }
+
+    #[test]
+    fn wide_blurs_draw_both_passes_at_half_resolution() {
+        let blurred = |sigma: f32| {
+            let bounds = |[x, y, w, h]: [f32; 4]| {
+                Bounds::new(
+                    crate::point(ScaledPixels(x), ScaledPixels(y)),
+                    Size::new(ScaledPixels(w), ScaledPixels(h)),
+                )
+            };
+            let mask = ContentMask {
+                bounds: bounds([0., 0., 800., 600.]),
+                ..Default::default()
+            };
+            let mut scene = Scene::default();
+            scene.push_effect(
+                EffectState {
+                    transform: None,
+                    opacity: 1.,
+                    color_matrix: None,
+                    blur: sigma,
+                    shadow: None,
+                    blend_mode: Default::default(),
+                    clip: None,
+                    mask: None,
+                    backdrop: None,
+                    content_mask: mask,
+                },
+                None,
+            );
+            scene.insert(Primitive::Quad(Quad {
+                bounds: bounds([100., 100., 200., 100.]),
+                content_mask: mask,
+                ..Default::default()
+            }));
+            scene.pop_effect();
+            scene.finish();
+            let mut frame = RenderFrame::default();
+            frame.record(&scene, [800, 600], 16384, true);
+            frame
+        };
+        let narrow = blurred(4.);
+        let [blur] = narrow.blurs[..] else {
+            panic!("one blur pass")
+        };
+        assert_eq!((blur.direction, blur.scale), ([1., 0.], 1.));
+        assert_eq!(narrow.composites[0].blur, 4.);
+        let wide = blurred(20.);
+        let [across, down] = wide.blurs[..] else {
+            panic!("two blur passes")
+        };
+        assert_eq!((across.direction, across.scale), ([1., 0.], 2.));
+        assert_eq!((down.direction, down.scale), ([0., 1.], 2.));
+        // The composite only scales up the half-size result, which covers the same window region.
+        let composite = wide.composites[0];
+        assert_eq!(composite.blur, 0.);
+        let Some(Cmd::Composite { src, .. }) = wide.cmds.last() else {
+            panic!("a composite last")
+        };
+        let [width, height] = wide.pixels(*src);
+        assert_eq!(composite.source_rect[2..], [width * 2., height * 2.]);
     }
 
     #[test]

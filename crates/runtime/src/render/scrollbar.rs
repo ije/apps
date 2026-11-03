@@ -6,7 +6,7 @@ use crate::style::{self, Style};
 use renderer::{
     Bounds, Corners, DispatchPhase, Edges, Hitbox, HitboxBehavior, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, Timer, Window,
-    point, prelude::*, px, quad, rgba, size, transparent_black,
+    point, px, quad, rgba, size, transparent_black,
 };
 use std::{
     cell::RefCell,
@@ -246,33 +246,39 @@ pub(super) struct Scrollbar {
     pub(super) origin: [f32; 2],
 }
 
-impl IntoElement for Scrollbar {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
+type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
+
+struct Bars(Scrollbar, RefCell<Prepainted>);
+
+impl renderer::Hooks for Bars {
+    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window);
+        *self.1.borrow_mut() = self.0.bars(cx.window);
+    }
+    fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window);
+        self.0.draw(self.1.take(), cx.window);
     }
 }
 
-impl renderer::Element for Scrollbar {
-    type RequestLayoutState = ();
-    type PrepaintState = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
+impl From<Scrollbar> for renderer::Child {
+    fn from(bar: Scrollbar) -> Self {
         let mut style = renderer::Style {
             position: renderer::Position::Absolute,
             ..Default::default()
         };
-        style.inset.left = px(self.origin[0]).into();
-        style.inset.top = px(self.origin[1]).into();
+        style.inset.left = px(bar.origin[0]).into();
+        style.inset.top = px(bar.origin[1]).into();
         style.size.width = px(0.).into();
         style.size.height = px(0.).into();
-        (window.request_layout(&style, []), ())
+        let mut node = renderer::node().hooks(Bars(bar, RefCell::default()));
+        *node.style() = style;
+        node.into()
     }
-    fn prepaint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-    ) -> Self::PrepaintState {
+}
+
+impl Scrollbar {
+    fn bars(&self, window: &mut Window) -> Prepainted {
         let look = self.look.as_ref()?;
         let state = window.with_element_state(
             ("scrollbar", self.id).into(),
@@ -360,14 +366,8 @@ impl renderer::Element for Scrollbar {
         });
         Some((state, Rc::new(bars)))
     }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        prepainted: &mut Self::PrepaintState,
-        window: &mut Window,
-    ) {
-        let (Some(look), Some((state, bars))) = (&self.look, prepainted.take()) else {
+    fn draw(&self, prepainted: Prepainted, window: &mut Window) {
+        let (Some(look), Some((state, bars))) = (&self.look, prepainted) else {
             return;
         };
         let now = Instant::now();

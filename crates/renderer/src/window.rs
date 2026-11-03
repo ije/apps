@@ -1,12 +1,10 @@
 use crate::{
-    AnyElement, App, AvailableSpace, Backdrop, BorderStyle, Bounds, BoxShadow, ContentMask,
-    CursorStyle, DevicePixels, Edges, ElementId, LayoutId, Modifiers, MouseEvent, PaintEffect,
-    Pixels, PlatformInput, Point, Radii, RenderImage, Rgba, ScaledPixels, Size, Style, TextStyle,
-    TextStyleRefinement, Utf16Selection,
+    App, Backdrop, BorderStyle, Bounds, BoxShadow, Child, ContentMask, CursorStyle, DevicePixels,
+    Edges, ElementId, Modifiers, MouseEvent, PaintEffect, Pixels, PlatformInput, Point, Radii,
+    RenderImage, Rgba, ScaledPixels, Size, Tree, Utf16Selection,
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
-    input::{DEFAULT_LINE_HEIGHT, DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
-    layout::LayoutEngine,
+    input::{DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
     platform, point, px,
     scene::{
         BackdropState, EffectState, MonochromeSprite, PolychromeSprite, Primitive, Quad, Scene,
@@ -35,7 +33,9 @@ pub struct WindowId(pub u64);
 
 /// The root of a window's content.
 pub trait View: 'static {
-    fn render(&mut self, window: &mut Window, cx: &mut App) -> AnyElement;
+    /// Describes the content. Subtrees that did not change can be linked with [`Child::Kept`]
+    /// when `tree` still holds them.
+    fn render(&mut self, tree: &Tree, window: &mut Window, cx: &mut App) -> Child;
 
     /// The window was resized, moved, activated, minimized or otherwise changed.
     fn window_changed(&mut self, _window: &mut Window, _cx: &mut App) {}
@@ -478,7 +478,7 @@ pub struct Window {
     /// The page zoom, and the content size and scale factor the platform reported.
     pub(crate) zoom: f32,
     native: (Size<Pixels>, f32),
-    layout: Option<LayoutEngine>,
+    tree: Option<Tree>,
     scene: Scene,
     next: Frame,
     rendered: Frame,
@@ -487,7 +487,8 @@ pub struct Window {
     next_hitbox: u64,
     content_masks: Vec<(ContentMask<Pixels>, ContentMask<ScaledPixels>)>,
     offsets: Vec<Point<Pixels>>,
-    pub(crate) text_styles: Vec<TextStyle>,
+    /// Light text of the box being painted gets thicker strokes.
+    pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     opacity: f32,
     states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
@@ -524,7 +525,7 @@ impl Window {
             viewport_size,
             zoom: 1.,
             native: (viewport_size, scale_factor),
-            layout: Some(LayoutEngine::default()),
+            tree: Some(Tree::default()),
             scene: Scene::default(),
             next: Frame::default(),
             rendered: Frame::default(),
@@ -533,7 +534,7 @@ impl Window {
             next_hitbox: 0,
             content_masks: Vec::new(),
             offsets: Vec::new(),
-            text_styles: Vec::new(),
+            font_smoothing: true,
             hit_transform: None,
             opacity: 1.,
             states: FxHashMap::default(),
@@ -877,27 +878,18 @@ impl Window {
             } else {
                 self.next_states.clear();
             }
-            if let Some(layout) = &mut self.layout {
-                layout.begin_frame(self.scale_factor, self.text_system.generation());
-            }
             if let Some(mut view) = self.view.take() {
-                let mut root = view.render(self, cx);
+                let mut tree = self.tree.take().unwrap_or_default();
+                tree.begin(self.scale_factor, self.text_system.generation());
+                let root = view.render(&tree, self, cx);
                 self.view = Some(view);
-                let id = root.request_layout(self);
-                let viewport = self.viewport_size;
-                if let Some(layout) = &mut self.layout {
-                    layout.stretch(id, viewport, self.scale_factor);
+                if let Some(root) = tree.commit_root(root, self.viewport_size, self.scale_factor) {
+                    tree.layout(root, self.viewport_size, self);
+                    tree.prepaint(root, self);
+                    self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
+                    tree.paint(root, self);
                 }
-                self.compute_layout(
-                    id,
-                    size(
-                        AvailableSpace::Definite(viewport.width),
-                        AvailableSpace::Definite(viewport.height),
-                    ),
-                );
-                root.prepaint_at(Point::default(), self);
-                self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
-                root.paint(self);
+                self.tree = Some(tree);
             }
             self.drawing = false;
             let again = mem::take(&mut self.redraw[0]);
@@ -933,13 +925,13 @@ impl Window {
         self.update_cursor(cx);
     }
 
-    /// Lays out and prepaints `render`'s element without painting or showing it, so a view can
-    /// read current bounds between frames. Like a draw, a pass that calls [`Self::redraw`] runs
-    /// once more. Returns `false` while the window draws.
+    /// Commits, lays out and prepaints `render`'s content without painting or showing it, so a
+    /// view can read current bounds between frames. Like a draw, a pass that calls
+    /// [`Self::redraw`] runs once more. Returns `false` while the window draws.
     pub fn layout(
         &mut self,
         cx: &mut App,
-        mut render: impl FnMut(&mut Self, &mut App) -> AnyElement,
+        mut render: impl FnMut(&Tree, &mut Self, &mut App) -> Child,
     ) -> bool {
         if self.drawing {
             return false;
@@ -949,23 +941,14 @@ impl Window {
         for _ in 0..2 {
             self.next.clear();
             self.next_hitbox = 0;
-            if let Some(layout) = &mut self.layout {
-                layout.begin_frame(self.scale_factor, self.text_system.generation());
+            let mut tree = self.tree.take().unwrap_or_default();
+            tree.begin(self.scale_factor, self.text_system.generation());
+            let root = render(&tree, self, cx);
+            if let Some(root) = tree.commit_root(root, self.viewport_size, self.scale_factor) {
+                tree.layout(root, self.viewport_size, self);
+                tree.prepaint(root, self);
             }
-            let mut root = render(self, cx);
-            let id = root.request_layout(self);
-            let viewport = self.viewport_size;
-            if let Some(layout) = &mut self.layout {
-                layout.stretch(id, viewport, self.scale_factor);
-            }
-            self.compute_layout(
-                id,
-                size(
-                    AvailableSpace::Definite(viewport.width),
-                    AvailableSpace::Definite(viewport.height),
-                ),
-            );
-            root.prepaint_at(Point::default(), self);
+            self.tree = Some(tree);
             // WARNING: the next draw starts from `states`, so states taken by this pass go back there.
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
@@ -1100,108 +1083,6 @@ impl Window {
         Some(result)
     }
 
-    pub fn request_layout(
-        &mut self,
-        style: &Style,
-        children: impl IntoIterator<Item = LayoutId>,
-    ) -> LayoutId {
-        self.request_element_layout(None, style, children)
-    }
-
-    /// Requests the node of the element with `id`, which keeps it from frame to frame.
-    pub fn request_element_layout(
-        &mut self,
-        id: Option<ElementId>,
-        style: &Style,
-        children: impl IntoIterator<Item = LayoutId>,
-    ) -> LayoutId {
-        let scale = self.scale_factor;
-        match &mut self.layout {
-            Some(layout) => layout.request_layout(id, style, scale, children),
-            None => LayoutEngine::default().request_layout(id, style, scale, children),
-        }
-    }
-
-    /// A leaf sized by `measure`, which also returns its first and last baselines. While `state` compares
-    /// equal to last frame's, the node keeps its layout and the returned state is last frame's,
-    /// with what `measure` stored in it.
-    pub fn request_measured_layout<S: PartialEq + 'static>(
-        &mut self,
-        style: &Style,
-        state: S,
-        measure: impl FnMut(
-            &S,
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-        ) -> (Size<Pixels>, Option<[Pixels; 2]>)
-        + 'static,
-    ) -> (LayoutId, Rc<S>) {
-        let scale = self.scale_factor;
-        match &mut self.layout {
-            Some(layout) => layout.request_measured_layout(style, scale, state, measure),
-            None => LayoutEngine::default().request_measured_layout(style, scale, state, measure),
-        }
-    }
-
-    /// Requests the layout of an element's children in its scope, so nodes without an id keep
-    /// their identity when other elements change.
-    pub fn with_layout_scope<R>(
-        &mut self,
-        id: Option<ElementId>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let Some(scope) = id.zip(self.layout.as_ref()).map(|(id, layout)| {
-            crate::layout::identity(Some(id), layout.scopes.last().copied().unwrap_or_default())
-        }) else {
-            return f(self);
-        };
-        if let Some(layout) = &mut self.layout {
-            layout.scopes.push(scope);
-        }
-        let result = f(self);
-        if let Some(layout) = &mut self.layout {
-            layout.scopes.pop();
-        }
-        result
-    }
-
-    pub fn compute_layout(&mut self, id: LayoutId, space: Size<AvailableSpace>) {
-        // WARNING: measure functions get the window, so the engine is out of it while it runs.
-        if let Some(mut layout) = self.layout.take() {
-            layout.compute_layout(id, space, self);
-            self.layout = Some(layout);
-        }
-    }
-
-    /// The bounds of a laid out node, moved by the element offset.
-    pub fn layout_bounds(&mut self, id: LayoutId) -> Bounds<Pixels> {
-        let scale = self.scale_factor;
-        let bounds = self
-            .layout
-            .as_mut()
-            .map_or_else(Bounds::default, |layout| layout.layout_bounds(id, scale));
-        bounds + self.element_offset()
-    }
-
-    /// The first and last baselines of a laid out node, from the top of its border box.
-    pub fn layout_baselines(&self, id: LayoutId) -> [Option<Pixels>; 2] {
-        let scale = self.scale_factor;
-        self.layout
-            .as_ref()
-            .map_or([None; 2], |layout| layout.baselines(id, scale))
-    }
-
-    /// Like `layout_bounds`, but with edges in layout units instead of device pixels.
-    pub fn exact_layout_bounds(&mut self, id: LayoutId) -> Bounds<Pixels> {
-        let scale = self.scale_factor;
-        let bounds = self
-            .layout
-            .as_mut()
-            .map_or_else(Bounds::default, |layout| layout.exact_bounds(id, scale));
-        bounds + self.element_offset()
-    }
-
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         let id = HitboxId(self.next_hitbox);
         self.next_hitbox += 1;
@@ -1257,30 +1138,9 @@ impl Window {
         result
     }
 
-    pub fn text_style(&self) -> TextStyle {
-        self.text_styles.last().cloned().unwrap_or_default()
-    }
-
-    pub fn line_height(&self) -> Pixels {
-        self.text_styles
-            .last()
-            .map_or(DEFAULT_LINE_HEIGHT, TextStyle::line_height_in_pixels)
-    }
-
-    pub fn with_text_style<R>(
-        &mut self,
-        style: Option<&TextStyleRefinement>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let Some(style) = style.filter(|style| !style.is_empty()) else {
-            return f(self);
-        };
-        let mut next = self.text_styles.last().cloned().unwrap_or_default();
-        next.refine(style);
-        self.text_styles.push(next);
-        let result = f(self);
-        self.text_styles.pop();
-        result
+    /// Whether light text of the box being painted gets thicker strokes.
+    pub fn font_smoothing(&self) -> bool {
+        self.font_smoothing
     }
 
     pub fn content_mask(&self) -> ContentMask<Pixels> {

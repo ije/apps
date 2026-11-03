@@ -19,7 +19,7 @@ pub(crate) use element::dimension;
 use element::{Build, element};
 use renderer::{
     App, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
-    ScrollWheelEvent, Window, WindowId, div, prelude::*, rgba,
+    ScrollWheelEvent, Window, WindowId, rgba,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -72,6 +72,10 @@ pub(crate) struct PageState {
     caret: RefCell<Option<input::Blink>>,
     /// The FPS HUD of `apps run`.
     hud: RefCell<Option<hud::Hud>>,
+    /// By element, what its kept boxes were built from, and the frame they hold for: viewport size,
+    /// scale, font loads and the top layer.
+    kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
+    kept_frame: RefCell<([f32; 4], Vec<usize>)>,
 }
 
 /// Clipping ancestors with their clipped axes, see [`clips`].
@@ -163,8 +167,8 @@ pub(crate) fn reflow(id: u64) {
     }
     let run = |window: &mut Window, cx: &mut App| {
         view.reflowing.set(true);
-        window.layout(cx, |window, cx| {
-            PageView(view.clone()).render_page(window, cx)
+        window.layout(cx, |tree, window, cx| {
+            PageView(view.clone()).render_page(tree, window, cx)
         });
         view.reflowing.set(false);
         window.refresh();
@@ -277,6 +281,8 @@ impl PageView {
             promote: Cell::new(None),
             caret: RefCell::default(),
             hud: RefCell::default(),
+            kept: RefCell::default(),
+            kept_frame: RefCell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);
@@ -285,7 +291,12 @@ impl PageView {
         Self(view)
     }
 
-    fn render_page(&mut self, window: &mut Window, cx: &mut App) -> renderer::AnyElement {
+    fn render_page(
+        &mut self,
+        tree: &renderer::Tree,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> renderer::Child {
         let started = std::time::Instant::now();
         {
             let mut host = self.host.borrow_mut();
@@ -424,7 +435,7 @@ impl PageView {
         }
         let inspectable = !host.packaged;
         let Some(page) = host.pages.get_mut(&self.id) else {
-            return div().size_full().into_any_element();
+            return renderer::node().size_full().into();
         };
         page.dirty = false;
         let mut doc = std::mem::take(&mut page.doc);
@@ -731,7 +742,8 @@ impl PageView {
                     | cull::RELISTED
                     | cull::STALE
                     | cull::COMPOSITED
-                    | cull::TRANSFORMED);
+                    | cull::TRANSFORMED
+                    | cull::ANIMATED);
             }
         } else {
             let mut order = Vec::new();
@@ -870,10 +882,59 @@ impl PageView {
                 } else if let Some(old) = &mut dom.layout_nodes[id] {
                     old.seen = revision;
                 }
+                // WARNING: these boxes build from their siblings, native state or counters, which no revision
+                // tracks, so the window never keeps them.
+                let volatile = matches!(
+                    node.tag.as_str(),
+                    "br" | "img"
+                        | "video"
+                        | "audio"
+                        | "canvas"
+                        | "svg"
+                        | "iframe"
+                        | "webview"
+                        | "embed"
+                        | "object"
+                        | "input"
+                        | "textarea"
+                        | "select"
+                        | "button"
+                        | "option"
+                        | "optgroup"
+                        | "fieldset"
+                        | "legend"
+                        | "details"
+                        | "summary"
+                        | "dialog"
+                        | "li"
+                        | "table"
+                        | "caption"
+                        | "tr"
+                        | "td"
+                        | "th"
+                        | "thead"
+                        | "tbody"
+                        | "tfoot"
+                        | "colgroup"
+                        | "col"
+                        | "q"
+                        | "progress"
+                        | "meter"
+                        | "slot"
+                ) || styles.pseudos.get(&id).is_some_and(|pair| {
+                    pair.iter().any(|pseudo| {
+                        pseudo.get(Prop::CONTENT).is_some_and(|value| {
+                            value.contains("counter") || value.contains("quote")
+                        })
+                    })
+                });
                 info[id] = cull::Info {
                     revision: dom.layout_nodes[id]
                         .as_ref()
                         .map_or(0, |node| node.geometry),
+                    subtree: dom.layout_nodes[id]
+                        .as_ref()
+                        .map_or(0, |node| node.revision),
                     flags: if flags & cull::HIDDEN != 0 {
                         flags
                     } else {
@@ -882,9 +943,12 @@ impl PageView {
                                 | flags
                                 | (u16::from(reshaped) * cull::CHANGED)
                                 | (u16::from(relisted) * cull::RELISTED)
+                                | (u16::from(volatile) * cull::VOLATILE)
                                 | (u16::from(dom.focus == Some(id)) * cull::BLOCKED),
                             |flags, &child| {
-                                flags | info[child].flags & (cull::BLOCKED | cull::VIEWPORT)
+                                flags
+                                    | info[child].flags
+                                        & (cull::BLOCKED | cull::VIEWPORT | cull::VOLATILE)
                             },
                         )
                     },
@@ -899,6 +963,27 @@ impl PageView {
         for &(id, turns) in &composited {
             info[id].flags |= cull::COMPOSITED | (u16::from(turns) * cull::TRANSFORMED);
         }
+        // WARNING: animated values are swapped in after the revisions were taken, so boxes with them, and the boxes
+        // around, are built again each frame.
+        let animate = |info: &mut [cull::Info], id: usize| {
+            let mut node = Some(id);
+            while let Some(id) = node.filter(|&id| id < info.len()) {
+                if info[id].flags & cull::ANIMATED != 0 {
+                    break;
+                }
+                info[id].flags |= cull::ANIMATED;
+                node = doc.nodes[id].parent;
+            }
+        };
+        for &(id, _) in &composited {
+            animate(&mut info, id);
+        }
+        for (id, _) in &paint {
+            animate(&mut info, *id);
+        }
+        for &(id, _) in &restore_pseudos {
+            animate(&mut info, id);
+        }
         // WARNING: the inline text of a paragraph holds the colors of its text, so a new color drops it this
         // frame and the next, which draws the color without animation again.
         let mut recolored = std::mem::take(&mut dom.recolored);
@@ -912,6 +997,9 @@ impl PageView {
             }
         }
         recolored.extend(&dom.recolored);
+        for &id in &recolored {
+            animate(&mut info, id);
+        }
         for id in recolored {
             let mut node = Some(id).filter(|&id| id < styles.values.len());
             while let Some(id) = node {
@@ -1160,9 +1248,7 @@ impl PageView {
             text: &text_system,
             pixel_ratio: window.scale_factor(),
             view: &self.0,
-            layers: Rc::default(),
             ancestors: Rc::default(),
-            stacking: 0,
             flex_parent: false,
             measured: &measured,
             inline_text: &inline_text,
@@ -1173,7 +1259,22 @@ impl PageView {
             info: &info,
             zone,
             top_layer: &top_layer,
+            tree,
+            culls: &Cell::new(0),
+            resized: false,
         };
+        {
+            // WARNING: the scale and fonts resize boxes without new revisions, and the top layer takes boxes out
+            // of their parents, so a change builds every box again. A new viewport size builds the subtrees with
+            // viewport units, see `cull::VIEWPORT`; other boxes key on their containing block.
+            let mut kept = self.kept_frame.borrow_mut();
+            if kept.0[2..] != frame[2..] || kept.1 != top_layer {
+                kept.1 = top_layer.clone();
+                self.kept.borrow_mut().clear();
+            }
+            build.resized = kept.0[..2] != frame[..2];
+            kept.0 = frame;
+        }
         let root = element(
             &build,
             0,
@@ -1184,7 +1285,7 @@ impl PageView {
         // Each box of the top layer paints over the page and the boxes before it, after its `::backdrop`,
         // laid out in the viewport and never culled.
         build.zone = None;
-        let mut overlay = Vec::new();
+        let mut overlay: Vec<renderer::Child> = Vec::new();
         for &id in &top_layer {
             if let Some(backdrop) = styles
                 .backdrops
@@ -1192,7 +1293,7 @@ impl PageView {
                 .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
             {
                 let units = styles.lengths[id];
-                let mut el = div().absolute().top_0().left_0().size_full();
+                let mut el = renderer::node().absolute().top_0().left_0().size_full();
                 if backdrop
                     .get(Prop::VISIBILITY)
                     .is_none_or(|value| value == "visible")
@@ -1231,7 +1332,7 @@ impl PageView {
                         .find_map(|prop| backdrop.get(prop))
                         .and_then(|value| effects::backdrop(value, &units))
                     {
-                        Some((blur, color_matrix)) => paint::Effected {
+                        Some((blur, color_matrix)) => el.hooks(paint::Effected {
                             effect: renderer::PaintEffect {
                                 backdrop: Some(renderer::Backdrop {
                                     bounds: renderer::Bounds::default(),
@@ -1241,19 +1342,24 @@ impl PageView {
                                 }),
                                 ..Default::default()
                             },
-                            child: el.into_any_element(),
                             backdrop: Some(Default::default()),
-                        }
-                        .into_any_element(),
-                        None => el.into_any_element(),
-                    },
+                        }),
+                        None => el,
+                    }
+                    .into(),
                 );
             }
-            let layers = paint::PaintLayers::default();
-            build.layers = layers.clone();
-            overlay.push(paint::paint_layers(layers.clone(), true).into_any_element());
-            overlay.push(element(&build, id, [width, height], [width, height], None));
-            overlay.push(paint::paint_layers(layers, false).into_any_element());
+            // The boxes of the top layer with a z-index paint around it, as in a stacking context.
+            overlay.push(
+                renderer::node()
+                    .absolute()
+                    .size_full()
+                    .stacking()
+                    .child(renderer::layers(true))
+                    .child(element(&build, id, [width, height], [width, height], None))
+                    .child(renderer::layers(false))
+                    .into(),
+            );
         }
         drop(build);
         for (node, children) in children.into_iter().rev() {
@@ -1295,7 +1401,7 @@ impl PageView {
             dom.container_pass = repass;
             if repass {
                 drop(host);
-                return self.render_page(window, cx);
+                return self.render_page(tree, window, cx);
             }
         }
         let runtime = self.runtime.clone();
@@ -1317,11 +1423,13 @@ impl PageView {
                 cx.defer(move |cx| Desktop::drive(runtime, cx));
             });
         }
-        let page = div()
-            .id(("apps-page", 0))
-            .size_full()
-            .when(page_scrolls, |page| page.overflow_y_scroll())
-            .when(!page_scrolls, |page| page.overflow_y_hidden())
+        let page = renderer::node().id(("apps-page", 0)).size_full();
+        let page = if page_scrolls {
+            page.overflow_y_scroll()
+        } else {
+            page.overflow_y_hidden()
+        };
+        let page = page
             .pr(renderer::px(page_space[1]))
             .restrict_scroll_to_axis()
             .track_scroll(&page_scroll)
@@ -1366,13 +1474,13 @@ impl PageView {
             }));
         // WARNING: the top layer stays out of the page's scroll container, so scrolling never moves it.
         if overlay.is_empty() {
-            page.into_any_element()
+            page.into()
         } else {
-            div()
+            renderer::node()
                 .size_full()
                 .child(page)
                 .children(overlay)
-                .into_any_element()
+                .into()
         }
     }
 }

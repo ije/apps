@@ -1,7 +1,7 @@
 use crate::style;
 use crate::style::Prop;
 use anyhow::Result;
-use renderer::{Bounds, Pixels, Point, SharedString, Window, point, prelude::*, px, rgba, size};
+use renderer::{Bounds, Pixels, Point, SharedString, Window, point, px, rgba, size};
 use std::{ops::Range, rc::Rc};
 
 pub(super) struct TextHighlight {
@@ -25,7 +25,7 @@ pub(super) fn paint_text(
     strut: renderer::FontId,
     window: &mut Window,
 ) {
-    let smoothing = window.text_style().font_smoothing;
+    let smoothing = window.font_smoothing();
     let shift = |row: usize| rows.get(row).map_or(px(0.), |row| row.shift);
     // Justified rows widen each space by the row gap.
     let justify = |row: usize, index: usize| {
@@ -352,6 +352,7 @@ fn inline_box(
     rows: &[crate::dom::Row],
     range: &std::ops::Range<usize>,
     style: Option<(&style::Style, style::Lengths)>,
+    root: &renderer::TextStyle,
     window: &Window,
 ) -> Option<(Point<Pixels>, Point<Pixels>, Pixels, Pixels)> {
     let (mut a, b) = text_position(layout, text, rows, range.start)
@@ -374,7 +375,6 @@ fn inline_box(
     };
     let system = window.text_system();
     let scale = window.scale_factor();
-    let root = window.text_style();
     let base = system.baseline(
         system.resolve_font(&root.font()),
         root.font_size,
@@ -468,21 +468,24 @@ fn first_line(
 }
 
 pub(super) struct InlineText {
-    pub(super) inner: renderer::StyledText,
     pub(super) data: Rc<style::InlineText>,
     pub(super) view: Rc<super::PageState>,
-    pub(super) runs: Option<Vec<renderer::TextRun>>,
     /// For justified text, whether the last row is justified too.
     pub(super) justify: Option<bool>,
-    /// Set when the text is measured here instead of by `inner`: the last measured wrap
-    /// width and text width.
-    pub(super) measured: Option<Rc<std::cell::Cell<[Pixels; 2]>>>,
+    /// For text measured here, the lines shaped at the snapped width and their runs.
+    pub(super) shaped: std::cell::RefCell<Option<(renderer::TextLayout, Vec<renderer::TextRun>)>>,
+    /// The hitboxes of cursors and the rows, from prepaint.
+    pub(super) prepainted: std::cell::RefCell<(
+        Vec<(renderer::Hitbox, renderer::CursorStyle)>,
+        crate::dom::Rows,
+    )>,
 }
 
 /// What a measured paragraph depends on, with its last measurement. Equal inputs keep it.
 struct Measured {
     data: Rc<style::InlineText>,
-    style: renderer::TextStyle,
+    /// The text style of the cached measurement.
+    styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     /// The last measured wrap width and text width.
     measured: Rc<std::cell::Cell<[Pixels; 2]>>,
     cached: std::cell::Cell<Option<(Option<Pixels>, renderer::Size<Pixels>)>>,
@@ -492,122 +495,118 @@ struct Measured {
 
 impl PartialEq for Measured {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.data, &other.data) && self.style == other.style
+        Rc::ptr_eq(&self.data, &other.data)
     }
 }
 
-impl IntoElement for InlineText {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for InlineText {
-    type RequestLayoutState = renderer::LayoutId;
-    type PrepaintState = (
-        Vec<(renderer::Hitbox, renderer::CursorStyle)>,
-        crate::dom::Rows,
-    );
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, renderer::LayoutId) {
-        let sized = self.data.runs.iter().any(|run| run.font_size.is_some())
-            || self
-                .data
+impl From<InlineText> for renderer::Child {
+    fn from(text: InlineText) -> Self {
+        let data = &text.data;
+        let sized = data.runs.iter().any(|run| run.font_size.is_some())
+            || data
                 .first_line
                 .as_ref()
                 .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
-        if self.data.first_line.is_none() && !sized {
-            self.measured = None;
-            let (id, ()) = self.inner.request_layout(window);
-            return (id, id);
+        if data.first_line.is_none() && !sized {
+            return renderer::text(data.text.to_string(), Some(data.runs.clone()))
+                .hooks(text)
+                .into();
         }
-        let (layout, kept) = window.request_measured_layout(
-            &renderer::Style::default(),
-            Measured {
-                data: self.data.clone(),
-                style: window.text_style(),
-                measured: Rc::default(),
-                cached: std::cell::Cell::new(None),
-                baselines: std::cell::Cell::new([px(0.); 2]),
-            },
-            |kept, known, available, window| {
-                let Measured {
-                    data,
-                    style,
-                    measured,
-                    cached,
-                    baselines: kept_baselines,
-                } = kept;
-                let (font_size, line_height) = (style.font_size, style.line_height);
-                let width = known
-                    .width
-                    .or(match available.width {
-                        renderer::AvailableSpace::Definite(width) => Some(width),
-                        _ => None,
-                    })
-                    .filter(|_| style.white_space == renderer::WhiteSpace::Normal);
-                if let Some((_, size)) = cached
-                    .get()
-                    .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == width)
-                {
-                    measured.set([width.unwrap_or_default(), size.width]);
-                    return (size, Some(kept_baselines.get()));
-                }
-                let system = window.text_system().clone();
-                let (text, runs) = first_line(data, width, font_size, &system);
-                let mut size = renderer::Size::<Pixels>::default();
-                let lines = system
-                    .shape_text_indented(
-                        text,
-                        font_size,
+        renderer::node()
+            .measure(
+                Measured {
+                    data: data.clone(),
+                    styled: Default::default(),
+                    measured: Rc::default(),
+                    cached: std::cell::Cell::new(None),
+                    baselines: std::cell::Cell::new([px(0.); 2]),
+                },
+                |kept, style, known, available, window| {
+                    let Measured {
+                        data,
+                        styled,
+                        measured,
+                        cached,
+                        baselines: kept_baselines,
+                    } = kept;
+                    // WARNING: a kept paragraph can move under another text style, which measures it again.
+                    if styled.borrow().as_ref() != Some(style) {
+                        cached.set(None);
+                        *styled.borrow_mut() = Some(style.clone());
+                    }
+                    let (font_size, line_height) = (style.font_size, style.line_height);
+                    let width = known
+                        .width
+                        .or(match available.width {
+                            renderer::AvailableSpace::Definite(width) => Some(width),
+                            _ => None,
+                        })
+                        .filter(|_| style.white_space == renderer::WhiteSpace::Normal);
+                    if let Some((_, size)) = cached
+                        .get()
+                        .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == width)
+                    {
+                        measured.set([width.unwrap_or_default(), size.width]);
+                        return (size, Some(kept_baselines.get()));
+                    }
+                    let system = window.text_system().clone();
+                    let (text, runs) = first_line(data, width, font_size, &system);
+                    let mut size = renderer::Size::<Pixels>::default();
+                    let lines = system
+                        .shape_text_indented(
+                            text,
+                            font_size,
+                            &runs,
+                            width,
+                            style.line_clamp,
+                            style.text_indent,
+                            style.text_wrap,
+                            style.word_break,
+                        )
+                        .unwrap_or_default();
+                    for line in &lines {
+                        let line = line.size(line_height);
+                        size.height += line.height;
+                        size.width = size.width.max(line.width);
+                    }
+                    let strut = (system.resolve_font(&style.font()), font_size, line_height);
+                    let scale = window.scale_factor();
+                    let extents = row_extents(
+                        lines.iter().map(|line| &**line),
                         &runs,
-                        width,
-                        style.line_clamp,
-                        style.text_indent,
-                        style.text_wrap,
-                        style.word_break,
-                    )
-                    .unwrap_or_default();
-                for line in &lines {
-                    let line = line.size(line_height);
-                    size.height += line.height;
-                    size.width = size.width.max(line.width);
-                }
-                let strut = (system.resolve_font(&style.font()), font_size, line_height);
-                let scale = window.scale_factor();
-                let extents = row_extents(
-                    lines.iter().map(|line| &**line),
-                    &runs,
-                    &data.line_heights,
-                    strut,
-                    &system,
-                    scale,
-                );
-                for [above, below] in &extents {
-                    size.height += *above + *below;
-                }
-                let base = system.baseline(strut.0, font_size, line_height, scale);
-                let baselines = [
-                    extents.first().map_or(px(0.), |row| row[0]) + base,
-                    size.height - extents.last().map_or(px(0.), |row| row[1]) - line_height + base,
-                ];
-                cached.set(Some((width, size)));
-                kept_baselines.set(baselines);
-                measured.set([width.unwrap_or_default(), size.width]);
-                (size, Some(baselines))
-            },
-        );
-        self.measured = Some(kept.measured.clone());
-        (layout, layout)
+                        &data.line_heights,
+                        strut,
+                        &system,
+                        scale,
+                    );
+                    for [above, below] in &extents {
+                        size.height += *above + *below;
+                    }
+                    let base = system.baseline(strut.0, font_size, line_height, scale);
+                    let baselines = [
+                        extents.first().map_or(px(0.), |row| row[0]) + base,
+                        size.height - extents.last().map_or(px(0.), |row| row[1]) - line_height
+                            + base,
+                    ];
+                    cached.set(Some((width, size)));
+                    kept_baselines.set(baselines);
+                    measured.set([width.unwrap_or_default(), size.width]);
+                    (size, Some(baselines))
+                },
+            )
+            .hooks(text)
+            .into()
     }
-    fn prepaint(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        id: &mut renderer::LayoutId,
-        window: &mut Window,
-    ) -> Self::PrepaintState {
-        let style = window.text_style();
-        if let Some(measured) = &self.measured {
+}
+
+impl renderer::Hooks for InlineText {
+    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window);
+        let (bounds, exact, style) = (cx.bounds, cx.exact, cx.text.clone());
+        let measured = cx.state::<Measured>().map(|kept| kept.measured.clone());
+        let node_layout = cx.text_layout().cloned();
+        let window = &mut *cx.window;
+        if let Some(measured) = &measured {
             // Bounds snap to device pixels and can be a little narrower than the measured
             // wrap or text width, which must not wrap or truncate again.
             let wrap = measured
@@ -619,24 +618,21 @@ impl renderer::Element for InlineText {
             let font_size = style.font_size;
             let system = window.text_system().clone();
             let (text, runs) = first_line(&self.data, width, font_size, &system);
-            self.inner = renderer::StyledText::new(text).with_runs(runs.clone());
-            let (layout, _) = self.inner.request_layout(window);
-            window.compute_layout(
-                layout,
-                size(
-                    renderer::AvailableSpace::Definite(wrap),
-                    renderer::AvailableSpace::MinContent,
-                ),
-            );
-            self.runs = Some(runs);
+            let layout =
+                renderer::TextLayout::shape(text, runs.clone(), &style, wrap, bounds, window);
+            *self.shaped.borrow_mut() = Some((layout, runs));
         }
-        self.inner.prepaint(bounds, &mut (), window);
-        let layout = self.inner.layout();
+        let shaped = self.shaped.borrow();
+        let (layout, runs) = match (&*shaped, &node_layout) {
+            (Some((layout, runs)), _) => (layout, &runs[..]),
+            (None, Some(layout)) => (layout, &self.data.runs[..]),
+            (None, None) => return,
+        };
         let mut rows = Vec::new();
         let indent = style.text_indent;
         let extents = row_extents(
             layout.line_layouts().iter().map(|line| &**line),
-            self.runs.as_deref().unwrap_or(&self.data.runs),
+            runs,
             &self.data.line_heights,
             (
                 window.text_system().resolve_font(&style.font()),
@@ -741,12 +737,10 @@ impl renderer::Element for InlineText {
             })
             .collect();
         // Inline boxes are recorded in layout units like Chrome, not at the snapped bounds.
-        let exact = window.exact_layout_bounds(*id);
         let shift = exact.origin - bounds.origin;
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        let layout = self.inner.layout();
         let computed = dom.computed.clone();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
         for (id, range) in &self.data.ranges {
@@ -758,6 +752,7 @@ impl renderer::Element for InlineText {
                 computed
                     .as_deref()
                     .map(|styles| (&*styles.values[*id], styles.lengths[*id])),
+                &style,
                 window,
             ) {
                 let (left, width) = if a.y == b.y {
@@ -845,15 +840,24 @@ impl renderer::Element for InlineText {
                 );
             }
         }
-        (hitboxes, rows)
+        std::mem::drop(host);
+        std::mem::drop(shaped);
+        *self.prepainted.borrow_mut() = (hitboxes, rows);
     }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut renderer::LayoutId,
-        (hitboxes, rows): &mut Self::PrepaintState,
-        window: &mut Window,
-    ) {
+
+    // WARNING: the paragraph paints its own rows, so the text node's lines are not painted.
+    fn paint(&self, cx: &mut renderer::NodeCx<'_>, _: &mut dyn FnMut(&mut Window)) {
+        let node_layout = cx.text_layout().cloned();
+        let text_style = cx.text.clone();
+        let window = &mut *cx.window;
+        let shaped = self.shaped.borrow();
+        let (layout, runs) = match (&*shaped, &node_layout) {
+            (Some((layout, runs)), _) => (layout, &runs[..]),
+            (None, Some(layout)) => (layout, &self.data.runs[..]),
+            (None, None) => return,
+        };
+        let prepainted = self.prepainted.borrow();
+        let (hitboxes, rows) = &*prepainted;
         for (hitbox, cursor) in hitboxes.iter() {
             window.set_cursor_style(*cursor, hitbox);
         }
@@ -862,7 +866,6 @@ impl renderer::Element for InlineText {
             let view = &*self.view;
             let host = view.host.borrow();
             let dom = &host.dom[&view.id];
-            let layout = self.inner.layout();
             if let Some(styles) = &dom.computed {
                 for &(index, ink) in &self.data.backgrounds {
                     let (id, range) = &self.data.ranges[index];
@@ -874,6 +877,7 @@ impl renderer::Element for InlineText {
                         rows,
                         range,
                         Some((style, units)),
+                        &text_style,
                         window,
                     ) {
                         let radii = [
@@ -974,11 +978,7 @@ impl renderer::Element for InlineText {
                 }
             }
         }
-        let layout = self.inner.layout();
-        let runs = self.runs.as_deref().unwrap_or(&self.data.runs);
-        let strut = window
-            .text_system()
-            .resolve_font(&window.text_style().font());
+        let strut = window.text_system().resolve_font(&text_style.font());
         let passes = self
             .data
             .shadows

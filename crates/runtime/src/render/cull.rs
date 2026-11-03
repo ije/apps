@@ -1,6 +1,6 @@
 use crate::style::Prop;
 use crate::{dom::Document, style};
-use renderer::{AnyElement, prelude::*, px};
+use renderer::{Child, px};
 use std::{collections::HashMap, rc::Rc};
 
 /// The subtree paints outside its box or keeps native state, so it is never replaced by a spacer.
@@ -29,11 +29,18 @@ pub(crate) const COMPOSITED: u16 = 1024;
 /// The composited box's transform animates too, so its layer and hit testing keep a transform that
 /// `render::composite` patches.
 pub(crate) const TRANSFORMED: u16 = 2048;
+/// The subtree builds from more than its nodes, styles and place, like form controls, media, lists,
+/// tables and scroll boxes, so the window never keeps its boxes from the last frame.
+pub(crate) const VOLATILE: u16 = 4096;
+/// Something in the subtree animates this frame, so its boxes are built again.
+pub(crate) const ANIMATED: u16 = 8192;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {
     /// The geometry revision of the subtree.
     pub(crate) revision: u64,
+    /// The revision of the subtree's nodes and styles.
+    pub(crate) subtree: u64,
     pub(crate) flags: u16,
 }
 
@@ -245,9 +252,47 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         ]
         .into_iter()
         .any(|name| style.get(name).is_some_and(|value| value.contains('%')));
+    let volatile = !matches!(
+        display,
+        "block" | "inline" | "inline-block" | "flex" | "inline-flex" | "contents"
+    ) || matches!(position, "absolute" | "fixed" | "sticky")
+        || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+        || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+            .into_iter()
+            .any(|prop| {
+                style
+                    .get(prop)
+                    .is_some_and(|value| matches!(value, "scroll" | "auto"))
+            })
+        || [
+            Prop::FILTER,
+            Prop::WEBKIT_FILTER,
+            Prop::CLIP_PATH,
+            Prop::WEBKIT_CLIP_PATH,
+            Prop::MASK_IMAGE,
+            Prop::WEBKIT_MASK_IMAGE,
+            Prop::BACKDROP_FILTER,
+            Prop::WEBKIT_BACKDROP_FILTER,
+        ]
+        .into_iter()
+        .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
+        || [
+            Prop::COUNTER_RESET,
+            Prop::COUNTER_INCREMENT,
+            Prop::COUNTER_SET,
+        ]
+        .into_iter()
+        .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
+        || [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH, Prop::COLUMNS]
+            .into_iter()
+            .any(|prop| style.get(prop).is_some_and(|value| value != "auto"))
+        || style
+            .get(Prop::CONTAINER_TYPE)
+            .is_some_and(|value| value != "normal");
     [
         (moved, MOVED),
         (blocked, BLOCKED),
+        (volatile, VOLATILE),
         (
             display == "none" || matches!(position, "absolute" | "fixed"),
             OUT,
@@ -460,7 +505,7 @@ pub(super) fn spacer(
     [left, width]: [f32; 2],
     zone: Rc<Zone>,
     view: Rc<super::PageState>,
-) -> AnyElement {
+) -> Child {
     let Run {
         members,
         top,
@@ -519,7 +564,7 @@ pub(super) fn spacer(
     .mt(px(margins[0]))
     .mb(px(margins[1]))
     .flex_shrink_0()
-    .into_any_element()
+    .into()
 }
 
 /// A zero size box at the padding box origin of a grid, in place of its culled items, which
@@ -529,7 +574,7 @@ pub(super) fn anchor(
     items: Vec<(usize, [f32; 4])>,
     zone: Rc<Zone>,
     view: Rc<super::PageState>,
-) -> AnyElement {
+) -> Child {
     renderer::canvas(
         move |bounds, window| {
             let view = &*view;
@@ -566,7 +611,7 @@ pub(super) fn anchor(
     .left(px(0.))
     .top(px(0.))
     .size(px(0.))
-    .into_any_element()
+    .into()
 }
 
 #[cfg(test)]
@@ -642,7 +687,22 @@ mod tests {
             ("u", SOLID),
             ("v", SOLID),
         ] {
-            assert_eq!(flags(name), expected, "{name}");
+            assert_eq!(flags(name) & !VOLATILE, expected, "{name}");
+        }
+        // Boxes placed or numbered by more than their style build again each frame.
+        for (name, volatile) in [
+            ("a", false),
+            ("b", false),
+            ("c", true),
+            ("d", true),
+            ("f", true),
+            ("g", true),
+            ("k", false),
+            ("l", true),
+            ("m", false),
+            ("v", true),
+        ] {
+            assert_eq!(flags(name) & VOLATILE != 0, volatile, "{name}");
         }
     }
 
@@ -708,6 +768,7 @@ mod tests {
         let info = Info {
             revision: 7,
             flags: SOLID,
+            ..Info::default()
         };
         let below = [0., 1300., 100., 20.];
         let member = |info: Info, placed: u64, bounds: [f32; 4], flex: bool| {
@@ -725,6 +786,7 @@ mod tests {
         let viewport = Info {
             revision: 7,
             flags: SOLID | VIEWPORT,
+            ..Info::default()
         };
         assert!(member(viewport, 7, below, false).is_some());
         let resized = Zone {
@@ -770,7 +832,8 @@ mod tests {
             member(
                 Info {
                     revision: 0,
-                    flags: SOLID
+                    flags: SOLID,
+                    ..Info::default()
                 },
                 0,
                 below,

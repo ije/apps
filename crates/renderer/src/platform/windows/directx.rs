@@ -718,10 +718,10 @@ impl Renderer {
         let batch = gpu.batch.as_ref().context("missing batch buffer")?;
         // Binds a render target with its viewport and globals.
         let bind = |target: Target| -> Result<()> {
-            let rect = frame.rect(target);
+            let [width, height] = frame.pixels(target);
             let viewport = D3D11_VIEWPORT {
-                Width: rect[2],
-                Height: rect[3],
+                Width: width,
+                Height: height,
                 MaxDepth: 1.,
                 ..Default::default()
             };

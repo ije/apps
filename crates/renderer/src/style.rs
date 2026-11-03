@@ -1,6 +1,5 @@
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Pixels, Point, Radii, Rgba,
-    Size, black,
+    BorderStyle, Bounds, ContentMask, DevicePixels, Edges, Pixels, Point, Radii, Rgba, Size, black,
     geometry::{round_stroke_to_device_pixel, to_layout_unit},
     point, px, size,
     text::{
@@ -293,7 +292,7 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub display: Display,
     pub visibility: Visibility,
@@ -332,6 +331,10 @@ pub struct Style {
     pub text: TextStyleRefinement,
     pub mouse_cursor: Option<CursorStyle>,
     pub opacity: Option<f32>,
+    /// The box paints in the list of its nearest stacking context, by this order.
+    pub z_index: Option<i32>,
+    /// The box is a stacking context, which lists the boxes with a z-index below it.
+    pub stacking: bool,
 }
 
 impl Default for Style {
@@ -370,6 +373,8 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            z_index: None,
+            stacking: false,
         }
     }
 }
@@ -694,291 +699,6 @@ pub struct TextStyleRefinement {
 impl TextStyleRefinement {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
-    }
-}
-
-pub trait Styled: Sized {
-    fn style(&mut self) -> &mut Style;
-
-    fn text_style(&mut self) -> &mut TextStyleRefinement {
-        &mut self.style().text
-    }
-
-    fn flex(mut self) -> Self {
-        self.style().display = Display::Flex;
-        self
-    }
-    fn grid(mut self) -> Self {
-        self.style().display = Display::Grid;
-        self
-    }
-    fn hidden(mut self) -> Self {
-        self.style().display = Display::None;
-        self
-    }
-    fn flex_row(mut self) -> Self {
-        self.style().flex_direction = FlexDirection::Row;
-        self
-    }
-    fn flex_col(mut self) -> Self {
-        self.style().flex_direction = FlexDirection::Column;
-        self
-    }
-    fn flex_wrap(mut self) -> Self {
-        self.style().flex_wrap = FlexWrap::Wrap;
-        self
-    }
-    fn flex_nowrap(mut self) -> Self {
-        self.style().flex_wrap = FlexWrap::NoWrap;
-        self
-    }
-    fn flex_1(mut self) -> Self {
-        let style = self.style();
-        style.flex_grow = 1.;
-        style.flex_shrink = 1.;
-        style.flex_basis = relative(0.);
-        self
-    }
-    fn flex_shrink(mut self, value: f32) -> Self {
-        self.style().flex_shrink = value;
-        self
-    }
-    fn flex_shrink_0(mut self) -> Self {
-        self.style().flex_shrink = 0.;
-        self
-    }
-    fn items_start(mut self) -> Self {
-        self.style().align_items = Some(AlignItems::FlexStart);
-        self
-    }
-    fn items_center(mut self) -> Self {
-        self.style().align_items = Some(AlignItems::Center);
-        self
-    }
-    fn baseline(mut self, value: Baseline) -> Self {
-        self.style().baseline = value;
-        self
-    }
-    fn justify_center(mut self) -> Self {
-        self.style().justify_content = Some(JustifyContent::Center);
-        self
-    }
-    fn absolute(mut self) -> Self {
-        self.style().position = Position::Absolute;
-        self
-    }
-    fn relative(mut self) -> Self {
-        self.style().position = Position::Relative;
-        self
-    }
-    fn top(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.top = value.into();
-        self
-    }
-    fn right(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.right = value.into();
-        self
-    }
-    fn bottom(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.bottom = value.into();
-        self
-    }
-    fn left(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.left = value.into();
-        self
-    }
-    fn top_0(mut self) -> Self {
-        self.style().inset.top = Length::Px(Pixels::ZERO);
-        self
-    }
-    fn left_0(mut self) -> Self {
-        self.style().inset.left = Length::Px(Pixels::ZERO);
-        self
-    }
-    fn w(mut self, value: impl Into<Length>) -> Self {
-        self.style().size.width = value.into();
-        self
-    }
-    fn h(mut self, value: impl Into<Length>) -> Self {
-        self.style().size.height = value.into();
-        self
-    }
-    fn size(mut self, value: impl Into<Length>) -> Self {
-        let value = value.into();
-        self.style().size = Size::new(value, value);
-        self
-    }
-    fn size_full(mut self) -> Self {
-        self.style().size = Size::new(relative(1.), relative(1.));
-        self
-    }
-    fn w_full(mut self) -> Self {
-        self.style().size.width = relative(1.);
-        self
-    }
-    fn min_w(mut self, value: impl Into<Length>) -> Self {
-        self.style().min_size.width = value.into();
-        self
-    }
-    fn min_h(mut self, value: impl Into<Length>) -> Self {
-        self.style().min_size.height = value.into();
-        self
-    }
-    fn max_w(mut self, value: impl Into<Length>) -> Self {
-        self.style().max_size.width = value.into();
-        self
-    }
-    fn max_h(mut self, value: impl Into<Length>) -> Self {
-        self.style().max_size.height = value.into();
-        self
-    }
-    fn mt(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.top = value.into();
-        self
-    }
-    fn mr(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.right = value.into();
-        self
-    }
-    fn mb(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.bottom = value.into();
-        self
-    }
-    fn ml(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.left = value.into();
-        self
-    }
-    fn mt_auto(mut self) -> Self {
-        self.style().margin.top = Length::Auto;
-        self
-    }
-    fn mr_auto(mut self) -> Self {
-        self.style().margin.right = Length::Auto;
-        self
-    }
-    fn mb_auto(mut self) -> Self {
-        self.style().margin.bottom = Length::Auto;
-        self
-    }
-    fn ml_auto(mut self) -> Self {
-        self.style().margin.left = Length::Auto;
-        self
-    }
-    fn pt(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.top = value.into();
-        self
-    }
-    fn pr(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.right = value.into();
-        self
-    }
-    fn pb(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.bottom = value.into();
-        self
-    }
-    fn pl(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.left = value.into();
-        self
-    }
-    fn gap_x(mut self, value: impl Into<Length>) -> Self {
-        self.style().gap.width = value.into();
-        self
-    }
-    fn gap_y(mut self, value: impl Into<Length>) -> Self {
-        self.style().gap.height = value.into();
-        self
-    }
-    fn border(mut self, value: Pixels) -> Self {
-        self.style().border_widths = Edges::all(value);
-        self
-    }
-    fn border_t(mut self, value: Pixels) -> Self {
-        self.style().border_widths.top = value;
-        self
-    }
-    fn border_r(mut self, value: Pixels) -> Self {
-        self.style().border_widths.right = value;
-        self
-    }
-    fn border_b(mut self, value: Pixels) -> Self {
-        self.style().border_widths.bottom = value;
-        self
-    }
-    fn border_l(mut self, value: Pixels) -> Self {
-        self.style().border_widths.left = value;
-        self
-    }
-    fn border_color(mut self, color: Rgba) -> Self {
-        self.style().border_color = Some(color);
-        self
-    }
-    fn rounded_full(mut self) -> Self {
-        self.style().corner_radii = Corners::all(Length::Px(px(f32::MAX / 4.))).into();
-        self
-    }
-    fn bg(mut self, color: Rgba) -> Self {
-        self.style().background = Some(color);
-        self
-    }
-    fn opacity(mut self, opacity: f32) -> Self {
-        self.style().opacity = Some(opacity);
-        self
-    }
-    fn cursor(mut self, cursor: CursorStyle) -> Self {
-        self.style().mouse_cursor = Some(cursor);
-        self
-    }
-    fn overflow_hidden(mut self) -> Self {
-        self.style().overflow = Point::new(Overflow::Hidden, Overflow::Hidden);
-        self
-    }
-    fn overflow_y_scroll(mut self) -> Self {
-        self.style().overflow.y = Overflow::Scroll;
-        self
-    }
-    fn overflow_y_hidden(mut self) -> Self {
-        self.style().overflow.y = Overflow::Hidden;
-        self
-    }
-    fn restrict_scroll_to_axis(mut self) -> Self {
-        self.style().restrict_scroll_to_axis = true;
-        self
-    }
-    fn text_color(mut self, color: Rgba) -> Self {
-        self.text_style().color = Some(color);
-        self
-    }
-    fn text_size(mut self, size: Pixels) -> Self {
-        self.text_style().font_size = Some(size);
-        self
-    }
-    fn line_height(mut self, height: Pixels) -> Self {
-        self.text_style().line_height = Some(height);
-        self
-    }
-    fn font_family(mut self, family: impl Into<SharedString>) -> Self {
-        self.text_style().font_family = Some(family.into());
-        self
-    }
-    fn font_weight(mut self, weight: FontWeight) -> Self {
-        self.text_style().font_weight = Some(weight);
-        self
-    }
-    fn whitespace_nowrap(mut self) -> Self {
-        self.text_style().white_space = Some(WhiteSpace::Nowrap);
-        self
-    }
-    fn text_left(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Left);
-        self
-    }
-    fn text_center(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Center);
-        self
-    }
-    fn text_right(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Right);
-        self
     }
 }
 

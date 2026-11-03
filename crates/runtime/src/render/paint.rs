@@ -1,17 +1,35 @@
 use crate::style;
 use crate::style::Prop;
-use renderer::{AnyElement, Bounds, Pixels, Point, Window, point, prelude::*, px};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use renderer::{Bounds, Child, Hooks, NodeCx, Pixels, Point, Window, point, px};
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
-/// A box turned a quarter turn for vertical writing modes.
+/// Turns a box a quarter turn for vertical writing modes.
 pub(super) struct Turned {
-    pub(super) child: AnyElement,
-    pub(super) clockwise: bool,
-    pub(super) block: f32,
-    pub(super) inline: f32,
+    clockwise: bool,
+    block: f32,
+    inline: f32,
+    matrix: Cell<super::effects::Matrix>,
 }
 
 impl Turned {
+    /// A box `block` wide and `inline` tall that holds `child` turned.
+    pub(super) fn node(child: Child, clockwise: bool, block: f32, inline: f32) -> renderer::Node {
+        let mut style = renderer::Style {
+            position: renderer::Position::Absolute,
+            ..Default::default()
+        };
+        style.size.width = px(block).into();
+        style.size.height = px(inline).into();
+        let mut node = renderer::node().child(child).hooks(Turned {
+            clockwise,
+            block,
+            inline,
+            matrix: Cell::new(super::effects::IDENTITY),
+        });
+        *node.style() = style;
+        node
+    }
+
     fn matrix(&self, origin: Point<Pixels>) -> super::effects::Matrix {
         let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
         // Clockwise maps (u, v) to (block - v, u); counterclockwise to (v, inline - u).
@@ -27,137 +45,68 @@ impl Turned {
     }
 }
 
-impl IntoElement for Turned {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
+impl Hooks for Turned {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let matrix = self.matrix(cx.bounds.origin);
+        self.matrix.set(matrix);
+        cx.window.with_hit_transform(matrix, inner);
     }
-}
-
-impl renderer::Element for Turned {
-    type RequestLayoutState = ();
-    type PrepaintState = super::effects::Matrix;
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
-        let child = self.child.request_layout(window);
-        let mut style = renderer::Style {
-            position: renderer::Position::Absolute,
-            ..Default::default()
-        };
-        style.size.width = px(self.block).into();
-        style.size.height = px(self.inline).into();
-        (window.request_layout(&style, [child]), ())
-    }
-    fn prepaint(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-    ) -> super::effects::Matrix {
-        let matrix = self.matrix(bounds.origin);
-        window.with_hit_transform(matrix, |window| self.child.prepaint(window));
-        matrix
-    }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        matrix: &mut super::effects::Matrix,
-        window: &mut Window,
-    ) {
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let effect = renderer::PaintEffect {
-            transform: Some(*matrix),
+            transform: Some(self.matrix.get()),
             ..Default::default()
         };
-        window.paint_effect(effect, |window| self.child.paint(window));
+        cx.window.paint_effect(effect, inner);
     }
 }
 
-/// Paints a child with the CSS transform of its style around its own box, for pseudo-elements.
+/// Paints a box with the CSS transform of its style around itself, for pseudo-elements.
 pub(super) struct Transformed {
-    pub(super) child: AnyElement,
     pub(super) style: Rc<style::Style>,
     pub(super) units: style::Lengths,
+    pub(super) matrix: Cell<Option<super::effects::Matrix>>,
 }
 
-impl IntoElement for Transformed {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for Transformed {
-    type RequestLayoutState = ();
-    type PrepaintState = Option<super::effects::Matrix>;
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
-        (self.child.request_layout(window), ())
-    }
-    fn prepaint(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-    ) -> Option<super::effects::Matrix> {
-        let matrix = super::effects::transform(&self.style, &self.units, bounds, None);
+impl Hooks for Transformed {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let matrix = super::effects::transform(&self.style, &self.units, cx.bounds, None);
+        self.matrix.set(matrix);
         match matrix {
-            Some(matrix) => window.with_hit_transform(matrix, |window| self.child.prepaint(window)),
-            None => self.child.prepaint(window),
+            Some(matrix) => cx.window.with_hit_transform(matrix, inner),
+            None => inner(cx.window),
         }
-        matrix
     }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        matrix: &mut Option<super::effects::Matrix>,
-        window: &mut Window,
-    ) {
-        match matrix {
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        match self.matrix.get() {
             Some(matrix) => {
                 let effect = renderer::PaintEffect {
-                    transform: Some(*matrix),
+                    transform: Some(matrix),
                     ..Default::default()
                 };
-                window.paint_effect(effect, |window| self.child.paint(window));
+                cx.window.paint_effect(effect, inner);
             }
-            None => self.child.paint(window),
+            None => inner(cx.window),
         }
     }
 }
 
-/// Paints a child through an effect layer.
+/// Paints a box through an effect layer.
 pub(super) struct Effected {
     pub(super) effect: renderer::PaintEffect,
-    pub(super) child: AnyElement,
-    /// The corner radii of the effect's backdrop, which covers the child's box.
+    /// The corner radii of the effect's backdrop, which covers the box.
     pub(super) backdrop: Option<renderer::Radii<renderer::Length>>,
 }
 
-impl IntoElement for Effected {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for Effected {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
-        (self.child.request_layout(window), ())
-    }
-    fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), window: &mut Window) {
-        self.child.prepaint(window);
-    }
-    fn paint(&mut self, bounds: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window) {
+impl Hooks for Effected {
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let mut effect = self.effect.clone();
         if let Some(backdrop) = effect.backdrop.as_mut()
             && let Some(radii) = &self.backdrop
         {
-            backdrop.bounds = bounds;
-            backdrop.corner_radii = radii.resolve(bounds.size);
+            backdrop.bounds = cx.bounds;
+            backdrop.corner_radii = radii.resolve(cx.bounds.size);
         }
-        window.paint_effect(effect, |window| self.child.paint(window));
+        cx.window.paint_effect(effect, inner);
     }
 }
 
@@ -171,7 +120,6 @@ pub(super) struct Sticky {
 }
 
 pub(super) struct DomBox {
-    pub(super) inner: Option<renderer::Div>,
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
     pub(super) ids: Rc<super::effects::Ids>,
@@ -218,34 +166,16 @@ pub(super) struct DomBox {
     /// For an inline box, its first and last text and its top and bottom padding and border. Its rectangle
     /// spans its text's, whatever else its line holds.
     pub(super) text: Option<([usize; 2], [f32; 2])>,
+    /// The bounds and transform from prepaint, for paint.
+    pub(super) placed: Cell<(Bounds<Pixels>, Option<super::effects::Matrix>)>,
 }
 
-impl IntoElement for DomBox {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for DomBox {
-    type RequestLayoutState = (renderer::LayoutId, AnyElement);
-    type PrepaintState = (Bounds<Pixels>, Option<super::effects::Matrix>);
-    fn request_layout(
-        &mut self,
-        window: &mut Window,
-    ) -> (renderer::LayoutId, Self::RequestLayoutState) {
-        let mut inner = self.inner.take().unwrap().into_any_element();
-        let id = inner.request_layout(window);
-        (id, (id, inner))
-    }
-    fn prepaint(
-        &mut self,
-        _: Bounds<Pixels>,
-        (id, inner): &mut Self::RequestLayoutState,
-        window: &mut Window,
-    ) -> Self::PrepaintState {
+impl Hooks for DomBox {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let (exact, baselines) = (cx.exact, cx.baselines);
+        let window = &mut *cx.window;
         // Positions keep layout units like Chrome; the inner element paints at snapped bounds.
-        let mut bounds = window.exact_layout_bounds(*id);
+        let mut bounds = exact;
         let mut offset = point(px(0.), px(0.));
         if let Some((axes, block, margin)) = self.anchor
             && let Some(anchor) = {
@@ -500,9 +430,7 @@ impl renderer::Element for DomBox {
                     ],
                 );
                 if let Some((grid, aligned)) = self.grid {
-                    let baselines = window
-                        .layout_baselines(*id)
-                        .map(|value| value.map(f32::from));
+                    let baselines = baselines.map(|value| value.map(f32::from));
                     // WARNING: the grid's own baseline comes from its first item in the same layout, so only aligned
                     // items, which the grid places from their last baselines, need another pass.
                     if dom.baselines.insert(self.id, baselines) != Some(baselines) {
@@ -530,9 +458,7 @@ impl renderer::Element for DomBox {
                     let _ = browser.set_bounds(bounds);
                 }
             }
-            window.with_element_offset(offset, |window| {
-                inner.prepaint(window);
-            });
+            window.with_element_offset(offset, |window| inner(window));
             if let Some(([first, last], [above, below])) = self.text {
                 let mut host = view.host.borrow_mut();
                 let bounds = &mut host.dom.entry(view.id).or_default().bounds;
@@ -576,15 +502,11 @@ impl renderer::Element for DomBox {
             ),
             None => prepaint(window),
         }
-        (bounds, matrix)
+        self.placed.set((bounds, matrix));
     }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        (_, inner): &mut Self::RequestLayoutState,
-        (bounds, matrix): &mut Self::PrepaintState,
-        window: &mut Window,
-    ) {
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let window = &mut *cx.window;
+        let (bounds, matrix) = self.placed.get();
         {
             let mut host = self.view.host.borrow_mut();
             let dom = host.dom.entry(self.view.id).or_default();
@@ -595,10 +517,9 @@ impl renderer::Element for DomBox {
             dom.painted[self.id] = dom.paint_count;
         }
         if matrix.is_none() && self.effects.is_none() {
-            return inner.paint(window);
+            return inner(window);
         }
-        let bounds = *bounds;
-        if let Some(matrix) = matrix
+        if let Some(matrix) = &matrix
             && self
                 .style
                 .get(Prop::BACKFACE_VISIBILITY)
@@ -607,10 +528,10 @@ impl renderer::Element for DomBox {
         {
             return;
         }
-        let (clip, mut layers) = self.effects(bounds, *matrix, window);
+        let (clip, mut layers) = self.effects(bounds, matrix, window);
         let mut paint = |window: &mut Window| match &clip {
-            Some(clip) => window.with_content_mask(Some(*clip), |window| inner.paint(window)),
-            None => inner.paint(window),
+            Some(clip) => window.with_content_mask(Some(*clip), |window| inner(window)),
+            None => inner(window),
         };
         nest_effects(&mut layers, window, &mut paint);
     }
@@ -878,81 +799,4 @@ fn mask_svg(
         }
     }
     (!content.is_empty()).then_some(content)
-}
-
-pub(super) type PaintLayers = Rc<
-    RefCell<
-        Vec<(
-            i32,
-            Rc<RefCell<AnyElement>>,
-            renderer::ContentMask<Pixels>,
-            Rc<[usize]>,
-        )>,
-    >,
->;
-
-pub(super) struct Stacked {
-    pub(super) inner: Option<AnyElement>,
-    pub(super) layers: PaintLayers,
-    pub(super) order: i32,
-    pub(super) path: Rc<[usize]>,
-}
-
-impl IntoElement for Stacked {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl renderer::Element for Stacked {
-    type RequestLayoutState = Rc<RefCell<AnyElement>>;
-    type PrepaintState = ();
-    fn request_layout(
-        &mut self,
-        window: &mut Window,
-    ) -> (renderer::LayoutId, Self::RequestLayoutState) {
-        let mut inner = self.inner.take().unwrap();
-        let id = inner.request_layout(window);
-        (id, Rc::new(RefCell::new(inner)))
-    }
-    fn prepaint(
-        &mut self,
-        _: Bounds<Pixels>,
-        inner: &mut Self::RequestLayoutState,
-        window: &mut Window,
-    ) {
-        inner.borrow_mut().prepaint(window);
-        self.layers.borrow_mut().push((
-            self.order,
-            inner.clone(),
-            window.content_mask(),
-            self.path.clone(),
-        ));
-    }
-    fn paint(
-        &mut self,
-        _: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        _: &mut (),
-        _: &mut Window,
-    ) {
-    }
-}
-
-pub(super) fn paint_layers(layers: PaintLayers, negative: bool) -> impl IntoElement {
-    renderer::canvas(
-        |_, _| (),
-        move |_, _, window| {
-            let mut layers = layers.borrow_mut();
-            layers.sort_by_key(|(order, ..)| *order);
-            for (_, inner, mask, _) in layers.iter().filter(|(order, ..)| (*order < 0) == negative)
-            {
-                window.with_content_mask(Some(*mask), |window| inner.borrow_mut().paint(window));
-            }
-        },
-    )
-    .absolute()
-    .w(px(0.))
-    .h(px(0.))
 }

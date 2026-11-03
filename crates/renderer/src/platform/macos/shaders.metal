@@ -155,8 +155,9 @@ struct Composite {
 struct Blur {
   float4 region;
   float4 source_rect;
+  float2 direction;
   float sigma;
-  float pad[3];
+  float scale;
 };
 
 constant uint COMPOSITE_MATRIX = 1;
@@ -170,14 +171,6 @@ constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear);
 
 float4 rgba(Rgba color) {
   return float4(color.r, color.g, color.b, color.a);
-}
-
-float3 srgb_to_linear(float3 color) {
-  return pow(color, float3(2.2));
-}
-
-float3 linear_to_srgb(float3 color) {
-  return pow(color, float3(1.0 / 2.2));
 }
 
 float2 unit_vertex(uint vertex_id) {
@@ -209,6 +202,10 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds bounds, Bounds clip_bo
 
 float4 over(float4 below, float4 above) {
   float alpha = above.a + below.a * (1.0 - above.a);
+  // WARNING: two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
+  if (alpha <= 0.0) {
+    return float4(0.0);
+  }
   float3 color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
   return float4(color, alpha);
 }
@@ -903,14 +900,17 @@ fragment float4 polychrome_sprite_fragment(
   PolychromeSprite sprite = sprites[input.sprite_id];
   float4 sample = atlas_texture.sample(linear_sampler, input.tile_position);
   float2 position = window_position(input.position, globals);
-  float distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
+  // Sprite bounds are whole device pixels, so square corners cover every pixel.
+  Corners rx = sprite.corner_radii.x;
+  bool square = rx.top_left == 0.0 && rx.top_right == 0.0 && rx.bottom_right == 0.0 && rx.bottom_left == 0.0;
+  float corners = square ? 1.0 : saturate(0.5 - quad_sdf(position, sprite.bounds, sprite.corner_radii));
 
   float4 color = sample;
   if ((sprite.grayscale & 0xFF) != 0) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.rgb = float3(grayscale);
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance) * mask_alpha(position, sprite.content_mask);
+  color.a *= sprite.opacity * corners * mask_alpha(position, sprite.content_mask);
   return color;
 }
 
@@ -947,21 +947,26 @@ float4 sample_layer(texture2d<float> source, float2 position, float4 rect) {
   return source.sample(linear_sampler, uv, level(0));
 }
 
-// Sums gaussian taps along `direction`, spaced to keep large blurs cheap.
-float4 gaussian_sample(texture2d<float> source, float2 position, float2 direction, float sigma, float4 rect) {
+// Sums gaussian taps along `direction`, one per `texel` window pixels and fewer for wide blurs.
+// Tap `i` weighs exp(-x^2 / 2 sigma^2) = q^(i^2), so each weight is the last one times q^(2i - 1).
+float4 gaussian_sample(texture2d<float> source, float2 position, float2 direction, float sigma, float texel, float4 rect) {
   if (sigma < 0.25) {
     return sample_layer(source, position, rect);
   }
-  float radius = ceil(3.0 * sigma);
+  float radius = ceil(3.0 * sigma / texel);
   float taps = min(radius, 32.0);
-  float step = radius / taps;
-  float4 sum = float4(0.0);
-  float weight = 0.0;
-  for (float i = -taps; i <= taps; i += 1.0) {
-    float offset = i * step;
-    float w = exp(-(offset * offset) / (2.0 * sigma * sigma));
-    sum += sample_layer(source, position + direction * offset, rect) * w;
-    weight += w;
+  float step = radius / taps * texel;
+  float q = exp(-(step * step) / (2.0 * sigma * sigma));
+  float4 sum = sample_layer(source, position, rect);
+  float weight = 1.0;
+  float w = 1.0;
+  float g = q;
+  for (float i = 1.0; i <= taps; i += 1.0) {
+    w *= g;
+    g *= q * q;
+    float2 offset = direction * (i * step);
+    sum += (sample_layer(source, position + offset, rect) + sample_layer(source, position - offset, rect)) * w;
+    weight += 2.0 * w;
   }
   return sum / weight;
 }
@@ -1046,11 +1051,11 @@ fragment float4 composite_fragment(CompositeVertexOutput input [[stage_in]],
 
   float4 color;
   if ((c.flags & COMPOSITE_BACKDROP) != 0) {
-    color = gaussian_sample(source, target_position, float2(0.0, 1.0), c.blur, c.source_rect);
+    color = gaussian_sample(source, target_position, float2(0.0, 1.0), c.blur, 1.0, c.source_rect);
   } else if ((c.flags & COMPOSITE_SHADOW) != 0) {
-    color = c.shadow_color * gaussian_sample(source, input.local - c.shadow.xy, float2(0.0, 1.0), c.blur, c.source_rect).a;
+    color = c.shadow_color * gaussian_sample(source, input.local - c.shadow.xy, float2(0.0, 1.0), c.blur, 1.0, c.source_rect).a;
   } else {
-    color = gaussian_sample(source, input.local, float2(0.0, 1.0), c.blur, c.source_rect);
+    color = gaussian_sample(source, input.local, float2(0.0, 1.0), c.blur, 1.0, c.source_rect);
   }
 
   if ((c.flags & COMPOSITE_MATRIX) != 0 && color.a > 0.0) {
@@ -1112,11 +1117,13 @@ vertex BlurVertexOutput blur_vertex(uint vertex_id [[vertex_id]],
       blur_id};
 }
 
-// The horizontal half of a separable blur; the composite does the vertical half.
+// One direction of a separable blur. A target at a lower resolution covers `scale` window pixels
+// per pixel, and its taps average blocks of the source.
 fragment float4 blur_fragment(BlurVertexOutput input [[stage_in]],
                               constant Blur *blurs [[buffer(0)]],
                               constant Globals &globals [[buffer(1)]],
                               texture2d<float> source [[texture(0)]]) {
   Blur blur = blurs[input.blur_id];
-  return gaussian_sample(source, window_position(input.position, globals), float2(1.0, 0.0), blur.sigma, blur.source_rect);
+  float2 position = globals.viewport_origin + input.position.xy * blur.scale;
+  return gaussian_sample(source, position, blur.direction, blur.sigma, blur.scale, blur.source_rect);
 }

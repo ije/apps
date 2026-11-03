@@ -1,7 +1,7 @@
 use super::paint::Effected;
 use crate::style;
 use crate::style::Prop;
-use renderer::{AnyElement, div, prelude::*, px, rgba};
+use renderer::{Child, px, rgba};
 use std::{
     collections::{HashMap, VecDeque},
     rc::Rc,
@@ -38,7 +38,7 @@ pub(super) fn css_background(
     view: Rc<super::PageState>,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
-) -> Vec<AnyElement> {
+) -> Vec<Child> {
     let list = |prop| {
         style::components(style.get(prop).unwrap_or(""), ',')
             .into_iter()
@@ -277,8 +277,7 @@ pub(super) fn css_background(
                     .absolute()
                     .top_0()
                     .left_0()
-                    .size_full()
-                    .into_any_element(),
+                    .size_full(),
                 );
                 indexes.push(index);
             }
@@ -387,8 +386,7 @@ pub(super) fn css_background(
             .absolute()
             .left_0()
             .top_0()
-            .size_full()
-            .into_any_element(),
+            .size_full(),
         );
         indexes.push(index);
     }
@@ -397,12 +395,12 @@ pub(super) fn css_background(
         .iter()
         .all(|mode| matches!(mode.trim(), "" | "normal"))
     {
-        return layers;
+        return layers.into_iter().map(Into::into).collect();
     }
     // Blended layers mix with the layers and color below them, inside an isolated group.
-    let mut group = div().absolute().top_0().left_0().size_full();
+    let mut group = renderer::node().absolute().top_0().left_0().size_full();
     if let Some((ink, alpha)) = style.get(Prop::BACKGROUND_COLOR).and_then(style::color) {
-        let mut color = div()
+        let mut color = renderer::node()
             .absolute()
             .size_full()
             .bg(rgba(ink << 8 | alpha as u32));
@@ -411,21 +409,20 @@ pub(super) fn css_background(
     }
     for (layer, index) in layers.into_iter().zip(indexes) {
         let blend_mode = super::effects::blend_mode(&pick(&modes, index));
-        group = group.child(Effected {
+        group = group.child(layer.hooks(Effected {
             effect: renderer::PaintEffect {
                 blend_mode,
                 ..Default::default()
             },
-            child: layer,
             backdrop: None,
-        });
+        }));
     }
     vec![
-        Effected {
-            effect: renderer::PaintEffect::default(),
-            child: group.into_any_element(),
-            backdrop: None,
-        }
-        .into_any_element(),
+        group
+            .hooks(Effected {
+                effect: renderer::PaintEffect::default(),
+                backdrop: None,
+            })
+            .into(),
     ]
 }

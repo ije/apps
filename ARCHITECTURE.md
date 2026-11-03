@@ -30,9 +30,11 @@ To enable the two features, add `jsExecute` and `httpImport` in `features` optio
 
 ## Renderer
 
-`crates/renderer` (`apps-renderer`) is apps' window system and GPU renderer. It started from [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), but keeps only what apps needs: an element tree built each frame over a retained taffy layout tree, text shaping, an atlas, and one renderer per platform.
+`crates/renderer` (`apps-renderer`) is apps' window system and GPU renderer for DOM and CSS: a box tree kept per window, text shaping, an atlas, and one renderer per platform. The platform code started from [Zed's GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
-Layout nodes are kept across frames. A node keeps its identity (element id, or position in the nearest element with an id) and is reused while its style, children and measure inputs stay equal, so taffy's caches skip unchanged subtrees. Measured leaves (text) pass their inputs as a `PartialEq` state to `request_measured_layout` and paint from the state it returns.
+Boxes are kept across frames. A box keeps its identity (element id, or position in the nearest box with an id). Each frame the view describes only what changed and links unchanged subtrees with `Child::Kept`, so they are not built, measured or laid out again. A changed box drops the layout caches of itself and its ancestors only, and taffy skips the rest. Measured leaves (text) keep their state while it compares equal.
+
+Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` below it and paints them around its children. Code that draws more than a box (text, effects, sticky and fixed offsets) runs as `Hooks` around the box each frame.
 
 | Platform | Window | Renderer | Text |
 |---|---|---|---|

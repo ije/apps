@@ -140,6 +140,10 @@ fn rgba(color: Rgba) -> vec4<f32> {
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     let alpha = above.a + below.a * (1.0 - above.a);
+    // WARNING: two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
+    if (alpha <= 0.0) {
+        return vec4<f32>(0.0);
+    }
     let color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
     return vec4<f32>(color, alpha);
 }
@@ -931,14 +935,20 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 
     let sprite = b_poly_sprites[input.sprite_id];
     let position = window_position(input.position);
-    let distance = quad_sdf(position, sprite.bounds, sprite.corner_radii);
+    // Sprite bounds are whole device pixels, so square corners cover every pixel.
+    let rx = sprite.corner_radii.x;
+    let square = rx.top_left == 0.0 && rx.top_right == 0.0 && rx.bottom_right == 0.0 && rx.bottom_left == 0.0;
+    var corners = 1.0;
+    if (!square) {
+        corners = saturate(0.5 - quad_sdf(position, sprite.bounds, sprite.corner_radii));
+    }
 
     var color = sample;
     if (sprite.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * mask_alpha(position, sprite.content_mask));
+    return blend_color(color, sprite.opacity * corners * mask_alpha(position, sprite.content_mask));
 }
 
 struct Composite {
@@ -1009,21 +1019,26 @@ fn sample_layer(position: vec2<f32>, rect: vec4<f32>) -> vec4<f32> {
     return textureSampleLevel(t_sprite, s_sprite, uv, 0.0);
 }
 
-// Sums gaussian taps along `direction`, spaced to keep large blurs cheap.
-fn gaussian_sample(position: vec2<f32>, direction: vec2<f32>, sigma: f32, rect: vec4<f32>) -> vec4<f32> {
+// Sums gaussian taps along `direction`, one per `texel` window pixels and fewer for wide blurs.
+// Tap `i` weighs exp(-x^2 / 2 sigma^2) = q^(i^2), so each weight is the last one times q^(2i - 1).
+fn gaussian_sample(position: vec2<f32>, direction: vec2<f32>, sigma: f32, texel: f32, rect: vec4<f32>) -> vec4<f32> {
     if (sigma < 0.25) {
         return sample_layer(position, rect);
     }
-    let radius = ceil(3.0 * sigma);
+    let radius = ceil(3.0 * sigma / texel);
     let taps = min(radius, 32.0);
-    let step = radius / taps;
-    var sum = vec4<f32>(0.0);
-    var weight = 0.0;
-    for (var i = -taps; i <= taps; i += 1.0) {
-        let offset = i * step;
-        let w = exp(-(offset * offset) / (2.0 * sigma * sigma));
-        sum += sample_layer(position + direction * offset, rect) * w;
-        weight += w;
+    let step = radius / taps * texel;
+    let q = exp(-(step * step) / (2.0 * sigma * sigma));
+    var sum = sample_layer(position, rect);
+    var weight = 1.0;
+    var w = 1.0;
+    var g = q;
+    for (var i = 1.0; i <= taps; i += 1.0) {
+        w *= g;
+        g *= q * q;
+        let offset = direction * (i * step);
+        sum += (sample_layer(position + offset, rect) + sample_layer(position - offset, rect)) * w;
+        weight += 2.0 * w;
     }
     return sum / weight;
 }
@@ -1108,11 +1123,11 @@ fn fs_composite(input: CompositeVarying) -> @location(0) vec4<f32> {
 
     var color: vec4<f32>;
     if ((c.flags & COMPOSITE_BACKDROP) != 0u) {
-        color = gaussian_sample(target_position, vec2<f32>(0.0, 1.0), c.blur, c.source_rect);
+        color = gaussian_sample(target_position, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect);
     } else if ((c.flags & COMPOSITE_SHADOW) != 0u) {
-        color = c.shadow_color * gaussian_sample(input.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, c.source_rect).a;
+        color = c.shadow_color * gaussian_sample(input.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect).a;
     } else {
-        color = gaussian_sample(input.local, vec2<f32>(0.0, 1.0), c.blur, c.source_rect);
+        color = gaussian_sample(input.local, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect);
     }
 
     if ((c.flags & COMPOSITE_MATRIX) != 0u && color.a > 0.0) {
@@ -1165,10 +1180,9 @@ fn fs_composite(input: CompositeVarying) -> @location(0) vec4<f32> {
 struct Blur {
     region: vec4<f32>,
     source_rect: vec4<f32>,
+    direction: vec2<f32>,
     sigma: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
+    scale: f32,
 }
 @group(1) @binding(0) var<storage, read> b_blurs: array<Blur>;
 
@@ -1187,9 +1201,11 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
-// The horizontal half of a separable blur; the composite does the vertical half.
+// One direction of a separable blur. A target at a lower resolution covers `scale` window pixels
+// per pixel, and its taps average blocks of the source.
 @fragment
 fn fs_blur(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = b_blurs[input.blur_id];
-    return gaussian_sample(window_position(input.position), vec2<f32>(1.0, 0.0), blur.sigma, blur.source_rect);
+    let position = globals.viewport_origin + input.position.xy * blur.scale;
+    return gaussian_sample(position, blur.direction, blur.sigma, blur.scale, blur.source_rect);
 }

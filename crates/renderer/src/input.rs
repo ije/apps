@@ -1,4 +1,4 @@
-use crate::{Pixels, Point, point, px};
+use crate::{Pixels, Point, point};
 use std::{ops::Range, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -257,5 +257,3 @@ pub struct Utf16Selection {
     pub range: Range<usize>,
     pub reversed: bool,
 }
-
-pub(crate) const DEFAULT_LINE_HEIGHT: Pixels = px(20.);

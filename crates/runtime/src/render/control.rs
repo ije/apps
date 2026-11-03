@@ -1,6 +1,6 @@
 //! Chrome's look for form controls whose `appearance` is not `none`.
 use crate::style::{self, Prop};
-use renderer::{AnyElement, IntoElement, Styled};
+use renderer::Child;
 use std::{fmt::Write, rc::Rc};
 
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -116,7 +116,7 @@ pub(super) struct Look {
 }
 
 /// A layer over the padding box that draws the control's marks.
-pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> AnyElement {
+pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child {
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
@@ -156,7 +156,7 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> AnyEle
     .left_0()
     .top_0()
     .size_full()
-    .into_any_element()
+    .into()
 }
 
 fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
