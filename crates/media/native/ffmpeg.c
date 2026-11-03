@@ -29,7 +29,8 @@ typedef struct {
   Track video, audio;
   AVBufferRef *device;
   enum AVPixelFormat hardware;
-  AVFrame *frame, *software;
+  // picture keeps the last video frame, so it can be shown after the track ends.
+  AVFrame *frame, *software, *picture;
   AVPacket *packet;
   struct SwsContext *scale;
   SwrContext *resample;
@@ -124,8 +125,9 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
   m->format = avformat_alloc_context();
   m->frame = av_frame_alloc();
   m->software = av_frame_alloc();
+  m->picture = av_frame_alloc();
   m->packet = av_packet_alloc();
-  if (!m->format || !m->frame || !m->software || !m->packet) goto fail;
+  if (!m->format || !m->frame || !m->software || !m->picture || !m->packet) goto fail;
   if (data) {
     m->data = data;
     m->size = size;
@@ -174,6 +176,7 @@ fail:
     avio_context_free(&m->io);
     av_frame_free(&m->frame);
     av_frame_free(&m->software);
+    av_frame_free(&m->picture);
     av_packet_free(&m->packet);
     avcodec_free_context(&m->video.codec);
     avcodec_free_context(&m->audio.codec);
@@ -292,6 +295,8 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
       if (status == 0) {
         if (kind == 2) return audio(m, samples, count, time);
         *time = seconds(m, track, m->frame->best_effort_timestamp);
+        av_frame_unref(m->picture);
+        av_frame_move_ref(m->picture, m->frame);
         *width = m->width;
         *height = m->height;
         return 1;
@@ -322,7 +327,7 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
 
 // Writes the last video frame as BGRA pixels of the size apps_ffmpeg_next returned.
 int apps_ffmpeg_pixels(AppsMedia *m, uint8_t *pixels) {
-  AVFrame *frame = m->frame;
+  AVFrame *frame = m->picture;
   if (frame->format == m->hardware && frame->hw_frames_ctx) {
     av_frame_unref(m->software);
     int status = av_hwframe_transfer_data(m->software, frame, 0);
@@ -354,6 +359,7 @@ int apps_ffmpeg_seek(AppsMedia *m, double time) {
   if (status < 0) status = avformat_seek_file(m->format, -1, INT64_MIN, target, INT64_MAX, 0);
   clear(&m->video);
   clear(&m->audio);
+  av_frame_unref(m->picture);
   m->read_end = 0;
   swr_free(&m->resample);
   return status;
@@ -378,6 +384,7 @@ void apps_ffmpeg_close(AppsMedia *m) {
   avio_context_free(&m->io);
   av_frame_free(&m->frame);
   av_frame_free(&m->software);
+  av_frame_free(&m->picture);
   av_packet_free(&m->packet);
   av_buffer_unref(&m->device);
   sws_freeContext(m->scale);

@@ -40,12 +40,249 @@ pub(super) struct Build<'a> {
     pub(super) info: &'a [cull::Info],
     /// The visible range for culling children, or `None` where nothing is culled.
     pub(super) zone: Option<Rc<cull::Zone>>,
+    /// The boxes of the top layer, which paint over the page instead of in their parents.
+    pub(super) top_layer: &'a [usize],
 }
 
 type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
-/// An inline SVG's style, its size and content hash, its source, and its parsed boxes.
+
+/// The CSS properties that an inline SVG's source takes as attributes, besides `style::SVG`.
+const SVG_SOURCE: [Prop; 13] = [
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::TRANSFORM_BOX,
+    Prop::CX,
+    Prop::CY,
+    Prop::R,
+    Prop::RX,
+    Prop::RY,
+    Prop::X,
+    Prop::Y,
+    Prop::WIDTH,
+    Prop::HEIGHT,
+];
+
+/// Builds the attributes of the elements in an inline SVG's source.
+struct SvgSource<'a> {
+    doc: &'a Document,
+    styles: &'a ComputedStyles,
+    /// The `<svg>` node.
+    root: usize,
+    /// The viewBox scale, which `vector-effect: non-scaling-stroke` undoes.
+    scale: f32,
+    /// The size of the `view-box` reference box of transforms.
+    view: [f32; 2],
+    /// The `<svg>` start tag without its style and `>`.
+    header: String,
+    ids: &'a super::effects::Ids,
+}
+
+impl SvgSource<'_> {
+    /// The attributes that replace an element's own: CSS geometry like `r`, with `transform` the CSS transform as a
+    /// matrix, and with `paint` a `style` of the SVG properties that its parent doesn't pass down and those that
+    /// override its attributes. The `<svg>` gets the values its content inherits. resvg doesn't parse every CSS
+    /// color, so colors become hex.
+    fn attrs(&self, element: usize, paint: bool, transform: bool) -> Vec<(&'static str, String)> {
+        let (doc, root) = (self.doc, self.root);
+        let own = &self.styles.values[element];
+        let units = &self.styles.lengths[element];
+        let tag = doc.nodes[element].tag.as_str();
+        let mut attrs = Vec::new();
+        if element != root {
+            for prop in &SVG_SOURCE[4..] {
+                let applies = match *prop {
+                    Prop::CX | Prop::CY => matches!(tag, "circle" | "ellipse"),
+                    Prop::R => tag == "circle",
+                    Prop::RX | Prop::RY => matches!(tag, "ellipse" | "rect"),
+                    _ => matches!(tag, "rect" | "image" | "foreignObject"),
+                };
+                if let Some(value) = own.get(*prop).filter(|value| applies && *value != "auto") {
+                    let value = if value.ends_with('%') || value.parse::<f32>().is_ok() {
+                        value.to_owned()
+                    } else {
+                        units
+                            .resolve(value, f32::NAN)
+                            .map_or_else(|| value.to_owned(), |length| length.to_string())
+                    };
+                    attrs.push((prop.name(), value));
+                }
+            }
+        }
+        // resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
+        if transform
+            && element != root
+            && [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+                .iter()
+                .any(|&prop| own.get(prop).is_some())
+        {
+            let fill = own
+                .get(Prop::TRANSFORM_BOX)
+                .is_some_and(|value| value != "view-box");
+            let [x, y, w, h] = fill
+                .then(|| self.shape(element))
+                .flatten()
+                .map_or([0., 0., self.view[0], self.view[1]], |(rect, _)| rect);
+            let bounds = Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+            attrs.push((
+                "transform",
+                super::effects::transform(own, units, bounds, None).map_or(String::new(), |m| {
+                    format!(
+                        "matrix({} {} {} {} {} {})",
+                        m[0], m[1], m[4], m[5], m[12], m[13]
+                    )
+                }),
+            ));
+        }
+        if !paint {
+            return attrs;
+        }
+        let parent = doc.nodes[element]
+            .parent
+            .map(|parent| &self.styles.values[parent]);
+        // `vector-effect: non-scaling-stroke` draws strokes in screen pixels, which resvg doesn't do, so their
+        // widths and dashes scale back by the viewBox scale. resvg ignores `pathLength`, so dashes scale by the
+        // real length over it.
+        let width = if element != root
+            && self.scale != 1.
+            && own.get(Prop::VECTOR_EFFECT) == Some("non-scaling-stroke")
+        {
+            1. / self.scale
+        } else {
+            1.
+        };
+        let dashed = own
+            .get(Prop::STROKE_DASHARRAY)
+            .is_some_and(|value| value != "none")
+            || own
+                .get(Prop::STROKE_DASHOFFSET)
+                .is_some_and(|value| value.trim_end_matches("px").parse::<f32>() != Ok(0.));
+        let dashes = width
+            * doc.nodes[element]
+                .attrs
+                .get("pathLength")
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|length| *length > 0. && dashed && element != root)
+                .and_then(|length| Some(self.shape(element)?.1 / length))
+                .filter(|ratio| *ratio > 0.)
+                .unwrap_or(1.);
+        let mut result = String::new();
+        for prop in style::SVG {
+            let Some(value) = own.get(prop) else { continue };
+            let factor = match prop {
+                Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN => continue,
+                Prop::STROKE_WIDTH => width,
+                Prop::STROKE_DASHARRAY | Prop::STROKE_DASHOFFSET => dashes,
+                _ => 1.,
+            };
+            if if element == root {
+                !prop.inherited()
+            } else {
+                prop.inherited()
+                    && factor == 1.
+                    && !doc.nodes[element].attrs.contains_key(prop.name())
+                    && parent.and_then(|parent| parent.get(prop)) == Some(value)
+            } {
+                continue;
+            }
+            let value = match prop {
+                Prop::DISPLAY if value != "none" => continue,
+                Prop::CLIP_PATH | Prop::MASK | Prop::FILTER if !value.starts_with("url(") => {
+                    continue;
+                }
+                Prop::VECTOR_EFFECT => continue,
+                Prop::FONT_SIZE => format!("{}px", units.font.em),
+                Prop::FILL
+                | Prop::STROKE
+                | Prop::COLOR
+                | Prop::STOP_COLOR
+                | Prop::FLOOD_COLOR
+                | Prop::LIGHTING_COLOR => {
+                    let color = if value.eq_ignore_ascii_case("currentcolor") {
+                        own.get(Prop::COLOR).unwrap_or("black")
+                    } else {
+                        value
+                    };
+                    style::color(color).map_or(value.to_owned(), |(rgb, alpha)| {
+                        format!("#{rgb:06x}{alpha:02x}")
+                    })
+                }
+                _ if factor != 1. => value
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        part.strip_suffix("px")
+                            .unwrap_or(part)
+                            .parse::<f32>()
+                            .map_or(part.to_owned(), |length| (length * factor).to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => value.to_owned(),
+            };
+            result.push_str(prop.name());
+            result.push(':');
+            result.push_str(&value);
+            result.push(';');
+        }
+        if !result.is_empty() {
+            attrs.push(("style", result));
+        }
+        attrs
+    }
+
+    /// The object box and path length of an element in its own coordinates, from a source of only its geometry.
+    fn shape(&self, element: usize) -> Option<([f32; 4], f32)> {
+        let attrs = |node| {
+            let mut attrs = self.attrs(node, false, node != element);
+            // resvg drops shapes without paint.
+            attrs.push(("fill", "#000".into()));
+            if node == element {
+                attrs.extend([("id", "h2o-shape".into()), ("transform", String::new())]);
+                // A `<use>` moves by `x` and `y` after its transform, so its box is measured without them.
+                if self.doc.nodes[node].tag == "use" {
+                    attrs.extend([("x", String::new()), ("y", String::new())]);
+                }
+            }
+            attrs
+        };
+        // The elements that `<use>` elements show go in `<defs>`.
+        let (mut targets, mut pending) = (Vec::new(), vec![element]);
+        while let Some(node) = pending.pop() {
+            let node = &self.doc.nodes[node];
+            if node.tag == "use"
+                && let Some(target) = node
+                    .attrs
+                    .get("href")
+                    .or_else(|| node.attrs.get("xlink:href"))
+                    .and_then(|value| value.strip_prefix('#'))
+                    .and_then(|name| {
+                        super::effects::index(self.ids, self.doc)
+                            .get(name)?
+                            .first()
+                            .copied()
+                    })
+                && !targets.contains(&target)
+            {
+                targets.push(target);
+                pending.push(target);
+            }
+            pending.extend(&node.children);
+        }
+        let mut source = format!("{}><defs>", self.header);
+        for target in targets {
+            source.push_str(&self.doc.serialize_svg(target, false, &attrs));
+        }
+        source.push_str("</defs>");
+        source.push_str(&self.doc.serialize_svg(element, false, &attrs));
+        source.push_str("</svg>");
+        super::canvas::svg_shape(&source)
+    }
+}
+/// An inline SVG's styles of the elements in its source, its size and content hash, its source, and its
+/// parsed boxes.
 pub(super) type Svg = (
-    Rc<style::Style>,
+    Vec<Rc<style::Style>>,
     ([f32; 2], u64),
     String,
     crate::dom::SvgBoxes,
@@ -108,6 +345,7 @@ pub(super) fn element(
         ids,
         info,
         ref zone,
+        top_layer,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -137,7 +375,11 @@ pub(super) fn element(
                 .get(Prop::DISPLAY)
                 .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
         });
+    // WARNING: a box whose opacity animates keeps one stacking context and effect layer at every
+    // value, so animation frames only patch the layer's opacity.
+    let composited = info[id].flags & cull::COMPOSITED != 0;
     let stacking = id == 0
+        || composited
         || style
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
@@ -168,6 +410,7 @@ pub(super) fn element(
         margins: margin_cache,
         ids,
         info,
+        top_layer,
         zone: zone
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVED) == 0)
@@ -275,18 +518,7 @@ pub(super) fn element(
     if chain.len() > 256 || style.get(Prop::DISPLAY).is_some_and(|s| s == "none") {
         return div().hidden().into_any_element();
     }
-    let opacity = style
-        .get(Prop::OPACITY)
-        .and_then(|value| {
-            value
-                .strip_suffix('%')
-                .map_or(value.parse::<f32>().ok(), |v| {
-                    v.parse::<f32>().ok().map(|v| v / 100.)
-                })
-        })
-        .filter(|v| v.is_finite())
-        .unwrap_or(1.)
-        .clamp(0., 1.);
+    let opacity = super::effects::opacity(style);
     // Group opacity and these properties paint the box through an offscreen layer.
     let effect_layer = ([
         Prop::FILTER,
@@ -304,8 +536,9 @@ pub(super) fn element(
         || style
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
-        || opacity < 1. && !node.children.is_empty())
-    .then_some(opacity);
+        || opacity < 1. && !node.children.is_empty()
+        || composited)
+        .then_some(opacity);
     let selection_colors = style::selection_colors(style, styles.selections.get(&id));
     let face = style::font(style);
     let line_height = match style::line_height(style) {
@@ -421,14 +654,19 @@ pub(super) fn element(
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
     let mut flat = Vec::new();
-    let mut pending: Vec<usize> = node.children.iter().rev().copied().collect();
+    // SVG, canvas and iframe children are no boxes of the page, so they make no lines.
+    let mut pending: Vec<usize> = if matches!(node.tag.as_str(), "svg" | "canvas" | "iframe") {
+        Vec::new()
+    } else {
+        node.children.iter().rev().copied().collect()
+    };
     while let Some(child) = pending.pop() {
         if styles.values[child]
             .get(Prop::DISPLAY)
             .is_some_and(|value| value == "contents")
         {
             pending.extend(doc.nodes[child].children.iter().rev());
-        } else if doc.nodes[child].tag != "#comment"
+        } else if !matches!(doc.nodes[child].tag.as_str(), "#comment" | "#doctype")
             // A hidden `<br>` breaks no line.
             && !(doc.nodes[child].tag == "br"
                 && styles.values[child].get(Prop::DISPLAY) == Some("none"))
@@ -641,120 +879,116 @@ pub(super) fn element(
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         }
         .map(|value| value.clamp(1., 4096.));
-        let paint = [
-            Prop::FILL,
-            Prop::FILL_OPACITY,
-            Prop::FILL_RULE,
-            Prop::STROKE,
-            Prop::STROKE_WIDTH,
-            Prop::STROKE_OPACITY,
-            Prop::STROKE_LINECAP,
-            Prop::STROKE_LINEJOIN,
-            Prop::COLOR,
-        ];
-        // WARNING: a source embeds the SVG's subtree, the paint values above and which attributes the style
-        // overrides, so any node change checks it again below, while an animated transform keeps it.
-        let latest = doc.nodes.latest();
-        let cached = view
-            .host
-            .borrow()
-            .dom
-            .get(&view.id)
-            .and_then(|state| state.svg_sources.get(&id))
-            .is_some_and(|(size, revision, old, _)| {
-                *size == [width, height]
-                    && *revision == latest
-                    && (Rc::ptr_eq(old, style)
-                        || paint.iter().all(|&prop| old.get(prop) == style.get(prop))
-                            && node.attrs.keys().all(|key| {
-                                Prop::find(key)
-                                    .is_none_or(|prop| old.contains(prop) == style.contains(prop))
-                            }))
-            });
-        if !cached {
-            let mut scope = id;
-            while let Some(parent) = doc.nodes[scope].parent {
-                scope = parent;
+        // WARNING: a source embeds the SVG's subtree with the SVG properties of each element, so it is built
+        // again when a node, the size or one of those values changes. The `<svg>` itself passes only inherited
+        // values, so its own animated transform or opacity keeps the source.
+        let mut scope = id;
+        while let Some(parent) = doc.nodes[scope].parent {
+            scope = parent;
+        }
+        let mut pending = vec![id];
+        let mut visited = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        let mut painted = Vec::new();
+        let mut hasher = rustc_hash::FxHasher::default();
+        while let Some(child) = pending.pop() {
+            if !visited.insert(child) {
+                continue;
             }
-            let mut pending = vec![id];
-            let mut visited = std::collections::HashSet::new();
-            let mut targets = Vec::new();
-            let mut hasher = rustc_hash::FxHasher::default();
-            while let Some(child) = pending.pop() {
-                if !visited.insert(child) {
-                    continue;
-                }
-                std::hash::Hash::hash(&(child, doc.nodes.revision(child)), &mut hasher);
-                let child = &doc.nodes[child];
-                pending.extend(&child.children);
-                if child.tag == "use"
-                    && let Some(reference) = child
-                        .attrs
-                        .get("href")
-                        .or_else(|| child.attrs.get("xlink:href"))
-                        .and_then(|value| value.strip_prefix('#'))
-                    && let Some(target) =
-                        super::effects::index(ids, doc)
-                            .get(reference)
-                            .and_then(|targets| {
-                                targets.iter().copied().find(|&target| {
-                                    let mut root = target;
-                                    while let Some(parent) = doc.nodes[root].parent {
-                                        if parent == id {
-                                            return false;
-                                        }
-                                        root = parent;
-                                    }
-                                    root == scope
-                                })
-                            })
-                    && !visited.contains(&target)
-                {
-                    targets.push(target);
-                    pending.push(target);
-                }
+            std::hash::Hash::hash(&(child, doc.nodes.revision(child)), &mut hasher);
+            painted.push(styles.values[child].clone());
+            let child = &doc.nodes[child];
+            pending.extend(&child.children);
+            if child.tag == "use"
+                && let Some(reference) = child
+                    .attrs
+                    .get("href")
+                    .or_else(|| child.attrs.get("xlink:href"))
+                    .and_then(|value| value.strip_prefix('#'))
+                && let Some(target) = super::effects::index(ids, doc)
+                    .get(reference)
+                    .and_then(|targets| {
+                        targets.iter().copied().find(|&target| {
+                            let mut root = target;
+                            while let Some(parent) = doc.nodes[root].parent {
+                                if parent == id {
+                                    return false;
+                                }
+                                root = parent;
+                            }
+                            root == scope
+                        })
+                    })
+                && !visited.contains(&target)
+            {
+                targets.push(target);
+                pending.push(target);
             }
-            // WARNING: a source and its parsed boxes are kept while the style, the size and the elements it copies are unchanged.
-            let key = ([width, height], std::hash::Hasher::finish(&hasher));
-            let kept = view
-                .svgs
-                .borrow()
-                .get(&id)
-                .and_then(|(old, at, source, boxes)| {
-                    (*at == key && (Rc::ptr_eq(old, style) || **old == **style))
-                        .then(|| (source.clone(), boxes.clone()))
-                });
-            let (source, boxes) = kept.unwrap_or_else(|| {
-            let mut source = format!(
+        }
+        let key = ([width, height], std::hash::Hasher::finish(&hasher));
+        let props = || style::SVG.iter().chain(&SVG_SOURCE);
+        let kept = view.svgs.borrow().get(&id).and_then(|(old, at, source, boxes)| {
+            (*at == key
+                && old.len() == painted.len()
+                && old.iter().zip(&painted).enumerate().all(|(index, (old, new))| {
+                    Rc::ptr_eq(old, new)
+                        || props().all(|&prop| {
+                            index == 0 && !prop.inherited() || old.get(prop) == new.get(prop)
+                        })
+                }))
+            .then(|| (source.clone(), boxes.clone()))
+        });
+        let built = kept.is_none();
+        let (source, boxes) = kept.unwrap_or_else(|| {
+            let view_box = node
+                .attrs
+                .get("viewBox")
+                .map(|value| {
+                    value
+                        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                        .filter_map(|part| part.parse::<f32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|parts| parts.len() == 4 && parts[2] > 0. && parts[3] > 0.);
+            let mut header = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\""
             );
             for (key, value) in &node.attrs {
                 if !matches!(
                     key.as_str(),
                     "width" | "height" | "xmlns" | "xmlns:xlink" | "style"
-                ) && Prop::find(key).is_none_or(|prop| !style.contains(prop))
+                ) && style::presentation(key).is_none()
                 {
-                    source.push_str(&format!(" {key}=\"{}\"", crate::dom::escape(value)));
+                    header.push_str(&format!(" {key}=\"{}\"", crate::dom::escape(value)));
                 }
             }
-            source.push_str(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
-            for prop in paint {
-                if let Some(value) = style.get(prop) {
-                    source.push_str(&format!(
-                        " {}=\"{}\"",
-                        prop.name(),
-                        crate::dom::escape(value)
-                    ));
-                }
+            header.push_str(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+            let svg = SvgSource {
+                doc,
+                styles,
+                root: id,
+                scale: view_box
+                    .as_ref()
+                    .map_or(1., |parts| (width / parts[2]).min(height / parts[3])),
+                view: view_box
+                    .as_ref()
+                    .map_or([width, height], |parts| [parts[2], parts[3]]),
+                header,
+                ids,
+            };
+            let attrs = |element| svg.attrs(element, true, true);
+            let mut source = svg.header.clone();
+            for (name, value) in attrs(id) {
+                source.push_str(&format!(" {name}=\"{}\"", crate::dom::escape(&value)));
             }
             source.push('>');
             source.push_str("<defs>");
             for &target in &targets {
-                source.push_str(&doc.serialize(target));
+                source.push_str(&doc.serialize_svg(target, false, &attrs));
             }
             source.push_str("</defs>");
             for child in &node.children {
-                source.push_str(&doc.serialize_marked(*child, true));
+                source.push_str(&doc.serialize_svg(*child, true, &attrs));
             }
             source.push_str("</svg>");
             // Elements keep their own ids in the source, so their geometry is found by id.
@@ -766,8 +1000,8 @@ pub(super) fn element(
                 }
                 pending.extend(&doc.nodes[child].children);
             }
-            // CSS keywords ignore case, and resvg does not parse every CSS color, so `currentcolor`
-            // becomes the resolved color in hex.
+            // CSS keywords ignore case, and resvg does not parse every CSS color, so `currentcolor` in
+            // attributes becomes the resolved color in hex.
             let current = style::color(style.get(Prop::COLOR).unwrap_or(""))
                 .map_or("black".to_owned(), |(rgb, alpha)| {
                     format!("#{rgb:06x}{alpha:02x}")
@@ -784,11 +1018,12 @@ pub(super) fn element(
             let boxes = (String::new(), names, [0.; 2], Vec::new(), [0.; 4]);
             view.svgs
                 .borrow_mut()
-                .insert(id, (style.clone(), key, replaced.clone(), boxes.clone()));
+                .insert(id, (painted, key, replaced.clone(), boxes.clone()));
             (replaced, boxes)
-            });
-            let mut host = view.host.borrow_mut();
-            let state = host.dom.entry(view.id).or_default();
+        });
+        let mut host = view.host.borrow_mut();
+        let state = host.dom.entry(view.id).or_default();
+        if built || !state.svg_sources.contains_key(&id) {
             // WARNING: paint only checks the raster size of inline SVGs, so a changed source drops the raster here.
             if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
                 && let Some((_, image)) = state.svgs.remove(&id)
@@ -796,17 +1031,33 @@ pub(super) fn element(
                 state.retired.push(image);
             }
             state.svg_boxes.insert(id, boxes);
-            state
-                .svg_sources
-                .insert(id, ([width, height], latest, style.clone(), source));
+            state.svg_sources.insert(id, source);
         }
+        drop(host);
         el = el
             .w(px(width))
             .h(px(height))
             .child(svg_layer(id, true, view.clone()));
     }
     if node.tag == "iframe" {
-        el = el.min_w(px(300.)).min_h(px(150.));
+        // Like browsers, the attributes or 300x150 size an iframe in the axes where CSS gives no size.
+        let auto = |prop: Prop| style.get(prop).is_none_or(|value| value == "auto");
+        let ratio = style
+            .get(Prop::ASPECT_RATIO)
+            .and_then(aspect_ratio)
+            .is_some();
+        let [width, height] = [("width", 300.), ("height", 150.)].map(|(name, default)| {
+            node.attrs
+                .get(name)
+                .and_then(|value| dimension(value, false))
+                .unwrap_or(default)
+        });
+        if auto(Prop::WIDTH) && (!ratio || auto(Prop::HEIGHT)) {
+            el = el.w(px(width));
+        }
+        if auto(Prop::HEIGHT) && !ratio {
+            el = el.h(px(height));
+        }
     }
     let input =
         (node.tag == "input").then(|| node.attrs.get("type").map_or("text", String::as_str));
@@ -1596,6 +1847,7 @@ pub(super) fn element(
                 } else if matches!(prop, Prop::WIDTH | Prop::HEIGHT)
                     && value == "auto"
                     && node.tag != "svg"
+                    && !(editable && prop == Prop::WIDTH)
                     // A table's automatic width shrinks to fit, unless it stretches in a flex column.
                     || prop == Prop::WIDTH
                         && node.tag == "table"
@@ -1654,15 +1906,7 @@ pub(super) fn element(
                 inner_shadows = units.shadows(value, true);
             }
             Prop::ASPECT_RATIO => {
-                let value = value.replace('/', " / ");
-                let parts = style::components(&value, ' ');
-                let numbers: Vec<f32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
-                let ratio = match numbers.as_slice() {
-                    [a, b, ..] if parts.contains(&"/") => a / b,
-                    [a, ..] => *a,
-                    _ => continue,
-                };
-                if ratio.is_finite() && ratio > 0. {
+                if let Some(ratio) = aspect_ratio(value) {
                     el.style().aspect_ratio = Some(ratio);
                 }
             }
@@ -2132,21 +2376,16 @@ pub(super) fn element(
         .get(Prop::WEBKIT_LINE_CLAMP)
         .or_else(|| style.get(Prop::LINE_CLAMP))
         .and_then(|value| value.parse::<usize>().ok())
-        .or_else(|| {
-            (style
-                .get(Prop::TEXT_OVERFLOW)
-                .is_some_and(|value| value == "ellipsis")
-                && style
-                    .get(Prop::WHITE_SPACE)
-                    .is_some_and(|value| matches!(value, "nowrap" | "pre"))
-                && el.style().overflow.x != renderer::Overflow::Visible)
-                .then_some(1)
-        })
     {
         let text = el.text_style();
         text.white_space = Some(renderer::WhiteSpace::Normal);
         text.line_clamp = Some(lines.max(1));
         text.text_overflow = Some("…".into());
+    } else if style.get(Prop::TEXT_OVERFLOW) == Some("ellipsis")
+        && matches!(style.get(Prop::WHITE_SPACE), Some("nowrap" | "pre"))
+        && el.style().overflow.x != renderer::Overflow::Visible
+    {
+        el.text_style().text_overflow = Some("…".into());
     }
     if position == "fixed" {
         let viewport = units.viewport;
@@ -2277,25 +2516,27 @@ pub(super) fn element(
                             .resolve(outer.size)
                             .inset(px(inset[0]), px(inset[1]), px(inset[2]), px(inset[3]))
                             .clamp_radii_for_quad_size(bounds.size);
+                        // Each side paints the whole ring and keeps its own part, so the sides meet at the corners.
                         for side in 0..4 {
                             if widths[side] <= 0. {
                                 continue;
                             }
-                            let mut edges = [px(0.); 4];
-                            edges[side] = px(widths[side]);
-                            window.paint_quad(renderer::quad(
-                                bounds,
-                                corners,
-                                renderer::transparent_black(),
-                                renderer::Edges {
-                                    top: edges[0],
-                                    right: edges[1],
-                                    bottom: edges[2],
-                                    left: edges[3],
-                                },
-                                colors[side],
-                                kinds[side],
-                            ));
+                            window.paint_quad(
+                                renderer::quad(
+                                    bounds,
+                                    corners,
+                                    renderer::transparent_black(),
+                                    renderer::Edges {
+                                        top: px(widths[0]),
+                                        right: px(widths[1]),
+                                        bottom: px(widths[2]),
+                                        left: px(widths[3]),
+                                    },
+                                    colors[side],
+                                    kinds[side],
+                                )
+                                .sides(1 << side),
+                            );
                         }
                     }
                 },
@@ -2635,16 +2876,71 @@ pub(super) fn element(
                 .border_r(px(pseudo_borders[1]))
                 .border_b(px(pseudo_borders[2]))
                 .border_l(px(pseudo_borders[3]));
-            if let Some(side) = (0..4).find(|&side| pseudo_borders[side] > 0.) {
-                decoration = decoration.border_color(
-                    pseudo
-                        .get(sides[side].2)
-                        .and_then(style::color)
-                        .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32)),
-                );
-            }
             let pseudo_radius = super::effects::radii(pseudo, &pseudo_units, || containing);
             decoration.style().corner_radii = pseudo_radius;
+            let colors = sides.map(|(_, _, color)| {
+                pseudo
+                    .get(color)
+                    .and_then(style::color)
+                    .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
+            });
+            let shown: Vec<usize> = (0..4).filter(|&side| pseudo_borders[side] > 0.).collect();
+            if let Some(&first) = shown.first() {
+                if shown.iter().all(|&side| colors[side] == colors[first]) {
+                    decoration = decoration.border_color(colors[first]);
+                } else {
+                    // Sides of other colors paint one by one, like those of elements.
+                    decoration = decoration.border_color(renderer::transparent_black());
+                    let kinds =
+                        sides.map(|(_, kind, _)| border_style(pseudo.get(kind).unwrap_or("solid")));
+                    let (borders, radius) = (pseudo_borders, pseudo_radius);
+                    decoration = decoration.child(
+                        renderer::canvas(
+                            |_, _| (),
+                            move |bounds, _, window| {
+                                let outer = Bounds::new(
+                                    point(
+                                        bounds.left() - px(borders[3]),
+                                        bounds.top() - px(borders[0]),
+                                    ),
+                                    size(
+                                        bounds.size.width + px(borders[1] + borders[3]),
+                                        bounds.size.height + px(borders[0] + borders[2]),
+                                    ),
+                                );
+                                let corners = radius
+                                    .resolve(outer.size)
+                                    .clamp_radii_for_quad_size(outer.size);
+                                for side in 0..4 {
+                                    if borders[side] <= 0. {
+                                        continue;
+                                    }
+                                    window.paint_quad(
+                                        renderer::quad(
+                                            outer,
+                                            corners,
+                                            renderer::transparent_black(),
+                                            renderer::Edges {
+                                                top: px(borders[0]),
+                                                right: px(borders[1]),
+                                                bottom: px(borders[2]),
+                                                left: px(borders[3]),
+                                            },
+                                            colors[side],
+                                            kinds[side],
+                                        )
+                                        .sides(1 << side),
+                                    );
+                                }
+                            },
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    );
+                }
+            }
             let mut pseudo_shadows = Vec::new();
             for (prop, value) in pseudo.iter() {
                 let value: &str = value;
@@ -2769,6 +3065,19 @@ pub(super) fn element(
                 }
                 .into_any_element(),
                 None => decoration.into_any_element(),
+            };
+            let decoration = if [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+                .iter()
+                .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
+            {
+                super::paint::Transformed {
+                    child: decoration,
+                    style: Rc::new(pseudo.clone()),
+                    units: pseudo_units,
+                }
+                .into_any_element()
+            } else {
+                decoration
             };
             let order = pseudo
                 .get(Prop::Z_INDEX)
@@ -3473,7 +3782,9 @@ pub(super) fn element(
                     }
                     continue;
                 }
-                if culled.binary_search_by_key(&child, |&(id, _)| id).is_ok() {
+                if culled.binary_search_by_key(&child, |&(id, _)| id).is_ok()
+                    || top_layer.contains(&child)
+                {
                     continue;
                 }
                 let placement = grid.as_ref().and_then(|grid| {
@@ -3900,6 +4211,8 @@ pub(super) fn element(
             .map(|_| containing),
         style: style.clone(),
         effects: effect_layer,
+        composited,
+        transformed: info[id].flags & cull::TRANSFORMED != 0,
         perspective: parent_perspective.clone().zip(parent),
         units,
         revision: info[id].revision,
@@ -4000,7 +4313,11 @@ pub(super) fn element(
         }),
     }
     .into_any_element();
-    if layered && let Some(order) = order.filter(|order| *order != 0) {
+    // WARNING: `z-index` does nothing in the top layer, whose boxes paint in their own order.
+    if layered
+        && let Some(order) = order.filter(|order| *order != 0)
+        && !top_layer.contains(&id)
+    {
         Stacked {
             inner: Some(element),
             layers: layers.clone(),
@@ -4083,6 +4400,19 @@ pub(super) fn pseudo_content(
         }
     }
     text
+}
+
+/// The ratio of an `aspect-ratio` value, like `5/4`, `1.25` or `auto 5 / 4`.
+pub(crate) fn aspect_ratio(value: &str) -> Option<f32> {
+    let value = value.replace('/', " / ");
+    let parts = style::components(&value, ' ');
+    let numbers: Vec<f32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
+    let ratio = match numbers.as_slice() {
+        [a, b, ..] if parts.contains(&"/") => a / b,
+        [a, ..] => *a,
+        _ => return None,
+    };
+    (ratio.is_finite() && ratio > 0.).then_some(ratio)
 }
 
 /// An HTML `width` or `height` attribute in pixels, parsed like browsers: leading digits after
@@ -4254,7 +4584,7 @@ fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
 
 fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
     let node = &doc.nodes[id];
-    node.tag != "#comment"
+    !matches!(node.tag.as_str(), "#comment" | "#doctype")
         && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
         && info[id].flags & cull::OUT == 0
 }
@@ -4866,12 +5196,17 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement 
             }
             let mut host = geometry.host.borrow_mut();
             let state = host.dom.entry(geometry.id).or_default();
-            if let Some((.., source)) = state.svg_sources.get(&id)
+            if let Some(source) = state.svg_sources.get(&id)
                 && let Some(entry) = state.svg_boxes.get_mut(&id)
             {
                 if entry.0 != *source {
+                    // WARNING: paint draws the tree parsed here, so a changed source is parsed once.
+                    let tree = super::canvas::svg_tree(source).ok();
                     let (size, content, boxes) =
-                        super::canvas::svg_boxes(source).unwrap_or_default();
+                        tree.as_ref().map(super::canvas::svg_boxes).unwrap_or_default();
+                    if let Some(tree) = tree {
+                        state.svg_trees.insert(id, tree);
+                    }
                     let names = &entry.1;
                     entry.2 = size;
                     entry.4 = content;
@@ -4929,10 +5264,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement 
             let mut host = view.host.borrow_mut();
             let state = host.dom.entry(view.id).or_default();
             let source = if inline {
-                state
-                    .svg_sources
-                    .get(&id)
-                    .map(|(.., source)| source.as_str())
+                state.svg_sources.get(&id).map(String::as_str)
             } else {
                 state.svg_images.get(&id).map(|(source, _)| &**source)
             };
@@ -4942,7 +5274,11 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement 
                     || u32::from(image.size().width) != raster[0]
                     || u32::from(image.size().height) != raster[1]
             }) {
-                match super::canvas::svg(source, raster[0], raster[1], None) {
+                let image = match state.svg_trees.remove(&id).filter(|_| inline) {
+                    Some(tree) => super::canvas::render_svg(&tree, raster[0], raster[1], None),
+                    None => super::canvas::svg(source, raster[0], raster[1], None),
+                };
+                match image {
                     Ok(image) => {
                         if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image)) {
                             window.drop_image(old);

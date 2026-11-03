@@ -154,6 +154,12 @@ pub struct RenderFrame {
     window: [u32; 2],
     max_texture: f32,
     copy: bool,
+    /// Effect layers of the window that the compositor plays, so the frame leaves them out.
+    pub skip: Vec<usize>,
+    /// Of those, the layers whose content `record` draws into a target of its own, listed after it
+    /// in `promoted` with that target and their `[x, y, width, height]` window region.
+    pub content: Vec<usize>,
+    pub promoted: Vec<(usize, Target, [i32; 4])>,
 }
 
 /// Copies the primitives of `keys` in their order.
@@ -161,6 +167,16 @@ fn extend<T: Copy>(items: &mut Vec<T>, primitives: &[T], keys: &[SortKey]) -> Ra
     let start = items.len() as u32;
     items.extend(keys.iter().map(|key| primitives[key[2] as usize]));
     start..items.len() as u32
+}
+
+/// The whole device pixels that cover `bounds`, as `[x, y, width, height]`.
+pub fn region(bounds: Bounds<ScaledPixels>) -> [i32; 4] {
+    let [x, y] = [bounds.origin.x.0.floor(), bounds.origin.y.0.floor()];
+    let [right, bottom] = [
+        (bounds.origin.x.0 + bounds.size.width.0).ceil(),
+        (bounds.origin.y.0 + bounds.size.height.0).ceil(),
+    ];
+    [x as i32, y as i32, (right - x) as i32, (bottom - y) as i32]
 }
 
 fn rect(bounds: Bounds<ScaledPixels>) -> [f32; 4] {
@@ -212,6 +228,17 @@ impl RenderFrame {
         self.max_texture = max_texture as f32;
         self.copy = copy;
         self.record_layer(scene, 0, Target::Frame, true, 0);
+        self.promoted.clear();
+        for index in 0..self.content.len() {
+            let layer = self.content[index];
+            let Some(bounds) = scene.layers[layer].bounds else {
+                continue;
+            };
+            let region = region(bounds);
+            let target = self.acquire(region);
+            self.record_layer(scene, layer, target, true, 1);
+            self.promoted.push((layer, target, region));
+        }
         // WARNING: shelf textures grow while the frame is recorded, so composites read their final size.
         if !self.shelves.is_empty() {
             for cmd in 0..self.cmds.len() {
@@ -417,12 +444,11 @@ impl RenderFrame {
                 }
                 Batch::Effects(keys) => {
                     for key in keys {
-                        self.record_effect(
-                            scene,
-                            &primitives.effects[key[2] as usize],
-                            target,
-                            depth,
-                        );
+                        let primitive = &primitives.effects[key[2] as usize];
+                        if layer == 0 && self.skip.contains(&primitive.layer) {
+                            continue;
+                        }
+                        self.record_effect(scene, primitive, target, depth);
                     }
                     self.flush(target, depth);
                     continue;
@@ -745,7 +771,7 @@ mod tests {
         let mut transform = super::IDENTITY;
         transform[0] = scale;
         let mut scene = Scene::default();
-        scene.push_effect(EffectState {
+        let state = EffectState {
             transform: (scale != 1.).then_some(transform),
             opacity: 0.5,
             color_matrix: None,
@@ -756,7 +782,8 @@ mod tests {
             mask: None,
             backdrop: None,
             content_mask: mask,
-        });
+        };
+        scene.push_effect(state, Some(7));
         scene.insert(Primitive::Quad(Quad {
             bounds: bounds(quad),
             content_mask: mask,
@@ -766,7 +793,91 @@ mod tests {
         scene.finish();
         let mut frame = RenderFrame::default();
         frame.record(&scene, window, 16384, true);
+        assert!(scene.patch(7, 0.25, None) && !scene.patch(8, 0.25, None));
+        let mut patched = RenderFrame::default();
+        patched.record(&scene, window, 16384, true);
+        assert!(
+            patched
+                .composites
+                .iter()
+                .any(|composite| composite.opacity == 0.25)
+        );
         frame
+    }
+
+    #[test]
+    fn patched_transforms_draw_like_new_frames() {
+        let bounds = |[x, y, w, h]: [f32; 4]| {
+            Bounds::new(
+                crate::point(ScaledPixels(x), ScaledPixels(y)),
+                Size::new(ScaledPixels(w), ScaledPixels(h)),
+            )
+        };
+        let mask = ContentMask {
+            bounds: bounds([0., 0., 800., 600.]),
+            ..Default::default()
+        };
+        let turn = |degrees: f32| {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let mut m = super::IDENTITY;
+            [m[0], m[1], m[4], m[5]] = [cos, sin, -sin, cos];
+            [m[12], m[13]] = [
+                150. - cos * 150. + sin * 150.,
+                150. - sin * 150. - cos * 150.,
+            ];
+            m
+        };
+        let scene = |degrees: f32| {
+            let mut scene = Scene::default();
+            let state = EffectState {
+                transform: Some(turn(degrees)),
+                opacity: 1.,
+                color_matrix: None,
+                blur: 0.,
+                shadow: None,
+                blend_mode: Default::default(),
+                clip: None,
+                mask: None,
+                backdrop: None,
+                content_mask: mask,
+            };
+            scene.push_effect(state, Some(9));
+            scene.insert(Primitive::Quad(Quad {
+                bounds: bounds([100., 100., 100., 100.]),
+                content_mask: mask,
+                ..Default::default()
+            }));
+            scene.pop_effect();
+            // Covers the layer only once it turns, and must still draw over it.
+            scene.insert(Primitive::Quad(Quad {
+                bounds: bounds([205., 140., 25., 20.]),
+                content_mask: mask,
+                ..Default::default()
+            }));
+            scene.finish();
+            scene
+        };
+        let draw = |scene: &Scene| {
+            let mut frame = RenderFrame::default();
+            frame.record(scene, [800, 600], 16384, true);
+            let order: Vec<_> = frame
+                .cmds
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::Quads(range) => Some(format!("quads {range:?}")),
+                    Cmd::Composite { index, .. } => Some(format!("composite {index}")),
+                    _ => None,
+                })
+                .collect();
+            (
+                order,
+                super::bytes(&frame.quads).to_vec(),
+                super::bytes(&frame.composites).to_vec(),
+            )
+        };
+        let mut patched = scene(0.);
+        assert!(patched.patch(9, 1., Some(turn(30.))));
+        assert_eq!(draw(&patched), draw(&scene(30.)));
     }
 
     #[test]

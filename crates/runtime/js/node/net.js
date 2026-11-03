@@ -88,7 +88,71 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
     unref() { this._referenced = false; return this; }
   }
   const connect = (...args) => { const [options] = normalize(args); return new Socket(options).connect(...args); };
-  const api = { Socket, Server, createServer: (...args) => new Server(...args), connect, createConnection: connect,
+  // Addresses are 128-bit BigInts with IPv4 mapped to ::ffff:a.b.c.d, as BlockList compares them.
+  const parseIP = (text, family) => {
+    text = String(text);
+    if (family === 'ipv4') { const parts = text.split('.'); return parts.length === 4 && parts.every(part => /^(?:0|[1-9]\d{0,2})$/.test(part) && part < 256) ? parts.reduce((n, part) => n << 8n | BigInt(part), 0xffffn) : undefined; }
+    if (!/^[\da-f:.]+$/i.test(text)) return;
+    let host;
+    try { host = new URL(`http://[${text}]`).hostname.slice(1, -1); } catch { return; }
+    const [head, tail] = host.split('::'), left = head ? head.split(':') : [], right = tail ? tail.split(':') : [];
+    return [...left, ...Array(8 - left.length - right.length).fill('0'), ...right].reduce((n, group) => n << 16n | BigInt('0x' + group), 0n);
+  };
+  const familyOf = value => { const family = String(value).toLowerCase(); if (family !== 'ipv4' && family !== 'ipv6') throw fail('ERR_INVALID_ARG_VALUE', `The property 'options.family' must be one of: 'ipv4', 'ipv6'. Received '${value}'`); return family; };
+  class SocketAddress {
+    #address; #port; #family; #flowlabel;
+    constructor(options = {}) {
+      const family = familyOf(options.family ?? 'ipv4'), address = options.address ?? (family === 'ipv4' ? '127.0.0.1' : '::'), flowlabel = options.flowlabel ?? 0;
+      if (typeof address !== 'string' || parseIP(address, family) === undefined) throw fail('ERR_INVALID_ADDRESS', 'Invalid socket address', Error);
+      if (!Number.isInteger(flowlabel) || flowlabel < 0 || flowlabel > 0xffffffff) throw fail('ERR_OUT_OF_RANGE', `The value of "options.flowlabel" is out of range. It must be >= 0 && <= 4294967295. Received ${flowlabel}`, RangeError);
+      this.#address = family === 'ipv6' ? new URL(`http://[${address}]`).hostname.slice(1, -1) : address; this.#port = port(options.port ?? 0); this.#family = family; this.#flowlabel = flowlabel;
+    }
+    get address() { return this.#address; }
+    get port() { return this.#port; }
+    get family() { return this.#family; }
+    get flowlabel() { return this.#flowlabel; }
+    toJSON() { return { address: this.#address, port: this.#port, family: this.#family, flowlabel: this.#flowlabel }; }
+    [Symbol.for('nodejs.util.inspect.custom')](depth, options, inspect) { return `SocketAddress ${inspect(this.toJSON(), options)}`; }
+    static isSocketAddress(value) { return typeof value === 'object' && value !== null && #address in value; }
+    static parse(input) {
+      if (typeof input !== 'string') throw fail('ERR_INVALID_ARG_TYPE', `The "input" argument must be of type string. Received ${typeof input}`);
+      try { const { hostname, port } = URL.parse(`http://${input}`); return hostname.startsWith('[') ? new SocketAddress({ address: hostname.slice(1, -1), port: port | 0, family: 'ipv6' }) : new SocketAddress({ address: hostname, port: port | 0 }); } catch {}
+    }
+  }
+  class BlockList {
+    #rules = [];
+    #read(value, family = 'ipv4') {
+      const text = SocketAddress.isSocketAddress(value) ? value.address : value, type = SocketAddress.isSocketAddress(value) ? value.family : familyOf(family), ip = parseIP(text, type);
+      if (ip === undefined) throw fail('ERR_INVALID_ADDRESS', 'Invalid socket address', Error);
+      return [ip, text, type === 'ipv4' ? 'IPv4' : 'IPv6'];
+    }
+    addAddress(address, family) { const [ip, text, type] = this.#read(address, family); this.#rules.unshift([`Address: ${type} ${text}`, ip, ip]); }
+    addRange(start, end, family) {
+      const [low, from, type] = this.#read(start, family), [high, to] = this.#read(end, family);
+      if (high < low) throw fail('ERR_INVALID_ARG_VALUE', `The argument 'start' must come before end. Received '${from}'`);
+      this.#rules.unshift([`Range: ${type} ${from}-${to}`, low, high]);
+    }
+    addSubnet(network, prefix, family) {
+      const [ip, text, type] = this.#read(network, family), bits = type === 'IPv4' ? 32 : 128;
+      if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) throw fail('ERR_OUT_OF_RANGE', `The value of "prefix" is out of range. It must be >= 0 && <= ${bits}. Received ${prefix}`, RangeError);
+      const mask = (1n << BigInt(bits - prefix)) - 1n;
+      this.#rules.unshift([`Subnet: ${type} ${text}/${prefix}`, ip & ~mask, ip | mask]);
+    }
+    check(address, family) { try { const [ip] = this.#read(address, family); return this.#rules.some(([, low, high]) => ip >= low && ip <= high); } catch { return false; } }
+    get rules() { return this.#rules.map(([text]) => text); }
+    toJSON() { return this.rules; }
+    fromJSON(data) {
+      for (const rule of typeof data === 'string' ? JSON.parse(data) : data) {
+        const [, kind, type, value] = /^(Address|Range|Subnet): IPv([46]) (.+)$/.exec(rule) ?? [], family = 'ipv' + type;
+        if (kind === 'Address') this.addAddress(value, family);
+        else if (kind === 'Range') this.addRange(...value.split('-'), family);
+        else if (kind === 'Subnet') this.addSubnet(value.slice(0, value.lastIndexOf('/')), +value.slice(value.lastIndexOf('/') + 1), family);
+      }
+    }
+    [Symbol.for('nodejs.util.inspect.custom')](depth, options, inspect) { return `BlockList ${inspect({ rules: this.rules }, options)}`; }
+    static isBlockList(value) { return typeof value === 'object' && value !== null && #rules in value; }
+  }
+  const api = { Socket, Server, BlockList, SocketAddress, createServer: (...args) => new Server(...args), connect, createConnection: connect,
     isIP: value => call('web.tcp.ip', String(value)), isIPv4: value => call('web.tcp.ip', String(value)) === 4, isIPv6: value => call('web.tcp.ip', String(value)) === 6 };
   return { api, normalize, port, failure,
     poll() {

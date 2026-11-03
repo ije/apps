@@ -228,15 +228,18 @@ impl State {
                         };
                         let engine = JsContext::new_interruptible(JavaScriptCore::load()?, host, role, Some(cancelled.clone()))?;
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
-                        if native { engine.eval("globalThis.require = name => { const key = name.replace(/^node:/, ''); const value = globalThis.__apps[key]; if (!value) throw new Error('Unsupported worker module: ' + name); return value; };", "apps:worker-modules")?; }
+                        if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire();", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
+                        while engine.eval_page("this.__appsNext?.()", "apps:worker")? == "true" {}
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
                             // WARNING: a native worker ends when only unreferenced timers are left, like in Node, so it checks before each wait.
                             if native && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
+                            crate::host::idle(true);
                             let message = if delay < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(delay as u64)) };
+                            crate::host::idle(false);
                             match message {
                                 Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {
                                     if let Some(text) = message.value[0].as_str() {

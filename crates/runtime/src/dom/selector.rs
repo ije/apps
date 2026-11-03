@@ -4,12 +4,12 @@ use std::{collections::HashMap, rc::Rc};
 
 pub(crate) type SelectorList = Rc<Vec<Selector>>;
 
-pub(crate) const FOCUS: u8 = 1;
-pub(crate) const FOCUS_WITHIN: u8 = 2;
-pub(crate) const HOVER: u8 = 4;
-pub(crate) const ACTIVE: u8 = 8;
-pub(crate) const FOCUS_VISIBLE: u8 = 128;
-const HAS: u8 = 16;
+pub(crate) const FOCUS: u16 = 1;
+pub(crate) const FOCUS_WITHIN: u16 = 2;
+pub(crate) const HOVER: u16 = 4;
+pub(crate) const ACTIVE: u16 = 8;
+pub(crate) const FOCUS_VISIBLE: u16 = 128;
+const HAS: u16 = 16;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Selector {
@@ -461,7 +461,7 @@ impl Selector {
     }
 
     /// Interaction states and `:has()` used here; nested `&` lists are added to `parents`.
-    pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u8 {
+    pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u16 {
         let mut states = self
             .previous
             .as_ref()
@@ -511,6 +511,7 @@ impl Selector {
                     "slotted",
                     "part",
                     "starting-style",
+                    "backdrop",
                 ]
                 .iter()
                 .position(|n| n == name)?,
@@ -1194,9 +1195,15 @@ impl Selector {
                                 _ => false,
                             }
                         }
-                        "modal" => {
+                        "modal" | "popover-open" | "fullscreen" | "-webkit-full-screen" => {
                             memo.depend(id, 5);
-                            node.state & super::MODAL != 0
+                            node.state
+                                & match name.as_str() {
+                                    "modal" => super::MODAL,
+                                    "popover-open" => super::POPOVER,
+                                    _ => super::FULLSCREEN,
+                                }
+                                != 0
                         }
                         "disabled" | "enabled" => {
                             matches!(

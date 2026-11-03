@@ -33,7 +33,15 @@ pub(crate) fn observe() {
 fn validate_menu(template: &Value) -> Result<()> {
     for item in template.as_array().context("Expected menu template")? {
         let options = item.as_object().context("Expected menu item")?;
-        for name in ["label", "role", "type", "accelerator", "toolTip"] {
+        for name in [
+            "label",
+            "role",
+            "type",
+            "accelerator",
+            "toolTip",
+            "sublabel",
+            "icon",
+        ] {
             ensure!(
                 options.get(name).is_none_or(Value::is_string),
                 "Expected menu text: {name}"
@@ -57,6 +65,12 @@ fn validate_menu(template: &Value) -> Result<()> {
 }
 
 pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
+    if operation.starts_with("tray.") {
+        ensure!(
+            arguments["id"].as_u64().is_some_and(|id| id > 0),
+            "Expected tray id"
+        );
+    }
     match operation {
         "poll"
         | "power.init"
@@ -68,7 +82,56 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "app.locale"
         | "app.state"
         | "screen.displays"
-        | "screen.cursor" => {}
+        | "screen.cursor"
+        | "prefs.appearance"
+        | "prefs.animation"
+        | "prefs.swipe"
+        | "prefs.touchID" => {}
+        "power.block" | "prefs.trusted" => {
+            ensure!(arguments.is_boolean(), "Expected boolean argument")
+        }
+        "power.unblock" => ensure!(
+            arguments.as_u64().is_some_and(|v| v <= u32::MAX as u64),
+            "Expected an assertion id"
+        ),
+        "prefs.color" => ensure!(
+            arguments.as_str().is_some_and(
+                |name| name.ends_with("Color") && name.bytes().all(|c| c.is_ascii_alphabetic())
+            ),
+            "Invalid color name"
+        ),
+        "prefs.media" => ensure!(
+            matches!(arguments.as_str(), Some("microphone" | "camera" | "screen")),
+            "Invalid media type"
+        ),
+        "prefs.askMedia" => ensure!(
+            matches!(arguments["type"].as_str(), Some("microphone" | "camera"))
+                && arguments["async"].is_u64(),
+            "Invalid media type"
+        ),
+        "prefs.promptTouchID" => ensure!(
+            arguments["reason"].as_str().is_some_and(|v| !v.is_empty())
+                && arguments["async"].is_u64(),
+            "reason must be non-empty"
+        ),
+        "prefs.getDefault" | "prefs.setDefault" => ensure!(
+            arguments["key"].is_string()
+                && matches!(
+                    arguments["type"].as_str(),
+                    Some(
+                        "string"
+                            | "boolean"
+                            | "integer"
+                            | "float"
+                            | "double"
+                            | "url"
+                            | "array"
+                            | "dictionary"
+                    )
+                ),
+            "Invalid user default"
+        ),
+        "prefs.registerDefaults" => ensure!(arguments.is_object(), "Expected user defaults"),
         "app.hidden" => ensure!(arguments.is_boolean(), "Expected boolean argument"),
         "app.loginItem" => ensure!(
             arguments.is_null() || arguments.is_boolean(),
@@ -79,6 +142,7 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
             "Invalid attention type"
         ),
         "app.cancelAttention" => ensure!(arguments.is_u64(), "Expected attention request id"),
+        "app.progress" => ensure!(arguments.is_number(), "Expected a progress number"),
         "app.activationPolicy" => ensure!(
             arguments.is_null()
                 || matches!(
@@ -122,6 +186,38 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                 validate_menu(arguments)?;
             }
         }
+        "tray.create" | "tray.image" | "tray.pressedImage" => {
+            ensure!(arguments["image"].is_string(), "Expected a tray image path");
+            ensure!(
+                arguments.get("guid").is_none_or(Value::is_string),
+                "Expected a GUID"
+            );
+        }
+        "tray.menu" | "tray.popup" => {
+            if !arguments["template"].is_null() {
+                validate_menu(&arguments["template"])?;
+            }
+            if operation == "tray.popup" {
+                ensure!(
+                    arguments["request"].as_u64().is_some_and(|id| id > 0),
+                    "Expected tray popup id"
+                );
+            }
+        }
+        "tray.toolTip" | "tray.title" => {
+            ensure!(arguments["text"].is_string(), "Expected tray text");
+            ensure!(
+                arguments.get("fontType").is_none_or(Value::is_string),
+                "Expected tray font type"
+            );
+        }
+        "tray.ignoreDoubleClick" => ensure!(arguments["ignore"].is_boolean(), "Expected boolean"),
+        "tray.destroy"
+        | "tray.close"
+        | "tray.getTitle"
+        | "tray.guid"
+        | "tray.bounds"
+        | "tray.getIgnoreDoubleClick" => {}
         "menu.popup" => {
             validate_menu(&arguments["template"])?;
             for name in ["x", "y"] {
@@ -161,7 +257,8 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "notification.close"
         | "app.badge"
         | "app.icon"
-        | "app.downloadFinished" => {
+        | "app.downloadFinished"
+        | "prefs.removeDefault" => {
             ensure!(arguments.is_string(), "Expected text argument");
         }
         "theme.set" => {

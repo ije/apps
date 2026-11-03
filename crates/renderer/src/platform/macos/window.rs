@@ -33,7 +33,8 @@ use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSDragOperation, NSScreen,
     NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSWindow,
-    NSWindowButton, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
+    NSWindowSharingType, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
@@ -210,15 +211,19 @@ unsafe fn build_window_class() -> *const AnyClass {
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(_, Sel));
         decl.add_method(
             sel!(canBecomeMainWindow),
-            yes as extern "C" fn(_, Sel) -> Bool,
+            can_become_key as extern "C" fn(_, Sel) -> Bool,
         );
         decl.add_method(
             sel!(canBecomeKeyWindow),
-            yes as extern "C" fn(_, Sel) -> Bool,
+            can_become_key as extern "C" fn(_, Sel) -> Bool,
         );
         decl.add_method(
             sel!(windowDidResize:),
             window_did_resize as extern "C" fn(_, Sel, *mut AnyObject),
+        );
+        decl.add_method(
+            sel!(windowWillResize:toSize:),
+            window_will_resize as extern "C" fn(_, Sel, *mut AnyObject, NSSize) -> NSSize,
         );
         decl.add_method(
             sel!(windowDidChangeOcclusionState:),
@@ -333,6 +338,13 @@ struct State {
     transparent_titlebar: bool,
     is_exiting_fullscreen: bool,
     closed: bool,
+    focusable: bool,
+    /// The content ratio and the extra size it leaves out, kept while the user resizes.
+    aspect: Option<(f64, NSSize)>,
+    /// The parent window, joined while this one is shown.
+    parent: Option<objc2::rc::Weak<NSWindow>>,
+    /// Shown as a sheet of the parent.
+    sheet: bool,
 }
 
 impl State {
@@ -601,6 +613,10 @@ impl Window {
                 transparent_titlebar: options.titlebar_hidden || options.frameless,
                 is_exiting_fullscreen: false,
                 closed: false,
+                focusable: true,
+                aspect: None,
+                parent: None,
+                sheet: false,
             }));
             for object in [native_window, native_view] {
                 (*object)
@@ -698,6 +714,26 @@ impl Window {
         self.state.borrow_mut().renderer.draw(scene, capture)
     }
 
+    /// See [`super::metal::Renderer::promote`].
+    pub fn promote(
+        &self,
+        key: u64,
+        index: usize,
+        region: [i32; 4],
+        step: f64,
+        opacities: &[f32],
+        transforms: &[[f64; 16]],
+    ) -> bool {
+        self.state
+            .borrow_mut()
+            .renderer
+            .promote(key, index, region, step, opacities, transforms)
+    }
+
+    pub fn demote(&self) {
+        self.state.borrow_mut().renderer.demote();
+    }
+
     pub fn is_active(&self) -> bool {
         self.state.borrow().native_window().isKeyWindow()
     }
@@ -779,6 +815,13 @@ impl Window {
     }
 
     pub fn change(&self, change: WindowChange) {
+        // The layer turns transparent now, so the next frame clears to transparent.
+        if let WindowChange::Vibrancy(material, _) = change
+            && let Ok(mut state) = self.state.try_borrow_mut()
+        {
+            let transparent = material.is_some() || !state.native_window().isOpaque();
+            state.renderer.update_transparency(transparent);
+        }
         let marker = self.marker;
         let view = self.state.borrow().native_view;
         self.later(move |window, state| {
@@ -815,13 +858,18 @@ impl Window {
                         // SAFETY: the view is retained by the window.
                         unsafe { view.cast::<NSView>().as_ref() }.setNeedsDisplay(true);
                     }
-                    if focus {
-                        window.makeKeyAndOrderFront(None);
-                    } else {
-                        window.orderFrontRegardless();
+                    if !attach(window, state) {
+                        if focus {
+                            window.makeKeyAndOrderFront(None);
+                        } else {
+                            window.orderFrontRegardless();
+                        }
                     }
                 }
-                WindowChange::Hide => window.orderOut(None),
+                WindowChange::Hide => {
+                    detach(window);
+                    window.orderOut(None)
+                }
                 WindowChange::Blur => window.orderBack(None),
                 WindowChange::Restore => window.deminiaturize(None),
                 WindowChange::SizeLimits(min, max) => {
@@ -857,6 +905,105 @@ impl Window {
                         color.a as f64,
                     )))
                 }
+                WindowChange::Opacity(alpha) => window.setAlphaValue(alpha as f64),
+                WindowChange::Shadow(on) => window.setHasShadow(on),
+                WindowChange::IgnoreMouse(ignore, forward) => {
+                    window.setIgnoresMouseEvents(ignore);
+                    window.setAcceptsMouseMovedEvents(ignore && forward);
+                }
+                WindowChange::AllWorkspaces(all, fullscreen) => {
+                    let mut behavior = window.collectionBehavior();
+                    behavior.set(NSWindowCollectionBehavior::CanJoinAllSpaces, all);
+                    behavior.set(NSWindowCollectionBehavior::FullScreenAuxiliary, fullscreen);
+                    window.setCollectionBehavior(behavior);
+                }
+                WindowChange::ContentProtection(on) => window.setSharingType(if on {
+                    NSWindowSharingType::None
+                } else {
+                    NSWindowSharingType::ReadOnly
+                }),
+                WindowChange::Focusable(on) => {
+                    if let Ok(mut state) = state.try_borrow_mut() {
+                        state.focusable = on;
+                    }
+                }
+                WindowChange::AspectRatio(ratio, extra) => {
+                    // WARNING: resize increments clear the aspect ratio.
+                    if ratio > 0. {
+                        window.setContentAspectRatio(NSSize::new(ratio as f64, 1.));
+                    } else {
+                        window.setResizeIncrements(NSSize::new(1., 1.));
+                    }
+                    if let Ok(mut state) = state.try_borrow_mut() {
+                        state.aspect = (ratio > 0.).then(|| {
+                            let extra = NSSize::new(extra.width.0 as f64, extra.height.0 as f64);
+                            (ratio as f64, extra)
+                        });
+                    }
+                }
+                WindowChange::Parent(parent, sheet) => {
+                    detach(window);
+                    let parent = match parent {
+                        // SAFETY: the runtime passes the view of a live window.
+                        Some(rwh::RawWindowHandle::AppKit(handle)) => {
+                            unsafe { handle.ns_view.cast::<NSView>().as_ref() }.window()
+                        }
+                        _ => None,
+                    };
+                    if let Ok(mut state) = state.try_borrow_mut() {
+                        state.parent = parent.as_ref().map(objc2::rc::Weak::from_retained);
+                        state.sheet = sheet;
+                    }
+                    if window.isVisible() {
+                        attach(window, state);
+                    }
+                }
+                WindowChange::Vibrancy(material, effect) => {
+                    let Some(content) = window.contentView() else {
+                        return;
+                    };
+                    // SAFETY: plain AppKit calls; the effect view is always the bottom subview.
+                    unsafe {
+                        let bottom = content.subviews().firstObject().filter(|view| {
+                            let effect: Bool =
+                                msg_send![&**view, isKindOfClass: class!(NSVisualEffectView)];
+                            effect.as_bool()
+                        });
+                        match (material, bottom) {
+                            (None, Some(view)) => view.removeFromSuperview(),
+                            (None, None) => {}
+                            (Some(material), view) => {
+                                let view = match view {
+                                    Some(view) => view,
+                                    None => {
+                                        let view: *mut AnyObject =
+                                            msg_send![class!(NSVisualEffectView), alloc];
+                                        let view: *mut AnyObject =
+                                            msg_send![view, initWithFrame: content.bounds()];
+                                        let Some(view) = Retained::from_raw(view.cast::<NSView>())
+                                        else {
+                                            return;
+                                        };
+                                        view.setAutoresizingMask(
+                                            NSAutoresizingMaskOptions::ViewWidthSizable
+                                                | NSAutoresizingMaskOptions::ViewHeightSizable,
+                                        );
+                                        // NSVisualEffectBlendingModeBehindWindow
+                                        let () = msg_send![&*view, setBlendingMode: 0isize];
+                                        content.addSubview_positioned_relativeTo(
+                                            &view,
+                                            NSWindowOrderingMode::Below,
+                                            None,
+                                        );
+                                        view
+                                    }
+                                };
+                                let () = msg_send![&*view, setMaterial: material];
+                                let () = msg_send![&*view, setState: effect];
+                            }
+                        }
+                    }
+                }
             }
             report_change(state);
         });
@@ -875,14 +1022,7 @@ impl Window {
     }
 
     pub fn activate(&self) {
-        let view = self.state.borrow().native_view;
-        self.later(move |window, _| {
-            if !window.isVisible() {
-                // SAFETY: the view is retained by the window.
-                unsafe { view.cast::<NSView>().as_ref() }.setNeedsDisplay(true);
-            }
-            window.makeKeyAndOrderFront(None);
-        });
+        self.change(WindowChange::Show(true));
     }
 
     /// Resizes the content area.
@@ -948,11 +1088,47 @@ impl Drop for Window {
         // SAFETY: the window stays retained until the posted close.
         unsafe {
             let () = msg_send![window, setDelegate: ptr::null_mut::<AnyObject>()];
+            // WARNING: a sheet that is not ended blocks its parent, a sheet shown next and quitting,
+            // which can already be posted, so it ends now.
+            detach(&*window.cast::<NSWindow>());
         }
         post_local(move || unsafe {
             let () = msg_send![window, close];
             let _: *mut AnyObject = msg_send![window, autorelease];
         });
+    }
+}
+
+/// Joins the parent window, as its sheet or as a child above it. Returns whether it is a sheet,
+/// which AppKit shows itself.
+fn attach(window: &NSWindow, state: &Shared) -> bool {
+    let Some((parent, sheet)) = state
+        .try_borrow()
+        .ok()
+        .and_then(|state| Some((state.parent.as_ref()?.load()?, state.sheet)))
+    else {
+        return false;
+    };
+    if sheet {
+        if window.sheetParent().is_none() {
+            parent.beginSheet_completionHandler(window, None);
+        }
+    } else if window.parentWindow().as_deref() != Some(&*parent) {
+        // WARNING: joining a parent resets its level.
+        let level = parent.level();
+        // SAFETY: both are live windows, and a window never becomes its own ancestor.
+        unsafe { parent.addChildWindow_ordered(window, NSWindowOrderingMode::Above) };
+        parent.setLevel(level);
+    }
+    sheet
+}
+
+fn detach(window: &NSWindow) {
+    if let Some(parent) = window.sheetParent() {
+        parent.endSheet(window);
+    }
+    if let Some(parent) = window.parentWindow() {
+        parent.removeChildWindow(window);
     }
 }
 
@@ -1036,8 +1212,12 @@ fn callbacks(this: &AnyObject) -> Option<Callbacks> {
     state.try_borrow().ok().map(|state| state.callbacks)
 }
 
-extern "C" fn yes(_: &AnyObject, _: Sel) -> Bool {
-    Bool::YES
+extern "C" fn can_become_key(this: &AnyObject, _: Sel) -> Bool {
+    // SAFETY: AppKit calls this on our windows.
+    Bool::new(
+        unsafe { get_state(this) }
+            .is_none_or(|state| state.try_borrow().map_or(true, |state| state.focusable)),
+    )
 }
 
 extern "C" fn dealloc_window(this: &AnyObject, _: Sel) {
@@ -1423,6 +1603,32 @@ extern "C" fn window_did_resize(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     {
         lock.move_traffic_light();
     }
+}
+
+/// Keeps the aspect ratio with its extra size, after AppKit applied the content aspect ratio.
+extern "C" fn window_will_resize(
+    this: &AnyObject,
+    _: Sel,
+    _: *mut AnyObject,
+    proposed: NSSize,
+) -> NSSize {
+    // SAFETY: AppKit calls this on our windows.
+    let Some((ratio, extra)) =
+        unsafe { get_state(this) }.and_then(|state| state.try_borrow().ok()?.aspect)
+    else {
+        return proposed;
+    };
+    // SAFETY: the receiver is an NSWindow.
+    let window = unsafe { &*(this as *const AnyObject).cast::<NSWindow>() };
+    let frame = window.frame();
+    let content = window.contentRectForFrameRect(frame).size;
+    let extra_width = frame.size.width - content.width + extra.width;
+    let extra_height = frame.size.height - content.height + extra.height;
+    let width = ((proposed.height - extra_height) * ratio + extra_width).round();
+    NSSize::new(
+        width,
+        ((width - extra_width) / ratio + extra_height).round(),
+    )
 }
 
 fn is_macos_at_least(major: NSInteger, minor: NSInteger) -> bool {

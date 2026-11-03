@@ -72,6 +72,59 @@ impl renderer::Element for Turned {
     }
 }
 
+/// Paints a child with the CSS transform of its style around its own box, for pseudo-elements.
+pub(super) struct Transformed {
+    pub(super) child: AnyElement,
+    pub(super) style: Rc<style::Style>,
+    pub(super) units: style::Lengths,
+}
+
+impl IntoElement for Transformed {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl renderer::Element for Transformed {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<super::effects::Matrix>;
+    fn request_layout(&mut self, window: &mut Window) -> (renderer::LayoutId, ()) {
+        (self.child.request_layout(window), ())
+    }
+    fn prepaint(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+    ) -> Option<super::effects::Matrix> {
+        let matrix = super::effects::transform(&self.style, &self.units, bounds, None);
+        match matrix {
+            Some(matrix) => window.with_hit_transform(matrix, |window| self.child.prepaint(window)),
+            None => self.child.prepaint(window),
+        }
+        matrix
+    }
+    fn paint(
+        &mut self,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        matrix: &mut Option<super::effects::Matrix>,
+        window: &mut Window,
+    ) {
+        match matrix {
+            Some(matrix) => {
+                let effect = renderer::PaintEffect {
+                    transform: Some(*matrix),
+                    ..Default::default()
+                };
+                window.paint_effect(effect, |window| self.child.paint(window));
+            }
+            None => self.child.paint(window),
+        }
+    }
+}
+
 /// Paints a child through an effect layer.
 pub(super) struct Effected {
     pub(super) effect: renderer::PaintEffect,
@@ -134,6 +187,10 @@ pub(super) struct DomBox {
     pub(super) style: Rc<style::Style>,
     /// The group opacity, when the box paints through an effect layer.
     pub(super) effects: Option<f32>,
+    /// The layer is keyed by the box, see `cull::COMPOSITED`.
+    pub(super) composited: bool,
+    /// The keyed layer keeps a transform, see `cull::TRANSFORMED`.
+    pub(super) transformed: bool,
     /// The parent's perspective, and the parent.
     pub(super) perspective: Option<((f32, String), usize)>,
     pub(super) units: style::Lengths,
@@ -297,17 +354,45 @@ impl renderer::Element for DomBox {
             offset += shift;
             bounds.origin += shift;
         }
+        // A fixed box sits at its insets and margins in the viewport. With both insets, auto margins share
+        // the free space, and a horizontal pair never goes below zero.
         if self.fixed {
             let viewport = window.viewport_size();
-            if let Some(left) = self.inset[3] {
-                offset.x = px(left) - bounds.left();
-            } else if let Some(right) = self.inset[1] {
-                offset.x = viewport.width - px(right) - bounds.right();
-            }
-            if let Some(top) = self.inset[0] {
-                offset.y = px(top) - bounds.top();
-            } else if let Some(bottom) = self.inset[2] {
-                offset.y = viewport.height - px(bottom) - bounds.bottom();
+            for axis in 0..2 {
+                let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
+                let auto = |side: usize| self.style.get(style::MARGIN[side + 1]) == Some("auto");
+                let margin = |side: usize| {
+                    if auto(side) {
+                        px(0.)
+                    } else {
+                        px(self.margin[side])
+                    }
+                };
+                let [extent, origin, size] = if axis == 0 {
+                    [viewport.width, bounds.left(), bounds.size.width]
+                } else {
+                    [viewport.height, bounds.top(), bounds.size.height]
+                };
+                let at = match (self.inset[start], self.inset[end]) {
+                    (Some(first), Some(last)) if auto(start) || auto(end) => {
+                        let free = extent - px(first + last) - size - margin(start) - margin(end);
+                        px(first)
+                            + match (auto(start), auto(end)) {
+                                (true, true) if axis == 0 => (free / 2.).max(px(0.)),
+                                (true, true) => free / 2.,
+                                (true, false) => free,
+                                _ => margin(start),
+                            }
+                    }
+                    (Some(first), _) => px(first) + margin(start),
+                    (None, Some(last)) => extent - px(last) - margin(end) - size,
+                    (None, None) => continue,
+                };
+                if axis == 0 {
+                    offset.x = at - origin;
+                } else {
+                    offset.y = at - origin;
+                }
             }
             bounds.origin += offset;
         }
@@ -338,8 +423,17 @@ impl renderer::Element for DomBox {
                 Some((*distance, [x + ox, y + oy]))
             });
         let mut matrix = super::effects::transform(&self.style, &self.units, bounds, perspective);
+        if self.transformed {
+            let matrix = *matrix.get_or_insert(super::effects::IDENTITY);
+            self.view
+                .spun
+                .borrow_mut()
+                .insert(self.id, (bounds, perspective, matrix));
+        }
         // Plain translations move the box instead of painting it through a layer.
-        if let Some([x, y]) = matrix.as_ref().and_then(super::effects::translation) {
+        if !self.transformed
+            && let Some([x, y]) = matrix.as_ref().and_then(super::effects::translation)
+        {
             let translation = point(px(x), px(y));
             offset += translation;
             bounds.origin += translation;
@@ -420,15 +514,17 @@ impl renderer::Element for DomBox {
                 }
             }
             if let Some((browser, _)) = view.browsers.borrow().get(&self.id)
-                && let Some((set, _)) = view.frames.borrow_mut().get_mut(&self.id)
+                && let Some((set, ..)) = view.frames.borrow_mut().get_mut(&self.id)
             {
+                // WARNING: native views are placed in window points, which the page zoom scales.
+                let zoom = window.zoom();
                 let bounds = [
                     window_bounds.origin.x,
                     window_bounds.origin.y,
                     window_bounds.size.width,
                     window_bounds.size.height,
                 ]
-                .map(|value| f32::from(value) as f64);
+                .map(|value| (f32::from(value) * zoom) as f64);
                 if *set != bounds {
                     *set = bounds;
                     let _ = browser.set_bounds(bounds);
@@ -473,7 +569,11 @@ impl renderer::Element for DomBox {
             }
         };
         match matrix {
-            Some(matrix) => window.with_hit_transform(matrix, &mut prepaint),
+            Some(matrix) => window.with_keyed_hit_transform(
+                matrix,
+                self.transformed.then_some(self.id as u64),
+                &mut prepaint,
+            ),
             None => prepaint(window),
         }
         (bounds, matrix)
@@ -563,32 +663,56 @@ impl DomBox {
             None => {}
         }
         let base = host.dom.get(&view.id).and_then(|state| state.base.clone());
-        let mask_layers = mask_svg(style, units, size, base.as_ref(), &host.assets);
-        let mask = (shapes.is_some() || mask_layers.is_some()).then(|| {
+        let images = [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
+            .into_iter()
+            .find_map(|prop| style.get(prop))
+            .filter(|value| !value.is_empty() && *value != "none");
+        let mask = (shapes.is_some() || images.is_some()).then(|| {
+            // WARNING: building a mask's SVG costs more than drawing the box, so the bitmap is kept by its
+            // exact inputs: the mask properties and clip shape, then the box size and units as hex bits.
+            let mut inputs = String::new();
+            for part in [
+                Prop::MASK_IMAGE,
+                Prop::WEBKIT_MASK_IMAGE,
+                Prop::MASK_SIZE,
+                Prop::WEBKIT_MASK_SIZE,
+                Prop::MASK_POSITION,
+                Prop::WEBKIT_MASK_POSITION,
+                Prop::MASK_REPEAT,
+                Prop::WEBKIT_MASK_REPEAT,
+            ]
+            .map(|prop| style.get(prop).unwrap_or(""))
+            .into_iter()
+            .chain(shapes.as_deref())
+            {
+                inputs.push_str(part);
+                inputs.push('\0');
+            }
+            super::effects::push_bits(&mut inputs, size, &units);
             let [width, height] = size;
-            let source = match (shapes, mask_layers) {
-                (Some(shape), Some(layers)) => format!(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"h2o-clip\">{shape}</clipPath></defs><g clip-path=\"url(#h2o-clip)\">{layers}</g></svg>"
-                ),
-                (Some(shape), None) => format!(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
-                ),
-                (None, layers) => format!(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{}</svg>",
-                    layers.unwrap_or_default()
-                ),
-            };
             let scale = window.scale_factor();
             let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
             let masks = &mut host.dom.entry(view.id).or_default().masks;
             if masks.get(&self.id).is_none_or(|(old, image)| {
-                *old != source
+                *old != inputs
                     || u32::from(image.size().width) != raster[0]
                     || u32::from(image.size().height) != raster[1]
             }) {
+                let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
+                    (Some(shape), Some(layers)) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"h2o-clip\">{shape}</clipPath></defs><g clip-path=\"url(#h2o-clip)\">{layers}</g></svg>"
+                    ),
+                    (Some(shape), None) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
+                    ),
+                    (None, Some(layers)) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
+                    ),
+                    (None, None) => return None,
+                };
                 match super::canvas::svg(&source, raster[0], raster[1], None) {
                     Ok(image) => {
-                        if let Some((_, old)) = masks.insert(self.id, (source, image)) {
+                        if let Some((_, old)) = masks.insert(self.id, (inputs, image)) {
                             window.drop_image(old);
                         }
                     }
@@ -620,6 +744,7 @@ impl DomBox {
                 }),
             mask: mask.flatten(),
             backdrop,
+            key: self.composited.then_some(self.id as u64),
             ..Default::default()
         };
         let isolate = style
@@ -630,7 +755,8 @@ impl DomBox {
             || outer.blend_mode != renderer::BlendMode::Normal
             || outer.mask.is_some()
             || outer.backdrop.is_some()
-            || isolate;
+            || isolate
+            || self.composited;
         if needed {
             // One filter function and no clip can share the outer layer.
             if layers.len() == 1 && clip.is_none() {

@@ -6,11 +6,19 @@ use std::{
     time::Instant,
 };
 
-pub fn run(entry: &Path, out: &Path, runtime: &Path, target: BuildTarget) -> Result<()> {
+pub fn run(
+    entry: &Path,
+    out: &Path,
+    runtime: &Path,
+    rust: Option<&Path>,
+    target: BuildTarget,
+) -> Result<()> {
     let started = Instant::now();
-    target.validate_binary(runtime).context(
-        "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
-    )?;
+    if rust.is_none() {
+        target.validate_binary(runtime).context(
+            "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
+        )?;
+    }
     let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true, None)?;
     if let Some(source) = files.get("native.json") {
         let addons: std::collections::BTreeMap<String, PathBuf> = serde_json::from_str(source)?;
@@ -20,14 +28,16 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: BuildTarget) -> Res
                 .context("Native addon does not match the build target")?;
         }
     }
-    let app = (
-        "app.js".to_owned(),
-        apps_runtime::bundle::script_source(&files, false),
-    );
+    let app = rust.is_none().then(|| {
+        (
+            "app.js".to_owned(),
+            apps_runtime::bundle::script_source(&files, false),
+        )
+    });
     for (name, source) in files
         .iter()
         .filter(|(name, _)| name.starts_with("script-"))
-        .chain([(&app.0, &app.1)])
+        .chain(app.as_ref().map(|(name, source)| (name, source)))
     {
         let allocator = oxc_allocator::Allocator::default();
         let parsed =
@@ -38,8 +48,17 @@ pub fn run(entry: &Path, out: &Path, runtime: &Path, target: BuildTarget) -> Res
             parsed.diagnostics
         );
     }
-    let root = entry.parent().context("Missing project directory")?;
-    let (bytes, _) = packaging::package_app(out, &files, runtime, root, true, target)?;
+    let root = rust
+        .or_else(|| entry.parent())
+        .context("Missing project directory")?;
+    let binary = rust
+        .map(|root| crate::rust::build(root, entry, true, target))
+        .transpose()?;
+    if let Some(path) = &binary {
+        target.validate_binary(path)?;
+    }
+    let (bytes, _) =
+        packaging::package_app(out, &files, runtime, root, true, target, binary.as_deref())?;
     println!(
         "apps: built {} bytes in {} ms → {}",
         bytes,

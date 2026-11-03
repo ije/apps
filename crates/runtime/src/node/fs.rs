@@ -192,6 +192,33 @@ impl Files {
                         .collect::<Vec<_>>()
                 ))
             }
+            "statfs" => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let file = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::statfs(file.as_ptr(), &mut info) } != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    #[cfg(target_os = "linux")]
+                    let fragment = info.f_frsize as u64;
+                    #[cfg(not(target_os = "linux"))]
+                    let fragment = info.f_bsize as u64;
+                    Ok(json!([
+                        info.f_type,
+                        info.f_bsize,
+                        fragment,
+                        info.f_blocks,
+                        info.f_bfree,
+                        info.f_bavail,
+                        info.f_files,
+                        info.f_ffree
+                    ]))
+                }
+                #[cfg(not(unix))]
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+            }
             "stat" => Ok(stat(&fs::metadata(path()?)?)),
             "lstat" => Ok(stat(&fs::symlink_metadata(path()?)?)),
             "rename" => {

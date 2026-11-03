@@ -97,8 +97,7 @@ impl Drop for Hud {
 }
 
 fn load() -> Result<Library> {
-    let path = std::env::current_exe()?
-        .canonicalize()?
+    let path = crate::desktop::app::library_exe()?
         .with_file_name(libloading::library_filename("apps_perfhud"));
     unsafe {
         let library = libloading::Library::new(&path).with_context(|| {

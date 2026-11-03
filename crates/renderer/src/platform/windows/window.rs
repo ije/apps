@@ -397,6 +397,19 @@ impl Window {
                         state.renderer.set_background(color);
                     }
                 }
+                WindowChange::ContentProtection(on) => {
+                    let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+                    let _ = SetWindowDisplayAffinity(hwnd, affinity);
+                }
+                // An owned window stays above its owner.
+                WindowChange::Parent(parent, _) => {
+                    let owner = match parent {
+                        Some(rwh::RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+                        _ => 0,
+                    };
+                    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
+                }
+                _ => {}
             }
         }
         self.inner.callbacks.changed();

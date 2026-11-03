@@ -1,0 +1,6 @@
+{
+  "name": "my-app",
+  "type": "rust",
+  "main": "src/main.rs",
+  "preload": "preload.ts"
+}

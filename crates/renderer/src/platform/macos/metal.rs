@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CGSize;
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::{NSArray, NSNumber, NSRange, NSString, NSValue, ns_string};
 use objc2_metal::{
     MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer,
     MTLCommandEncoder, MTLCommandQueue, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
@@ -17,7 +17,10 @@ use objc2_metal::{
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLSize,
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
-use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+use objc2_quartz_core::{
+    CACurrentMediaTime, CAKeyframeAnimation, CAMediaTiming, CAMetalDrawable, CAMetalLayer,
+    CATransaction, CATransform3D, NSValueCATransform3DAdditions, kCAFillModeBoth,
+};
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
@@ -108,6 +111,24 @@ pub(crate) struct Renderer {
     /// The pool index of each layer texture of the frame.
     targets: Vec<usize>,
     frame: RenderFrame,
+    /// Effect layers that Core Animation plays in sublayers, see [`Self::promote`].
+    promoted: Vec<Promoted>,
+    /// The sublayers changed, so the next frame presents in the Core Animation transaction.
+    restacked: bool,
+}
+
+/// A recorded frame, and the drawables of the sublayers it draws.
+type Rendered = (
+    Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    Vec<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+);
+
+struct Promoted {
+    key: u64,
+    /// The scene layer.
+    index: usize,
+    sublayer: Retained<CAMetalLayer>,
+    drawn: bool,
 }
 
 enum Blend {
@@ -233,7 +254,163 @@ impl Renderer {
             pool: Vec::new(),
             targets: Vec::new(),
             frame: RenderFrame::default(),
+            promoted: Vec::new(),
+            restacked: false,
         })
+    }
+
+    /// Plays scene layer `index`, keyed `key`, in a sublayer over the window region `region` of
+    /// device pixels: `opacities` and, unless empty, `transforms` (column-major, in points of the
+    /// window, y down) every `step` seconds from now, holding the last ones. A new sublayer gets its
+    /// content with the next frame, which must present before the transaction ends: one frame for
+    /// all sublayers, since Core Animation may show any of the frames presented in it. Returns
+    /// whether the sublayer is new.
+    #[allow(clippy::too_many_arguments)]
+    pub fn promote(
+        &mut self,
+        key: u64,
+        index: usize,
+        region: [i32; 4],
+        step: f64,
+        opacities: &[f32],
+        transforms: &[[f64; 16]],
+    ) -> bool {
+        CATransaction::setDisableActions(true);
+        let scale = self.layer.contentsScale();
+        let [x, y, w, h] = region.map(|value| value as f64 / scale);
+        let height = self.layer.bounds().size.height;
+        let flipped = self.layer.isGeometryFlipped();
+        let mut fresh = false;
+        if let Some(at) = self
+            .promoted
+            .iter()
+            .position(|promoted| promoted.key == key && promoted.index != index)
+        {
+            self.promoted.remove(at).sublayer.removeFromSuperlayer();
+        }
+        let at = match self
+            .promoted
+            .iter()
+            .position(|promoted| promoted.key == key)
+        {
+            Some(at) => at,
+            None => {
+                let sublayer = CAMetalLayer::new();
+                sublayer.setDevice(Some(&self.device));
+                sublayer.setPixelFormat(FORMAT);
+                sublayer.setFramebufferOnly(false);
+                sublayer.setOpaque(false);
+                sublayer.setPresentsWithTransaction(true);
+                sublayer.setContentsScale(scale);
+                sublayer.setDrawableSize(CGSize::new(region[2] as f64, region[3] as f64));
+                sublayer.setAnchorPoint(objc2_core_foundation::CGPoint::new(0., 0.));
+                sublayer.setBounds(objc2_core_foundation::CGRect::new(
+                    objc2_core_foundation::CGPoint::new(0., 0.),
+                    CGSize::new(w, h),
+                ));
+                sublayer.setPosition(objc2_core_foundation::CGPoint::new(
+                    x,
+                    if flipped { y } else { height - y - h },
+                ));
+                self.layer.addSublayer(&sublayer);
+                self.promoted.push(Promoted {
+                    key,
+                    index,
+                    sublayer,
+                    drawn: false,
+                });
+                self.restacked = true;
+                fresh = true;
+                self.promoted.len() - 1
+            }
+        };
+        let sublayer = &self.promoted[at].sublayer;
+        let count = opacities.len().max(1);
+        let times: Vec<_> = (0..count)
+            .map(|k| NSNumber::new_f64(k as f64 / (count - 1).max(1) as f64))
+            .collect();
+        let times = NSArray::from_retained_slice(&times);
+        let begin = CACurrentMediaTime();
+        let play = |path: &NSString, values: &NSArray| {
+            let animation = CAKeyframeAnimation::animationWithKeyPath(Some(path));
+            // SAFETY: the values are what the key path animates: numbers or transform values.
+            unsafe { animation.setValues(Some(values)) };
+            animation.setKeyTimes(Some(&times));
+            animation.setDuration(step * (count - 1) as f64);
+            animation.setBeginTime(begin);
+            // SAFETY: a constant of Core Animation.
+            animation.setFillMode(unsafe { kCAFillModeBoth });
+            animation.setRemovedOnCompletion(false);
+            sublayer.addAnimation_forKey(&animation, Some(path));
+        };
+        let numbers: Vec<_> = opacities
+            .iter()
+            .map(|&value| NSNumber::new_f32(value))
+            .collect();
+        let numbers = NSArray::from_retained_slice(&numbers);
+        // SAFETY: an array of numbers is an array of objects.
+        play(ns_string!("opacity"), unsafe {
+            &*Retained::as_ptr(&numbers).cast::<NSArray>()
+        });
+        sublayer.setOpacity(opacities.last().copied().unwrap_or(1.));
+        if !transforms.is_empty() {
+            // WARNING: the superlayer is y-up unless flipped, and a sublayer turns about its anchor: a
+            // sublayer point maps to the window by `place`, a window point to the superlayer by `lift`.
+            let mul = |a: &[f64; 16], b: &[f64; 16]| -> [f64; 16] {
+                std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[i / 4 * 4 + k]).sum())
+            };
+            let shift = |dx: f64, dy: f64, flip: bool| {
+                let mut m = [0.; 16];
+                [m[0], m[5], m[10], m[15]] = [1., if flip { -1. } else { 1. }, 1., 1.];
+                [m[12], m[13]] = [dx, dy];
+                m
+            };
+            let (place, lift, anchor) = if flipped {
+                (
+                    shift(x, y, false),
+                    shift(0., 0., false),
+                    shift(-x, -y, false),
+                )
+            } else {
+                (
+                    shift(x, y + h, true),
+                    shift(0., height, true),
+                    shift(-x, -(height - y - h), false),
+                )
+            };
+            let values: Vec<_> = transforms
+                .iter()
+                .map(|matrix| {
+                    let m = mul(&anchor, &mul(&lift, &mul(matrix, &place)));
+                    // SAFETY: a `CATransform3D` is 16 `CGFloat`s, which are `f64`, column by column.
+                    let t = unsafe { mem::transmute::<[f64; 16], CATransform3D>(m) };
+                    // SAFETY: a plain struct value.
+                    unsafe { NSValue::valueWithCATransform3D(t) }
+                })
+                .collect();
+            if let Some(last) = values.last() {
+                // SAFETY: the value holds a transform.
+                sublayer.setTransform(unsafe { last.CATransform3DValue() });
+            }
+            let values = NSArray::from_retained_slice(&values);
+            // SAFETY: an array of values is an array of objects.
+            play(ns_string!("transform"), unsafe {
+                &*Retained::as_ptr(&values).cast::<NSArray>()
+            });
+        }
+        fresh
+    }
+
+    /// Takes the promoted layers back into the window frame, from the next frame on.
+    pub fn demote(&mut self) {
+        if self.promoted.is_empty() {
+            return;
+        }
+        CATransaction::setDisableActions(true);
+        for promoted in self.promoted.drain(..) {
+            promoted.sublayer.removeFromSuperlayer();
+        }
+        self.restacked = true;
     }
 
     pub fn atlas(&self) -> &Rc<MetalAtlas> {
@@ -285,11 +462,18 @@ impl Renderer {
         if window[0] == 0 || window[1] == 0 {
             return capture.then(|| Err(anyhow::anyhow!("The window has no size")));
         }
+        if capture {
+            self.demote();
+        }
+        // WARNING: new or removed sublayers show in the Core Animation transaction, so the frame that
+        // draws their layers elsewhere presents in it too.
+        let transact = self.presents_with_transaction || mem::take(&mut self.restacked);
+        self.layer.setPresentsWithTransaction(transact);
         let Some(drawable) = self.layer.nextDrawable() else {
             eprintln!("apps: no drawable for a {window:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
-        let commands = match self.render_frame(scene, &drawable.texture(), window) {
+        let (commands, sublayers) = match self.render_frame(scene, &drawable.texture(), window) {
             Ok(commands) => commands,
             Err(error) => {
                 eprintln!("apps: failed to render: {error:#}");
@@ -297,12 +481,18 @@ impl Renderer {
             }
         };
         let readback = capture.then(|| self.read_back(&commands, &drawable.texture(), window));
-        if self.presents_with_transaction {
+        if transact {
             commands.commit();
             commands.waitUntilScheduled();
             drawable.present();
+            for sublayer in &sublayers {
+                sublayer.present();
+            }
         } else {
             commands.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            for sublayer in &sublayers {
+                commands.presentDrawable(ProtocolObject::from_ref(&**sublayer));
+            }
             commands.commit();
         }
         readback.map(|buffer| {
@@ -365,8 +555,16 @@ impl Renderer {
         scene: &Scene,
         drawable: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
-    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);
+        frame.skip.clear();
+        frame.content.clear();
+        for promoted in &self.promoted {
+            frame.skip.push(promoted.index);
+            if !promoted.drawn {
+                frame.content.push(promoted.index);
+            }
+        }
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         for (_, _, idle) in &mut self.pool {
             *idle = idle.saturating_add(1);
@@ -418,6 +616,45 @@ impl Renderer {
             .commandBuffer()
             .context("creating command buffer")?;
         let result = self.encode(&frame, &commands, drawable, &bindings);
+        let mut sublayers = Vec::new();
+        if result.is_ok() && !frame.promoted.is_empty() {
+            let blit = commands
+                .blitCommandEncoder()
+                .context("creating blit command encoder")?;
+            for &(index, target, region) in &frame.promoted {
+                let Target::Layer(layer) = target else {
+                    continue;
+                };
+                let Some(promoted) = self.promoted.iter_mut().find(|p| p.index == index) else {
+                    continue;
+                };
+                let Some(sublayer) = promoted.sublayer.nextDrawable() else {
+                    continue;
+                };
+                let source = &self.pool[self.targets[frame.layers[layer].texture]].0;
+                // SAFETY: both textures hold the region, which starts at the layer target's origin.
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        source,
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                        MTLSize {
+                            width: region[2] as usize,
+                            height: region[3] as usize,
+                            depth: 1,
+                        },
+                        &sublayer.texture(),
+                        0,
+                        0,
+                        MTLOrigin { x: 0, y: 0, z: 0 },
+                    );
+                }
+                promoted.drawn = true;
+                sublayers.push(sublayer);
+            }
+            blit.endEncoding();
+        }
         self.frame = frame;
         result?;
         // WARNING: Metal may call the completion handler off the main thread, so the buffer goes
@@ -438,7 +675,7 @@ impl Renderer {
         drop(pool);
         // SAFETY: Metal copies the block and calls it once, after the frame completes.
         unsafe { commands.addCompletedHandler(RcBlock::as_ptr(&block)) };
-        Ok(commands)
+        Ok((commands, sublayers))
     }
 
     fn encode(

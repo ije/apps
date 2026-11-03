@@ -49,7 +49,16 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLTexture",
     "MTLTypes",
 ] }
-objc2-quartz-core = { workspace = true, features = ["objc2-core-foundation", "objc2-core-graphics", "objc2-metal"] }
+objc2-quartz-core = { workspace = true, features = [
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-metal",
+    "CAAnimation",
+    "CABase",
+    "CAMediaTiming",
+    "CATransaction",
+    "CATransform3D",
+] }
 pathfinder_geometry.workspace = true
 smallvec.workspace = true
 

@@ -14,7 +14,7 @@ The devtools server gives agents screenshots, DOM, JavaScript evaluation, consol
 Agents call the tools with plain HTTP (`curl -s http://127.0.0.1:<port>/` lists them), or connect an MCP client to `http://127.0.0.1:<port>/mcp`.
 To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.claude/skills/apps-devtools && apps skill > ~/.claude/skills/apps-devtools/SKILL.md`.
 
-`apps run` keeps source maps in memory and reads assets and native addons from their original paths. It does not create `.apps/`.
+`apps run` keeps source maps in memory and reads assets and native addons from their original paths. For JavaScript apps, it does not create `.apps/`.
 `apps build` writes to `dist/` by default and does not generate source maps.
 On macOS, `identifier` in `package.json` sets the bundle ID (`CFBundleIdentifier`). It defaults to `com.apps.<name>`, with `_` changed to `-`.
 It packs imported `.node` addons into the app bundle and writes each one to the user's cache folder the first time it loads.
@@ -134,3 +134,71 @@ The `ready` handler runs once after the main module and the app are ready.
 The `windowClose` handler runs after each window closes. Calls to `app.on()` and `app.whenReady()` also work.
 The `fetch` handler starts a http server with the same options as `serve()`.
 The default port is `3000`.
+
+## macOS tray
+
+Create a `Tray` in the main process after `app.whenReady()`. Put the icon in `icons/` and add `"files": ["icons"]` to `package.json` so it ships with the app. A filename ending in `Template.png` lets macOS adapt the icon to the menu bar.
+
+```js
+import { app, BrowserWindow, Menu, Tray } from 'electron'
+import { join } from 'node:path'
+
+let tray
+app.whenReady().then(() => {
+  tray = new Tray(join(app.getAppPath(), 'icons', 'ServerTemplate.png'))
+  tray.setToolTip('Server is running')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Server', sublabel: 'Running', enabled: false },
+    { type: 'separator' },
+    { label: 'Settings…', click: () => new BrowserWindow().loadFile('settings.html') },
+    { role: 'quit' },
+  ]))
+})
+app.on('window-all-closed', () => {})
+```
+
+The `window-all-closed` listener keeps the tray available after the settings window closes.
+
+## Rust main
+
+Set `type` to `rust` and point `main` at a Rust source file.
+
+```json
+{
+  "name": "my-app",
+  "main": "src/main.rs",
+  "type": "rust",
+  "preload": "preload.ts"
+}
+```
+
+```rust
+use apps::{app, BrowserWindow, WindowOptions};
+
+fn main() -> apps::Result<()> {
+    app::run(|app| {
+        app.handle("greet", |_window, args| {
+            let name = args.first().and_then(|v| v.as_str()).unwrap_or("world");
+            Ok(format!("Hello, {name}!").into())
+        })?;
+        BrowserWindow::new(app, WindowOptions::default())?.load_file("index.html")
+    })
+}
+```
+
+An extension can be a Rust crate with a function such as `pub fn register(app: &apps::App) -> apps::Result<()>`. Call it from the startup callback to register its handlers.
+
+The callback and its registered handlers run on the app's main thread. A handler receives the window ID and a list of JSON arguments. Its result resolves the preload's promise, and an error rejects it. Keep handlers short so the window can draw and respond to input.
+
+```ts
+// preload.ts
+import { ipcRenderer } from '@pierre/apps'
+
+export const greet = (name: string) => ipcRenderer.invoke('greet', name)
+```
+
+Page scripts run in JavaScriptCore. They can import `greet` from the preload. The CLI bundles `index.html` if it exists. Set `"pages": ["index.html", "settings.html"]` to bundle more pages. Paths are relative to `package.json`.
+
+Run `apps run` or `apps build` from the app folder. The CLI uses Cargo to compile the executable. It creates a manifest in `.apps/cargo/` if the app has no `Cargo.toml`. Set `APPS_RUST_SDK` to the `crates/runtime` directory if the CLI has moved away from its source checkout.
+
+To add a crate, put a `Cargo.toml` next to `package.json`. Add `apps = { package = "apps-runtime", path = "/path/to/h2o/crates/runtime" }` under `[dependencies]`. The path in `main` must match a Cargo binary target. Cargo detects `src/main.rs` by default. See [examples/rust](examples/rust) for a complete app.

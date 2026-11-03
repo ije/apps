@@ -59,7 +59,18 @@ fn rotate(axis: [f32; 3], angle: f32) -> Option<Matrix> {
         return None;
     }
     let [x, y, z] = axis.map(|value| value / length);
-    let (s, c) = angle.sin_cos();
+    // Quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
+    let quarter = angle / std::f32::consts::FRAC_PI_2;
+    let (s, c) = if (quarter - quarter.round()).abs() < 1e-6 {
+        [(0., 1.), (1., 0.), (0., -1.), (-1., 0.)][(quarter.round() as i64).rem_euclid(4) as usize]
+    } else {
+        angle.sin_cos()
+    };
+    if [x, y, z] == [0., 0., 1.] {
+        let mut m = IDENTITY;
+        [m[0], m[1], m[4], m[5]] = [c, s, -s, c];
+        return Some(m);
+    }
     let t = 1. - c;
     Some([
         t * x * x + c,
@@ -627,7 +638,15 @@ pub(crate) fn clip(
             let shapes: String = doc.nodes[clip]
                 .children
                 .iter()
-                .map(|&child| doc.serialize(child))
+                .map(|&child| {
+                    doc.serialize_svg(child, false, &|node| {
+                        doc.nodes[node]
+                            .inline
+                            .as_ref()
+                            .map(|inline| vec![("style", inline.source())])
+                            .unwrap_or_default()
+                    })
+                })
                 .collect();
             Some(svg(if object {
                 format!("<g transform=\"scale({width} {height})\">{shapes}</g>")
@@ -711,6 +730,65 @@ pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     }
 }
 
+fn angle(value: &str) -> Option<f32> {
+    let number = |unit: &str| value.strip_suffix(unit).and_then(|v| v.parse::<f32>().ok());
+    number("deg")
+        .or_else(|| number("grad").map(|v| v * 0.9))
+        .or_else(|| number("rad").map(f32::to_degrees))
+        .or_else(|| number("turn").map(|v| v * 360.))
+        .or((value == "0").then_some(0.))
+        .filter(|v| v.is_finite())
+}
+
+/// The first argument of a gradient without its `in <space> [<method> hue]`, which picks the
+/// interpolation space and is not part of the shape, and that space.
+fn first_argument(body: &str) -> (String, Option<String>) {
+    let parts = style::components(body, ',');
+    let words: Vec<&str> = parts
+        .first()
+        .map_or("", |part| part.trim())
+        .split_whitespace()
+        .collect();
+    match words.iter().position(|word| *word == "in") {
+        Some(index) => {
+            let end = words[index + 1..]
+                .iter()
+                .position(|word| *word == "hue")
+                .map_or(index + 2, |hue| index + hue + 2)
+                .min(words.len());
+            let rest = words[..index].iter().chain(&words[end..]);
+            (
+                rest.copied().collect::<Vec<_>>().join(" "),
+                Some(words[index + 1..end].join(" ")),
+            )
+        }
+        None => (words.join(" "), None),
+    }
+}
+
+/// The axis a linear gradient changes along, `1` for vertical, when it is parallel to one.
+pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
+    if kind.trim_start_matches("repeating-") != "linear-gradient" {
+        return None;
+    }
+    let (first, _) = first_argument(body);
+    let degrees = match first.strip_prefix("to ") {
+        Some(side) => match side.trim() {
+            "top" => 0.,
+            "right" => 90.,
+            "bottom" => 180.,
+            "left" => 270.,
+            _ => return None,
+        },
+        None => angle(&first).unwrap_or(180.),
+    };
+    match degrees.rem_euclid(180.) {
+        0. => Some(1),
+        90. => Some(0),
+        _ => None,
+    }
+}
+
 /// The SVG of a CSS gradient layer covering a `width` by `height` box, sized, placed and
 /// repeated like a background or mask layer.
 #[allow(clippy::too_many_arguments)]
@@ -751,37 +829,8 @@ pub(crate) fn gradient_svg(
         "right" | "bottom" => free,
         value => units.resolve(value, free).unwrap_or(0.),
     });
-    let angle = |value: &str| -> Option<f32> {
-        let number = |unit: &str| value.strip_suffix(unit).and_then(|v| v.parse::<f32>().ok());
-        number("deg")
-            .or_else(|| number("grad").map(|v| v * 0.9))
-            .or_else(|| number("rad").map(f32::to_degrees))
-            .or_else(|| number("turn").map(|v| v * 360.))
-            .or((value == "0").then_some(0.))
-            .filter(|v| v.is_finite())
-    };
     let parts = style::components(body, ',');
-    // `in <space> [<method> hue]` picks the interpolation space and is not part of the shape.
-    let words: Vec<&str> = parts
-        .first()
-        .map_or("", |part| part.trim())
-        .split_whitespace()
-        .collect();
-    let (first, space) = match words.iter().position(|word| *word == "in") {
-        Some(index) => {
-            let end = words[index + 1..]
-                .iter()
-                .position(|word| *word == "hue")
-                .map_or(index + 2, |hue| index + hue + 2)
-                .min(words.len());
-            let rest = words[..index].iter().chain(&words[end..]);
-            (
-                rest.copied().collect::<Vec<_>>().join(" "),
-                Some(words[index + 1..end].join(" ")),
-            )
-        }
-        None => (words.join(" "), None),
-    };
+    let (first, space) = first_argument(body);
     let first = first.as_str();
     let repeating = kind.starts_with("repeating-");
     let prelude;
@@ -1111,6 +1160,43 @@ pub(crate) fn gradient_svg(
     ))
 }
 
+/// Appends a box size and the units that lengths resolve with, as hex bits, to a cache key.
+pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
+    let [font, root] = [units.font, units.root]
+        .map(|font| [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]);
+    let container = units.container.unwrap_or([f32::NAN; 2]);
+    for &value in size
+        .iter()
+        .chain(&font)
+        .chain(&root)
+        .chain(&units.viewport)
+        .chain(&container)
+    {
+        let bits = value.to_bits();
+        key.extend(
+            (0..8)
+                .rev()
+                .map(|digit| char::from(b"0123456789abcdef"[(bits >> (digit * 4) & 15) as usize])),
+        );
+    }
+}
+
+/// The `opacity` of a style, from 0 to 1.
+pub(super) fn opacity(style: &style::Style) -> f32 {
+    style
+        .get(Prop::OPACITY)
+        .and_then(|value| {
+            value
+                .strip_suffix('%')
+                .map_or(value.parse::<f32>().ok(), |v| {
+                    v.parse::<f32>().ok().map(|v| v / 100.)
+                })
+        })
+        .filter(|v| v.is_finite())
+        .unwrap_or(1.)
+        .clamp(0., 1.)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,6 +1290,27 @@ mod tests {
         assert!(matrix.is_some());
         assert_eq!(blend_mode("multiply"), BlendMode::Multiply);
         assert_eq!(blend_mode("unknown"), BlendMode::Normal);
+    }
+
+    #[test]
+    fn linear_gradients_along_an_axis_are_found() {
+        for (kind, body, axis) in [
+            ("linear-gradient", "red, blue", Some(1)),
+            ("linear-gradient", "to right, red, blue", Some(0)),
+            ("linear-gradient", "in oklch to left, red, blue", Some(0)),
+            ("linear-gradient", "-90deg, red, blue", Some(0)),
+            ("linear-gradient", "0.5turn in srgb, red, blue", Some(1)),
+            (
+                "repeating-linear-gradient",
+                "to top, red, blue 9px",
+                Some(1),
+            ),
+            ("linear-gradient", "45deg, red, blue", None),
+            ("linear-gradient", "to bottom right, red, blue", None),
+            ("radial-gradient", "red, blue", None),
+        ] {
+            assert_eq!(gradient_axis(kind, body), axis, "{kind}({body})");
+        }
     }
 
     #[test]

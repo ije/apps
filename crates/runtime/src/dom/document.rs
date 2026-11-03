@@ -90,7 +90,7 @@ pub struct Node {
     pub(crate) stylesheet: Option<Rc<crate::style::Stylesheet>>,
     pub(crate) inline: Option<crate::style::Declarations>,
     #[serde(skip)]
-    pub(crate) state: u8,
+    pub(crate) state: u16,
     /// The value a script or the user gave a form control, which its `value` attribute no longer gives.
     #[serde(skip)]
     pub(crate) value: Option<String>,
@@ -278,6 +278,10 @@ enum Content {
 struct Builder {
     nodes: Vec<Node>,
     stack: Vec<Open>,
+    /// The active formatting elements with their attributes, `None` for a marker.
+    active: Vec<Option<(usize, Attrs)>>,
+    /// Whether each node is on the stack of open elements.
+    opened: Vec<bool>,
     last: rustc_hash::FxHashMap<u64, usize>,
     bound: [usize; 7],
     mode: Mode,
@@ -478,6 +482,18 @@ impl Builder {
             }
         }
         let saved = mode.map(|mode| std::mem::replace(&mut self.mode, mode));
+        if html
+            && matches!(
+                tag,
+                "applet" | "caption" | "marquee" | "object" | "td" | "th" | "template"
+            )
+        {
+            self.active.push(None);
+        }
+        if self.opened.len() <= id {
+            self.opened.resize(id + 1, false);
+        }
+        self.opened[id] = true;
         self.stack.push(Open {
             id,
             key,
@@ -494,6 +510,15 @@ impl Builder {
             return;
         }
         let Some(open) = self.stack.pop() else { return };
+        self.opened[open.id] = false;
+        if !open.svg
+            && matches!(
+                self.nodes[open.id].tag.as_str(),
+                "applet" | "caption" | "marquee" | "object" | "td" | "th" | "template"
+            )
+        {
+            while let Some(Some(_)) = self.active.pop() {}
+        }
         if open.prev == 0 {
             self.last.remove(&open.key);
         } else {
@@ -625,6 +650,197 @@ impl Builder {
             self.push(id, true, None);
         }
         Content::Markup
+    }
+
+    /// Opens again the formatting elements that closed with an element they were in, like `<b>` after `</p>`.
+    fn reconstruct(&mut self) {
+        let Some(Some((last, _))) = self.active.last() else {
+            return;
+        };
+        if self.opened[*last] {
+            return;
+        }
+        let mut start = self.active.len() - 1;
+        while start > 0 && matches!(&self.active[start - 1], Some((id, _)) if !self.opened[*id]) {
+            start -= 1;
+        }
+        for index in start..self.active.len() {
+            let Some((id, attrs)) = self.active[index].clone() else {
+                continue;
+            };
+            let tag = self.nodes[id].tag.clone();
+            let clone = self.element(&tag, attrs.clone());
+            self.push(clone, false, None);
+            self.active[index] = Some((clone, attrs));
+        }
+    }
+
+    /// Moves `child` to the end of `parent`.
+    fn adopt(&mut self, child: usize, parent: usize) {
+        if let Some(old) = self.nodes[child].parent {
+            self.nodes[old].children.retain(|&id| id != child);
+        }
+        self.nodes[child].parent = Some(parent);
+        self.nodes[parent].children.push(child);
+    }
+
+    /// The HTML adoption agency algorithm for the end tag of formatting element `subject`, which
+    /// splits misnested formatting elements, like `<b><p>x</b>y` into `<b></b><p><b>x</b>y`.
+    // WARNING: it edits the stack in the middle, so the open elements from the formatting element up
+    // are taken off and pushed again, which recomputes the scope positions.
+    fn adoption(&mut self, subject: &str) {
+        let is = |builder: &Self, id: usize| builder.nodes[id].tag == subject;
+        if let Some(open) = self.stack.last()
+            && !open.svg
+            && is(self, open.id)
+            && !self.active.iter().flatten().any(|(id, _)| *id == open.id)
+        {
+            return self.pop();
+        }
+        for _ in 0..8 {
+            let Some(index) = self
+                .active
+                .iter()
+                .rposition(|entry| entry.as_ref().is_none_or(|(id, _)| is(self, *id)))
+                .filter(|&index| self.active[index].is_some())
+            else {
+                let at = self
+                    .last
+                    .get(&key(subject))
+                    .copied()
+                    .filter(|&at| at >= self.bound[SPECIAL])
+                    .unwrap_or(0);
+                return self.pop_to(at);
+            };
+            let Some((formatting, attrs)) = self.active[index].clone() else {
+                return;
+            };
+            let Some(position) = self.stack.iter().rposition(|open| open.id == formatting) else {
+                self.active.remove(index);
+                return;
+            };
+            if position + 1 < self.bound[DEFAULT] {
+                return;
+            }
+            let Some(furthest) = (position + 1..self.stack.len())
+                .find(|&at| self.stack[at].bits & 1 << SPECIAL != 0)
+                .map(|at| self.stack[at].id)
+            else {
+                self.pop_to(position + 1);
+                self.active.remove(index);
+                return;
+            };
+            let common = self.stack[position - 1].id;
+            let mut tail = self.stack.split_off(position);
+            for open in tail.iter().rev() {
+                match open.prev {
+                    0 => self.last.remove(&open.key),
+                    prev => self.last.insert(open.key, prev),
+                };
+                self.bound = open.below;
+            }
+            let mut bookmark = index;
+            let mut last = furthest;
+            let mut at = tail
+                .iter()
+                .position(|open| open.id == furthest)
+                .unwrap_or(0);
+            let mut count = 0;
+            loop {
+                count += 1;
+                at -= 1;
+                let node = tail[at].id;
+                if node == formatting {
+                    break;
+                }
+                let mut entry = self
+                    .active
+                    .iter()
+                    .position(|entry| matches!(entry, Some((id, _)) if *id == node));
+                if count > 3
+                    && let Some(found) = entry.take()
+                {
+                    self.active.remove(found);
+                    if found < bookmark {
+                        bookmark -= 1;
+                    }
+                }
+                let Some(entry) = entry else {
+                    self.opened[node] = false;
+                    tail.remove(at);
+                    continue;
+                };
+                let attrs = self.active[entry]
+                    .as_ref()
+                    .map(|(_, attrs)| attrs.clone())
+                    .unwrap_or_default();
+                let clone = self.nodes.len();
+                self.nodes.push(Node {
+                    tag: self.nodes[node].tag.clone(),
+                    attrs: attrs.clone(),
+                    ..Node::default()
+                });
+                self.opened.resize(clone + 1, false);
+                self.opened[node] = false;
+                self.opened[clone] = true;
+                self.active[entry] = Some((clone, attrs));
+                tail[at].id = clone;
+                if last == furthest {
+                    bookmark = entry + 1;
+                }
+                self.adopt(last, clone);
+                last = clone;
+            }
+            self.adopt(last, common);
+            let clone = self.nodes.len();
+            self.nodes.push(Node {
+                tag: subject.into(),
+                attrs: attrs.clone(),
+                ..Node::default()
+            });
+            self.opened.resize(clone + 1, false);
+            for child in std::mem::take(&mut self.nodes[furthest].children) {
+                self.nodes[child].parent = Some(clone);
+                self.nodes[clone].children.push(child);
+            }
+            self.adopt(clone, furthest);
+            if let Some(old) = self
+                .active
+                .iter()
+                .position(|entry| matches!(entry, Some((id, _)) if *id == formatting))
+            {
+                self.active.remove(old);
+                if old < bookmark {
+                    bookmark -= 1;
+                }
+            }
+            self.active
+                .insert(bookmark.min(self.active.len()), Some((clone, attrs)));
+            let mut open = tail.remove(0);
+            self.opened[formatting] = false;
+            open.id = clone;
+            let below = tail
+                .iter()
+                .position(|open| open.id == furthest)
+                .map_or(tail.len(), |at| at + 1);
+            tail.insert(below, open);
+            for open in tail {
+                let at = self.stack.len() + 1;
+                let prev = self.last.insert(open.key, at).unwrap_or(0);
+                let below = self.bound;
+                for (kind, bound) in self.bound.iter_mut().enumerate() {
+                    if open.bits & 1 << kind != 0 {
+                        *bound = at;
+                    }
+                }
+                self.opened[open.id] = true;
+                self.stack.push(Open {
+                    prev,
+                    below,
+                    ..open
+                });
+            }
+        }
     }
 
     fn insert(&mut self, text: &str) {
@@ -1094,14 +1310,61 @@ impl Builder {
                 self.open(tag, attrs, None);
                 Content::Plain
             }
-            "button" | "a" | "nobr" => {
+            "button" => {
                 let open = self.scope(tag, DEFAULT);
                 self.pop_to(open);
+                self.reconstruct();
                 self.open(tag, attrs, None)
+            }
+            "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small"
+            | "strike" | "strong" | "tt" | "u" => {
+                let marker = self
+                    .active
+                    .iter()
+                    .rposition(Option::is_none)
+                    .map_or(0, |at| at + 1);
+                if tag == "a"
+                    && let Some((id, _)) = self.active[marker..]
+                        .iter()
+                        .flatten()
+                        .find(|(id, _)| self.nodes[*id].tag == "a")
+                        .cloned()
+                {
+                    self.adoption("a");
+                    self.active
+                        .retain(|entry| entry.as_ref().is_none_or(|(other, _)| *other != id));
+                    if let Some(at) = self.stack.iter().rposition(|open| open.id == id) {
+                        self.pop_to(at + 1);
+                    }
+                }
+                self.reconstruct();
+                if tag == "nobr" && self.scope(tag, DEFAULT) > 0 {
+                    self.adoption("nobr");
+                    self.reconstruct();
+                }
+                // Like browsers, at most three equal formatting elements are reopened.
+                let marker = self
+                    .active
+                    .iter()
+                    .rposition(Option::is_none)
+                    .map_or(0, |at| at + 1);
+                let same: Vec<usize> = (marker..self.active.len())
+                    .filter(|&at| matches!(&self.active[at], Some((id, other)) if self.nodes[*id].tag == tag && *other == attrs))
+                    .collect();
+                if same.len() >= 3 {
+                    self.active.remove(same[0]);
+                }
+                let id = self.element(tag, attrs.clone());
+                self.push(id, false, None);
+                self.active.push(Some((id, attrs)));
+                Content::Markup
             }
             "table" => self.open(tag, attrs, Some(Mode::Table)),
             "area" | "br" | "embed" | "img" | "image" | "keygen" | "wbr" | "input" | "param"
             | "source" | "track" | "hr" => {
+                if !matches!(tag, "param" | "source" | "track" | "hr") {
+                    self.reconstruct();
+                }
                 self.element(if tag == "image" { "img" } else { tag }, attrs);
                 Content::Markup
             }
@@ -1109,11 +1372,15 @@ impl Builder {
             "xmp" | "iframe" | "noembed" | "noscript" => {
                 Content::Raw(self.element(tag, attrs), false)
             }
-            "select" => self.open(tag, attrs, Some(Mode::Select)),
+            "select" => {
+                self.reconstruct();
+                self.open(tag, attrs, Some(Mode::Select))
+            }
             "optgroup" | "option" => {
                 if self.is("option") {
                     self.pop();
                 }
+                self.reconstruct();
                 self.open(tag, attrs, None)
             }
             "rb" | "rtc" | "rp" | "rt" => {
@@ -1146,8 +1413,14 @@ impl Builder {
                 }
                 self.open(tag, attrs, None)
             }
-            "svg" => self.svg(tag, attrs, closing),
-            _ => self.open(tag, attrs, None),
+            "svg" => {
+                self.reconstruct();
+                self.svg(tag, attrs, closing)
+            }
+            _ => {
+                self.reconstruct();
+                self.open(tag, attrs, None)
+            }
         }
     }
 
@@ -1401,6 +1674,8 @@ impl Builder {
             | "figcaption" | "figure" | "footer" | "form" | "header" | "hgroup" | "listing"
             | "main" | "marquee" | "menu" | "nav" | "object" | "ol" | "pre" | "search"
             | "section" | "summary" | "ul" => self.scope(tag, DEFAULT),
+            "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small"
+            | "strike" | "strong" | "tt" | "u" => return self.adoption(tag),
             _ => self
                 .last
                 .get(&key(tag))
@@ -1459,8 +1734,15 @@ impl Builder {
             }
             Mode::Table | Mode::Section | Mode::Row => {
                 self.foster = !rest.is_empty();
+                if self.foster {
+                    self.reconstruct();
+                }
                 self.insert(text);
                 self.foster = false;
+            }
+            Mode::Body | Mode::Caption | Mode::Cell => {
+                self.reconstruct();
+                self.insert(text);
             }
             _ => self.insert(text),
         }
@@ -1495,6 +1777,8 @@ impl Document {
                 ..Node::default()
             }],
             stack: Vec::new(),
+            active: Vec::new(),
+            opened: Vec::new(),
             last: rustc_hash::FxHashMap::default(),
             bound: [0; 7],
             mode: Mode::Initial,
@@ -1664,6 +1948,49 @@ impl Document {
                     .is_some_and(|word| word.eq_ignore_ascii_case(b"doctype"))
                 {
                     builder.comment(&rest[if next == b'?' { 1 } else { 2 }..close]);
+                } else if context.is_none()
+                    && matches!(builder.mode, Mode::Initial)
+                    && builder.stack.is_empty()
+                {
+                    // A doctype keeps its name, then its public and system ids after NULs when it has them.
+                    let body = rest[9.min(close)..close].trim_ascii();
+                    let (name, tail) = body
+                        .split_once(|c: char| c.is_ascii_whitespace())
+                        .unwrap_or((body, ""));
+                    let quoted = |text: &str| -> Option<(String, String)> {
+                        let text = text.trim_ascii_start();
+                        let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+                        let end = text[1..].find(quote).map_or(text.len(), |end| end + 1);
+                        Some((
+                            text[1..end].into(),
+                            text.get(end + 1..).unwrap_or("").into(),
+                        ))
+                    };
+                    let tail = tail.trim_ascii_start();
+                    let ids = match tail.get(..6).map(str::to_ascii_lowercase).as_deref() {
+                        Some("public") => quoted(&tail[6..]).map(|(public, rest)| {
+                            (
+                                public,
+                                quoted(&rest).map(|(system, _)| system).unwrap_or_default(),
+                            )
+                        }),
+                        Some("system") => {
+                            quoted(&tail[6..]).map(|(system, _)| (String::new(), system))
+                        }
+                        _ => None,
+                    };
+                    let mut text = name.to_ascii_lowercase();
+                    if let Some((public, system)) = ids {
+                        text = format!("{text}\0{public}\0{system}");
+                    }
+                    let id = builder.nodes.len();
+                    builder.nodes.push(Node {
+                        tag: "#doctype".into(),
+                        text,
+                        parent: Some(0),
+                        ..Node::default()
+                    });
+                    builder.nodes[0].children.push(id);
                 }
                 pos += (close + 1).min(rest.len());
             }
@@ -1695,7 +2022,7 @@ impl Document {
         let mut pending = vec![root];
         while let Some(id) = pending.pop() {
             let node = &self.nodes[id];
-            if id != root && node.tag == "#comment" {
+            if id != root && matches!(node.tag.as_str(), "#comment" | "#doctype") {
                 continue;
             }
             match &node.stylesheet {
@@ -1707,13 +2034,30 @@ impl Document {
         text
     }
 
+    /// Serializes the subtree as HTML, with its comments, which hydration markers of pages need.
     pub fn serialize(&self, id: usize) -> String {
-        self.serialize_marked(id, false)
+        self.write(id, false, None)
     }
 
-    /// Serializes the subtree, and with `mark` gives each element without an id the id `h2o-<node>`, so
-    /// SVG geometry can be traced back to nodes.
-    pub fn serialize_marked(&self, id: usize, mark: bool) -> String {
+    /// Serializes the subtree for an SVG source, without comments because XML rejects `--` in them. With
+    /// `mark`, each element without an id gets the id `h2o-<node>`, so SVG geometry can be traced back to
+    /// nodes. `attrs` gives the attributes that replace an element's own, like its `style`; an empty value
+    /// drops the attribute. Elements never keep their own `style`.
+    pub fn serialize_svg(
+        &self,
+        id: usize,
+        mark: bool,
+        attrs: &dyn Fn(usize) -> Vec<(&'static str, String)>,
+    ) -> String {
+        self.write(id, mark, Some(attrs))
+    }
+
+    fn write(
+        &self,
+        id: usize,
+        mark: bool,
+        svg: Option<&dyn Fn(usize) -> Vec<(&'static str, String)>>,
+    ) -> String {
         let mut result = String::new();
         let mut pending = vec![(id, false)];
         while let Some((id, close)) = pending.pop() {
@@ -1748,14 +2092,36 @@ impl Document {
                     }
                     continue;
                 }
-                "#comment" => continue,
+                "#comment" => {
+                    if svg.is_none() {
+                        result.push_str("<!--");
+                        result.push_str(&node.text);
+                        result.push_str("-->");
+                    }
+                    continue;
+                }
+                "#doctype" => {
+                    let mut ids = node.text.split('\0');
+                    result.push_str(&format!("<!DOCTYPE {}", ids.next().unwrap_or("")));
+                    if let (Some(public), Some(system)) = (ids.next(), ids.next()) {
+                        result.push_str(&format!(" PUBLIC \"{public}\" \"{system}\""));
+                    }
+                    result.push('>');
+                    continue;
+                }
                 _ => {}
             }
             let element = id != 0 && !node.tag.starts_with('#');
             if element {
                 result.push('<');
                 result.push_str(&node.tag);
+                let replaced = svg.map(|attrs| attrs(id));
                 for (key, value) in &node.attrs {
+                    if replaced.as_ref().is_some_and(|replaced| {
+                        key == "style" || replaced.iter().any(|(name, _)| name == key)
+                    }) {
+                        continue;
+                    }
                     result.push(' ');
                     result.push_str(key);
                     result.push_str("=\"");
@@ -1765,10 +2131,22 @@ impl Document {
                 if mark && !node.attrs.contains_key("id") {
                     result.push_str(&format!(" id=\"h2o-{id}\""));
                 }
-                if let Some(inline) = &node.inline {
-                    result.push_str(" style=\"");
-                    result.push_str(&escape(&inline.source()));
-                    result.push('"');
+                let extra = match replaced {
+                    Some(replaced) => replaced,
+                    None => node
+                        .inline
+                        .as_ref()
+                        .map(|inline| vec![("style", inline.source())])
+                        .unwrap_or_default(),
+                };
+                for (name, value) in extra {
+                    if !value.is_empty() {
+                        result.push(' ');
+                        result.push_str(name);
+                        result.push_str("=\"");
+                        result.push_str(&escape(&value));
+                        result.push('"');
+                    }
                 }
                 result.push('>');
             }
@@ -1943,6 +2321,7 @@ mod tests {
         match node.tag.as_str() {
             "#text" => format!("{:?}", node.text),
             "#comment" => format!("<!--{}-->", node.text),
+            "#doctype" => format!("<!DOCTYPE {}>", node.text.replace('\0', "|")),
             tag => {
                 let attrs: String = node
                     .attrs
@@ -2000,10 +2379,15 @@ mod tests {
             "<div><b>x</div>y<svg><linearGradient><stop/></LINEARGRADIENT><g></g></svg><table><tr><td><p>in</table><i>out</i>",
         );
         let y = doc.nodes.iter().position(|n| n.text == "y").unwrap();
-        assert_eq!(doc.nodes[doc.nodes[y].parent.unwrap()].tag, "body");
+        let b = doc.nodes[y].parent.unwrap();
+        assert_eq!(
+            (doc.nodes[b].tag.as_str(), parent(&doc, "div").as_str()),
+            ("b", "body")
+        );
+        assert_eq!(doc.nodes[doc.nodes[b].parent.unwrap()].tag, "body");
         assert_eq!(parent(&doc, "g"), "svg");
         assert_eq!(parent(&doc, "stop"), "linearGradient");
-        assert_eq!(parent(&doc, "i"), "body");
+        assert_eq!(parent(&doc, "i"), "b");
     }
 
     #[test]
@@ -2072,7 +2456,7 @@ mod tests {
         for (source, expected) in [
             (
                 "<!doctype html><title>x</title><p>",
-                "<html><head><title>\"x\"</title></head><body><p></p></body></html>",
+                "<!DOCTYPE html><html><head><title>\"x\"</title></head><body><p></p></body></html>",
             ),
             (
                 "<html><body>a",
@@ -2110,6 +2494,26 @@ mod tests {
                 "<a href=1>x<a href=2>y</a><br></br><!--c-->",
                 "<html><head></head><body><a href=\"1\">\"x\"</a><a href=\"2\">\"y\"</a><br></br><br></br><!--c--></body></html>",
             ),
+            (
+                "<b>1<p>2</b>3</p>",
+                "<html><head></head><body><b>\"1\"</b><p><b>\"2\"</b>\"3\"</p></body></html>",
+            ),
+            (
+                "<a><p>X<a>Y</a>Z</p></a>",
+                "<html><head></head><body><a></a><p><a>\"X\"</a><a>\"Y\"</a>\"Z\"</p></body></html>",
+            ),
+            (
+                "<p><b><i>x</p>y",
+                "<html><head></head><body><p><b><i>\"x\"</i></b></p><b><i>\"y\"</i></b></body></html>",
+            ),
+            (
+                "<b><div><i>x</b>y</i>z",
+                "<html><head></head><body><b></b><div><b><i>\"x\"</i></b><i>\"y\"</i>\"z\"</div></body></html>",
+            ),
+            (
+                "<table><tr><td><b>x</td><td>y</td></tr></table>z",
+                "<html><head></head><body><table><tbody><tr><td><b>\"x\"</b></td><td>\"y\"</td></tr></tbody></table>\"z\"</body></html>",
+            ),
         ] {
             assert_eq!(tree(&Document::parse(source), 0), expected, "{source}");
         }
@@ -2118,7 +2522,47 @@ mod tests {
         );
         assert_eq!(
             tree(&doc, 0),
-            "<!-- a --><!--?xml x?--><!--3--><html lang=\"en\"><head></head><body></body></html>"
+            "<!-- a --><!DOCTYPE html><!--?xml x?--><!--3--><html lang=\"en\"><head></head><body></body></html>"
+        );
+        for (source, expected) in [
+            (
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" 'http://www.w3.org/TR/html4/strict.dtd'><p>",
+                "<!DOCTYPE html|-//W3C//DTD HTML 4.01//EN|http://www.w3.org/TR/html4/strict.dtd>",
+            ),
+            (
+                "<!doctype html SYSTEM \"about:legacy-compat\">",
+                "<!DOCTYPE html||about:legacy-compat>",
+            ),
+            ("<!doctype>", "<!DOCTYPE >"),
+            ("<html><!doctype html>", ""),
+        ] {
+            let doc = Document::parse(source);
+            let first = &doc.nodes[doc.nodes[0].children[0]];
+            assert_eq!(
+                if first.tag == "#doctype" {
+                    tree(&doc, doc.nodes[0].children[0])
+                } else {
+                    String::new()
+                },
+                expected,
+                "{source}"
+            );
+        }
+        assert!(
+            Document::fragment("<!doctype html><p>", "body")
+                .nodes
+                .iter()
+                .all(|node| node.tag != "#doctype")
+        );
+        let legacy = Document::parse("<!DOCTYPE html PUBLIC \"a\" \"b\"><p>x");
+        assert!(
+            legacy
+                .serialize(0)
+                .starts_with("<!DOCTYPE html PUBLIC \"a\" \"b\"><html>")
+        );
+        assert_eq!(
+            Document::parse(&legacy.serialize(0)).nodes[1].text,
+            "html\0a\0b"
         );
     }
 
@@ -2264,6 +2708,27 @@ mod tests {
         assert_eq!(
             tree(&doc, 0),
             "<svg><g></g></svg><div>\"x\"</div><circle></circle>"
+        );
+    }
+
+    #[test]
+    fn html_keeps_comments_and_svg_sources_drop_them() {
+        let doc = Document::parse(
+            "<p>a<!-- -->b<svg><!--x--><g style='fill:red' x='1' transform='scale(2)'></g></svg></p>",
+        );
+        assert!(doc.serialize(0).contains("<p>a<!-- -->b<svg><!--x--><g style=\"fill:red\" x=\"1\" transform=\"scale(2)\"></g></svg></p>"));
+        let svg = find(&doc, "svg");
+        assert_eq!(
+            doc.serialize_svg(svg, false, &|node| if doc.nodes[node].tag == "g" {
+                vec![
+                    ("style", "fill:blue".into()),
+                    ("x", "2".into()),
+                    ("transform", String::new()),
+                ]
+            } else {
+                Vec::new()
+            }),
+            "<svg><g style=\"fill:blue\" x=\"2\"></g></svg>"
         );
     }
 

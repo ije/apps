@@ -148,10 +148,15 @@ const ELECTRON: &[&str] = &[
     "Notification",
     "Menu",
     "MenuItem",
+    "Tray",
     "globalShortcut",
     "session",
     "powerMonitor",
     "screen",
+    "powerSaveBlocker",
+    "systemPreferences",
+    "webUtils",
+    "net",
 ];
 
 /// `$appsN<module>.<name>`: how linked module code reads an import, so it needs no `with` scope.
@@ -849,11 +854,14 @@ impl Builder {
                         "CLOSING",
                     ],
                 ),
+                // WARNING: `__apps.net` is Electron's net, so node's net comes from the built-in modules.
                 "node:net" => (
-                    "globalThis.__apps.net",
+                    "globalThis.__apps.module.createRequire()('net')",
                     vec![
                         "Socket",
                         "Server",
+                        "BlockList",
+                        "SocketAddress",
                         "connect",
                         "createConnection",
                         "createServer",
@@ -1080,6 +1088,24 @@ impl Builder {
                         "subtle",
                         "constants",
                         "getCurves",
+                        "KeyObject",
+                        "Sign",
+                        "Verify",
+                        "createSecretKey",
+                        "createPublicKey",
+                        "createPrivateKey",
+                        "createSign",
+                        "createVerify",
+                        "sign",
+                        "verify",
+                        "generateKeyPair",
+                        "generateKeyPairSync",
+                        "generateKey",
+                        "generateKeySync",
+                        "hkdf",
+                        "hkdfSync",
+                        "scrypt",
+                        "scryptSync",
                     ],
                 ),
                 "node:worker_threads" => (
@@ -1328,6 +1354,14 @@ impl Builder {
                         "futimesSync",
                         "fdatasync",
                         "fdatasyncSync",
+                        "statfs",
+                        "statfsSync",
+                        "readv",
+                        "readvSync",
+                        "writev",
+                        "writevSync",
+                        "glob",
+                        "globSync",
                     ],
                 ),
                 "node:fs/promises" => (
@@ -1362,6 +1396,8 @@ impl Builder {
                         "open",
                         "opendir",
                         "watch",
+                        "statfs",
+                        "glob",
                     ],
                 ),
                 "node:os" => (
@@ -1556,8 +1592,61 @@ impl Builder {
                     "globalThis.__apps.tty",
                     vec!["isatty", "ReadStream", "WriteStream"],
                 ),
-                "node:dns" => ("globalThis.__apps.dns", vec!["lookup", "promises"]),
-                "node:dns/promises" => ("globalThis.__apps.dns.promises", vec!["lookup"]),
+                "node:dns" | "node:dns/promises" => {
+                    let mut names = vec![
+                        "lookup",
+                        "Resolver",
+                        "getServers",
+                        "setServers",
+                        "getDefaultResultOrder",
+                        "setDefaultResultOrder",
+                        "resolve",
+                        "reverse",
+                        "resolve4",
+                        "resolve6",
+                        "resolveAny",
+                        "resolveCaa",
+                        "resolveCname",
+                        "resolveMx",
+                        "resolveNaptr",
+                        "resolveNs",
+                        "resolvePtr",
+                        "resolveSoa",
+                        "resolveSrv",
+                        "resolveTlsa",
+                        "resolveTxt",
+                        "NODATA",
+                        "FORMERR",
+                        "SERVFAIL",
+                        "NOTFOUND",
+                        "NOTIMP",
+                        "REFUSED",
+                        "BADQUERY",
+                        "BADNAME",
+                        "BADFAMILY",
+                        "BADRESP",
+                        "CONNREFUSED",
+                        "TIMEOUT",
+                        "EOF",
+                        "FILE",
+                        "NOMEM",
+                        "DESTRUCTION",
+                        "BADSTR",
+                        "BADFLAGS",
+                        "NONAME",
+                        "BADHINTS",
+                        "NOTINITIALIZED",
+                        "LOADIPHLPAPI",
+                        "ADDRGETNETWORKPARAMS",
+                        "CANCELLED",
+                    ];
+                    if specifier == "node:dns" {
+                        names.extend(["promises", "ADDRCONFIG", "V4MAPPED", "ALL"]);
+                        ("globalThis.__apps.dns", names)
+                    } else {
+                        ("globalThis.__apps.dns.promises", names)
+                    }
+                }
                 "node:querystring" => (
                     "globalThis.__apps.querystring",
                     vec![
@@ -2456,6 +2545,16 @@ pub fn compile(
     let package = manifest.as_ref().map(fs::read_to_string).transpose()?;
     let metadata: Value =
         serde_json::from_str(package.as_deref().unwrap_or("{}")).context("Invalid package.json")?;
+    let rust = entry.extension().is_some_and(|ext| ext == "rs") && realm == Realm::Main;
+    let root = if rust {
+        ensure!(
+            metadata["type"] == "rust",
+            "A Rust main needs type: rust in package.json"
+        );
+        manifest.as_ref().unwrap().parent().unwrap().to_owned()
+    } else {
+        root
+    };
     let preload = metadata
         .get("preload")
         .map(|value| {
@@ -2572,13 +2671,68 @@ pub fn compile(
         cache,
         ..Shared::default()
     });
-    let mut output = bundle(
-        vec![(entry.to_owned(), inline)],
-        realm,
-        files,
-        shared.clone(),
-        production,
-    )?;
+    let mut output = if rust {
+        let mut output = BBTreeMap::new();
+        let defaults = [json!("index.html")];
+        let pages = match metadata.get("pages") {
+            Some(value) => value
+                .as_array()
+                .context("package.json pages must be an array")?
+                .as_slice(),
+            None => {
+                let index = shared.root.join("index.html");
+                files.borrow_mut().insert(index.clone());
+                if index.try_exists()? {
+                    defaults.as_slice()
+                } else {
+                    &[]
+                }
+            }
+        };
+        for page in pages {
+            let name = page
+                .as_str()
+                .context("Expected a page path")?
+                .trim_start_matches("./");
+            let relative = Path::new(name);
+            ensure!(
+                name.ends_with(".html")
+                    && !name.contains(['\\', '?', '#'])
+                    && relative
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "Invalid page path {name:?}"
+            );
+            ensure!(!output.contains_key(name), "Duplicate page {name:?}");
+            let path = shared.root.join(relative);
+            files.borrow_mut().insert(path.clone());
+            ensure!(
+                path.canonicalize()
+                    .with_context(|| format!("Cannot find page {name:?}"))?
+                    .starts_with(&shared.root),
+                "Page outside app: {name}"
+            );
+            output.insert(
+                name.into(),
+                html(&path, files.clone(), shared.clone(), production)?,
+            );
+        }
+        collect_files(
+            &mut output,
+            &mut files.borrow_mut(),
+            &shared.root,
+            Some(&shared.root),
+        )?;
+        output
+    } else {
+        bundle(
+            vec![(entry.to_owned(), inline)],
+            realm,
+            files,
+            shared.clone(),
+            production,
+        )?
+    };
     for (index, code) in shared.scripts.take().into_iter().enumerate() {
         output.insert(format!("script-{index}.js"), code);
     }
@@ -2620,8 +2774,10 @@ fn bundle(
                 return builder.visit(path, inline);
             };
             // WARNING: a classic script runs as its own bundled script through `__appsChunk`, so it gets the global
-            // scope, sloppy mode and the window as `this`. Its entry module only runs it in order.
-            let code = format!("$appsClassic({})", json!(name));
+            // scope, sloppy mode and the window as `this`. Its entry module only runs it in order. The name ends
+            // with `#` and the position of its `<script>` element.
+            let (name, element) = name.split_once('#').context("Missing script element")?;
+            let code = format!("$appsClassic({},{element})", json!(name));
             classic = true;
             let next = builder.graph.ids.len();
             let id = *builder.graph.ids.entry(path.clone()).or_insert(next);
@@ -3026,7 +3182,7 @@ fn bundle(
             + 64,
     );
     if classic {
-        app.push_str("const $appsClassic=this.__appsChunk;\n");
+        app.push_str("const $appsChunk=this.__appsChunk,$appsScripts=document.getElementsByTagName('script'),$appsClassic=(name,element)=>{__appsScript($appsScripts[element]);$appsChunk(name)};\n");
     }
     for line in builder.lines.iter().flatten() {
         app.push_str(line);
@@ -3045,8 +3201,24 @@ fn bundle(
     for (_, (name, source)) in builder.assets {
         files.insert(name, source);
     }
+    let main = (realm == Realm::Main).then_some(key.1.parent()).flatten();
+    collect_files(
+        &mut files,
+        &mut builder.files.borrow_mut(),
+        &builder.shared.root,
+        main,
+    )?;
+    Ok(files)
+}
+
+fn collect_files(
+    files: &mut BBTreeMap<String, String>,
+    sources: &mut BTreeSet<PathBuf>,
+    root: &Path,
+    main: Option<&Path>,
+) -> Result<()> {
     let mut native = std::collections::BTreeMap::new();
-    for path in builder.files.borrow().iter().filter(|path| {
+    for path in sources.iter().filter(|path| {
         path.extension()
             .is_some_and(|extension| extension == "node")
     }) {
@@ -3063,17 +3235,14 @@ fn bundle(
     if !native.is_empty() {
         files.insert("native.json".into(), serde_json::to_string(&native)?);
     }
-    let assets: std::collections::BTreeMap<_, _> = builder
-        .files
-        .borrow()
+    let assets: std::collections::BTreeMap<_, _> = sources
         .iter()
-        .filter_map(|path| Some((asset_name(&builder.shared.root, path)?, path.clone())))
+        .filter_map(|path| Some((asset_name(root, path)?, path.clone())))
         .collect();
     if !assets.is_empty() {
         files.insert("assets.json".into(), serde_json::to_string(&assets)?);
     }
-    if realm == Realm::Main {
-        let root = key.1.parent().context("Missing entry directory")?;
+    if let Some(root) = main {
         let mut package = json!({});
         for directory in root.ancestors() {
             let path = directory.join("package.json");
@@ -3089,7 +3258,7 @@ fn bundle(
                 "Expected an object in {}",
                 path.display()
             );
-            builder.files.borrow_mut().insert(path);
+            sources.insert(path);
             break;
         }
         if package.get("name").is_none() {
@@ -3114,7 +3283,7 @@ fn bundle(
                         }
                     }
                 }
-                builder.files.borrow_mut().insert(path);
+                sources.insert(path);
             }
         }
         let source = package.to_string();
@@ -3122,12 +3291,15 @@ fn bundle(
             apps_runtime::bundle::package_metadata(Some(&source))?;
         apps_runtime::bundle::disabled_features(Some(&source))?;
         let mut metadata = json!({"name":name,"productName":product_name,"version":version,"identifier":identifier});
+        if package["type"] == "rust" {
+            metadata["type"] = "rust".into();
+        }
         if let Some(features) = package.get("features") {
             metadata["features"] = features.clone();
         }
         files.insert("package.json".into(), metadata.to_string());
     }
-    Ok(files)
+    Ok(())
 }
 
 fn native_specifier(path: &Path) -> Result<String> {
@@ -3509,12 +3681,9 @@ fn html(
                     &shared,
                 )?,
             };
-            sheet = Some(match node.attrs.get("media") {
-                Some(media) => format!("@media {media}{{{text}}}"),
-                None => text,
-            });
-            node.tag = "style".into();
-            node.attrs.clear();
+            // WARNING: the link stays like in browsers, and the page loader moves its CSS out of this attribute.
+            node.attrs
+                .insert(apps_runtime::bundle::LINK_SHEET.into(), text);
         } else if node.tag == "script" {
             let (classic, preload) = match node
                 .attrs
@@ -3527,7 +3696,12 @@ fn html(
                 Some("preload") => (false, true),
                 _ => continue,
             };
-            let src = node.attrs.remove("src");
+            // WARNING: page scripts keep `src` and `type` like in browsers. Without text, the runtime skips them.
+            let src = if preload {
+                node.attrs.remove("src")
+            } else {
+                node.attrs.get("src").cloned()
+            };
             node.children.clear();
             // WARNING: like browsers with modules, `nomodule` scripts never run.
             if classic && node.attrs.contains_key("nomodule") {
@@ -3535,10 +3709,6 @@ fn html(
             }
             let deferred = src.is_some()
                 && (node.attrs.contains_key("defer") || node.attrs.contains_key("async"));
-            node.attrs.insert(
-                "type".into(),
-                if preload { "preload" } else { "module" }.into(),
-            );
             let entry = match src {
                 Some(src) => match remote(parent, &src, http)? {
                     Some((path, source)) => (path, Some(source)),
@@ -3609,10 +3779,43 @@ fn html(
         );
     }
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
-        let Some(&(first, _)) = list.first() else {
+        let Some(&(mut first, _)) = list.first() else {
             continue;
         };
-        let entries = list.into_iter().map(|(_, entry)| entry).collect();
+        let mut order = HashMap::new();
+        if realm == Realm::Renderer {
+            // WARNING: the bundle runs from a new element before the page scripts, which keep their own attributes.
+            // A classic script gets the position of its element among all scripts, for `document.currentScript`.
+            let parent = doc.nodes[first].parent.unwrap_or(0);
+            let mut node = apps_runtime::dom::Node::default();
+            node.tag = "script".into();
+            node.attrs.insert("type".into(), "module".into());
+            node.parent = Some(parent);
+            doc.nodes.push(node);
+            let at = doc.nodes[parent]
+                .children
+                .iter()
+                .position(|&child| child == first)
+                .unwrap_or(0);
+            first = doc.nodes.len() - 1;
+            doc.nodes[parent].children.insert(at, first);
+            let mut pending = vec![0];
+            while let Some(id) = pending.pop() {
+                if doc.nodes[id].tag == "script" {
+                    order.insert(id, order.len());
+                }
+                pending.extend(doc.nodes[id].children.iter().rev());
+            }
+        }
+        let entries = list
+            .into_iter()
+            .map(|(node, (path, inline))| match path.to_str() {
+                Some(name) if name.starts_with("apps:///") => {
+                    (PathBuf::from(format!("{name}#{}", order[&node])), inline)
+                }
+                _ => (path, inline),
+            })
+            .collect();
         let code = script_source(
             &bundle(entries, realm, files.clone(), shared.clone(), production)?,
             true,

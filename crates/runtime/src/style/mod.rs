@@ -14,7 +14,7 @@ mod tests;
 mod text;
 mod value;
 
-pub(crate) use animation::{Animation, Motion};
+pub(crate) use animation::{Animation, Motion, Scripted, easing};
 pub use color::color;
 pub(crate) use parser::{DROPPED, FontUnits, Lengths};
 use shorthand::expand;
@@ -149,11 +149,28 @@ select[multiple] option,select[size]:not([size='0']):not([size='1']) option{padd
 select[multiple] option:checked,select[size]:not([size='0']):not([size='1']) option:checked{background-color:light-dark(#cecece,#545454)}
 select[multiple],select[size]:not([size='0']):not([size='1']){overflow-y:auto;vertical-align:text-bottom}
 dialog{position:absolute;left:0;right:0;width:fit-content;height:fit-content;margin:auto;border:solid;padding:1em;background-color:#fff;color:#000}
-dialog:modal{position:fixed;top:0;bottom:0;max-width:calc(100% - 6px - 2em);max-height:calc(100% - 6px - 2em);overflow:auto;z-index:2147483647}
+dialog:modal{position:fixed;top:0;bottom:0;max-width:calc(100% - 6px - 2em);max-height:calc(100% - 6px - 2em);overflow:auto;user-select:text;visibility:visible}
+dialog::backdrop{background:rgba(0,0,0,.1)}
+[popover]{position:fixed;inset:0;width:fit-content;height:fit-content;margin:auto;border:solid;padding:.25em;overflow:auto;color:CanvasText;background-color:Canvas}
+[popover]:not(:popover-open):not(dialog[open]){display:none}
+dialog:popover-open{display:block}
+[popover]:popover-open::backdrop{pointer-events:none!important;background-color:transparent}
 ";
+
+/// Rules for a fullscreen element, which apply only while one is fullscreen, like in Chromium.
+const FULLSCREEN_UA: &str = "
+:not(:root):fullscreen{position:fixed!important;inset:0!important;margin:0!important;box-sizing:border-box!important;min-width:0!important;max-width:none!important;min-height:0!important;max-height:none!important;width:100%!important;height:100%!important;transform:none!important;object-fit:contain}
+iframe:fullscreen{border:none!important;padding:0!important}
+:not(:root):fullscreen::backdrop{background:black}
+";
+
+/// The `format()` and `tech()` keywords of `@font-face` sources that load. Color fonts draw in one color.
+pub(crate) const FONT_FORMATS: [&str; 5] = ["collection", "opentype", "truetype", "woff", "woff2"];
+pub(crate) const FONT_TECHS: [&str; 2] = ["features-opentype", "variations"];
 
 thread_local! {
     static UA_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(UA));
+    static FULLSCREEN_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("{UA}{FULLSCREEN_UA}")));
     pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, HashMap<String, renderer::SharedString>)> = Default::default();
 }
 
@@ -172,11 +189,106 @@ impl std::hash::Hash for StyleRef {
     }
 }
 
+/// The properties that SVG elements take as presentation attributes and that resvg draws.
+pub(crate) const SVG: [Prop; 43] = [
+    Prop::CLIP_PATH,
+    Prop::CLIP_RULE,
+    Prop::COLOR,
+    Prop::DISPLAY,
+    Prop::FILL,
+    Prop::FILL_OPACITY,
+    Prop::FILL_RULE,
+    Prop::FILTER,
+    Prop::FLOOD_COLOR,
+    Prop::FLOOD_OPACITY,
+    Prop::FONT_FAMILY,
+    Prop::FONT_SIZE,
+    Prop::FONT_STYLE,
+    Prop::FONT_WEIGHT,
+    Prop::IMAGE_RENDERING,
+    Prop::ISOLATION,
+    Prop::LETTER_SPACING,
+    Prop::LIGHTING_COLOR,
+    Prop::MASK,
+    Prop::MASK_TYPE,
+    Prop::MIX_BLEND_MODE,
+    Prop::OPACITY,
+    Prop::PAINT_ORDER,
+    Prop::SHAPE_RENDERING,
+    Prop::STOP_COLOR,
+    Prop::STOP_OPACITY,
+    Prop::STROKE,
+    Prop::STROKE_DASHARRAY,
+    Prop::STROKE_DASHOFFSET,
+    Prop::STROKE_LINECAP,
+    Prop::STROKE_LINEJOIN,
+    Prop::STROKE_MITERLIMIT,
+    Prop::STROKE_OPACITY,
+    Prop::STROKE_WIDTH,
+    Prop::TEXT_ANCHOR,
+    Prop::TEXT_DECORATION,
+    Prop::TEXT_RENDERING,
+    Prop::TRANSFORM,
+    Prop::TRANSFORM_ORIGIN,
+    Prop::VECTOR_EFFECT,
+    Prop::VISIBILITY,
+    Prop::WORD_SPACING,
+    Prop::FONT_STRETCH,
+];
+
+/// The property that an SVG presentation attribute sets. `transform` is not one, because its syntax differs
+/// from CSS.
+pub(crate) fn presentation(name: &str) -> Option<Prop> {
+    Prop::find(name)
+        .filter(|prop| SVG.contains(prop) && !matches!(*prop, Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN))
+}
+
+/// An SVG `transform` attribute as a CSS `transform`, or `None` when it doesn't parse.
+pub(crate) fn svg_transform(value: &str) -> Option<String> {
+    let mut result = Vec::new();
+    for part in value.split_inclusive(')') {
+        let part = part.trim_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+        if part.is_empty() {
+            continue;
+        }
+        let (name, args) = part.strip_suffix(')')?.split_once('(')?;
+        let args = args
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| arg.parse::<f32>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        result.push(match (name.trim(), args.as_slice()) {
+            ("matrix", [a, b, c, d, e, f]) => format!("matrix({a}, {b}, {c}, {d}, {e}, {f})"),
+            ("translate", [x]) => format!("translate({x}px)"),
+            ("translate", [x, y]) => format!("translate({x}px, {y}px)"),
+            ("scale", [x]) => format!("scale({x})"),
+            ("scale", [x, y]) => format!("scale({x}, {y})"),
+            ("rotate", [a]) => format!("rotate({a}deg)"),
+            ("rotate", [a, x, y]) => {
+                format!(
+                    "translate({x}px, {y}px) rotate({a}deg) translate({}px, {}px)",
+                    -x, -y
+                )
+            }
+            ("skewX", [a]) => format!("skewX({a}deg)"),
+            ("skewY", [a]) => format!("skewY({a}deg)"),
+            _ => return None,
+        });
+    }
+    Some(if result.is_empty() {
+        "none".into()
+    } else {
+        result.join(" ")
+    })
+}
+
 #[derive(Hash, PartialEq, Eq)]
 struct StyleKey {
     scope: usize,
     tag: String,
     inline: Option<String>,
+    /// The presentation attributes of an SVG element.
+    hints: Vec<(Prop, Rc<str>)>,
     parent: Option<StyleRef>,
     font: [u32; 6],
     root: [u32; 6],
@@ -220,6 +332,7 @@ struct CachedStyle {
     lengths: Lengths,
     pseudos: Option<Rc<[Style; 2]>>,
     text_pseudos: Option<Rc<[Option<Style>; 4]>>,
+    backdrop: Option<Rc<Style>>,
     scrollbars: Option<Rc<[Option<Style>; 5]>>,
     selection: Option<Style>,
     animations: Option<Vec<Animation>>,
@@ -238,6 +351,8 @@ struct StyleScope {
     id: usize,
     used: u64,
     restricted: bool,
+    /// The UA rules include the fullscreen ones.
+    fullscreen: bool,
     sheets: Vec<Rc<Stylesheet>>,
     /// Selectors, declarations with their `!important` flag, and layer.
     rules: Vec<(SelectorList, Vec<Declared>, i32)>,
@@ -251,12 +366,13 @@ struct StyleScope {
     buckets: [FxHashMap<String, Vec<usize>>; 4],
     universal: Vec<usize>,
     containers: Vec<Option<ContainerQuery>>,
-    /// Whether each `@media` rule of the sheets matched when the rules were collected.
-    media: Vec<bool>,
+    /// The `@media` rules of the sheets, and the ones around each rule.
+    blocks: Vec<Rc<MediaBlock>>,
+    medias: Vec<Option<MediaStack>>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     properties: Registry,
     /// Interaction states the selectors use.
-    states: u8,
+    states: u16,
     matches: SelectorCache,
     nodes: Vec<Option<MatchedRules>>,
     /// The cascade order of each rule. Tailwind's generated rules share one block of keys in
@@ -272,13 +388,14 @@ type Collected<'a> = (
     &'a Declarations,
     i32,
     Option<ContainerQuery>,
+    Option<MediaStack>,
 );
 
 impl StyleScope {
     /// Adds collected rules; `tailwind` has the keys of generated rules by selector list.
     fn push(&mut self, rules: Vec<Collected>, tailwind: Option<&FxHashMap<usize, u64>>) {
         let mut lists = Vec::new();
-        for (selectors, body, layer, container) in rules {
+        for (selectors, body, layer, container, media) in rules {
             let order = self.rules.len();
             let key = tailwind.and_then(|keys| keys.get(&(Rc::as_ptr(selectors) as usize)));
             self.keys.push(match key {
@@ -324,6 +441,7 @@ impl StyleScope {
                 .collect();
             self.elements.push(elements);
             self.containers.push(container);
+            self.medias.push(media);
             let body = body
                 .resolve()
                 .iter()
@@ -351,7 +469,7 @@ impl StyleScope {
         &mut self,
         update: &tailwind::Update,
         rules: &[Collected],
-        collected: &Collect,
+        blocks: &[Rc<MediaBlock>],
         doc: &Document,
     ) -> bool {
         let generated = |key: &u64| Some(key >> 40) == self.block && key & ((1 << 40) - 1) != 0;
@@ -379,15 +497,12 @@ impl StyleScope {
         let start = self.rules.len();
         let rules = rules
             .iter()
-            .map(|(selectors, body, _, container)| (*selectors, *body, layer, container.clone()))
+            .map(|(selectors, body, _, container, media)| {
+                (*selectors, *body, layer, container.clone(), media.clone())
+            })
             .collect();
         self.push(rules, Some(update.keys));
-        self.media.clear();
-        for sheet in &self.sheets {
-            for rule in &sheet.0 {
-                rule.media(collected, &mut self.media);
-            }
-        }
+        self.blocks.extend(blocks.iter().cloned());
         let keys: Vec<&Key> = self.elements[start..]
             .iter()
             .flatten()
@@ -512,14 +627,14 @@ fn derive<R, E>(
 pub(crate) struct StyleCache {
     viewport: [f32; 2],
     /// The scale when font metrics are used.
-    metrics: Option<f32>,
+    pub(crate) metrics: Option<f32>,
     reduced_motion: bool,
     native_theme: u32,
     scopes: Vec<StyleScope>,
     next: usize,
     pass: u64,
     /// Interaction states used by the scopes of the latest pass.
-    pub(crate) states: u8,
+    pub(crate) states: u16,
     /// Parsed `<style>` text by node, with the pass that last used it.
     sheets: HashMap<usize, (u64, Rc<str>, Rc<Stylesheet>)>,
     pub(crate) cssom: HashMap<usize, Cssom>,
@@ -539,6 +654,16 @@ pub(crate) struct StyleCache {
 }
 
 type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
+/// The `@media` rules around a style rule.
+type MediaStack = Rc<[Rc<MediaBlock>]>;
+
+/// An `@media` rule of the sheets, with its result at the last viewport.
+struct MediaBlock {
+    queries: Vec<MediaQuery>,
+    matched: std::cell::Cell<bool>,
+    /// It holds more than style rules, like layers or keyframes, so a new result rebuilds the scope.
+    fixed: bool,
+}
 type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, FontUnits)>;
 /// A collapsed table: the pass that used it, the styles and columns of its parts, the viewport,
@@ -604,6 +729,17 @@ impl StyleCache {
             }
         }
         changed
+    }
+
+    /// The `@font-face` rules of the sheets that the latest pass used, in order.
+    pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
+        let mut seen = std::collections::HashSet::new();
+        self.scopes
+            .iter()
+            .flat_map(|scope| &scope.sheets)
+            .filter(|sheet| seen.insert(Rc::as_ptr(sheet)))
+            .flat_map(|sheet| sheet.font_faces())
+            .collect()
     }
 
     pub(crate) fn sheet(
@@ -1146,6 +1282,7 @@ const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
     ("line-clamp", "none|<integer>|*"),
     ("line-height", "normal|<number>|<length-percentage>"),
     ("list-style", "*"),
+    ("list-style-image", "none"),
     ("list-style-position", "inside|outside"),
     ("list-style-type", "*"),
     ("margin", "[auto|<length-percentage>]+"),
@@ -2205,6 +2342,8 @@ pub(crate) fn resolved(
                     )
                 }
                 Some(m) => format!("matrix3d({})", m.map(number).join(", ")),
+                // Functions that cancel out, like `translateX(0px)`, are still a matrix in browsers.
+                None if value.contains('(') => "matrix(1, 0, 0, 1, 0, 0)".into(),
                 None => value,
             }
         }
@@ -2275,6 +2414,36 @@ pub(crate) fn resolved(
             })
             .collect::<Vec<_>>()
             .join(", "),
+        // Browsers give `inset()` the fewest sides, like the `margin` shorthand.
+        "clip-path" | "shape-outside" if value.starts_with("inset(") && value.ends_with(')') => {
+            let body = &value[6..value.len() - 1];
+            let (sides, round) = body
+                .split_once(" round ")
+                .map_or((body, None), |(sides, round)| (sides, Some(round.trim())));
+            let sides = match components(sides, ' ')[..] {
+                [a] => [a; 4],
+                [a, b] => [a, b, a, b],
+                [a, b, c] => [a, b, c, b],
+                [a, b, c, d] => [a, b, c, d],
+                _ => return value,
+            };
+            let count = if sides[3] != sides[1] {
+                4
+            } else if sides[2] != sides[0] {
+                3
+            } else if sides[1] != sides[0] {
+                2
+            } else {
+                1
+            };
+            let mut result = format!("inset({}", sides[..count].join(" "));
+            if let Some(round) = round {
+                result.push_str(" round ");
+                result.push_str(round);
+            }
+            result.push(')');
+            result
+        }
         "transform-origin" | "perspective-origin" => {
             let [width, height] = size.unwrap_or_default();
             let mut parts: Vec<String> = components(&value, ' ')
@@ -2337,9 +2506,22 @@ pub(crate) fn resolved(
                     | "column-rule-width"
             ) =>
         {
+            // Only the used-value properties resolve percentages; the others keep them, like `border-radius: 20%`.
+            let used = name.starts_with("margin-")
+                || name.starts_with("padding-")
+                || matches!(
+                    name,
+                    "top" | "right" | "bottom" | "left" | "width" | "height"
+                );
             components(&value, ' ')
                 .into_iter()
-                .map(length)
+                .map(|part| {
+                    if !used && part.ends_with('%') {
+                        part.to_owned()
+                    } else {
+                        length(part)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
@@ -2684,6 +2866,9 @@ struct Collect<'a> {
     native_theme: u32,
     rules: Vec<Collected<'a>>,
     container: Option<ContainerQuery>,
+    /// The `@media` rules around the next rules, and every `@media` rule collected.
+    media: Option<MediaStack>,
+    blocks: Vec<Rc<MediaBlock>>,
     /// Full layer names with their path rank: 10 bits per level, siblings in first-seen order.
     layers: Vec<(String, i32)>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
@@ -2732,9 +2917,13 @@ impl Rule {
                             depth @ 0..2 => rank | 1023 << (10 * (1 - depth)),
                             _ => *rank,
                         });
-                    collected
-                        .rules
-                        .push((parent, values, rank, collected.container.clone()));
+                    collected.rules.push((
+                        parent,
+                        values,
+                        rank,
+                        collected.container.clone(),
+                        collected.media.clone(),
+                    ));
                 }
             }
             Self::Theme(_, children) => {
@@ -2834,32 +3023,47 @@ impl Rule {
                 collected.container = outer;
             }
             Self::Media(queries, children) => {
-                if collected.media(queries) {
+                let matched = collected.media(queries);
+                let fixed = !children.iter().all(Self::plain);
+                let block = Rc::new(MediaBlock {
+                    queries: queries.clone(),
+                    matched: matched.into(),
+                    fixed,
+                });
+                collected.blocks.push(block.clone());
+                // WARNING: style rules under an `@media` that doesn't match join the scope with their
+                // condition, so a new result restyles only the nodes they match. Layers, keyframes and
+                // properties wait for the scope to be rebuilt.
+                if matched || !fixed {
+                    let outer = collected.media.clone();
+                    if !fixed {
+                        collected.media = Some(
+                            outer
+                                .iter()
+                                .flat_map(|stack| stack.iter().cloned())
+                                .chain([block])
+                                .collect(),
+                        );
+                    }
                     for rule in children {
                         rule.collect(parent, layer, collected);
                     }
+                    collected.media = outer;
                 }
             }
         }
     }
 
-    /// Appends whether each `@media` rule matches, in tree order.
-    fn media(&self, collected: &Collect, out: &mut Vec<bool>) {
-        let children = match self {
-            Self::Media(queries, children) => {
-                out.push(collected.media(queries));
-                children
-            }
+    /// Whether the rule only adds style rules, so it can join a scope under a condition.
+    fn plain(&self) -> bool {
+        match self {
+            Self::Layer(..) | Self::Keyframes(..) | Self::Property(..) | Self::Theme(..) => false,
             Self::Style(_, children)
-            | Self::Layer(_, children)
+            | Self::Media(_, children)
             | Self::Supports(_, _, children)
             | Self::Starting(children)
-            | Self::Theme(_, children)
-            | Self::Container(.., children) => children,
-            _ => return,
-        };
-        for child in children {
-            child.media(collected, out);
+            | Self::Container(.., children) => children.iter().all(Self::plain),
+            _ => true,
         }
     }
 
@@ -2958,6 +3162,10 @@ pub(crate) struct StyleContext {
     pub scale: f32,
     /// Loaded font names by the family names pages use.
     pub aliases: HashMap<String, String>,
+    /// `insertCSS()` sheets, which follow the page's sheets, and whether each has the user origin.
+    pub inserted: Vec<(Rc<Stylesheet>, bool)>,
+    /// The last styles. A restyle that computes the same values for a node keeps its old style.
+    pub previous: Option<Rc<ComputedStyles>>,
 }
 
 #[derive(Clone, Default)]
@@ -2967,6 +3175,8 @@ pub(crate) struct ComputedStyles {
     pub lengths: Vec<Lengths>,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
     pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
+    /// `::backdrop` of the elements in the top layer.
+    pub backdrops: FxHashMap<usize, Rc<Style>>,
     /// `::-webkit-scrollbar`, `-track`, `-thumb`, `-corner` and `-thumb:hover`.
     pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
     pub selections: FxHashMap<usize, Style>,
@@ -3044,6 +3254,27 @@ pub(crate) fn compute_styles(
     out
 }
 
+/// Lists the font families in `FONT_NAMES` by lowercase name once after fonts change: the installed
+/// and loaded ones, and the `@font-face` families that draw with another one.
+pub(crate) fn font_names(system: &renderer::TextSystem, aliases: &HashMap<String, String>) {
+    FONT_NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        if names.0.is_empty() {
+            names.1.clear();
+            names.0 = system
+                .all_font_names()
+                .into_iter()
+                .map(|name| (name.to_ascii_lowercase(), name))
+                .chain(
+                    aliases
+                        .iter()
+                        .map(|(alias, name)| (alias.to_ascii_lowercase(), name.clone())),
+                )
+                .collect();
+        }
+    });
+}
+
 /// Computes the styles of the nodes reachable from node 0 into `out`, leaving other nodes as they are.
 /// `cache` shares parsed `<style>` text between nodes.
 pub(crate) fn cascade(
@@ -3059,19 +3290,11 @@ pub(crate) fn cascade(
         || (reduced_motion(), crate::desktop::native::theme_state()),
         |context| (context.reduced_motion, context.theme),
     );
-    let ua = UA_SHEET.with(Clone::clone);
     if let Some(text) = text_system {
-        FONT_NAMES.with(|names| {
-            let mut names = names.borrow_mut();
-            if names.0.is_empty() {
-                names.1.clear();
-                names.0 = text
-                    .all_font_names()
-                    .into_iter()
-                    .map(|name| (name.to_ascii_lowercase(), name))
-                    .collect();
-            }
-        });
+        font_names(
+            text,
+            context.map_or(&HashMap::new(), |context| &context.aliases),
+        );
     }
     let mut collected = Collect {
         width,
@@ -3080,6 +3303,8 @@ pub(crate) fn cascade(
         native_theme,
         rules: Vec::new(),
         container: None,
+        media: None,
+        blocks: Vec::new(),
         layers: Vec::new(),
         keyframes: HashMap::new(),
         properties: Registry::default(),
@@ -3088,10 +3313,12 @@ pub(crate) fn cascade(
     let mut sheets = Vec::new();
     let mut pending = vec![0];
     let mut scheme = None;
+    let mut fullscreen = false;
     while let Some(id) = pending.pop() {
         let node = &doc.nodes[id];
         order.push(id);
         pending.extend(node.children.iter().rev());
+        fullscreen |= node.state & crate::dom::FULLSCREEN != 0;
         if node.tag == "meta"
             && node
                 .attrs
@@ -3103,7 +3330,14 @@ pub(crate) fn cascade(
                 .get("content")
                 .map(|content| Rc::<str>::from(content.trim()));
         }
-        if node.tag != "style" {
+        if node.tag != "style"
+            && !(node.tag == "link"
+                && node.stylesheet.is_some()
+                && node.attrs.get("rel").is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                }))
+        {
             continue;
         }
         let mut ancestor = node.parent;
@@ -3147,6 +3381,16 @@ pub(crate) fn cascade(
                 .filter_map(|id| style_cache.constructed.get(id).cloned()),
         );
     }
+    let inserted = context.map_or(&[][..], |context| &context.inserted[..]);
+    if root == 0 {
+        sheets.extend(inserted.iter().map(|(sheet, _)| sheet.clone()));
+    }
+    // WARNING: user origin rules rank between the UA's and the page's, and their `!important` beats the page's.
+    let user = |sheet: &Rc<Stylesheet>| {
+        inserted
+            .iter()
+            .any(|(inserted, user)| *user && Rc::ptr_eq(inserted, sheet))
+    };
     let scale = context.map_or(1., |context| context.scale);
     let metrics = text_system.map(|_| scale);
     if style_cache.viewport != [width, height]
@@ -3172,26 +3416,59 @@ pub(crate) fn cascade(
             style_cache.queries.clear();
             style_cache.queried = false;
         }
-        // Selector matches stay valid while every `@media` rule keeps its result.
-        style_cache.scopes.retain_mut(|scope| {
-            let mut media = Vec::new();
-            for sheet in &scope.sheets {
-                for rule in &sheet.0 {
-                    rule.media(&collected, &mut media);
-                }
+        // WARNING: a new `@media` result rebuilds the scopes that collected its rules, unless it holds
+        // style rules only: they stay in the scope and restyle the nodes they match. Scopes can share
+        // rules, so all results change after every scope saw them.
+        let mut flipped: Vec<Rc<MediaBlock>> = Vec::new();
+        for block in style_cache.scopes.iter().flat_map(|scope| &scope.blocks) {
+            if collected.media(&block.queries) != block.matched.get()
+                && !flipped.iter().any(|old| Rc::ptr_eq(old, block))
+            {
+                flipped.push(block.clone());
             }
-            for node in scope.nodes.iter_mut().flatten() {
+        }
+        let hit = |stack: &Option<MediaStack>| {
+            stack.as_ref().is_some_and(|stack| {
+                stack
+                    .iter()
+                    .any(|block| flipped.iter().any(|old| Rc::ptr_eq(old, block)))
+            })
+        };
+        style_cache.scopes.retain_mut(|scope| {
+            if scope
+                .blocks
+                .iter()
+                .any(|block| block.fixed && flipped.iter().any(|old| Rc::ptr_eq(old, block)))
+            {
+                return false;
+            }
+            let StyleScope {
+                nodes,
+                medias,
+                pseudos,
+                ..
+            } = scope;
+            for node in nodes.iter_mut().flatten() {
                 if !resized
                     || node
                         .cached
                         .as_ref()
                         .is_some_and(|cached| cached.value.viewport)
+                    || !flipped.is_empty()
+                        && (node.rules.iter().any(|(order, _)| hit(&medias[*order]))
+                            || node
+                                .pseudos
+                                .iter()
+                                .any(|&index| hit(&medias[pseudos[index].2])))
                 {
                     node.cached = None;
                 }
             }
-            media == scope.media
+            true
         });
+        for block in &flipped {
+            block.matched.set(!block.matched.get());
+        }
         let live: Vec<_> = style_cache.scopes.iter().map(|scope| scope.id).collect();
         style_cache.queries.retain(|key, _| live.contains(&key.0));
     }
@@ -3206,6 +3483,8 @@ pub(crate) fn cascade(
             native_theme,
             rules: Vec::new(),
             container: None,
+            media: None,
+            blocks: Vec::new(),
             layers: Vec::new(),
             keyframes: HashMap::new(),
             properties: Registry::default(),
@@ -3223,7 +3502,7 @@ pub(crate) fn cascade(
                 .sheets
                 .iter()
                 .any(|sheet| old.iter().any(|old| Rc::ptr_eq(sheet, old)))
-                || scope.insert(update, &added.rules, &collected, doc)
+                || scope.insert(update, &added.rules, &added.blocks, doc)
         });
         if !update.replaced.is_empty() {
             style_cache.queries.clear();
@@ -3233,6 +3512,7 @@ pub(crate) fn cascade(
     let restricted = context.is_some_and(|context| context.required.is_some());
     let exact = style_cache.scopes.iter().position(|cached| {
         cached.restricted == restricted
+            && cached.fullscreen == fullscreen
             && cached.sheets.len() == sheets.len()
             && cached
                 .sheets
@@ -3278,7 +3558,7 @@ pub(crate) fn cascade(
                 .iter()
                 .enumerate()
                 .find_map(|(index, cached)| {
-                    (cached.restricted == restricted)
+                    (cached.restricted == restricted && cached.fullscreen == fullscreen)
                         .then(|| fresh(&cached.sheets))
                         .flatten()
                         .map(|fresh| (index, fresh))
@@ -3288,14 +3568,18 @@ pub(crate) fn cascade(
     let scope = match (exact, incremental) {
         (Some(scope), _) => scope,
         (None, Some((index, (fresh, gone)))) => {
-            let mut media = Vec::new();
             let mut new = Vec::new();
             for (sheet, flags) in sheets.iter().zip(&fresh) {
+                let first = collected.rules.len();
                 for (rule, &flag) in sheet.0.iter().zip(flags) {
-                    rule.media(&collected, &mut media);
                     let start = collected.rules.len();
                     rule.collect(None, "", &mut collected);
                     new.extend(std::iter::repeat_n(flag, collected.rules.len() - start));
+                }
+                if user(sheet) {
+                    for rule in &mut collected.rules[first..] {
+                        rule.2 = i32::MIN + 2;
+                    }
                 }
             }
             let mut removed = Collect {
@@ -3305,6 +3589,8 @@ pub(crate) fn cascade(
                 native_theme,
                 rules: Vec::new(),
                 container: None,
+                media: None,
+                blocks: Vec::new(),
                 layers: Vec::new(),
                 keyframes: HashMap::new(),
                 properties: Registry::default(),
@@ -3409,6 +3695,7 @@ pub(crate) fn cascade(
                 let Collect {
                     keyframes,
                     properties,
+                    blocks,
                     ..
                 } = std::mem::replace(
                     &mut collected,
@@ -3419,6 +3706,8 @@ pub(crate) fn cascade(
                         native_theme,
                         rules: Vec::new(),
                         container: None,
+                        media: None,
+                        blocks: Vec::new(),
                         layers: Vec::new(),
                         keyframes: HashMap::new(),
                         properties: Registry::default(),
@@ -3468,7 +3757,17 @@ pub(crate) fn cascade(
                         .retain(|key, value| key.scope != cached.id || !animated(value));
                 }
                 cached.sheets = sheets.clone();
-                cached.media = media;
+                // WARNING: kept rules hold the `@media` rules they were collected with, so those stay checked.
+                let mut seen = std::collections::HashSet::new();
+                cached.blocks = cached
+                    .medias
+                    .iter()
+                    .flatten()
+                    .flat_map(|stack| stack.iter())
+                    .chain(blocks.iter().filter(|block| block.fixed))
+                    .filter(|block| seen.insert(Rc::as_ptr(block)))
+                    .cloned()
+                    .collect();
                 cached.keyframes = keyframes;
                 cached.properties = properties;
                 index
@@ -3477,6 +3776,7 @@ pub(crate) fn cascade(
                 collected.layers.clear();
                 collected.keyframes.clear();
                 collected.properties.clear();
+                collected.blocks.clear();
                 usize::MAX
             }
         }
@@ -3485,14 +3785,24 @@ pub(crate) fn cascade(
     let scope = if scope != usize::MAX {
         scope
     } else {
-        let mut media = Vec::new();
         for sheet in &sheets {
+            let first = collected.rules.len();
             for rule in &sheet.0 {
-                rule.media(&collected, &mut media);
                 rule.collect(None, "", &mut collected);
+            }
+            if user(sheet) {
+                for rule in &mut collected.rules[first..] {
+                    rule.2 = i32::MIN + 2;
+                }
             }
         }
         let author = std::mem::take(&mut collected.rules);
+        let ua = if fullscreen {
+            &FULLSCREEN_SHEET
+        } else {
+            &UA_SHEET
+        }
+        .with(Clone::clone);
         for rule in &ua.0 {
             rule.collect(None, "", &mut collected);
         }
@@ -3505,6 +3815,7 @@ pub(crate) fn cascade(
             keyframes,
             properties,
             layers,
+            blocks,
             ..
         } = collected;
         style_cache.next += 1;
@@ -3512,6 +3823,7 @@ pub(crate) fn cascade(
             id: style_cache.next,
             used: 0,
             restricted,
+            fullscreen,
             sheets: sheets.clone(),
             rules: Vec::new(),
             layers,
@@ -3521,7 +3833,8 @@ pub(crate) fn cascade(
             buckets: Default::default(),
             universal: Vec::new(),
             containers: Vec::new(),
-            media,
+            blocks,
+            medias: Vec::new(),
             keyframes,
             properties,
             states: 0,
@@ -3584,6 +3897,7 @@ pub(crate) fn cascade(
         lengths,
         pseudos,
         text_pseudos,
+        backdrops,
         scrollbars,
         selections,
         animations,
@@ -3735,6 +4049,12 @@ pub(crate) fn cascade(
                 };
                 let (mut matched, mut matched_pseudos) = (matched, matched_pseudos);
                 let mut applies = |order: usize| {
+                    if scoped.medias[order]
+                        .as_ref()
+                        .is_some_and(|stack| stack.iter().any(|block| !block.matched.get()))
+                    {
+                        return false;
+                    }
                     let Some(conditions) = &scoped.containers[order] else {
                         return true;
                     };
@@ -3780,6 +4100,56 @@ pub(crate) fn cascade(
                 };
                 matched.retain(|(order, _)| applies(*order));
                 matched_pseudos.retain(|index| applies(scoped.pseudos[*index].2));
+                // WARNING: only elements in an `<svg>` take presentation attributes, so other elements with
+                // such attributes, like `<font color>`, skip them.
+                // SVG graphics take `transform` as a hint and get the UA `transform-origin: 0 0`.
+                let graphic = matches!(
+                    node.tag.as_str(),
+                    "g" | "path"
+                        | "rect"
+                        | "circle"
+                        | "ellipse"
+                        | "line"
+                        | "polyline"
+                        | "polygon"
+                        | "text"
+                        | "use"
+                        | "image"
+                        | "foreignObject"
+                        | "switch"
+                );
+                let mut hints = Vec::new();
+                for (name, value) in node.attrs.iter() {
+                    if graphic
+                        && name == "transform"
+                        && let Some(value) = svg_transform(value)
+                    {
+                        hints.push((Prop::TRANSFORM, value.into()));
+                    } else if let Some(prop) = presentation(name) {
+                        // Unitless lengths in presentation attributes are pixels.
+                        let value = value.trim();
+                        let pixels = matches!(
+                            prop,
+                            Prop::STROKE_WIDTH
+                                | Prop::STROKE_DASHOFFSET
+                                | Prop::FONT_SIZE
+                                | Prop::LETTER_SPACING
+                                | Prop::WORD_SPACING
+                        ) && value.parse::<f32>().is_ok();
+                        hints.push((prop, if pixels { format!("{value}px").into() } else { value.into() }));
+                    }
+                }
+                if (graphic || !hints.is_empty()) && node.tag != "svg" {
+                    let mut up = node.parent;
+                    while let Some(parent) = up.filter(|&parent| !matches!(doc.nodes[parent].tag.as_str(), "svg" | "foreignObject")) {
+                        up = doc.nodes[parent].parent;
+                    }
+                    if up.is_none_or(|parent| doc.nodes[parent].tag != "svg") {
+                        hints.clear();
+                    } else if graphic {
+                        hints.push((Prop::TRANSFORM_ORIGIN, "0 0".into()));
+                    }
+                }
                 let resolved = StyleKey {
                     scope,
                     tag: node.tag.clone(),
@@ -3788,6 +4158,7 @@ pub(crate) fn cascade(
                         .as_ref()
                         .map(Declarations::source)
                         .or_else(|| node.attrs.get("style").cloned()),
+                    hints,
                     parent: parent_style.cloned().map(StyleRef),
                     font: font_key,
                     root: root_font,
@@ -3827,6 +4198,9 @@ pub(crate) fn cascade(
             }
             if let Some(values) = &cached.text_pseudos {
                 text_pseudos.insert(id, values.clone());
+            }
+            if let Some(values) = &cached.backdrop {
+                backdrops.insert(id, values.clone());
             }
             if let Some(values) = &cached.scrollbars {
                 scrollbars.insert(id, values.clone());
@@ -3898,6 +4272,13 @@ pub(crate) fn cascade(
                 if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
                     cascade.insert(prop, (rank, value.clone()));
                 }
+            }
+        }
+        // Presentation attributes come before all author rules, in a layer of their own.
+        for (prop, value) in &key.hints {
+            let rank = (false, 0, [0; 4], 0);
+            if cascade.get(prop).is_none_or(|(old, _)| rank >= *old) {
+                cascade.insert(*prop, (rank, value.clone()));
             }
         }
         let inline = node.inline.as_ref().map(Cow::Borrowed).or_else(|| {
@@ -4413,7 +4794,7 @@ pub(crate) fn cascade(
         }
         units.root = root;
         style.insert(Prop::FONT_SIZE, format!("{size}px"));
-        let mut pseudo_cascade: [BTreeMap<Prop, (CascadeRank, &Rc<str>)>; 15] = Default::default();
+        let mut pseudo_cascade: [BTreeMap<Prop, (CascadeRank, &Rc<str>)>; 16] = Default::default();
         let mut shadowed: Vec<(CascadeRank, bool, &Rc<str>, &Vec<Declared>)> = Vec::new();
         for &index in &key.pseudos {
             let (pseudo, selector, order, _) = &scoped.pseudos[index];
@@ -4461,6 +4842,7 @@ pub(crate) fn cascade(
             _,
             _,
             starting,
+            backdrop,
         ] = pseudo_cascade;
         let starting = (!starting.is_empty()).then(|| {
             let mut values = style.clone();
@@ -4505,6 +4887,13 @@ pub(crate) fn cascade(
                 values
             })
         };
+        // Only boxes in the top layer have a `::backdrop`, and the root never shows one.
+        if node.state & crate::dom::TOP_LAYER != 0
+            && node.tag != "html"
+            && let Some(values) = derive(backdrop)
+        {
+            backdrops.insert(id, Rc::new(values));
+        }
         if [&marker, &letter, &line, &placeholder]
             .iter()
             .any(|cascade| !cascade.is_empty())
@@ -4643,13 +5032,67 @@ pub(crate) fn cascade(
             if part { &mut *parts } else { &mut *slotted }.insert(id, groups.clone());
             (part, groups)
         });
-        if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
-            let effects = Animation::parse(&style, &scoped.keyframes, &registry);
-            if !effects.is_empty() {
-                animations.insert(id, effects);
+        let mut effects = if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME)
+        {
+            Animation::parse(&style, &scoped.keyframes, &registry)
+        } else {
+            Vec::new()
+        };
+        // Pseudo-element animations go with the element's, named apart.
+        for (slot, pseudo) in pseudos
+            .get(&id)
+            .into_iter()
+            .flat_map(|pair| pair.iter().enumerate())
+        {
+            if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
+                effects.extend(
+                    Animation::parse(pseudo, &scoped.keyframes, &registry)
+                        .into_iter()
+                        .map(|mut effect| {
+                            effect.pseudo = slot as u8 + 1;
+                            effect.name =
+                                format!("{}\0{}", ["::before", "::after"][slot], effect.name);
+                            effect
+                        }),
+                );
             }
         }
-        let style = Rc::new(style);
+        if !effects.is_empty() {
+            animations.insert(id, effects);
+        }
+        // WARNING: frame caches compare styles by pointer, so a node that gets the same values, lengths and
+        // pseudo-element styles keeps last frame's style. Rebuilt scopes then don't redo layout of the whole page.
+        let units_bits = |units: &Lengths| {
+            [units.font, units.root].map(|font| {
+                [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]
+                    .map(f32::to_bits)
+                    .map(|bits| (bits, font.absolute))
+            })
+        };
+        let style = match context.and_then(|context| context.previous.as_deref()) {
+            Some(previous)
+                if previous.values.get(id).is_some_and(|old| **old == style)
+                    && previous.lengths.get(id).is_some_and(|old| {
+                        old.container.is_none()
+                            && units.container.is_none()
+                            && units_bits(old) == units_bits(&units)
+                    })
+                    && previous.pseudos.get(&id) == pseudos.get(&id)
+                    && previous.text_pseudos.get(&id) == text_pseudos.get(&id)
+                    && previous.backdrops.get(&id) == backdrops.get(&id)
+                    && previous.scrollbars.get(&id) == scrollbars.get(&id)
+                    && previous.selections.get(&id) == selections.get(&id)
+                    && previous.starting.get(&id) == starting.as_ref()
+                    && !previous.animations.contains_key(&id)
+                    && !animations.contains_key(&id)
+                    && shadowed.is_none()
+                    && !previous.slotted.contains_key(&id)
+                    && !previous.parts.contains_key(&id) =>
+            {
+                previous.values[id].clone()
+            }
+            _ => Rc::new(style),
+        };
         style_flags[id] = flags(&style);
         let cached = Rc::new(CachedStyle {
             used: std::cell::Cell::new(style_cache.pass),
@@ -4658,6 +5101,7 @@ pub(crate) fn cascade(
             lengths: units,
             pseudos: pseudos.get(&id).cloned(),
             text_pseudos: text_pseudos.get(&id).cloned(),
+            backdrop: backdrops.get(&id).cloned(),
             scrollbars: scrollbars.get(&id).cloned(),
             selection: selections.get(&id).cloned(),
             animations: animations.get(&id).cloned(),
@@ -5961,8 +6405,8 @@ impl Stylesheet {
         edit_rules(rules, last, edit, parent, |rule| rule)
     }
 
-    /// The `font-family` and `src` of each `@font-face` rule.
-    pub(crate) fn font_faces(&self) -> impl Iterator<Item = (String, String)> + '_ {
+    /// The `font-family`, `src` and `unicode-range` of each `@font-face` rule.
+    pub(crate) fn font_faces(&self) -> impl Iterator<Item = (String, String, Option<String>)> + '_ {
         self.0.iter().filter_map(|rule| {
             let Rule::FontFace(values) = &**rule else {
                 return None;
@@ -5972,7 +6416,11 @@ impl Stylesheet {
                 .get(Prop::FONT_FAMILY)?
                 .trim_matches(['\'', '"'])
                 .to_owned();
-            Some((family, values.get(Prop::new("src"))?.to_owned()))
+            Some((
+                family,
+                values.get(Prop::new("src"))?.to_owned(),
+                values.get(Prop::new("unicode-range")).map(str::to_owned),
+            ))
         })
     }
 

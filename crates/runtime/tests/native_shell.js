@@ -1,0 +1,34 @@
+(() => {
+  const assert = (value, message) => { if (!value) throw Error(message); };
+  const throws = (fn, text, message) => { try { fn(); } catch (error) { assert(String(error.message).includes(text), message + ': ' + error.message); return; } throw Error(message); };
+  const calls = [], events = [];
+  const shell = __appsNativeShell((op, value) => {
+    calls.push([op, value]);
+    if (op === 'native.poll') return events.splice(0);
+    if (op === 'native.power.block') return 40 + calls.length;
+    if (op === 'native.prefs.color') return { controlAccentColor: '#0A84FFFF', systemBlueColor: '#007AFFFF', controlBackgroundColor: '#FFFFFFFF' }[value] ?? null;
+    if (op === 'native.prefs.askMedia' || op === 'native.prefs.promptTouchID') events.push({ type: 'reply', id: value.async, value: op.endsWith('Media') ? true : 'Canceled' });
+    return null;
+  }, __apps.events.EventEmitter);
+  const last = op => calls.filter(call => call[0] === op).at(-1)?.[1];
+  const { powerSaveBlocker, systemPreferences } = shell;
+  const first = powerSaveBlocker.start('prevent-app-suspension'), second = powerSaveBlocker.start('prevent-display-sleep');
+  assert(first === 0 && second === 1 && calls[0][1] === false && calls[1][1] === true, 'Blocker ids and types');
+  assert(powerSaveBlocker.isStarted(0) && powerSaveBlocker.stop(0) && !powerSaveBlocker.isStarted(0) && !powerSaveBlocker.stop(0) && powerSaveBlocker.isStarted(1), 'Stop blockers');
+  assert(last('native.power.unblock') === 41, 'Release the native assertion');
+  throws(() => powerSaveBlocker.start('prevent-sleep'), 'Invalid power save blocker type', 'Blocker types');
+  assert(systemPreferences instanceof __apps.events.EventEmitter && systemPreferences.getAccentColor() === '0A84FFFF', 'Accent color without #');
+  assert(systemPreferences.getColor('control-background') === '#FFFFFFFF' && systemPreferences.getSystemColor('blue') === '#007AFFFF', 'Named colors');
+  throws(() => systemPreferences.getColor('nope'), 'Unknown color: nope', 'Unknown colors');
+  throws(() => systemPreferences.getSystemColor('Bad Name'), 'Unknown system color: Bad Name', 'Invalid names');
+  assert(last('native.prefs.color') === 'nopeColor', 'Invalid names never reach native code');
+  throws(() => systemPreferences.getUserDefault('key', 'number'), 'Invalid type: number', 'User default types');
+  throws(() => systemPreferences.setUserDefault('key', 'integer', 1.5), 'Unable to convert value to: integer', 'User default values');
+  systemPreferences.setUserDefault('key', 'array', [1, 'two']);
+  assert(JSON.stringify(last('native.prefs.setDefault')) === JSON.stringify({ key: 'key', type: 'array', value: [1, 'two'] }), 'Set user defaults');
+  assert(!shell.pending(), 'Blockers and preferences do not keep the event loop polling');
+  globalThis.nativeShellAsync = [];
+  systemPreferences.askForMediaAccess('camera').then(value => nativeShellAsync.push(value));
+  systemPreferences.promptTouchID('Unlock').catch(error => nativeShellAsync.push(error.message));
+  shell.poll();
+})();

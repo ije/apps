@@ -507,7 +507,7 @@ pub(crate) fn inline_text(
             .into_iter()
             .any(|prop| style.get(prop) != parent.get(prop))
             || style.iter().any(|(key, value)| {
-                !key.is_custom()
+                key.is_known()
                     && parent.value(key) != Some(value)
                     // A relative box that is not moved lays out like a static one.
                     && !(key == Prop::POSITION
@@ -584,6 +584,34 @@ pub(crate) fn inline_text(
                             | Prop::OUTLINE_STYLE
                             | Prop::OUTLINE_WIDTH
                             | Prop::OUTLINE_OFFSET
+                            // Sizes, vertical margins and item or container properties don't apply to inline boxes.
+                            | Prop::WIDTH
+                            | Prop::HEIGHT
+                            | Prop::MIN_WIDTH
+                            | Prop::MIN_HEIGHT
+                            | Prop::MAX_WIDTH
+                            | Prop::MAX_HEIGHT
+                            | Prop::ASPECT_RATIO
+                            | Prop::MARGIN_TOP
+                            | Prop::MARGIN_BOTTOM
+                            | Prop::JUSTIFY_SELF
+                            | Prop::ALIGN_SELF
+                            | Prop::FLEX_GROW
+                            | Prop::FLEX_SHRINK
+                            | Prop::FLEX_BASIS
+                            | Prop::ORDER
+                            | Prop::GRID_ROW_START
+                            | Prop::GRID_ROW_END
+                            | Prop::GRID_COLUMN_START
+                            | Prop::GRID_COLUMN_END
+                            | Prop::JUSTIFY_ITEMS
+                            | Prop::ALIGN_ITEMS
+                            | Prop::JUSTIFY_CONTENT
+                            | Prop::ALIGN_CONTENT
+                            | Prop::FLEX_DIRECTION
+                            | Prop::FLEX_WRAP
+                            | Prop::ROW_GAP
+                            | Prop::COLUMN_GAP
                     )
             })
         {

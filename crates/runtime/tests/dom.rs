@@ -56,6 +56,34 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
 }
 
 #[test]
+fn svg_presentation_attributes_links_and_attribute_nodes() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const style = (id, name) => getComputedStyle(document.getElementById(id)).getPropertyValue(name);
+        const got = [style('a', 'fill'), style('b', 'stroke-width'), style('c', 'fill'), style('d', 'fill'), style('p', 'fill')].join('|');
+        if (got !== 'none|5px|rgb(0, 0, 255)|rgb(0, 128, 0)|rgb(0, 0, 0)') throw Error('presentation ' + got);
+        const link = document.createElement('link');
+        link.rel = 'stylesheet'; link.href = '/x.css';
+        if (link.rel !== 'stylesheet' || link.getAttribute('rel') !== 'stylesheet') throw Error('rel');
+        globalThis.failed = 0; link.onerror = () => failed++;
+        document.head.append(link);
+        const attr = link.getAttributeNode('rel');
+        if (attr.value !== 'stylesheet' || link.removeAttributeNode(attr) !== attr || link.hasAttribute('rel') || attr.ownerElement !== null) throw Error('attribute node');
+        let thrown = false; try { link.removeAttributeNode(attr); } catch (error) { thrown = error.name === 'NotFoundError'; }
+        if (!thrown || document.currentScript !== null) throw Error('attribute node removed twice');
+    "#, "test").unwrap();
+    for _ in 0..10 {
+        engine.tick().unwrap();
+    }
+    assert_eq!(engine.eval("failed", "test").unwrap(), "1");
+}
+
+#[test]
 fn window_scroll_moves_the_page() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
@@ -1235,6 +1263,11 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
         if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10') throw Error(seen.join(';'));
         seen.length = 0; __appsLayout();
         if (seen.length) throw Error('Unchanged targets reported');
+        let entry;
+        const pageObserver = new IntersectionObserver(([e]) => entry = e, { root: document });
+        pageObserver.observe(document.getElementById('a')); __appsLayout();
+        if (entry?.intersectionRatio !== 0.5 || entry.rootBounds.width !== innerWidth || entry.rootBounds.height !== innerHeight) throw Error('Document root bounds');
+        pageObserver.disconnect();
         const c = document.getElementById('c'), clip = document.getElementById('clip');
         if (c.offsetParent.id !== 'rel' || c.offsetTop !== 20 || c.offsetLeft !== 20) throw Error('Offsets');
         if (document.getElementById('a').offsetParent !== document.body) throw Error('Static offset parent');
@@ -1436,6 +1469,40 @@ fn checkbox_and_radio_activation_runs_before_listeners() {
         check('user toggles skip page setters, like React tracks', () => writes === 0 && tracked === false);
         "#,
     );
+}
+
+#[test]
+fn range_inputs_sanitize_slide_and_step() {
+    let (host, engine) = checked_page(
+        "<html><body><input id='r' type='range'></body></html>",
+        r#"
+        const r = document.getElementById('r'), values = [];
+        check('default is the middle', () => r.value === '50' && r.valueAsNumber === 50);
+        r.max = '1';
+        values.push(r.getAttribute('max'), r.value);
+        r.step = 'any'; values.push(r.value);
+        r.value = 7; values.push(r.value);
+        r.min = '-1'; r.step = '0.3'; r.value = '0.95'; values.push(r.value);
+        r.value = 'abc'; values.push(r.value);
+        check('min, max and step reflect and sanitize ' + values, () => values.join() === '1,1,0.5,1,0.8,-0.1');
+        "#,
+    );
+    let id: usize = engine.eval("document.getElementById('r')._id", "test").unwrap().parse().unwrap();
+    host.borrow_mut().dom.entry(1).or_default().bounds.insert(id, [0., 0., 116., 16.]);
+    engine.eval(r#"
+        const r = document.getElementById('r'), seen = [];
+        r.removeAttribute('min'); r.removeAttribute('max'); r.removeAttribute('step'); r.value = '50';
+        r.addEventListener('input', () => seen.push('input:' + r.value));
+        r.addEventListener('change', () => seen.push('change:' + r.value));
+        __appsLayout();
+        __appsDispatch('pointerdown', [r._id], { clientX: 38, clientY: 8, button: 0, buttons: 1 });
+        __appsDispatch('pointermove', [r._id], { clientX: 83, clientY: 8, buttons: 1 });
+        __appsDispatch('pointerup', [r._id], { clientX: 83, clientY: 8, button: 0, buttons: 0 });
+        if (seen.join() !== 'input:30,input:75,change:75' || document.activeElement !== r) throw Error('Drag ' + seen);
+        seen.length = 0;
+        for (const key of ['ArrowRight', 'PageDown', 'Home', 'Home', 'End']) __appsDispatch('keydown', [], { key });
+        if (seen.join() !== 'input:76,change:76,input:66,change:66,input:0,change:0,input:100,change:100') throw Error('Keys ' + seen);
+    "#, "test").unwrap();
 }
 
 #[test]
@@ -2260,4 +2327,286 @@ fn slotted_and_part_rules_cross_the_shadow_boundary() {
         if (style(inner.getElementById('core'), 'color') !== 'rgb(255, 165, 0)') throw Error('exportparts ' + style(inner.getElementById('core'), 'color'));
         if (style(inner.getElementById('u'), 'color') === 'rgb(0, 0, 255)') throw Error('unexported part');
     "#, "test").unwrap();
+}
+
+#[test]
+fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
+    let (host, engine) = checked_page(
+        "<html><body><div id='a' popover><button id='open-b' popovertarget='b'>b</button><div id='b' popover='auto'>b</div></div><div id='c' popover=''>c</div><div id='m' popover='manual'>m</div><div id='h' popover='hint'>h</div><div id='plain'>x</div><button id='toggle' popovertarget='a'>a</button><button id='show' popovertarget='m' popovertargetaction='show'>m</button><form><button id='submit' popovertarget='a'>no</button></form><button id='cmd' commandfor='c' command='toggle-popover'>c</button><button id='custom' commandfor='plain' command='--go'>go</button></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), [a, b, c, m, h, plain] = ['a', 'b', 'c', 'm', 'h', 'plain'].map($);
+        const log = [];
+        for (const node of [a, b, c, m, h]) for (const type of ['beforetoggle', 'toggle']) node.addEventListener(type, e => log.push(node.id + ':' + type + ':' + e.oldState + '>' + e.newState));
+        const press = target => { __appsDispatch('pointerdown', [target._id], { clientX: 1, clientY: 1, button: 0, buttons: 1 }); __appsDispatch('pointerup', [target._id], { clientX: 1, clientY: 1, button: 0, buttons: 0 }); };
+        check('attribute states', () => a.popover === 'auto' && c.popover === 'auto' && m.popover === 'manual' && h.popover === 'hint' && plain.popover === null && Object.assign(document.createElement('div'), { popover: 'bogus' }).popover === 'manual');
+        check('not a popover', () => { try { plain.showPopover(); return false; } catch (e) { return e.name === 'NotSupportedError'; } });
+        check('disconnected', () => { const d = document.createElement('div'); d.popover = 'auto'; try { d.showPopover(); return false; } catch (e) { return e.name === 'InvalidStateError'; } });
+        a.showPopover();
+        check('open', () => a.matches(':popover-open') && !b.matches(':popover-open') && log.join() === 'a:beforetoggle:closed>open');
+        a.showPopover();
+        check('showing twice is a no-op', () => log.length === 1);
+        $('open-b').click();
+        check('nested popover keeps its ancestor', () => a.matches(':popover-open') && b.matches(':popover-open'));
+        c.showPopover();
+        check('unrelated auto popover closes the stack', () => !a.matches(':popover-open') && !b.matches(':popover-open') && c.matches(':popover-open'));
+        m.showPopover(); h.showPopover();
+        check('manual and hint stay', () => m.matches(':popover-open') && h.matches(':popover-open') && c.matches(':popover-open'));
+        press(plain);
+        check('light dismiss closes auto and hint, not manual', () => !c.matches(':popover-open') && !h.matches(':popover-open') && m.matches(':popover-open'));
+        a.showPopover(); b.showPopover();
+        press(a);
+        check('a press inside keeps the popover and closes nested ones', () => a.matches(':popover-open') && !b.matches(':popover-open'));
+        __appsDispatch('keydown', [], { key: 'Escape' });
+        check('escape hides the top popover', () => !a.matches(':popover-open'));
+        check('toggle returns the state', () => c.togglePopover() === true && c.togglePopover() === false && c.togglePopover({ force: true }) === true && c.togglePopover(true) === true && c.togglePopover(false) === false);
+        a.addEventListener('beforetoggle', e => e.preventDefault(), { once: true });
+        a.showPopover();
+        check('canceled beforetoggle keeps it closed', () => !a.matches(':popover-open'));
+        $('toggle').click();
+        check('popovertarget opens', () => a.matches(':popover-open'));
+        $('toggle').click();
+        check('popovertarget toggles', () => !a.matches(':popover-open'));
+        m.hidePopover(); $('show').click(); $('show').click();
+        check('popovertargetaction show', () => m.matches(':popover-open') && $('show').popoverTargetAction === 'show' && $('toggle').popoverTargetAction === 'toggle');
+        check('popoverTargetElement', () => $('toggle').popoverTargetElement === a && ($('toggle').popoverTargetElement = c, $('toggle').popoverTargetElement === c && $('toggle').getAttribute('popovertarget') === ''));
+        $('submit').click();
+        check('submit buttons in forms do not invoke', () => !a.matches(':popover-open'));
+        let commanded = null; c.addEventListener('command', e => commanded = [e.command, e.source?.id, e instanceof CommandEvent]);
+        $('cmd').click();
+        check('commandfor toggles a popover', () => c.matches(':popover-open') && commanded.join() === 'toggle-popover,cmd,true' && $('cmd').commandForElement === c && $('cmd').command === 'toggle-popover' && $('cmd').type === 'button');
+        let custom = null; plain.addEventListener('command', e => custom = e.command);
+        $('custom').click();
+        check('custom commands only fire the event', () => custom === '--go');
+        m.popover = 'auto';
+        check('changing the type hides', () => !m.matches(':popover-open'));
+        c.remove();
+        check('removal hides', () => !c.matches(':popover-open'));
+        globalThis.toggleLog = log;
+        "#,
+    );
+    let id: usize = engine
+        .eval(
+            "document.getElementById('m').showPopover(); document.getElementById('m')._id",
+            "test",
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    engine.eval("document.body.offsetWidth", "test").unwrap();
+    assert_eq!(host.borrow().dom[&1].top_layer, [id]);
+    for _ in 0..10 {
+        engine.tick().unwrap();
+    }
+    engine
+        .eval(
+            r#"
+        const toggles = toggleLog.filter(entry => entry.includes(':toggle:'));
+        if (toggles.join() !== 'a:toggle:closed>closed,b:toggle:closed>closed,c:toggle:closed>open,m:toggle:closed>open,h:toggle:closed>closed') throw Error('coalesced toggles ' + toggles.join());
+    "#,
+            "test",
+        )
+        .unwrap();
+}
+
+#[test]
+fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
+    let (host, engine) = checked_page(
+        "<html><body><div style='overflow:hidden;height:10px'><dialog id='d'><button id='in'>in</button></dialog></div><dialog id='n' closedby='none'>n</dialog><dialog id='any' closedby='any'>any</dialog><button id='open' commandfor='d' command='show-modal'>open</button><button id='close' commandfor='d' command='close' value='done'>close</button><div id='out'>out</div></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), d = $('d');
+        const log = [];
+        for (const type of ['beforetoggle', 'cancel', 'close']) d.addEventListener(type, e => log.push(type + (e.newState ? ':' + e.newState : '')));
+        check('closedBy', () => d.closedBy === 'none' && $('n').closedBy === 'none' && $('any').closedBy === 'any');
+        $('open').click();
+        check('show-modal command', () => d.open && d.matches(':modal') && d.closedBy === 'closerequest' && log.join() === 'beforetoggle:open');
+        check('backdrop style', () => getComputedStyle(d, '::backdrop').backgroundColor === 'rgba(0, 0, 0, 0.1)' && getComputedStyle($('n'), '::backdrop').backgroundColor === '');
+        check('modal tab order', () => { __appsDispatch('keydown', [], { key: 'Tab' }); return document.activeElement === $('in'); });
+        d.requestClose('x');
+        check('requestClose', () => !d.open && d.returnValue === 'x' && log.slice(1).join() === 'cancel,beforetoggle:closed');
+        $('n').showModal();
+        __appsDispatch('keydown', [], { key: 'Escape' });
+        check('closedby none ignores escape', () => $('n').open);
+        $('n').close();
+        $('any').showModal();
+        __appsDispatch('pointerdown', [$('any')._id], { clientX: 1, clientY: 1, button: 0, buttons: 1 });
+        __appsDispatch('pointerup', [$('any')._id], { clientX: 1, clientY: 1, button: 0, buttons: 0 });
+        check('closedby any closes on a backdrop press', () => !$('any').open);
+        $('open').click();
+        $('close').click();
+        check('close command', () => !d.open && d.returnValue === 'done');
+        d.addEventListener('beforetoggle', e => { if (e.newState === 'open') e.preventDefault(); }, { once: true });
+        d.showModal();
+        check('canceled beforetoggle keeps the dialog closed', () => !d.open);
+        d.showModal();
+        "#,
+    );
+    let ids: Vec<usize> = ["d", "out"]
+        .iter()
+        .map(|id| {
+            engine
+                .eval(&format!("document.getElementById('{id}')._id"), "test")
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    {
+        let mut host = host.borrow_mut();
+        let dom = host.dom.entry(1).or_default();
+        assert_eq!(dom.top_layer, [ids[0]]);
+        dom.bounds.insert(ids[0], [40., 40., 20., 20.]);
+        dom.bounds.insert(ids[1], [0., 0., 100., 100.]);
+    }
+    engine
+        .eval(
+            r#"
+        const d = document.getElementById('d');
+        if (document.elementFromPoint(45, 45) !== d) throw Error('modal outside the clip of its parent ' + document.elementFromPoint(45, 45)?.id);
+        if (document.elementFromPoint(5, 5) !== d) throw Error('backdrop hits as its dialog');
+        d.remove();
+        if (document.elementFromPoint(5, 5)?.id !== 'out') throw Error('removed dialog left the top layer');
+    "#,
+            "test",
+        )
+        .unwrap();
+    assert!(host.borrow().dom[&1].top_layer.is_empty());
+}
+
+#[test]
+fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
+    let (host, engine) = checked_page(
+        "<html><body><div id='v'>video</div><dialog id='d'>d</dialog></body></html>",
+        r#"
+        const v = document.getElementById('v'), log = [];
+        document.addEventListener('fullscreenchange', e => log.push('change:' + e.target.id + ':' + !!document.fullscreenElement));
+        document.addEventListener('fullscreenerror', e => log.push('error:' + e.target.id));
+        globalThis.fullscreenLog = log;
+        check('enabled', () => document.fullscreenEnabled && document.fullscreenElement === null && typeof v.webkitRequestFullscreen === 'function');
+        v.requestFullscreen();
+        check('element', () => document.fullscreenElement === v && v.matches(':fullscreen') && document.webkitFullscreenElement === v && document.fullscreen);
+        const d = document.getElementById('d'); d.showModal();
+        globalThis.failed = d.requestFullscreen().then(() => 'resolved', e => e instanceof TypeError);
+        "#,
+    );
+    let id: usize = engine
+        .eval("document.getElementById('v')._id", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
+    {
+        let host = host.borrow();
+        assert_eq!(host.dom[&1].top_layer.first(), Some(&id));
+        assert!(host.commands.iter().any(|command| {
+            command["args"][0] == "htmlFullscreen" && command["args"][2] == true
+        }));
+    }
+    for _ in 0..10 {
+        engine.tick().unwrap();
+    }
+    engine
+        .eval(
+            r#"
+        globalThis.done = null; failed.then(value => globalThis.done = value);
+        __appsDispatch('keydown', [], { key: 'Escape' });
+        if (document.fullscreenElement !== null || document.getElementById('v').matches(':fullscreen')) throw Error('escape exits');
+        if (!document.getElementById('d').open) throw Error('escape closed the dialog while it left fullscreen');
+    "#,
+            "test",
+        )
+        .unwrap();
+    for _ in 0..10 {
+        engine.tick().unwrap();
+    }
+    engine
+        .eval(
+            r#"
+        if (done !== true) throw Error('modal dialogs cannot go fullscreen ' + done);
+        if (fullscreenLog.join() !== 'change:v:true,error:d,change:v:false') throw Error(fullscreenLog.join());
+    "#,
+            "test",
+        )
+        .unwrap();
+    assert!(
+        host.borrow().commands.iter().any(|command| {
+            command["args"][0] == "htmlFullscreen" && command["args"][2] == false
+        })
+    );
+}
+
+#[test]
+fn document_types_follow_the_parser_and_the_document() {
+    checked_page(
+        "<!DOCTYPE html><html><body><p>x</p></body></html>",
+        r#"
+        const doctype = document.doctype;
+        check('parsed', () => doctype instanceof DocumentType && doctype.nodeType === 10 && doctype.name === 'html' && doctype.publicId === '' && doctype.systemId === '' && doctype.nodeName === 'html' && doctype.textContent === null && document.firstChild === doctype && document.childNodes.length === 2);
+        check('standards mode', () => document.compatMode === 'CSS1Compat');
+        check('serialized', () => new XMLSerializer().serializeToString(document).startsWith('<!DOCTYPE html><html>'));
+        check('string tag', () => Object.prototype.toString.call(doctype) === '[object DocumentType]');
+        check('created', () => { const made = document.implementation.createDocumentType('svg:svg', '-//W3C//DTD SVG 1.1//EN', 'x.dtd'); return made.name === 'svg:svg' && made.publicId === '-//W3C//DTD SVG 1.1//EN' && made.systemId === 'x.dtd' && made.parentNode === null; });
+        check('invalid name', () => { try { document.implementation.createDocumentType('1x', '', ''); return false; } catch (e) { return e.name === 'InvalidCharacterError'; } });
+        check('only documents hold doctypes', () => { try { document.body.append(document.implementation.createDocumentType('html', '', '')); return false; } catch (e) { return e.name === 'HierarchyRequestError'; } });
+        check('moves', () => { doctype.remove(); const gone = document.doctype === null; document.insertBefore(doctype, document.documentElement); return gone && document.doctype === doctype && document.firstChild === doctype; });
+        const parse = source => new DOMParser().parseFromString(source, 'text/html');
+        check('quirks', () => parse('<p>x').compatMode === 'BackCompat' && parse('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><p>').compatMode === 'BackCompat' && parse('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd"><p>').compatMode === 'CSS1Compat' && parse('<!doctype html><p>').doctype.name === 'html');
+        check('text skips doctypes', () => document.body.textContent === 'x');
+        "#,
+    );
+}
+
+#[test]
+fn web_animations_sample_commit_finish_and_replace() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine.eval(r#"
+        const a = document.getElementById('a'), b = document.getElementById('b'), events = [];
+        const check = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got) + ' != ' + JSON.stringify(want)); };
+        if (!Object.hasOwn(Element.prototype, 'animate')) throw Error('Element.animate is missing');
+        const paused = a.animate({ opacity: [0, 1], transform: ['translateX(0px)', 'translateX(100px)'] }, { duration: 1000, easing: 'linear(0, 0.25 50%, 1)' });
+        paused.pause(); paused.currentTime = 250;
+        check([paused.playState, getComputedStyle(a).opacity, getComputedStyle(a).transform], ['paused', '0.125', 'matrix(1, 0, 0, 1, 12.5, 0)']);
+        check(paused.effect.getKeyframes().map(frame => [frame.offset, frame.computedOffset]), [[null, 0], [null, 1]]);
+        paused.commitStyles(); paused.cancel();
+        check([a.style.opacity, a.style.transform, getComputedStyle(a).opacity, paused.playState], ['0.125', 'translateX(12.5px)', '0.125', 'idle']);
+        for (const bad of [{ easing: 'bogus' }, { duration: -1 }, { fill: 'up' }, { easing: 'ease, linear' }]) {
+            try { a.animate({ opacity: [0, 1] }, bad); } catch (error) { if (error instanceof TypeError) continue; throw error; }
+            throw Error('Accepted ' + JSON.stringify(bad));
+        }
+        const one = b.animate({ opacity: [0, 0.2] }, { duration: 20, fill: 'forwards' }), two = b.animate({ opacity: [0, 0.4] }, { duration: 20, fill: 'forwards' });
+        one.onremove = () => events.push('remove');
+        two.onfinish = event => events.push('finish ' + event.currentTime);
+        two.finished.then(animation => events.push('finished ' + (animation === two)));
+        const gone = b.animate({ opacity: [1, 0] }, 1000);
+        gone.finished.catch(error => events.push(error.name));
+        gone.cancel();
+        // Play and pause wait for the next frame, like in browsers.
+        const fresh = document.body.appendChild(document.createElement('i')).animate({ opacity: [0, 1] }, 1000);
+        events.push('pending ' + fresh.pending + ' ' + fresh.startTime);
+        fresh.ready.then(() => events.push('ready ' + fresh.pending + ' ' + (typeof fresh.startTime)));
+    "#, "test").unwrap();
+    let started = std::time::Instant::now();
+    while engine
+        .eval("events.length", "test")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap()
+        < 6
+    {
+        let delay = engine.tick().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    assert_eq!(
+        engine.eval("JSON.stringify([events.sort(), one.replaceState, two.playState, b.getAnimations().length, getComputedStyle(b).opacity])", "test").unwrap(),
+        r#"[["AbortError","finish 20","finished true","pending true null","ready false number","remove"],"removed","finished",1,"0.4"]"#
+    );
 }

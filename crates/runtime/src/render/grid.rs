@@ -899,11 +899,35 @@ pub(crate) fn intrinsic(
     } else {
         min
     };
+    // An `aspect-ratio` sizes the `box-sizing` box from the width, but a box that doesn't clip still grows
+    // to fit its content, like in Chrome.
+    let ratio = vertical[0]
+        .is_none()
+        .then(|| style.get(Prop::ASPECT_RATIO))
+        .flatten()
+        .and_then(super::element::aspect_ratio)
+        .zip(available)
+        .map(|(ratio, width)| {
+            let height = if border_box {
+                (width + inner[0]) / ratio - inner[1]
+            } else {
+                width / ratio
+            };
+            let clips = [Prop::OVERFLOW_Y, Prop::OVERFLOW]
+                .into_iter()
+                .find_map(|prop| style.get(prop))
+                .is_some_and(|value| value != "visible");
+            if clips || matches!(node.tag.as_str(), "svg" | "img" | "canvas" | "video") {
+                height.max(0.)
+            } else {
+                height.max(content[2])
+            }
+        });
     let result = [
         min + outer[0],
         max + outer[0],
         available.unwrap_or(max) + outer[0],
-        clamp(vertical[0].unwrap_or(content[2]), vertical) + outer[1],
+        clamp(vertical[0].or(ratio).unwrap_or(content[2]), vertical) + outer[1],
     ];
     if measured.sizes.len() > 65536 {
         measured.sizes.clear();
@@ -1893,6 +1917,25 @@ mod tests {
         assert_eq!(grid.rows, [26., 26.]);
         let cells: Vec<_> = grid.cells.iter().map(|(_, cell, ..)| *cell).collect();
         assert_eq!(cells[2..], [[1, 1, 1, 1], [2, 1, 1, 1]]);
+    }
+
+    #[test]
+    fn aspect_ratio_children_give_rows_their_height() {
+        let text = renderer::TextSystem::new();
+        let mut doc = Document::parse(
+            "<style>main{display:grid;grid-template-columns:300px 200px}i{display:block;aspect-ratio:5/4}.b{box-sizing:border-box;padding:10px}.c{overflow:hidden}</style><main><div><i style='width:100%'></i></div><div><i class=b></i><p style='height:20px;margin:0'></p></div></main><main><div><i class=c style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div><div><i style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div></main>",
+        );
+        let mut state = crate::dom::State::default();
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let rows: Vec<_> = (0..doc.nodes.len())
+            .filter(|&id| doc.nodes[id].tag == "main")
+            .map(|main| {
+                layout(&doc, main, &styles, Some(800.), None, None, None, &text, &mut Default::default())
+                    .rows
+            })
+            .collect();
+        // 300px / 1.25, and a 200px border box gives 160px; a clipping box keeps 30px, others fit their content.
+        assert_eq!(rows, [vec![240.], vec![90.]]);
     }
 
     #[test]

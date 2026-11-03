@@ -2,7 +2,7 @@ use crate::web::{base64, bytes};
 use anyhow::{Context, Result, bail, ensure};
 use ring::{
     aead, hmac,
-    rand::SystemRandom,
+    rand::{SecureRandom, SystemRandom},
     signature::{self, KeyPair},
 };
 use serde_json::{Value, json};
@@ -31,9 +31,27 @@ fn der<'a>(input: &mut &'a [u8], tag: u8) -> Result<&'a [u8]> {
 
 pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
     let rng = SystemRandom::new();
-    let signing = &signature::ECDSA_P256_SHA256_FIXED_SIGNING;
     match op {
+        "generate" if args[0] == "ed25519" => {
+            let mut seed = [0; 32];
+            if args[1].is_null() {
+                rng.fill(&mut seed)
+                    .map_err(|_| anyhow::anyhow!("Key generation failed"))?;
+            } else {
+                seed = bytes(&args[1])?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Invalid Ed25519 key"))?;
+            }
+            let key = signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+                .map_err(|_| anyhow::anyhow!("Invalid Ed25519 key"))?;
+            Ok(json!({"private":base64(&seed),"public":base64(key.public_key().as_ref())}))
+        }
         "generate" => {
+            let signing = if args[0] == "P-384" {
+                &signature::ECDSA_P384_SHA384_FIXED_SIGNING
+            } else {
+                &signature::ECDSA_P256_SHA256_FIXED_SIGNING
+            };
             let document = signature::EcdsaKeyPair::generate_pkcs8(signing, &rng)
                 .map_err(|_| anyhow::anyhow!("Key generation failed"))?;
             let key = signature::EcdsaKeyPair::from_pkcs8(signing, document.as_ref(), &rng)
@@ -49,35 +67,90 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 json!({"private":base64(private),"public":base64(key.public_key().as_ref()),"pkcs8":base64(document.as_ref())}),
             )
         }
+        // `ECDSA` signatures are IEEE P1363 (r || s) and `ec` ones are DER. RSA keys are PKCS#1 DER.
         "sign" | "verify" => {
             let algorithm = args[0].as_str().context("Expected algorithm")?;
             let secret = bytes(&args[1])?;
             let public = bytes(&args[2])?;
             let data = bytes(&args[3])?;
             let signature = bytes(&args[4])?;
-            if algorithm == "ECDSA" {
-                if op == "verify" {
-                    return Ok(json!(
-                        signature::UnparsedPublicKey::new(
-                            &signature::ECDSA_P256_SHA256_FIXED,
-                            public
-                        )
+            let hash = args[5].as_str().unwrap_or("SHA-256");
+            let p384 = public.len() == 97;
+            if op == "verify" && algorithm != "HMAC" {
+                let verification: &'static dyn signature::VerificationAlgorithm =
+                    match (algorithm, hash, p384) {
+                        ("ECDSA", "SHA-256", false) => &signature::ECDSA_P256_SHA256_FIXED,
+                        ("ECDSA", "SHA-384", true) => &signature::ECDSA_P384_SHA384_FIXED,
+                        ("ec", "SHA-256", false) => &signature::ECDSA_P256_SHA256_ASN1,
+                        ("ec", "SHA-384", false) => &signature::ECDSA_P256_SHA384_ASN1,
+                        ("ec", "SHA-256", true) => &signature::ECDSA_P384_SHA256_ASN1,
+                        ("ec", "SHA-384", true) => &signature::ECDSA_P384_SHA384_ASN1,
+                        ("ed25519", ..) => &signature::ED25519,
+                        ("rsa", "SHA-1", _) => {
+                            &signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY
+                        }
+                        ("rsa", "SHA-256", _) => {
+                            &signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY
+                        }
+                        ("rsa", "SHA-384", _) => &signature::RSA_PKCS1_2048_8192_SHA384,
+                        ("rsa", "SHA-512", _) => {
+                            &signature::RSA_PKCS1_1024_8192_SHA512_FOR_LEGACY_USE_ONLY
+                        }
+                        ("rsa-pss", "SHA-256", _) => &signature::RSA_PSS_2048_8192_SHA256,
+                        ("rsa-pss", "SHA-384", _) => &signature::RSA_PSS_2048_8192_SHA384,
+                        ("rsa-pss", "SHA-512", _) => &signature::RSA_PSS_2048_8192_SHA512,
+                        _ => bail!("Unsupported signature algorithm: {algorithm} with {hash}"),
+                    };
+                return Ok(json!(
+                    signature::UnparsedPublicKey::new(verification, public)
                         .verify(&data, &signature)
                         .is_ok()
-                    ));
-                }
-                let key = signature::EcdsaKeyPair::from_private_key_and_public_key(
-                    signing, &secret, &public, &rng,
-                )
-                .map_err(|_| anyhow::anyhow!("Invalid ECDSA key"))?;
-                return Ok(base64(
-                    key.sign(&rng, &data)
-                        .map_err(|_| anyhow::anyhow!("ECDSA signing failed"))?
-                        .as_ref(),
                 ));
             }
+            let failed = |_| anyhow::anyhow!("Signing failed");
+            match algorithm {
+                "ECDSA" | "ec" => {
+                    let signing = match (algorithm, hash, p384) {
+                        ("ECDSA", "SHA-256", false) => &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                        ("ECDSA", "SHA-384", true) => &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
+                        ("ec", "SHA-256", false) => &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                        ("ec", "SHA-384", true) => &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+                        _ => {
+                            bail!("ECDSA signs P-256 keys with SHA-256 and P-384 keys with SHA-384")
+                        }
+                    };
+                    let key = signature::EcdsaKeyPair::from_private_key_and_public_key(
+                        signing, &secret, &public, &rng,
+                    )
+                    .map_err(|_| anyhow::anyhow!("Invalid ECDSA key"))?;
+                    return Ok(base64(key.sign(&rng, &data).map_err(failed)?.as_ref()));
+                }
+                "ed25519" => {
+                    let key = signature::Ed25519KeyPair::from_seed_and_public_key(&secret, &public)
+                        .map_err(|_| anyhow::anyhow!("Invalid Ed25519 key"))?;
+                    return Ok(base64(key.sign(&data).as_ref()));
+                }
+                "rsa" | "rsa-pss" => {
+                    let padding: &'static dyn signature::RsaEncoding = match (algorithm, hash) {
+                        ("rsa", "SHA-256") => &signature::RSA_PKCS1_SHA256,
+                        ("rsa", "SHA-384") => &signature::RSA_PKCS1_SHA384,
+                        ("rsa", "SHA-512") => &signature::RSA_PKCS1_SHA512,
+                        ("rsa-pss", "SHA-256") => &signature::RSA_PSS_SHA256,
+                        ("rsa-pss", "SHA-384") => &signature::RSA_PSS_SHA384,
+                        ("rsa-pss", "SHA-512") => &signature::RSA_PSS_SHA512,
+                        _ => bail!("RSA signs with SHA-256, SHA-384 or SHA-512"),
+                    };
+                    let key = signature::RsaKeyPair::from_der(&secret)
+                        .map_err(|error| anyhow::anyhow!("Invalid RSA key: {error}"))?;
+                    let mut output = vec![0; key.public().modulus_len()];
+                    key.sign(padding, &rng, &data, &mut output)
+                        .map_err(failed)?;
+                    return Ok(base64(&output));
+                }
+                _ => {}
+            }
             ensure!(algorithm == "HMAC", "Unsupported signature algorithm");
-            let hash = match args[5].as_str().unwrap_or("SHA-256") {
+            let hash = match hash {
                 "SHA-1" => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
                 "SHA-256" => hmac::HMAC_SHA256,
                 "SHA-384" => hmac::HMAC_SHA384,

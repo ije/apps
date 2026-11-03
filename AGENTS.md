@@ -2,10 +2,6 @@
  
 A tiny, high performance, memory-safe electron alternative with compatible API.
 
-## Important Rules
-
-- Rebuild `examples/react` app after changes and report build size, FCP time, memeory usage
-
 ## Goals
 
 - 120FPS, 0 FPS when idle, low CPU load

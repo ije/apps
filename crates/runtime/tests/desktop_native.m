@@ -1,7 +1,9 @@
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <objc/runtime.h>
 #include <string.h>
+#include <unistd.h>
 char *apps_native_call(const char *,const char *);
 void apps_native_free(char *);
 void apps_theme_observe(void (*)(void));
@@ -35,6 +37,56 @@ int main(int argc, const char *argv[]) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         [NSApp finishLaunching];
         apps_theme_observe(themeWake);
+        if (!strcmp(argv[1], "--tray")) {
+            alarm(8);
+            __block NSStatusItem *status;
+            Method method = class_getInstanceMethod(NSStatusBar.class, @selector(statusItemWithLength:));
+            IMP original = method_getImplementation(method);
+            IMP capture = imp_implementationWithBlock(^NSStatusItem *(NSStatusBar *bar, CGFloat length) {
+                status = ((NSStatusItem *(*)(id, SEL, CGFloat))original)(bar, @selector(statusItemWithLength:), length);
+                return status;
+            });
+            method_setImplementation(method, capture);
+            NSString *icon = [[NSString stringWithUTF8String:argv[0]].stringByDeletingLastPathComponent stringByAppendingPathComponent:@"ServerTemplate.tiff"];
+            [[NSImage imageNamed:NSImageNameStatusAvailable].TIFFRepresentation writeToFile:icon atomically:YES];
+            NSDictionary *create = @{ @"id": @1, @"image": icon, @"guid": @"a64ad871-6826-4a77-90f9-900e39d536dd" };
+            NSData *json = [NSJSONSerialization dataWithJSONObject:create options:0 error:nil];
+            native("tray.create", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+            method_setImplementation(method, original);
+            imp_removeBlock(capture);
+            if (!status.button.image.isTemplate || ![status.autosaveName isEqual:create[@"guid"]]) return 34;
+            native("tray.title", "{\"id\":1,\"text\":\"Server\"}");
+            native("tray.toolTip", "{\"id\":1,\"text\":\"Running\"}");
+            NSView *view = status.button.subviews.lastObject;
+            if (![native("tray.getTitle", "{\"id\":1}") isEqual:@"Server"] || ![view.toolTip isEqual:@"Running"]) return 35;
+            if ([native("tray.bounds", "{\"id\":1}")[@"width"] doubleValue] <= 0) return 36;
+            NSEvent *click = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp location:NSZeroPoint modifierFlags:NSEventModifierFlagOption timestamp:0 windowNumber:view.window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:0];
+            [view mouseUp:click];
+            [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
+            NSArray *events = native("poll", "null");
+            if (![events filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"event == 'click' AND id == 1 AND alt == YES"]].count) return 37;
+            native("tray.menu", "{\"id\":1,\"template\":[{\"label\":\"Server\",\"sublabel\":\"Running\",\"submenu\":[{\"label\":\"Settings\",\"click\":42}]},{\"type\":\"separator\"},{\"role\":\"quit\",\"label\":\"Quit\"}]}");
+            __block BOOL selected = NO;
+            id observer = [NSNotificationCenter.defaultCenter addObserverForName:NSMenuDidBeginTrackingNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
+                NSMenu *menu = note.object;
+                if (menu != status.menu) return;
+                [NSRunLoop.mainRunLoop performInModes:@[NSEventTrackingRunLoopMode, NSDefaultRunLoopMode] block:^{
+                    NSMenuItem *row = menu.itemArray.firstObject;
+                    selected = [row.title isEqual:@"Server"] && [menu itemAtIndex:1].isSeparatorItem && [menu itemAtIndex:2].action == @selector(terminate:);
+                    if (@available(macOS 14.4, *)) selected &= [row.subtitle isEqual:@"Running"];
+                    [row.submenu performActionForItemAtIndex:0];
+                    native("tray.close", "{\"id\":1}");
+                }];
+            }];
+            native("tray.popup", "{\"id\":1,\"template\":null,\"request\":3}");
+            [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.4]];
+            [NSNotificationCenter.defaultCenter removeObserver:observer];
+            events = native("poll", "null");
+            if (!selected || ![events filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"type == 'menu' AND id == 42"]].count) return 38;
+            native("tray.destroy", "{\"id\":1}");
+            if (view.superview || native("tray.bounds", "{\"id\":1}")) return 39;
+            return 0;
+        }
         native("theme.set", "\"dark\"");
         NSDictionary *theme = native("theme.get", "null");
         for (NSString *key in theme) if (![key isEqual:@"themeSource"] && CFGetTypeID((__bridge CFTypeRef)theme[key]) != CFBooleanGetTypeID()) return 27;
@@ -109,6 +161,28 @@ int main(int argc, const char *argv[]) {
         native("menu.set", "null");
         NSArray *displays = native("screen.displays", "null");
         if (!displays.count || [displays[0][@"bounds"][@"x"] doubleValue] != 0 || [displays[0][@"bounds"][@"y"] doubleValue] != 0 || [displays[0][@"scaleFactor"] doubleValue] < 1 || ![native("screen.cursor", "null")[@"x"] isKindOfClass:NSNumber.class]) return 33;
+        NSNumber *assertion = native("power.block", "true");
+        CFDictionaryRef properties = IOPMAssertionCopyProperties(assertion.unsignedIntValue);
+        if (!properties) return 34;
+        CFRelease(properties);
+        native("power.unblock", assertion.stringValue.UTF8String);
+        properties = IOPMAssertionCopyProperties(assertion.unsignedIntValue);
+        if (properties) { CFRelease(properties); return 34; }
+        NSString *accent = native("prefs.color", "\"controlAccentColor\"");
+        if (accent.length != 9 || ![accent hasPrefix:@"#"] || [native("prefs.color", "\"systemBlueColor\"") length] != 9 || native("prefs.color", "\"missingColor\"") != [NSNull null]) return 35;
+        if (![@[@"dark", @"light"] containsObject:native("prefs.appearance", "null")] || [native("prefs.animation", "null") count] != 3 || ![native("prefs.swipe", "null") isKindOfClass:NSNumber.class] || ![native("prefs.touchID", "null") isKindOfClass:NSNumber.class] || ![native("prefs.trusted", "false") isKindOfClass:NSNumber.class]) return 36;
+        if (![@[@"not-determined", @"restricted", @"denied", @"granted"] containsObject:native("prefs.media", "\"camera\"")] || ![@[@"denied", @"granted"] containsObject:native("prefs.media", "\"screen\"")] || native("prefs.askMedia", "{\"type\":\"camera\",\"async\":1}")) return 37;
+        NSString *key = [@"apps-test-" stringByAppendingString:NSUUID.UUID.UUIDString];
+        NSDictionary *values = @{ @"string": @"text", @"boolean": @YES, @"integer": @7, @"double": @1.5, @"url": @"https://example.com/a", @"array": @[@1, @"two"], @"dictionary": @{ @"a": @1 } };
+        for (NSString *type in values) {
+            NSString *request = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:@{ @"key": key, @"type": type, @"value": values[type] } options:0 error:nil] encoding:NSUTF8StringEncoding];
+            if (native("prefs.setDefault", request.UTF8String) != [NSNull null] || ![native("prefs.getDefault", request.UTF8String) isEqual:values[type]]) return 38;
+        }
+        NSString *quoted = [NSString stringWithFormat:@"\"%@\"", key], *string = [NSString stringWithFormat:@"{\"key\":\"%@\",\"type\":\"string\"}", key];
+        native("prefs.removeDefault", quoted.UTF8String);
+        if (native("prefs.setDefault", [NSString stringWithFormat:@"{\"key\":\"%@\",\"type\":\"array\",\"value\":[null]}", key].UTF8String) || ![native("prefs.getDefault", string.UTF8String) isEqual:@""]) return 39;
+        native("prefs.registerDefaults", [NSString stringWithFormat:@"{\"%@\":\"registered\"}", key].UTF8String);
+        if (![native("prefs.getDefault", string.UTF8String) isEqual:@"registered"]) return 40;
         NSDictionary *options=@{ @"id": NSUUID.UUID.UUIDString, @"argv": @[@"smoke",@"second"], @"cwd": NSTemporaryDirectory(), @"data": @{ @"value": @42 } };
         NSString *arguments=[[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:options options:0 error:nil] encoding:NSUTF8StringEncoding];
         if (![native("app.singleInstance",arguments.UTF8String) boolValue]) return 7;
@@ -130,6 +204,12 @@ int main(int argc, const char *argv[]) {
         if (![NSApp.dockTile.badgeLabel isEqual:@"3"]) return 10;
         native("app.badge","\"\"");
         if (NSApp.dockTile.badgeLabel || ![native("app.activationPolicy","null") isEqual:@"accessory"]) return 10;
+        native("app.progress","0.5");
+        native("app.progress","2");
+        NSView *bar = NSApp.dockTile.contentView.subviews.lastObject;
+        if (![bar isKindOfClass:NSClassFromString(@"AppsDockProgress")] || [[bar valueForKey:@"value"] doubleValue] != 1) return 34;
+        native("app.progress","-1");
+        if (NSApp.dockTile.contentView) return 34;
         NSDictionary *locale=native("app.locale","null");
         if (![locale[@"system"] length] || ![locale[@"languages"] isKindOfClass:NSArray.class]) return 11;
         native("app.about","{\"applicationName\":\"Smoke\",\"credits\":\"Thanks\"}");
@@ -150,7 +230,7 @@ int main(int argc, const char *argv[]) {
                 [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
                 events = native("poll", "null");
             }
-            if (!running || events.count != 1 || ![events[0][@"type"] isEqual:@"dialog"] || !events[0][@"value"]) return 30;
+            if (!running || events.count != 1 || ![events[0][@"type"] isEqual:@"reply"] || !events[0][@"value"]) return 30;
         }
         return 0;
     }

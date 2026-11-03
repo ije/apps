@@ -51,6 +51,7 @@ fn main() {
             "Carbon",
             "IOKit",
             "CoreGraphics",
+            "CoreText",
             "ImageIO",
             "ServiceManagement",
             "UniformTypeIdentifiers",

@@ -22,12 +22,15 @@ use std::{
 pub fn run(
     entry: &Path,
     runtime: &Path,
+    rust: Option<&Path>,
     watch: bool,
     devtools: bool,
     mcp: Option<u16>,
     args: &[String],
 ) -> Result<i32> {
-    let root = entry.parent().context("Missing project directory")?;
+    let root = rust
+        .or_else(|| entry.parent())
+        .context("Missing project directory")?;
     let public = root.join("public");
     let runtime = runtime.canonicalize().context(
         "Cannot find the runtime. Build the workspace or set APPS_RUNTIME to an executable",
@@ -36,18 +39,35 @@ pub fn run(
     let mut files = Rc::new(RefCell::new(BTreeSet::new()));
     let cache = watch.then(Rc::<bundler::Cache>::default);
     let started = Instant::now();
-    let mut bundle = match bundler::compile(
-        entry,
-        bundler::Realm::Main,
-        None,
-        files.clone(),
-        false,
-        cache.clone(),
-    ) {
+    let target =
+        crate::build_target::BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)?;
+    let compile = |files: Rc<RefCell<BTreeSet<PathBuf>>>| -> Result<_> {
+        if rust.is_some() {
+            files.borrow_mut().extend([
+                entry.to_owned(),
+                root.join("Cargo.toml"),
+                root.join("Cargo.lock"),
+            ]);
+        }
+        let bundle = bundler::compile(
+            entry,
+            bundler::Realm::Main,
+            None,
+            files,
+            false,
+            cache.clone(),
+        )?;
+        let binary = match rust {
+            Some(root) => crate::rust::build(root, entry, false, target)?,
+            None => runtime.clone(),
+        };
+        Ok((binary, bundle))
+    };
+    let mut bundle = match compile(files.clone()) {
         Ok(bundle) => {
             println!(
                 "apps: compiled {} bytes in {} ms",
-                bundle.values().map(String::len).sum::<usize>(),
+                bundle.1.values().map(String::len).sum::<usize>(),
                 started.elapsed().as_millis()
             );
             Some(bundle)
@@ -97,6 +117,10 @@ pub fn run(
                     if public.is_dir() {
                         directories.insert(public.clone());
                     }
+                    let src = root.join("src");
+                    if rust.is_some() && src.is_dir() {
+                        directories.insert(src.clone());
+                    }
                     if directories != watched {
                         let mut paths = watcher.paths_mut();
                         for path in watched.difference(&directories) {
@@ -105,7 +129,7 @@ pub fn run(
                         for path in directories.difference(&watched) {
                             paths.add(
                                 path,
-                                if path == &public {
+                                if path == &public || rust.is_some() && path == &src {
                                     notify::RecursiveMode::Recursive
                                 } else {
                                     notify::RecursiveMode::NonRecursive
@@ -119,21 +143,34 @@ pub fn run(
             }
             if launch {
                 launch = false;
-                child = Some(
-                    Command::new(&runtime)
-                        .arg("--bundle-stdin")
+                let (binary, files) = bundle.take().unwrap();
+                let mut cmd = Command::new(binary);
+                if rust.is_some() {
+                    cmd.env("APPS_RUST_DEV", "1")
+                        .env("APPS_RUST_LIBRARIES", &runtime)
+                        .env_remove("APPS_RUST_DEVTOOLS")
+                        .env_remove("APPS_RUST_MCP_PORT");
+                    if devtools {
+                        cmd.env("APPS_RUST_DEVTOOLS", "1");
+                    }
+                    if let Some(port) = mcp {
+                        cmd.env("APPS_RUST_MCP_PORT", port.to_string());
+                    }
+                } else {
+                    cmd.arg("--bundle-stdin")
                         .args(devtools.then_some("--devtools"))
                         .args(mcp.map(|port| format!("--devtools-mcp={port}")))
                         .arg("--")
-                        .arg(entry)
-                        .args(args)
+                        .arg(entry);
+                }
+                child = Some(
+                    cmd.args(args)
                         .env("APPS_JSC_LIBRARY", &library)
                         .current_dir(root)
                         .stdin(Stdio::piped())
                         .spawn()?,
                 );
                 let input = child.as_mut().unwrap().stdin.take().unwrap();
-                let files = bundle.take().unwrap();
                 writer = Some(
                     std::thread::Builder::new()
                         .name("apps-bundle".into())
@@ -201,6 +238,7 @@ pub fn run(
                     let files = files.borrow();
                     if event.paths.iter().any(|path| {
                         path.starts_with(&public)
+                            || rust.is_some() && path.extension().is_some_and(|e| e == "rs")
                             || files
                                 .range(path.clone()..)
                                 .next()
@@ -220,15 +258,10 @@ pub fn run(
                 fresh = true;
                 let next_files = Rc::default();
                 let rebuild = Instant::now();
-                let rebuilt = bundler::compile(
-                    entry,
-                    bundler::Realm::Main,
-                    None,
-                    Rc::clone(&next_files),
-                    false,
-                    cache.clone(),
-                )
-                .and_then(|bundle| {
+                let rebuilt = compile(Rc::clone(&next_files)).and_then(|(binary, bundle)| {
+                    if rust.is_some() {
+                        return Ok((binary, bundle));
+                    }
                     if validator.is_none() {
                         validator = Some(JsContext::new(
                             JavaScriptCore::load()?,
@@ -237,7 +270,7 @@ pub fn run(
                         )?);
                     }
                     validator.as_ref().unwrap().validate_bundle(&bundle)?;
-                    Ok(bundle)
+                    Ok((binary, bundle))
                 });
                 match rebuilt {
                     Ok(next_bundle) => {

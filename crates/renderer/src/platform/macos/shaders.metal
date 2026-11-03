@@ -513,6 +513,28 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
   if (border_sdf < antialias_threshold) {
     float4 border_color = input.border_color;
 
+    // A quad of some sides keeps their pixels. A pixel belongs to the side with the least depth into the border
+    // over the side's width, so neighbors meet on the line from the outer corner to the inner one, like CSS.
+    uint sides = quad.border_style >> 8;
+    if (sides != 0) {
+      float4 widths = float4(quad.border_widths.top, quad.border_widths.right,
+                             quad.border_widths.bottom, quad.border_widths.left);
+      float4 depths = float4(point.y, size.x - point.x, size.y - point.y, point.x);
+      float coverage = 0.0;
+      for (uint a = 0; a < 4; a++) {
+        if ((sides & (1u << a)) == 0 || widths[a] <= 0.0) continue;
+        float nearest = 1e6;
+        for (uint b = 0; b < 4; b++) {
+          if ((sides & (1u << b)) != 0 || widths[b] <= 0.0) continue;
+          // Distance to where side b takes over, along the normal of that line.
+          float scale = (a + b) % 2 == 1 ? length(float2(widths[a], widths[b])) : widths[a] + widths[b];
+          nearest = min(nearest, (depths[b] * widths[a] - depths[a] * widths[b]) / scale);
+        }
+        coverage = max(coverage, saturate(0.5 + nearest));
+      }
+      border_color.a *= coverage;
+    }
+
     // Exact distance to the inner edge, for the double and dotted styles.
     Bounds inner_bounds = {
       quad.bounds.origin + float2(quad.border_widths.left, quad.border_widths.top),
@@ -531,14 +553,14 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
     float inner_depth = quad_sdf(position, inner_bounds, inner_radii);
 
     // Double borders keep the outer and inner thirds.
-    if (quad.border_style == 3) {
+    if ((quad.border_style & 255) == 3) {
       float depth = -outer_sdf;
       float width = depth + inner_depth;
       border_color.a *= saturate(antialias_threshold - min(depth - width / 3.0, width * 2.0 / 3.0 - depth));
     }
 
     // Dashed (1) and dotted (2) border logic
-    if (quad.border_style == 1 || quad.border_style == 2) {
+    if ((quad.border_style & 255) == 1 || (quad.border_style & 255) == 2) {
       // Position along the perimeter in "dash space", where each dash
       // period has length 1
       float t = 0.0;
@@ -552,7 +574,7 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
       // overlapping when dash size is smaller than the border width.
       //
       // Dash pattern: (2 * border width) dash, (1 * border width) gap
-      bool dotted = quad.border_style == 2;
+      bool dotted = (quad.border_style & 255) == 2;
       const float dash_length_per_width = dotted ? 1.0 : 2.0;
       const float dash_gap_per_width = 1.0;
       const float dash_period_per_width = dash_length_per_width + dash_gap_per_width;

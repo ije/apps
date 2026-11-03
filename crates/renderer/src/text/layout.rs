@@ -147,7 +147,7 @@ impl LineLayout {
             glyph_ix: 0,
         };
         let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
+        let (mut prev_ch, mut hyphen_after) = ('\0', false);
         let mut glyphs = self
             .runs
             .iter()
@@ -173,7 +173,11 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if first_non_whitespace_ix.is_some()
                 && ch != ' '
-                && (prev_ch == ' ' || !is_word_char(ch) || word_break == WordBreak::BreakAll)
+                && (prev_ch == ' '
+                    || !is_word_char(ch)
+                    || word_break == WordBreak::BreakAll
+                    // UAX #14: a hyphen inside a word breaks after it, but not before a digit.
+                    || hyphen_after && ch.is_alphabetic())
             {
                 last_candidate_ix = Some(boundary);
                 last_candidate_x = x;
@@ -220,6 +224,7 @@ impl LineLayout {
                 }
                 boundaries.push(last_boundary);
             }
+            hyphen_after = ch == '-' && prev_ch.is_alphanumeric();
             prev_ch = ch;
         }
         if !constrain || boundaries.is_empty() {
@@ -857,11 +862,9 @@ mod tests {
     use super::*;
     use crate::{point, px};
 
-    #[test]
-    fn balance_and_pretty_even_out_lines() {
-        // Nine 40px words with 10px spaces, in a 200px line.
-        let text = ["aaaa"; 9].join(" ");
-        let layout = LineLayout {
+    // A layout with one 10px glyph per character.
+    fn layout(text: &str) -> LineLayout {
+        LineLayout {
             font_size: px(10.),
             width: px(text.len() as f32 * 10.),
             runs: vec![ShapedRun {
@@ -878,7 +881,32 @@ mod tests {
             }],
             len: text.len(),
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn hyphens_break_after_inside_words() {
+        let text = "ab-cd x-12 -ef";
+        let boundaries = layout(text).compute_wrap_boundaries(
+            text,
+            px(0.),
+            None,
+            px(0.),
+            TextWrap::Wrap,
+            WordBreak::Normal,
+        );
+        let found: Vec<_> = boundaries
+            .iter()
+            .map(|boundary| boundary.glyph_ix)
+            .collect();
+        assert_eq!(found, [3, 6, 11]);
+    }
+
+    #[test]
+    fn balance_and_pretty_even_out_lines() {
+        // Nine 40px words with 10px spaces, in a 200px line.
+        let text = ["aaaa"; 9].join(" ");
+        let layout = layout(&text);
         for (wrap, starts) in [
             (TextWrap::Wrap, vec![20, 40]),
             (TextWrap::Balance, vec![15, 30]),

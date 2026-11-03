@@ -431,6 +431,33 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
     if (border_sdf < antialias_threshold) {
         var border_color = input.border_color;
 
+        // A quad of some sides keeps their pixels. A pixel belongs to the side with the least depth into the
+        // border over the side's width, so neighbors meet on the line from the outer corner to the inner one,
+        // like CSS.
+        let sides = quad.border_style >> 8u;
+        if (sides != 0u) {
+            let widths = vec4<f32>(quad.border_widths.top, quad.border_widths.right,
+                quad.border_widths.bottom, quad.border_widths.left);
+            let depths = vec4<f32>(point.y, size.x - point.x, size.y - point.y, point.x);
+            var coverage = 0.0;
+            for (var a = 0u; a < 4u; a++) {
+                if ((sides & (1u << a)) == 0u || widths[a] <= 0.0) {
+                    continue;
+                }
+                var nearest = 1e6;
+                for (var b = 0u; b < 4u; b++) {
+                    if ((sides & (1u << b)) != 0u || widths[b] <= 0.0) {
+                        continue;
+                    }
+                    // Distance to where side b takes over, along the normal of that line.
+                    let scale = select(widths[a] + widths[b], length(vec2<f32>(widths[a], widths[b])), (a + b) % 2u == 1u);
+                    nearest = min(nearest, (depths[b] * widths[a] - depths[a] * widths[b]) / scale);
+                }
+                coverage = max(coverage, saturate(0.5 + nearest));
+            }
+            border_color.a *= coverage;
+        }
+
         // Exact distance to the inner edge, for the double and dotted styles.
         let inner_bounds = Bounds(
             quad.bounds.origin + vec2<f32>(quad.border_widths.left, quad.border_widths.top),
@@ -451,14 +478,14 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
         let inner_depth = quad_sdf(point + quad.bounds.origin, inner_bounds, inner_radii);
 
         // Double borders keep the outer and inner thirds.
-        if (quad.border_style == 3u) {
+        if ((quad.border_style & 255u) == 3u) {
             let depth = -outer_sdf;
             let width = depth + inner_depth;
             border_color.a *= saturate(antialias_threshold - min(depth - width / 3.0, width * 2.0 / 3.0 - depth));
         }
 
         // Dashed (1) and dotted (2) border logic
-        if (quad.border_style == 1u || quad.border_style == 2u) {
+        if ((quad.border_style & 255u) == 1u || (quad.border_style & 255u) == 2u) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1
             var t = 0.0;
@@ -472,7 +499,7 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
             // overlapping when dash size is smaller than the border width.
             //
             // Dash pattern: (2 * border width) dash, (1 * border width) gap
-            let dotted = quad.border_style == 2u;
+            let dotted = (quad.border_style & 255u) == 2u;
             let dash_length_per_width = select(2.0, 1.0, dotted);
             let dash_gap_per_width = 1.0;
             let dash_period_per_width = dash_length_per_width + dash_gap_per_width;

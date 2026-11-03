@@ -151,7 +151,7 @@
     if (disabled.has(name)) return reject(new TypeError(`Importing ${url.slice(0, url.indexOf(':'))} URLs needs the ${name} feature. Add "${name}" to "features" in package.json`));
     download(url).then(response => response.ok ? response.text() : Promise.reject(new TypeError(`Cannot import ${url}: HTTP ${response.status}`))).then(resolve, reject);
   };
-  globalThis.__appsPlatform(call);
+  globalThis.__appsPlatform(call, nodeRole);
   delete globalThis.__appsPlatform;
   let modulesPending = 0;
   const moduleErrors = [];
@@ -164,7 +164,7 @@
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
-  const hooks = {}, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
+  const hooks = { blob: pollWeb.blob }, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
   delete globalThis.__appsBridge;
   __appsSyncBridge();
   globalThis.__appsPending = () => modulesPending > 0 || moduleErrors.length > 0 || (children?.pending() ?? false) || (node?.poll.pending() ?? false) || (pty?.poll.pending() ?? false) || bridge.poll.pending() || workers.pending() || (net?.pending() ?? false);
@@ -233,6 +233,7 @@
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
+    globalThis.__appsFiles = hooks.files;
     const executed = (id, data) => call('dom.executed', id, stringify(data));
     Object.defineProperty(globalThis, '__appsExecuted', { value: (id, value, failed) => (failed ? Promise.reject(value) : Promise.resolve(value)).then(value => executed(id, { value })).catch(error => executed(id, { error: String(error?.message ?? error) })) });
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
@@ -241,6 +242,9 @@
     return;
   }
   const info = call('info');
+  if (info.rustMain && typeof role === 'object' && 'preload' in role) {
+    bridge.ipcRenderer.invoke = async (channel, ...args) => parse(call('rust.invoke', channel, stringify(args)));
+  }
   globalThis.global = globalThis;
   // WARNING: V8 call sites are parsed from JSC's stack text, so getThis(), getFunction() and getTypeName() know nothing.
   const capture = Error.captureStackTrace;
@@ -272,6 +276,8 @@
   delete globalThis.__appsSQLite;
   const events = globalThis.__appsEvents;
   delete globalThis.__appsEvents;
+  globalThis.__appsEventTargets(pollWeb.listeners);
+  delete globalThis.__appsEventTargets;
   servers = globalThis.__appsServe(call);
   delete globalThis.__appsServe;
   node = globalThis.__appsNode(call, events.EventEmitter, inspector, info);
@@ -280,12 +286,25 @@
   delete globalThis.__appsNodeStreams;
   children = globalThis.__appsChildProcess(call, events.EventEmitter, stream);
   delete globalThis.__appsChildProcess;
-  const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto });
+  const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect });
   delete globalThis.__appsNodeIO;
+  node.util.types.isKeyObject = value => value instanceof io.crypto.KeyObject;
   net = globalThis.__appsNet(call, events.EventEmitter, stream, node.Buffer);
   delete globalThis.__appsNet;
   const http = globalThis.__appsHTTP(servers.serve, stream, events.EventEmitter, net);
   delete globalThis.__appsHTTP;
+  class ClientRequest extends http.http.ClientRequest {
+    constructor(options) {
+      options = typeof options === 'string' ? { url: options } : { ...options };
+      if (!['follow', 'error'].includes(options.redirect ??= 'follow')) throw new TypeError(`Unsupported redirect mode: ${options.redirect}`);
+      super(options.url ?? `${options.protocol ?? 'http:'}//${options.host ?? (options.hostname ?? 'localhost') + (options.port ? ':' + options.port : '')}${options.path ?? '/'}`, { method: options.method, headers: options.headers });
+      Object.assign(this, { _redirect: options.redirect, chunkedEncoding: false });
+    }
+    followRedirect() {}
+    getUploadProgress() { const total = this._chunks.reduce((size, chunk) => size + chunk.length, 0); return { active: this.headersSent && !this.res, started: this.headersSent, current: this.res ? total : 0, total }; }
+  }
+  const isOnline = () => info.platform === 'win32' || Object.values(node.os.networkInterfaces()).flat().some(item => !item.internal && !/^(169\.254\.|fe80:)/i.test(item.address));
+  const electronNet = Object.freeze({ fetch: (input, init) => fetch(input, init), request: options => new ClientRequest(options), isOnline, get online() { return isOnline(); } });
   pty = globalThis.__appsPty(call);
   delete globalThis.__appsPty;
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents));
@@ -345,11 +364,11 @@
   hooks.report = error => { if (!uncaught(error)) console.error(error); };
   addEventListener('unhandledrejection', event => { if (!process.listenerCount('unhandledRejection')) return; event.preventDefault(); process.emit('unhandledRejection', event.reason, event.promise); });
   const output = fd => {
-    let tty;
-    const writable = new stream.Writable({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
+    const tty = node.tty.isatty(fd), writable = new stream.Writable({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
     // WARNING: Writes stay synchronous so they keep their order with console output.
     writable.write = (data, encoding, callback) => { if (typeof encoding === 'function') { callback = encoding; encoding = undefined; } call('process.write', fd, typeof data === 'string' && !encoding ? data : Buffer.from(data, encoding)); if (callback) queueMicrotask(callback); return true; };
-    return Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { get: () => (tty ??= node.tty.isatty(fd)) || undefined, enumerable: true } });
+    Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { value: tty || undefined, enumerable: true } });
+    return tty ? node.terminal(writable, stream) : writable;
   };
   process.stdout = output(1);
   process.stderr = output(2);
@@ -411,14 +430,14 @@
   const { path, os } = node;
   let ready = false, nextWindow = 0, resolveReady;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-  const windows = new Map(), captures = new Map(), states = new WeakMap(), pages = new WeakMap();
-  let nextCapture = 0, nextLoad = 0;
+  const windows = new Map(), captures = new Map(), states = new WeakMap(), pages = new WeakMap(), opened = new Map();
+  let nextCapture = 0, nextLoad = 0, nextCSS = 0;
   const destroyed = () => Error('Object has been destroyed');
   const state = win => { if (win.isDestroyed()) throw destroyed(); return states.get(win); };
   const loadError = (code, description, url) => Object.assign(new Error(`${description} (${code}) loading '${url}'`), { code: description, errno: code, url });
   const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win, op }); call('window', op, win, id, ...args); });
   class WebContents extends events.EventEmitter {
-    constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null }); }
+    constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null, zoom: [1, 0] }); }
     #page() { const page = pages.get(this); if (!windows.has(page.win)) throw destroyed(); return page; }
     _load(op, target, url) {
       const page = this.#page(), request = ++nextLoad;
@@ -462,7 +481,24 @@
     reloadIgnoringCache() { this.reload(); }
     send(channel, ...args) { bridge.send(this.#page().win, channel, ...args); }
     executeJavaScript(code) { return pending(this.#page().win, 'execute', String(code)); }
+    insertCSS(css, { cssOrigin = 'author' } = {}) { const key = `apps-css-${++nextCSS}`; call('window', 'insertCSS', this.#page().win, key, String(css), cssOrigin === 'user'); return Promise.resolve(key); }
+    removeInsertedCSS(key) { call('window', 'removeInsertedCSS', this.#page().win, String(key)); return Promise.resolve(); }
+    setWindowOpenHandler(handler) { if (handler !== null && typeof handler !== 'function') throw new TypeError('Expected a window open handler'); this.#page().open = handler; }
+    #edit(command, text = null) { call('window', 'edit', this.#page().win, command, text); }
+    undo() { this.#edit('undo'); } redo() { this.#edit('redo'); } cut() { this.#edit('cut'); } copy() { this.#edit('copy'); } paste() { this.#edit('paste'); } pasteAndMatchStyle() { this.#edit('pasteAndMatchStyle'); }
+    delete() { this.#edit('delete'); } selectAll() { this.#edit('selectAll'); } unselect() { this.#edit('unselect'); } replace(text) { this.#edit('replace', String(text)); }
+    insertText(text) { this.#edit('insertText', String(text)); return Promise.resolve(); }
     capturePage(rect) { return pending(this.#page().win, 'capture', rect ?? null); }
+    // WARNING: like Chromium, the page draws at most 5x and at least 0.25x, while the getters keep the value that was set.
+    #zoom(factor, level) { const page = this.#page(); page.zoom = [factor, level]; call('window', 'zoom', page.win, Math.min(Math.max(factor, 0.25), 5)); }
+    setZoomFactor(factor) { if (typeof factor !== 'number' || !(factor > 0)) throw new Error("'zoomFactor' must be a double greater than 0.0"); this.#zoom(factor, Math.log(factor) / Math.log(1.2)); }
+    getZoomFactor() { return pages.get(this).zoom[0]; }
+    setZoomLevel(level) { if (typeof level !== 'number' || !Number.isFinite(level)) throw new TypeError('Expected a number for zoomLevel'); this.#zoom(1.2 ** level, level); }
+    getZoomLevel() { return pages.get(this).zoom[1]; }
+    get zoomFactor() { return this.getZoomFactor(); }
+    set zoomFactor(factor) { this.setZoomFactor(factor); }
+    get zoomLevel() { return this.getZoomLevel(); }
+    set zoomLevel(level) { this.setZoomLevel(level); }
     openDevTools() { call('window', 'devtools', this.#page().win); }
     toggleDevTools() { this.openDevTools(); }
     focus() { BrowserWindow.fromId(this.#page().win).focus(); }
@@ -481,6 +517,7 @@
   const closed = win => {
     const closing = quitting;
     windows.delete(win.id);
+    opened.delete(win.id);
     for (const child of win.contentView.children) win.contentView.removeChildView(child);
     const page = pages.get(win.webContents);
     page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
@@ -494,7 +531,34 @@
     else quit();
   };
   hooks.contents = id => windows.get(id)?.webContents ?? null;
-  const int = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return Math.round(value); };
+  // Pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
+  globalThis.__appsWindowOpen = (id, [kind, url, frameName, features, disposition]) => {
+    const opener = windows.get(id);
+    if (!opener) return 'null';
+    if (kind !== 'open') { const child = opened.get(url) === id ? windows.get(url) : null; if (kind === 'close') child?.close(); return JSON.stringify(!child); }
+    const page = pages.get(opener.webContents), details = { url, frameName, features, disposition, referrer: { url: page.url, policy: 'strict-origin-when-cross-origin' }, postBody: undefined };
+    try {
+      const result = page.open ? page.open(details) : { action: 'allow' };
+      // WARNING: BrowserWindow loads only bundled pages and local files, so other URLs are denied.
+      if (result?.action !== 'allow' || !/^(apps:\/\/\/|file:)/i.test(url)) return 'null';
+      const options = {};
+      for (const [, key, value] of features.matchAll(/(\w+)\s*=\s*([\d.]+)/g)) { const name = { width: 'width', height: 'height', left: 'x', top: 'y' }[key.toLowerCase()]; if (name) options[name] = Number(value); }
+      Object.assign(options, result.overrideBrowserWindowOptions);
+      const win = new BrowserWindow(options);
+      opened.set(win.id, id);
+      win.loadFile(url).catch(() => {});
+      opener.webContents.emit('did-create-window', win, { ...details, options });
+      return String(win.id);
+    } catch (error) { hooks.report(error); return 'null'; }
+  };
+  const num = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return value; };
+  const int = (value, name) => Math.round(num(value, name));
+  // NSVisualEffectMaterial and NSVisualEffectState values.
+  const materials = { 'appearance-based': 0, titlebar: 3, selection: 4, menu: 5, popover: 6, sidebar: 7, header: 10, sheet: 11, window: 12, hud: 13, 'fullscreen-ui': 15, tooltip: 17, content: 18, 'under-window': 21, 'under-page': 22 };
+  const material = type => { if (!type) return null; if (!Object.hasOwn(materials, type)) throw new TypeError(`Invalid vibrancy type: ${type}`); return materials[type]; };
+  const effectStates = ['followWindow', 'active', 'inactive'];
+  // WARNING: a parent destroys or keeps its children natively, so they leave it before it closes.
+  const orphan = win => { for (const child of win.getChildWindows()) { states.get(child).parent = 0; call('window', 'parent', child.id, null); } };
   // WARNING: Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
   const argb = color => /^#([\da-f]{4}|[\da-f]{8})$/i.test(color) ? '#' + color.slice(color.length === 5 ? 2 : 3) + color.slice(1, color.length === 5 ? 2 : 3) : color;
   const resize = (win, next, content) => {
@@ -507,6 +571,7 @@
     target.height = Math.min(Math.max(target.height, s.min[1], 1), s.max[1] || 16384);
     call('window', 'bounds', win.id, target.x, target.y, target.width, target.height);
     s.bounds = target;
+    if (win.isNormal()) s.normal = { ...target };
     s.content = { x: target.x + dx, y: target.y + dy, width: target.width - dw, height: target.height - dh };
   };
   class BrowserWindow extends events.EventEmitter {
@@ -515,13 +580,22 @@
       if (!ready) throw Error('Call app.whenReady() before creating a window');
       options = { ...options, title: String(options.title ?? name) };
       if (typeof options.backgroundColor === 'string') options.backgroundColor = argb(options.backgroundColor);
+      if (options.parent != null && !(options.parent instanceof BrowserWindow)) throw new TypeError('Expected a BrowserWindow for parent');
+      if (options.parent) { state(options.parent); options.parent = options.parent.id; } else delete options.parent;
+      if (typeof options.opacity === 'number') options.opacity = Math.min(Math.max(options.opacity, 0), 1);
+      if (options.vibrancy !== undefined) options.vibrancy = material(options.vibrancy) ?? undefined;
+      const effect = effectStates.indexOf(options.visualEffectState ?? 'followWindow');
+      if (effect < 0) throw new TypeError(`Invalid visualEffectState: ${options.visualEffectState}`);
+      options.visualEffectState = effect;
       this.id = ++nextWindow;
       call('window', 'create', this.id, options);
       Object.defineProperty(this, 'webContents', { value: new WebContents(this.id), enumerable: true });
       const { x = 0, y = 0, width = 800, height = 600 } = options;
-      states.set(this, { bounds: { x, y, width, height }, content: { x, y, width, height }, minimized: false, maximized: false, fullscreen: false, visible: options.show !== false, focused: false,
+      states.set(this, { bounds: { x, y, width, height }, content: { x, y, width, height }, normal: { x, y, width, height }, minimized: false, maximized: false, fullscreen: false, visible: options.show !== false, focused: false,
         title: options.title, min: [options.minWidth ?? 0, options.minHeight ?? 0], max: [options.maxWidth ?? 0, options.maxHeight ?? 0], alwaysOnTop: options.alwaysOnTop === true,
-        resizable: options.resizable !== false, movable: options.movable !== false, minimizable: options.minimizable !== false, maximizable: options.maximizable !== false, closable: options.closable !== false, native: null, closing: false });
+        resizable: options.resizable !== false, movable: options.movable !== false, minimizable: options.minimizable !== false, maximizable: options.maximizable !== false, closable: options.closable !== false, native: null, closing: false,
+        opacity: options.opacity ?? 1, shadow: options.hasShadow !== false, focusable: options.focusable !== false, contentProtection: false, workspaces: false, attention: -1,
+        parent: options.parent ?? 0, modal: !!options.parent && options.modal === true, background: options.backgroundColor, transparent: options.transparent === true, effect });
       windows.set(this.id, this);
       Object.defineProperty(this, 'contentView', { value: browsers.contentView(this, options), enumerable: true });
       app.emit('web-contents-created', event(), this.webContents);
@@ -537,14 +611,15 @@
       this.emit('close', close);
       if (close.defaultPrevented) { quitting = false; return; }
       states.get(this).closing = true;
+      orphan(this);
       call('window', 'close', this.id);
     }
-    destroy() { if (this.isDestroyed()) return; call('window', 'close', this.id); closed(this); }
+    destroy() { if (this.isDestroyed()) return; orphan(this); call('window', 'close', this.id); closed(this); }
     setWindowButtonVisibility(visible) { state(this); call('window', 'buttons', this.id, !!visible); }
     isDestroyed() { return !windows.has(this.id); }
     getTitle() { return state(this).title; }
     setTitle(title) { const s = state(this); s.title = String(title); call('window', 'title', this.id, s.title); }
-    setBackgroundColor(color) { state(this); call('window', 'background', this.id, argb(String(color))); }
+    setBackgroundColor(color) { const s = state(this), background = argb(String(color)); call('window', 'background', this.id, background); s.background = background; }
     getBounds() { return { ...state(this).bounds }; }
     setBounds(bounds) { resize(this, bounds, false); }
     getContentBounds() { return { ...state(this).content }; }
@@ -580,6 +655,7 @@
     isMaximized() { return state(this).maximized; }
     restore() { state(this).minimized = false; call('window', 'restore', this.id); }
     isNormal() { const s = state(this); return !s.minimized && !s.maximized && !s.fullscreen; }
+    getNormalBounds() { const s = state(this); return { ...(this.isNormal() ? s.bounds : s.normal) }; }
     setFullScreen(flag) { state(this).fullscreen = !!flag; call('window', 'fullscreen', this.id, !!flag); }
     isFullScreen() { return state(this).fullscreen; }
     show() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'show', this.id); }
@@ -589,13 +665,66 @@
     focus() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'focus', this.id); }
     blur() { state(this).focused = false; call('window', 'blur', this.id); }
     isFocused() { return state(this).focused; }
+    setOpacity(opacity) { const s = state(this), value = Math.min(Math.max(num(opacity, 'opacity'), 0), 1); call('window', 'opacity', this.id, value); s.opacity = value; }
+    getOpacity() { return state(this).opacity; }
+    setHasShadow(hasShadow) { this.#flag('shadow', hasShadow); }
+    hasShadow() { return state(this).shadow; }
+    setIgnoreMouseEvents(ignore, { forward = false } = {}) { state(this); call('window', 'ignoreMouse', this.id, !!ignore, !!forward); }
+    setVisibleOnAllWorkspaces(visible, { visibleOnFullScreen = false, skipTransformProcessType = false } = {}) {
+      const s = state(this);
+      // Like Electron, only an app without a Dock icon shows windows over fullscreen apps.
+      if (!skipTransformProcessType) call('native.app.activationPolicy', visibleOnFullScreen ? 'accessory' : 'regular');
+      call('window', 'workspaces', this.id, !!visible, !!visibleOnFullScreen);
+      s.workspaces = !!visible;
+    }
+    isVisibleOnAllWorkspaces() { return state(this).workspaces; }
+    setContentProtection(enable) { this.#flag('contentProtection', enable); }
+    isContentProtected() { return state(this).contentProtection; }
+    setFocusable(focusable) { this.#flag('focusable', focusable); }
+    isFocusable() { return state(this).focusable; }
+    setAspectRatio(aspectRatio, extraSize = {}) { state(this); call('window', 'aspectRatio', this.id, Math.max(num(aspectRatio, 'aspectRatio'), 0), int(extraSize.width ?? 0, 'width'), int(extraSize.height ?? 0, 'height')); }
+    setProgressBar(progress) { state(this); call('native.app.progress', num(progress, 'progress')); }
+    flashFrame(flag) {
+      const s = state(this);
+      // WARNING: request ids start at 0, and an active app gets -1, no request.
+      if (flag) s.attention = call('native.app.attention', 'critical');
+      else if (s.attention >= 0) { call('native.app.cancelAttention', s.attention); s.attention = -1; }
+    }
+    setSkipTaskbar() { state(this); }
+    setMenu(menu) { state(this); if (menu !== null && !(menu instanceof nativeShell.Menu)) throw new TypeError('Invalid Menu'); }
+    removeMenu() { state(this); }
+    setVibrancy(type) {
+      const s = state(this), value = material(type);
+      call('window', 'vibrancy', this.id, value, s.effect);
+      // Like Electron, the page is transparent over vibrancy unless it has a background color.
+      call('window', 'background', this.id, s.background ?? (value === null && !s.transparent ? '#fff' : '#0000'));
+    }
+    setParentWindow(parent) {
+      const s = state(this);
+      if (s.modal) throw Error('Can not be called for modal window');
+      if (parent !== null && !(parent instanceof BrowserWindow)) throw new TypeError('Expected a BrowserWindow or null');
+      for (let win = parent; win; win = win.getParentWindow()) if (win === this) throw Error('A window cannot be its own ancestor');
+      call('window', 'parent', this.id, parent?.id ?? null);
+      s.parent = parent?.id ?? 0;
+    }
+    getParentWindow() { return windows.get(state(this).parent) ?? null; }
+    getChildWindows() { state(this); return [...windows.values()].filter(win => states.get(win).parent === this.id); }
+    isModal() { return state(this).modal; }
     static getAllWindows() { return [...windows.values()]; }
     static fromId(id) { return windows.get(id) ?? null; }
     static fromWebContents(webContents) { for (const win of windows.values()) if (win.webContents === webContents) return win; return null; }
     static getFocusedWindow() { for (const win of windows.values()) if (states.get(win).focused) return win; return null; }
   }
-  if (info.platform !== 'darwin') for (const method of ['center', 'unmaximize', 'showInactive', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop'])
-    BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is only available on macOS`); };
+  if (info.platform !== 'darwin') {
+    const win32 = info.platform === 'win32';
+    for (const method of ['center', 'unmaximize', 'showInactive', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop',
+      'setHasShadow', 'setIgnoreMouseEvents', 'setFocusable', 'setAspectRatio', 'setProgressBar', 'flashFrame', 'setSkipTaskbar', 'setIcon', 'setMenu', 'removeMenu', win32 ? 'setOpacity' : 'setVisibleOnAllWorkspaces'])
+      BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is not supported on ${info.platform}`); };
+    // What Electron itself does on these platforms.
+    Object.assign(BrowserWindow.prototype, { setVibrancy() { state(this); } }, win32
+      ? { setVisibleOnAllWorkspaces() { state(this); }, isVisibleOnAllWorkspaces() { state(this); return false; } }
+      : { setOpacity() { state(this); }, getOpacity() { state(this); return 1; }, setContentProtection() { state(this); }, isContentProtected() { state(this); return false; } });
+  }
   const app = new events.EventEmitter();
   const event = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
   const switches = new Map(info.argv.slice(1).flatMap(arg => { const match = /^--([^=]+)(?:=(.*))?$/s.exec(arg); return match ? [[match[1], match[2] ?? '']] : []; }));
@@ -680,16 +809,19 @@
       const old = s.native ?? { ...data, focused: false }, [x, y, width, height] = data.frame, [left, top, innerWidth, innerHeight] = data.content;
       s.native = data;
       Object.assign(s, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
+      const resized = old.frame[2] !== width || old.frame[3] !== height;
+      // WARNING: zoom and fullscreen animations report the frames in between as normal, so only moves and finished live resizes are normal bounds.
+      if (win.isNormal() && !data.resizing && (old.resizing || !resized)) s.normal = { x, y, width, height };
       win.contentView.setBounds({ x: 0, y: 0, width: innerWidth, height: innerHeight });
       for (const [key, on, off] of [['minimized', 'minimize', 'restore'], ['maximized', 'maximize', 'unmaximize'], ['fullscreen', 'enter-full-screen', 'leave-full-screen'], ['visible', 'show', 'hide']])
         if (old[key] !== data[key]) win.emit(data[key] ? on : off);
-      const resized = old.frame[2] !== width || old.frame[3] !== height;
       if (resized) win.emit('resize');
       if (!data.resizing && (resized || old.resizing)) win.emit('resized');
       if (old.frame[0] !== x || old.frame[1] !== y) { win.emit('move'); win.emit('moved'); }
       if (old.focused !== data.focused) { const kind = data.focused ? 'focus' : 'blur'; win.emit(kind); app.emit('browser-window-' + kind, event(), win); }
     }
     else if (name === 'close') win?.close();
+    else if (name === 'html-full-screen') win?.emit(data ? 'enter-html-full-screen' : 'leave-html-full-screen');
     else if (name === 'title') {
       if (!win) return true;
       const updated = event();
@@ -807,5 +939,5 @@
     if (value === undefined) throw missingModule(name);
     return value;
   }, { resolve: name => { if (isBuiltin(name)) return String(name); throw missingModule(name); } }) };
-  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, ...nativeShell, ...bridge, serve: servers.serve, ...modules, module: builtins.module, pty: pty.api, ws: http.ws });
+  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, ...nativeShell, ...bridge, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
 })();

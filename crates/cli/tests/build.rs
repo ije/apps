@@ -132,20 +132,23 @@ fn bundles_electron_pages_and_rejects_unsupported_exports() {
     );
     let bundle = apps_runtime::bundle::read(&out).unwrap();
     assert!(bundle.files["app.js"].contains("apps:///page-0.html"));
-    let page = bundle
-        .pages
-        .get("page-0.html")
-        .map(|doc| doc.serialize(0))
-        .or_else(|| bundle.files.get("page-0.html").cloned())
-        .unwrap();
-    assert!(
-        page.contains("#123456") && page.contains("apps:///script-"),
-        "{page}"
+    let doc = &bundle.pages["page-0.html"];
+    let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+    assert_eq!(
+        apps_runtime::style::styles(doc, 800., 600.)[p]["color"],
+        "#123456"
     );
-    fs::write(&entry, "import {app, Tray} from 'electron'; app.quit();").unwrap();
+    assert!(doc.serialize(0).contains("apps:///script-"));
+    fs::write(
+        &entry,
+        "import {app, autoUpdater} from 'electron'; app.quit();",
+    )
+    .unwrap();
     let result = build();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("electron.Tray is not supported"));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("electron.autoUpdater is not supported")
+    );
 }
 
 #[test]

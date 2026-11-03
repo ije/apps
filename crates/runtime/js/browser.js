@@ -241,7 +241,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
 
 globalThis.__appsNativeShell = (call, EventEmitter) => {
   const native = (op, args = null) => call('native.' + op, args);
-  const shortcuts = new Map(), notifications = new Map();
+  const shortcuts = new Map(), notifications = new Map(), trays = new Map();
   const eventOf = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
   let nextNativeID = 0, menuActive = false, menuReady = false, applicationMenu, observeTheme = false, observePower = false, observeApp = false, nativeApp, focused = () => null;
   const bindApp = (app, identifier, focusedWindow = focused) => {
@@ -298,9 +298,10 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     showItemInFolder: path => native('shell.showItemInFolder', String(path)),
   });
   const options = args => args.length > 1 ? args[1] : args[0] ?? {};
-  const dialogs = new Map();
-  let nextDialog = 0;
-  const later = (op, value) => new Promise(resolve => { const id = ++nextDialog; dialogs.set(id, resolve); native(op, { ...value, async: id }); });
+  const replies = new Map();
+  let nextReply = 0;
+  // WARNING: native code sends the reply through the main queue, so it can't arrive before `replies` holds it.
+  const later = (op, value) => new Promise(resolve => { const id = ++nextReply; native(op, { ...value, async: id }); replies.set(id, resolve); });
   const dialog = Object.freeze({
     showOpenDialog: async (...args) => later('dialog.open', options(args)),
     showOpenDialogSync: (...args) => { const result = native('dialog.open', options(args)); return result.canceled ? undefined : result.filePaths; },
@@ -372,6 +373,8 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
           for (let i = start; i <= end; i++) items[i].checked = items[i] === this;
         }
         if (key === 'reload' || key === 'forcereload') return contents?.reload();
+        // Like Electron, the zoom roles step the zoom level by 0.5.
+        if (key === 'resetzoom' || key === 'zoomin' || key === 'zoomout') { if (contents) contents.zoomLevel = key === 'resetzoom' ? 0 : contents.zoomLevel + (key === 'zoomin' ? 0.5 : -0.5); return; }
         if (!key && typeof action === 'function') action(this, window, event);
       };
     }
@@ -380,8 +383,8 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
   const serialize = (menu, items) => menu.items.map(item => {
     item.menu = menu;
     items.set(++nextNativeID, item);
-    if (!item.submenu && item.type !== 'separator' && (!item.role || /^(force)?reload$/i.test(item.role))) interactive = true;
-    return { label: String(item.label), type: String(item.type), ...(item.role ? { role: item.role.toLowerCase() } : {}), ...(item.accelerator && item.registerAccelerator !== false ? { accelerator: String(item.accelerator) } : {}), ...(item.toolTip ? { toolTip: String(item.toolTip) } : {}), enabled: !!item.enabled, visible: !!item.visible, checked: !!item.checked, click: nextNativeID, ...(item.submenu ? { submenu: serialize(item.submenu, items) } : {}) };
+    if (!item.submenu && item.type !== 'separator' && (!item.role || /^((force)?reload|resetzoom|zoomin|zoomout)$/i.test(item.role))) interactive = true;
+    return { label: String(item.label), type: String(item.type), ...(item.role ? { role: item.role.toLowerCase() } : {}), ...(item.accelerator && item.registerAccelerator !== false ? { accelerator: String(item.accelerator) } : {}), ...(item.toolTip ? { toolTip: String(item.toolTip) } : {}), ...(item.sublabel ? { sublabel: String(item.sublabel) } : {}), ...(typeof item.icon === 'string' ? { icon: item.icon } : {}), enabled: !!item.enabled, visible: !!item.visible, checked: !!item.checked, click: nextNativeID, ...(item.submenu ? { submenu: serialize(item.submenu, items) } : {}) };
   });
   class Menu extends EventEmitter {
     constructor() { super(); this.items = []; }
@@ -413,6 +416,45 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     closePopup() {}
   }
   let applicationItems = new Map(), popupItems = new Map();
+  class Tray extends EventEmitter {
+    #id;
+    #call(op, options = {}) {
+      if (this.isDestroyed()) throw Error('Tray is destroyed');
+      return native('tray.' + op, { id: this.#id, ...options });
+    }
+    constructor(image, guid) {
+      super();
+      if (!nativeApp?.isReady()) throw Error('Call app.whenReady() before creating a tray');
+      this.#id = ++nextNativeID;
+      native('tray.create', { id: this.#id, image, guid });
+      trays.set(this.#id, { tray: this, menus: new Map() });
+    }
+    destroy() {
+      if (this.isDestroyed()) return;
+      this.#call('destroy');
+      trays.delete(this.#id);
+    }
+    isDestroyed() { return !trays.has(this.#id); }
+    setImage(image) { this.#call('image', { image }); }
+    setPressedImage(image) { this.#call('pressedImage', { image }); }
+    setToolTip(text) { this.#call('toolTip', { text }); }
+    setTitle(text, options) { this.#call('title', { text, fontType: options?.fontType }); }
+    getTitle() { return this.#call('getTitle'); }
+    getGUID() { return this.#call('guid'); }
+    setIgnoreDoubleClickEvents(ignore) { this.#call('ignoreDoubleClick', { ignore }); }
+    getIgnoreDoubleClickEvents() { return this.#call('getIgnoreDoubleClick'); }
+    getBounds() { return this.#call('bounds'); }
+    #menu(op, menu, request) {
+      if (menu != null && !(menu instanceof Menu)) throw new TypeError('Expected a Menu');
+      const items = new Map();
+      this.#call(op, { template: menu ? serialize(menu, items) : null, request });
+      const menus = trays.get(this.#id).menus;
+      if (menu) menus.set(request, items); else menus.delete(request);
+    }
+    setContextMenu(menu) { this.#menu('menu', menu, 0); }
+    popUpContextMenu(menu) { this.#menu('popup', menu, ++nextNativeID); }
+    closeContextMenu() { this.#call('close'); }
+  }
   globalThis.__appsInitMenu = () => {
     if (menuReady) return;
     if (applicationMenu === undefined) {
@@ -441,6 +483,40 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     unregisterAll() { for (const accelerator of [...shortcuts.keys()]) this.unregister(accelerator); },
     isRegistered: accelerator => shortcuts.has(accelerator),
   });
+  const blockers = new Map();
+  let nextBlocker = 0;
+  const powerSaveBlocker = Object.freeze({
+    start(type) {
+      if (type !== 'prevent-app-suspension' && type !== 'prevent-display-sleep') throw new TypeError(`Invalid power save blocker type: ${type}`);
+      blockers.set(nextBlocker, native('power.block', type === 'prevent-display-sleep'));
+      return nextBlocker++;
+    },
+    stop: id => { if (!blockers.has(id)) return false; native('power.unblock', blockers.get(id)); return blockers.delete(id); },
+    isStarted: id => blockers.has(id),
+  });
+  const defaults = { string: value => typeof value === 'string', boolean: value => typeof value === 'boolean', integer: Number.isInteger, float: Number.isFinite, double: Number.isFinite, url: value => typeof value === 'string', array: Array.isArray, dictionary: value => value !== null && typeof value === 'object' && !Array.isArray(value) };
+  const defaultType = type => { if (!Object.hasOwn(defaults, type)) throw new TypeError(`Invalid type: ${type}`); return type; };
+  const camel = name => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+  const color = (name, kind, selector) => { name = String(name); const value = /^[a-z]+(-[a-z]+)*$/.test(name) ? native('prefs.color', selector(camel(name))) : null; if (value === null) throw new Error(`Unknown ${kind}: ${name}`); return value; };
+  // WARNING: Electron emits systemPreferences events on Windows and Linux only, so on macOS nothing emits them either.
+  const systemPreferences = Object.assign(new EventEmitter(), {
+    getAccentColor: () => native('prefs.color', 'controlAccentColor').slice(1),
+    getColor: name => color(name, 'color', name => name + 'Color'),
+    getSystemColor: name => color(name, 'system color', name => 'system' + name[0].toUpperCase() + name.slice(1) + 'Color'),
+    getEffectiveAppearance: () => native('prefs.appearance'),
+    getMediaAccessStatus: type => native('prefs.media', String(type)),
+    askForMediaAccess: async type => later('prefs.askMedia', { type: String(type) }),
+    isTrustedAccessibilityClient: prompt => native('prefs.trusted', !!prompt),
+    getUserDefault: (key, type) => native('prefs.getDefault', { key: String(key), type: defaultType(type) }),
+    setUserDefault(key, type, value) { if (!defaults[defaultType(type)](value)) throw new TypeError(`Unable to convert value to: ${type}`); native('prefs.setDefault', { key: String(key), type, value }); },
+    removeUserDefault: key => native('prefs.removeDefault', String(key)),
+    registerDefaults: values => native('prefs.registerDefaults', values),
+    isSwipeTrackingFromScrollEventsEnabled: () => native('prefs.swipe'),
+    getAnimationSettings: () => native('prefs.animation'),
+    canPromptTouchID: () => native('prefs.touchID'),
+    promptTouchID: async reason => { const value = await later('prefs.promptTouchID', { reason: String(reason) }); if (value !== true) throw new Error(value); },
+  });
+  Object.defineProperty(systemPreferences, 'effectiveAppearance', { enumerable: true, get: () => native('prefs.appearance') });
   const powerMonitor = new EventEmitter();
   Object.assign(powerMonitor, {
     isOnBatteryPower: () => native('power.battery'),
@@ -469,11 +545,27 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     on(name, listener) { displays ??= native('screen.displays'); return EventEmitter.prototype.on.call(this, name, listener); },
   });
   const poll = () => {
-    if (!menuActive && !popupItems.size && !shortcuts.size && !notifications.size && !dialogs.size && !observeTheme && !observePower && !observeApp && !displays) return;
+    if (!menuActive && !popupItems.size && !trays.size && !shortcuts.size && !notifications.size && !replies.size && !observeTheme && !observePower && !observeApp && !displays) return;
     for (const event of native('poll')) {
-      if (event.type === 'dialog') { dialogs.get(event.id)?.(event.value); dialogs.delete(event.id); }
+      if (event.type === 'reply') { replies.get(event.id)?.(event.value); replies.delete(event.id); }
       else if (event.type === 'shortcut') { for (const item of shortcuts.values()) if (item.id === event.id) item.callback(); }
-      else if (event.type === 'menu') (applicationItems.get(event.id) ?? popupItems.get(event.id))?.click({ shiftKey: !!event.shift, ctrlKey: !!event.control, altKey: !!event.alt, metaKey: !!event.meta, triggeredByAccelerator: !!event.accelerator });
+      else if (event.type === 'menu') {
+        let item = applicationItems.get(event.id) ?? popupItems.get(event.id);
+        if (!item) for (const { menus } of trays.values()) {
+          for (const items of menus.values()) if ((item = items.get(event.id))) break;
+          if (item) break;
+        }
+        item?.click({ shiftKey: !!event.shift, ctrlKey: !!event.control, altKey: !!event.alt, metaKey: !!event.meta, triggeredByAccelerator: !!event.accelerator });
+      }
+      else if (event.type === 'tray') {
+        const state = trays.get(event.id);
+        if (!state) continue;
+        if (event.request) state.menus.delete(event.request);
+        else {
+          const input = { ...eventOf(), shiftKey: !!event.shift, ctrlKey: !!event.control, altKey: !!event.alt, metaKey: !!event.meta };
+          state.tray.emit(event.event, input, ...(event.bounds ? [event.bounds] : []), ...(event.position ? [event.position] : []), ...(event.data === undefined ? [] : [event.data]));
+        }
+      }
       else if (event.type === 'theme') nativeTheme.emit('updated');
       else if (event.type === 'power') powerMonitor.emit(event.event, event.event === 'thermal-state-change' ? { state: native('power.thermal') } : undefined);
       else if (event.type === 'screen' && displays) {
@@ -499,5 +591,5 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
       }
     }
   };
-  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, MenuItem, globalShortcut, powerMonitor, screen, bindApp, poll, pending: () => menuActive || shortcuts.size > 0 || notifications.size > 0 || observePower || observeApp };
+  return { clipboard, shell, dialog, nativeTheme, safeStorage, Notification, Menu, MenuItem, Tray, globalShortcut, powerMonitor, screen, powerSaveBlocker, systemPreferences, bindApp, poll, pending: () => menuActive || shortcuts.size > 0 || notifications.size > 0 || observePower || observeApp };
 };

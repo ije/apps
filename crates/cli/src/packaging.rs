@@ -13,6 +13,7 @@ pub fn package_app(
     root: &Path,
     production: bool,
     target: BuildTarget,
+    app_binary: Option<&Path>,
 ) -> Result<(usize, PathBuf)> {
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version, identifier) =
@@ -193,7 +194,7 @@ pub fn package_app(
             stage.path().join(&executable_name),
         )?;
     }
-    fs::copy(runtime,&executable).context("Cannot copy the runtime. Build the workspace first with cargo build --workspace --release.")?;
+    fs::copy(app_binary.unwrap_or(runtime), &executable).context("Cannot copy the runtime. Build the workspace first with cargo build --workspace --release.")?;
     #[cfg(unix)]
     if target.platform != "windows" {
         use std::os::unix::fs::PermissionsExt;
@@ -412,6 +413,7 @@ mod tests {
                     dir.path(),
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    None,
                 )
                 .unwrap();
                 let filename = if cfg!(windows) {
@@ -570,6 +572,7 @@ mod tests {
                     dir.path(),
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    None,
                 )
                 .unwrap();
                 assert_eq!(executable.file_stem().unwrap(), name);
@@ -605,7 +608,7 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            package_app(&out, &files, &runtime, dir.path(), true, target)
+            package_app(&out, &files, &runtime, dir.path(), true, target, None)
         };
         let error = build(r#"["video"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
@@ -673,7 +676,7 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            package_app(&out, &files, &runtime, dir.path(), true, target)
+            package_app(&out, &files, &runtime, dir.path(), true, target, None)
         };
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
@@ -717,6 +720,7 @@ mod tests {
             dir.path(),
             false,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
         )
         .unwrap();
         assert!(assets.join("app.js").is_file());
@@ -731,6 +735,7 @@ mod tests {
             dir.path(),
             true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
         )
         .unwrap();
         assert!(assets.join("app.h2o").is_file());
@@ -745,6 +750,7 @@ mod tests {
             dir.path(),
             false,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
         )
         .unwrap();
         assert!(!assets.join("app.h2o").exists());
@@ -790,6 +796,7 @@ mod tests {
                 dir.path(),
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -821,6 +828,7 @@ mod tests {
                 dir.path(),
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                None,
             )
             .unwrap();
             assert!(!assets.join("message.txt").exists());
@@ -845,6 +853,7 @@ mod tests {
                 dir.path(),
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                None,
             )
             .unwrap();
             for name in [
@@ -864,6 +873,7 @@ mod tests {
                     dir.path(),
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    None,
                 )
                 .unwrap_err();
                 assert!(
@@ -890,6 +900,7 @@ mod tests {
                     dir.path(),
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                    None,
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("without backslashes"), "{error}");
@@ -903,6 +914,7 @@ mod tests {
             dir.path(),
             true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside public"), "{error}");

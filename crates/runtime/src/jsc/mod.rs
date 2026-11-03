@@ -350,7 +350,11 @@ thread_local! {
     static INSPECTOR_MESSAGES: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
     // WARNING: the render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
     pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
+    pub(crate) static CLIPBOARD: std::cell::Cell<Option<Clipboard>> = const { std::cell::Cell::new(None) };
 }
+
+/// Writes text to the clipboard, or reads it without text.
+type Clipboard = fn(Option<String>) -> Option<String>;
 
 /// Returns the context of this thread with `role`.
 pub(crate) fn context(role: Role) -> Option<usize> {
@@ -800,6 +804,10 @@ fn dispatch(
     }
     if let Some(op) = op.strip_prefix("native.") {
         anyhow::ensure!(
+            !op.starts_with("tray.") || matches!(role, Role::Main),
+            "Tray requires the main process"
+        );
+        anyhow::ensure!(
             !matches!(role, Role::Renderer(_)),
             "Native desktop APIs require a preload bridge"
         );
@@ -837,6 +845,17 @@ fn dispatch(
             );
         return Ok(serde_json::Value::Null);
     }
+    if op == "bridge.file" {
+        let path = match (role, values[0].as_u64()) {
+            (Role::Preload(id), Some(index)) => host
+                .borrow()
+                .dropped
+                .get(&id)
+                .and_then(|paths| paths.get(index as usize).cloned()),
+            _ => None,
+        };
+        return Ok(path.unwrap_or_default().into());
+    }
     if op == "bridge.exposures" {
         let Role::Renderer(id) = role else {
             bail!("Only pages can read exposed APIs")
@@ -850,6 +869,22 @@ fn dispatch(
                 .map(|(name, value)| (name.clone(), value.clone().into_value()))
                 .collect(),
         ));
+    }
+    if op == "rust.invoke" {
+        let Role::Preload(id) = role else {
+            bail!("Rust handlers require a preload")
+        };
+        let channel = args[0].as_str().context("Expected a channel name")?;
+        let handler = host
+            .try_borrow()
+            .context("Host is busy")?
+            .rust_handlers
+            .as_ref()
+            .and_then(|handlers| handlers.get(channel))
+            .cloned()
+            .with_context(|| format!("No Rust handler registered for {channel:?}"))?;
+        let args = serde_json::from_str(args[1].as_str().context("Expected JSON arguments")?)?;
+        return Ok(handler(id, args)?.to_string().into());
     }
     if op == "bridge.dispatch" {
         let target = &values[0];
@@ -973,6 +1008,30 @@ fn dispatch(
         host.try_borrow_mut()
             .context("Host is busy")?
             .media(id, op, &args)
+    } else if let (Role::Renderer(id), "dom.open") = (role, op) {
+        // WARNING: the main handler can open windows, which borrows the host, so none is held here.
+        let (main, api) = HOSTS
+            .with_borrow(|hosts| {
+                hosts.iter().find_map(|(&ctx, binding)| {
+                    (Rc::ptr_eq(host, &binding.1) && binding.2 == Role::Main)
+                        .then(|| (ctx as Ptr, binding.0.clone()))
+                })
+            })
+            .context("The main process is unavailable")?;
+        let result = call_json(
+            &api,
+            main,
+            "__appsWindowOpen",
+            &[&id.to_string(), &args.to_string()],
+            |value| api.text(main, value),
+        )?;
+        Ok(serde_json::from_str(&result)?)
+    } else if let (Role::Renderer(_), "dom.clipboard") = (role, op) {
+        // WARNING: `execCommand` checks for user input before it calls this.
+        Ok(CLIPBOARD
+            .get()
+            .and_then(|clipboard| clipboard(values[0].as_str().map(str::to_owned)))
+            .map_or(serde_json::Value::Null, serde_json::Value::String))
     } else {
         host.try_borrow_mut()
             .context("Host is busy")?
@@ -1701,24 +1760,15 @@ impl JsContext {
         self.install(files)?;
         self.eval_page(&crate::bundle::script_source(files, true), entry)
             .context("Cannot execute the app bundle")?;
+        while self.eval_page("this.__appsNext?.()", entry)? == "true" {}
         Ok(())
     }
 
     fn install(&self, files: &BBTreeMap<String, String>) -> Result<()> {
-        let paths: HashMap<String, std::path::PathBuf> =
-            serde_json::from_str(files.get("native.json").map_or("{}", String::as_str))?;
-        let scripts: Vec<(String, bytes::Bytes)> = files
-            .iter()
-            .filter(|(name, _)| name.starts_with("script-"))
-            .map(|(name, source)| (name.clone(), source.clone().into()))
-            .collect();
         HOSTS.with(|hosts| {
             let binding = &hosts.borrow()[&(self.ctx as usize)];
             let mut host = binding.1.borrow_mut();
-            host.native_modules.extend(paths);
-            if !scripts.is_empty() {
-                std::sync::Arc::make_mut(&mut host.scripts).extend(scripts);
-            }
+            host.install(files)?;
             if !host.scripts.is_empty() {
                 let window = match binding.2 {
                     Role::Renderer(id) | Role::Preload(id) => Some(id),
@@ -1726,8 +1776,8 @@ impl JsContext {
                 };
                 binding.4.borrow_mut().configure_storage(&host, window);
             }
-        });
-        Ok(())
+            Ok(())
+        })
     }
 }
 

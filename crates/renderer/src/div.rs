@@ -252,8 +252,9 @@ impl Element for Div {
         let content = if ids.is_empty() {
             bounds.size
         } else {
+            // WARNING: children are in window coordinates, which are negative above the viewport.
             let mut min = point(Pixels::MAX, Pixels::MAX);
-            let mut max = Point::default();
+            let mut max = point(px(f32::MIN), px(f32::MIN));
             for &id in ids.iter() {
                 let child = window.layout_bounds(id);
                 min = min.min(child.origin);

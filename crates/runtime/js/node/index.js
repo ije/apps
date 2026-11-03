@@ -424,6 +424,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     [kind]() { return this.#type; }
   }
   typed(Stats.prototype); typed(Dirent.prototype);
+  class StatFs { constructor(values, big) { ['type', 'bsize', 'frsize', 'blocks', 'bfree', 'bavail', 'files', 'ffree'].forEach((key, i) => { this[key] = big ? BigInt(values[i]) : values[i]; }); } }
   const descriptions = { ENOENT: 'no such file or directory', EACCES: 'permission denied', EEXIST: 'file already exists', ENOTDIR: 'not a directory', EISDIR: 'illegal operation on a directory', ENOTEMPTY: 'directory not empty', EPERM: 'operation not permitted', EBUSY: 'resource busy or locked', EXDEV: 'cross-device link not permitted', EINVAL: 'invalid argument', EROFS: 'read-only file system', ENOSPC: 'no space left on device', EMFILE: 'too many open files', ELOOP: 'too many symbolic links encountered', ENAMETOOLONG: 'name too long', EBADF: 'bad file descriptor', EIO: 'i/o error' };
   const syscalls = { readFile: 'open', writeFile: 'open', appendFile: 'open', readdir: 'scandir', copyFile: 'copyfile', truncate: 'open' };
   const failure = (error, name, args) => {
@@ -442,10 +443,14 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (length < 0 || offset + length > size) throw rangeError('length', length < 0 ? '>= 0' : `<= ${size - offset}`, length);
   };
   const chunk = (buffer, offset, length, position) => { if (typeof buffer === 'string') return [new Uint8Array(Buffer.from(buffer, length)), offset ?? null]; const bytes = view(buffer); if (offset !== null && typeof offset === 'object') ({ offset, length, position } = offset); offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : bytes.length - offset; span(bytes.length, offset, length, true); return [bytes.subarray(offset, offset + length), position ?? null]; };
+  const vectors = buffers => { if (!Array.isArray(buffers) || !buffers.every(buffer => ArrayBuffer.isView(buffer))) throw typeError('buffers', 'an instance of ArrayBufferView[]', buffers); return buffers.map(buffer => view(buffer)); };
+  const scatter = (list, data) => { let at = 0; for (const buffer of list) { buffer.set(data.subarray(at, at + buffer.length)); at += buffer.length; } return data.length; };
+  const offsetOrNull = position => typeof position === 'number' ? position : null;
   const seconds = value => value instanceof Date ? value.getTime() / 1000 : Number(value);
   const finish = (name, result, args) => {
     if (name === 'readFile') { const encoding = options(args[1]).encoding; return utf8.test(encoding) ? result : encoding && encoding !== 'buffer' ? bytes(result).toString(encoding) : bytes(result); }
     if (name === 'stat' || name === 'lstat' || name === 'fstat') return new Stats(result);
+    if (name === 'statfs') return new StatFs(result, args[1]?.bigint);
     if (name === 'readdir') {
       const o = options(args[1]), raw = o.encoding === 'buffer';
       return result.map(([name, type]) => {
@@ -464,6 +469,8 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     async close() { const fd = this.#fd; if (fd < 0) return; this.#fd = -1; handles.unregister(this); await asyncCall('close', fd); }
     async read(buffer = Buffer.alloc(16384), offset = 0, length, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length, position = null } = buffer ?? {}); else if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); const data = bytes(await asyncCall('read', this.#fd, length, position)); view(buffer).set(data, offset); return { bytesRead: data.length, buffer }; }
     async write(buffer, ...args) { return { bytesWritten: await asyncCall('write', this.#fd, ...chunk(buffer, ...args)), buffer }; }
+    async readv(buffers, position) { const list = vectors(buffers); return { bytesRead: scatter(list, bytes(await asyncCall('read', this.#fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)))), buffers }; }
+    async writev(buffers, position) { return { bytesWritten: await asyncCall('write', this.#fd, Buffer.concat(vectors(buffers)), offsetOrNull(position)), buffers }; }
     async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const b = await asyncCall('read', this.#fd, 1048576, null); if (!b.length) break; chunks.push(bytes(b)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
     async writeFile(data, o) { const { encoding, signal } = options(o), bytes = view(data, encoding); let at = 0; do { aborted(signal); at += await asyncCall('write', this.#fd, bytes.subarray(at, at + 1048576), null); } while (at < bytes.length); }
     async appendFile(data, o) { await this.writeFile(data, o); }
@@ -490,7 +497,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (name === 'mkdir' && typeof args[1].mode === 'string') args[1].mode = parseInt(args[1].mode, 8);
     return args;
   };
-  for (const name of ['readFile', 'writeFile', 'appendFile', 'mkdir', 'readdir', 'stat', 'lstat', 'fstat', 'rename', 'copyFile', 'realpath', 'readlink', 'symlink', 'link', 'chmod', 'chown', 'lchown', 'utimes', 'lutimes', 'truncate', 'access', 'unlink', 'rm', 'rmdir', 'mkdtemp', 'open', 'close', 'fsync', 'fdatasync', 'ftruncate', 'fchmod', 'fchown', 'futimes']) {
+  for (const name of ['readFile', 'writeFile', 'appendFile', 'mkdir', 'readdir', 'stat', 'lstat', 'fstat', 'statfs', 'rename', 'copyFile', 'realpath', 'readlink', 'symlink', 'link', 'chmod', 'chown', 'lchown', 'utimes', 'lutimes', 'truncate', 'access', 'unlink', 'rm', 'rmdir', 'mkdtemp', 'open', 'close', 'fsync', 'fdatasync', 'ftruncate', 'fchmod', 'fchown', 'futimes']) {
     files[name + 'Sync'] = (...args) => {
       args = prepare(name, args);
       let result;
@@ -522,6 +529,71 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     asyncCall('read', fd, length, position).then(data => { data = bytes(data); view(buffer).set(data, offset); callback(null, data.length, buffer); }, error => callback(failure(error, 'read', [fd])));
   };
   files.write = (fd, buffer, ...args) => { const callback = args.pop(); asyncCall('write', fd, ...chunk(buffer, ...args)).then(written => callback(null, written, buffer), error => callback(failure(error, 'write', [fd]))); };
+  files.readvSync = (fd, buffers, position) => { const list = vectors(buffers); try { return scatter(list, bytes(sync('read', fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)))); } catch (error) { throw failure(error, 'read', [fd]); } };
+  files.writevSync = (fd, buffers, position) => { const data = Buffer.concat(vectors(buffers)); try { return sync('write', fd, data, offsetOrNull(position)); } catch (error) { throw failure(error, 'write', [fd]); } };
+  files.readv = (fd, buffers, position, callback) => { if (typeof position === 'function') [position, callback] = [null, position]; const list = vectors(buffers); asyncCall('read', fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)).then(data => callback(null, scatter(list, bytes(data)), buffers), error => callback(failure(error, 'read', [fd]))); };
+  files.writev = (fd, buffers, position, callback) => { if (typeof position === 'function') [position, callback] = [null, position]; asyncCall('write', fd, Buffer.concat(vectors(buffers)), offsetOrNull(position)).then(written => callback(null, written, buffers), error => callback(failure(error, 'write', [fd]))); };
+  // WARNING: like Node, globs match names case-insensitively on macOS and Windows, and wildcards and `**` skip names that start with a dot.
+  const fold = windows || info.platform === 'darwin', split = text => text.split(windows ? /[\\/]+/ : /\/+/).filter(Boolean);
+  const expand = text => { const brace = /\{([^{}]*,[^{}]*)\}/.exec(text); return brace ? brace[1].split(',').flatMap(part => expand(text.slice(0, brace.index) + part + text.slice(brace.index + brace[0].length))) : [text]; };
+  const segment = text => {
+    if (text === '**' || !/[*?[]/.test(text)) return text;
+    let source = '';
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], end = c === '[' ? text.indexOf(']', i + 2) : -1;
+      if (c === '*') source += '.*';
+      else if (c === '?') source += '.';
+      else if (end > 0) { source += '[' + (text[i + 1] === '!' ? '^' + text.slice(i + 2, end) : text.slice(i + 1, end)) + ']'; i = end; }
+      else source += c.replace(/[.+^$|{}()[\]\\]/, '\\$&');
+    }
+    return new RegExp(`^${text[0] === '.' ? '' : '(?!\\.)'}${source}$`, fold ? 'i' : '');
+  };
+  const named = (part, name) => typeof part === 'string' ? (fold ? part.toLowerCase() === name.toLowerCase() : part === name) : part.test(name);
+  const globbed = (parts, names, i = 0, j = 0) => i === parts.length ? j === names.length : parts[i] === '**' ? globbed(parts, names, i + 1, j) || (j < names.length && names[j][0] !== '.' && globbed(parts, names, i, j + 1)) : j < names.length && named(parts[i], names[j]) && globbed(parts, names, i + 1, j + 1);
+  // Yields ['readdir' | 'lstat', path] steps for a sync or async driver, and returns the matches.
+  const glob = function* (patterns, o = {}) {
+    const cwd = o.cwd === undefined ? call('cwd') : pathArg(o.cwd), results = new Map(), excludes = Array.isArray(o.exclude) && o.exclude.flatMap(expand).map(text => split(text).map(segment));
+    const excluded = (rel, entry) => excludes ? excludes.some(parts => globbed(parts, split(rel))) : !!o.exclude?.(o.withFileTypes ? entry : rel);
+    const walk = function* (dir, rel, parts, index) {
+      if (index === parts.length) return void results.set(rel, new Dirent(path.basename(dir), S.S_IFDIR, path.dirname(dir)));
+      const part = parts[index];
+      if (part === '**') {
+        yield* walk(dir, rel, parts, index + 1);
+        for (const entry of yield ['readdir', dir]) {
+          const next = path.join(rel, entry.name);
+          if (entry.name[0] === '.' || excluded(next, entry)) continue;
+          if (entry.isDirectory()) yield* walk(path.join(dir, entry.name), next, parts, index);
+          else if (index === parts.length - 1) results.set(next, entry);
+        }
+        return;
+      }
+      const list = typeof part === 'string' ? [yield ['lstat', path.join(dir, part)]].filter(Boolean).map(stats => new Dirent(part, stats.mode & S.S_IFMT, dir)) : (yield ['readdir', dir]).filter(entry => part.test(entry.name));
+      for (const entry of list) {
+        const next = path.join(rel, entry.name);
+        if (excluded(next, entry)) continue;
+        if (index === parts.length - 1) results.set(next, entry);
+        else if (entry.isDirectory() || entry.isSymbolicLink()) yield* walk(path.join(dir, entry.name), next, parts, index + 1);
+      }
+    };
+    for (const pattern of new Set([patterns].flat().flatMap(expand))) {
+      const root = path.isAbsolute(pattern) ? path.parse(pattern).root : '';
+      yield* walk(root || cwd, root || '.', split(pattern.slice(root.length)).map(segment), 0);
+    }
+    return o.withFileTypes ? [...results.values()] : [...results.keys()];
+  };
+  files.globSync = (pattern, o) => {
+    const steps = glob(pattern, o);
+    let step = steps.next();
+    while (!step.done) { const [op, file] = step.value; let result; try { result = op === 'readdir' ? files.readdirSync(file, { withFileTypes: true }) : files.lstatSync(file, { throwIfNoEntry: false }); } catch { result = op === 'readdir' ? [] : undefined; } step = steps.next(result); }
+    return step.value;
+  };
+  files.promises.glob = async function* (pattern, o) {
+    const steps = glob(pattern, o);
+    let step = steps.next();
+    while (!step.done) { const [op, file] = step.value; let result; try { result = op === 'readdir' ? await files.promises.readdir(file, { withFileTypes: true }) : await files.promises.lstat(file); } catch { result = op === 'readdir' ? [] : undefined; } step = steps.next(result); }
+    yield* step.value;
+  };
+  files.glob = (pattern, o, callback) => { if (typeof o === 'function') [o, callback] = [{}, o]; Array.fromAsync(files.promises.glob(pattern, o)).then(list => callback(null, list), callback); };
   class Dir {
     #entries;
     constructor(path, entries) { this.path = path; this.#entries = entries; }
@@ -573,7 +645,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return entry;
   };
   files.unwatchFile = (value, listener) => { const file = pathArg(value), entry = polls.get(file); if (!entry) return; if (listener) entry.off('change', listener); else entry.removeAllListeners('change'); if (!entry.listenerCount('change')) { clearInterval(entry.timer); polls.delete(file); } };
-  const poll = () => { if (!pending.size && !watchers.size) return; for (const event of sync('poll')) { if (event.watch) { const watcher = watchers.get(event.id); if (!watcher) continue; if (event.error) watcher.emit('error', new Error(event.error)); else for (const p of event.paths) watcher.emit('change', event.event, p); } else { const item = pending.get(event.id); pending.delete(event.id); if (item) { if (event.error) item.reject(Object.assign(new Error(event.error), { code: event.code ?? undefined })); else item.resolve(event.value); } } } };
+  const poll = () => { if (!pending.size && !watchers.size && !resizing.size) return; for (const event of sync('poll')) { if (event.resize) { for (const stream of resizing) stream.emit('resize'); } else if (event.watch) { const watcher = watchers.get(event.id); if (!watcher) continue; if (event.error) watcher.emit('error', new Error(event.error)); else for (const p of event.paths) watcher.emit('change', event.event, p); } else { const item = pending.get(event.id); pending.delete(event.id); if (item) { if (event.error) item.reject(Object.assign(new Error(event.error), { code: event.code ?? undefined })); else item.resolve(event.value); } } } };
   poll.pending = () => pending.size > 0 || [...watchers.values()].some(w => w._ref);
 
   const os = {
@@ -969,11 +1041,67 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   };
   querystring.decode = querystring.parse; querystring.encode = querystring.stringify;
 
+  let resultOrder = 'verbatim';
   const family = value => ({ IPv4: 4, IPv6: 6 })[value] ?? Number(value ?? 0);
-  const resolve = async (hostname, o) => { try { return await asyncCall('lookup', String(hostname), family(o.family)); } catch (error) { throw Object.assign(error, { message: `getaddrinfo ENOTFOUND ${hostname}`, code: 'ENOTFOUND', errno: undefined, syscall: 'getaddrinfo', hostname }); } };
+  const resolve = async (hostname, o) => {
+    let list;
+    try { list = await asyncCall('lookup', String(hostname), family(o.family)); } catch (error) { throw Object.assign(error, { message: `getaddrinfo ENOTFOUND ${hostname}`, code: 'ENOTFOUND', errno: undefined, syscall: 'getaddrinfo', hostname }); }
+    const order = o.order ?? (o.verbatim === false ? 'ipv4first' : resultOrder);
+    return order === 'verbatim' ? list : list.sort((a, b) => order === 'ipv4first' ? a.family - b.family : b.family - a.family);
+  };
+  const rrtypes = { A: 1, AAAA: 28, ANY: 255, CAA: 257, CNAME: 5, MX: 15, NAPTR: 35, NS: 2, PTR: 12, SOA: 6, SRV: 33, TLSA: 52, TXT: 16 };
+  const fields = { A: ['address', 'ttl'], AAAA: ['address', 'ttl'], CNAME: ['value'], NS: ['value'], PTR: ['value'], MX: ['exchange', 'priority'], TXT: ['entries'], SRV: ['name', 'port', 'priority', 'weight'], SOA: ['nsname', 'hostmaster', 'serial', 'refresh', 'retry', 'expire', 'minttl'], NAPTR: ['flags', 'service', 'regexp', 'replacement', 'order', 'preference'], TLSA: ['certUsage', 'selector', 'match', 'data'] };
+  const shape = (type, records, o) => {
+    const list = records.map(([kind, ...values]) => {
+      const record = kind === 'CAA' ? { critical: values[0], [values[1]]: values[2] } : Object.fromEntries(fields[kind].map((key, i) => [key, values[i]]));
+      if (kind === 'TLSA') record.data = record.data.buffer.slice(record.data.byteOffset, record.data.byteOffset + record.data.byteLength);
+      return type === 'ANY' ? Object.assign(record, { type: kind }) : record;
+    });
+    if (type === 'A' || type === 'AAAA') return o?.ttl ? list : list.map(record => record.address);
+    if (type === 'CNAME' || type === 'NS' || type === 'PTR' || type === 'TXT') return list.map(record => record.value ?? record.entries);
+    return type === 'SOA' ? list[0] : list;
+  };
+  const systemServers = () => { try { return [...files.readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^\s*nameserver\s+([^\s%]+)/gm)].map(match => match[1]); } catch { return []; } };
+  // WARNING: queries go through the system resolver library, which takes only IPv4 servers from setServers().
+  const PromiseResolver = class Resolver {
+    #servers = null; #seconds; #tries; #generation = 0;
+    constructor(o = {}) { this.#seconds = o.timeout > 0 ? Math.ceil(o.timeout / 1000) : null; this.#tries = o.tries ?? null; }
+    getServers() { return this.#servers ? [...this.#servers] : systemServers(); }
+    setServers(list) {
+      if (!Array.isArray(list)) throw typeError('servers', 'an instance of Array', list);
+      this.#servers = list.map(server => {
+        const text = String(server), [, ip, port] = /^\[(.+)\](?::(\d+))?$/.exec(text) ?? /^([^:]+)(?::(\d+))?$/.exec(text) ?? [, text], kind = call('web.tcp.ip', ip);
+        if (!kind) throw error(TypeError, 'ERR_INVALID_IP_ADDRESS', `Invalid IP address: ${text}`);
+        if (kind === 6) throw error(Error, 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'IPv6 DNS servers are not supported');
+        return port && port !== '53' ? `${ip}:${port}` : ip;
+      });
+    }
+    cancel() { this.#generation++; }
+    #query(hostname, type, reverse) {
+      if (typeof hostname !== 'string') throw typeError(reverse ? 'ip' : 'name', 'of type string', hostname);
+      const syscall = reverse ? 'getHostByAddr' : 'query' + type[0] + type.slice(1).toLowerCase(), generation = this.#generation;
+      const fail = code => Object.assign(new Error(`${syscall} ${code} ${hostname}`), { errno: undefined, code, syscall, hostname });
+      return asyncCall('resolve', hostname, rrtypes[type], this.#servers?.map(server => server.includes(':') ? server : server + ':53') ?? null, this.#seconds, this.#tries, !!reverse)
+        .then(list => { if (generation !== this.#generation) throw fail('ECANCELLED'); return list; }, failure => { throw fail(generation !== this.#generation ? 'ECANCELLED' : /^E[A-Z]+$/.test(failure.message) ? failure.message : 'EBADRESP'); });
+    }
+    resolve(hostname, rrtype = 'A') { if (!Object.hasOwn(rrtypes, rrtype)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'rrtype' is invalid. Received '${rrtype}'`); return this.#query(hostname, rrtype).then(list => shape(rrtype, list)); }
+    async reverse(ip) { return shape('PTR', await this.#query(ip, 'PTR', true)); }
+    static { for (const type of Object.keys(rrtypes)) this.prototype['resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase())] = async function(hostname, o) { return shape(type, await this.#query(hostname, type), o); }; }
+  };
+  class Resolver extends PromiseResolver {}
+  const methods = ['resolve', 'reverse', ...Object.keys(rrtypes).map(type => 'resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase()))];
+  for (const method of methods) Resolver.prototype[method] = function(...args) { const callback = args.pop(); if (typeof callback !== 'function') throw typeError('callback', 'of type function', callback); PromiseResolver.prototype[method].apply(this, args).then(value => callback(null, value), callback); };
+  const resolver = new Resolver(), order = {
+    getDefaultResultOrder: () => resultOrder,
+    setDefaultResultOrder(value) { if (!['ipv4first', 'ipv6first', 'verbatim'].includes(value)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received '${value}'`); resultOrder = value; },
+    getServers: () => resolver.getServers(), setServers: list => resolver.setServers(list),
+    ...Object.fromEntries('NODATA FORMERR SERVFAIL NOTFOUND NOTIMP REFUSED BADQUERY BADNAME BADFAMILY BADRESP CONNREFUSED TIMEOUT EOF FILE NOMEM DESTRUCTION BADSTR BADFLAGS NONAME BADHINTS NOTINITIALIZED LOADIPHLPAPI ADDRGETNETWORKPARAMS CANCELLED'.split(' ').map(code => [code, 'E' + code])),
+  };
   const dns = {
+    ...order, Resolver, ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,
+    ...Object.fromEntries(methods.map(method => [method, Resolver.prototype[method].bind(resolver)])),
     lookup(hostname, o, callback) { if (typeof o === 'function') { callback = o; o = {}; } o = typeof o === 'object' && o !== null ? o : { family: o }; resolve(hostname, o).then(list => o.all ? callback(null, list) : callback(null, list[0].address, list[0].family), callback); },
-    promises: { lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
+    promises: { ...order, Resolver: PromiseResolver, ...Object.fromEntries(methods.map(method => [method, PromiseResolver.prototype[method].bind(resolver)])), lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
   };
   dns.lookup[promisify.custom] = dns.promises.lookup;
 
@@ -991,26 +1119,33 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   };
   let ttyStreams;
   const ttyStream = name => (ttyStreams ??= (() => {
-    const { Readable, Writable } = globalThis.__apps.stream, unsupported = message => error(Error, 'ERR_TTY_INIT_FAILED', `TTY initialization failed: ${message}`);
+    const { Readable, Writable } = streams ?? globalThis.__apps.stream, unsupported = message => error(Error, 'ERR_TTY_INIT_FAILED', `TTY initialization failed: ${message}`);
     function ReadStream(fd) { throw unsupported(tty.isatty(fd) ? 'reading a terminal is not supported' : 'uv_tty_init returned EINVAL (invalid argument)'); }
     function WriteStream(fd) {
       if (!(this instanceof WriteStream)) return new WriteStream(fd);
       if ((fd !== 1 && fd !== 2) || !tty.isatty(fd)) throw unsupported('uv_tty_init returned EINVAL (invalid argument)');
       Writable.call(this, { write(data, _encoding, done) { call('process.write', fd, data); done(); } });
       Object.assign(this, { fd, isTTY: true });
+      resizable(this);
     }
     for (const [type, base] of [[ReadStream, Readable], [WriteStream, Writable]]) { Object.setPrototypeOf(type.prototype, base.prototype); Object.setPrototypeOf(type, base); }
     Object.assign(WriteStream.prototype, {
       getColorDepth: colorDepth,
       hasColors(count, env) { if (env === undefined && (count === undefined || (typeof count === 'object' && count !== null))) { env = count; count = 16; } else integer(count, 'count', 2); return count <= 2 ** colorDepth(env); },
-      getWindowSize() { return [this.columns, this.rows]; },
+      getWindowSize() { return sync('tty.size', this.fd) ?? [80, 24]; },
       clearLine(direction, callback) { return this.write(direction < 0 ? '\x1b[1K' : direction > 0 ? '\x1b[0K' : '\x1b[2K', callback); },
       clearScreenDown(callback) { return this.write('\x1b[0J', callback); },
       cursorTo(x, y, callback) { if (typeof y === 'function') { callback = y; y = undefined; } return this.write(typeof y === 'number' ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`, callback); },
       moveCursor(dx, dy, callback) { return this.write((dx < 0 ? `\x1b[${-dx}D` : dx > 0 ? `\x1b[${dx}C` : '') + (dy < 0 ? `\x1b[${-dy}A` : dy > 0 ? `\x1b[${dy}B` : ''), callback); },
     });
+    for (const [index, name] of ['columns', 'rows'].entries()) Object.defineProperty(WriteStream.prototype, name, { configurable: true, enumerable: true, get() { return this.getWindowSize()[index]; } });
     return { ReadStream, WriteStream };
   })())[name];
   const tty = { isatty: fd => Number.isInteger(fd) && sync('isatty', fd), get ReadStream() { return ttyStream('ReadStream'); }, get WriteStream() { return ttyStream('WriteStream'); } };
-  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, dns, tty, details, sync, asyncCall, poll };
+  // WARNING: SIGWINCH is hooked only when a terminal stream gets its first `resize` listener.
+  const resizing = new Set(), resizable = stream => stream.on('newListener', name => { if (name !== 'resize' || resizing.has(stream)) return; if (!resizing.size) sync('tty.watch'); resizing.add(stream); });
+  let streams;
+  // Makes process.stdout and stderr terminal streams. They are created before `__apps.stream` exists.
+  const terminal = (stream, modules) => { streams = modules; return resizable(Object.setPrototypeOf(stream, tty.WriteStream.prototype)); };
+  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, dns, tty, details, sync, asyncCall, poll, terminal };
 };

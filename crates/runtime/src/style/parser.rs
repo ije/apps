@@ -652,9 +652,12 @@ fn condition(
             if supports {
                 let supported = match selector.as_deref() {
                     Some("selector") => !Selector::parse(text, None).is_empty(),
-                    Some("font-format") => ["truetype", "opentype"]
+                    Some("font-format") => super::FONT_FORMATS
                         .iter()
                         .any(|format| text.eq_ignore_ascii_case(format)),
+                    Some("font-tech") => super::FONT_TECHS
+                        .iter()
+                        .any(|tech| text.eq_ignore_ascii_case(tech)),
                     Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
                         let value = value.trim();
@@ -1683,8 +1686,10 @@ mod tests {
             ("selector(a > b)", Some(true)),
             ("not selector(a > b)", Some(false)),
             ("font-tech(color-colrv1)", Some(false)),
-            ("not font-format(woff2)", Some(true)),
+            ("font-tech(variations)", Some(true)),
+            ("not font-format(woff2)", Some(false)),
             ("font-format(opentype)", Some(true)),
+            ("font-format(embedded-opentype)", Some(false)),
             ("(width: bogus)", Some(false)),
             ("(width: calc(100% - 2px))", Some(true)),
             ("(filter: blur(2px))", Some(true)),

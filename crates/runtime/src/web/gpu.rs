@@ -122,7 +122,7 @@ fn load() -> Result<Library> {
 
 #[cfg(not(target_os = "linux"))]
 fn load() -> Result<Library> {
-    let executable = std::env::current_exe()?.canonicalize()?;
+    let executable = crate::desktop::app::library_exe()?;
     let directory = executable
         .parent()
         .context("Missing executable directory")?;

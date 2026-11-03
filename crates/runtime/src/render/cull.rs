@@ -23,6 +23,12 @@ pub(crate) const STALE: u16 = 128;
 pub(crate) const RELISTED: u16 = 256;
 /// The subtree sizes something in viewport units, so a frame that resizes the viewport lays it out.
 pub(crate) const VIEWPORT: u16 = 512;
+/// Only the box's opacity animates, so it paints through a keyed layer that `render::composite`
+/// patches between frames.
+pub(crate) const COMPOSITED: u16 = 1024;
+/// The composited box's transform animates too, so its layer and hit testing keep a transform that
+/// `render::composite` patches.
+pub(crate) const TRANSFORMED: u16 = 2048;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {

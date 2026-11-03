@@ -485,6 +485,8 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     let (mut audio_end, mut last_frame) = (0., -1. / 30.);
     // The seek target that frames and samples before it are dropped for, and whether it was reported.
     let (mut target, mut loaded) = (Some(0.), false);
+    // The last video frame dropped before the target, shown when the track ends before one reaches it.
+    let mut skipped = None;
     // WARNING: a blocked track waits behind the other track's full packet queue until that track decodes, so it counts as ready.
     let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);
     let mut tick = Instant::now();
@@ -498,7 +500,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             drop(state);
             unsafe { apps_ffmpeg_seek(media, time) };
             (video_done, audio_done) = (!has_video, !has_audio);
-            (audio_end, last_frame, target) = (time, time - 1. / 30., Some(time));
+            (audio_end, last_frame, target, skipped) = (time, time - 1. / 30., Some(time), None);
             (blocked, converted) = (0, f64::NEG_INFINITY);
             continue;
         }
@@ -533,7 +535,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             drop(state);
             let (mut time, mut width, mut height) = (0., 0, 0);
             let (mut samples, mut count) = (std::ptr::null(), 0);
-            let kind = unsafe {
+            let mut kind = unsafe {
                 apps_ffmpeg_next(
                     media,
                     want,
@@ -544,6 +546,11 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     &mut count,
                 )
             };
+            // WARNING: like browsers, a seek past the last frame shows the last frame.
+            let last = kind == 0 && want & 1 != 0 && skipped.is_some();
+            if last && let Some(frame) = skipped.take() {
+                (time, width, height, kind) = frame;
+            }
             match kind {
                 1 => {
                     blocked = 0;
@@ -554,9 +561,11 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     };
                     let next = time + (time - last_frame).max(0.);
                     last_frame = time;
-                    if target.is_some_and(|target| time < target - 0.02) {
+                    if !last && target.is_some_and(|target| time < target - 0.02) {
+                        skipped = Some((time, width, height, 1));
                         continue;
                     }
+                    skipped = None;
                     // WARNING: a frame is not converted when the next one is due too, but one is every 0.1 s, so slow decoding still shows frames.
                     let audio = lock(&shared.audio);
                     let late = audio.clock.running && next <= audio.clock.now();

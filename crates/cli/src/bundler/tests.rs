@@ -434,7 +434,7 @@ fn html_and_css_images_become_bundled_assets() {
         let media = asset_name(&root, &root.join("img").join(name)).unwrap();
         assert!(page.contains(&format!("src=\"apps:///{media}\"")), "{page}");
     }
-    assert!(page.contains(&format!("url(\"apps:///{icon}\")")));
+    assert!(linked_css(page).contains(&format!("url(\"apps:///{icon}\")")));
     assert!(
         page.contains("https://example.com/x.png") && page.contains("data:image/png;base64,AA==")
     );
@@ -1462,10 +1462,10 @@ fn tailwind_import_survives_nested_css_without_a_package() {
     .unwrap();
     let files = Rc::default();
     let source = html(&path, Rc::clone(&files), Rc::default(), false).unwrap();
-    assert!(source.contains("@import \"tailwindcss\";"));
+    assert!(linked_css(&source).contains("@import \"tailwindcss\";"));
     assert!(!source.contains(".h-4"));
     assert_eq!(files.borrow().len(), 2);
-    let doc = Document::parse(&source);
+    let doc = apps_runtime::bundle::page(&source);
     let style = apps_runtime::style::styles(&doc, 800., 600.).pop().unwrap();
     let px = |key: &str| apps_runtime::style::length(&style[key], 0., 16., 800., 600.);
     assert_eq!(px("height"), 16.);
@@ -1492,9 +1492,10 @@ fn tailwind_parts_keep_their_imports() {
     )
     .unwrap();
     let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
-    assert!(source.contains("@import \"tailwindcss/theme.css\";"));
-    assert!(source.contains("@import \"tailwindcss/utilities\";"));
-    let style = apps_runtime::style::styles(&Document::parse(&source), 800., 600.)
+    let css = linked_css(&source);
+    assert!(css.contains("@import \"tailwindcss/theme.css\";"));
+    assert!(css.contains("@import \"tailwindcss/utilities\";"));
+    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
         .pop()
         .unwrap();
     assert_eq!(style["display"], "flex");
@@ -1558,8 +1559,8 @@ fn unsupported_electron_exports_fail_at_build_time() {
     let entry = dir.path().join("main.js");
     for (source, error) in [
         (
-            "import {app, Tray} from 'electron'; app.quit();",
-            "electron.Tray is not supported",
+            "import {app, autoUpdater} from 'electron'; app.quit();",
+            "electron.autoUpdater is not supported",
         ),
         (
             "import {protocol} from '@pierre/apps';",
@@ -1575,7 +1576,7 @@ fn unsupported_electron_exports_fail_at_build_time() {
         }
     }
     let entry = dir.path().join("main.ts");
-    fs::write(&entry, "import electron, {screen, MenuItem, webContents} from 'electron'; import type {Tray} from 'electron'; const tray: Tray | null = null; if (tray || electron.screen !== screen || typeof MenuItem !== 'function' || typeof webContents.fromId !== 'function') throw Error('exports');").unwrap();
+    fs::write(&entry, "import electron, {screen, MenuItem, Tray, webContents, powerSaveBlocker, systemPreferences, webUtils, net} from 'electron'; import {Tray as AppsTray} from '@pierre/apps'; import {Socket} from 'node:net'; if (electron.Tray !== Tray || AppsTray !== Tray || typeof Tray !== 'function' || electron.screen !== screen || typeof MenuItem !== 'function' || typeof webContents.fromId !== 'function' || typeof powerSaveBlocker.start !== 'function' || typeof systemPreferences.getColor !== 'function' || typeof webUtils.getPathForFile !== 'function' || typeof net.request !== 'function' || electron.net !== net || typeof Socket !== 'function') throw Error('exports');").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
     apps_runtime::desktop::Desktop::new(&files).unwrap();
 }
@@ -2348,6 +2349,7 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             production,
             crate::build_target::BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)
                 .unwrap(),
+            None,
         )
         .unwrap();
         let moved = dir.path().join("relocated");
@@ -2597,6 +2599,15 @@ fn workers_keep_native_addons_from_earlier_modules() {
     );
 }
 
+/// The CSS that the bundler keeps for the stylesheet link of a page.
+fn linked_css(page: &str) -> String {
+    Document::parse(page)
+        .nodes
+        .iter()
+        .find_map(|node| node.attrs.get(apps_runtime::bundle::LINK_SHEET).cloned())
+        .unwrap_or_default()
+}
+
 #[test]
 fn stylesheets_cannot_close_style_or_read_other_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -2626,14 +2637,16 @@ fn stylesheets_cannot_close_style_or_read_other_files() {
     fs::write(&page, "<style>@import './node_modules/theme/screen.css'; body { margin: 0 }</style><link rel='stylesheet' media='print' href='./node_modules/theme/base.css'>").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
     let doc = Document::parse(&files["page-0.html"]);
-    let styles: Vec<_> = (0..doc.nodes.len())
-        .filter(|&id| doc.nodes[id].tag == "style")
-        .map(|id| doc.text(id))
-        .collect();
-    assert_eq!(styles.len(), 2, "{}", files["page-0.html"]);
-    assert!(styles[0].contains("#123456") && styles[0].contains("#654321"));
-    assert!(!styles[0].contains("@IMPORT"));
-    assert!(styles[1].starts_with("@media print{") && styles[1].contains("#123456"));
+    let [style, link] =
+        ["style", "link"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
+    let style = doc.text(style);
+    assert!(style.contains("#123456") && style.contains("#654321"));
+    assert!(!style.contains("@IMPORT"));
+    assert_eq!(
+        doc.nodes[link].attrs.get("media").map(String::as_str),
+        Some("print")
+    );
+    assert!(linked_css(&files["page-0.html"]).contains("#123456"));
     for (html, message) in [
         (
             "<link rel='stylesheet' href='./node_modules/theme/evil.css'>",
@@ -2933,6 +2946,7 @@ fn page_scripts_share_one_module_graph_per_realm() {
                 (Some("apps:///script-1.js".into()), true),
                 (None, true),
                 (Some("apps:///script-0.js".into()), true),
+                (Some("./first.ts".into()), true),
                 (None, true)
             ]
         );
@@ -3278,10 +3292,10 @@ fn http_imports_download_with_the_feature() {
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
         if production {
-            let page = &files["page-0.html"];
+            let css = linked_css(&files["page-0.html"]);
             assert!(
-                page.contains(".b{color:red}") && page.contains(&format!("\"{origin}/img/a.png\"")),
-                "{page}"
+                css.contains(".b{color:red}") && css.contains(&format!("\"{origin}/img/a.png\"")),
+                "{css}"
             );
         }
         let engine = apps_runtime::jsc::JsContext::new(
@@ -3312,7 +3326,7 @@ fn classic_scripts_share_the_global_scope_and_run_before_modules() {
         ),
         (
             "web/a.js",
-            "function helper() { return 'helper'; } var shared = 1; implicit = 2;",
+            "function helper() { return 'helper'; } var shared = 1; implicit = 2; order.scripts.push(document.currentScript.getAttribute('src')); Promise.resolve().then(() => order.scripts.push('then ' + document.currentScript?.getAttribute('src')));",
         ),
         (
             "web/b.js",
@@ -3322,7 +3336,7 @@ fn classic_scripts_share_the_global_scope_and_run_before_modules() {
             "src/main.ts",
             "const order: string[] = (globalThis as any).order; if (order.join() !== 'inline,classic') throw Error('module ' + order); order.push('module');",
         ),
-        ("web/deferred.js", "order.push('deferred');"),
+        ("web/deferred.js", "order.push('deferred'); order.scripts.push(document.currentScript.getAttribute('src'));"),
         ("web/style.css", "@import '/web/base.css';"),
         ("web/base.css", "#color { color: rgb(1, 2, 3) }"),
         ("web/alt.css", "#color { color: rgb(9, 9, 9) }"),
@@ -3330,7 +3344,7 @@ fn classic_scripts_share_the_global_scope_and_run_before_modules() {
         fs::write(root.join(name), source).unwrap();
     }
     fs::write(dir.path().join("outside.js"), "").unwrap();
-    fs::write(root.join("web/index.html"), r#"<link rel="Preload  Stylesheet" href="/web/style.css"><link rel="alternate stylesheet" href="/web/alt.css"><p id="color">x</p><script type="module" src="/src/main.ts"></script><script>globalThis.order = ['inline'];</script><script src="vendor/lib.umd.js"></script><script src="a.js"></script><script src="b.js"></script><script nomodule>throw Error('nomodule');</script><script defer src="deferred.js"></script><script type="module">if (order.join() !== 'inline,classic,module,deferred' || getComputedStyle(document.getElementById('color')).color !== 'rgb(1, 2, 3)') throw Error('order ' + order);</script>"#).unwrap();
+    fs::write(root.join("web/index.html"), r#"<link rel="Preload  Stylesheet" href="/web/style.css"><link rel="alternate stylesheet" href="/web/alt.css"><p id="color">x</p><script type="module" src="/src/main.ts"></script><script>globalThis.order = ['inline']; order.scripts = [document.currentScript.getAttribute('src') ?? ''];</script><script src="vendor/lib.umd.js"></script><script src="a.js"></script><script src="b.js"></script><script nomodule>throw Error('nomodule');</script><script defer src="deferred.js"></script><script type="module">const link = document.querySelector('link[href="/web/style.css"]'); if (order.join() !== 'inline,classic,module,deferred' || getComputedStyle(document.getElementById('color')).color !== 'rgb(1, 2, 3)' || !link.sheet.cssRules.length || document.styleSheets.length !== 1 || document.styleSheets[0] !== link.sheet || link.hasAttribute('apps-sheet') || document.currentScript !== null || order.scripts.join() !== ',a.js,then a.js,deferred.js') throw Error('order ' + order + ' ' + order.scripts);</script>"#).unwrap();
     let entry = root.join("main.ts");
     fs::write(&entry, "import {app, BrowserWindow} from '@pierre/apps'; app.whenReady().then(() => new BrowserWindow().loadFile(import.meta.resolve('./web/index.html')));").unwrap();
     for production in [false, true] {
@@ -3482,4 +3496,56 @@ fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
         )) && page.contains(&format!("srcset=\" apps:///{b} 2x\"")),
         "{page}"
     );
+}
+
+#[test]
+fn rust_main_bundles_pages_from_the_package_root() -> Result<()> {
+    let project = tempfile::tempdir()?;
+    let root = project.path();
+    fs::create_dir(root.join("src"))?;
+    fs::create_dir(root.join("ui"))?;
+    let entry = root.join("src/main.rs");
+    fs::write(&entry, "fn main() {}")?;
+    fs::write(
+        root.join("package.json"),
+        r#"{"type":"rust","name":"my-app","pages":["ui/main.html"],"preload":"src/preload.ts"}"#,
+    )?;
+    fs::write(
+        root.join("src/preload.ts"),
+        "export const answer = () => 42",
+    )?;
+    fs::write(
+        root.join("ui/main.html"),
+        "<h1></h1><script type='module' src='page.ts'></script>",
+    )?;
+    fs::write(
+        root.join("ui/page.ts"),
+        "import {answer} from '../src/preload'; document.querySelector('h1').textContent = String(answer());",
+    )?;
+    for production in [false, true] {
+        let tracked = Rc::default();
+        let files = compile(
+            &entry,
+            Realm::Main,
+            None,
+            Rc::clone(&tracked),
+            production,
+            None,
+        )?;
+        assert!(!files.contains_key("app.js"));
+        assert!(files["ui/main.html"].contains("apps:///script-"));
+        assert!(files["package.json"].contains("my-app"));
+        assert!(
+            tracked
+                .borrow()
+                .contains(&root.join("ui/page.ts").canonicalize()?)
+        );
+    }
+    fs::write(
+        root.join("package.json"),
+        r#"{"type":"rust","name":"my-app","main":"src/main.rs"}"#,
+    )?;
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None)?;
+    assert_eq!(files.keys().collect::<Vec<_>>(), ["package.json"]);
+    Ok(())
 }

@@ -4,7 +4,7 @@ mod control;
 pub(crate) mod cull;
 pub(crate) mod effects;
 mod element;
-mod fonts;
+pub(crate) mod fonts;
 pub(crate) mod grid;
 mod hud;
 pub mod image;
@@ -37,7 +37,7 @@ pub(crate) struct PageState {
     pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
     /// By browser, the bounds it was given and the node revision its source was checked at.
-    pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64)>>,
+    pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64, bool)>>,
     /// The `canvas` and `iframe` nodes, found again when the document changes.
     tagged: RefCell<(u64, Vec<usize>, Vec<usize>)>,
     /// The `id` index of the document, kept while the document is unchanged.
@@ -54,11 +54,20 @@ pub(crate) struct PageState {
     pub(crate) dropped: RefCell<Vec<PathBuf>>,
     /// The pressed mouse buttons, as DOM `buttons` bits.
     buttons: Cell<u8>,
+    /// The screen position of the content area, until the window moves.
+    pub(crate) origin: Cell<Option<renderer::Point<renderer::Pixels>>>,
     window: WindowId,
     /// A script read geometry, so this build only lays the page out.
     reflowing: Cell<bool>,
     /// Boxes whose animations wait until they come into view, with their clipping ancestors.
     parked: RefCell<Vec<(usize, Clips)>>,
+    /// Animated boxes in view that painted no keyed layer, so their opacity can't be patched.
+    flat: RefCell<rustc_hash::FxHashSet<usize>>,
+    /// From when composite frames may promote their layers to the compositor, and whether they are.
+    promote: Cell<Option<(std::time::Instant, bool)>>,
+    /// By box whose keyed layer keeps a transform: the bounds and parent perspective its transform
+    /// resolves with, and the transform drawn last.
+    pub(super) spun: RefCell<rustc_hash::FxHashMap<usize, Spun>>,
     /// The caret drawn last: its node, offset and text length, when it moved, and its blink timer by phase.
     caret: RefCell<Option<input::Blink>>,
     /// The FPS HUD of `apps run`.
@@ -67,6 +76,11 @@ pub(crate) struct PageState {
 
 /// Clipping ancestors with their clipped axes, see [`clips`].
 type Clips = Vec<(usize, [bool; 2])>;
+type Spun = (
+    renderer::Bounds<renderer::Pixels>,
+    Option<(f32, [f32; 2])>,
+    effects::Matrix,
+);
 
 thread_local! {
     /// The app and the window of the page scripts that run now.
@@ -78,10 +92,57 @@ thread_local! {
 // WARNING: `f` must not use `cx` or `window`: a reflow reaches them through pointers while it runs.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
     crate::jsc::REFLOW.set(Some(reflow));
+    crate::jsc::CLIPBOARD.set(Some(clipboard));
     let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
     let result = f();
     SCRIPTS.set(previous);
     result
+}
+
+/// Writes `text` to the clipboard, or reads it without text, for the page scripts that run now.
+fn clipboard(text: Option<String>) -> Option<String> {
+    let (cx, _) = SCRIPTS.get()?;
+    // WARNING: the pointer comes from `scripted`, whose caller does not touch it until the script returns.
+    let cx = unsafe { &*cx };
+    match text {
+        Some(text) => {
+            cx.write_to_clipboard(text);
+            None
+        }
+        None => cx.read_from_clipboard(),
+    }
+}
+
+/// Runs edit `command` of `webContents` in the page, like the keyboard: copy and cut write
+/// what the page copied to the clipboard, and paste reads it. Without an app it skips the clipboard.
+pub(crate) fn edit(
+    renderer: &crate::jsc::JsContext,
+    app: Option<(&mut App, Option<&mut Window>)>,
+    command: &str,
+    text: &str,
+) {
+    let run = |text: &str| {
+        let [command, text] = [command, text].map(|value| serde_json::json!(value).to_string());
+        renderer.call("__appsEdit", &[&command, &text])
+    };
+    let result = match app {
+        Some((cx, window)) => {
+            let pasted = matches!(command, "paste" | "pasteAndMatchStyle")
+                .then(|| cx.read_from_clipboard().unwrap_or_default());
+            let result = scripted(cx, window, || run(pasted.as_deref().unwrap_or(text)));
+            if let Ok(copied) = &result
+                && matches!(command, "copy" | "cut")
+                && !copied.is_empty()
+            {
+                cx.write_to_clipboard(copied.clone());
+            }
+            result
+        }
+        None => run(text),
+    };
+    if let Err(error) = result {
+        eprintln!("apps: {error}");
+    }
 }
 
 /// Lays page `id` out now when it changed since its last layout, like a browser's forced reflow.
@@ -93,8 +154,10 @@ pub(crate) fn reflow(id: u64) {
     else {
         return;
     };
+    // WARNING: composite frames turn boxes without a layout, so a read after them lays the page out.
     if view.host.try_borrow_mut().map_or(true, |host| {
         !host.pages.get(&id).is_some_and(|page| page.dirty)
+            && !host.dom.get(&id).is_some_and(|dom| dom.bounds.moved())
     }) {
         return;
     }
@@ -161,6 +224,19 @@ fn button(button: MouseButton) -> u8 {
     }
 }
 
+impl PageState {
+    /// The `screenX` and `screenY` of window position `at`, in screen points.
+    fn screen(&self, window: &Window, at: renderer::Point<renderer::Pixels>) -> [f32; 2] {
+        let origin = self.origin.get().unwrap_or_else(|| {
+            let origin = window.window_state().content.origin;
+            self.origin.set(Some(origin));
+            origin
+        });
+        let at = origin + at * window.zoom();
+        [f32::from(at.x), f32::from(at.y)]
+    }
+}
+
 /// The view of a window.
 pub(crate) struct PageView(pub(crate) Rc<PageState>);
 
@@ -193,9 +269,13 @@ impl PageView {
             moving: Cell::new(false),
             dropped: RefCell::default(),
             buttons: Cell::new(0),
+            origin: Cell::new(None),
             window,
             reflowing: Cell::new(false),
             parked: RefCell::default(),
+            flat: RefCell::default(),
+            spun: RefCell::default(),
+            promote: Cell::new(None),
             caret: RefCell::default(),
             hud: RefCell::default(),
         });
@@ -236,7 +316,8 @@ impl PageView {
             let view = data.clone();
             window.on_mouse_event(move |event: &MouseExitEvent, phase, window, cx| {
                 if phase.capture() {
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y)}), Some(window), cx);
+                    let [x, y] = view.screen(window, event.position);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y}), Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -245,7 +326,8 @@ impl PageView {
                     if event.pressed_button.is_none() {
                         view.buttons.set(0);
                     }
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointermove", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                    let [x, y] = view.screen(window, event.position);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointermove", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -253,7 +335,8 @@ impl PageView {
                 if phase.bubble() {
                     let button = button(event.button);
                     view.buttons.set(view.buttons.get() | 1 << [0, 2, 1, 3, 4][usize::from(button)]);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":button,"buttons":view.buttons.get(),"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                    let [x, y] = view.screen(window, event.position);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -261,7 +344,8 @@ impl PageView {
                 if phase.capture() {
                     let button = button(event.button);
                     view.buttons.set(view.buttons.get() & !(1 << [0, 2, 1, 3, 4][usize::from(button)]));
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerup", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"button":button,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
+                    let [x, y] = view.screen(window, event.position);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerup", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -269,7 +353,8 @@ impl PageView {
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase.capture() && view.host.try_borrow().is_ok_and(|host| host.dom.get(&view.id).is_some_and(|dom| dom.wheel)) {
                     let delta = event.delta.pixel_delta(renderer::px(16.));
-                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
+                    let [x, y] = view.screen(window, event.position);
+                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
                         cx.stop_propagation();
                     }
                 }
@@ -326,9 +411,10 @@ impl PageView {
             }
         }
         if let Some((browser, _)) = self.browsers.borrow().get(&usize::MAX) {
-            let bounds = [0., 0., width as f64, height as f64];
+            let zoom = window.zoom() as f64;
+            let bounds = [0., 0., width as f64 * zoom, height as f64 * zoom];
             let mut frames = self.frames.borrow_mut();
-            let set = &mut frames.entry(usize::MAX).or_insert(([f64::NAN; 4], 0)).0;
+            let set = &mut frames.entry(usize::MAX).or_insert(([f64::NAN; 4], 0, true)).0;
             if *set != bounds {
                 *set = bounds;
                 let _ = browser.set_bounds(bounds);
@@ -363,7 +449,7 @@ impl PageView {
             Some((window.text_system(), window.scale_factor())),
         );
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && fonts::load(&doc, dom, &state.assets)
+            && fonts::load(&doc, dom, &state.assets).0
         {
             styles = crate::dom::styles(
                 &mut doc,
@@ -457,55 +543,47 @@ impl PageView {
                 .map(|id| (id, restyled.values[id].clone(), true))
                 .collect();
         }
-        match next {
-            Some(at) if at <= now + std::time::Duration::from_millis(8) => {
-                dom.motion.wake = None;
-                window.on_next_frame(|window, _| window.refresh());
-            }
-            Some(at) => {
-                if dom
-                    .motion
-                    .wake
-                    .as_ref()
-                    .is_none_or(|(old, _)| *old <= now || at < *old)
-                {
-                    let delay = at.saturating_duration_since(now);
-                    let window_id = window.id();
-                    let task = cx.timer(delay, move |cx| cx.refresh_window(window_id));
-                    dom.motion.wake = Some((at, task));
-                }
-            }
-            None => dom.motion.wake = None,
-        }
-        if !events.is_empty() {
-            let runtime = self.runtime.clone();
-            let id = self.id;
-            cx.defer(move |cx| {
-                let renderer = runtime
-                    .borrow()
-                    .views
-                    .get(&id)
-                    .and_then(|view| view.renderer.clone());
-                for (node, kind, name, elapsed) in events {
-                    let data = if kind.starts_with("animation") {
-                        serde_json::json!({"animationName": name, "elapsedTime": elapsed})
-                    } else {
-                        serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
-                    };
-                    if let Some(renderer) = &renderer
-                        && let Err(error) = renderer.eval(
-                            &format!("__appsDispatch('{kind}',[{node}],{data})"),
-                            "apps:animation",
-                        )
-                    {
-                        eprintln!("apps: {error}");
-                    }
-                }
-                Desktop::drive(runtime, cx);
-            });
-        }
-        // WARNING: animated values replace `styles.values` only while this frame is built; `restore` puts the cascade back.
+        let mut flat = self.flat.borrow_mut();
+        flat.retain(|id| animated.iter().any(|(animated, ..)| animated == id));
+        let composited: Vec<(usize, bool)> = animated
+            .iter()
+            .filter(|(id, style, layout)| {
+                !layout
+                    && !flat.contains(id)
+                    && composites(style, &styles.values[*id])
+                    && [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
+                        .into_iter()
+                        .all(|prop| style.get(prop).is_none_or(|value| value == "none"))
+                    && style.get(Prop::BACKFACE_VISIBILITY) != Some("hidden")
+            })
+            .map(|(id, style, _)| {
+                let base = &styles.values[*id];
+                let turns = TURNS.iter().any(|&prop| {
+                    style.get(prop).is_some_and(|value| value != "none")
+                        || style.get(prop) != base.get(prop)
+                });
+                (*id, turns)
+            })
+            .collect();
+        drop(flat);
+        let compositing = !animated.is_empty()
+            && composited.len() == animated.len()
+            && dom.motion.pseudos.is_empty();
+        animate(&self.0, dom, next, now, compositing, events, window, cx);
+        // WARNING: animated values replace `styles.values` and `styles.pseudos` only while this frame is built;
+        // `restore` and `restore_pseudos` put the cascade back.
         let mut restore = Vec::new();
+        let mut restore_pseudos = Vec::new();
+        let pseudos = std::mem::take(&mut dom.motion.pseudos);
+        if !pseudos.is_empty() {
+            dom.computed = None;
+            let map = &mut Rc::make_mut(&mut styles).pseudos;
+            for (id, pair) in pseudos {
+                if let Some(old) = map.insert(id, pair) {
+                    restore_pseudos.push((id, old));
+                }
+            }
+        }
         let mut paint = Vec::new();
         if !animated.is_empty() {
             dom.computed = None;
@@ -545,7 +623,7 @@ impl PageView {
                 ) {
                     Ok(browser) => {
                         entry.insert((browser, String::new()));
-                        frames.insert(node, ([f64::NAN; 4], 0));
+                        frames.insert(node, ([f64::NAN; 4], 0, true));
                     }
                     Err(error) => {
                         eprintln!("apps: iframe: {error}");
@@ -558,6 +636,28 @@ impl PageView {
             else {
                 continue;
             };
+            // WARNING: the native view draws above the page, so CSS can only hide it, when it or an ancestor has no opacity.
+            let mut shown = styles.values[node]
+                .get(Prop::VISIBILITY)
+                .is_none_or(|value| value == "visible");
+            let mut current = Some(node);
+            while let Some(id) = current
+                && shown
+            {
+                let style = paint
+                    .iter()
+                    .find(|(painted, _)| *painted == id)
+                    .map_or(&styles.values[id], |(_, style)| style);
+                shown = style
+                    .get(Prop::OPACITY)
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .is_none_or(|value| value > 0.);
+                current = doc.nodes[id].parent;
+            }
+            if frame.2 != shown {
+                frame.2 = shown;
+                let _ = browser.command("visible", &serde_json::json!(shown));
+            }
             if frame.1 == revision {
                 continue;
             }
@@ -625,7 +725,11 @@ impl PageView {
             });
         if unchanged {
             for info in &mut info {
-                info.flags &= !(cull::CHANGED | cull::RELISTED | cull::STALE);
+                info.flags &= !(cull::CHANGED
+                    | cull::RELISTED
+                    | cull::STALE
+                    | cull::COMPOSITED
+                    | cull::TRANSFORMED);
             }
         } else {
             let mut order = Vec::new();
@@ -635,25 +739,15 @@ impl PageView {
                 pending.extend(&doc.nodes[id].children);
             }
             // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
+            // A new viewport size is left to `cull::VIEWPORT`, as for kept styles, so a resize that restyles colors
+            // keeps culling.
             let units = |lengths: &style::Lengths| {
                 let [font, root] = [lengths.font, lengths.root];
                 let mut hasher = rustc_hash::FxHasher::default();
                 std::hash::Hash::hash(
                     &[
-                        font.em,
-                        font.ch,
-                        font.ex,
-                        font.cap,
-                        font.ic,
-                        font.lh,
-                        root.em,
-                        root.ch,
-                        root.ex,
-                        root.cap,
-                        root.ic,
-                        root.lh,
-                        lengths.viewport[0],
-                        lengths.viewport[1],
+                        font.em, font.ch, font.ex, font.cap, font.ic, font.lh, root.em, root.ch,
+                        root.ex, root.cap, root.ic, root.lh,
                     ]
                     .map(f32::to_bits),
                     &mut hasher,
@@ -795,6 +889,14 @@ impl PageView {
                 };
             }
         }
+        self.spun.borrow_mut().clear();
+        // A drawn frame takes promoted layers back, see `composite`.
+        self.promote.set(
+            (!composited.is_empty()).then(|| (now + std::time::Duration::from_millis(300), false)),
+        );
+        for &(id, turns) in &composited {
+            info[id].flags |= cull::COMPOSITED | (u16::from(turns) * cull::TRANSFORMED);
+        }
         // WARNING: the inline text of a paragraph holds the colors of its text, so a new color drops it this
         // frame and the next, which draws the color without animation again.
         let mut recolored = std::mem::take(&mut dom.recolored);
@@ -846,6 +948,9 @@ impl PageView {
         let mut warnings = Vec::new();
         if inspectable && !dom.linted {
             dom.linted = true;
+            if dom.checked.len() > 65536 {
+                dom.checked.clear();
+            }
             for name in style::DROPPED.take() {
                 if dom.warned.insert(format!("@{name}")) {
                     warnings.push(format!(
@@ -859,7 +964,7 @@ impl PageView {
                     continue;
                 }
                 let pseudos = styles.text_pseudos.get(&id);
-                for (pseudo, values) in [
+                for (index, (pseudo, values)) in [
                     ("", Some(&**style)),
                     (
                         "::first-letter",
@@ -869,10 +974,16 @@ impl PageView {
                         "::first-line",
                         pseudos.and_then(|values| values[2].as_ref()),
                     ),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     let Some(values) = values else { continue };
                     for (key, value) in values.own() {
-                        if !pseudo.is_empty() && style.value(key) == Some(value) {
+                        // WARNING: each declaration is checked once, so restyles don't parse every value again.
+                        if !pseudo.is_empty() && style.value(key) == Some(value)
+                            || !dom.checked.insert((index as u8, key, value.clone()))
+                        {
                             continue;
                         }
                         let (value, name) = (&**value, key.name());
@@ -1010,6 +1121,17 @@ impl PageView {
                 resized: dom.cull.resized,
             })
         });
+        // The root never leaves the page: a fullscreen root is the page at the window size.
+        let top_layer: Vec<usize> = dom
+            .top_layer
+            .iter()
+            .copied()
+            .filter(|&id| {
+                visible.get(id) == Some(&true)
+                    && doc.nodes[id].state & crate::dom::TOP_LAYER != 0
+                    && doc.nodes[id].tag != "html"
+            })
+            .collect();
         dom.containers.clear();
         dom.flexed_grids.clear();
         dom.measurements.pixel_ratio = window.scale_factor();
@@ -1030,31 +1152,108 @@ impl PageView {
             }
             ids.1.clone()
         };
+        let mut build = Build {
+            doc: &doc,
+            styles: &styles,
+            text: &text_system,
+            pixel_ratio: window.scale_factor(),
+            view: &self.0,
+            layers: Rc::default(),
+            ancestors: Rc::default(),
+            stacking: 0,
+            flex_parent: false,
+            measured: &measured,
+            inline_text: &inline_text,
+            perspective: None,
+            siblings: &RefCell::default(),
+            margins: &RefCell::default(),
+            ids: &ids,
+            info: &info,
+            zone,
+            top_layer: &top_layer,
+        };
         let root = element(
-            &Build {
-                doc: &doc,
-                styles: &styles,
-                text: &text_system,
-                pixel_ratio: window.scale_factor(),
-                view: &self.0,
-                layers: Rc::default(),
-                ancestors: Rc::default(),
-                stacking: 0,
-                flex_parent: false,
-                measured: &measured,
-                inline_text: &inline_text,
-                perspective: None,
-                siblings: &RefCell::default(),
-                margins: &RefCell::default(),
-                ids: &ids,
-                info: &info,
-                zone,
-            },
+            &build,
             0,
             [width - page_space[1], height],
             [width - page_space[1], height],
             None,
         );
+        // Each box of the top layer paints over the page and the boxes before it, after its `::backdrop`,
+        // laid out in the viewport and never culled.
+        build.zone = None;
+        let mut overlay = Vec::new();
+        for &id in &top_layer {
+            if let Some(backdrop) = styles
+                .backdrops
+                .get(&id)
+                .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
+            {
+                let units = styles.lengths[id];
+                let mut el = div().absolute().top_0().left_0().size_full();
+                if backdrop
+                    .get(Prop::VISIBILITY)
+                    .is_none_or(|value| value == "visible")
+                {
+                    if let Some((color, alpha)) =
+                        backdrop.get(Prop::BACKGROUND_COLOR).and_then(style::color)
+                    {
+                        el = el.bg(rgba(color << 8 | alpha as u32));
+                    }
+                    if let Some(opacity) = backdrop
+                        .get(Prop::OPACITY)
+                        .and_then(|value| value.parse::<f32>().ok())
+                    {
+                        el = el.opacity(opacity.clamp(0., 1.));
+                    }
+                    if backdrop
+                        .get(Prop::BACKGROUND_IMAGE)
+                        .is_some_and(|value| value != "none")
+                    {
+                        let host = self.host.borrow();
+                        el = el.children(background::css_background(
+                            backdrop,
+                            units,
+                            id,
+                            3,
+                            Default::default(),
+                            self.0.clone(),
+                            host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
+                            &host.assets,
+                        ));
+                    }
+                }
+                overlay.push(
+                    match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
+                        .into_iter()
+                        .find_map(|prop| backdrop.get(prop))
+                        .and_then(|value| effects::backdrop(value, &units))
+                    {
+                        Some((blur, color_matrix)) => paint::Effected {
+                            effect: renderer::PaintEffect {
+                                backdrop: Some(renderer::Backdrop {
+                                    bounds: renderer::Bounds::default(),
+                                    corner_radii: Default::default(),
+                                    blur,
+                                    color_matrix,
+                                }),
+                                ..Default::default()
+                            },
+                            child: el.into_any_element(),
+                            backdrop: Some(Default::default()),
+                        }
+                        .into_any_element(),
+                        None => el.into_any_element(),
+                    },
+                );
+            }
+            let layers = paint::PaintLayers::default();
+            build.layers = layers.clone();
+            overlay.push(paint::paint_layers(layers.clone(), true).into_any_element());
+            overlay.push(element(&build, id, [width, height], [width, height], None));
+            overlay.push(paint::paint_layers(layers, false).into_any_element());
+        }
+        drop(build);
         for (node, children) in children.into_iter().rev() {
             doc.nodes.compose_children(node, children);
         }
@@ -1069,12 +1268,18 @@ impl PageView {
             dom.measurements = measured.into_inner();
             dom.inline_text = inline_text.into_inner();
             dom.animating.clear();
-            let restored = !restore.is_empty();
+            dom.animating_pseudos.clear();
+            let restored = !restore.is_empty() || !restore_pseudos.is_empty();
             if restored {
-                let values = &mut Rc::make_mut(&mut styles).values;
+                let styles = Rc::make_mut(&mut styles);
                 for (id, style) in restore {
                     dom.animating
-                        .insert(id, std::mem::replace(&mut values[id], style));
+                        .insert(id, std::mem::replace(&mut styles.values[id], style));
+                }
+                for (id, pair) in restore_pseudos {
+                    if let Some(animated) = styles.pseudos.insert(id, pair) {
+                        dom.animating_pseudos.insert(id, animated);
+                    }
                 }
             }
             // WARNING: animated layout values change the boxes again next frame, so its flags are not kept.
@@ -1110,7 +1315,7 @@ impl PageView {
                 cx.defer(move |cx| Desktop::drive(runtime, cx));
             });
         }
-        div()
+        let page = div()
             .id(("apps-page", 0))
             .size_full()
             .when(page_scrolls, |page| page.overflow_y_scroll())
@@ -1156,8 +1361,286 @@ impl PageView {
                     },
                 )
                 .absolute()
-            }))
-            .into_any_element()
+            }));
+        // WARNING: the top layer stays out of the page's scroll container, so scrolling never moves it.
+        if overlay.is_empty() {
+            page.into_any_element()
+        } else {
+            div()
+                .size_full()
+                .child(page)
+                .children(overlay)
+                .into_any_element()
+        }
+    }
+}
+
+/// The properties that turn a composited box, see `cull::TRANSFORMED`.
+const TURNS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
+
+/// Whether two styles differ in nothing but `opacity` and transforms, which composite frames patch.
+fn composites(a: &style::Style, b: &style::Style) -> bool {
+    let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY && !TURNS.contains(prop);
+    a.iter().filter(rest).eq(b.iter().filter(rest))
+}
+
+/// Wakes the view for the next animation change, with an opacity-only frame while `composite`,
+/// and sends the animation events.
+#[allow(clippy::too_many_arguments)]
+fn animate(
+    view: &Rc<PageState>,
+    dom: &mut crate::dom::State,
+    next: Option<std::time::Instant>,
+    now: std::time::Instant,
+    composite: bool,
+    events: Vec<(usize, &'static str, String, f64)>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match next {
+        Some(at) if at <= now + std::time::Duration::from_millis(8) => {
+            dom.motion.wake = None;
+            let view = view.clone();
+            window.on_next_frame(move |window, cx| match composite {
+                true => self::composite(view, window, cx),
+                false => window.refresh(),
+            });
+        }
+        Some(at) => {
+            if dom
+                .motion
+                .wake
+                .as_ref()
+                .is_none_or(|(old, _)| *old <= now || at < *old)
+            {
+                let delay = at.saturating_duration_since(now);
+                let window_id = window.id();
+                let view = view.clone();
+                let task = cx.timer(delay, move |cx| {
+                    if composite {
+                        cx.update_window(window_id, |window, cx| self::composite(view, window, cx));
+                    } else {
+                        cx.refresh_window(window_id);
+                    }
+                });
+                dom.motion.wake = Some((at, task));
+            }
+        }
+        None => dom.motion.wake = None,
+    }
+    if !events.is_empty() {
+        let runtime = view.runtime.clone();
+        let id = view.id;
+        cx.defer(move |cx| {
+            let renderer = runtime
+                .borrow()
+                .views
+                .get(&id)
+                .and_then(|view| view.renderer.clone());
+            for (node, kind, name, elapsed) in events {
+                // Pseudo-element animations are named like `::before\0spin`.
+                let (pseudo, name) = name.split_once('\0').unwrap_or(("", &name));
+                let data = if kind.starts_with("animation") {
+                    serde_json::json!({"animationName": name, "elapsedTime": elapsed, "pseudoElement": pseudo})
+                } else {
+                    serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
+                };
+                if let Some(renderer) = &renderer
+                    && let Err(error) = renderer.eval(
+                        &format!("__appsDispatch('{kind}',[{node}],{data})"),
+                        "apps:animation",
+                    )
+                {
+                    eprintln!("apps: {error}");
+                }
+            }
+            Desktop::drive(runtime, cx);
+        });
+    }
+}
+
+/// An animation frame that only changes the opacity and transform of boxes with keyed layers: it
+/// samples the animations, patches those layers in the last frame's scene and shows it again. Any
+/// other change, or a transform that moves a box's center, draws the whole frame.
+fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
+    if window.will_draw() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let size = window.viewport_size();
+    let viewport = [f32::from(size.width), f32::from(size.height)];
+    let Ok(mut host) = view.host.try_borrow_mut() else {
+        return window.refresh();
+    };
+    let state = &mut *host;
+    let (Some(page), Some(dom)) = (state.pages.get(&view.id), state.dom.get_mut(&view.id)) else {
+        return window.refresh();
+    };
+    let doc = &page.doc;
+    // WARNING: the page must be as the last frame drew it: no DOM, style, focus or viewport change.
+    let Some((.., styles)) = dom.cull.seen.clone().filter(|(latest, focus, _)| {
+        !page.dirty
+            && !dom.dirty
+            && (*latest, *focus) == (doc.nodes.latest(), dom.focus)
+            && state.viewports.get(&view.id) == Some(&viewport)
+            && view.hud.borrow().is_none()
+    }) else {
+        return window.refresh();
+    };
+    let mut events = Vec::new();
+    let now = std::time::Instant::now();
+    let bounds = &dom.bounds;
+    let shown = |id| in_view(bounds, viewport, id, clips(doc, &styles, id));
+    let (animated, next) = dom.motion.update(
+        doc,
+        &styles,
+        &dom.cull.visible,
+        &shown,
+        now,
+        false,
+        &mut events,
+    );
+    *view.parked.borrow_mut() = dom
+        .motion
+        .parked
+        .iter()
+        .map(|&id| (id, clips(doc, &styles, id).collect()))
+        .collect();
+    let mut spun = view.spun.borrow_mut();
+    // WARNING: a box whose center moves could change what it covers and intersects, so only spins
+    // and pulses about the center keep their layout.
+    let centered =
+        |bounds: &renderer::Bounds<renderer::Pixels>, a: &effects::Matrix, b: &effects::Matrix| {
+            let [x, y] = [
+                f32::from(bounds.origin.x + bounds.size.width / 2.),
+                f32::from(bounds.origin.y + bounds.size.height / 2.),
+            ];
+            let center = |m: &effects::Matrix| {
+                let w = m[3] * x + m[7] * y + m[15];
+                [
+                    (m[0] * x + m[4] * y + m[12]) / w,
+                    (m[1] * x + m[5] * y + m[13]) / w,
+                ]
+            };
+            let ([a, b], [c, d]) = (center(a), center(b));
+            (a - c).abs() < 0.5 && (b - d).abs() < 0.5
+        };
+    let mut changes = Vec::new();
+    let eligible = dom.motion.custom.is_empty()
+        && dom.motion.pseudos.is_empty()
+        && animated.len() == dom.animating.len()
+        && animated.iter().all(|(id, style, layout)| {
+            let Some(old) = dom.animating.get(id) else {
+                return false;
+            };
+            if Rc::ptr_eq(old, style) {
+                return true;
+            }
+            let turns = TURNS.iter().any(|&prop| old.get(prop) != style.get(prop));
+            let matrix = match spun.get_mut(id).filter(|_| turns) {
+                Some((bounds, perspective, last)) => {
+                    let matrix =
+                        effects::transform(style, &styles.lengths[*id], *bounds, *perspective)
+                            .unwrap_or(effects::IDENTITY);
+                    if !centered(bounds, last, &matrix) {
+                        return false;
+                    }
+                    *last = matrix;
+                    Some(matrix)
+                }
+                None if turns => return false,
+                None => None,
+            };
+            changes.push((*id, effects::opacity(style), matrix));
+            !layout && composites(old, style)
+        });
+    // WARNING: the compositor plays promoted layers until the next drawn frame, so the view only wakes
+    // to give it more of their timeline and for events.
+    let renew = now + std::time::Duration::from_millis(1750);
+    let promoted = eligible
+        && match view.promote.get() {
+            Some((at, _)) if now < at => view.promote.get().is_some_and(|(_, on)| on),
+            Some(_) => {
+                let times: Vec<_> = (0..=240)
+                    .map(|k| now + std::time::Duration::from_secs_f64(f64::from(k) / 120.))
+                    .collect();
+                let on = animated.iter().all(|(id, ..)| {
+                    let timeline = dom.motion.timeline(*id, &styles, &times);
+                    let opacities: Vec<f32> = timeline.iter().map(effects::opacity).collect();
+                    let transforms = match spun.get(id) {
+                        Some((bounds, perspective, last)) => {
+                            let transforms: Vec<_> = timeline
+                                .iter()
+                                .map(|style| {
+                                    effects::transform(
+                                        style,
+                                        &styles.lengths[*id],
+                                        *bounds,
+                                        *perspective,
+                                    )
+                                    .unwrap_or(effects::IDENTITY)
+                                })
+                                .collect();
+                            if !transforms
+                                .iter()
+                                .all(|matrix| centered(bounds, last, matrix))
+                            {
+                                return false;
+                            }
+                            Some(transforms)
+                        }
+                        None => None,
+                    };
+                    !shown(*id)
+                        || window.promote(*id as u64, 1. / 120., &opacities, transforms.as_deref())
+                });
+                // WARNING: layers promoted before one that could not be would stop with their timeline.
+                if !on {
+                    window.demote();
+                }
+                view.promote.set(on.then_some((renew, true)));
+                on
+            }
+            None => false,
+        };
+    let mut flat = view.flat.borrow_mut();
+    let patched = eligible
+        && (promoted
+            || changes.into_iter().all(|(id, opacity, matrix)| {
+                window.patch_effect(id as u64, opacity, matrix) || !shown(id) || {
+                    flat.insert(id);
+                    false
+                }
+            }));
+    if patched && spun.keys().any(|id| dom.animating.contains_key(id)) {
+        dom.bounds.set_moved();
+    }
+    drop((flat, spun));
+    if patched {
+        dom.animating
+            .extend(animated.into_iter().map(|(id, style, _)| (id, style)));
+    }
+    let next = match view.promote.get() {
+        Some((renew, true)) if promoted => {
+            let event = dom
+                .animating
+                .keys()
+                .filter_map(|&id| dom.motion.next_event(id, &styles, now))
+                .min();
+            Some(event.map_or(renew, |event| event.min(renew)))
+        }
+        _ => next.filter(|_| patched),
+    };
+    animate(&view, dom, next, now, true, events, window, cx);
+    drop(host);
+    // WARNING: like a drawn frame, the time ends before the frame goes to the GPU.
+    if patched && !promoted && crate::desktop::mcp::profiling() {
+        crate::desktop::mcp::frame(view.id, started);
+    }
+    // WARNING: new promoted layers show with one frame that leaves them out, see `Window::promote`.
+    let promoting = promoted && view.promote.get().is_some_and(|(at, _)| at == renew);
+    if !patched || (!promoted || promoting) && !window.present() {
+        window.refresh();
     }
 }
 
@@ -1250,6 +1733,7 @@ fn retire(
             visible.get(id) == Some(&true)
                 && match layer / 64 {
                     0 => styles.values.get(id).map(|style| &**style),
+                    3 => styles.backdrops.get(&id).map(|style| &**style),
                     slot => styles
                         .pseudos
                         .get(&id)

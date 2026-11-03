@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
+    cell::Cell,
     mem,
     ops::Range,
     rc::Rc,
@@ -183,6 +184,26 @@ pub enum WindowChange {
     Movable(bool),
     /// The color shown behind the content.
     Background(Rgba),
+    /// The alpha of the whole window, from 0 to 1.
+    Opacity(f32),
+    Shadow(bool),
+    /// Lets mouse events pass through to the windows below. With the second flag, mouse moves
+    /// still reach the window while it is the key window.
+    IgnoreMouse(bool, bool),
+    /// Shows the window on every workspace, and over fullscreen windows with the second flag.
+    AllWorkspaces(bool, bool),
+    /// Keeps the content out of screenshots and screen sharing.
+    ContentProtection(bool),
+    /// Whether the window can become the key window. It keeps its focus when turned off.
+    Focusable(bool),
+    /// Keeps the content width / height at a ratio, after taking an extra size away, while the
+    /// user resizes. A ratio of 0 turns it off.
+    AspectRatio(f32, Size<Pixels>),
+    /// Makes the window a child of another window, or its sheet with the second flag. `None`
+    /// detaches it. A child shows above its parent and moves with it.
+    Parent(Option<raw_window_handle::RawWindowHandle>, bool),
+    /// An `NSVisualEffectMaterial` behind the content, or `None`, with an `NSVisualEffectState`.
+    Vibrancy(Option<isize>, isize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -235,15 +256,43 @@ impl Hitbox {
     }
 }
 
-/// A projective map of the plane z = 0 from content coordinates to the window.
+/// A projective map of the plane z = 0 from content coordinates to the window: its own map,
+/// composed with the outer ones. The map of a keyed effect changes between frames, see
+/// [`Window::patch_effect`].
 #[derive(Debug, PartialEq)]
 struct HitTransform {
-    forward: [f32; 9],
-    inverse: [f32; 9],
+    local: Cell<[f32; 9]>,
+    key: Option<u64>,
+    outer: Option<Rc<HitTransform>>,
+    forward: Cell<[f32; 9]>,
+    inverse: Cell<[f32; 9]>,
     window_mask: Bounds<Pixels>,
 }
 
 impl HitTransform {
+    /// Composes the maps again after the local map of `key` became `local`; `done` holds the
+    /// transforms composed already.
+    fn refresh(&self, key: u64, local: [f32; 9], done: &mut Vec<*const Self>) {
+        if done.contains(&(self as *const Self)) {
+            return;
+        }
+        if let Some(outer) = &self.outer {
+            outer.refresh(key, local, done);
+        }
+        if self.key == Some(key) {
+            self.local.set(local);
+        }
+        let forward = match &self.outer {
+            Some(outer) => mul3(&outer.forward.get(), &self.local.get()),
+            None => self.local.get(),
+        };
+        if let Some(inverse) = invert3(&forward) {
+            self.forward.set(forward);
+            self.inverse.set(inverse);
+        }
+        done.push(self);
+    }
+
     fn map(m: &[f32; 9], position: Point<Pixels>) -> Option<Point<Pixels>> {
         let [x, y] = [position.x.0, position.y.0];
         let w = m[2] * x + m[5] * y + m[8];
@@ -254,6 +303,23 @@ impl HitTransform {
             )
         })
     }
+}
+
+/// The 3x3 homography of a 4x4 column-major transform on the plane z = 0: columns 0, 1 and 3 of
+/// rows 0, 1 and 3.
+fn plane(m: &[f32; 16]) -> [f32; 9] {
+    [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
+}
+
+/// Conjugates a 4x4 column-major transform in logical pixels with the scale factor: device = S * M * S^-1.
+fn device_matrix(mut matrix: [f32; 16], scale: f32) -> [f32; 16] {
+    for row in [3, 7, 11] {
+        matrix[row] /= scale;
+    }
+    for column in [12, 13, 14] {
+        matrix[column] *= scale;
+    }
+    matrix
 }
 
 fn mul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
@@ -290,9 +356,19 @@ pub struct PaintQuad {
     pub border_widths: Edges<Pixels>,
     pub border_color: Rgba,
     pub border_style: BorderStyle,
+    /// The sides of the border it paints (top 1, right 2, bottom 4, left 8), or 0 for all. A side ends where
+    /// the line from the outer corner to the inner one meets it, so sides of other colors join like in CSS.
+    pub border_sides: u8,
 }
 
 impl PaintQuad {
+    pub fn sides(self, border_sides: u8) -> Self {
+        Self {
+            border_sides,
+            ..self
+        }
+    }
+
     pub fn corner_radii(self, radii: impl Into<Radii<Pixels>>) -> Self {
         Self {
             corner_radii: radii.into(),
@@ -316,6 +392,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color,
         border_style,
+        border_sides: 0,
     }
 }
 
@@ -362,6 +439,20 @@ impl Frame {
         self.controls.clear();
     }
 
+    /// Maps hitboxes under the transform keyed `key` with the new transform `matrix`.
+    fn turn(&self, key: u64, matrix: &[f32; 16]) {
+        let local = plane(matrix);
+        let mut done = Vec::new();
+        for hitbox in &self.hitboxes {
+            if let Some(transform) = &hitbox.transform
+                && std::iter::successors(Some(transform), |inner| inner.outer.as_ref())
+                    .any(|inner| inner.key == Some(key))
+            {
+                transform.refresh(key, local, &mut done);
+            }
+        }
+    }
+
     /// Fills `ids` with the hit hitboxes, front first, and returns how many of them are hovered.
     fn hit_test(&self, position: Point<Pixels>, ids: &mut Vec<HitboxId>) -> usize {
         ids.clear();
@@ -370,7 +461,7 @@ impl Frame {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             let local = match &hitbox.transform {
                 Some(transform) if transform.window_mask.contains(&position) => {
-                    HitTransform::map(&transform.inverse, position)
+                    HitTransform::map(&transform.inverse.get(), position)
                 }
                 Some(_) => None,
                 None => Some(position),
@@ -396,8 +487,13 @@ pub struct Window {
     pub(crate) platform: platform::Window,
     pub(crate) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
+    /// Device pixels per pixel, with the page zoom.
     pub(crate) scale_factor: f32,
+    /// The content size in pixels, with the page zoom.
     pub(crate) viewport_size: Size<Pixels>,
+    /// The page zoom, and the content size and scale factor the platform reported.
+    pub(crate) zoom: f32,
+    native: (Size<Pixels>, f32),
     layout: Option<LayoutEngine>,
     scene: Scene,
     next: Frame,
@@ -422,6 +518,11 @@ pub struct Window {
     pub(crate) pending_clicks: Vec<(ElementId, crate::MouseDownEvent)>,
     pub(crate) removed: bool,
     cursor: Option<CursorStyle>,
+    /// When the view last drew.
+    drawn_at: std::time::Instant,
+    /// The transforms the compositor plays for promoted layers: key, start, step and transforms,
+    /// so hit testing follows them.
+    tracks: Vec<(u64, std::time::Instant, f32, Vec<[f32; 16]>)>,
 }
 
 impl Window {
@@ -439,6 +540,8 @@ impl Window {
             text_system,
             scale_factor,
             viewport_size,
+            zoom: 1.,
+            native: (viewport_size, scale_factor),
             layout: Some(LayoutEngine::default()),
             scene: Scene::default(),
             next: Frame::default(),
@@ -454,6 +557,8 @@ impl Window {
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
             next_frame_callbacks: Vec::new(),
+            drawn_at: std::time::Instant::now(),
+            tracks: Vec::new(),
             captures: Vec::new(),
             dirty: false,
             redraw: [false; 2],
@@ -486,6 +591,20 @@ impl Window {
         self.mouse_position
     }
 
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Zooms the page like a browser: pixels grow by `zoom`, so the viewport shrinks by it and
+    /// everything draws again at the new scale. Input from the platform is mapped back.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        if self.zoom != zoom {
+            self.mouse_position = self.mouse_position * (self.zoom / zoom);
+            self.zoom = zoom;
+            self.mark_resized(self.native.0, self.native.1);
+        }
+    }
+
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
     }
@@ -511,6 +630,153 @@ impl Window {
     /// Whether this draw replaces one that called [`Self::redraw`].
     pub fn redrawing(&self) -> bool {
         self.redraw[1]
+    }
+
+    /// Whether the window draws in this frame.
+    pub fn will_draw(&self) -> bool {
+        self.drawing || self.dirty || !self.captures.is_empty()
+    }
+
+    /// Sets the opacity of the effect layer that the last frame painted with `key`, and its transform
+    /// unless `None`, for [`Self::present`]. Hit testing follows the transform. Returns `false` when
+    /// the last frame has no such layer or the transform needs a new frame.
+    pub fn patch_effect(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
+        let device = transform.map(|matrix| device_matrix(matrix, self.scale_factor));
+        if !self.scene.patch(key, opacity.clamp(0., 1.), device) {
+            return false;
+        }
+        if let Some(matrix) = transform {
+            self.rendered.turn(key, &matrix);
+        }
+        true
+    }
+
+    /// Takes the promoted layers back into the frames that [`Self::present`] shows.
+    pub fn demote(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.platform.demote();
+        self.tracks.clear();
+    }
+
+    /// Hands the effect layer that the last frame painted with `key` to the compositor, which plays
+    /// `opacities` and, unless `None`, `transforms` (in logical pixels, like [`PaintEffect`]) every
+    /// `step` seconds from now and holds the last ones, so the view draws no frames for it. Returns
+    /// `false` where the platform can't, or right after a drawn frame, or when the layer has other
+    /// effects, is clipped or painted over in its reach; [`Self::patch_effect`] animates it then. A
+    /// new promoted layer shows with the next [`Self::present`], and the next drawn frame takes it back.
+    pub fn promote(
+        &mut self,
+        key: u64,
+        step: f32,
+        opacities: &[f32],
+        transforms: Option<&[[f32; 16]]>,
+    ) -> bool {
+        // WARNING: a promoted layer costs a frame to set up, so frames that keep drawing don't promote.
+        if self.will_draw() || self.drawn_at.elapsed() < std::time::Duration::from_millis(250) {
+            return false;
+        }
+        let Some(&(_, index)) = self.scene.keyed.iter().find(|(keyed, _)| *keyed == key) else {
+            return false;
+        };
+        let layer = &self.scene.layers[index];
+        let (Some(effect), Some(content)) = (layer.effect.as_ref(), layer.bounds) else {
+            return false;
+        };
+        if effect.color_matrix.is_some()
+            || effect.blur > 0.
+            || effect.shadow.is_some()
+            || effect.blend_mode != crate::BlendMode::Normal
+            || effect.clip.is_some()
+            || effect.mask.is_some()
+            || effect.backdrop.is_some()
+            || transforms.is_some() != effect.transform.is_some()
+        {
+            return false;
+        }
+        let scale = self.scale_factor;
+        let reach = match transforms {
+            Some(transforms) => transforms
+                .iter()
+                .map(|matrix| {
+                    crate::scene::transform_bounds(&device_matrix(*matrix, scale), content)
+                })
+                .reduce(|all, bounds| all.union(&bounds)),
+            None => Some(content),
+        };
+        let region = crate::frame::region(content);
+        // WARNING: the compositor draws the layer over the window without its clip, so it must stay
+        // inside the clip and nothing may paint over it there.
+        let mask = &effect.content_mask;
+        let [x, y, right, bottom] = [
+            mask.rounded.origin.x,
+            mask.rounded.origin.y,
+            mask.rounded.origin.x + mask.rounded.size.width,
+            mask.rounded.origin.y + mask.rounded.size.height,
+        ];
+        let (rx, ry) = (&mask.corner_radii.x, &mask.corner_radii.y);
+        let corners = [
+            (x, y, rx.top_left, ry.top_left),
+            (right - rx.top_right, y, rx.top_right, ry.top_right),
+            (
+                right - rx.bottom_right,
+                bottom - ry.bottom_right,
+                rx.bottom_right,
+                ry.bottom_right,
+            ),
+            (x, bottom - ry.bottom_left, rx.bottom_left, ry.bottom_left),
+        ]
+        .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)));
+        if reach.is_none_or(|reach| {
+            mask.bounds.intersect(&reach) != reach
+                || corners.iter().any(|corner| corner.intersects(&reach))
+                || self.scene.paints_over(index, reach)
+        }) || region[2] > 2048
+            || region[3] > 2048
+        {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let zoom = f64::from(self.zoom);
+            let points: Vec<[f64; 16]> = transforms
+                .unwrap_or_default()
+                .iter()
+                .map(|matrix| {
+                    let mut matrix = matrix.map(f64::from);
+                    for row in [3, 7, 11] {
+                        matrix[row] /= zoom;
+                    }
+                    for column in [12, 13, 14] {
+                        matrix[column] *= zoom;
+                    }
+                    matrix
+                })
+                .collect();
+            self.platform
+                .promote(key, index, region, f64::from(step), opacities, &points);
+            self.tracks.retain(|track| track.0 != key);
+            if let Some(transforms) = transforms {
+                self.tracks
+                    .push((key, std::time::Instant::now(), step, transforms.to_vec()));
+            }
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (step, opacities);
+            false
+        }
+    }
+
+    /// Shows the last frame again with its patched layers, without laying out or painting the
+    /// view. Returns `false` when the window draws anyway.
+    pub fn present(&mut self) -> bool {
+        if self.will_draw() {
+            return false;
+        }
+        // WARNING: the atlas and text caches keep their frame, so the tiles this scene reads stay.
+        let _ = self.platform.draw(&self.scene, false);
+        true
     }
 
     /// Runs `callback` at the start of the next frame, whether or not the window draws.
@@ -606,8 +872,9 @@ impl Window {
     }
 
     pub(crate) fn mark_resized(&mut self, size: Size<Pixels>, scale_factor: f32) {
-        self.viewport_size = size;
-        self.scale_factor = scale_factor;
+        self.native = (size, scale_factor);
+        self.viewport_size = size / self.zoom;
+        self.scale_factor = scale_factor * self.zoom;
         self.dirty = false;
         self.refresh();
     }
@@ -622,6 +889,10 @@ impl Window {
 
     /// Lays out and paints the view, then shows the frame.
     pub(crate) fn draw(&mut self, cx: &mut App) {
+        #[cfg(target_os = "macos")]
+        self.platform.demote();
+        self.tracks.clear();
+        self.drawn_at = std::time::Instant::now();
         loop {
             self.dirty = false;
             self.drawing = true;
@@ -789,6 +1060,14 @@ impl Window {
                 | PlatformInput::ScrollWheel(_)
         );
         if mouse {
+            // WARNING: the compositor turns promoted layers without frames, so hit testing takes their
+            // transform of now.
+            for (key, start, step, transforms) in &self.tracks {
+                let at = (start.elapsed().as_secs_f32() / step).round() as usize;
+                if let Some(matrix) = transforms.get(at).or(transforms.last()) {
+                    self.rendered.turn(*key, matrix);
+                }
+            }
             self.hover_count = self
                 .rendered
                 .hit_test(self.mouse_position, &mut self.hit_test);
@@ -1128,7 +1407,7 @@ impl Window {
             bounds.bottom_left(),
             bounds.bottom_right(),
         ]
-        .map(|corner| HitTransform::map(&transform.forward, corner));
+        .map(|corner| HitTransform::map(&transform.forward.get(), corner));
         if corners.iter().any(Option::is_none) {
             return bounds;
         }
@@ -1142,11 +1421,21 @@ impl Window {
     /// coordinates to the window, in logical pixels. Use it in prepaint around content painted
     /// with a transformed [`PaintEffect`].
     pub fn with_hit_transform<R>(&mut self, m: [f32; 16], f: impl FnOnce(&mut Self) -> R) -> R {
-        // The plane z = 0 maps through a 3x3 homography: columns 0, 1 and 3 of rows 0, 1 and 3.
-        let local = [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]];
+        self.with_keyed_hit_transform(m, None, f)
+    }
+
+    /// Like [`Self::with_hit_transform`], for content painted with an effect keyed by `key`, whose
+    /// transform [`Self::patch_effect`] can change.
+    pub fn with_keyed_hit_transform<R>(
+        &mut self,
+        m: [f32; 16],
+        key: Option<u64>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let local = plane(&m);
         let outer = self.hit_transform.clone();
         let forward = match &outer {
-            Some(outer) => mul3(&outer.forward, &local),
+            Some(outer) => mul3(&outer.forward.get(), &local),
             None => local,
         };
         let Some(inverse) = invert3(&forward) else {
@@ -1156,14 +1445,17 @@ impl Window {
             .as_ref()
             .map_or_else(|| self.content_mask().bounds, |outer| outer.window_mask);
         self.hit_transform = Some(Rc::new(HitTransform {
-            forward,
-            inverse,
+            local: local.into(),
+            key,
+            outer,
+            forward: forward.into(),
+            inverse: inverse.into(),
             window_mask,
         }));
         self.push_content_mask(unbounded_mask());
         let result = f(self);
         self.content_masks.pop();
-        self.hit_transform = outer;
+        self.hit_transform = self.hit_transform.take().and_then(|own| own.outer.clone());
         result
     }
 
@@ -1232,7 +1524,7 @@ impl Window {
         let opacity = self.opacity;
         let quad = Quad {
             order: 0,
-            border_style: quad.border_style,
+            border_style: quad.border_style as u32 | u32::from(quad.border_sides) << 8,
             bounds: self.snap_bounds(quad.bounds),
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
@@ -1351,18 +1643,8 @@ impl Window {
             let tile = self.image_tile(&image)?;
             Some((tile, bounds.scale(scale)))
         });
-        // Conjugates the matrix with the scale factor: device = S * M * S^-1.
-        let scaled = |mut matrix: [f32; 16]| {
-            for row in [3, 7, 11] {
-                matrix[row] /= scale;
-            }
-            for column in [12, 13, 14] {
-                matrix[column] *= scale;
-            }
-            matrix
-        };
-        self.scene.push_effect(EffectState {
-            transform: effect.transform.map(scaled),
+        let state = EffectState {
+            transform: effect.transform.map(|matrix| device_matrix(matrix, scale)),
             opacity: effect.opacity.clamp(0., 1.),
             color_matrix: effect.color_matrix,
             blur: effect.blur.0 * scale,
@@ -1397,7 +1679,8 @@ impl Window {
                 },
             ),
             content_mask,
-        });
+        };
+        self.scene.push_effect(state, effect.key);
         // WARNING: ancestor clips apply after the effect, in window space, so the layer starts unclipped.
         self.push_content_mask(unbounded_mask());
         let result = f(self);

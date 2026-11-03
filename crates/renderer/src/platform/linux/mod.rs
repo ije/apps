@@ -260,8 +260,14 @@ impl Window {
 
     pub fn change(&self, change: WindowChange) {
         // Window managers own placement, levels and the window buttons, so the other changes are ignored.
-        if let WindowChange::Show(_) | WindowChange::Restore = change {
-            self.activate();
+        match change {
+            WindowChange::Show(_) | WindowChange::Restore => self.activate(),
+            WindowChange::Parent(parent, _) => {
+                if let Window::X11(window) = self {
+                    window.set_parent(parent);
+                }
+            }
+            _ => {}
         }
     }
 

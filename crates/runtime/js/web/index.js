@@ -82,7 +82,8 @@ globalThis.__appsWeb = call => {
           catch (error) { console.error(error); }
           s.passive = false;
         }
-        try { if (!s.immediate && typeof this['on' + event.type] === 'function') this['on' + event.type](event); }
+        // WARNING: only own `on*` properties run here. Accessor handlers, like DOM ones, are listeners in their place.
+        try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!s.immediate && typeof handler === 'function') handler.call(this, event); }
         catch (error) { console.error(error); }
       } finally { Object.assign(s, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
       return !event.defaultPrevented;
@@ -652,6 +653,8 @@ globalThis.__appsWeb = call => {
   };
   poll.pending = () => sockets.size > 0 || retries.size > 0 || waiting();
   poll.eventState = event => eventStates.get(event);
+  poll.blob = blob => blobs.get(blob);
+  poll.listeners = (target, type) => (eventTargets.get(target)?.get(String(type)) ?? []).map(item => item.callback);
   Object.assign(globalThis, { DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
     TextDecoderStream, URL, URLSearchParams, crypto, Headers, Request, Response, Blob, File, FormData, fetch, WebSocket, MessageEvent, CloseEvent });
   return poll;

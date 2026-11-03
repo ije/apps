@@ -184,6 +184,24 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
 }
 
 #[test]
+fn inline_boxes_ignore_properties_that_do_not_apply_to_them() {
+    let doc = Document::parse(
+        "<style>a{justify-self:start;width:10px;margin-top:-10px;-webkit-text-decoration-color:red;text-underline-offset:4px}</style><p>the <a href=x>/hairline-create</a> skill</p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let inline = inline_text(&doc, &computed, element(&doc, "p")).unwrap();
+    assert_eq!(&*inline.text, "the /hairline-create skill");
+}
+
+#[test]
 fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
     let mut expected = None;
     for content in [
@@ -1616,15 +1634,15 @@ fn passes_drop_unused_scopes_and_report_interaction_states() {
 }
 
 #[test]
-fn resizes_keep_scopes_until_a_media_query_changes() {
+fn media_results_restyle_their_nodes_and_rebuild_scopes_only_for_other_rules() {
     let doc = Document::parse(
-        "<style>.a{font-size:2vw} @media (max-width: 500px){.a{color:red}}</style><div class=a></div><p></p>",
+        "<style>.a{font-size:2vw} @media (max-width: 500px){.a{color:red} .a::before{content:'x'}} @media (max-width: 350px){@keyframes k{to{color:blue}}}</style><div class=a></div><p></p>",
     );
     let (div, p) = (element(&doc, "div"), element(&doc, "p"));
     let mut cache = StyleCache::default();
     let mut scopes = Vec::new();
     let mut last: Option<ComputedStyles> = None;
-    for width in [800., 700., 400., 300.] {
+    for width in [800., 700., 400., 600., 300.] {
         let computed = compute_styles(
             &doc,
             width,
@@ -1641,20 +1659,21 @@ fn resizes_keep_scopes_until_a_media_query_changes() {
             computed.values[div].get(Prop::COLOR),
             fresh[div].get("color").map(String::as_str)
         );
+        assert_eq!(computed.pseudos.contains_key(&div), width <= 500.);
         assert_eq!(
             &computed.values[div]["font-size"],
             format!("{}px", width / 50.)
         );
-        // Values without viewport units are kept and get the new viewport.
-        if let Some(last) = last.filter(|_| width == 700.) {
+        // Values without viewport units or rules under a new media result are kept and get the new viewport.
+        if let Some(last) = last.filter(|_| width != 300.) {
             assert!(Rc::ptr_eq(&last.values[p], &computed.values[p]));
             assert!(!Rc::ptr_eq(&last.values[div], &computed.values[div]));
-            assert_eq!(computed.lengths[p].viewport, [700., 600.]);
+            assert_eq!(computed.lengths[p].viewport, [width, 600.]);
         }
         last = Some(computed);
     }
-    assert_eq!(scopes, [scopes[0], scopes[0], scopes[2], scopes[2]]);
-    assert_ne!(scopes[0], scopes[2]);
+    assert_eq!(scopes[..4], [scopes[0]; 4]);
+    assert_ne!(scopes[0], scopes[4]);
 }
 
 #[test]
@@ -2542,4 +2561,52 @@ fn block_in_inline_splits_and_empty_inlines_make_no_line() {
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
     );
+}
+
+#[test]
+fn top_layer_boxes_get_ua_rules_and_backdrops() {
+    let mut doc = Document::parse(
+        "<style>::backdrop{color:red}#p::backdrop{background:blue}</style><dialog id=d open>d</dialog><div id=p popover>p</div><div id=f>f</div><dialog id=n open>n</dialog>",
+    );
+    let [d, p, f, n] = ["#d", "#p", "#f", "#n"].map(|selector| element(&doc, selector));
+    let (mut sheets, mut cache) = (HashMap::new(), StyleCache::default());
+    let closed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(&closed.values[p]["display"], "none");
+    assert!(!closed.values[f].contains(Prop::WIDTH));
+    assert!(closed.backdrops.is_empty());
+    doc.nodes[d].state = crate::dom::MODAL;
+    doc.nodes[p].state = crate::dom::POPOVER;
+    doc.nodes[f].state = crate::dom::FULLSCREEN;
+    let open = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        [
+            &open.values[d]["position"],
+            &open.values[p]["position"],
+            &open.values[f]["position"]
+        ],
+        ["fixed"; 3]
+    );
+    assert_eq!(
+        (
+            &open.values[p]["display"],
+            &open.values[f]["width"],
+            &open.values[f]["margin-top"]
+        ),
+        ("block", "100%", "0")
+    );
+    let backdrop = |id: usize, prop: &str| open.backdrops[&id][prop].to_string();
+    assert_eq!(color(&backdrop(d, "background-color")), Some((0, 26)));
+    assert_eq!(
+        (
+            backdrop(p, "background-color"),
+            backdrop(p, "pointer-events")
+        ),
+        ("blue".into(), "none".into())
+    );
+    assert_eq!(color(&backdrop(f, "background-color")), Some((0, 255)));
+    assert_eq!(color(&backdrop(d, "color")), Some((0xff0000, 255)));
+    assert!(!open.backdrops.contains_key(&n));
+    doc.nodes[f].state = 0;
+    let exited = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert!(!exited.values[f].contains(Prop::WIDTH) && !exited.backdrops.contains_key(&f));
 }

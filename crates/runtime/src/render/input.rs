@@ -314,8 +314,11 @@ impl PageState {
                     .ok()
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |time| time.as_millis() as u64);
+                let mut host = self.host.borrow_mut();
+                let paths = host.dropped.entry(self.id).or_default();
+                paths.push(path.to_string_lossy().into_owned());
                 Ok(
-                    serde_json::json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"path":path.to_string_lossy(),"bytes":bytes,"lastModified":modified}),
+                    serde_json::json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"file":paths.len() - 1,"bytes":bytes,"lastModified":modified}),
                 )
             })();
             match result {
@@ -364,6 +367,7 @@ impl renderer::View for PageView {
     }
 
     fn window_changed(&mut self, _: &mut Window, cx: &mut App) {
+        self.origin.set(None);
         if let Ok(mut host) = self.host.try_borrow_mut()
             && !host.window_changes.contains(&self.id)
         {
@@ -444,30 +448,19 @@ impl renderer::View for PageView {
                     modifiers.control && !modifiers.platform
                 };
                 if primary && !modifiers.alt && matches!(key, "c" | "x" | "v") {
-                    let text = if key == "v" {
-                        cx.read_from_clipboard().unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let action = match key {
-                        "c" => "copy",
-                        "x" => "cut",
-                        _ => "paste",
-                    };
-                    let script = format!(
-                        "JSON.stringify(__appsClipboard({},{}))",
-                        serde_json::json!(action),
-                        serde_json::json!(text)
-                    );
-                    match super::scripted(cx, Some(window), || self.evaluate(&script)) {
-                        Ok(value) => {
-                            if key != "v"
-                                && let Ok(text) = serde_json::from_str::<String>(&value)
-                            {
-                                cx.write_to_clipboard(text);
-                            }
-                        }
-                        Err(error) => eprintln!("apps: {error}"),
+                    let renderer = self
+                        .runtime
+                        .borrow()
+                        .views
+                        .get(&id)
+                        .and_then(|view| view.renderer.clone());
+                    if let Some(renderer) = renderer {
+                        let command = match key {
+                            "c" => "copy",
+                            "x" => "cut",
+                            _ => "paste",
+                        };
+                        super::edit(&renderer, Some((cx, Some(&mut *window))), command, "");
                     }
                     cx.stop_propagation();
                     window.refresh();

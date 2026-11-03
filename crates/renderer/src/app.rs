@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, CursorStyle, Pixels, PlatformInput, Point, Size, TextSystem, Utf16Selection, View,
-    Window, WindowControlArea, WindowId, WindowOptions, platform,
+    Bounds, CursorStyle, FileDropEvent, Pixels, PlatformInput, Point, ScrollDelta, Size,
+    TextSystem, Utf16Selection, View, Window, WindowControlArea, WindowId, WindowOptions, platform,
 };
 use anyhow::Result;
 use std::{
@@ -358,9 +358,33 @@ impl Callbacks {
         });
     }
 
-    pub fn input(&self, input: PlatformInput) -> bool {
-        self.with(|window, app| window.dispatch_event(input, app))
-            .unwrap_or(false)
+    /// Sends platform input, whose positions are in window points, so the page zoom maps them.
+    pub fn input(&self, mut input: PlatformInput) -> bool {
+        self.with(|window, app| {
+            let zoom = window.zoom;
+            if zoom != 1. {
+                match &mut input {
+                    PlatformInput::MouseDown(event) => event.position = event.position / zoom,
+                    PlatformInput::MouseUp(event) => event.position = event.position / zoom,
+                    PlatformInput::MouseMove(event) => event.position = event.position / zoom,
+                    PlatformInput::MouseExited(event) => event.position = event.position / zoom,
+                    PlatformInput::ScrollWheel(event) => {
+                        event.position = event.position / zoom;
+                        if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                            *delta = *delta / zoom;
+                        }
+                    }
+                    PlatformInput::FileDrop(
+                        FileDropEvent::Entered { position, .. }
+                        | FileDropEvent::Pending { position }
+                        | FileDropEvent::Submit { position },
+                    ) => *position = *position / zoom,
+                    _ => {}
+                }
+            }
+            window.dispatch_event(input, app)
+        })
+        .unwrap_or(false)
     }
 
     /// The display is ready for a frame. Returns whether more frames are wanted, or `None` while
@@ -486,11 +510,14 @@ impl Callbacks {
 
     pub fn bounds_for_range(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
         self.with(|window, app| {
-            window.with_view(app, |view, window, app| {
-                view.bounds_for_range(range, window, app)
-            })
+            let zoom = window.zoom;
+            window
+                .with_view(app, |view, window, app| {
+                    view.bounds_for_range(range, window, app)
+                })
+                .flatten()
+                .map(|bounds| bounds * zoom)
         })
-        .flatten()
         .flatten()
     }
 
@@ -498,6 +525,7 @@ impl Callbacks {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub fn character_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
         self.with(|window, app| {
+            let point = point / window.zoom;
             window.with_view(app, |view, window, app| {
                 view.character_index_for_point(point, window, app)
             })

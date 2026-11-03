@@ -3,7 +3,7 @@
 - Electron compatible API
 - Stanard Web API
 - DOM and CSS renderer on GPU renderer with builtin tailwindCSS support
-- JSC as runtime
+- JavaScriptCore runs page scripts and preloads. A Rust app uses its Cargo binary as the main entry and registers native handlers on the main thread. JavaScript apps also use JavaScriptCore for the main entry.
 
 ## Security
 

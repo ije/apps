@@ -110,6 +110,8 @@ globalThis.editorResult = 'pending';
   assert(editor.textContent === 'A文B' && __appsEditing().marked === null, 'Composition commit');
   assert(composition.map(event => event[0]).join() === 'compositionstart,compositionupdate,beforeinput,input,compositionupdate,beforeinput,input,compositionend', 'Composition event order');
   compositionController.abort();
+  assert(__appsDispatch('keydown', [], { nativeKey: 'z', ...primary }) === false && editor.textContent === 'AB', 'Undo removes the committed composition');
+  assert(__appsDispatch('keydown', [], { nativeKey: 'z', shiftKey: true, ...primary }) === false && editor.textContent === 'A文B', 'Redo commits it again');
 
   const input = document.querySelector('textarea'); input.focus();
   input.value = 'A😀e\u0301B'; input.setSelectionRange(5,5);

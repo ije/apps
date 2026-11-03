@@ -63,7 +63,7 @@ pub(crate) struct LayoutNode {
 }
 
 /// Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
-/// floats (stale, capacity, layout count), 8 floats per node (x, y, width, height, scroll left, scroll top,
+/// floats (stale, capacity, layout count, moved), 8 floats per node (x, y, width, height, scroll left, scroll top,
 /// scroll range x, scroll range y), then one byte of `MIRROR_*` flags per node.
 #[derive(Default)]
 pub struct LayoutMirror {
@@ -84,10 +84,14 @@ impl Drop for MirrorMemory {
 }
 
 /// Node states that scripts set: a checked checkbox, radio or option, whether that replaces the
-/// attribute, and an open modal dialog.
-pub(crate) const CHECKED: u8 = 16;
-pub(crate) const DIRTY: u8 = 32;
-pub(crate) const MODAL: u8 = 64;
+/// attribute, an open modal dialog, a shown popover and the fullscreen element. The last three are
+/// in the top layer.
+pub(crate) const CHECKED: u16 = 16;
+pub(crate) const DIRTY: u16 = 32;
+pub(crate) const MODAL: u16 = 64;
+pub(crate) const POPOVER: u16 = 256;
+pub(crate) const FULLSCREEN: u16 = 512;
+pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
 
 impl Node {
     /// Whether a checkbox, radio or option is checked, by script state or else by its attribute.
@@ -209,6 +213,20 @@ impl LayoutMirror {
     }
 
     /// Counts a layout in the third header float, so pages know when cached box sizes are old.
+    /// Whether frames turned boxes since the last layout, so their bounds are stale.
+    pub(crate) fn moved(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| unsafe { *memory.0.as_ptr().add(3) } != 0.)
+    }
+
+    /// Marks the bounds stale until the next layout, so the page lays out before it reads them.
+    pub(crate) fn set_moved(&mut self) {
+        if let Some(memory) = &self.memory {
+            unsafe { *memory.0.as_ptr().add(3) = 1. };
+        }
+    }
+
     pub(crate) fn touch(&mut self) {
         self.reserve(0);
         if let Some(memory) = &self.memory {
@@ -216,6 +234,7 @@ impl LayoutMirror {
             unsafe {
                 let count = memory.0.as_ptr().add(2);
                 *count = (*count + 1.) % 16_777_216.;
+                *memory.0.as_ptr().add(3) = 0.;
             }
         }
     }
@@ -316,7 +335,9 @@ pub struct State {
     layout_epoch: u64,
     /// Parsed `<style>` and media query text.
     pub(crate) sheets: HashMap<Rc<str>, Rc<style::Stylesheet>>,
-    style_cache: style::StyleCache,
+    /// `insertCSS()` sheets by key, with whether each has the user origin.
+    pub(crate) inserted: Vec<(String, Rc<style::Stylesheet>, bool)>,
+    pub(crate) style_cache: style::StyleCache,
     style_viewport: [f32; 2],
     style_metrics: Option<f32>,
     style_reduced_motion: bool,
@@ -346,28 +367,36 @@ pub struct State {
     decoding: HashMap<usize, u64>,
     /// Empty nodes that the page reserved for `dom.batch` creates.
     pub(crate) reserved: HashSet<usize>,
-    /// Inline SVG sources by `<svg>` node, with the size, the newest node revision and the style they were built at.
-    pub(crate) svg_sources: HashMap<usize, ([f32; 2], u64, Rc<style::Style>, String)>,
+    /// Inline SVG sources by `<svg>` node.
+    pub(crate) svg_sources: HashMap<usize, String>,
     /// Inline SVG geometry by `<svg>` node: the source it came from, the nodes of elements with their own
     /// ids, the SVG's size, and each element's node with its canvas box and object box.
     pub(crate) svg_boxes: HashMap<usize, SvgBoxes>,
+    /// Inline SVG trees that prepaint parsed for their boxes and paint draws next.
+    pub(crate) svg_trees: HashMap<usize, resvg::usvg::Tree>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
     pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
-    /// The `@font-face` sources already loaded.
-    pub(crate) fonts: std::collections::HashSet<String>,
+    /// The `@font-face` URLs tried, with the font family of the ones that loaded.
+    pub(crate) fonts: HashMap<String, Option<String>>,
     /// How many fonts were added, from `@font-face` or `FontFace`.
     pub(crate) font_loads: u32,
+    /// The node revision whose text no waiting `unicode-range` face uses.
+    pub(crate) font_text: Option<u64>,
     pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
+    /// The declarations the lint checked, by pseudo-element index.
+    pub(crate) checked: rustc_hash::FxHashSet<(u8, style::Prop, Rc<str>)>,
     pub(crate) motion: style::Motion,
     pub(crate) animated: HashMap<usize, style::Style>,
     pub(crate) animating: HashMap<usize, Rc<style::Style>>,
+    /// The animated `::before` and `::after` styles of the last frame.
+    pub(crate) animating_pseudos: HashMap<usize, Rc<[style::Style; 2]>>,
     /// Nodes with an animated color in the last frame, whose paragraphs draw it from their inline text.
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
@@ -376,6 +405,8 @@ pub struct State {
     /// The padding boxes of containing blocks. They stay between frames, so absolute boxes size in last frame's.
     pub(crate) blocks: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
+    /// The top layer: modal dialogs, shown popovers and fullscreen elements, in the order they went in.
+    pub top_layer: Vec<usize>,
 }
 
 impl State {
@@ -618,6 +649,7 @@ pub fn call(
             | "dom.textPoint"
             | "dom.font"
             | "dom.fontCheck"
+            | "dom.fontSources"
             | "dom.hitTest"
             | "dom.css"
             | "dom.sheet"
@@ -626,6 +658,11 @@ pub fn call(
             | "dom.supports"
             | "dom.registerProperty"
             | "dom.computed"
+            | "dom.animation"
+            | "dom.animated"
+            | "dom.easing"
+            | "dom.cssAnimations"
+            | "dom.cssControl"
             | "dom.declare"
             | "dom.properties"
             | "dom.client"
@@ -695,6 +732,93 @@ pub fn call(
         }
         if op == "dom.wheel" {
             state.wheel = true;
+            return Ok(Value::Null);
+        }
+        if op == "dom.cssControl" {
+            let system = state.text_system.clone();
+            let styles = styles(
+                doc,
+                state,
+                viewport,
+                system.as_deref().map(|system| (system, state.pixel_ratio)),
+            );
+            state.dirty = true;
+            return Ok(json!(state.motion.css_control(
+                args[0].as_u64().unwrap_or(0) as u32,
+                args[1].as_str().unwrap_or_default(),
+                args[2].as_f64().unwrap_or(0.),
+                &styles,
+            )));
+        }
+        if op == "dom.easing" {
+            let easing = args[0].as_str().unwrap_or("linear");
+            return Ok(json!(style::easing(easing, args[1].as_f64().unwrap_or(0.))));
+        }
+        if op == "dom.animation" {
+            // Arguments: the animation id, its target node, and its state, or none to remove it. Times are in ms.
+            let id = args[0].as_u64().context("Expected an animation")? as u32;
+            state.dirty = true;
+            // WARNING: the last frame's animated style of the node is stale now, so getComputedStyle samples again.
+            if let Some(node) = state.motion.unscript(id) {
+                state.animating.remove(&node);
+                state.animating_pseudos.remove(&node);
+            }
+            let spec = &args[2];
+            let Some(node) = args[1]
+                .as_u64()
+                .map(|node| node as usize)
+                .filter(|&node| spec.is_object() && node < doc.nodes.len())
+            else {
+                return Ok(Value::Null);
+            };
+            state.animating.remove(&node);
+            state.animating_pseudos.remove(&node);
+            let frames: Vec<(f64, &str, String)> = spec["frames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|frame| {
+                    Some((
+                        frame[0].as_f64()?,
+                        frame[1].as_str()?,
+                        frame[2].as_str().unwrap_or("linear").to_owned(),
+                    ))
+                })
+                .collect();
+            let number = |index: usize| spec["timing"][index].as_f64().unwrap_or(0.);
+            let iterations = number(3);
+            let animation = style::Scripted::new(
+                id,
+                &frames,
+                [
+                    number(0) / 1000.,
+                    number(1) / 1000.,
+                    number(2) / 1000.,
+                    if iterations < 0. {
+                        f64::INFINITY
+                    } else {
+                        iterations
+                    },
+                    number(4),
+                ],
+                [
+                    spec["direction"].as_str().unwrap_or("normal"),
+                    spec["fill"].as_str().unwrap_or("none"),
+                    spec["easing"].as_str().unwrap_or("linear"),
+                    spec["composite"].as_str().unwrap_or("replace"),
+                ],
+                match spec["pseudo"].as_str() {
+                    Some("::before") => 1,
+                    Some("::after") => 2,
+                    _ => 0,
+                },
+            );
+            state.motion.script(
+                node,
+                animation,
+                spec["time"].as_f64().unwrap_or(0.) / 1000.,
+                spec["rate"].as_f64(),
+            );
             return Ok(Value::Null);
         }
         if op == "dom.requestFrame" {
@@ -883,6 +1007,7 @@ pub fn call(
                         .extend(state.masks.remove(&id).map(|(_, image)| image));
                     state.svg_sources.remove(&id);
                     state.svg_boxes.remove(&id);
+                    state.svg_trees.remove(&id);
                     state.svg_images.remove(&id);
                     state.decoding.remove(&id);
                     if let Some(root) = state.shadows.remove(&id) {
@@ -906,6 +1031,7 @@ pub fn call(
                 }
             }
             if !freed.is_empty() {
+                state.top_layer.retain(|node| !freed.contains(node));
                 state
                     .measurements
                     .sizes
@@ -999,7 +1125,27 @@ pub fn call(
             let first = args[2].as_bool().unwrap_or(false);
             let caret = args[3].as_bool().unwrap_or(false);
             let mut nearest = Vec::new();
-            let mut pending = vec![(0, [0., 0., viewport[0], viewport[1]], false)];
+            let screen = [0., 0., viewport[0], viewport[1]];
+            let up = |id: usize| {
+                doc.nodes[id]
+                    .parent
+                    .or_else(|| state.hosts.get(&id).copied())
+            };
+            // Boxes of the top layer escape the clips of their ancestors.
+            let top: Vec<usize> = state
+                .top_layer
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    doc.nodes[id].state & TOP_LAYER != 0
+                        && doc.nodes[id].tag != "html"
+                        && std::iter::successors(Some(id), |&id| up(id))
+                            .all(|id| computed.values[id].get(Prop::DISPLAY) != Some("none"))
+                        && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
+                })
+                .collect();
+            let mut pending = vec![(0, screen, false)];
+            pending.extend(top.iter().map(|&id| (id, screen, false)));
             let mut hits = Vec::new();
             while let Some((id, mut clip, hit)) = pending.pop() {
                 if hit {
@@ -1067,7 +1213,12 @@ pub fn call(
                         .children
                         .get(&id)
                         .unwrap_or(&doc.nodes[id].children);
-                    pending.extend(children.iter().map(|&child| (child, clip, false)));
+                    pending.extend(
+                        children
+                            .iter()
+                            .filter(|child| !top.contains(child))
+                            .map(|&child| (child, clip, false)),
+                    );
                 }
             }
             // Hits come deepest and last in the tree first. The box painted last is on top, so z-index
@@ -1080,6 +1231,28 @@ pub fn call(
                         .unwrap_or(0),
                 )
             });
+            // A `::backdrop` covers what paints before its box and hits as that box.
+            for &id in top.iter().rev() {
+                if hits.first().is_some_and(|&hit| {
+                    std::iter::successors(Some(hit), |&hit| up(hit)).any(|hit| hit == id)
+                }) {
+                    break;
+                }
+                if computed.backdrops.get(&id).is_some_and(|backdrop| {
+                    backdrop.get(Prop::POINTER_EVENTS) != Some("none")
+                        && backdrop
+                            .get(Prop::VISIBILITY)
+                            .is_none_or(|value| value == "visible")
+                        && backdrop.get(Prop::DISPLAY) != Some("none")
+                }) && x >= 0.
+                    && y >= 0.
+                    && x < viewport[0]
+                    && y < viewport[1]
+                {
+                    hits.insert(0, id);
+                    break;
+                }
+            }
             if caret {
                 if let Some(&id) = hits.first()
                     && doc.nodes[id].tag == "#text"
@@ -1313,6 +1486,50 @@ pub fn call(
                 state.dirty = true;
                 Ok(tree(doc, id, false))
             }
+            "dom.cssAnimations" => {
+                // The CSS animations and transitions of the node, or with `subtree` of its tree in tree order.
+                let system = state.text_system.clone();
+                let styles = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                let mut nodes = Vec::new();
+                let mut pending = vec![id];
+                while let Some(node) = pending.pop() {
+                    nodes.push(node);
+                    if args[1].as_bool() == Some(true) {
+                        pending.extend(doc.nodes[node].children.iter().rev());
+                        pending.extend(state.shadows.get(&node));
+                    }
+                }
+                Ok(json!(state.motion.css(
+                    &nodes,
+                    args[2].as_bool() == Some(true),
+                    &styles
+                )))
+            }
+            "dom.animated" => {
+                // The values that script animations give the node now, for `commitStyles()`.
+                let system = state.text_system.clone();
+                let styles = styles(
+                    doc,
+                    state,
+                    viewport,
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                Ok(state
+                    .motion
+                    .scripted(id, 0, &styles)
+                    .map_or(Value::Null, |values| {
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.name().to_owned(), json!(&**value)))
+                            .collect::<serde_json::Map<_, _>>()
+                            .into()
+                    }))
+            }
             "dom.computed" => {
                 let system = state.text_system.clone();
                 let styles = styles(
@@ -1322,19 +1539,47 @@ pub fn call(
                     system.as_deref().map(|system| (system, state.pixel_ratio)),
                 );
                 let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
+                // Script animations show their values at once, not from the last frame.
+                let slot = match pseudo {
+                    "" => Some(0),
+                    "before" => Some(1),
+                    "after" => Some(2),
+                    _ => None,
+                };
+                let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles));
+                // WARNING: the compositor can play animations between frames, so they are sampled now.
+                let current = state
+                    .animating
+                    .contains_key(&id)
+                    .then(|| {
+                        let now = std::time::Instant::now();
+                        state.motion.timeline(id, &styles, &[now]).pop()
+                    })
+                    .flatten();
+                let mut sampled = None;
                 let style = match pseudo {
-                    "" => Some(
+                    "" => Some(current.as_ref().unwrap_or_else(|| {
                         &**state
                             .animating
                             .get(&id)
                             .or_else(|| styles.authored.get(&id))
-                            .unwrap_or(&styles.values[id]),
-                    ),
-                    "before" | "after" => styles
-                        .pseudos
+                            .unwrap_or(&styles.values[id])
+                    })),
+                    "before" | "after" => state
+                        .animating_pseudos
                         .get(&id)
+                        .or_else(|| styles.pseudos.get(&id))
                         .map(|values| &values[usize::from(pseudo == "after")]),
+                    "backdrop" => styles.backdrops.get(&id).map(|style| &**style),
                     _ => None,
+                };
+                let style = match (style, scripted) {
+                    (Some(style), Some(values)) => {
+                        let mut style = style.clone();
+                        style.extend(values.iter().map(|(key, value)| (key, value.clone())));
+                        Some(&*sampled.insert(style))
+                    }
+                    (style, _) => style,
                 };
                 let Some(style) = style.filter(|style| !style.is_empty()) else {
                     return Ok(json!(if args[1].is_string() {
@@ -1412,6 +1657,9 @@ pub fn call(
                 })
             }
             "dom.css" => {
+                if doc.nodes[id].tag == "link" && doc.nodes[id].stylesheet.is_none() {
+                    return Ok(Value::Null);
+                }
                 let sheet = state.style_cache.sheet(doc, id, &mut state.sheets);
                 Ok(sheet.map_or_else(|| json!([]), |sheet| sheet.cssom()))
             }
@@ -1720,9 +1968,14 @@ pub fn call(
             }
             "dom.font" => {
                 let family = args[1].as_str().context("Expected font family")?;
-                add_font(state, family, crate::web::bytes(&args[2])?)?;
-                Ok(Value::Null)
+                Ok(match args[2].as_str() {
+                    Some(name) => json!(local_font(state, family, name)),
+                    None => json!(add_font(state, family, crate::web::bytes(&args[2])?)?),
+                })
             }
+            "dom.fontSources" => Ok(json!(crate::render::fonts::sources(
+                args[1].as_str().context("Expected font sources")?
+            ))),
             "dom.fontCheck" => {
                 let family = args[1].as_str().context("Expected font family")?;
                 let family = state
@@ -2233,13 +2486,55 @@ fn scroll_offset(
     offset
 }
 
-/// Adds font data for the CSS `family`, from `FontFace` or `@font-face`.
-pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<()> {
+/// Adds font data for the CSS `family`, from `FontFace` or `@font-face`, and returns its font family.
+pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<String> {
+    const LIMIT: usize = 32 * 1024 * 1024;
     let system = state
         .text_system
         .as_ref()
         .context("Font loading requires a displayed window")?;
-    ensure!(bytes.len() <= 32 * 1024 * 1024, "Font exceeds 32 MB limit");
+    ensure!(bytes.len() <= LIMIT, "Font exceeds 32 MB limit");
+    // WARNING: fontdb and the text systems read sfnt data only, so WOFF and WOFF2 fonts are decoded first.
+    let bytes = match bytes.get(..4) {
+        Some(b"\0\x01\0\0" | b"true" | b"OTTO" | b"ttcf") => bytes,
+        #[cfg(target_os = "macos")]
+        Some(b"wOFF" | b"wOF2") => {
+            #[allow(improper_ctypes)]
+            unsafe extern "C" {
+                fn apps_font_sfnt(
+                    bytes: *const u8,
+                    length: usize,
+                    allocate: extern "C" fn(&mut Vec<u8>, usize) -> *mut u8,
+                    font: &mut Vec<u8>,
+                ) -> bool;
+            }
+            extern "C" fn allocate(font: &mut Vec<u8>, length: usize) -> *mut u8 {
+                if length > LIMIT {
+                    return std::ptr::null_mut();
+                }
+                *font = vec![0; length];
+                font.as_mut_ptr()
+            }
+            let mut font = Vec::new();
+            ensure!(
+                unsafe { apps_font_sfnt(bytes.as_ptr(), bytes.len(), allocate, &mut font) },
+                "Invalid or too large WOFF font"
+            );
+            font
+        }
+        #[cfg(not(target_os = "macos"))]
+        Some(magic @ (b"wOFF" | b"wOF2")) => {
+            let font = if magic == b"wOFF" {
+                wuff::decompress_woff1(&bytes)
+            } else {
+                wuff::decompress_woff2(&bytes)
+            }
+            .map_err(|_| anyhow::anyhow!("Invalid WOFF font"))?;
+            ensure!(font.len() <= LIMIT, "Font exceeds 32 MB limit");
+            font
+        }
+        _ => anyhow::bail!("Unsupported font format"),
+    };
     let mut fonts = crate::render::canvas::fonts(false);
     let database = std::sync::Arc::make_mut(&mut fonts.0);
     let ids = database.load_font_source(resvg::usvg::fontdb::Source::Binary(std::sync::Arc::new(
@@ -2259,15 +2554,44 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
         .0
         .clone();
     system.add_fonts(vec![std::borrow::Cow::Owned(bytes)])?;
+    use_font(state, family, &name, true);
+    Ok(name)
+}
+
+/// Uses the installed font family `name` for the CSS `family`, like `local()` in `@font-face`.
+/// Returns false when no such family is installed.
+pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
+    let Some(system) = state.text_system.clone() else {
+        return false;
+    };
+    style::font_names(&system, &state.font_aliases);
+    let Some(found) =
+        style::FONT_NAMES.with(|names| names.borrow().0.get(&name.to_ascii_lowercase()).cloned())
+    else {
+        return false;
+    };
+    use_font(state, family, &found, false);
+    true
+}
+
+/// Restyles the page for changed fonts, where the CSS `family` draws with the font family `name`.
+/// Without `added` font data, a family that draws with a font already keeps it.
+pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool) {
+    let same = name.eq_ignore_ascii_case(family);
+    if !added && (same || state.font_aliases.contains_key(family)) {
+        return;
+    }
     state.font_loads += 1;
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
-    state.style_cache = style::StyleCache::default();
+    // WARNING: a new style cache would drop constructed and CSSOM-edited sheets, so only the values that used font metrics go.
+    state.style_cache.metrics = None;
     state.computed = None;
-    if !name.eq_ignore_ascii_case(family) {
-        state.font_aliases.insert(family.to_owned(), name);
+    if !same {
+        state
+            .font_aliases
+            .insert(family.to_owned(), name.to_owned());
     }
     state.dirty = true;
-    Ok(())
 }
 
 /// Writes the overflow clip and positioned flags of current styles into the layout mirror.
@@ -2340,6 +2664,12 @@ pub(crate) fn styles(
         scale: scale.unwrap_or(1.),
         aliases: state.font_aliases.clone(),
         animated,
+        inserted: state
+            .inserted
+            .iter()
+            .map(|(_, sheet, user)| (sheet.clone(), *user))
+            .collect(),
+        previous: state.computed.clone(),
         ..Default::default()
     };
     if !state.shadows.is_empty() {
@@ -2374,6 +2704,7 @@ pub(crate) fn styles(
             context.required = None;
             result.pseudos.clear();
             result.text_pseudos.clear();
+            result.backdrops.clear();
             result.scrollbars.clear();
             result.selections.clear();
             result.animations.clear();
@@ -2598,6 +2929,7 @@ pub(crate) fn styles(
         return Rc::new(result);
     }
     state.animating.clear();
+    state.animating_pseudos.clear();
     state.style_epoch += 1;
     state.style_viewport = viewport;
     state.style_metrics = scale;
@@ -2687,6 +3019,74 @@ mod tests {
         unsafe { *count(&mirror) = 16_777_215. };
         mirror.touch();
         assert_eq!(unsafe { *count(&mirror) }, 0.);
+    }
+
+    #[test]
+    fn font_faces_load_woff_and_list_css_faces() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let fixtures = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts"));
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut()
+            .assets
+            .insert("test.woff".into(), fixtures.join("test.woff"));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    r#"<style>@font-face{font-family:Css;src:url(test.woff) format("woff")}
+                    @font-face{font-family:Later;src:url(later.woff);unicode-range:U+0400-04FF}</style><p>AB</p>"#,
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        {
+            let mut host = host.borrow_mut();
+            let state = host.dom.entry(1).or_default();
+            state.text_system = Some(Rc::new(renderer::TextSystem::new()));
+            state.base = url::Url::parse("apps:///index.html").ok();
+        }
+        let bytes = std::fs::read(fixtures.join("test-cff.woff2")).unwrap();
+        let bytes: Vec<_> = bytes.iter().map(u8::to_string).collect();
+        engine
+            .eval(
+                &format!(
+                    r#"
+            globalThis.log = [];
+            const face = new FontFace('Bytes', new Uint8Array([{}]));
+            document.fonts.add(face);
+            face.load().then(() => log.push('bytes ' + face.status));
+            new FontFace('Bad', 'url(a.eot) format("embedded-opentype")').load().catch(error => log.push('bad ' + error.name));
+            new FontFace('Local', 'local("No Such Font 123")').load().catch(error => log.push('local ' + error.name));
+            document.fonts.ready.then(fonts => {{
+                log.push([...fonts].map(face => face.family + ' ' + face.status).join());
+                const context = document.createElement('canvas').getContext('2d');
+                for (const family of ['Bytes', 'Css']) {{ context.font = '10px ' + family; log.push(context.measureText('AB').width); }}
+                log.push(document.fonts.check('10px Css'), document.fonts.check('10px Later'), document.fonts.check('10px Later', 'Ж'), document.fonts.has(face));
+            }});
+        "#,
+                    bytes.join(",")
+                ),
+                "test",
+            )
+            .unwrap();
+        for _ in 0..5 {
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            engine.eval("JSON.stringify(log)", "test").unwrap(),
+            r#"["bytes loaded","bad SyntaxError","local NetworkError","Css loaded,Later unloaded,Bytes loaded",15,15,true,true,false,true]"#
+        );
     }
 
     #[test]

@@ -978,10 +978,28 @@ fn console(args: &Value) -> Value {
 }
 
 fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
-    if args["gc"] == true {
-        desktop.main.collect_garbage();
+    let context = desktop
+        .main
+        .as_ref()
+        .map(|main| (Role::Main, main))
+        .or_else(|| {
+            desktop
+                .views
+                .iter()
+                .filter_map(|(&id, v)| v.renderer.as_deref().map(|engine| (id, engine)))
+                .min_by_key(|(id, _)| *id)
+                .map(|(id, engine)| (Role::Renderer(id), engine))
+        });
+    let engine = context.map(|(_, engine)| engine);
+    if args["gc"] == true
+        && let Some(engine) = engine
+    {
+        engine.collect_garbage();
     }
-    let mut heap = desktop.main.heap()?;
+    let mut heap = engine
+        .map(|engine| engine.heap())
+        .transpose()?
+        .unwrap_or(Value::Null);
     if let Some(types) = heap
         .as_object_mut()
         .and_then(|heap| heap.remove("objectTypeCounts"))
@@ -1013,7 +1031,9 @@ fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
     });
     drop(host);
     if args["snapshot"] == true {
-        let ctx = jsc::context(Role::Main).context("No main context")?;
+        let ctx = context
+            .and_then(|(role, _)| jsc::context(role))
+            .context("No JavaScript context")?;
         let snapshot = request(ctx, "Heap.snapshot", json!({}))?;
         let data = snapshot["snapshotData"]
             .as_str()
@@ -1088,7 +1108,13 @@ fn profile_start() -> Result<()> {
         STATE.with_borrow(|state| state.profile.is_none()),
         "A profile is already running"
     );
-    let ctx = jsc::context(Role::Main).context("No main context")?;
+    let ctx = jsc::context(Role::Main)
+        .or_else(|| {
+            jsc::contexts()
+                .into_iter()
+                .find_map(|(ctx, role)| matches!(role, Role::Renderer(_)).then_some(ctx))
+        })
+        .context("No JavaScript context")?;
     // Debugger sessions report the scripts and source maps that name the sampled functions.
     for (ctx, _) in jsc::contexts() {
         attach(ctx)?;

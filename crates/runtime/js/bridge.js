@@ -1,6 +1,8 @@
 globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const pending=new Map(),functions=new Map(),functionIds=new WeakMap(),handlers=new Map(),queue=[],refs=new Map(),refIds=new WeakMap(),facades=new Map(),emitter=EventEmitter?new EventEmitter():null;
   const random=crypto.randomUUID.bind(crypto),errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError};
+  // WARNING: a dropped File carries the index of its path in Rust, never the path. A page can forge an index, but it only names files that were dropped on that page.
+  const files=hooks.files=new WeakMap();
   const peer=role=>role==='main'?'main':typeof role==='object'&&role!==null?'preload'in role?'preload:'+role.preload:'renderer'in role?'renderer:'+role.renderer:null:null;
   const send=(target,message)=>call('bridge.dispatch',target,message);
   const uncloneable=()=>{throw new Error('An object could not be cloned.');};
@@ -18,6 +20,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     const id=seen.size;seen.set(value,id);
     if(value instanceof Date)return{type:'date',id,value:String(value.getTime())};
     if(value instanceof Error)return{type:'error',id,value:String(value.message),name:String(value.name),stack:value.stack};
+    const blob=value instanceof Blob?hooks.blob?.(value):null;
+    if(blob)return{type:'blob',id,value:blob,mime:value.type,...(value instanceof File?{name:value.name,lastModified:value.lastModified,file:files.get(value)}:{})};
     if(value instanceof ArrayBuffer||ArrayBuffer.isView(value))return{type:'bytes',id,name:value instanceof ArrayBuffer?'ArrayBuffer':value.constructor.name,value:new Uint8Array(value.buffer??value,value.byteOffset??0,value.byteLength)};
     if(value instanceof Promise){if(strict)uncloneable();return{type:'promise',id,then:capability(settle=>{value.then(v=>settle(true,v),e=>settle(false,e));},target,!persistent)};}
     if(value instanceof Map)return{type:'map',id,items:[...value].map(([k,v])=>[next(k),next(v)])};
@@ -36,6 +40,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(value.type==='promise')result=new Promise((resolve,reject)=>rpc(target,{kind:'call',function:value.then,args:{type:'array',id:0,items:[{type:'function',id:capability((ok,v)=>ok?resolve(v):reject(v),target,true)}]}}));
     else if(value.type==='date')result=new Date(Number(value.value));
     else if(value.type==='error'){result=new(Object.hasOwn(errors,value.name)?errors[value.name]:Error)(value.value);if(result.name!==value.name)result.name=value.name;result.stack=value.stack;}
+    else if(value.type==='blob'){result=value.name===undefined?new Blob([value.value],{type:value.mime}):new File([value.value],value.name,{type:value.mime,lastModified:value.lastModified});if(value.file!==undefined)files.set(result,value.file);}
     else if(value.type==='bytes'){const bytes=new Uint8Array(value.value);const constructors={Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float32Array,Float64Array,BigInt64Array,BigUint64Array,DataView};result=value.name==='ArrayBuffer'?bytes.buffer:new (constructors[value.name]??Uint8Array)(bytes.buffer);}
     else result=value.type==='array'?new Array(value.items.length):value.type==='map'?new Map():value.type==='set'?new Set():{};
     seen.set(value.id,result);
@@ -137,6 +142,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     globalThis.window??=globalThis;
     Object.defineProperty(globalThis,'document',{get:()=>facade(0),configurable:true});
   }
+  const webUtils=Object.freeze({getPathForFile(file){if(!(file instanceof File))throw new TypeError('Expected a File');const index=files.get(file);return index===undefined?'':call('bridge.file',index);}});
   const poll=()=>{if(queue.length)drain();};poll.pending=()=>pending.size>0||queue.length>0;poll.queued=()=>queue.length>0;
-  return{contextBridge,ipcMain,ipcRenderer,send:(id,channel,...args)=>send({preload:id},{kind:'event',channel,args:encode(args,{preload:id})}),poll};
+  return{contextBridge,ipcMain,ipcRenderer,webUtils,send:(id,channel,...args)=>send({preload:id},{kind:'event',channel,args:encode(args,{preload:id})}),poll};
 };

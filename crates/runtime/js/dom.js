@@ -1,6 +1,6 @@
 (() => {
-  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, microtask = queueMicrotask;
-  delete globalThis.__appsDOM; delete globalThis.__appsEventState;
+  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask;
+  delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
   // WARNING: records mirror the Rust tree for reads. Writes queue as `code, a, b, c` integers, with strings in `texts` and their lengths in place, and reach Rust in one `dom.batch` before any other host call and at the microtask checkpoint that ends the turn, so Rust never reads a stale page.
   class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : new Map(); this.up = null; this.kids = []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
   const records = [], texts = [], orphans = [];
@@ -26,8 +26,10 @@
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0; geometry[0] = 1;
+  // WARNING: observers measure the layout of the last frame, so the frame that follows their delivery lays the page out once.
+  let observing = false;
   const layout = () => {
-    if (stale) { stale = false; call('dom.reflow'); }
+    if ((stale || geometry[3]) && !observing) { stale = false; call('dom.reflow'); }
     if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
     return geometry;
   };
@@ -60,16 +62,18 @@
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
   const index = rec => { const kids = rec.up.kids; let i = rec.i; if (kids[i] !== rec) rec.i = i = kids[i + 1] === rec ? i + 1 : kids[i - 1] === rec ? i - 1 : kids.indexOf(rec); return i; };
   const own = rec => rec.text ??= host('dom.source', rec.id);
-  const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && rec.tag === '#comment') continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
+  const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
   const detach = rec => { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; rec.text = ''; };
   // WARNING: wrappers hold their wrapped parent and children so that listeners and expandos live as long as their tree.
   const hold = (parent, child) => { child._parent?._held?.delete(child); child._parent = parent; (parent._held ??= new Set()).add(child); };
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
   const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
-  const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
-  let readyState = 'loading', active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
+  const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
+  let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
   const selectionPending = new Set();
+  // The top layer, open modal and other dialogs, shown auto and hint popovers, fullscreen elements, and boxes that take close requests, in order.
+  const topLayer = [], modals = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
   const selectionChanged = (target = document) => {
     if (selectionPending.has(target)) return;
     selectionPending.add(target);
@@ -144,7 +148,7 @@
     for (let rec = node._m, child = null; rec && rec.tag[0] !== '#'; child = rec, rec = rec.up) if (rec.attrs.has('disabled') && (rec === node._m || rec.tag === 'fieldset' && rec.kids.find(kid => kid.tag === 'legend') !== child || rec.tag === 'optgroup' && node.localName === 'option')) return true;
     return false;
   };
-  const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
+  const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
   const group = radio => { const name = radio.name, form = radio.form; return name ? [...radio.getRootNode().querySelectorAll('input')].filter(other => other.type === 'radio' && other.name === name && other.form === form) : [radio]; };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
@@ -159,6 +163,8 @@
   const attributeChanged = (element, name, oldValue, value) => {
     if (shadows && name === 'slot') { signal(element.parentNode, element, oldValue ?? ''); signal(element.parentNode, element); }
     else if (shadows && name === 'name' && element.localName === 'slot') { const root = element.getRootNode(); if (root instanceof ShadowRoot && (slotted(root.host, oldValue ?? '') || slotted(root.host, value ?? ''))) queueSlot(element); }
+    else if (name === 'popover' && element._popover && popoverState(oldValue) !== popoverState(value)) hidePopover(element, true, true);
+    else if (name === 'open' && element.localName === 'dialog' && value === null) closeDialog(element);
     else if (name === 'open' && element.localName === 'details' && (oldValue === null) !== (value === null)) {
       const pending = toggles.get(element), newState = value === null ? 'closed' : 'open';
       if (pending) pending.newState = newState;
@@ -183,7 +189,8 @@
       if (tag === 'label') { const control = labelControl(activator); if (control && !control.contains(target) && !disabled(control)) { if (focusable(control)) control.focus(); fireClick(control, { ...init, detail: 0 }, native); } }
       else if (tag === 'summary') activator.parentElement.open = !activator.parentElement.open;
       else if ((type === 'submit' || type === 'image') && activator.form) activator.form.requestSubmit(activator);
-      else if (type === 'reset' && activator.form) activator.form.reset();
+      else if (tag === 'button' || tag === 'input') { if (type === 'reset' && activator.form) activator.form.reset(); invoke(activator, target); }
+      else if ((tag === 'a' || tag === 'area') && !/^(_self|_top|_parent)?$/i.test(activator.getAttribute('target') ?? '')) openWindow(activator.href, activator.getAttribute('target'));
     }
     return allowed;
   };
@@ -191,6 +198,7 @@
   const serialize = rec => {
     if (rec.tag === '#text') return rec.up && rawText.test(rec.up.tag) ? own(rec) : own(rec).replace(/[&<>\u00a0]/g, c => escapes[c]);
     if (rec.tag === '#comment') return '<!--' + rec.text + '-->';
+    if (rec.tag === '#doctype') return '<!DOCTYPE ' + own(rec).split('\0')[0] + '>';
     if (rec.tag[0] === '#') return rec.kids.map(serialize).join('');
     let attrs = '';
     for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
@@ -236,6 +244,10 @@
   const rangesClear = node => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (other, at) => other === node ? at > 0 : node.contains(other), node, () => 0)).includes(true)); };
   // WARNING: removing the focused element blurs it, and removing a pointer capture target releases the capture at the document, as in browsers.
   const forgetRemoved = () => {
+    if (topLayer.length || dialogs.length) {
+      if (fullscreens.some(node => !node.isConnected)) exitFullscreen(true);
+      for (const node of [...topLayer, ...dialogs]) if (!node.isConnected) { if (node._popover) hidePopover(node, false, false); if (dialogs.includes(node)) closeDialog(node); }
+    }
     if (captures.size) for (const [id, node] of captures) if (!node.isConnected) { captures.delete(id); dispatch(document, new PointerEvent('lostpointercapture', { pointerId: id, bubbles: true, composed: true })); }
     if (!active || active.isConnected) return;
     const previous = active; active = null; call('dom.focus', []); dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true }));
@@ -343,7 +355,7 @@
         return child;
       }
       const rec = this._m, kid = child._m, ref = before?._m ?? null;
-      if (child.nodeType === 9 || this.nodeType !== 1 && this.nodeType !== 11 && this._id !== 0) throw new DOMException(child.nodeType === 9 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
+      if (child.nodeType === 9 || child.nodeType === 10 && this.nodeType !== 9 || this.nodeType !== 1 && this.nodeType !== 11 && this._id !== 0) throw new DOMException(child.nodeType === 9 || child.nodeType === 10 ? 'Invalid child' : 'Invalid parent', 'HierarchyRequestError');
       if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
       for (let up = rec; up; up = up.up ?? up.host) if (up === kid) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
       const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected, parented = !!kid.up;
@@ -364,6 +376,8 @@
       if (parented) forgetRemoved();
       if (removal) change(removal);
       if (observed) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling });
+      // WARNING: only the bundler loads stylesheets and h2o never preloads, so these links fail when a script inserts them, like links that can't load.
+      if (kid.tag === 'link' && kid.attrs.has('href') && /(^|\s)(stylesheet|preload|modulepreload)(\s|$)/i.test(kid.attrs.get('rel') ?? '') && child.isConnected) setTimeout(() => child.dispatchEvent(new Event('error')));
       return child;
     }
     removeChild(child) {
@@ -438,6 +452,16 @@
     get wholeText() { let node = this, text = ''; while (node.previousSibling?.nodeType === 3) node = node.previousSibling; for (; node?.nodeType === 3; node = node.nextSibling) text += node.data; return text; }
   }
   class Comment extends CharacterData { constructor(data = '', tag) { super(tag ? data : create('#comment', String(data)), '#comment'); } }
+  // WARNING: a doctype keeps its name, public id and system id in its text, joined by NULs when it has ids.
+  class DocumentType extends Node {
+    constructor(id, tag) { super(id, tag); this.nodeName = this.name; }
+    get name() { return own(this._m).split('\0')[0]; } get publicId() { return own(this._m).split('\0')[1] ?? ''; } get systemId() { return own(this._m).split('\0')[2] ?? ''; }
+    get textContent() { return null; } set textContent(_) {} get nodeValue() { return null; } set nodeValue(_) {}
+  }
+  // Like the HTML parser, a page without an HTML doctype, or with a legacy one, is in quirks mode.
+  const quirks = doctype => !doctype || doctype.name !== 'html' || /^(-\/\/w3o\/\/dtd w3 html strict 3\.0\/\/en\/\/|-\/w3c\/dtd html 4\.0 transitional\/en|html)$/i.test(doctype.publicId) || doctype.systemId.toLowerCase() === 'http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd'
+    || /^(\+\/\/silmaril\/\/dtd html pro v0r11 19970101\/\/|-\/\/(as|advasoft ltd)\/\/dtd html 3\.0 aswedit \+ extensions\/\/|-\/\/ietf\/\/dtd html|-\/\/metrius\/\/dtd metrius presentational\/\/|-\/\/microsoft\/\/dtd internet explorer [23]\.0|-\/\/netscape comm\. corp\.\/\/dtd|-\/\/o'reilly and associates\/\/dtd html|-\/\/softquad|-\/\/spyglass\/\/dtd html 2\.0 extended\/\/|-\/\/sq\/\/dtd html 2\.0 hotmetal \+ extensions\/\/|-\/\/sun microsystems corp\.\/\/dtd hotjava|-\/\/w3c\/\/dtd html (3|4\.0 (frameset|transitional)|experimental)|-\/\/w3c\/\/dtd w3 html\/\/|-\/\/w3o\/\/dtd w3 html 3\.0\/\/|-\/\/webtechs\/\/dtd mozilla html)/i.test(doctype.publicId)
+    || !doctype.systemId && /^-\/\/w3c\/\/dtd html 4\.01 (frameset|transitional)\/\//i.test(doctype.publicId);
   const cssName = name => String(name).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
   const styleName = name => { name = String(name); if (name.startsWith('--')) return name; if (name === 'cssFloat') return 'float'; return name.replace(/^(webkit|moz|ms)(?=[A-Z])/, '-$1').replace(/^(Webkit|Moz|Ms)(?=[A-Z])/, prefix => '-' + prefix.toLowerCase()).replace(/[A-Z]/g, c => '-' + c.toLowerCase()); };
   let cssProperties = null;
@@ -549,11 +573,13 @@
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); attrs.set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open')) attributeChanged(this, name, oldValue, value); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); attrs.set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover')) attributeChanged(this, name, oldValue, value); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (name === 'slot' || name === 'name' || name === 'open') attributeChanged(this, name, oldValue, null); }
+    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (name === 'slot' || name === 'name' || name === 'open' || name === 'popover') attributeChanged(this, name, oldValue, null); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
+    getAttributeNode(name) { name = attrName(this, name); return this._m.attrs.has(name) ? new Attr(this, name, this._m.attrs.get(name)) : null; }
+    removeAttributeNode(attr) { if (!(attr instanceof Attr) || attr.ownerElement !== this || !this._m.attrs.has(attr.name)) throw new DOMException('The attribute is not on this element', 'NotFoundError'); attr._value = this._m.attrs.get(attr.name); this.removeAttribute(attr.name); attr.ownerElement = null; return attr; }
     get style() { return this._style ??= declaration({ read: () => declare(this.getAttribute('style') ?? ''), write: list => { const value = declarationText(list); declared.set(value, list.map(entry => entry.slice())); this.setAttribute('style', value); } }); }
     set style(value) { this.style.cssText = value; }
     get innerHTML() { return this._m.kids.map(serialize).join('') || own(this._m); }
@@ -653,9 +679,18 @@
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
   const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); };
+  // WARNING: a range's value is always sanitized: clamped to min and max and rounded to the step from min, so changing them changes the value, like in browsers.
+  const rangeBounds = node => { const number = name => { const value = parseFloat(node.getAttribute(name)); return Number.isFinite(value) ? value : null; }, min = number('min') ?? 0, step = number('step'); return [min, Math.max(min, number('max') ?? 100), node.getAttribute('step')?.trim().toLowerCase() === 'any' ? 0 : step > 0 ? step : 1]; };
+  const rangeValue = (node, raw) => {
+    const [min, max, step] = rangeBounds(node); let value = String(raw ?? '').trim() ? Number(raw) : NaN;
+    value = Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : (min + max) / 2;
+    if (step) { let n = Math.round((value - min) / step); if (min + n * step > max) n--; value = +(min + n * step).toPrecision(15); }
+    return String(value);
+  };
+  const setRange = (node, raw) => { const value = rangeValue(node, raw); if (value !== node.value) { setValue(node, value); dispatch(node, trusted(new Event('input', { bubbles: true, composed: true }))); } };
   const formState = (node, bits) => { if (node._bits !== bits) { node._bits = bits; op(8, node._id, bits); } };
   // WARNING: user edits change the internal value and checkedness, never the page-visible `value` and `checked` properties, which frameworks wrap to tell their own writes apart.
-  const setChecked = (node, value) => { node._checked = value; formState(node, value ? 3 : 2); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, 2); } };
+  const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } };
   const formOf = node => { const id = node.getAttribute('form'); if (id !== null) { const form = id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; };
   const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
   const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
@@ -703,7 +738,7 @@
   };
   class HTMLInputElement extends HTMLElement {
     get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
-    get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : this._value ?? this.getAttribute('value')?.replace(/[\r\n]/g, '') ?? ''; }
+    get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? this.getAttribute('value')?.replace(/[\r\n]/g, '') ?? ''; }
     set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) setValue(this, value); }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
     get checked() { return this._checked ?? this.hasAttribute('checked'); }
@@ -746,6 +781,7 @@
     get textLength() { return this.value.length; }
   }
   for (const name of ['selectionStart', 'selectionEnd', 'selectionDirection', 'setSelectionRange', 'select', 'setRangeText']) Object.defineProperty(HTMLTextAreaElement.prototype, name, Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, name));
+  for (const attr of ['accept', 'alt', 'autocomplete', 'max', 'min', 'pattern', 'step']) Object.defineProperty(HTMLInputElement.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
   const options = select => { const result = []; for (const kid of select._m.kids) { if (kid.tag === 'option') result.push(of(kid)); else if (kid.tag === 'optgroup') for (const sub of kid.kids) if (sub.tag === 'option') result.push(of(sub)); } return result; };
   // WARNING: a single select shows one option, the last selected one or else the first enabled one, unless `selectedIndex = -1` emptied it.
   const selectedness = select => {
@@ -795,7 +831,7 @@
   }
   class HTMLOptGroupElement extends HTMLElement { get label() { return this.getAttribute('label') ?? ''; } set label(value) { this.setAttribute('label', value); } }
   class HTMLButtonElement extends HTMLElement {
-    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return type === 'reset' || type === 'button' ? type : 'submit'; } set type(value) { this.setAttribute('type', value); }
+    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return /^(submit|reset|button)$/.test(type) ? type : this.hasAttribute('commandfor') ? 'button' : 'submit'; } set type(value) { this.setAttribute('type', value); }
     get value() { return this.getAttribute('value') ?? ''; } set value(value) { this.setAttribute('value', value); }
   }
   class HTMLFieldSetElement extends HTMLElement { get elements() { const result = []; find(this._m, rec => { if (listed.test(rec.tag)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); } get type() { return 'fieldset'; } }
@@ -824,7 +860,7 @@
       if (!dispatch(this, new Event('reset', { bubbles: true, cancelable: true }))) return;
       for (const control of this.elements) {
         if (control.localName === 'select') { for (const option of options(control)) option._selected = undefined; control._none = false; selectedness(control); }
-        else if (control.localName === 'input' || control.localName === 'textarea') { control._value = undefined; control._checked = undefined; control._edited = undefined; op(7, control._id, '', 1); formState(control, 0); }
+        else if (control.localName === 'input' || control.localName === 'textarea') { control._value = undefined; control._checked = undefined; control._edited = undefined; op(7, control._id, '', 1); formState(control, control._bits & ~3); }
         else if (control.localName === 'output') control.textContent = control.defaultValue;
       }
     }
@@ -842,28 +878,193 @@
       return entries;
     }
   }
-  const modals = [];
+  // WARNING: the top layer is mirrored in Rust in its order by op 9, and its boxes by state bits of op 8: 4 modal, 8 popover, 16 fullscreen.
+  const layer = (node, on) => { const i = topLayer.indexOf(node); if (i >= 0) topLayer.splice(i, 1); if (on) topLayer.push(node); op(9, node._id, on ? 1 : 0); };
+  const flag = (node, bit, on) => formState(node, on ? node._bits | bit : node._bits & ~bit);
+  const drop = (list, node) => { const i = list.indexOf(node); if (i >= 0) list.splice(i, 1); };
+  // WARNING: toggle events coalesce: a later change in the same task moves the queued event to the new state, keeping its old one.
+  const toggled = (node, oldState, newState, source = null) => {
+    if (node._toggle) { Object.assign(node._toggle, { newState, source }); return; }
+    const state = node._toggle = { oldState, newState, source };
+    setTimeout(() => { node._toggle = null; dispatch(node, new ToggleEvent('toggle', state)); }, 0);
+  };
+  const popoverState = value => value === null ? null : /^(auto|)$/i.test(value) ? 'auto' : /^hint$/i.test(value) ? 'hint' : 'manual';
+  const stackOf = node => node._popover === 'hint' ? hints : autos;
+  const position = node => { const i = autos.indexOf(node); return i >= 0 ? i : hints.includes(node) ? autos.length + hints.indexOf(node) : -1; };
+  const nearestPopover = (node, list) => { for (const item of node ? path(node) : []) if (list.includes(item)) return item; return null; };
+  // The open popover that a new box nests in: through its flat tree parent or its invoker, whichever is higher.
+  const ancestorPopover = (node, list, invoker) => [path(node)[1], invoker].map(item => nearestPopover(item, list)).reduce((a, b) => b && (!a || list.indexOf(b) > list.indexOf(a)) ? b : a, null);
+  const hideAll = (list, end) => { for (let guard = 0; list.length && list.at(-1) !== end && guard < 1000; guard++) hidePopover(list.at(-1), false, true); };
+  const hideUntil = end => { if (hints.includes(end)) return hideAll(hints, end); hideAll(hints, null); if (end === document || autos.includes(end)) hideAll(autos, end === document ? null : end); };
+  const popoverReady = (node, showing) => {
+    if (popoverState(node.getAttribute('popover')) === null) throw new DOMException('The element is not a popover', 'NotSupportedError');
+    if (!!node._popover !== showing) return false;
+    if (!node.isConnected || node.localName === 'dialog' && node._modal || fullscreens.includes(node)) throw new DOMException('The popover is not connected, or is a modal dialog or fullscreen', 'InvalidStateError');
+    return true;
+  };
+  const showPopover = (node, source) => {
+    if (!popoverReady(node, false) || !dispatch(node, new ToggleEvent('beforetoggle', { cancelable: true, oldState: 'closed', newState: 'open', source })) || !popoverReady(node, false)) return;
+    const mode = popoverState(node.getAttribute('popover'));
+    if (mode === 'hint') hideAll(hints, ancestorPopover(node, hints, source));
+    else if (mode === 'auto') hideUntil(ancestorPopover(node, autos, source) ?? document);
+    if (popoverState(node.getAttribute('popover')) !== mode) throw new DOMException('The popover type changed while it opened', 'InvalidStateError');
+    if (!popoverReady(node, false)) return;
+    node._popover = mode; node._returnFocus = active;
+    if (mode !== 'manual') { stackOf(node).push(node); watchers.push(node); }
+    flag(node, 8, true); layer(node, true);
+    (node.hasAttribute('autofocus') ? node : node.querySelector('[autofocus]'))?.focus();
+    toggled(node, 'closed', 'open', source);
+  };
+  const hidePopover = (node, focus, events, source = null) => {
+    if (!node._popover) return;
+    if (node._popover !== 'manual') hideAll(stackOf(node), node);
+    if (events) { dispatch(node, new ToggleEvent('beforetoggle', { oldState: 'open', newState: 'closed', source })); if (node._popover && node._popover !== 'manual') hideAll(stackOf(node), node); }
+    if (!node._popover) return;
+    drop(stackOf(node), node); drop(watchers, node);
+    node._popover = null; flag(node, 8, false); layer(node, false);
+    if (events) toggled(node, 'open', 'closed', source);
+    const previous = node._returnFocus; node._returnFocus = null;
+    if (focus && previous?.isConnected && active && node.contains(active)) previous.focus();
+  };
+  // A dialog that closes or leaves the document leaves the open dialogs and, when modal, the top layer, without events.
+  const closeDialog = dialog => {
+    drop(dialogs, dialog); drop(watchers, dialog);
+    if (dialog._modal) { dialog._modal = false; drop(modals, dialog); flag(dialog, 4, false); layer(dialog, false); }
+  };
+  const openDialog = (dialog, modal) => {
+    if (!dispatch(dialog, new ToggleEvent('beforetoggle', { cancelable: true, oldState: 'closed', newState: 'open' })) || dialog.open || modal && (!dialog.isConnected || dialog._popover)) return;
+    toggled(dialog, 'closed', 'open');
+    dialog.setAttribute('open', '');
+    dialog._focus = active; dialogs.push(dialog); watchers.push(dialog);
+    if (modal) { dialog._modal = true; modals.push(dialog); flag(dialog, 4, true); layer(dialog, true); }
+    hideUntil(ancestorPopover(dialog, hints, null) ?? ancestorPopover(dialog, autos, null) ?? document);
+    (dialog.querySelector('[autofocus]') ?? [...dialog.querySelectorAll('*')].find(focusable))?.focus();
+  };
   class HTMLDialogElement extends HTMLElement {
     get open() { return this.hasAttribute('open'); } set open(value) { this.toggleAttribute('open', !!value); }
     get returnValue() { return this._returnValue ?? ''; } set returnValue(value) { this._returnValue = String(value); }
-    show() { if (this.open) { if (this._modal) throw new DOMException('The dialog is modal', 'InvalidStateError'); return; } this._focus = active; this.setAttribute('open', ''); (this.querySelector('[autofocus]') ?? [...this.querySelectorAll('*')].find(focusable))?.focus(); }
+    get closedBy() { const value = (this.getAttribute('closedby') ?? '').toLowerCase(); return /^(any|closerequest|none)$/.test(value) ? value : this._modal ? 'closerequest' : 'none'; } set closedBy(value) { this.setAttribute('closedby', value); }
+    show() { if (this.open) { if (this._modal) throw new DOMException('The dialog is modal', 'InvalidStateError'); return; } openDialog(this, false); }
     showModal() {
       if (this.open) { if (this._modal) return; throw new DOMException('The dialog is already open', 'InvalidStateError'); }
       if (!this.isConnected) throw new DOMException('The dialog is not connected', 'InvalidStateError');
-      this._modal = true; this._focus = active; modals.push(this); formState(this, 4); this.setAttribute('open', '');
-      (this.querySelector('[autofocus]') ?? [...this.querySelectorAll('*')].find(focusable))?.focus();
+      if (this._popover) throw new DOMException('The dialog is a shown popover', 'InvalidStateError');
+      openDialog(this, true);
     }
     close(result) {
       if (!this.open) return;
+      dispatch(this, new ToggleEvent('beforetoggle', { oldState: 'open', newState: 'closed' }));
+      if (!this.open) return;
+      toggled(this, 'open', 'closed');
       this.removeAttribute('open');
-      if (result !== undefined) this.returnValue = result;
-      if (this._modal) { this._modal = false; modals.splice(modals.indexOf(this), 1); formState(this, 0); }
+      if (result !== undefined && result !== null) this.returnValue = result;
       const previous = this._focus; this._focus = null;
       if (previous?.isConnected && active && this.contains(active)) previous.focus();
       setTimeout(() => dispatch(this, new Event('close')), 0);
     }
     requestClose(result) { if (this.open && dispatch(this, new Event('cancel', { cancelable: true }))) this.close(result); }
   }
+  // A close request goes to the box opened last: a dialog closes after a `cancel` that may stop it, when its `closedby` allows it, and a popover hides.
+  const closeRequest = () => {
+    const top = watchers.at(-1);
+    if (!top) return false;
+    if (top._popover) hidePopover(top, true, true);
+    else if (top.closedBy !== 'none' && dispatch(top, trusted(new Event('cancel', { cancelable: true })))) top.close();
+    return true;
+  };
+  // An element reference attribute: the element set through the property, else the element with that id in its tree.
+  const referenced = (node, name, key) => { const set = node[key]?.deref(); if (set && node.hasAttribute(name)) return set; const id = node.getAttribute(name); return id ? node.getRootNode().getElementById?.(id) ?? null : null; };
+  const reference = (node, name, key, value) => { if (value === null || value === undefined) { node[key] = null; node.removeAttribute(name); } else { if (!(value instanceof Element)) throw new TypeError('Expected an Element'); node[key] = new WeakRef(value); node.setAttribute(name, ''); } };
+  const commands = /^(toggle-popover|show-popover|hide-popover|show-modal|close|request-close)$/;
+  // The popover that a button opens or closes, when its `popovertarget` or popover `command` points to one.
+  const invoked = node => {
+    if (!(node instanceof HTMLButtonElement || node instanceof HTMLInputElement && /^(button|submit|reset|image)$/.test(node.type)) || disabled(node)) return null;
+    const target = node.localName === 'button' && node.commandForElement;
+    if (target) return /popover$/.test(node.command) && target.popover !== null ? target : null;
+    if (node.form && (node.localName === 'button' ? node.type === 'submit' : /^(submit|image)$/.test(node.type))) return null;
+    const popover = node.popoverTargetElement;
+    return popover?.popover ? popover : null;
+  };
+  // Runs the `commandfor` or else the `popovertarget` action of an activated button.
+  const invoke = (button, target) => {
+    const element = button.localName === 'button' ? button.commandForElement : null;
+    if (element) {
+      const command = button.command, custom = command.startsWith('--');
+      if (!command || !custom && element.popover === null && !(element.localName === 'dialog' && (command === 'show-modal' ? !element.open : /close$/.test(command) && element.open))) return;
+      if (!dispatch(element, new CommandEvent('command', { cancelable: true, command, source: button })) || !element.isConnected || custom) return;
+      if (command === 'hide-popover' || command === 'toggle-popover' && element._popover) hidePopover(element, true, true, button);
+      else if (/popover$/.test(command)) { if (!element._popover && element.popover !== null && !(element.localName === 'dialog' && element._modal) && !fullscreens.includes(element)) showPopover(element, button); }
+      else if (element.localName !== 'dialog') return;
+      else if (command === 'show-modal') { if (!element.open && !element._popover) element.showModal(); }
+      else if (command === 'close') element.close(button.value);
+      else element.requestClose(button.value);
+      return;
+    }
+    const popover = invoked(button);
+    if (!popover || popover.contains(target) && button !== popover && popover.contains(button)) return;
+    const action = button.popoverTargetAction;
+    if (popover._popover) { if (action !== 'show') hidePopover(popover, true, true, button); }
+    else if (action !== 'hide' && popover.isConnected && !(popover.localName === 'dialog' && popover._modal) && !fullscreens.includes(popover)) showPopover(popover, button);
+  };
+  class CommandEvent extends Event { constructor(type, options = {}) { super(type, options); this.command = String(options.command ?? ''); this.source = options.source ?? null; } }
+  for (const Type of [HTMLButtonElement, HTMLInputElement]) Object.defineProperties(Type.prototype, {
+    popoverTargetElement: { configurable: true, get() { return referenced(this, 'popovertarget', '_popoverTarget'); }, set(value) { reference(this, 'popovertarget', '_popoverTarget', value); } },
+    popoverTargetAction: { configurable: true, get() { const value = (this.getAttribute('popovertargetaction') ?? '').toLowerCase(); return value === 'show' || value === 'hide' ? value : 'toggle'; }, set(value) { this.setAttribute('popovertargetaction', value); } },
+  });
+  Object.defineProperties(HTMLButtonElement.prototype, {
+    commandForElement: { configurable: true, get() { return referenced(this, 'commandfor', '_commandFor'); }, set(value) { reference(this, 'commandfor', '_commandFor', value); } },
+    command: { configurable: true, get() { const value = this.getAttribute('command') ?? ''; return value.startsWith('--') ? value : commands.test(value.toLowerCase()) ? value.toLowerCase() : ''; }, set(value) { this.setAttribute('command', value); } },
+  });
+  Object.defineProperty(HTMLElement.prototype, 'popover', { configurable: true, get() { return popoverState(this.getAttribute('popover')); }, set(value) { if (value === null) this.removeAttribute('popover'); else this.setAttribute('popover', value); } });
+  Object.assign(HTMLElement.prototype, {
+    showPopover(options = {}) { popoverReady(this, false); showPopover(this, options?.source ?? null); },
+    hidePopover() { if (popoverReady(this, true)) hidePopover(this, true, true); },
+    togglePopover(options) {
+      const force = typeof options === 'boolean' ? options : options?.force, source = typeof options === 'object' ? options?.source ?? null : null;
+      if (this._popover && force !== true) { if (popoverReady(this, true)) hidePopover(this, true, true, source); }
+      else if (!this._popover && force !== false) { popoverReady(this, false); showPopover(this, source); }
+      else popoverReady(this, !this._popover);
+      return !!this._popover;
+    },
+  });
+  // Presses outside the open popovers and dialogs light dismiss them, when the press starts and ends in the same one.
+  let pressedPopover = null, pressedDialog = null;
+  const lightDismiss = (down, target, x, y) => {
+    if (autos.length || hints.length) {
+      const clicked = nearestPopover(target, [...autos, ...hints]), button = path(target).map(node => node.nodeType === 1 && invoked(node)).find(popover => popover?._popover && popover._popover !== 'manual') ?? null;
+      const ancestor = position(clicked) > position(button) ? clicked : button;
+      if (down) pressedPopover = ancestor; else { const same = ancestor === pressedPopover; pressedPopover = null; if (same) hideUntil(ancestor ?? document); }
+    }
+    if (dialogs.length) {
+      let clicked = path(target).find(node => node.localName === 'dialog' && dialogs.includes(node)) ?? null;
+      if (clicked === target && clicked._modal) { const box = clicked.getBoundingClientRect(); if (x < box.left || y < box.top || x >= box.right || y >= box.bottom) clicked = null; }
+      if (down) pressedDialog = clicked;
+      else { const same = clicked === pressedDialog, top = dialogs.at(-1); pressedDialog = null; if (same && top && top !== clicked && top.closedBy === 'any') top.requestClose(); }
+    }
+  };
+  // Elements leave fullscreen, the last first, and each gets `fullscreenchange`, or the document once it left.
+  const exitFullscreen = (all, native = false) => {
+    const exited = all ? fullscreens.splice(0) : fullscreens.splice(-1);
+    for (const node of exited.reverse()) { flag(node, 16, false); layer(node, false); }
+    if (!native && exited.length && !fullscreens.length) call('dom.fullscreen', false);
+    return new Promise(resolve => setTimeout(() => { for (const node of exited) dispatch(node.isConnected ? node : document, trusted(new Event('fullscreenchange', { bubbles: true, composed: true }))); resolve(); }, 0));
+  };
+  const requestFullscreen = function () {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected || this.localName === 'dialog' && this._modal || this.namespaceURI !== XHTML && this.localName !== 'svg' && this.localName !== 'math') {
+        setTimeout(() => { dispatch(this.isConnected ? this : document, trusted(new Event('fullscreenerror', { bubbles: true, composed: true }))); reject(new TypeError('The element cannot enter fullscreen')); }, 0);
+        return;
+      }
+      if (fullscreens.at(-1) === this) return resolve();
+      if (this._popover) hidePopover(this, true, true);
+      hideUntil(document);
+      const first = !fullscreens.length;
+      drop(fullscreens, this); fullscreens.push(this); flag(this, 16, true); layer(this, true);
+      if (first) call('dom.fullscreen', true);
+      setTimeout(() => { dispatch(this, trusted(new Event('fullscreenchange', { bubbles: true, composed: true }))); resolve(); }, 0);
+    });
+  };
+  Object.assign(Element.prototype, { requestFullscreen, webkitRequestFullscreen: requestFullscreen, webkitRequestFullScreen: requestFullscreen });
   class HTMLDetailsElement extends HTMLElement { get open() { return this.hasAttribute('open'); } set open(value) { this.toggleAttribute('open', !!value); } }
   class HTMLLabelElement extends HTMLElement { get htmlFor() { return this.getAttribute('for') ?? ''; } set htmlFor(value) { this.setAttribute('for', value); } get control() { return labelControl(this); } get form() { return this.control?.form ?? null; } }
   const resolved = value => { try { return new URL(value, document.baseURI).href; } catch { return value; } };
@@ -1044,7 +1245,7 @@
   }
   class WheelEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); this.deltaX = options.deltaX ?? 0; this.deltaY = options.deltaY ?? 0; this.deltaZ = options.deltaZ ?? 0; this.deltaMode = options.deltaMode ?? 0; } }
   for (const [name, value] of Object.entries({ DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 })) { WheelEvent[name] = value; WheelEvent.prototype[name] = value; }
-  class ToggleEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldState = options.oldState ?? ''; this.newState = options.newState ?? ''; } }
+  class ToggleEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldState = options.oldState ?? ''; this.newState = options.newState ?? ''; this.source = options.source ?? null; } }
   class SubmitEvent extends Event { constructor(type, options = {}) { super(type, options); this.submitter = options.submitter ?? null; } }
   class KeyboardEvent extends UIEvent { constructor(type, options = {}) { super(type, options); const { bubbles, cancelable, composed, ...fields } = options; Object.assign(this, { key: '', code: '', keyCode: 0, charCode: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, repeat: false, isComposing: false }, fields); } getModifierState(key) { return !!this[({ Control: 'ctrlKey', Meta: 'metaKey', Alt: 'altKey', Shift: 'shiftKey' })[key]]; } }
   class PointerEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); Object.assign(this, { pointerId: options.pointerId ?? 0, width: options.width ?? 1, height: options.height ?? 1, pressure: options.pressure ?? (this.buttons ? 0.5 : 0), tangentialPressure: options.tangentialPressure ?? 0, tiltX: options.tiltX ?? 0, tiltY: options.tiltY ?? 0, twist: options.twist ?? 0, altitudeAngle: options.altitudeAngle ?? Math.PI / 2, azimuthAngle: options.azimuthAngle ?? 0, pointerType: options.pointerType ?? '', isPrimary: options.isPrimary ?? false }); } getCoalescedEvents() { return []; } getPredictedEvents() { return []; } }
@@ -1185,7 +1386,7 @@
   const adoptedProperty = { configurable: true, get() { return (this._adoption ??= adoptedSheets(this)).proxy; }, set(sheets) { const adoption = this._adoption ??= adoptedSheets(this), list = Array.from(sheets); adoption.apply(list); adoption.list.splice(0, adoption.list.length, ...list); } };
   const styleSheetsOf = root => {
     const sheets = new StyleSheetList(), stack = [...root._m.kids].reverse();
-    while (stack.length) { const rec = stack.pop(); if (rec.tag === 'style') { const sheet = of(rec).sheet; if (sheet) sheets.push(sheet); } if (rec.tag !== 'template' && rec.tag !== 'noscript') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); }
+    while (stack.length) { const rec = stack.pop(); if (rec.tag === 'style' || rec.tag === 'link') { const sheet = of(rec).sheet; if (sheet) sheets.push(sheet); } if (rec.tag !== 'template' && rec.tag !== 'noscript') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); }
     return sheets;
   };
   const cssEscape = value => {
@@ -1212,6 +1413,7 @@
   class ShadowRoot extends DocumentFragment {
     get innerHTML(){return this._m.kids.map(serialize).join('');} set innerHTML(value){setHTML(this,value);}
     get activeElement() { for (let node = active; node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
+    get fullscreenElement() { for (let node = fullscreens.at(-1); node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
     get styleSheets() { return styleSheetsOf(this); }
   }
   const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root._m];while(stack.length){const rec=stack.pop(),Type=definitions.get(rec.tag),node=Type&&of(rec);if(Type&&!(node instanceof Type))upgrade(node,Type);if(rec.tag!=='template')for(let i=rec.kids.length;i--;)stack.push(rec.kids[i]);if(rec.shadow)stack.push(rec.shadow);}}};
@@ -1301,7 +1503,7 @@
     createComment(text) { return wrap(create('#comment', String(text))); }
     createDocumentFragment() { return wrap(create('#fragment')); }
     createRange() { return new Range(); }
-    get implementation(){return this._implementation??={createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<html><head></head><body></body></html>','text/html');if(title)doc.title=title;return doc;},hasFeature:()=>true};}
+    get implementation(){return this._implementation??={createDocumentType:(name,publicId,systemId)=>{name=String(name);if(!/^[A-Za-z_][\w.-]*(:[A-Za-z_][\w.-]*)?$/.test(name))throw new DOMException('Invalid doctype name','InvalidCharacterError');publicId=String(publicId);systemId=String(systemId);return wrap(create('#doctype',publicId||systemId?[name,publicId,systemId].join('\0'):name));},createHTMLDocument:title=>{const doc=new DOMParser().parseFromString('<html><head></head><body></body></html>','text/html');if(title)doc.title=title;return doc;},hasFeature:()=>true};}
     createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return node.cloneNode(deep); }
     adoptNode(node) { node.remove(); return node; }
@@ -1313,7 +1515,7 @@
     get baseURI() { const base = find(this._m, rec => rec.tag === 'base' && rec.attrs.has('href')); try { return base ? new URL(base.getAttribute('href'), location.href).href : location.href; } catch { return location.href; } }
     get URL() { return location.href; } get documentURI() { return location.href; } get location() { return this === document ? location : null; }
     get characterSet() { return 'UTF-8'; } get contentType() { return 'text/html'; } get scrollingElement() { return this.documentElement; }
-    get readyState() { return this === document ? readyState : 'complete'; } get compatMode() { return 'CSS1Compat'; } get visibilityState() { return 'visible'; } get hidden() { return false; }
+    get readyState() { return this === document ? readyState : 'complete'; } get currentScript() { return this === document ? currentScript : null; } get compatMode() { return (this._quirks ??= quirks(this.doctype)) ? 'BackCompat' : 'CSS1Compat'; } get doctype() { return of(this._m.kids.find(rec => rec.tag === '#doctype')); } get visibilityState() { return 'visible'; } get hidden() { return false; }
     get title() { return (find(this._m, rec => rec.tag === 'title')?.textContent ?? '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
     set title(value) {
       let title = find(this._m, rec => rec.tag === 'title');
@@ -1334,6 +1536,11 @@
     caretPositionFromPoint(x,y){const range=this.caretRangeFromPoint(x,y);return range?{offsetNode:range.startContainer,offset:range.startOffset}:null;}
     elementFromPoint(x, y) { return wrap(call('dom.hitTest', x, y, true)); }
     elementsFromPoint(x, y) { return call('dom.hitTest', x, y).map(wrap); }
+    get fullscreenElement() { let node = fullscreens.at(-1) ?? null; while (node && node.getRootNode() !== this) node = node.getRootNode().host ?? null; return node; }
+    get fullscreenEnabled() { return true; } get fullscreen() { return !!this.fullscreenElement; }
+    exitFullscreen() { return fullscreens.length ? exitFullscreen(false) : Promise.reject(new TypeError('The document is not in fullscreen')); }
+    get webkitFullscreenElement() { return this.fullscreenElement; } get webkitCurrentFullScreenElement() { return this.fullscreenElement; } get webkitFullscreenEnabled() { return true; } get webkitIsFullScreen() { return this.fullscreen; }
+    webkitExitFullscreen() { return this.exitFullscreen(); } webkitCancelFullScreen() { return this.exitFullscreen(); }
   }
   DocumentFragment.prototype.getElementById = Document.prototype.getElementById;
   class ParentNode {
@@ -1510,7 +1717,7 @@
     for (; rec && !(node = rec.ref?.deref()); rec = rec.up) chain.push(rec);
     for (let i = chain.length; i--;) {
       const { id, tag } = chain[i], above = node, svg = tag === 'svg' || above instanceof SVGElement && above.localName !== 'foreignObject';
-      const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag === '#text' ? Text : tag === '#comment' ? Comment : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : htmlTypes.get(tag) ?? HTMLElement;
+      const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag === '#text' ? Text : tag === '#comment' ? Comment : tag === '#doctype' ? DocumentType : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : htmlTypes.get(tag) ?? HTMLElement;
       node = new Type(id, tag); if (above) hold(above, node);
     }
     return node;
@@ -1600,6 +1807,7 @@
   for (const [tags, name] of [['a area link base', 'href'], ['img script iframe embed source track audio video input', 'src'], ['object', 'data'], ['blockquote q ins del', 'cite']]) for (const tag of tags.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { const value = this.getAttribute(name); return value === null ? '' : resolved(value); }, set(value) { this.setAttribute(name, value); } });
   for (const key of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password']) for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, key, { configurable: true, get() { try { return new URL(this.href)[key]; } catch { return key === 'origin' ? 'null' : ''; } }, set(value) { try { const url = new URL(this.href); url[key] = value; this.href = url.href; } catch {} } });
   for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, 'toString', { configurable: true, writable: true, value() { return this.href; } });
+  for (const [tags, names] of [['a area link', 'rel'], ['a area', 'target download'], ['a link script', 'type'], ['link', 'media as hreflang'], ['meta', 'name content']]) for (const tag of tags.split(' ')) for (const name of names.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { return this.getAttribute(name) ?? ''; }, set(value) { this.setAttribute(name, value); } });
   for (const tag of ['a', 'area', 'link']) Object.defineProperty(htmlTypes.get(tag).prototype, 'relList', { configurable: true, get() { return this._relList ??= new DOMTokenList(this, 'rel'); } });
   {
     const kids = (el, ...tags) => [...el.children].filter(child => tags.includes(child.localName));
@@ -1640,14 +1848,16 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { Node, CharacterData, Text, Comment, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
+  Object.assign(globalThis, { Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
   Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
   Object.assign(globalThis, { CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
-  Object.defineProperty(HTMLStyleElement.prototype, 'sheet', { configurable: true, get() { let inert = !this.isConnected; for (let rec = this._m.up; rec && !inert; rec = rec.up) inert = rec.tag === 'template' || rec.tag === 'noscript'; return inert ? this._sheet = null : this._sheet ??= new CSSStyleSheet({}, this); } });
-  Object.defineProperty(HTMLLinkElement.prototype, 'sheet', { configurable: true, get() { return null; } });
+  const ownSheet = node => { let inert = !node.isConnected; for (let rec = node._m.up; rec && !inert; rec = rec.up) inert = rec.tag === 'template' || rec.tag === 'noscript'; return inert ? node._sheet = null : node._sheet ??= new CSSStyleSheet({}, node); };
+  Object.defineProperty(HTMLStyleElement.prototype, 'sheet', { configurable: true, get() { return ownSheet(this); } });
+  // WARNING: only stylesheet links of the page HTML have a sheet, with the CSS that the bundler compiled.
+  Object.defineProperty(HTMLLinkElement.prototype, 'sheet', { configurable: true, get() { return /(^|\s)stylesheet(\s|$)/i.test(this.getAttribute('rel') ?? '') && (this._linked ??= call('dom.css', this._id) !== null) ? ownSheet(this) : null; } });
   Object.defineProperty(Node.prototype, 'baseURI', { configurable: true, get() { return document.baseURI; } });
   globalThis.Option = function Option(text = '', value, defaultSelected = false, selected = false) { const option = document.createElement('option'); if (text !== '') option.text = text; if (value !== undefined) option.value = value; option.defaultSelected = defaultSelected; if (selected) option.selected = true; return option; };
   // WARNING: `on*` properties add one listener on first set, where it keeps its place among the others, and remove it when set to null, like browser event handlers.
@@ -1664,12 +1874,15 @@
       const created = own[name] = { value, listener(event) { const fn = created.value; if (typeof fn !== 'function') return; const result = fn.call(this, event); if (result === false) event.preventDefault(); } };
       this.addEventListener(name, created.listener);
     } });
-  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
+  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
   for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
-  handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange'); handler(Document.prototype, 'fullscreenchange');
+  handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange');
+  for (const name of ['fullscreenchange', 'fullscreenerror']) for (const target of [Element.prototype, Document.prototype]) handler(target, name);
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
-  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Submit)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
+  // WARNING: bundled pages set the running classic `<script>` here, see `$appsClassic` in the bundler.
+  globalThis.__appsScript = node => { currentScript = node ?? null; };
   globalThis.__appsLoaded = () => {
     readyState = 'interactive'; dispatch(document, trusted(new Event('readystatechange')));
     dispatch(document, trusted(new Event('DOMContentLoaded', { bubbles: true })));
@@ -1678,14 +1891,20 @@
   };
   globalThis.Image = function Image(width,height) { const image=document.createElement('img'); if(width!==undefined) image.width=width; if(height!==undefined) image.height=height; return image; };
   class FontFace {
-    constructor(family,source,descriptors={}) { Object.assign(this,{family:String(family),style:'normal',weight:'normal',stretch:'normal',status:'unloaded'},descriptors); this._source=source;this.loaded=new Promise((resolve,reject)=>{this._resolve=resolve;this._reject=reject;});this.loaded.catch(()=>{}); }
-    load() { if (this.status!=='unloaded') return this.loaded; this.status='loading'; (async()=>{try {let bytes=this._source;if(typeof bytes==='string'){const local=/^local\(["']?([^"')]+)["']?\)$/.exec(bytes);if(local){if(!call('dom.fontCheck',0,local[1])) throw new DOMException('Local font unavailable','NetworkError');} else {const url=/url\(["']?([^"')]+)["']?\)/.exec(bytes);if(!url) throw new DOMException('Unsupported font source','SyntaxError');const response=await fetch(url[1]);if(!response.ok)throw new DOMException('Font request failed','NetworkError');bytes=await response.arrayBuffer();call('dom.font',0,this.family,new Uint8Array(bytes));}}else call('dom.font',0,this.family,ArrayBuffer.isView(bytes)?new Uint8Array(bytes.buffer,bytes.byteOffset,bytes.byteLength):new Uint8Array(bytes));this.status='loaded';this._resolve(this);}catch(error){this.status='error';this._reject(error);}})();return this.loaded; }
+    constructor(family,source,descriptors={}) { Object.assign(this,{family:String(family),style:'normal',weight:'normal',stretch:'normal',unicodeRange:'U+0-10FFFF',status:'unloaded'},descriptors); this._source=source;this.loaded=new Promise((resolve,reject)=>{this._resolve=resolve;this._reject=reject;});this.loaded.catch(()=>{}); }
+    load() { if (this.status!=='unloaded') return this.loaded; this.status='loading'; (async()=>{const source=this._source;let error=new DOMException('No supported font source','SyntaxError');for(const [kind,value] of typeof source==='string'?call('dom.fontSources',0,source):[['data',source]]) try {if(kind==='local'){if(call('dom.font',0,this.family,value))return this._done('loaded');throw new DOMException('Local font unavailable','NetworkError');}let bytes=value;if(kind==='url'){const response=await fetch(value);if(!response.ok)throw new DOMException('Font request failed','NetworkError');bytes=await response.arrayBuffer();}call('dom.font',0,this.family,ArrayBuffer.isView(bytes)?new Uint8Array(bytes.buffer,bytes.byteOffset,bytes.byteLength):new Uint8Array(bytes));return this._done('loaded');}catch(caught){error=caught;}this._done('error',error);})();return this.loaded; }
+    _done(status,error) { this.status=status; if(status==='loaded')this._resolve(this); else if(status==='error')this._reject(error); }
   }
   class FontFaceSet extends EventTarget {
-    constructor() {super();this._faces=new Set();this.status='loaded';this.ready=Promise.resolve(this);}
-    add(face) {if(!(face instanceof FontFace))throw new TypeError('Expected FontFace');this._faces.add(face);return this;} delete(face){return this._faces.delete(face);} clear(){this._faces.clear();} has(face){return this._faces.has(face);} get size(){return this._faces.size;} values(){return this._faces.values();} keys(){return this.values();} entries(){return this._faces.entries();} forEach(fn,thisArg){this._faces.forEach(face=>fn.call(thisArg,face,face,this));} [Symbol.iterator](){return this.values();}
-    load(font,text=' ') {const families=String(font).replace(/^.*?\d+(?:\.\d+)?px\s+/,'').split(',').map(v=>v.trim().replace(/^['"]|['"]$/g,'')),faces=[...this._faces].filter(face=>families.includes(face.family));this.status='loading';this.dispatchEvent(new Event('loading'));const result=Promise.all(faces.map(face=>face.load()));this.ready=result.then(()=>{this.status='loaded';this.dispatchEvent(new Event('loadingdone'));return this;},error=>{this.status='loaded';this.dispatchEvent(new Event('loadingerror'));throw error;});this.ready.catch(()=>{});return result;}
-    check(font,text=' ') {const families=String(font).replace(/^.*?\d+(?:\.\d+)?px\s+/,'').split(',').map(v=>v.trim().replace(/^['"]|['"]$/g,''));return families.some(family=>{const faces=[...this._faces].filter(face=>face.family===family);return faces.length?faces.every(face=>face.status==='loaded'):call('dom.fontCheck',0,family);});}
+    constructor() {super();this._faces=new Set();this._css=[];}
+    // WARNING: `@font-face` faces load with the next frame, or in `dom.fonts` when the page asks for them, so fonts are ready before text is measured.
+    _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;version++;}this._css=css.map(([family,source,range,status],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,range?{unicodeRange:range}:{});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
+    add(face) {if(!(face instanceof FontFace))throw new TypeError('Expected FontFace');this._faces.add(face);return this;} delete(face){return this._faces.delete(face);} clear(){this._faces.clear();} has(face){return this._all().includes(face);} get size(){return this._all().length;} values(){return this._all().values();} keys(){return this.values();} entries(){return this._all().map(face=>[face,face]).values();} forEach(fn,thisArg){for(const face of this._all())fn.call(thisArg,face,face,this);} [Symbol.iterator](){return this.values();}
+    get status() {return this._all().some(face=>face.status==='loading')?'loading':'loaded';}
+    get ready() {return Promise.all(this._all().map(face=>face.status==='loading'&&face.loaded.catch(()=>{}))).then(()=>this);}
+    _match(font,text) {const families=String(font).replace(/^.*?\d+(?:\.\d+)?px\s+/,'').split(',').map(v=>v.trim().replace(/^['"]|['"]$/g,'')),codes=[...String(text)].map(c=>c.codePointAt(0)),faces=this._all().filter(face=>families.includes(face.family));return [families,faces,faces.filter(face=>String(face.unicodeRange).split(',').some(range=>{const [low,high=low]=range.trim().slice(2).split('-');return codes.some(code=>code>=parseInt(low.replace(/\?/g,'0'),16)&&code<=parseInt(high.replace(/\?/g,'f'),16));}))];}
+    load(font,text=' ') {const [,,faces]=this._match(font,text);this.dispatchEvent(new Event('loading'));const result=Promise.all(faces.map(face=>face.load()));result.then(()=>this.dispatchEvent(new Event('loadingdone')),()=>this.dispatchEvent(new Event('loadingerror')));return result;}
+    check(font,text=' ') {const [families,faces,used]=this._match(font,text);return families.some(family=>faces.some(face=>face.family===family)?used.every(face=>face.family!==family||face.status==='loaded'):call('dom.fontCheck',0,family));}
   }
   Object.assign(globalThis,{FontFace,FontFaceSet});document.fonts=new FontFaceSet();
   globalThis.NodeFilter = { SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3 };
@@ -1705,6 +1924,9 @@
   globalThis.__appsAnimationFrame = () => {
     animationTimer = undefined;
     const now = performance.now(), callbacks = [...animationFrames];
+    // Script animations see the frame time while the callbacks run, and their pending tasks finish first.
+    timelineTime = now; microtask(() => { timelineTime = null; });
+    if (pendingAnimations.size) { const ready = [...pendingAnimations]; pendingAnimations.clear(); for (const animation of ready) readyAnimation(animation); }
     for (const [id, callback] of callbacks) {
       if (!animationFrames.delete(id)) continue;
       try { callback(now); } catch (error) { console.error(error); }
@@ -1717,6 +1939,466 @@
     return id;
   };
   globalThis.cancelAnimationFrame = id => animationFrames.delete(id);
+  // Web Animations. `Animation` keeps the timing model and sends its keyframes, timing and current time to Rust, which samples them every frame. A timer runs its finish.
+  let timelineTime = null;
+  const timelineNow = () => { if (timelineTime === null) { timelineTime = performance.now(); microtask(() => { timelineTime = null; }); } return timelineTime; };
+  class AnimationTimeline { constructor() { if (new.target === AnimationTimeline) throw new TypeError('Illegal constructor'); } get currentTime() { return timelineNow(); } get duration() { return null; } }
+  class DocumentTimeline extends AnimationTimeline { #origin; constructor(options = {}) { super(); this.#origin = Number(options?.originTime ?? 0); } get currentTime() { return timelineNow() - this.#origin; } }
+  const documentTimeline = new DocumentTimeline();
+  const easings = new Map();
+  const easingOf = value => {
+    value = String(value).trim();
+    if (easings.has(value)) return value;
+    // WARNING: `animation-timing-function` takes a list, so commas outside functions are errors here.
+    if (!value || value.replace(/\([^)]*\)/g, '').includes(',') || !call('dom.supports', 'animation-timing-function', value)) throw new TypeError(`'${value}' is not a valid easing`);
+    if (easings.size > 256) easings.clear();
+    easings.set(value, true);
+    return value;
+  };
+  const defaultTiming = { delay: 0, endDelay: 0, fill: 'auto', iterationStart: 0, iterations: 1, duration: 'auto', direction: 'normal', easing: 'linear' };
+  const timingChoices = { fill: ['none', 'forwards', 'backwards', 'both', 'auto'], direction: ['normal', 'reverse', 'alternate', 'alternate-reverse'] };
+  const timingOf = (input, base) => {
+    const timing = { ...base };
+    if (input == null) return timing;
+    if (typeof input !== 'object') throw new TypeError('Expected timing options');
+    for (const key of Object.keys(defaultTiming)) {
+      const raw = input[key];
+      if (raw === undefined) continue;
+      let value;
+      if (timingChoices[key]) { value = String(raw); if (!timingChoices[key].includes(value)) throw new TypeError(`'${value}' is not a valid ${key}`); }
+      else if (key === 'easing') value = easingOf(raw);
+      else if (key === 'duration' && typeof raw === 'string') { if (raw !== 'auto') throw new TypeError(`'${raw}' is not a valid duration`); value = raw; }
+      else {
+        value = Number(raw);
+        if (Number.isNaN(value) || key !== 'iterations' && key !== 'duration' && !Number.isFinite(value) || (key === 'iterations' || key === 'duration' || key === 'iterationStart') && value < 0) throw new TypeError(`${raw} is not a valid ${key}`);
+      }
+      timing[key] = value;
+    }
+    return timing;
+  };
+  const computedTiming = (timing, local, rate) => {
+    const duration = timing.duration === 'auto' ? 0 : timing.duration, fill = timing.fill === 'auto' ? 'none' : timing.fill;
+    const activeDuration = duration === 0 || timing.iterations === 0 ? 0 : duration * timing.iterations, endTime = Math.max(timing.delay + activeDuration + timing.endDelay, 0);
+    const result = { ...timing, duration, fill, activeDuration, endTime, localTime: local, progress: null, currentIteration: null };
+    if (local === null) return result;
+    const start = Math.max(Math.min(timing.delay, endTime), 0), stop = Math.max(Math.min(timing.delay + activeDuration, endTime), 0);
+    const before = local < start || rate < 0 && local === start, after = !before && (local > stop || rate >= 0 && local === stop);
+    if (before && fill !== 'backwards' && fill !== 'both' || after && fill !== 'forwards' && fill !== 'both') return result;
+    const active = Math.max(Math.min(local - timing.delay, activeDuration), 0);
+    const overall = timing.iterationStart + (duration === 0 ? (before ? 0 : timing.iterations) : active / duration);
+    let simple = Number.isFinite(overall) ? overall % 1 : timing.iterationStart % 1;
+    if (simple === 0 && !before && active === activeDuration && timing.iterations !== 0 && overall > 0) simple = 1;
+    const iteration = after && timing.iterations === Infinity ? Infinity : Math.floor(overall) - (simple === 1 ? 1 : 0);
+    const reverse = timing.direction === 'reverse' || timing.direction === 'alternate' && iteration % 2 === 1 || timing.direction === 'alternate-reverse' && iteration % 2 === 0;
+    const directed = reverse ? 1 - simple : simple;
+    return Object.assign(result, { progress: timing.easing === 'linear' ? directed : call('dom.easing', timing.easing, directed), currentIteration: iteration });
+  };
+  const frameKeys = new Set(['offset', 'easing', 'composite']);
+  // Keyframes as `{ offset, computed, easing, composite, props: [[css name, value]] }`, from a list of keyframes or from lists of values by property.
+  const keyframesOf = input => {
+    if (input == null) return [];
+    if (typeof input !== 'object') throw new TypeError('Keyframes must be an object or an array');
+    let frames;
+    if (typeof input[Symbol.iterator] === 'function') {
+      frames = Array.from(input, frame => {
+        if (frame === null || typeof frame !== 'object') throw new TypeError('A keyframe must be an object');
+        return { offset: frame.offset == null ? null : Number(frame.offset), computed: null, easing: easingOf(frame.easing ?? 'linear'), composite: frame.composite == null ? 'auto' : String(frame.composite), props: Object.keys(frame).filter(key => !frameKeys.has(key)).map(key => [styleName(key), String(frame[key])]) };
+      });
+    } else {
+      const points = [];
+      for (const key of Object.keys(input)) {
+        if (frameKeys.has(key)) continue;
+        const values = Array.isArray(input[key]) ? input[key] : [input[key]];
+        values.forEach((value, index) => points.push([values.length === 1 ? 1 : index / (values.length - 1), styleName(key), String(value)]));
+      }
+      points.sort((a, b) => a[0] - b[0]);
+      frames = [];
+      for (const [offset, name, value] of points) { const last = frames[frames.length - 1]; if (last?.computed === offset) last.props.push([name, value]); else frames.push({ offset: null, computed: offset, easing: 'linear', composite: 'auto', props: [[name, value]] }); }
+      const list = (value, map) => value === undefined ? [] : Array.isArray(value) ? value.map(map) : [map(value)];
+      list(input.offset, value => value == null ? null : Number(value)).forEach((offset, index) => { if (frames[index]) frames[index].offset = offset; });
+      const eases = list(input.easing, easingOf), composites = list(input.composite, String);
+      frames.forEach((frame, index) => { if (eases.length) frame.easing = eases[index % eases.length]; if (composites.length) frame.composite = composites[index % composites.length]; });
+    }
+    let previous = -Infinity;
+    for (const { offset } of frames) {
+      if (offset === null) continue;
+      if (!(offset >= 0 && offset <= 1)) throw new TypeError('Keyframe offsets must be between 0 and 1');
+      if (offset < previous) throw new TypeError('Keyframe offsets must be in animationOrder');
+      previous = offset;
+    }
+    // Missing offsets: the first keyframe goes to 0, the last to 1, and the others spread out evenly between known ones.
+    const known = frames.map(frame => frame.offset ?? frame.computed);
+    if (frames.length === 1) known[0] ??= 1;
+    else if (frames.length) { known[0] ??= 0; known[frames.length - 1] ??= 1; }
+    for (let index = 1; index < known.length; index++) {
+      if (known[index] !== null) continue;
+      let end = index;
+      while (known[end] === null) end++;
+      for (let step = index; step < end; step++) known[step] = known[index - 1] + (known[end] - known[index - 1]) * (step - index + 1) / (end - index + 1);
+    }
+    frames.forEach((frame, index) => { frame.computed = known[index]; });
+    return frames;
+  };
+  const camelName = name => name.startsWith('--') ? name : name === 'float' ? 'cssFloat' : name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  // Effects keep `{ target, pseudo, frames, timing, composite, animation }`.
+  const effects = new WeakMap();
+  let retimed, animationOrder, replaceable, filling;
+  class AnimationEffect {
+    constructor() { if (new.target === AnimationEffect) throw new TypeError('Illegal constructor'); }
+    getTiming() { return { ...effects.get(this).timing }; }
+    getComputedTiming() { const { timing, animation } = effects.get(this); return computedTiming(timing, animation?.currentTime ?? null, animation?.playbackRate ?? 1); }
+    updateTiming(input = {}) { const effect = effects.get(this); effect.timing = timingOf(input, effect.timing); if (effect.animation) retimed(effect.animation); }
+  }
+  class KeyframeEffect extends AnimationEffect {
+    constructor(target, keyframes, options) {
+      super();
+      if (target instanceof KeyframeEffect) { const source = effects.get(target); effects.set(this, { ...source, frames: source.frames.map(frame => ({ ...frame, props: [...frame.props] })), timing: { ...source.timing }, animation: null }); return; }
+      if (target != null && !(target instanceof Element)) throw new TypeError('The target must be an element');
+      const settings = typeof options === 'number' ? { duration: options } : options ?? {};
+      const composite = settings.composite ?? 'replace';
+      if (!['replace', 'add', 'accumulate'].includes(composite)) throw new TypeError(`'${composite}' is not a valid composite`);
+      effects.set(this, { target: target ?? null, pseudo: settings.pseudoElement ?? null, frames: keyframesOf(keyframes), timing: timingOf(settings, defaultTiming), composite, animation: null });
+    }
+    get target() { return effects.get(this).target; }
+    set target(target) { if (target != null && !(target instanceof Element)) throw new TypeError('The target must be an element'); const effect = effects.get(this); effect.target = target ?? null; if (effect.animation) retimed(effect.animation); }
+    get pseudoElement() { return effects.get(this).pseudo; }
+    set pseudoElement(value) { const effect = effects.get(this); effect.pseudo = value == null ? null : String(value); if (effect.animation) retimed(effect.animation); }
+    get composite() { return effects.get(this).composite; }
+    set composite(value) { if (['replace', 'add', 'accumulate'].includes(value)) effects.get(this).composite = value; }
+    get iterationComposite() { return 'replace'; }
+    getKeyframes() { return effects.get(this).frames.map(frame => { const result = { offset: frame.offset, computedOffset: frame.computed, easing: frame.easing, composite: frame.composite }; for (const [name, value] of frame.props) result[camelName(name)] = value; return result; }); }
+    setKeyframes(keyframes) { const effect = effects.get(this); effect.frames = keyframesOf(keyframes); if (effect.animation) retimed(effect.animation); }
+  }
+  class AnimationPlaybackEvent extends Event { constructor(type, init = {}) { super(type, init); this.currentTime = init?.currentTime ?? null; this.timelineTime = init?.timelineTime ?? null; } }
+  // The animations that are not idle, for `getAnimations()` and replacing.
+  const liveAnimations = new Set();
+  let animationIds = 0;
+  // Pending play and pause tasks finish at the next animation frame, which is their ready time, like in browsers.
+  const pendingAnimations = new Set();
+  let readyAnimation;
+  class Animation extends EventTarget {
+    #id = ++animationIds; #effect = null; #timeline; #start = null; #hold = null; #rate = 1; #pendingRate = null; #playing = false; #pausing = false; #previous = null;
+    #finished; #settle; #fail; #done = false; #queued = false; #ready; #readyResolve = null; #readyReject = null; #timer; #replace = 'active'; #synced = false;
+    static {
+      retimed = animation => animation.#update(false, false);
+      animationOrder = animation => animation.#id;
+      filling = animation => animation.#fills();
+      // Finished animations that fill and that newer ones fully cover are removed, so filling animations don't pile up.
+      replaceable = animation => animation.#replace === 'active' && animation.playState === 'finished' && animation.#fills();
+      readyAnimation = animation => animation.#commit();
+    }
+    constructor(effect = null, timeline = documentTimeline) { super(); this.id = ''; this.#timeline = timeline; this.#ready = Promise.resolve(this); this.#reset(); this.effect = effect; }
+    #reset() { this.#done = false; this.#finished = new Promise((resolve, reject) => { this.#settle = resolve; this.#fail = reject; }); this.#finished.catch(() => {}); }
+    #wait() { this.#ready = new Promise((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; }); this.#ready.catch(() => {}); }
+    #resolve() { this.#readyResolve?.(this); this.#readyResolve = this.#readyReject = null; }
+    #schedule() { pendingAnimations.add(this); if (!host('dom.requestFrame') && animationTimer === undefined) animationTimer = setTimeout(__appsAnimationFrame, 16); }
+    #now() { return this.#timeline?.currentTime ?? null; }
+    #current() { if (this.#hold !== null) return this.#hold; const now = this.#now(); return this.#start === null || now === null ? null : (now - this.#start) * this.#rate; }
+    #effective() { return this.#pendingRate ?? this.#rate; }
+    #apply() { if (this.#pendingRate !== null) { this.#rate = this.#pendingRate; this.#pendingRate = null; } }
+    #end() { return this.#effect ? computedTiming(effects.get(this.#effect).timing, null, 1).endTime : 0; }
+    #fills() { const fill = this.#effect ? effects.get(this.#effect).timing.fill : 'none'; return this.#rate < 0 ? fill === 'backwards' || fill === 'both' : fill === 'forwards' || fill === 'both'; }
+    // Sets the current time without the finished checks.
+    #seek(time) { const now = this.#now(); if (this.#hold !== null || this.#start === null || now === null || this.#rate === 0) this.#hold = time; else this.#start = now - time / this.#rate; if (now === null) this.#start = null; this.#previous = null; }
+    get effect() { return this.#effect; }
+    set effect(effect) {
+      if (effect === this.#effect) return;
+      if (effect !== null && !(effect instanceof KeyframeEffect)) throw new TypeError('The effect must be a KeyframeEffect');
+      if (this.#effect) effects.get(this.#effect).animation = null;
+      if (effect) { const owner = effects.get(effect).animation; if (owner) owner.effect = null; effects.get(effect).animation = this; }
+      this.#effect = effect;
+      this.#update(false, false);
+    }
+    get timeline() { return this.#timeline; }
+    set timeline(timeline) {
+      const time = this.#current(), running = this.#start !== null && this.#hold === null;
+      this.#timeline = timeline ?? null;
+      if (time !== null) { this.#start = null; this.#hold = time; if (running) { this.#playing = true; this.#schedule(); } }
+      this.#update(false, false);
+    }
+    get startTime() { return this.#start; }
+    set startTime(value) {
+      const time = value == null ? null : Number(value);
+      if (this.#now() === null && time !== null) this.#hold = null;
+      const previous = this.#current();
+      this.#apply();
+      this.#start = time;
+      if (time === null) this.#hold = previous; else if (this.#rate !== 0) this.#hold = null;
+      if (this.pending) { this.#playing = this.#pausing = false; this.#resolve(); }
+      this.#update(true, false);
+    }
+    get currentTime() { return this.#current(); }
+    set currentTime(value) {
+      if (value == null) { if (this.#current() !== null) throw new TypeError('The current time cannot be null'); return; }
+      const time = Number(value);
+      this.#seek(time);
+      if (this.#pausing) { this.#hold = time; this.#apply(); this.#start = null; this.#pausing = false; this.#resolve(); }
+      this.#update(true, false);
+    }
+    get playbackRate() { return this.#rate; }
+    set playbackRate(value) { this.#pendingRate = null; const time = this.#current(); this.#rate = Number(value); if (time !== null) this.currentTime = time; else this.#update(false, false); }
+    updatePlaybackRate(value) {
+      const state = this.playState;
+      this.#pendingRate = Number(value);
+      if (this.pending) return;
+      if (state === 'running') return this.#play(false);
+      if (state === 'finished') {
+        const now = this.#now(), unconstrained = this.#start !== null && now !== null ? (now - this.#start) * this.#rate : null;
+        this.#start = this.#pendingRate === 0 ? now : unconstrained === null || now === null ? null : now - unconstrained / this.#pendingRate;
+      }
+      this.#apply();
+      this.#update(false, false);
+    }
+    get playState() {
+      const time = this.#current();
+      if (time === null && this.#start === null && !this.pending) return 'idle';
+      if (this.#pausing || this.#start === null && !this.#playing) return 'paused';
+      const rate = this.#effective();
+      return time !== null && (rate > 0 && time >= this.#end() || rate < 0 && time <= 0) ? 'finished' : 'running';
+    }
+    get replaceState() { return this.#replace; }
+    get pending() { return this.#playing || this.#pausing; }
+    get ready() { return this.#ready; }
+    get finished() { return this.#finished; }
+    // WARNING: browsers resolve the promises at once but fire the events in a later task.
+    #fire(type, timelineTime, currentTime = this.#current()) { setTimeout(() => this.dispatchEvent(new AnimationPlaybackEvent(type, { currentTime, timelineTime }))); }
+    // Runs the pending task at the frame time.
+    #commit() {
+      const now = this.#now();
+      if (now === null || !this.pending) return;
+      if (this.#playing) {
+        this.#playing = false;
+        if (this.#hold !== null) { this.#apply(); this.#start = this.#rate === 0 ? now : now - this.#hold / this.#rate; if (this.#rate !== 0) this.#hold = null; }
+        else if (this.#start !== null && this.#pendingRate !== null) { const time = (now - this.#start) * this.#rate; this.#apply(); if (this.#rate === 0) this.#hold = time; else this.#start = now - time / this.#rate; }
+      } else {
+        this.#pausing = false;
+        if (this.#start !== null && this.#hold === null) this.#hold = (now - this.#start) * this.#rate;
+        this.#apply();
+        this.#start = null;
+      }
+      this.#resolve();
+      this.#update(false, false);
+    }
+    play() { this.#play(true); }
+    #play(rewind) {
+      const aborted = this.#pausing, time = this.#current(), end = this.#end(), rate = this.#effective();
+      let seek = null;
+      if (rewind && rate > 0 && (time === null || time < 0 || time >= end)) seek = 0;
+      else if (rewind && rate < 0 && (time === null || time <= 0 || time > end)) { if (end === Infinity) throw new DOMException('Cannot play an endless animation in reverse', 'InvalidStateError'); seek = end; }
+      else if (rate === 0 && time === null) seek = 0;
+      if (seek !== null) this.#hold = seek;
+      if (this.#hold !== null) this.#start = null;
+      const waiting = this.pending;
+      this.#playing = this.#pausing = false;
+      if (this.#hold === null && seek === null && !aborted && this.#pendingRate === null) return;
+      if (!waiting) this.#wait();
+      this.#playing = true;
+      this.#schedule();
+      this.#update(false, false);
+    }
+    pause() {
+      if (this.#pausing || this.playState === 'paused') return;
+      if (this.#current() === null) {
+        const end = this.#end();
+        if (this.#effective() < 0 && end === Infinity) throw new DOMException('Cannot pause an endless animation in reverse', 'InvalidStateError');
+        this.#hold = this.#effective() < 0 ? end : 0;
+      }
+      if (!this.#playing) this.#wait();
+      this.#playing = false;
+      this.#pausing = true;
+      this.#schedule();
+      this.#update(false, false);
+    }
+    finish() {
+      const end = this.#end(), rate = this.#effective();
+      if (rate === 0 || rate > 0 && end === Infinity) throw new DOMException('Cannot finish the animation', 'InvalidStateError');
+      this.#apply();
+      const limit = this.#rate > 0 ? end : 0, now = this.#now();
+      this.#seek(limit);
+      if (this.#start === null && now !== null) this.#start = now - limit / this.#rate;
+      if (this.pending && this.#start !== null) { if (this.#pausing) this.#hold = null; this.#playing = this.#pausing = false; this.#resolve(); }
+      this.#update(true, true);
+    }
+    cancel() {
+      if (this.playState !== 'idle') {
+        if (this.pending) { this.#playing = this.#pausing = false; this.#apply(); this.#readyReject?.(new DOMException('The animation was canceled', 'AbortError')); this.#readyResolve = this.#readyReject = null; this.#ready = Promise.resolve(this); }
+        if (!this.#done) this.#fail(new DOMException('The animation was canceled', 'AbortError'));
+        this.#reset();
+        this.#fire('cancel', this.#now(), null);
+      }
+      this.#start = this.#hold = null;
+      this.#update(false, false);
+    }
+    reverse() {
+      if (this.#now() === null) throw new DOMException('The animation has no active timeline', 'InvalidStateError');
+      const original = this.#pendingRate;
+      this.#pendingRate = -this.#effective();
+      try { this.#play(true); } catch (error) { this.#pendingRate = original; throw error; }
+    }
+    persist() { this.#replace = 'persisted'; }
+    commitStyles() {
+      const effect = this.#effect && effects.get(this.#effect), target = effect?.target;
+      if (!target) return;
+      if (effect.pseudo || !target.isConnected) throw new DOMException('The target is not rendered', 'NoModificationAllowedError');
+      const values = call('dom.animated', target._id) ?? {};
+      for (const frame of effect.frames) for (const [name] of frame.props) if (values[name] !== undefined) target.style.setProperty(name, values[name]);
+    }
+    // Updates the finished state after a change, like the spec's "update an animation's finished state", then sends the state to Rust.
+    #update(seek, now) {
+      const end = this.#end(), rate = this.#rate, time = this.#now();
+      const unconstrained = seek ? this.#current() : this.#start !== null && time !== null ? (time - this.#start) * rate : null;
+      if (unconstrained !== null && this.#start !== null && !this.pending) {
+        if (rate > 0 && unconstrained >= end) this.#hold = seek ? unconstrained : Math.max(this.#previous ?? end, end);
+        else if (rate < 0 && unconstrained <= 0) this.#hold = seek ? unconstrained : Math.min(this.#previous ?? 0, 0);
+        else if (rate !== 0 && time !== null) { if (seek && this.#hold !== null) this.#start = time - this.#hold / rate; this.#hold = null; }
+      }
+      this.#previous = this.#current();
+      clearTimeout(this.#timer);
+      const state = this.playState;
+      if (state === 'finished') {
+        if (!this.#done && !this.#queued) {
+          this.#queued = true;
+          const notify = () => { this.#queued = false; if (this.playState !== 'finished' || this.#done) return; this.#done = true; this.#settle(this); this.#fire('finish', this.#now()); if (this.#fills()) this.#replaceOlder(); };
+          if (now) notify(); else microtask(notify);
+        }
+      } else {
+        if (this.#done) this.#reset();
+        if (state === 'running' && !this.pending && rate !== 0) {
+          const left = rate > 0 ? (end - this.#previous) / rate : this.#previous / -rate;
+          if (Number.isFinite(left)) this.#timer = setTimeout(() => this.#update(false, false), Math.max(0, left));
+        }
+      }
+      if (state === 'idle' || this.#replace === 'removed') liveAnimations.delete(this); else liveAnimations.add(this);
+      this.#sync();
+    }
+    #replaceOlder() {
+      const target = effects.get(this.#effect)?.target, covered = new Set();
+      if (!target) return;
+      for (const animation of [...liveAnimations].sort((a, b) => animationOrder(b) - animationOrder(a))) {
+        const effect = animation.effect && effects.get(animation.effect);
+        if (effect?.target !== target || !replaceable(animation)) continue;
+        const names = effect.frames.flatMap(frame => frame.props.map(([name]) => name));
+        if (animationOrder(animation) < this.#id && names.every(name => covered.has(name))) {
+          animation.#replace = 'removed';
+          liveAnimations.delete(animation);
+          animation.#sync();
+          animation.#fire('remove', animation.#now());
+        } else for (const name of names) covered.add(name);
+      }
+    }
+    #sync() {
+      const effect = this.#effect && effects.get(this.#effect), target = effect?.target, time = this.#current();
+      // WARNING: only `::before` and `::after` animate among pseudo-elements.
+      if (!target || effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || time === null || this.#replace === 'removed') { if (this.#synced) { this.#synced = false; call('dom.animation', this.#id, -1, null); } return; }
+      const { timing } = effect, duration = timing.duration === 'auto' ? 0 : Math.min(timing.duration, 1e12);
+      this.#synced = true;
+      call('dom.animation', this.#id, target._id, {
+        frames: effect.frames.map(frame => [frame.computed, frame.props.map(([name, value]) => `${name}:${value}`).join(';'), frame.easing]),
+        timing: [timing.delay, timing.endDelay, duration, timing.iterations === Infinity ? -1 : timing.iterations, timing.iterationStart],
+        direction: timing.direction, fill: timing.fill === 'auto' ? 'none' : timing.fill, easing: timing.easing, composite: effect.composite, pseudo: effect.pseudo,
+        time, rate: this.#start !== null && this.#hold === null && this.#now() !== null ? this.#rate : null,
+      });
+    }
+  }
+  for (const name of ['finish', 'cancel', 'remove']) handler(Animation.prototype, name);
+  // CSS animations and transitions run in Rust. Script sees them as these objects, found again by their serial.
+  const cssAnimations = new Map(), cssData = new WeakMap(), cssToken = Symbol();
+  class CSSAnimation extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get animationName() { return cssData.get(this).name; } }
+  class CSSTransition extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get transitionProperty() { return cssData.get(this).name; } }
+  const cssReset = data => { data.settled = false; data.finished = new Promise((resolve, reject) => { data.resolve = resolve; data.reject = reject; }); data.finished.catch(() => {}); };
+  const cssSettle = (animation, done) => {
+    const data = cssData.get(animation);
+    if (data.settled) return false;
+    data.settled = true;
+    if (done) data.resolve(animation); else data.reject(new DOMException('The animation was canceled', 'AbortError'));
+    const currentTime = done ? data.time : null, timelineTime = timelineNow();
+    setTimeout(() => animation.dispatchEvent(new AnimationPlaybackEvent(done ? 'finish' : 'cancel', { currentTime, timelineTime })));
+    data.ended = done;
+    if (!done) data.state = 'idle';
+    // Rust lists only finished animations that fill, so the others leave the cache.
+    if (!done || !['forwards', 'both'].includes(effects.get(data.effect).timing.fill)) cssAnimations.delete(data.serial);
+    return true;
+  };
+  const cssEntry = ([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
+    let animation = cssAnimations.get(serial);
+    if (!animation) {
+      animation = new (kind === 'animation' ? CSSAnimation : CSSTransition)(cssToken);
+      const keyframes = [];
+      for (const [offset, property, value, ease] of frames) {
+        let frame = keyframes.find(frame => frame.offset === offset && frame.easing === ease);
+        if (!frame) keyframes.push(frame = { offset, easing: ease });
+        frame[camelName(property)] = value;
+      }
+      keyframes.sort((a, b) => a.offset - b.offset);
+      const effect = new KeyframeEffect(wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: pseudo || null });
+      effects.get(effect).animation = animation;
+      const data = { serial, kind, name, effect };
+      cssReset(data);
+      cssData.set(animation, data);
+      cssAnimations.set(serial, animation);
+    }
+    Object.assign(cssData.get(animation), { time, state });
+    return animation;
+  };
+  // Reads the state again from Rust; gone ones are idle.
+  const cssState = animation => {
+    const data = cssData.get(animation), target = data.effect.target;
+    if (data.state !== 'idle') {
+      const entry = target && call('dom.cssAnimations', target._id, false, true).find(entry => entry[0] === data.serial);
+      // An animation that ended without filling is gone from Rust but stays finished.
+      if (entry) Object.assign(data, { time: entry[4], state: entry[5] }); else Object.assign(data, data.ended ? { time: computedTiming(effects.get(data.effect).timing, null, 1).endTime, state: 'finished' } : { time: null, state: 'idle' });
+    }
+    return data;
+  };
+  const cssControl = (animation, action, time = 0) => { const data = cssData.get(animation); if (call('dom.cssControl', data.serial, action, time)) cssState(animation); return data; };
+  // Settles the objects of an animation event from Rust; returns whether one settled.
+  const cssEvent = (type, id, data) => {
+    const kind = type.startsWith('animation') ? 'animation' : 'transition', name = kind === 'animation' ? data.animationName : data.propertyName;
+    if (!/(end|cancel)$/.test(type)) return false;
+    let settled = false;
+    for (const animation of cssAnimations.values()) {
+      const own = cssData.get(animation);
+      if (own.kind === kind && own.name === name && own.effect.target?._id === id && (own.effect.pseudoElement ?? '') === (data.pseudoElement ?? '')) settled = cssSettle(animation, type.endsWith('end')) || settled;
+    }
+    return settled;
+  };
+  for (const Type of [CSSAnimation, CSSTransition]) Object.defineProperties(Type.prototype, {
+    effect: { get() { return cssData.get(this).effect; }, set() {}, configurable: true },
+    timeline: { get() { return documentTimeline; }, set() {}, configurable: true },
+    currentTime: { get() { return cssState(this).time; }, set(value) { if (value == null) throw new TypeError('The current time cannot be null'); cssControl(this, 'seek', Number(value)); }, configurable: true },
+    startTime: { get() { const data = cssState(this); return data.state === 'running' ? timelineNow() - data.time : null; }, set(value) { if (value != null) cssControl(this, 'seek', timelineNow() - Number(value)); }, configurable: true },
+    playState: { get() { return cssState(this).state; }, configurable: true },
+    pending: { get() { return false; }, configurable: true },
+    ready: { get() { return cssData.get(this).ready ??= Promise.resolve(this); }, configurable: true },
+    finished: { get() { return cssData.get(this).finished; }, configurable: true },
+    playbackRate: { get() { return 1; }, set(value) { if (Number(value) !== 1) throw new DOMException('CSS animations and transitions play at rate 1', 'NotSupportedError'); }, configurable: true },
+    replaceState: { get() { return 'active'; }, configurable: true },
+    updatePlaybackRate: { value(value) { this.playbackRate = value; }, writable: true, configurable: true },
+    reverse: { value() { throw new DOMException('CSS animations and transitions cannot play in reverse', 'NotSupportedError'); }, writable: true, configurable: true },
+    persist: { value() {}, writable: true, configurable: true },
+    play: { value() { const data = cssData.get(this); if (data.settled && data.state !== 'idle') { cssReset(data); data.ended = false; } cssAnimations.set(data.serial, this); cssControl(this, 'play'); }, writable: true, configurable: true },
+    pause: { value() { cssControl(this, 'pause'); }, writable: true, configurable: true },
+    finish: { value() { const { activeDuration } = cssData.get(this).effect.getComputedTiming(); if (activeDuration === Infinity) throw new DOMException('Cannot finish an endless animation', 'InvalidStateError'); cssControl(this, 'finish'); }, writable: true, configurable: true },
+    cancel: { value() { if (cssState(this).state === 'idle') return; cssControl(this, 'cancel'); cssSettle(this, false); }, writable: true, configurable: true },
+    commitStyles: { value() { const target = cssData.get(this).effect.target, computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
+  });
+  const cssOf = (node, subtree) => {
+    // Pseudo-element animations belong to the subtree, like in browsers.
+    const list = call('dom.cssAnimations', node._id, subtree, subtree).map(cssEntry);
+    // The whole document lists every live one, so the others leave the cache.
+    if (node._id === 0) { const live = new Set(list); for (const [serial, animation] of cssAnimations) if (!live.has(animation)) cssAnimations.delete(serial); }
+    return list;
+  };
+  const animationsOf = test => [...liveAnimations].filter(animation => (animation.playState !== 'finished' || filling(animation)) && animation.effect && test(effects.get(animation.effect))).sort((a, b) => animationOrder(a) - animationOrder(b));
+  Object.defineProperties(Element.prototype, {
+    animate: { value(keyframes, options) { const animation = new Animation(new KeyframeEffect(this, keyframes, options), options?.timeline === undefined ? documentTimeline : options.timeline); if (options?.id !== undefined) animation.id = String(options.id); animation.play(); return animation; }, writable: true, configurable: true },
+    getAnimations: { value(options) { const subtree = !!options?.subtree; return [...cssOf(this, subtree), ...animationsOf(({ target, pseudo }) => target === this && (!pseudo || subtree) || subtree && !!target && this.contains(target))]; }, writable: true, configurable: true },
+  });
+  Object.defineProperties(Document.prototype, {
+    timeline: { get() { return documentTimeline; }, configurable: true },
+    getAnimations: { value() { return [...cssOf(this, true), ...animationsOf(({ target }) => !!target?.isConnected)]; }, writable: true, configurable: true },
+  });
+  Object.assign(globalThis, { Animation, AnimationEffect, KeyframeEffect, AnimationTimeline, DocumentTimeline, AnimationPlaybackEvent, CSSAnimation, CSSTransition });
   const mediaQueries = new Set();
   let mediaViewport = '';
   class MediaQueryListEvent extends Event {
@@ -1730,7 +2412,7 @@
     removeListener(callback) { this.removeEventListener('change', callback); }
   }
   Object.assign(globalThis, { MediaQueryList, MediaQueryListEvent, matchMedia: query => new MediaQueryList(query) });
-  globalThis.__appsLayout = () => { for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } if (entries.length) observer.callback(entries, observer); } };
+  globalThis.__appsLayout = () => { for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -1756,7 +2438,9 @@
     for(const ref of intersectionObservers){
       const observer=ref.deref();
       if(!observer){intersectionObservers.delete(ref);continue;}
-      const m=layout(),root=observer.root?.getBoundingClientRect()??new DOMRect(0,0,...(viewport??=host('dom.viewport')));
+      observing=true;
+      try{
+      const m=layout(),root=observer.root==null||observer.root===document?new DOMRect(0,0,...(viewport??=host('dom.viewport'))):observer.root.getBoundingClientRect();
       const margins=observer.rootMargin.trim().split(/\s+/).map(value=>value.endsWith('%')?parseFloat(value)*root.width/100:parseFloat(value));
       if(margins.some(v=>!Number.isFinite(v)))throw new DOMException('Invalid rootMargin','SyntaxError');
       const [top,right=top,bottom=top,left=right]=margins,stop=observer.root?._m;
@@ -1773,6 +2457,7 @@
         if(changed)observer.records.push({time:performance.now(),target,rootBounds,boundingClientRect:new DOMRect(bx,by,bw,bh),intersectionRect:new DOMRect(x,y,Math.max(0,r-x),Math.max(0,b-y)),isIntersecting,intersectionRatio:ratio});
         if(previous===null)observer.targets.set(key,{ratio,isIntersecting});else{previous.ratio=ratio;previous.isIntersecting=isIntersecting;}
       }
+      }finally{observing=false;}
       const entries=observer.takeRecords();if(entries.length)observer.callback(entries,observer);
     }
   };
@@ -1808,6 +2493,9 @@
     if (placeholder) node.replaceChild(created, placeholder); else node.insertBefore(created, after ?? null);
     return [created, 0];
   };
+  // Undo and redo entries by editing host, and the text a composition replaced.
+  const histories = new WeakMap();
+  let composed = null;
   globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null) => {
     const target = active;
     if (!target || disabled(target) || target.readOnly) return;
@@ -1818,7 +2506,7 @@
     const isComposing = mark || composing !== null, control = editable(target);
     inputType ??= isComposing ? 'insertCompositionText' : text ? 'insertText' : 'deleteContentBackward';
     if (mark && !composing) {
-      composing = [start,end];
+      composing = [start,end]; composed = [start, state.text.slice(start,end)];
       dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
     if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
@@ -1845,13 +2533,76 @@
       else if (inputType === 'insertLineBreak' && !plain) { const br = document.createElement('br'); range.insertNode(br); if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.data && !br.nextSibling.nextSibling) br.after(document.createElement('br')); selection.collapse(br.parentNode, br.parentNode.childNodes.indexOf(br) + 1); }
       else { const [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset]; if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at); }
     }
+    // Typing in a row undoes in one step, and a composition undoes as the text it committed.
+    if (!mark && !inputType.startsWith('history')) {
+      const history = histories.get(target) ?? histories.set(target, { undo: [], redo: [] }).get(target), last = history.undo.at(-1);
+      const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)], inserted = control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '';
+      const typed = !removed && /^insert(Text|CompositionText)$/.test(inputType);
+      history.redo.length = 0;
+      if (typed && last?.typed && last.at + last.inserted.length === at) last.inserted += inserted;
+      else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
+    }
     if (isComposing) composing = [start,start+text.length];
     dispatch(target, trusted(new InputEvent('input', options)));
     if (isComposing && !mark) {
       composing = null;
       dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
     }
+    return true;
   };
+  // WARNING: entries hold offsets into the text, so a change that bypassed the history clears it.
+  const undo = redo => {
+    const history = active && histories.get(active), state = __appsEditing(), entry = history?.[redo ? 'redo' : 'undo'].pop();
+    if (!entry || !state) return false;
+    const [from, to] = redo ? [entry.removed, entry.inserted] : [entry.inserted, entry.removed];
+    if (state.text.slice(entry.at, entry.at + from.length) !== from) { history.undo.length = history.redo.length = 0; return false; }
+    const done = !!__appsInput(to, entry.at, entry.at + from.length, false, null, redo ? 'historyRedo' : 'historyUndo');
+    entry.typed = false;
+    history[done !== redo ? 'redo' : 'undo'].push(entry);
+    return done;
+  };
+  const edit = (command, text = '') => {
+    const target = active, state = __appsEditing();
+    if (command === 'undo' || command === 'redo') return undo(command === 'redo');
+    if (command === 'selectAll') {
+      if (editable(target)) target.select();
+      else if (state) selection.selectAllChildren(target);
+      else { const root = selection.anchorNode?.getRootNode(); selection.selectAllChildren(root?.host ? root : document.body); }
+      return true;
+    }
+    if (command === 'unselect') { if (editable(target)) target.setSelectionRange(target.selectionEnd, target.selectionEnd); else selection.removeAllRanges(); return true; }
+    if (!state) return false;
+    const start = Math.min(state.start,state.end), end = Math.max(state.start,state.end), forward = command === 'forwardDelete';
+    if (command === 'insertText' || command === 'replace') return !!__appsInput(text, start, end, false, null, command === 'replace' ? 'insertReplacementText' : 'insertText');
+    return !!__appsInput('', start === end && !forward ? textBoundary(state.text,start,false) : start, start === end && forward ? textBoundary(state.text,end,true) : end, false, null, forward ? 'deleteContentForward' : 'deleteContentBackward');
+  };
+  globalThis.__appsEdit = (command, text = '') => command === 'copy' || command === 'cut' ? __appsClipboard(command) : void (command === 'paste' || command === 'pasteAndMatchStyle' ? __appsClipboard('paste', text) : edit(command, text));
+  const editCommands = new Map(['copy', 'cut', 'paste', 'selectAll', 'insertText', 'delete', 'forwardDelete', 'undo', 'redo'].map(name => [name.toLowerCase(), name]));
+  // WARNING: like browsers, page scripts reach the clipboard only while they handle user input.
+  const enabled = command => {
+    const state = __appsEditing(), ranged = state ? state.start !== state.end : !selection.isCollapsed, writable = !!state && !active.readOnly && !disabled(active);
+    return (command === 'selectAll' || (command === 'undo' || command === 'redo' ? !!histories.get(active)?.[command].length : command === 'copy' ? ranged : writable && (command !== 'cut' || ranged))) && (!/^(copy|cut|paste)$/.test(command) || native > 0);
+  };
+  // The main process runs `setWindowOpenHandler()` while this waits, and returns the new window's id or null.
+  const openWindow = globalThis.open = (url = '', target = '', features = '') => {
+    [url, target, features] = [url, target, features].map(String);
+    try { url = url && new URL(url, document.baseURI).href; } catch { throw new DOMException(`Invalid URL '${url}'`, 'SyntaxError'); }
+    if (/^_(self|top|parent)$/i.test(target)) { if (url) location.assign(url); return globalThis; }
+    const id = call('dom.open', 'open', url, target, features, features ? 'new-window' : 'foreground-tab');
+    return id === null ? null : Object.freeze({ get closed() { return call('dom.open', 'closed', id); }, close() { call('dom.open', 'close', id); } });
+  };
+  Object.assign(Document.prototype, {
+    execCommand(name, _ui, value) {
+      const command = editCommands.get(String(name).toLowerCase());
+      if (!command || !enabled(command)) return false;
+      if (command === 'paste') __appsClipboard('paste', call('dom.clipboard') ?? '');
+      else if (command === 'copy' || command === 'cut') { const text = __appsClipboard(command); if (text) call('dom.clipboard', text); }
+      else edit(command, value === undefined ? '' : String(value));
+      return true;
+    },
+    queryCommandSupported: name => editCommands.has(String(name).toLowerCase()),
+    queryCommandEnabled(name) { const command = editCommands.get(String(name).toLowerCase()); return !!command && enabled(command); },
+  });
   globalThis.__appsFrameEvent=(id,event)=>{const target=wrap(id);if(event.type==='did-finish-load')dispatch(target,new Event('load'));else if(event.type==='did-fail-load')dispatch(target,new Event('error'));else if(event.type==='message')dispatch(target,new MessageEvent('message',{data:event.data,origin:'null'}));};
   globalThis.__appsClipboard = (type, text = '') => {
     const target = active ?? document.body, data = new DataTransfer();
@@ -1868,7 +2619,7 @@
     }
     return data.getData('text/plain');
   };
-  globalThis.__appsDrop=(files,x,y)=>{const data=new DataTransfer();for(const value of files){const file=new File([new Uint8Array(value.bytes)],value.name,{lastModified:value.lastModified,type:({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf'})[value.name.split('.').at(-1).toLowerCase()]??'application/octet-stream'});file.path=value.path;data.items.add(file);}const target=document.elementFromPoint(x,y)??document.body;dispatch(target,trusted(new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,dataTransfer:data})));};
+  globalThis.__appsDrop=(files,x,y)=>{const data=new DataTransfer();for(const value of files){const file=new File([new Uint8Array(value.bytes)],value.name,{lastModified:value.lastModified,type:({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf'})[value.name.split('.').at(-1).toLowerCase()]??'application/octet-stream'});droppedFiles.set(file,value.file);data.items.add(file);}const target=document.elementFromPoint(x,y)??document.body;dispatch(target,trusted(new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,dataTransfer:data})));};
   const nativeKeys = { backspace:'Backspace', delete:'Delete', enter:'Enter', escape:'Escape', tab:'Tab', left:'ArrowLeft', right:'ArrowRight', up:'ArrowUp', down:'ArrowDown', home:'Home', end:'End', pageup:'PageUp', pagedown:'PageDown', insert:'Insert', space:' ', shift:'Shift', control:'Control', ctrl:'Control', alt:'Alt', command:'Meta', super:'Meta' };
   const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91 };
   let modifiers = {}, graphemes, words;
@@ -1917,17 +2668,22 @@
   };
   const tabOrder = () => {
     const list = [], stack = [document];
-    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
+    // A modal dialog makes what is below it in the top layer inert.
+    const above = modals.length ? topLayer.slice(topLayer.indexOf(modals.at(-1))) : null;
+    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable) && (!above || path(node).some(item => above.includes(item)))) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
     return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
   };
   // WARNING: native presses follow the browser order: pointerdown, mousedown, focus and selection, contextmenu; a canceled pointerdown drops the mouse events of the press, and a canceled mousedown keeps focus and selection.
-  let press = null, last = null;
+  let press = null, last = null, sliding = null;
+  const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
-  globalThis.__appsDispatch = (name, ids, data = {}) => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } };
+  // WARNING: browsers settle the `finished` promise of a CSS animation before its end event, so that event waits for the promise reactions.
+  globalThis.__appsDispatch = (name, ids, data = {}) => { const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
+    if (name === 'fullscreen:exit') { if (fullscreens.length) exitFullscreen(true, true); return true; }
     if (name.startsWith('window:')) return dispatchEvent(trusted(new Event(name.slice(7))));
-    if (/^(animation|transition)(start|end|run|cancel|iteration)$/.test(name)) { const target = wrap(ids[0]); return !!target && dispatch(target, trusted(Object.assign(new Event(name, { bubbles: true, composed: true }), data, { pseudoElement: '' }))); }
+    if (/^(animation|transition)(start|end|run|cancel|iteration)$/.test(name)) { const target = wrap(ids[0]); return !!target && dispatch(target, trusted(Object.assign(new Event(name, { bubbles: true, composed: true }), { pseudoElement: '' }, data))); }
     if (name === 'modifiers') {
       const previous = modifiers; modifiers = data;
       for (const [field,key] of Object.entries({ shiftKey:'Shift', ctrlKey:'Control', altKey:'Alt', metaKey:'Meta' })) {
@@ -1944,6 +2700,8 @@
         const key = named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
         data = { ...data, key, code, keyCode: keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }
+      // Like browsers, Escape leaves fullscreen before the page sees it.
+      if (name === 'keydown' && data.key === 'Escape' && fullscreens.length) { exitFullscreen(true); return false; }
       const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data }));
       if (!dispatch(target, event)) return false;
       if (event.isComposing || event.keyCode === 229) return true;
@@ -1952,13 +2710,11 @@
         if (event.key === ' ' && plain && (tag === 'button' || /^(button|submit|reset|image|checkbox|radio)$/.test(type) || tag === 'summary') && !disabled(target)) fireClick(target, { detail: 0 }, true);
         return true;
       }
-      const state = __appsEditing(), mac = navigator.platform.includes('Mac'), primary = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+      const state = __appsEditing(), mac = navigator.platform.includes('Mac'), primary = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey, lower = event.key.toLowerCase();
+      if (primary && !event.altKey && lower === 'a') { edit('selectAll'); return false; }
       if (state) {
         const start = Math.min(state.start,state.end), end = Math.max(state.start,state.end);
-        if (primary && !event.altKey && event.key.toLowerCase() === 'a') {
-          if (editable(target)) target.select(); else selection.selectAllChildren(target);
-          return false;
-        }
+        if (primary && !event.altKey && (lower === 'z' || !mac && !event.shiftKey && lower === 'y')) { edit(event.shiftKey || lower === 'y' ? 'redo' : 'undo'); return false; }
         const backward = event.key === 'Backspace' || (mac && event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'h');
         const forward = event.key === 'Delete' || (mac && event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'd');
         if (backward || forward) {
@@ -2002,16 +2758,17 @@
         return false;
       }
       if (event.key === 'Enter' && plain && (tag === 'button' || /^(button|submit|reset|image)$/.test(type) || (tag === 'a' || tag === 'area') && target.hasAttribute('href') || tag === 'summary') && !disabled(target)) { fireClick(target, { detail: 0 }, true); return false; }
-      if (event.key === 'Escape' && modals.length && dispatch(modals.at(-1), trusted(new Event('cancel', { cancelable: true })))) { modals.at(-1).close(); return false; }
+      if (event.key === 'Escape' && closeRequest()) return false;
       if (tag === 'select' && plain && !disabled(target) && /^(ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(event.key) || tag === 'select' && plain && event.key.length === 1 && event.key !== ' ') {
         const list = options(target).filter(option => !disabled(option)), index = list.indexOf(target.selectedOptions[0]);
         const next = event.key.length === 1 ? list.find((option, i) => i > index && option.text.toLowerCase().startsWith(event.key.toLowerCase())) ?? list.find(option => option.text.toLowerCase().startsWith(event.key.toLowerCase())) : list[event.key === 'Home' || event.key === 'PageUp' ? 0 : event.key === 'End' || event.key === 'PageDown' ? list.length - 1 : Math.max(0, Math.min(list.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))];
         if (next && !next._current) { for (const option of options(target)) option._selected = option === next; target._none = false; selectedness(target); dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); dispatch(target, trusted(new Event('change', { bubbles: true }))); }
         return false;
       }
-      if (!state && primary && !event.altKey && event.key.toLowerCase() === 'a') {
-        const root = selection.anchorNode?.getRootNode();
-        selection.selectAllChildren(root?.host ? root : document.body);
+      if (tag === 'input' && type === 'range' && plain && !disabled(target) && /^(Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down))$/.test(event.key)) {
+        const [min, max, step] = rangeBounds(target), unit = step || (max - min) / 100, key = event.key, before = target.value;
+        setRange(target, key === 'Home' ? min : key === 'End' ? max : Number(before) + (/Up|Right/.test(key) ? 1 : -1) * (key.startsWith('Page') ? Math.max(unit, (max - min) / 10) : unit));
+        if (target.value !== before) dispatch(target, trusted(new Event('change', { bubbles: true })));
         return false;
       }
       if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) {
@@ -2032,7 +2789,7 @@
     }
     if (name !== 'pointermove' && name !== 'pointerdown' && name !== 'pointerup') return false;
     if (!captures.has(1)) hover(element, mouseInit(data));
-    const target = element ?? (selectionDrag ? selectionDrag.host : null), button = data.button ?? 0, init = mouseInit(data, name === 'pointermove' ? { button: -1 } : {});
+    const target = element ?? sliding?.[0] ?? (selectionDrag ? selectionDrag.host : null), button = data.button ?? 0, init = mouseInit(data, name === 'pointermove' ? { button: -1 } : {});
     last = [data.clientX, data.clientY];
     if (name === 'pointerdown' && target) call('dom.active', path(target).map(node => node._id));
     if (name === 'pointerup' && !data.buttons) call('dom.active', []);
@@ -2041,6 +2798,7 @@
     const first = name === 'pointerdown' && (!press || press.button === button), ended = name === 'pointerup' && !data.buttons;
     if (first) { pointers.add(1); press = { target, button, detail: data.detail ?? 1, mouse: true }; }
     if (name === 'pointerdown') keyboardFocus = false;
+    if (first || ended) lightDismiss(first, target, data.clientX, data.clientY);
     const result = dispatch(target, trusted(new PointerEvent(first ? 'pointerdown' : ended ? 'pointerup' : 'pointermove', init)));
     if (first && !result) press.mouse = false;
     const blocked = path(target).some(node => node.nodeType === 1 && /^(button|input|select|textarea)$/.test(node.localName) && disabled(node));
@@ -2050,7 +2808,8 @@
       const focus = path(target).find(node => focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable));
       const offset = editable(focus) && button === 0 ? call('dom.textIndex', focus._id, data.clientX, data.clientY) : 0;
       if (focus) focus.focus(); else if (button === 0) active?.blur();
-      if (button === 0 && editable(focus)) {
+      if (button === 0 && focus?.localName === 'input' && focus.type === 'range') { sliding = [focus, focus.value]; slide(focus, data.clientX); }
+      else if (button === 0 && editable(focus)) {
         const anchor = data.shiftKey ? (__appsEditing()?.start ?? offset) : offset;
         const granularity = data.shiftKey ? 1 : Math.min(3,data.detail ?? 1);
         const [start,end] = granularity > 1 ? selectionExtent(focus.value,offset,granularity) : [anchor,offset];
@@ -2071,6 +2830,8 @@
         }
       }
     }
+    // WARNING: like browsers, a slider moves after the page's mouse listeners and sends `change` when the press ends.
+    if (sliding && name !== 'pointerdown') { slide(sliding[0], data.clientX); if (ended) { if (sliding[0].value !== sliding[1]) dispatch(sliding[0], trusted(new Event('change', { bubbles: true }))); sliding = null; } }
     if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac'))) dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })));
     if (name === 'pointermove' && result && selectionDrag && (selectionDrag.x !== data.clientX || selectionDrag.y !== data.clientY)) {
       const { host, node, offset, endNode, endOffset, granularity } = selectionDrag;

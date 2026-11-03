@@ -63,7 +63,45 @@
   assert(clickArgs[0] === menu.getMenuItemById('run') && clickArgs[1] === window && clickArgs[2].shiftKey === true && clickArgs[2].triggeredByAccelerator === false, 'click(menuItem, browserWindow, event)');
   assert(menu.getMenuItemById('check').checked && !menu.getMenuItemById('a').checked && menu.getMenuItemById('b').checked && reloads.length === 1, 'Checkbox, radio and reload roles');
   assert(id('normal') !== undefined && template[1].submenu[0].label === 'New', 'Submenus serialize');
+  window.webContents.zoomLevel = 0;
+  const zooms = Menu.buildFromTemplate([{ role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'resetZoom' }]).items, levels = [];
+  for (const item of [zooms[0], zooms[0], zooms[1], zooms[2]]) { item.click(); levels.push(window.webContents.zoomLevel); }
+  assert(levels.join() === '0.5,1,0.5,0', 'Zoom roles step the focused page by half a level');
   const accelerated = Menu.buildFromTemplate(['Meta+Home', 'F24', 'MediaPlayPause', 'CmdOrCtrl+Plus'].map(accelerator => ({ label: accelerator, accelerator })));
   Menu.setApplicationMenu(accelerated);
   assert(calls.at(-1)[1].map(item => item.accelerator).join() === 'Meta+Home,F24,MediaPlayPause,CmdOrCtrl+Plus', 'Accelerators pass to the native menu');
+
+  app.isReady = () => false;
+  let early;
+  try { new shell.Tray('serverTemplate.png'); } catch (error) { early = error; }
+  assert(early?.message.includes('whenReady'), 'Tray needs a ready app');
+  app.isReady = () => true;
+  const first = new shell.Tray('serverTemplate.png'), firstId = calls.at(-1)[1].id;
+  const second = new shell.Tray('other.png'), secondId = calls.at(-1)[1].id;
+  const actions = [];
+  first.setContextMenu(Menu.buildFromTemplate([{ label: 'Server', icon: 'server.png', sublabel: 'Running', submenu: [{ label: 'Settings', click: () => actions.push('first') }] }]));
+  const header = calls.at(-1)[1].template[0], settings = header.submenu[0].click;
+  assert(header.icon === 'server.png' && header.sublabel === 'Running', 'Tray menu icon and subtitle');
+  second.setContextMenu(Menu.buildFromTemplate([{ label: 'Other', click: () => actions.push('second') }]));
+  const other = calls.at(-1)[1].template[0].click;
+  first.popUpContextMenu(Menu.buildFromTemplate([{ label: 'Temporary', click: () => actions.push('popup') }]));
+  const popup = calls.at(-1)[1];
+  first.once('click', (event, bounds, point) => { assert(event.altKey && bounds.width === 24 && point.x === 10, 'Tray click arguments'); actions.push('click'); });
+  events.push({ type: 'tray', id: firstId, event: 'click', alt: true, bounds: { width: 24 }, position: { x: 10 } },
+    ...[settings, other, popup.template[0].click].map(id => ({ type: 'menu', id })),
+    { type: 'tray', id: firstId, request: popup.request }, { type: 'menu', id: popup.template[0].click });
+  shell.poll();
+  first.setContextMenu(null);
+  events.push({ type: 'menu', id: settings }, { type: 'menu', id: other });
+  shell.poll();
+  assert(actions.join() === 'click,first,second,popup,second', 'Tray menu callbacks stay with their owner and expire on removal');
+  first.destroy(); first.destroy();
+  let destroyed;
+  try { first.getBounds(); } catch (error) { destroyed = error; }
+  assert(first.isDestroyed() && destroyed && !second.isDestroyed(), 'Tray destruction is independent and idempotent');
+  second.on('right-click', () => actions.push('stale'));
+  second.destroy();
+  events.push({ type: 'tray', id: secondId, event: 'right-click' });
+  shell.poll();
+  assert(!actions.includes('stale'), 'Discard events for destroyed trays');
 })();

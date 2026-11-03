@@ -188,16 +188,22 @@ return (body, execute) => {
     for (const id of definitions.keys()) if (!modules.has(id)) setup(id);
     return;
   }
+  const entry = id => {
+    const start = () => { if (id === entries[0]) globalThis.__appsStart?.(modules.get(id).namespace.default); };
+    const result = load(id);
+    if (result instanceof Promise) globalThis.__appsTrackModule(result.then(start));
+    else start();
+  };
+  // WARNING: pages and page workers run one entry per `__appsNext` call of the runtime, so microtasks run between
+  // scripts, and those of a classic script still see it as `document.currentScript`, like in browsers.
+  if (this !== globalThis) {
+    const pending = entries.slice();
+    this.__appsNext = () => { globalThis.__appsScript?.(null); if (!pending.length) return false; entry(pending.shift()); return true; };
+    return;
+  }
   let failed = false, failure;
   for (const id of entries) {
-    try {
-      const start = () => { if (id === entries[0]) globalThis.__appsStart?.(modules.get(id).namespace.default); };
-      const result = load(id);
-      if (result instanceof Promise) globalThis.__appsTrackModule(result.then(start));
-      else start();
-    } catch (error) {
-      if (!failed) [failed, failure] = [true, error];
-    }
+    try { entry(id); } catch (error) { if (!failed) [failed, failure] = [true, error]; }
   }
   if (failed) throw failure;
 };

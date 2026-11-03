@@ -244,12 +244,9 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
         return color;
     }
     let color = parse(value, 0).map(|(space, channels, alpha)| {
-        let rgb = if space == Space::Srgb {
-            channels
-        } else {
-            from_xyz(Space::Srgb, to_xyz(space, channels))
-        };
-        let [r, g, b] = rgb.map(|v| (v.clamp(0., 1.) * 255.).round() as u32);
+        let rgb = convert(space, channels, Space::Srgb);
+        // Browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
+        let [r, g, b] = rgb.map(|v| ((v as f32).clamp(0., 1.) * 255.).round() as u32);
         (
             r << 16 | g << 8 | b,
             (alpha.clamp(0., 1.) * 255.).round() as u8,
@@ -537,11 +534,33 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
 }
 
 fn convert(from: Space, values: [f64; 3], to: Space) -> [f64; 3] {
-    if from == to {
-        values
-    } else {
-        from_xyz(to, to_xyz(from, values))
+    match (from, to) {
+        _ if from == to => values,
+        // WARNING: a round trip through XYZ moves channels like 25.5 below the rounding point.
+        (Space::Hsl | Space::Hwb, Space::Srgb) => hsl(from, values),
+        _ => from_xyz(to, to_xyz(from, values)),
     }
+}
+
+/// HSL or HWB channels as sRGB. Missing channels become 0.
+fn hsl(space: Space, values: [f64; 3]) -> [f64; 3] {
+    let [a, b, c] = values.map(|v| if v.is_nan() { 0. } else { v });
+    let (white, black, saturation, light) = if space == Space::Hwb {
+        (b / 100., c / 100., 1., 0.5)
+    } else {
+        (0., 0., b / 100., c / 100.)
+    };
+    let hue = a.rem_euclid(360.);
+    [0., 8., 4.].map(|n| {
+        let k = (n + hue / 30.) % 12.;
+        let value =
+            light - saturation * light.min(1. - light) * (k - 3.).min(9. - k).clamp(-1., 1.);
+        if white + black >= 1. {
+            white / (white + black)
+        } else {
+            value * (1. - white - black) + white
+        }
+    })
 }
 
 /// Converts to XYZ D65. Missing channels become 0.
@@ -594,25 +613,7 @@ fn to_xyz(space: Space, values: [f64; 3]) -> [f64; 3] {
             };
             matrix(LMS_TO_XYZ, matrix(OKLAB_TO_LMS, lab).map(|v| v.powi(3)))
         }
-        Space::Hsl | Space::Hwb => {
-            let (white, black, saturation, light) = if space == Space::Hwb {
-                (b / 100., c / 100., 1., 0.5)
-            } else {
-                (0., 0., b / 100., c / 100.)
-            };
-            let hue = a.rem_euclid(360.);
-            let rgb = [0., 8., 4.].map(|n| {
-                let k = (n + hue / 30.) % 12.;
-                let value = light
-                    - saturation * light.min(1. - light) * (k - 3.).min(9. - k).clamp(-1., 1.);
-                if white + black >= 1. {
-                    white / (white + black)
-                } else {
-                    value * (1. - white - black) + white
-                }
-            });
-            to_xyz(Space::Srgb, rgb)
-        }
+        Space::Hsl | Space::Hwb => to_xyz(Space::Srgb, hsl(space, [a, b, c])),
     }
 }
 
@@ -736,6 +737,7 @@ mod tests {
             ("rgb(1 2 3 4)", None),
             ("hsl(120 100% 50%)", Some((0x00ff00, 255))),
             ("hsl(120, 100%, 25%)", Some((0x008000, 255))),
+            ("hsl(164.31436498259058 80% 50%)", Some((0x1ae6b0, 255))),
             ("HSLA(240deg 100% 50% / 0.5)", Some((0x0000ff, 128))),
             ("hsl(0.5turn 100% 50%)", Some((0x00ffff, 255))),
             ("hsl(3.14159265rad 100 50)", Some((0x00ffff, 255))),
@@ -745,7 +747,7 @@ mod tests {
             ("hsl(120 100% 50% / 25%)", Some((0x00ff00, 64))),
             ("hsl(120% 100% 50%)", None),
             ("hwb(0 0% 0%)", Some((0xff0000, 255))),
-            ("hwb(120 20% 30%)", Some((0x33b233, 255))),
+            ("hwb(120 20% 30%)", Some((0x33b333, 255))),
             ("hwb(0 60% 60%)", Some((0x808080, 255))),
             ("lab(54.29 80.8 69.89)", Some((0xff0000, 255))),
             ("lab(54.29% 64.64% 55.912%)", Some((0xff0000, 255))),

@@ -18,6 +18,28 @@ pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
 
 thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
 
+thread_local! {
+    /// Event loop start, idle start and total idle time, for `performance.eventLoopUtilization()`.
+    pub(crate) static IDLE: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Instant>, std::time::Duration)> = std::cell::Cell::default();
+}
+
+/// Marks where the thread's event loop starts or stops waiting.
+pub(crate) fn idle(waiting: bool) {
+    IDLE.with(|idle| {
+        let (start, since, total) = idle.get();
+        let now = std::time::Instant::now();
+        idle.set(if waiting {
+            (start.or(Some(now)), Some(now), total)
+        } else {
+            (
+                start,
+                None,
+                total + since.map_or_else(Default::default, |since| now - since),
+            )
+        });
+    });
+}
+
 impl Waker {
     pub fn install(wake: impl Fn() + Send + Sync + 'static) {
         WAKER.set(Self(Some(std::sync::Arc::new(wake))));
@@ -68,6 +90,7 @@ pub struct Page {
 
 #[derive(Default)]
 pub struct Host {
+    pub rust_handlers: Option<HashMap<String, crate::desktop::app::Handler>>,
     pub app_name: Option<String>,
     pub app_version: Option<String>,
     pub app_path: PathBuf,
@@ -83,6 +106,8 @@ pub struct Host {
     pub pages: HashMap<u64, Page>,
     pub dom: HashMap<u64, crate::dom::State>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
+    /// By page, the paths of the files dropped on it. Page `File`s carry only the index, see `webUtils.getPathForFile`.
+    pub dropped: HashMap<u64, Vec<String>>,
     pub browsers: crate::desktop::browser::State,
     pub logs: std::collections::VecDeque<Value>,
     pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
@@ -97,6 +122,24 @@ pub struct Host {
 }
 
 impl Host {
+    pub(crate) fn install(
+        &mut self,
+        files: &bbtree::unsync::BBTreeMap<String, String>,
+    ) -> Result<()> {
+        let paths: HashMap<String, PathBuf> =
+            serde_json::from_str(files.get("native.json").map_or("{}", String::as_str))?;
+        self.native_modules.extend(paths);
+        let mut scripts = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("script-"))
+            .peekable();
+        if scripts.peek().is_some() {
+            std::sync::Arc::make_mut(&mut self.scripts)
+                .extend(scripts.map(|(name, source)| (name.clone(), source.clone().into())));
+        }
+        Ok(())
+    }
+
     pub fn enabled(&self, feature: &str) -> bool {
         self.disabled & crate::bundle::feature_bit(feature) == 0
     }
@@ -219,9 +262,11 @@ impl Host {
                     0 => {
                         let (id, tag) = (usize::try_from(a).context("Invalid node")?, parts[0]);
                         ensure!(
-                            matches!(tag, "#text" | "#comment" | "#fragment" | "#document")
-                                || !tag.is_empty()
-                                    && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+                            matches!(
+                                tag,
+                                "#text" | "#comment" | "#fragment" | "#document" | "#doctype"
+                            ) || !tag.is_empty()
+                                && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
                             "Invalid tag"
                         );
                         ensure!(state.reserved.remove(&id), "Invalid node");
@@ -430,14 +475,15 @@ impl Host {
                         true
                     }
                     8 => {
+                        use crate::dom::{CHECKED, DIRTY, FULLSCREEN, MODAL, POPOVER};
                         let id = node(doc, a)?;
-                        let bits = [crate::dom::CHECKED, crate::dom::DIRTY, crate::dom::MODAL]
+                        let bits = [CHECKED, DIRTY, MODAL, POPOVER, FULLSCREEN]
                             .into_iter()
                             .enumerate()
                             .fold(0, |bits, (index, bit)| {
                                 bits | if b & 1 << index != 0 { bit } else { 0 }
                             });
-                        let mask = crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::MODAL;
+                        let mask = CHECKED | DIRTY | MODAL | POPOVER | FULLSCREEN;
                         if doc.nodes[id].state & mask == bits {
                             return Ok(false);
                         }
@@ -446,6 +492,14 @@ impl Host {
                         }
                         let node = &mut doc.nodes[id];
                         node.state = node.state & !mask | bits;
+                        true
+                    }
+                    9 => {
+                        let id = node(doc, a)?;
+                        state.top_layer.retain(|&other| other != id);
+                        if b != 0 {
+                            state.top_layer.push(id);
+                        }
                         true
                     }
                     _ => bail!("Unknown DOM operation"),
@@ -516,8 +570,12 @@ impl Host {
                     "The {feature} feature is disabled. Add \"{feature}\" to \"features\" in package.json"
                 );
                 if args[1].is_string() {
-                    let path = local_file(&self.assets, state, &args[1])?
-                        .context("Media is not a bundled asset or local file")?;
+                    let path = local_file(
+                        &self.assets,
+                        state,
+                        args[1].as_str().context("Expected a URL")?,
+                    )?
+                    .context("Media is not a bundled asset or local file")?;
                     media.open(node, Ok(&path), video)?;
                 } else {
                     media.open(node, Err(crate::node::bytes(&args[1])?), video)?;
@@ -575,6 +633,12 @@ impl Host {
                     .push(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
                 return Ok(Value::Null);
             }
+            if op == "dom.fullscreen" {
+                ensure!(self.pages.contains_key(&id), "Window is closed");
+                self.commands
+                    .push(json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}));
+                return Ok(Value::Null);
+            }
             if op == "dom.executed" {
                 ensure!(
                     args[0].is_u64() && args[1].is_string(),
@@ -587,21 +651,40 @@ impl Host {
             let page = self.pages.get_mut(&id).context("Window is closed")?;
             if op == "dom.viewport" {
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
+                // WARNING: a zoomed viewport has fractional sizes, but like browsers `innerWidth` is whole.
                 return Ok(json!([
-                    viewport[0],
-                    viewport[1],
+                    viewport[0].round(),
+                    viewport[1].round(),
                     self.dom
                         .get(&id)
-                        .map_or(1., |state| state.pixel_ratio.max(1.)),
+                        .map(|state| state.pixel_ratio)
+                        .filter(|&ratio| ratio > 0.)
+                        .unwrap_or(1.),
                     crate::desktop::native::theme_state()
                 ]));
             }
             let state = self.dom.entry(id).or_default();
+            if op == "dom.fonts" {
+                let system = state.text_system.clone();
+                crate::dom::styles(
+                    &mut page.doc,
+                    state,
+                    *self.viewports.get(&id).unwrap_or(&[800., 600.]),
+                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                );
+                let loaded = crate::render::fonts::load(&page.doc, state, &self.assets);
+                page.dirty |= std::mem::take(&mut state.dirty);
+                return Ok(json!(loaded));
+            }
             if op == "dom.imageURL" {
                 let node = args[0].as_u64().context("Invalid node")? as usize;
                 ensure!(node < page.doc.nodes.len(), "Invalid node id");
-                let path = local_file(&self.assets, state, &args[1])?
-                    .context("Image is not a bundled asset or local file")?;
+                let path = local_file(
+                    &self.assets,
+                    state,
+                    args[1].as_str().context("Expected a URL")?,
+                )?
+                .context("Image is not a bundled asset or local file")?;
                 return Ok(crate::dom::load_image(state, node, move || {
                     let metadata = std::fs::metadata(&path)?;
                     ensure!(
@@ -752,7 +835,7 @@ impl Host {
                     .map(|(name, value)| (lossy(name), lossy(value)))
                     .collect();
                 Ok(
-                    json!({"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"rustMain":self.rust_handlers.is_some(),"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             "cwd" => Ok(json!(std::env::current_dir()?)),
@@ -780,13 +863,13 @@ impl Host {
 }
 
 /// The file of a bundled asset URL, or of a local file URL in a local page.
-fn local_file(
+pub(crate) fn local_file(
     assets: &HashMap<String, PathBuf>,
     state: &crate::dom::State,
-    url: &Value,
+    url: &str,
 ) -> Result<Option<PathBuf>> {
     let base = state.base.as_ref().context("Missing page URL")?;
-    let url = base.join(url.as_str().context("Expected a URL")?)?;
+    let url = base.join(url)?;
     Ok(match url.scheme() {
         "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
         "file" if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) => {

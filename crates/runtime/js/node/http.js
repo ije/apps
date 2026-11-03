@@ -119,7 +119,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     _final(done){
       this.headersSent=true;
       const body=this._chunks.length&&this.method!=='GET'&&this.method!=='HEAD'?Buffer.concat(this._chunks):undefined;
-      fetch(this._url,{method:this.method,headers:this._webHeaders(),body,signal:this._abort.signal}).then(response=>{
+      fetch(this._url,{method:this.method,headers:this._webHeaders(),body,signal:this._abort.signal,redirect:this._redirect}).then(response=>{
         if(this.destroyed)return response.body?.cancel();
         const res=headersOf(response.headers,new IncomingMessage(this.socket));
         Object.assign(res,{statusCode:response.status,statusMessage:response.statusText||STATUS_CODES[response.status]||'',req:this,_body:response.body});

@@ -1,10 +1,10 @@
-globalThis.__appsPlatform = call => {
+globalThis.__appsPlatform = (call, node) => {
   const codecBytes = globalThis.__appsBytes;
   globalThis.self = globalThis;
   const native = globalThis.__appsNow;
   delete globalThis.__appsNow;
   const clock = call('web.platform.time'), base = native() - clock.now;
-  const timeline = [], observers = new Map(), illegal = Symbol(), types = ['mark', 'measure'];
+  const timeline = [], observers = new Map(), illegal = Symbol(), types = node ? ['function', 'mark', 'measure'] : ['mark', 'measure'];
   class PerformanceEntry {
     #name; #type; #start; #duration;
     constructor(name, type, start, duration) { if (new.target === PerformanceEntry) throw new TypeError('Illegal constructor'); this.#name = String(name); this.#type = type; this.#start = start; this.#duration = duration; }
@@ -52,6 +52,36 @@ globalThis.__appsPlatform = call => {
     return mark.startTime;
   };
   const clear = (type, name) => { for (let i = timeline.length - 1; i >= 0; i--) if (timeline[i].entryType === type && (name === undefined || timeline[i].name === String(name))) timeline.splice(i, 1); };
+  // Node's timerify() entries go to observers only, not to the timeline.
+  class PerformanceNodeEntry extends PerformanceEntry {
+    #detail;
+    constructor(name, start, duration, detail) { super(name, 'function', start, duration); this.#detail = detail; }
+    get detail() { return this.#detail; }
+  }
+  const timerify = (fn, { histogram } = {}) => {
+    if (typeof fn !== 'function') throw Object.assign(new TypeError(`The "fn" argument must be of type function. Received ${fn === null ? 'null' : `type ${typeof fn} (${String(fn)})`}`), { code: 'ERR_INVALID_ARG_TYPE' });
+    const done = (start, args) => {
+      const duration = performance.now() - start, entry = new PerformanceNodeEntry(fn.name, start, duration, args);
+      histogram?.record(Math.max(1, Math.round(duration * 1e6)));
+      for (const notify of observers.values()) notify(entry);
+    };
+    const timed = function(...args) {
+      const start = performance.now(), result = new.target ? Reflect.construct(fn, args) : fn.apply(this, args);
+      if (typeof result?.finally !== 'function') { done(start, args); return result; }
+      return result.finally(() => done(start, args));
+    };
+    return Object.defineProperties(timed, { name: { value: `timerified ${fn.name}` }, length: { value: fn.length } });
+  };
+  const eventLoopUtilization = (first, second) => {
+    let idle, active;
+    if (second) { idle = first.idle - second.idle; active = first.active - second.active; }
+    else {
+      const time = call('node.loop');
+      if (!time) return { idle: 0, active: 0, utilization: 0 };
+      idle = time[0] - (first?.idle ?? 0); active = time[1] - time[0] - (first?.active ?? 0);
+    }
+    return { idle, active, utilization: active / (idle + active) };
+  };
   globalThis.performance = Object.freeze({ timeOrigin: clock.origin, now: () => native() - base, toJSON() { return { timeOrigin: this.timeOrigin }; },
     mark: (name, options) => record(new PerformanceMark(name, options)),
     measure(name, start, end) {
@@ -65,6 +95,7 @@ globalThis.__appsPlatform = call => {
     getEntries: () => [...timeline].sort((a, b) => a.startTime - b.startTime),
     getEntriesByName: (name, type) => select(timeline, name, type).sort((a, b) => a.startTime - b.startTime),
     getEntriesByType: type => select(timeline, undefined, type).sort((a, b) => a.startTime - b.startTime),
+    ...(node ? { timerify, eventLoopUtilization } : {}),
   });
   Object.assign(globalThis, { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
   globalThis.scheduler = Object.freeze({

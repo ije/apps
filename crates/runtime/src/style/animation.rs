@@ -4,6 +4,7 @@ use super::{
 };
 use crate::dom::Document;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     rc::Rc,
     time::Instant,
@@ -43,7 +44,17 @@ pub(crate) struct Animation {
     iterations: f64,
     direction: String,
     fill: String,
+    /// The default easing of keyframes.
     timing: String,
+    /// The easing of each iteration, which `Element.animate()` sets.
+    easing: String,
+    end_delay: f64,
+    iteration_start: f64,
+    /// How keyframes combine with the value below: `replace`, `add` or `accumulate`.
+    composite: String,
+    /// The element (0), its `::before` (1) or `::after` (2). Pseudo-element animations have names like
+    /// `::before\0spin`, so their clocks and events stay apart.
+    pub pseudo: u8,
     tracks: Vec<(Prop, Keyframes)>,
 }
 
@@ -118,50 +129,18 @@ impl Animation {
                     }
                 }
                 let name = values["name"].trim_matches(['\'', '"']);
-                let rules = keyframes.get(name)?;
-                let mut tracks: Vec<(Prop, Keyframes)> = Vec::new();
-                for (offset, declarations) in rules {
-                    let declarations = declarations.resolve();
-                    let timing = declarations
-                        .get(Prop::ANIMATION_TIMING_FUNCTION)
-                        .map(str::to_owned)
-                        .unwrap_or_default();
-                    let mut frame = style.clone();
-                    let mut custom = Vec::new();
-                    frame.extend(
-                        declarations
-                            .iter()
-                            .filter(|(_, value)| !value.ends_with("!important"))
-                            .filter_map(|(key, value)| {
-                                if key.is_custom() {
-                                    custom.push((key, value.clone()));
-                                    return None;
-                                }
-                                Some((key, value.clone()))
-                            }),
-                    );
-                    resolve_style(&mut frame, Some(style), &custom, registry);
-                    resolve_keywords(&mut frame, Some(style));
-                    for (key, value) in declarations.iter() {
-                        if value.ends_with("!important") || !animatable(key, registry) {
-                            continue;
-                        }
-                        let Some(value) = computed(&frame, key, registry) else {
-                            continue;
-                        };
-                        let frame = (f64::from(*offset), value.to_owned(), timing.clone());
-                        match tracks.iter_mut().find(|(name, _)| *name == key) {
-                            Some((_, frames)) => {
-                                frames.retain(|(at, ..)| *at != frame.0);
-                                frames.push(frame);
-                            }
-                            None => tracks.push((key, vec![frame])),
-                        }
-                    }
-                }
-                for (_, frames) in &mut tracks {
-                    frames.sort_by(|a, b| a.0.total_cmp(&b.0));
-                }
+                let rules: Vec<_> = keyframes
+                    .get(name)?
+                    .iter()
+                    .map(|(offset, declarations)| {
+                        let declarations = declarations.resolve();
+                        let timing = declarations
+                            .get(Prop::ANIMATION_TIMING_FUNCTION)
+                            .map(str::to_owned)
+                            .unwrap_or_default();
+                        (f64::from(*offset), declarations, timing)
+                    })
+                    .collect();
                 Some(Self {
                     name: name.into(),
                     paused: values["play-state"] == "paused",
@@ -179,12 +158,75 @@ impl Animation {
                     direction: values["direction"].into(),
                     fill: values["fill-mode"].into(),
                     timing: values["timing-function"].into(),
-                    tracks,
+                    easing: String::new(),
+                    end_delay: 0.,
+                    iteration_start: 0.,
+                    composite: style
+                        .get(Prop::ANIMATION_COMPOSITION)
+                        .map(|value| components(value, ','))
+                        .and_then(|parts| {
+                            parts
+                                .get(index % parts.len().max(1))
+                                .map(|part| part.to_string())
+                        })
+                        .unwrap_or_else(|| "replace".into()),
+                    pseudo: 0,
+                    tracks: tracks(style, &rules, registry),
                 })
             })
             .collect()
     }
+}
 
+/// The computed values of keyframes `(offset, declarations, easing)` for an element with `style`, by property.
+fn tracks(
+    style: &Style,
+    rules: &[(f64, Style, String)],
+    registry: &Registry,
+) -> Vec<(Prop, Keyframes)> {
+    let mut tracks: Vec<(Prop, Keyframes)> = Vec::new();
+    for (offset, declarations, timing) in rules {
+        let mut frame = style.clone();
+        let mut custom = Vec::new();
+        frame.extend(
+            declarations
+                .iter()
+                .filter(|(_, value)| !value.ends_with("!important"))
+                .filter_map(|(key, value)| {
+                    if key.is_custom() {
+                        custom.push((key, value.clone()));
+                        return None;
+                    }
+                    Some((key, value.clone()))
+                }),
+        );
+        resolve_style(&mut frame, Some(style), &custom, registry);
+        resolve_keywords(&mut frame, Some(style));
+        for (key, value) in declarations.iter() {
+            // Custom properties that can't interpolate switch halfway, like in browsers.
+            if value.ends_with("!important") || !animatable(key, registry) && !key.is_custom() {
+                continue;
+            }
+            let Some(value) = computed(&frame, key, registry) else {
+                continue;
+            };
+            let frame = (*offset, value.to_owned(), timing.clone());
+            match tracks.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, frames)) => {
+                    frames.retain(|(at, ..)| *at != frame.0);
+                    frames.push(frame);
+                }
+                None => tracks.push((key, vec![frame])),
+            }
+        }
+    }
+    for (_, frames) in &mut tracks {
+        frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    tracks
+}
+
+impl Animation {
     /// Writes the animated values into `out`. Returns the seconds until the values can change
     /// next (0 while they change continuously, `None` when they never change), and whether the
     /// animation has ended.
@@ -195,39 +237,48 @@ impl Animation {
         registry: &Registry,
         out: &mut Style,
     ) -> (Option<f64>, bool) {
-        let time = elapsed - self.delay;
-        let end = if self.duration == 0. {
+        // The phases of Web Animations: before `start`, active, and after `stop`.
+        let length = if self.duration == 0. {
             0.
         } else {
             self.duration * self.iterations
         };
-        let ended = time >= end;
-        let active = !self.paused && !ended && time >= 0.;
-        let mut wake = (!self.paused && !ended).then(|| if time < 0. { -time } else { end - time });
-        if time < 0. && !matches!(self.fill.as_str(), "backwards" | "both")
+        let end = (self.delay + length + self.end_delay).max(0.);
+        let start = self.delay.min(end).max(0.);
+        let stop = (self.delay + length).min(end).max(0.);
+        let before = elapsed < start;
+        let ended = elapsed >= stop;
+        let active = !self.paused && !ended && !before;
+        let mut wake =
+            (!self.paused && !ended).then_some(if before { start } else { stop } - elapsed);
+        if before && !matches!(self.fill.as_str(), "backwards" | "both")
             || ended && !matches!(self.fill.as_str(), "forwards" | "both")
         {
             return (wake, ended);
         }
-        let overall = if time < 0. {
-            0.
-        } else if self.duration == 0. {
-            if self.iterations.is_finite() {
-                self.iterations
+        let time = (elapsed - self.delay).min(length).max(0.);
+        let overall = self.iteration_start
+            + if self.duration == 0. {
+                if before {
+                    0.
+                } else if self.iterations.is_finite() {
+                    self.iterations
+                } else {
+                    1.
+                }
             } else {
-                1.
-            }
-        } else {
-            time.max(0.).min(end) / self.duration
-        };
+                time / self.duration
+            };
         let mut iteration = overall.floor();
         let mut progress = overall.fract();
-        if ended && overall > 0. && progress == 0. {
+        if !before && time >= length && self.iterations != 0. && progress == 0. && overall > 0. {
             progress = 1.;
             iteration -= 1.;
         }
         if active {
-            wake = wake.map(|wake| wake.min((iteration + 1.) * self.duration - time));
+            wake = wake.map(|wake| {
+                wake.min((iteration + 1. - self.iteration_start) * self.duration - time)
+            });
         }
         let reverse = self.direction == "reverse"
             || self.direction == "alternate" && iteration % 2. == 1.
@@ -235,17 +286,43 @@ impl Animation {
         if reverse {
             progress = 1. - progress;
         }
+        if !self.easing.is_empty() && self.easing != "linear" {
+            progress = easing(&self.easing, progress);
+            if active {
+                wake = Some(0.);
+            }
+        }
         for (property, frames) in &self.tracks {
-            let mut keys: Vec<(f64, &str, &str)> = frames
+            let mut keys: Vec<(f64, Cow<str>, &str)> = frames
                 .iter()
-                .map(|(at, value, timing)| (*at, value.as_str(), timing.as_str()))
+                .map(|(at, value, timing)| (*at, Cow::Borrowed(value.as_str()), timing.as_str()))
                 .collect();
-            if let Some(value) = computed(base, *property, registry) {
-                if keys[0].0 > 0. {
-                    keys.insert(0, (0., value, ""));
-                }
-                if keys[keys.len() - 1].0 < 1. {
-                    keys.push((1., value, ""));
+            // Missing ends and added keyframes take the value below: earlier animations, or the element's own.
+            let replace = self.composite == "replace";
+            if !replace || keys[0].0 > 0. || keys[keys.len() - 1].0 < 1. {
+                let under = out
+                    .get(*property)
+                    .or_else(|| computed(base, *property, registry))
+                    .map(str::to_owned);
+                if let Some(under) = under {
+                    if !replace {
+                        for key in &mut keys {
+                            if let Some(sum) = add(
+                                property.name(),
+                                &under,
+                                &key.1,
+                                self.composite == "accumulate",
+                            ) {
+                                key.1 = Cow::Owned(sum);
+                            }
+                        }
+                    }
+                    if keys[0].0 > 0. {
+                        keys.insert(0, (0., Cow::Owned(under.clone()), ""));
+                    }
+                    if keys[keys.len() - 1].0 < 1. {
+                        keys.push((1., Cow::Owned(under), ""));
+                    }
                 }
             }
             let index = keys
@@ -253,9 +330,15 @@ impl Animation {
                 .rposition(|key| key.0 <= progress)
                 .unwrap_or(0)
                 .min(keys.len().saturating_sub(2));
-            let (from, to) = (keys[index], keys[(index + 1).min(keys.len() - 1)]);
+            let (from, to) = (&keys[index], &keys[(index + 1).min(keys.len() - 1)]);
+            // An easing that overshoots goes past the first or last keyframe.
             let local = if to.0 > from.0 {
-                ((progress - from.0) / (to.0 - from.0)).clamp(0., 1.)
+                let local = (progress - from.0) / (to.0 - from.0);
+                if (0. ..=1.).contains(&progress) {
+                    local.clamp(0., 1.)
+                } else {
+                    local
+                }
             } else {
                 1.
             };
@@ -264,9 +347,12 @@ impl Animation {
             } else {
                 from.2
             };
+            let discrete = property.is_custom() && !animatable(*property, registry);
             if active && to.0 > from.0 {
                 let steps = if from.1 == to.1 || matches!(timing, "step-start" | "step-end") {
                     Some(1.)
+                } else if discrete {
+                    (timing == "linear").then_some(2.)
                 } else {
                     timing.strip_prefix("steps(").map(|args| {
                         components(args.trim_end_matches(')'), ',')
@@ -291,8 +377,10 @@ impl Animation {
                 });
             }
             let local = easing(timing, local);
-            let value = interpolate(property.name(), from.1, to.1, local)
-                .unwrap_or_else(|| if local < 0.5 { from.1 } else { to.1 }.to_owned());
+            let value = (!discrete)
+                .then(|| interpolate(property.name(), &from.1, &to.1, local))
+                .flatten()
+                .unwrap_or_else(|| if local < 0.5 { &*from.1 } else { &*to.1 }.to_owned());
             out.insert(*property, value);
         }
         (wake, ended)
@@ -300,6 +388,7 @@ impl Animation {
 }
 
 struct Clock {
+    serial: u32,
     name: String,
     elapsed: std::time::Duration,
     last: Instant,
@@ -307,14 +396,21 @@ struct Clock {
     started: bool,
     iteration: f64,
     delay: f64,
+    /// Whether script paused (`true`) or played it, over `animation-play-state`.
+    held: Option<bool>,
+    /// Script canceled it, so it stays off until its name changes.
+    canceled: bool,
 }
 
 #[derive(Clone)]
 struct Transition {
+    serial: u32,
     property: Prop,
     from: String,
     to: String,
     start: Instant,
+    /// The seconds since `start` where script paused it.
+    held: Option<f64>,
     delay: f64,
     duration: f64,
     timing: String,
@@ -324,9 +420,106 @@ struct Transition {
 }
 
 impl Transition {
+    fn elapsed(&self, now: Instant) -> f64 {
+        self.held
+            .unwrap_or_else(|| now.saturating_duration_since(self.start).as_secs_f64())
+    }
+
     fn progress(&self, now: Instant) -> Option<f64> {
-        let time = now.saturating_duration_since(self.start).as_secs_f64() - self.delay;
+        let time = self.elapsed(now) - self.delay;
         (time < self.duration).then(|| easing(&self.timing, (time / self.duration).max(0.)))
+    }
+}
+
+/// An animation from `Element.animate()`. Script keeps its timing model and sends the current time, so this
+/// only runs the clock between updates.
+pub(crate) struct Scripted {
+    id: u32,
+    /// Keyframes as `(offset, declarations, easing)`.
+    rules: Vec<(f64, Style, String)>,
+    effect: Animation,
+    /// What owns the style that the keyframes were resolved against.
+    base: Option<Rc<dyn std::any::Any>>,
+    /// The current time in seconds at `since`, and the playback rate while time runs.
+    time: f64,
+    rate: Option<f64>,
+    since: Instant,
+}
+
+impl Scripted {
+    /// A script animation from its keyframes `(offset, CSS declarations, easing)`, its timing in seconds
+    /// `[delay, end delay, duration, iterations, iteration start]`, `[direction, fill, easing, composite]` and
+    /// pseudo-element slot.
+    pub fn new(
+        id: u32,
+        keyframes: &[(f64, &str, String)],
+        [delay, end_delay, duration, iterations, iteration_start]: [f64; 5],
+        [direction, fill, easing, composite]: [&str; 4],
+        pseudo: u8,
+    ) -> Self {
+        Self {
+            id,
+            rules: keyframes
+                .iter()
+                .map(|(offset, source, easing)| {
+                    (*offset, super::declarations(source), easing.clone())
+                })
+                .collect(),
+            effect: Animation {
+                name: String::new(),
+                paused: true,
+                duration,
+                delay,
+                iterations,
+                direction: direction.into(),
+                fill: fill.into(),
+                timing: "linear".into(),
+                easing: easing.into(),
+                end_delay,
+                iteration_start,
+                composite: composite.into(),
+                pseudo,
+                tracks: Vec::new(),
+            },
+            base: None,
+            time: 0.,
+            rate: None,
+            since: Instant::now(),
+        }
+    }
+
+    fn local(&self, now: Instant) -> f64 {
+        self.time
+            + self.rate.map_or(0., |rate| {
+                now.saturating_duration_since(self.since).as_secs_f64() * rate
+            })
+    }
+
+    /// The style it animates and its owner: the element's, or one of its pseudo-elements'.
+    fn base<'a>(
+        &self,
+        id: usize,
+        styles: &'a ComputedStyles,
+    ) -> Option<(Rc<dyn std::any::Any>, &'a Style)> {
+        match self.effect.pseudo {
+            0 => Some((styles.values[id].clone(), &*styles.values[id])),
+            slot => {
+                let pair = styles.pseudos.get(&id)?;
+                Some((pair.clone(), &pair[usize::from(slot) - 1]))
+            }
+        }
+    }
+
+    /// Resolves the keyframes again when the style changed.
+    fn resolve(&mut self, owner: Rc<dyn std::any::Any>, base: &Style, registry: &Registry) {
+        if self
+            .base
+            .as_ref()
+            .is_none_or(|old| !Rc::ptr_eq(old, &owner))
+        {
+            self.effect.tracks = tracks(base, &self.rules, registry);
+            self.base = Some(owner);
+        }
     }
 }
 
@@ -342,15 +535,398 @@ pub(crate) struct Motion {
     pub wake: Option<(Instant, renderer::Timer)>,
     /// Nodes whose animations wait until their box comes into view, from the last update.
     pub parked: Vec<usize>,
+    /// The animations from `Element.animate()` of each node, in composite order.
+    scripted: HashMap<usize, Vec<Scripted>>,
+    /// The last id of a CSS animation or transition, so script can find them.
+    serial: u32,
+    /// Events from script controls, for the next update.
+    queued: Vec<(usize, &'static str, String, f64)>,
+    /// The animated `::before` and `::after` styles of the last update.
+    pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
 }
 
 impl Motion {
+    /// The style of node `id` at each of `times`, sampled like `update` from its last clocks without
+    /// changing them or sending events, so a compositor can play it.
+    pub fn timeline(&self, id: usize, styles: &ComputedStyles, times: &[Instant]) -> Vec<Style> {
+        let registry = &*styles.registry;
+        let base = &*styles.values[id];
+        let effects = styles.animations.get(&id).map_or(&[][..], Vec::as_slice);
+        let clocks = self.clocks.get(&id).map_or(&[][..], Vec::as_slice);
+        times
+            .iter()
+            .map(|&at| {
+                let mut out = Style::default();
+                for (effect, clock) in effects.iter().zip(clocks) {
+                    let paused = clock.held.unwrap_or(effect.paused);
+                    if clock.canceled || effect.pseudo != 0 {
+                        continue;
+                    }
+                    let mut elapsed = clock.elapsed;
+                    if !paused {
+                        elapsed += at.saturating_duration_since(clock.last);
+                    }
+                    let held;
+                    let effect = if paused == effect.paused {
+                        effect
+                    } else {
+                        held = Animation {
+                            paused,
+                            ..effect.clone()
+                        };
+                        &held
+                    };
+                    effect.sample(elapsed.as_secs_f64(), base, registry, &mut out);
+                }
+                for animation in self.scripted.get(&id).into_iter().flatten() {
+                    if animation.effect.pseudo == 0 {
+                        let local = animation.local(at);
+                        animation.effect.sample(local, base, registry, &mut out);
+                    }
+                }
+                for transition in self.transitions.get(&id).into_iter().flatten() {
+                    if let Some(progress) = transition.progress(at)
+                        && let Some(value) = interpolate(
+                            transition.property.name(),
+                            &transition.from,
+                            &transition.to,
+                            progress,
+                        )
+                    {
+                        out.insert(transition.property, value);
+                    }
+                }
+                let mut style = base.clone();
+                style.extend(out.iter().map(|(key, value)| (key, value.clone())));
+                style
+            })
+            .collect()
+    }
+
+    /// When the next animation or transition event of node `id` fires after `now`, if any.
+    pub fn next_event(&self, id: usize, styles: &ComputedStyles, now: Instant) -> Option<Instant> {
+        let effects = styles.animations.get(&id).map_or(&[][..], Vec::as_slice);
+        let clocks = self.clocks.get(&id).map_or(&[][..], Vec::as_slice);
+        let animations = effects.iter().zip(clocks).filter_map(|(effect, clock)| {
+            if clock.held.unwrap_or(effect.paused) || clock.canceled || clock.ended {
+                return None;
+            }
+            let elapsed = (clock.elapsed + now.saturating_duration_since(clock.last)).as_secs_f64();
+            let active = elapsed - effect.delay;
+            let end = effect.duration * effect.iterations;
+            let at = if active < 0. {
+                0.
+            } else if effect.duration > 0. {
+                (((active / effect.duration).floor() + 1.) * effect.duration).min(end)
+            } else {
+                end
+            };
+            Some(effect.delay + at - elapsed)
+        });
+        let transitions =
+            self.transitions
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter_map(|transition| {
+                    let time = transition.elapsed(now) - transition.delay;
+                    transition.held.is_none().then(|| {
+                        if time < 0. {
+                            -time
+                        } else {
+                            transition.duration - time
+                        }
+                    })
+                });
+        animations
+            .chain(transitions)
+            .filter(|seconds| seconds.is_finite())
+            .map(|seconds| now + std::time::Duration::from_secs_f64(seconds.max(0.)))
+            .min()
+    }
+
     pub fn forget(&mut self, id: usize) {
         if let Some(previous) = self.previous.get_mut(id) {
             *previous = Rc::default();
         }
         self.clocks.remove(&id);
         self.transitions.remove(&id);
+        self.scripted.remove(&id);
+    }
+
+    /// Adds or replaces the script animation `id` of `node`, at `time` seconds and running at `rate`, or
+    /// paused with `None`.
+    pub fn script(&mut self, node: usize, mut animation: Scripted, time: f64, rate: Option<f64>) {
+        animation.time = time;
+        animation.rate = rate.filter(|rate| *rate != 0.);
+        animation.effect.paused = animation.rate.is_none();
+        animation.since = Instant::now();
+        self.unscript(animation.id);
+        let list = self.scripted.entry(node).or_default();
+        let index = list.partition_point(|other| other.id < animation.id);
+        list.insert(index, animation);
+    }
+
+    /// Removes the script animation `id`, and returns its node.
+    pub fn unscript(&mut self, id: u32) -> Option<usize> {
+        let node = self.scripted.iter().find_map(|(&node, list)| {
+            list.iter()
+                .any(|animation| animation.id == id)
+                .then_some(node)
+        })?;
+        let list = self.scripted.get_mut(&node)?;
+        list.retain(|animation| animation.id != id);
+        if list.is_empty() {
+            self.scripted.remove(&node);
+        }
+        Some(node)
+    }
+
+    /// The CSS transitions and then the CSS animations of `nodes` that script sees, as `[serial, node, kind, name,
+    /// time, state, [delay, end delay, duration, iterations, iteration start], direction, fill, easing, frames]`
+    /// with times in ms, infinite iterations as -1 and frames as `[offset, property, value, easing]`.
+    pub fn css(
+        &self,
+        nodes: &[usize],
+        pseudos: bool,
+        styles: &ComputedStyles,
+    ) -> Vec<serde_json::Value> {
+        let now = Instant::now();
+        let mut list = Vec::new();
+        for &node in nodes {
+            for transition in self.transitions.get(&node).into_iter().flatten() {
+                let name = transition.property.name();
+                list.push(serde_json::json!([
+                    transition.serial,
+                    node,
+                    "transition",
+                    name,
+                    transition.elapsed(now) * 1000.,
+                    if transition.held.is_some() {
+                        "paused"
+                    } else {
+                        "running"
+                    },
+                    [
+                        transition.delay * 1000.,
+                        0.,
+                        transition.duration * 1000.,
+                        1.,
+                        0.
+                    ],
+                    "normal",
+                    "backwards",
+                    transition.timing,
+                    [
+                        [0., name, transition.from, "linear"],
+                        [1., name, transition.to, "linear"]
+                    ],
+                ]));
+            }
+        }
+        for &node in nodes {
+            let (Some(clocks), Some(effects)) =
+                (self.clocks.get(&node), styles.animations.get(&node))
+            else {
+                continue;
+            };
+            for (clock, effect) in clocks.iter().zip(effects) {
+                // Finished animations that don't fill are gone for script, like canceled ones.
+                if clock.canceled
+                    || effect.pseudo != 0 && !pseudos
+                    || clock.ended && !matches!(effect.fill.as_str(), "forwards" | "both")
+                {
+                    continue;
+                }
+                let paused = clock.held.unwrap_or(effect.paused);
+                let length = if effect.duration == 0. {
+                    0.
+                } else {
+                    effect.duration * effect.iterations
+                };
+                let time = (clock.elapsed.as_secs_f64()
+                    + if paused {
+                        0.
+                    } else {
+                        now.saturating_duration_since(clock.last).as_secs_f64()
+                    })
+                .min(effect.delay + length);
+                let frames: Vec<_> = effect
+                    .tracks
+                    .iter()
+                    .flat_map(|(prop, keys)| {
+                        keys.iter().map(move |(offset, value, timing)| {
+                            serde_json::json!([
+                                offset,
+                                prop.name(),
+                                value,
+                                if timing.is_empty() {
+                                    &effect.timing
+                                } else {
+                                    timing
+                                }
+                            ])
+                        })
+                    })
+                    .collect();
+                let (pseudo, name) = clock.name.split_once('\0').unwrap_or(("", &clock.name));
+                list.push(serde_json::json!([
+                    clock.serial,
+                    node,
+                    "animation",
+                    name,
+                    time * 1000.,
+                    if clock.ended {
+                        "finished"
+                    } else if paused {
+                        "paused"
+                    } else {
+                        "running"
+                    },
+                    [
+                        effect.delay * 1000.,
+                        0.,
+                        effect.duration * 1000.,
+                        if effect.iterations.is_finite() {
+                            effect.iterations
+                        } else {
+                            -1.
+                        },
+                        0.
+                    ],
+                    effect.direction,
+                    effect.fill,
+                    "linear",
+                    frames,
+                    pseudo,
+                ]));
+            }
+        }
+        list
+    }
+
+    /// Runs a script control on the CSS animation or transition `serial`: `pause`, `play`, `seek` to `time` ms,
+    /// `finish` or `cancel`. Returns whether it found it.
+    pub fn css_control(
+        &mut self,
+        serial: u32,
+        action: &str,
+        time: f64,
+        styles: &ComputedStyles,
+    ) -> bool {
+        let now = Instant::now();
+        for (&node, clocks) in &mut self.clocks {
+            let Some(index) = clocks.iter().position(|clock| clock.serial == serial) else {
+                continue;
+            };
+            let clock = &mut clocks[index];
+            let effect = styles
+                .animations
+                .get(&node)
+                .and_then(|effects| effects.get(index));
+            let paused = clock
+                .held
+                .unwrap_or(effect.is_some_and(|effect| effect.paused));
+            if !paused && !clock.canceled {
+                clock.elapsed += now.saturating_duration_since(clock.last);
+            }
+            clock.last = now;
+            let end = effect.map_or(0., |effect| {
+                effect.delay
+                    + if effect.duration == 0. {
+                        0.
+                    } else {
+                        effect.duration * effect.iterations
+                    }
+            });
+            match action {
+                "pause" => clock.held = Some(true),
+                "play" => {
+                    if clock.ended || clock.canceled {
+                        clock.elapsed = Default::default();
+                        (clock.ended, clock.started, clock.canceled, clock.iteration) =
+                            (false, false, false, 0.);
+                    }
+                    clock.held = Some(false);
+                }
+                "seek" => {
+                    clock.elapsed = std::time::Duration::from_secs_f64((time / 1000.).max(0.))
+                }
+                "finish" if end.is_finite() => {
+                    clock.elapsed = std::time::Duration::from_secs_f64(end.max(0.))
+                }
+                "cancel" => {
+                    if clock.started && !clock.ended && !clock.canceled {
+                        let active = (clock.elapsed.as_secs_f64() - clock.delay).max(0.);
+                        self.queued
+                            .push((node, "animationcancel", clock.name.clone(), active));
+                    }
+                    clock.canceled = true;
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        for (&node, list) in &mut self.transitions {
+            let Some(index) = list
+                .iter()
+                .position(|transition| transition.serial == serial)
+            else {
+                continue;
+            };
+            let transition = &mut list[index];
+            let elapsed = transition.elapsed(now);
+            let after =
+                |seconds: f64| now.checked_sub(std::time::Duration::from_secs_f64(seconds.max(0.)));
+            match action {
+                "pause" => transition.held = Some(elapsed),
+                "play" => {
+                    if let Some(held) = transition.held.take() {
+                        transition.start = after(held).unwrap_or(now);
+                    }
+                }
+                "seek" if transition.held.is_some() => {
+                    transition.held = Some((time / 1000.).max(0.))
+                }
+                "seek" => transition.start = after(time / 1000.).unwrap_or(now),
+                "finish" | "cancel" => {
+                    let transition = list.remove(index);
+                    let (kind, time) = if action == "finish" {
+                        ("transitionend", transition.duration)
+                    } else {
+                        (
+                            "transitioncancel",
+                            (elapsed - transition.delay).clamp(0., transition.duration),
+                        )
+                    };
+                    self.queued
+                        .push((node, kind, transition.property.name().to_owned(), time));
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        false
+    }
+
+    /// The values that the script animations of `node` or its pseudo-element `pseudo` give it now.
+    pub fn scripted(&mut self, node: usize, pseudo: u8, styles: &ComputedStyles) -> Option<Style> {
+        let now = Instant::now();
+        let list = self.scripted.get_mut(&node)?;
+        let mut out = Style::new();
+        for animation in list
+            .iter_mut()
+            .filter(|animation| animation.effect.pseudo == pseudo)
+        {
+            let Some((owner, base)) = animation.base(node, styles) else {
+                continue;
+            };
+            animation.resolve(owner, base, &styles.registry);
+            animation
+                .effect
+                .sample(animation.local(now), base, &styles.registry, &mut out);
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Samples the animations and transitions at `now`. `shown` tells whether a node's box was in view
@@ -367,6 +943,7 @@ impl Motion {
         events: &mut Vec<(usize, &'static str, String, f64)>,
     ) -> (Animated, Option<Instant>) {
         let registry = &*styles.registry;
+        events.append(&mut self.queued);
         self.previous
             .resize_with(styles.values.len(), Default::default);
         for (id, new) in styles.values.iter().enumerate() {
@@ -383,12 +960,9 @@ impl Motion {
                 |kept: &[Transition], events: &mut Vec<(usize, &'static str, String, f64)>| {
                     for transition in &running {
                         if !kept.iter().any(|next| {
-                            next.property == transition.property && next.start == transition.start
+                            next.property == transition.property && next.serial == transition.serial
                         }) {
-                            let time = now
-                                .saturating_duration_since(transition.start)
-                                .as_secs_f64()
-                                - transition.delay;
+                            let time = transition.elapsed(now) - transition.delay;
                             events.push((
                                 id,
                                 "transitioncancel",
@@ -484,11 +1058,14 @@ impl Motion {
                 if from == after || interpolate(property.name(), &from, after, 0.5).is_none() {
                     continue;
                 }
+                self.serial += 1;
                 next.push(Transition {
+                    serial: self.serial,
                     property,
                     from,
                     to: after.to_owned(),
                     start: now,
+                    held: None,
                     delay: if delay < 0. { delay * factor } else { delay },
                     duration: duration.max(0.) * factor,
                     timing,
@@ -511,7 +1088,7 @@ impl Motion {
         }
         let cancel =
             |id: usize, clock: &Clock, events: &mut Vec<(usize, &'static str, String, f64)>| {
-                if clock.started && !clock.ended {
+                if clock.started && !clock.ended && !clock.canceled {
                     events.push((
                         id,
                         "animationcancel",
@@ -533,10 +1110,7 @@ impl Motion {
             let kept = visible.get(id) == Some(&true);
             if !kept {
                 for transition in list.iter() {
-                    let time = now
-                        .saturating_duration_since(transition.start)
-                        .as_secs_f64()
-                        - transition.delay;
+                    let time = transition.elapsed(now) - transition.delay;
                     events.push((
                         id,
                         "transitioncancel",
@@ -548,6 +1122,7 @@ impl Motion {
             kept
         });
         let mut animated: HashMap<usize, Style> = HashMap::new();
+        let mut pseudo: HashMap<(usize, u8), Style> = HashMap::new();
         let mut wakes: Vec<(usize, bool, bool, f64, f64)> = Vec::new();
         for (&id, effects) in &styles.animations {
             if visible.get(id) != Some(&true) {
@@ -558,13 +1133,14 @@ impl Motion {
                 cancel(id, clock, events);
             }
             clocks.truncate(effects.len());
-            let out = animated.entry(id).or_default();
             for (index, effect) in effects.iter().enumerate() {
                 if clocks
                     .get(index)
                     .is_none_or(|clock| clock.name != effect.name)
                 {
+                    self.serial += 1;
                     let clock = Clock {
+                        serial: self.serial,
                         name: effect.name.clone(),
                         elapsed: Default::default(),
                         last: now,
@@ -572,6 +1148,8 @@ impl Motion {
                         started: false,
                         iteration: 0.,
                         delay: effect.delay,
+                        held: None,
+                        canceled: false,
                     };
                     if index == clocks.len() {
                         clocks.push(clock);
@@ -581,12 +1159,38 @@ impl Motion {
                     }
                 }
                 let clock = &mut clocks[index];
-                if !effect.paused {
+                let paused = clock.held.unwrap_or(effect.paused);
+                if !paused && !clock.canceled {
                     clock.elapsed += now.saturating_duration_since(clock.last);
                 }
                 clock.last = now;
+                if clock.canceled {
+                    continue;
+                }
+                let held;
+                let effect = if paused == effect.paused {
+                    effect
+                } else {
+                    held = Animation {
+                        paused,
+                        ..effect.clone()
+                    };
+                    &held
+                };
                 let elapsed = clock.elapsed.as_secs_f64();
-                let (wake, ended) = effect.sample(elapsed, &styles.values[id], registry, out);
+                let (base, out) = match effect.pseudo {
+                    0 => (&*styles.values[id], animated.entry(id).or_default()),
+                    slot => {
+                        let Some(pair) = styles.pseudos.get(&id) else {
+                            continue;
+                        };
+                        (
+                            &pair[usize::from(slot) - 1],
+                            pseudo.entry((id, slot)).or_default(),
+                        )
+                    }
+                };
+                let (wake, ended) = effect.sample(elapsed, base, registry, out);
                 let active = elapsed - effect.delay;
                 if !clock.started && active >= 0. {
                     clock.started = true;
@@ -644,16 +1248,50 @@ impl Motion {
                 ));
             }
         }
+        // Script animations come after CSS animations in composite order. Script runs their finish, so only
+        // their changes wake the view.
+        for (&id, list) in &mut self.scripted {
+            if visible.get(id) != Some(&true) {
+                continue;
+            }
+            for animation in list.iter_mut() {
+                let Some((owner, base)) = animation.base(id, styles) else {
+                    continue;
+                };
+                animation.resolve(owner, base, registry);
+                let out = match animation.effect.pseudo {
+                    0 => animated.entry(id).or_default(),
+                    slot => pseudo.entry((id, slot)).or_default(),
+                };
+                let local = animation.local(now);
+                let (wake, _) = animation.effect.sample(local, base, registry, out);
+                let Some(rate) = animation.rate else {
+                    continue;
+                };
+                let change = if rate > 0. {
+                    wake.map_or(f64::INFINITY, |wake| wake / rate)
+                } else if local > 0. {
+                    0.
+                } else {
+                    f64::INFINITY
+                };
+                let tracks = &animation.effect.tracks;
+                wakes.push((
+                    id,
+                    tracks.iter().all(|(key, _)| PAINT.contains(key)),
+                    tracks.iter().all(|(key, frames)| {
+                        still(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                    }),
+                    change,
+                    f64::INFINITY,
+                ));
+            }
+        }
         for (&id, list) in &mut self.transitions {
             let out = animated.entry(id).or_default();
             list.retain_mut(|transition| match transition.progress(now) {
                 Some(progress) => {
-                    if !transition.started
-                        && now
-                            .saturating_duration_since(transition.start)
-                            .as_secs_f64()
-                            >= transition.delay
-                    {
+                    if !transition.started && transition.elapsed(now) >= transition.delay {
                         transition.started = true;
                         events.push((
                             id,
@@ -670,10 +1308,9 @@ impl Motion {
                     ) {
                         out.insert(transition.property, value);
                     }
-                    let time = now
-                        .saturating_duration_since(transition.start)
-                        .as_secs_f64()
-                        - transition.delay;
+                    let time = transition.elapsed(now) - transition.delay;
+                    // A transition that script paused never changes.
+                    let held = transition.held.map(|_| f64::INFINITY);
                     wakes.push((
                         id,
                         PAINT.contains(&transition.property),
@@ -681,8 +1318,8 @@ impl Motion {
                             transition.property,
                             [transition.from.as_str(), transition.to.as_str()].into_iter(),
                         ),
-                        (-time).max(0.),
-                        transition.duration - time,
+                        held.unwrap_or((-time).max(0.)),
+                        held.unwrap_or(transition.duration - time),
                     ));
                     true
                 }
@@ -792,7 +1429,7 @@ impl Motion {
             next = next.min(if unseen || parked { end } else { change });
         }
         self.styled.retain(|id, _| animated.contains_key(id));
-        let animated = animated
+        let mut animated: Animated = animated
             .into_iter()
             .map(|(id, values)| {
                 let base = &styles.values[id];
@@ -812,11 +1449,133 @@ impl Motion {
                 (id, style, layout.contains(&id))
             })
             .collect();
+        // Animated pseudo-elements draw from their own styles, and their host rebuilds with its own one.
+        let mut pairs: HashMap<usize, [Style; 2]> = HashMap::new();
+        for ((id, slot), values) in pseudo {
+            let Some(pair) = styles.pseudos.get(&id).filter(|_| !values.is_empty()) else {
+                continue;
+            };
+            let layout = values.iter().any(|(key, _)| !PAINT.contains(&key));
+            pairs.entry(id).or_insert_with(|| (**pair).clone())[usize::from(slot) - 1]
+                .extend(values.iter().map(|(key, value)| (key, value.clone())));
+            match animated.iter_mut().find(|(node, ..)| *node == id) {
+                Some(entry) => entry.2 |= layout,
+                None => animated.push((id, styles.values[id].clone(), layout)),
+            }
+        }
+        self.pseudos = pairs
+            .into_iter()
+            .map(|(id, pair)| (id, Rc::new(pair)))
+            .collect();
         let next = std::time::Duration::try_from_secs_f64(next.max(0.))
             .ok()
             .and_then(|delay| now.checked_add(delay));
         (animated, next)
     }
+}
+
+/// `composite: add` of an animation value onto the value below it, or with `accumulate`, matching transform and
+/// filter functions combine their arguments. `None` where values don't add, so the animation value replaces.
+fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
+    // A number with its unit, like `10px` or `0.5`.
+    fn number(text: &str) -> Option<(f64, &str)> {
+        let bytes = text.as_bytes();
+        // An `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
+        let end = (0..bytes.len())
+            .find(|&index| {
+                let byte = bytes[index];
+                !(byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'-' | b'+')
+                    || matches!(byte, b'e' | b'E')
+                        && bytes.get(index + 1).is_some_and(|next| {
+                            next.is_ascii_digit() || matches!(next, b'-' | b'+')
+                        }))
+            })
+            .unwrap_or(bytes.len());
+        Some((text[..end].parse::<f64>().ok()?, &text[end..]))
+    }
+    let sum = |a: &str, b: &str, offset: f64| match (number(a), number(b)) {
+        (Some((a, unit)), Some((b, other))) if unit == other || a == 0. && unit.is_empty() => {
+            Some(format!(
+                "{}{}",
+                super::value::number(a + b - offset),
+                if unit.is_empty() { other } else { unit }
+            ))
+        }
+        (Some(_), Some((0., ""))) => Some(a.to_owned()),
+        (Some(_), Some(_)) if offset == 0. => Some(format!("calc({a} + {b})")),
+        _ => None,
+    };
+    if matches!(
+        property,
+        "transform" | "filter" | "backdrop-filter" | "box-shadow" | "text-shadow"
+    ) {
+        if under == "none" || value == "none" {
+            return Some(if under == "none" { value } else { under }.to_owned());
+        }
+        if accumulate && !property.ends_with("shadow") {
+            let [a, b] = [under, value].map(|list| components(list, ' '));
+            let combined: Option<Vec<String>> = (a.len() == b.len())
+                .then(|| {
+                    a.iter()
+                        .zip(&b)
+                        .map(|(a, b)| {
+                            let (name, args) = a.strip_suffix(')')?.split_once('(')?;
+                            let (other, more) = b.strip_suffix(')')?.split_once('(')?;
+                            let [args, more] = [args, more].map(|args| components(args, ','));
+                            if name != other
+                                || args.len() != more.len()
+                                || name.starts_with("matrix")
+                            {
+                                return None;
+                            }
+                            // Scales and the filters that are 1 when unchanged combine as `a + b - 1`.
+                            let offset = if name.starts_with("scale")
+                                || matches!(
+                                    name,
+                                    "brightness" | "contrast" | "opacity" | "saturate"
+                                ) {
+                                1.
+                            } else {
+                                0.
+                            };
+                            let args: Option<Vec<String>> = args
+                                .iter()
+                                .zip(&more)
+                                .map(|(a, b)| sum(a, b, offset))
+                                .collect();
+                            Some(format!("{name}({})", args?.join(", ")))
+                        })
+                        .collect()
+                })
+                .flatten();
+            if let Some(combined) = combined {
+                return Some(combined.join(" "));
+            }
+        }
+        return Some(if property.ends_with("shadow") {
+            format!("{under}, {value}")
+        } else {
+            format!("{under} {value}")
+        });
+    }
+    if let (Some((a, alpha)), Some((b, other))) = (color(under), color(value)) {
+        let channel = |shift: u32| ((a >> shift & 255) + (b >> shift & 255)).min(255);
+        let alpha = (f64::from(alpha) + f64::from(other)).min(255.) / 255.;
+        return Some(format!(
+            "rgba({}, {}, {}, {})",
+            channel(16),
+            channel(8),
+            channel(0),
+            super::value::number(alpha)
+        ));
+    }
+    let [a, b] = [under, value].map(|list| components(list, ' '));
+    if a.len() != b.len() {
+        return None;
+    }
+    let parts: Option<Vec<String>> = a.iter().zip(&b).map(|(a, b)| sum(a, b, 0.)).collect();
+    Some(parts?.join(" "))
 }
 
 /// Whether animated paint values keep the box where it is, so they can't move it into view.
@@ -950,212 +1709,295 @@ pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Optio
     if t == 1. {
         return Some(to.to_owned());
     }
-    if property == "visibility" && (from == "visible" || to == "visible") {
-        return Some(
-            if t <= 0. {
+    // WARNING: animations mix the same values every frame, so their parsed pairs are kept by a hash
+    // of the property and values, checked against them.
+    thread_local! {
+        static LERPS: std::cell::RefCell<Lerps> = Default::default();
+    }
+    let key = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, (property, from, to));
+    LERPS.with_borrow_mut(|lerps| {
+        if !lerps
+            .get(&key)
+            .is_some_and(|(p, a, b, _)| p == property && a == from && b == to)
+        {
+            if lerps.len() >= 1024 {
+                lerps.clear();
+            }
+            let lerp = Lerp::new(property, from, to);
+            lerps.insert(key, (property.into(), from.into(), to.into(), lerp));
+        }
+        lerps[&key].3.as_ref().map(|lerp| lerp.at(t))
+    })
+}
+
+/// Parsed pairs by a hash of the property and values, with those values.
+type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Lerp>)>;
+
+/// Two values parsed once, so each frame only mixes numbers and writes them.
+#[derive(Clone, Debug)]
+pub(crate) enum Lerp {
+    Same(String),
+    /// `visibility`: the end values outside (0, 1), `visible` between them.
+    Visible(String, String),
+    List(Vec<Lerp>, &'static str),
+    Function(String, Box<Lerp>),
+    Color((u32, u8), (u32, u8)),
+    /// Two numbers and their unit, rounded to integers for `z-index` and `order`.
+    Number(f64, f64, String, bool),
+    /// Two lengths in other units, mixed in `calc()`.
+    Calc(String, String, bool),
+}
+
+impl Lerp {
+    pub(crate) fn new(property: &str, from: &str, to: &str) -> Option<Self> {
+        if from == to {
+            return Some(Self::Same(from.to_owned()));
+        }
+        if property == "visibility" && (from == "visible" || to == "visible") {
+            return Some(Self::Visible(from.to_owned(), to.to_owned()));
+        }
+        if matches!(property, "box-shadow" | "text-shadow") {
+            let normalize = |value: &str| -> Option<Vec<String>> {
+                if value == "none" {
+                    return Some(Vec::new());
+                }
+                components(value, ',')
+                    .into_iter()
+                    .map(|shadow| {
+                        let (mut lengths, mut ink, mut inset) = (Vec::new(), "black", "");
+                        for part in components(shadow, ' ') {
+                            if part == "inset" {
+                                inset = "inset ";
+                            } else if part
+                                .starts_with(|c: char| c.is_ascii_digit() || ".+-".contains(c))
+                                || part.starts_with("calc(")
+                            {
+                                lengths.push(part);
+                            } else {
+                                ink = part;
+                            }
+                        }
+                        (2..=4).contains(&lengths.len()).then(|| {
+                            lengths.resize(4, "0px");
+                            format!("{inset}{} {ink}", lengths.join(" "))
+                        })
+                    })
+                    .collect()
+            };
+            let (mut a, mut b) = (normalize(from)?, normalize(to)?);
+            let (first, second) = (a.clone(), b.clone());
+            for (list, other) in [(&mut a, &second), (&mut b, &first)] {
+                for shadow in other.iter().skip(list.len()) {
+                    list.push(if shadow.starts_with("inset") {
+                        "inset 0px 0px 0px 0px transparent".into()
+                    } else {
+                        "0px 0px 0px 0px transparent".into()
+                    });
+                }
+            }
+            if a.is_empty() {
+                return Some(Self::Same("none".into()));
+            }
+            return a
+                .iter()
+                .zip(&b)
+                .map(|(a, b)| Self::new("", a, b))
+                .collect::<Option<Vec<_>>>()
+                .map(|list| Self::List(list, ", "));
+        }
+        if from == "none" || to == "none" {
+            let other = if from == "none" { to } else { from };
+            let identity = match property {
+                "translate" | "rotate" | "scale" => components(other, ' ')
+                    .into_iter()
+                    .map(|part| match property {
+                        "scale" => "1",
+                        "rotate"
+                            if part
+                                .starts_with(|c: char| c.is_ascii_digit() || ".+-".contains(c)) =>
+                        {
+                            "0deg"
+                        }
+                        "rotate" => part,
+                        _ => "0px",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "transform" => components(other, ' ')
+                    .into_iter()
+                    .map(|part| {
+                        let (name, args) = part.strip_suffix(')')?.split_once('(')?;
+                        let args = match name {
+                            "matrix" => "1, 0, 0, 1, 0, 0".to_owned(),
+                            "matrix3d" => {
+                                "1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1".to_owned()
+                            }
+                            "perspective" => return None,
+                            _ => components(args, ',')
+                                .iter()
+                                .enumerate()
+                                .map(|(index, arg)| {
+                                    if name.starts_with("scale") {
+                                        "1".to_owned()
+                                    } else if name == "rotate3d" && index < 3 {
+                                        (*arg).to_owned()
+                                    } else {
+                                        format!(
+                                            "0{}",
+                                            arg.trim_start_matches(|c: char| {
+                                                c.is_ascii_digit() || ".+-".contains(c)
+                                            })
+                                        )
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        };
+                        Some(format!("{name}({args})"))
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .join(" "),
+                _ => return None,
+            };
+            return if from == "none" {
+                Self::new(property, &identity, to)
+            } else {
+                Self::new(property, from, &identity)
+            };
+        }
+        if let (Some(a), Some(b)) = (color(from), color(to)) {
+            return Some(Self::Color(a, b));
+        }
+        for separator in [',', ' '] {
+            let (a, b) = (components(from, separator), components(to, separator));
+            if a.len() != b.len() || a.is_empty() {
+                return None;
+            }
+            if a.len() > 1 {
+                return a
+                    .iter()
+                    .zip(&b)
+                    .map(|(a, b)| Self::new(property, a, b))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|list| Self::List(list, if separator == ',' { ", " } else { " " }));
+            }
+        }
+        fn function(value: &str) -> Option<(&str, &str)> {
+            value
+                .strip_suffix(')')?
+                .split_once('(')
+                .filter(|(name, _)| {
+                    !matches!(*name, "calc" | "min" | "max" | "clamp" | "var" | "url")
+                })
+        }
+        if let (Some((name, a)), Some((other, b))) = (function(from), function(to))
+            && name == other
+        {
+            return Self::new(property, a, b)
+                .map(|args| Self::Function(name.into(), Box::new(args)));
+        }
+        fn number(value: &str) -> Option<(f64, &str)> {
+            let end = value
+                .char_indices()
+                .find(|&(index, c)| {
+                    !(c.is_ascii_digit() || c == '.' || index == 0 && "+-".contains(c))
+                })
+                .map_or(value.len(), |(index, _)| index);
+            let unit = &value[end..];
+            let number = value[..end].parse::<f64>().ok()?;
+            (number.is_finite() && unit.bytes().all(|b| b.is_ascii_alphabetic() || b == b'%'))
+                .then_some((number, unit))
+        }
+        let length = |value: &str| {
+            number(value).is_some_and(|(value, unit)| !unit.is_empty() || value == 0.)
+                || ["calc(", "min(", "max(", "clamp("]
+                    .iter()
+                    .any(|name| value.starts_with(name))
+        };
+        let integer = matches!(property, "z-index" | "order");
+        match (number(from), number(to)) {
+            (Some((a, unit)), Some((b, other)))
+                if unit == other || a == 0. && unit.is_empty() || b == 0. && other.is_empty() =>
+            {
+                let unit = if unit.is_empty() { other } else { unit };
+                Some(Self::Number(a, b, unit.into(), integer))
+            }
+            _ if length(from) && length(to) => {
+                let term = |value: &str| value.strip_prefix("calc").unwrap_or(value).to_owned();
+                Some(Self::Calc(term(from), term(to), integer))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn at(&self, t: f64) -> String {
+        let mut out = String::new();
+        self.write(t, &mut out);
+        out
+    }
+
+    fn write(&self, t: f64, out: &mut String) {
+        use std::fmt::Write;
+        // Six significant digits, like browsers serialize animated values.
+        let round = |value: f64, integer: bool| {
+            if integer {
+                value.round().to_string()
+            } else {
+                super::value::number(value)
+            }
+        };
+        match self {
+            Self::Same(value) => out.push_str(value),
+            Self::Visible(from, to) => out.push_str(if t <= 0. {
                 from
             } else if t >= 1. {
                 to
             } else {
                 "visible"
-            }
-            .to_owned(),
-        );
-    }
-    if matches!(property, "box-shadow" | "text-shadow") {
-        let normalize = |value: &str| -> Option<Vec<String>> {
-            if value == "none" {
-                return Some(Vec::new());
-            }
-            components(value, ',')
-                .into_iter()
-                .map(|shadow| {
-                    let (mut lengths, mut ink, mut inset) = (Vec::new(), "black", "");
-                    for part in components(shadow, ' ') {
-                        if part == "inset" {
-                            inset = "inset ";
-                        } else if part
-                            .starts_with(|c: char| c.is_ascii_digit() || ".+-".contains(c))
-                            || part.starts_with("calc(")
-                        {
-                            lengths.push(part);
-                        } else {
-                            ink = part;
-                        }
+            }),
+            Self::List(items, separator) => {
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(separator);
                     }
-                    (2..=4).contains(&lengths.len()).then(|| {
-                        lengths.resize(4, "0px");
-                        format!("{inset}{} {ink}", lengths.join(" "))
-                    })
-                })
-                .collect()
-        };
-        let (mut a, mut b) = (normalize(from)?, normalize(to)?);
-        let (first, second) = (a.clone(), b.clone());
-        for (list, other) in [(&mut a, &second), (&mut b, &first)] {
-            for shadow in other.iter().skip(list.len()) {
-                list.push(if shadow.starts_with("inset") {
-                    "inset 0px 0px 0px 0px transparent".into()
-                } else {
-                    "0px 0px 0px 0px transparent".into()
-                });
+                    item.write(t, out);
+                }
             }
-        }
-        if a.is_empty() {
-            return Some("none".into());
-        }
-        return a
-            .iter()
-            .zip(&b)
-            .map(|(a, b)| interpolate("", a, b, t))
-            .collect::<Option<Vec<_>>>()
-            .map(|list| list.join(", "));
-    }
-    if from == "none" || to == "none" {
-        let other = if from == "none" { to } else { from };
-        let identity = match property {
-            "translate" | "rotate" | "scale" => components(other, ' ')
-                .into_iter()
-                .map(|part| match property {
-                    "scale" => "1",
-                    "rotate"
-                        if part.starts_with(|c: char| c.is_ascii_digit() || ".+-".contains(c)) =>
-                    {
-                        "0deg"
-                    }
-                    "rotate" => part,
-                    _ => "0px",
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            "transform" => components(other, ' ')
-                .into_iter()
-                .map(|part| {
-                    let (name, args) = part.strip_suffix(')')?.split_once('(')?;
-                    let args = match name {
-                        "matrix" => "1, 0, 0, 1, 0, 0".to_owned(),
-                        "matrix3d" => "1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1".to_owned(),
-                        "perspective" => return None,
-                        _ => components(args, ',')
-                            .iter()
-                            .enumerate()
-                            .map(|(index, arg)| {
-                                if name.starts_with("scale") {
-                                    "1".to_owned()
-                                } else if name == "rotate3d" && index < 3 {
-                                    (*arg).to_owned()
-                                } else {
-                                    format!(
-                                        "0{}",
-                                        arg.trim_start_matches(|c: char| {
-                                            c.is_ascii_digit() || ".+-".contains(c)
-                                        })
-                                    )
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", "),
+            Self::Function(name, args) => {
+                out.push_str(name);
+                out.push('(');
+                args.write(t, out);
+                out.push(')');
+            }
+            Self::Color(a, b) => {
+                let alpha = f64::from(a.1) + (f64::from(b.1) - f64::from(a.1)) * t;
+                let mut rgb = 0;
+                for shift in [16, 8, 0] {
+                    let channel = |(value, alpha): (u32, u8)| {
+                        f64::from((value >> shift) as u8) * f64::from(alpha)
                     };
-                    Some(format!("{name}({args})"))
-                })
-                .collect::<Option<Vec<_>>>()?
-                .join(" "),
-            _ => return None,
-        };
-        return if from == "none" {
-            interpolate(property, &identity, to, t)
-        } else {
-            interpolate(property, from, &identity, t)
-        };
-    }
-    if let (Some(a), Some(b)) = (color(from), color(to)) {
-        let alpha = f64::from(a.1) + (f64::from(b.1) - f64::from(a.1)) * t;
-        let mut rgb = 0;
-        for shift in [16, 8, 0] {
-            let channel =
-                |(value, alpha): (u32, u8)| f64::from((value >> shift) as u8) * f64::from(alpha);
-            let premultiplied = channel(a) + (channel(b) - channel(a)) * t;
-            rgb = rgb << 8
-                | if alpha > 0. {
-                    (premultiplied / alpha).round().clamp(0., 255.) as u32
-                } else {
-                    0
-                };
+                    let premultiplied = channel(*a) + (channel(*b) - channel(*a)) * t;
+                    rgb = rgb << 8
+                        | if alpha > 0. {
+                            (premultiplied / alpha).round().clamp(0., 255.) as u32
+                        } else {
+                            0
+                        };
+                }
+                let _ = write!(out, "#{rgb:06x}{:02x}", alpha.round().clamp(0., 255.) as u8);
+            }
+            Self::Number(a, b, unit, integer) => {
+                let _ = write!(out, "{}{unit}", round(a + (b - a) * t, *integer));
+            }
+            Self::Calc(from, to, integer) => {
+                let _ = write!(
+                    out,
+                    "calc({from} * {} + {to} * {})",
+                    round(1. - t, *integer),
+                    round(t, *integer)
+                );
+            }
         }
-        return Some(format!(
-            "#{rgb:06x}{:02x}",
-            alpha.round().clamp(0., 255.) as u8
-        ));
-    }
-    for separator in [',', ' '] {
-        let (a, b) = (components(from, separator), components(to, separator));
-        if a.len() != b.len() || a.is_empty() {
-            return None;
-        }
-        if a.len() > 1 {
-            return a
-                .iter()
-                .zip(&b)
-                .map(|(a, b)| interpolate(property, a, b, t))
-                .collect::<Option<Vec<_>>>()
-                .map(|list| list.join(if separator == ',' { ", " } else { " " }));
-        }
-    }
-    fn function(value: &str) -> Option<(&str, &str)> {
-        value
-            .strip_suffix(')')?
-            .split_once('(')
-            .filter(|(name, _)| !matches!(*name, "calc" | "min" | "max" | "clamp" | "var" | "url"))
-    }
-    if let (Some((name, a)), Some((other, b))) = (function(from), function(to))
-        && name == other
-    {
-        return interpolate(property, a, b, t).map(|args| format!("{name}({args})"));
-    }
-    fn number(value: &str) -> Option<(f64, &str)> {
-        let end = value
-            .char_indices()
-            .find(|&(index, c)| !(c.is_ascii_digit() || c == '.' || index == 0 && "+-".contains(c)))
-            .map_or(value.len(), |(index, _)| index);
-        let unit = &value[end..];
-        let number = value[..end].parse::<f64>().ok()?;
-        (number.is_finite() && unit.bytes().all(|b| b.is_ascii_alphabetic() || b == b'%'))
-            .then_some((number, unit))
-    }
-    let length = |value: &str| {
-        number(value).is_some_and(|(value, unit)| !unit.is_empty() || value == 0.)
-            || ["calc(", "min(", "max(", "clamp("]
-                .iter()
-                .any(|name| value.starts_with(name))
-    };
-    let round = |value: f64| {
-        if matches!(property, "z-index" | "order") {
-            value.round()
-        } else {
-            (value * 1e4).round() / 1e4
-        }
-    };
-    match (number(from), number(to)) {
-        (Some((a, unit)), Some((b, other)))
-            if unit == other || a == 0. && unit.is_empty() || b == 0. && other.is_empty() =>
-        {
-            Some(format!(
-                "{}{}",
-                round(a + (b - a) * t),
-                if unit.is_empty() { other } else { unit }
-            ))
-        }
-        _ if length(from) && length(to) => {
-            let term = |value: &str| value.strip_prefix("calc").unwrap_or(value).to_owned();
-            Some(format!(
-                "calc({} * {} + {} * {})",
-                term(from),
-                round(1. - t),
-                term(to),
-                round(t)
-            ))
-        }
-        _ => None,
     }
 }
 
@@ -1165,6 +2007,7 @@ fn timing_function(part: &str) -> bool {
         "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end"
     ) || part.starts_with("cubic-bezier(")
         || part.starts_with("steps(")
+        || part.starts_with("linear(")
 }
 
 fn time(value: &str) -> Option<f64> {
@@ -1179,9 +2022,101 @@ fn time(value: &str) -> Option<f64> {
         .map(|value| value * scale)
 }
 
-fn easing(value: &str, progress: f64) -> f64 {
+/// The points `(input, output)` of a `linear()` easing, or `None` with fewer than two.
+fn linear_points(value: &str) -> Option<Rc<[(f64, f64)]>> {
+    type Points = HashMap<String, Option<Rc<[(f64, f64)]>>>;
+    thread_local! {
+        static POINTS: std::cell::RefCell<Points> = Default::default();
+    }
+    if let Some(points) = POINTS.with_borrow(|cache| cache.get(value).cloned()) {
+        return points;
+    }
+    let mut stops: Vec<(Option<f64>, f64)> = Vec::new();
+    for part in components(
+        value.trim_start_matches("linear(").trim_end_matches(')'),
+        ',',
+    ) {
+        let mut items = components(part, ' ').into_iter();
+        let Some(output) = items.next().and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        let inputs: Vec<f64> = items
+            .filter_map(|value| value.strip_suffix('%')?.parse::<f64>().ok())
+            .map(|value| value / 100.)
+            .collect();
+        if inputs.is_empty() {
+            stops.push((None, output));
+        }
+        stops.extend(
+            inputs
+                .into_iter()
+                .take(2)
+                .map(|input| (Some(input), output)),
+        );
+    }
+    let points = (stops.len() >= 2).then(|| {
+        // The first input defaults to 0, the last to 1, inputs never go back, and missing ones spread out evenly.
+        stops[0].0.get_or_insert(0.);
+        let last = stops.len() - 1;
+        let mut largest = f64::MIN;
+        for (index, (input, _)) in stops.iter_mut().enumerate() {
+            if index == last && input.is_none() {
+                *input = Some(largest.max(1.));
+            }
+            if let Some(input) = input {
+                *input = input.max(largest);
+                largest = *input;
+            }
+        }
+        let mut index = 1;
+        while index < stops.len() {
+            if stops[index].0.is_some() {
+                index += 1;
+                continue;
+            }
+            let end = (index..stops.len())
+                .find(|&end| stops[end].0.is_some())
+                .unwrap_or(last);
+            let [from, to] = [stops[index - 1].0, stops[end].0].map(|input| input.unwrap_or(1.));
+            for (step, stop) in stops[index..end].iter_mut().enumerate() {
+                stop.0 = Some(from + (to - from) * (step + 1) as f64 / (end - index + 1) as f64);
+            }
+            index = end;
+        }
+        stops
+            .into_iter()
+            .map(|(input, output)| (input.unwrap_or(1.), output))
+            .collect::<Rc<[_]>>()
+    });
+    POINTS.with_borrow_mut(|cache| {
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(value.to_owned(), points.clone());
+    });
+    points
+}
+
+pub(crate) fn easing(value: &str, progress: f64) -> f64 {
     let curve = match value {
         "linear" => return progress,
+        _ if value.starts_with("linear(") => {
+            let Some(points) = linear_points(value) else {
+                return progress;
+            };
+            // Inputs before the first point or after the last extend the first or last segment.
+            let index = points
+                .iter()
+                .rposition(|point| point.0 <= progress)
+                .unwrap_or(0)
+                .min(points.len() - 2);
+            let ((x0, y0), (x1, y1)) = (points[index], points[index + 1]);
+            return if x1 > x0 {
+                y0 + (y1 - y0) * (progress - x0) / (x1 - x0)
+            } else {
+                y1
+            };
+        }
         "step-start" => return 1.,
         "step-end" => return if progress == 1. { 1. } else { 0. },
         "ease-in" => [0.42, 0., 1., 1.],
@@ -1226,19 +2161,40 @@ fn easing(value: &str, progress: f64) -> f64 {
     if progress == 0. || progress == 1. {
         return progress;
     }
+    let bezier = |t: f64, a: f64, b: f64| {
+        3. * (1. - t) * (1. - t) * t * a + 3. * (1. - t) * t * t * b + t * t * t
+    };
+    // Newton's method first and bisection when it stalls, both to 1e-7 like browsers, so a symmetric curve
+    // gives exactly 0.5 at its middle.
+    let mut t = progress;
+    for _ in 0..8 {
+        let x = bezier(t, curve[0], curve[2]) - progress;
+        if x.abs() < 1e-7 {
+            return bezier(t, curve[1], curve[3]);
+        }
+        let slope = 3. * (1. - t) * (1. - t) * curve[0]
+            + 6. * (1. - t) * t * (curve[2] - curve[0])
+            + 3. * t * t * (1. - curve[2]);
+        if slope.abs() < 1e-6 {
+            break;
+        }
+        t -= x / slope;
+    }
     let (mut low, mut high) = (0., 1.);
-    for _ in 0..20 {
-        let t = (low + high) / 2.;
-        let x =
-            3. * (1. - t) * (1. - t) * t * curve[0] + 3. * (1. - t) * t * t * curve[2] + t * t * t;
+    t = progress;
+    for _ in 0..40 {
+        let x = bezier(t, curve[0], curve[2]);
+        if (x - progress).abs() < 1e-7 {
+            break;
+        }
         if x < progress {
             low = t;
         } else {
             high = t;
         }
+        t = (low + high) / 2.;
     }
-    let t = (low + high) / 2.;
-    3. * (1. - t) * (1. - t) * t * curve[1] + 3. * (1. - t) * t * t * curve[3] + t * t * t
+    bezier(t, curve[1], curve[3])
 }
 
 #[cfg(test)]
@@ -1812,6 +2768,230 @@ mod tests {
         let (half, end, later) = (style(0.5), style(2.), style(3.));
         assert!(!Rc::ptr_eq(&half, &end) && Rc::ptr_eq(&end, &later));
         assert_eq!(&later["width"], "10px");
+    }
+
+    #[test]
+    fn linear_easing_spreads_missing_inputs_and_extrapolates() {
+        assert_eq!(easing("linear(0, 1)", 0.3), 0.3);
+        assert!((easing("linear(0, 0.25 50%, 1)", 0.25) - 0.125).abs() < 1e-9);
+        assert!((easing("linear(0, 0.25 50%, 1)", 0.75) - 0.625).abs() < 1e-9);
+        // `0.5` has no input, so it goes halfway between 0 and 40%.
+        assert!((easing("linear(0, 0.5, 1 40%, 1)", 0.2) - 0.5).abs() < 1e-9);
+        // Two inputs hold the output, and inputs never go back.
+        assert_eq!(easing("linear(0, 0.5 20% 60%, 1)", 0.4), 0.5);
+        assert_eq!(easing("linear(0, 1 50%, 0.2 30%)", 0.5), 0.2);
+        assert!((easing("linear(0, 1)", 1.5) - 1.5).abs() < 1e-9);
+        assert!((easing("linear(0, 1.2 60%, 1)", 0.6) - 1.2).abs() < 1e-9);
+        assert_eq!(easing("linear(1)", 0.4), 0.4);
+    }
+
+    #[test]
+    fn script_animations_follow_web_animations_timing() {
+        let doc = Document::parse("<div style='opacity:0.5'></div>");
+        let styles = computed_styles(&doc);
+        let id = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+        let base = styles.values[id].clone();
+        let opacity = |animation: &Scripted, local: f64| {
+            let mut out = Style::new();
+            animation
+                .effect
+                .sample(local, &base, &Default::default(), &mut out);
+            out.get(Prop::OPACITY)
+                .map(|value| (value.parse::<f64>().unwrap() * 1e4).round() / 1e4)
+        };
+        let new = |frames: &[(f64, &str, String)], timing, direction, fill, easing| {
+            let mut animation =
+                Scripted::new(1, frames, timing, [direction, fill, easing, "replace"], 0);
+            animation.resolve(base.clone(), &base, &Default::default());
+            animation
+        };
+        let frames = [
+            (0., "opacity:0", "linear".into()),
+            (1., "opacity:1", "linear".into()),
+        ];
+        // Iterations start halfway, and every other one runs backwards.
+        let alternate = new(
+            &frames,
+            [0., 0., 1., 3., 0.5],
+            "alternate",
+            "none",
+            "linear",
+        );
+        assert_eq!(opacity(&alternate, 0.6), Some(0.9));
+        assert_eq!(opacity(&alternate, 3.), None);
+        // A negative end delay cuts the active interval, where a finished animation holds its time.
+        let cut = new(&frames, [0.2, -0.5, 1., 1., 0.], "normal", "both", "linear");
+        assert_eq!(opacity(&cut, 0.), Some(0.));
+        assert_eq!(opacity(&cut, 0.5), Some(0.3));
+        assert_eq!(opacity(&cut, 0.7), Some(0.5));
+        // The effect easing applies to the whole iteration and can overshoot the keyframes.
+        let spring = new(
+            &frames,
+            [0., 0., 1., 1., 0.],
+            "normal",
+            "none",
+            "linear(0, 1.2 60%, 1)",
+        );
+        assert_eq!(opacity(&spring, 0.6), Some(1.2));
+        // A single keyframe animates from the element's own value.
+        let single = new(
+            &[(1., "opacity:1", "linear".into())],
+            [0., 0., 1., 1., 0.],
+            "normal",
+            "none",
+            "linear",
+        );
+        assert_eq!(opacity(&single, 0.5), Some(0.75));
+        // Motion keeps the clock between updates, and paused animations never wake the view.
+        let mut motion = Motion::default();
+        motion.script(
+            id,
+            new(&frames, [0., 0., 10., 1., 0.], "normal", "none", "linear"),
+            2.,
+            Some(1.),
+        );
+        let visible = vec![true; doc.nodes.len()];
+        let (animated, next) = motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            Instant::now(),
+            false,
+            &mut Vec::new(),
+        );
+        let value = animated[0]
+            .1
+            .get(Prop::OPACITY)
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!((0.2..0.21).contains(&value) && next.is_some());
+        motion.script(
+            id,
+            new(&frames, [0., 0., 10., 1., 0.], "normal", "none", "linear"),
+            5.,
+            None,
+        );
+        let (animated, next) = motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            Instant::now(),
+            false,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            (animated[0].1.get(Prop::OPACITY), next),
+            (Some("0.5"), None)
+        );
+        assert_eq!(motion.unscript(1), Some(id));
+        assert!(motion.scripted(id, 0, &styles).is_none());
+    }
+
+    #[test]
+    fn composite_adds_and_accumulates_values() {
+        assert_eq!(add("opacity", "0.2", "0.4", false).as_deref(), Some("0.6"));
+        assert_eq!(
+            add("width", "10px", "2em", false).as_deref(),
+            Some("calc(10px + 2em)")
+        );
+        assert_eq!(
+            add("transform", "translateX(10px)", "rotate(5deg)", false).as_deref(),
+            Some("translateX(10px) rotate(5deg)")
+        );
+        assert_eq!(
+            add(
+                "transform",
+                "translateX(10px) scale(2)",
+                "translateX(5px) scale(1.5)",
+                true
+            )
+            .as_deref(),
+            Some("translateX(15px) scale(2.5)")
+        );
+        assert_eq!(
+            add(
+                "background-color",
+                "rgb(100, 0, 0)",
+                "rgb(200, 10, 0)",
+                false
+            )
+            .as_deref(),
+            Some("rgba(255, 10, 0, 1)")
+        );
+        assert_eq!(add("display", "block", "none", false), None);
+    }
+
+    #[test]
+    fn css_animations_of_elements_and_pseudo_elements_answer_script() {
+        let doc = Document::parse(
+            "<style>@keyframes fade{from{opacity:0}to{opacity:1}}@keyframes vary{from{--x:a}to{--x:b}}div{animation:fade 1s linear,vary 1s linear -0.6s paused}p::before{content:'x';animation:fade 2s linear -1s paused}</style><div></div><p></p>",
+        );
+        let styles = computed_styles(&doc);
+        let [div, p] =
+            ["div", "p"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
+        let visible = vec![true; doc.nodes.len()];
+        let mut motion = Motion::default();
+        let mut events = Vec::new();
+        let (animated, _) = motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            Instant::now(),
+            false,
+            &mut events,
+        );
+        // Unregistered custom properties switch halfway.
+        let own = animated.iter().find(|(id, ..)| *id == div).unwrap();
+        assert_eq!(own.1.get(Prop::new("--x")), Some("b"));
+        // `::before` animates its own style, and its host draws again.
+        let pair = &motion.pseudos.iter().find(|(id, _)| *id == p).unwrap().1;
+        assert_eq!(pair[0].get(Prop::OPACITY), Some("0.5"));
+        assert!(animated.iter().any(|(id, ..)| *id == p));
+        let list = motion.css(&[div, p], false, &styles);
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            (list[0][3].as_str(), list[0][5].as_str()),
+            (Some("fade"), Some("running"))
+        );
+        let pseudos = motion.css(&[p], true, &styles);
+        assert_eq!(
+            (pseudos[0][3].as_str(), pseudos[0][11].as_str()),
+            (Some("fade"), Some("::before"))
+        );
+        let serial = list[0][0].as_u64().unwrap() as u32;
+        assert!(motion.css_control(serial, "pause", 0., &styles));
+        assert_eq!(
+            motion.css(&[div], false, &styles)[0][5].as_str(),
+            Some("paused")
+        );
+        assert!(motion.css_control(serial, "seek", 250., &styles));
+        assert_eq!(
+            motion.css(&[div], false, &styles)[0][4].as_f64(),
+            Some(250.)
+        );
+        assert!(motion.css_control(serial, "cancel", 0., &styles));
+        assert_eq!(motion.css(&[div], false, &styles).len(), 1);
+        let mut events = Vec::new();
+        motion.update(
+            &doc,
+            &styles,
+            &visible,
+            &|_| true,
+            Instant::now(),
+            false,
+            &mut events,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(id, kind, name, _)| (*id, *kind, name.as_str())
+                    == (div, "animationcancel", "fade"))
+        );
+        assert!(!motion.css_control(u32::MAX, "pause", 0., &styles));
     }
 
     #[test]

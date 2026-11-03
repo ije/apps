@@ -151,7 +151,9 @@
       [Symbol.asyncIterator]() { return this; },
     };
   };
-  const getEventListeners = (emitter, name) => emitter.listeners?.(name) ?? [];
+  let targetListeners = () => [];
+  const getEventListeners = (emitter, name) => typeof EventTarget !== 'undefined' && emitter instanceof EventTarget ? targetListeners(emitter, name) : emitter.listeners?.(name) ?? [];
+  globalThis.__appsEventTargets = listeners => { targetListeners = listeners; };
   const getMaxListeners = target => { if (typeof target?.getMaxListeners === 'function') return target.getMaxListeners(); if (target instanceof EventTarget) return targets.get(target) ?? EventEmitter.defaultMaxListeners; throw invalid('emitter', 'an instance of EventEmitter or EventTarget', target); };
   const setMaxListeners = (value = EventEmitter.defaultMaxListeners, ...list) => {
     limit(value, 'setMaxListeners');

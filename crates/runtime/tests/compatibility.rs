@@ -314,6 +314,72 @@ fn bridge_preload_calls_main_and_publishes_events() {
 }
 
 #[test]
+fn bridge_clones_files_and_preload_reads_dropped_paths() {
+    let api = JavaScriptCore::load().unwrap();
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body></body>"),
+            dirty: false,
+        },
+    );
+    host.borrow_mut()
+        .dropped
+        .insert(1, vec!["/tmp/first.txt".into(), "/tmp/notes.txt".into()]);
+    let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+    let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+    preload.eval("const {contextBridge,webUtils}=__apps;contextBridge.exposeInMainWorld('desktop',{path:file=>webUtils.getPathForFile(file),describe:file=>[file.constructor.name,file.name,file.type,file.size,file.lastModified],echo:value=>value});", "test").unwrap();
+    let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+    page.eval("document.addEventListener('drop',event=>globalThis.dropped=event.dataTransfer.files[0]);__appsDrop([{name:'notes.txt',file:1,bytes:[104,105],lastModified:7}],0,0);", "test").unwrap();
+    assert_eq!(
+        page.eval("typeof __appsFiles+':'+('path' in dropped)", "test")
+            .unwrap(),
+        "undefined:false"
+    );
+    assert_eq!(
+        page.eval("desktop.path(dropped)", "test").unwrap(),
+        "/tmp/notes.txt"
+    );
+    assert_eq!(
+        page.eval("desktop.path(new File(['x'],'x.txt'))", "test")
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        page.eval("desktop.describe(dropped).join()", "test")
+            .unwrap(),
+        "File,notes.txt,text/plain,2,7"
+    );
+    assert_eq!(
+        page.eval(
+            "desktop.describe(new Blob(['hello'],{type:'text/plain'})).join()",
+            "test"
+        )
+        .unwrap(),
+        "Blob,,text/plain,5,"
+    );
+    assert_eq!(
+        page.eval("desktop.path(desktop.echo(dropped))", "test")
+            .unwrap(),
+        "/tmp/notes.txt"
+    );
+    assert!(
+        page.eval(
+            "(()=>{try{desktop.path({})}catch(e){return e.message}})()",
+            "test"
+        )
+        .unwrap()
+        .contains("Expected a File")
+    );
+    assert_eq!(
+        main.eval("__apps.webUtils.getPathForFile(new File([],'a'))", "test")
+            .unwrap(),
+        ""
+    );
+}
+
+#[test]
 fn bridge_capabilities_failures_and_closed_contexts() {
     let api = JavaScriptCore::load().unwrap();
     let host = Rc::new(RefCell::new(Host::default()));
@@ -608,7 +674,7 @@ fn node_http_and_websocket_adapters() {
 #[test]
 fn node_http_classes_ports_and_errors() {
     run(r#"
-        const {assert,http,https,net,stream}=__apps;
+        const {assert,http,https,stream}=__apps,net=__apps.module.createRequire()('net');
         assert.ok(Object.create(http.IncomingMessage.prototype) instanceof stream.Readable&&Object.create(http.ServerResponse.prototype) instanceof http.OutgoingMessage);
         assert.ok(http.createServer() instanceof net.Server&&http.maxHeaderSize===16384&&http.STATUS_CODES[418]==="I'm a Teapot"&&Object.keys(http.STATUS_CODES).length===63&&http.METHODS.length===35);
         assert.throws(()=>http.validateHeaderName('a b'),{code:'ERR_INVALID_HTTP_TOKEN',message:'Header name must be a valid HTTP token ["a b"]'});
@@ -674,9 +740,31 @@ fn node_http_close_finishes_requests_and_streams_large_bodies() {
 }
 
 #[test]
+fn electron_net_requests_fetch_and_online_state() {
+    run(r#"
+        const {assert,http,net}=__apps;
+        const server=http.createServer((req,res)=>{
+            if(req.url==='/moved'){res.writeHead(302,{Location:'/echo'});return res.end();}
+            let body='';req.setEncoding('utf8');req.on('data',chunk=>body+=chunk);req.on('end',()=>res.end(req.method+' '+req.url+' '+req.headers['x-test']+' '+body));
+        });
+        await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+        const port=server.address().port,base=`http://127.0.0.1:${port}`;
+        const send=(options,body)=>new Promise((resolve,reject)=>{const request=net.request(options),events=[];request.on('response',response=>{let data='';response.on('data',chunk=>data+=chunk);response.on('end',()=>resolve([response.statusCode,data,events]));});request.on('finish',()=>events.push('finish'));request.on('error',reject);request.setHeader('X-Test','yes');assert.strictEqual(request.getHeader('x-test'),'yes');assert.strictEqual(request.end(body),request);});
+        assert.deepStrictEqual(await send({method:'POST',url:base+'/echo'},'hello'),[200,'POST /echo yes hello',['finish']]);
+        assert.deepStrictEqual(await send({hostname:'127.0.0.1',port,path:'/moved'}),[200,'GET /echo yes ',['finish']]);
+        const failed=await new Promise(resolve=>{const request=net.request({url:base+'/moved',redirect:'error'});request.on('error',resolve);request.on('response',()=>resolve(null));request.end();});
+        assert.ok(failed instanceof Error);
+        assert.throws(()=>net.request({url:base,redirect:'manual'}),/Unsupported redirect mode/);
+        assert.strictEqual(await (await net.fetch(base+'/echo',{method:'PUT',body:'x',headers:{'X-Test':'f'}})).text(),'PUT /echo f x');
+        assert.strictEqual(typeof net.isOnline(),'boolean');assert.strictEqual(net.online,net.isOnline());
+        await new Promise(resolve=>server.close(resolve));
+    "#);
+}
+
+#[test]
 fn node_net_reads_while_writing_and_reuses_socket_paths() {
     run(r#"
-        const {assert,net,os,path,fs}=__apps,size=16<<20;
+        const {assert,os,path,fs}=__apps,net=__apps.module.createRequire()('net'),size=16<<20;
         const echo=net.createServer(socket=>socket.pipe(socket));await new Promise(resolve=>echo.listen(0,'127.0.0.1',resolve));
         const client=net.connect(echo.address().port,'127.0.0.1');let received=0;
         client.on('data',chunk=>{received+=chunk.length;if(received===size)client.end();});client.write(Buffer.alloc(size,7));
@@ -911,7 +999,7 @@ fn node_zlib_streams_crypto_digests_and_os_priority() {
         assert.strictEqual(crypto.createHmac('md5','key').update('data').digest('hex'),'9d5c73ef85594d34ec4438b7c97e51d8');
         assert.deepStrictEqual(hashes.map(name=>crypto.pbkdf2Sync('pw','salt',3,40,name).toString('hex').slice(0,24)),['d684741fdc128b5679ae66b7','b095208e7496b1a485a5dbe9','26ada39be31f195500c2ef78','3c671234e386cb307220d70e','b9a2cf5af8187f5db8f65515','6a7be24f5b46c5c3769d73a6']);
         assert.strictEqual((await __apps.util.promisify(crypto.pbkdf2)('pw','salt',1,16,'md5')).toString('hex'),'9887054ca80d1507d8b6e84a29476d04');
-        assert.strictEqual(crypto.constants.RSA_PKCS1_PADDING,1);assert.deepStrictEqual(crypto.getCurves(),['prime256v1']);
+        assert.strictEqual(crypto.constants.RSA_PKCS1_PADDING,1);assert.deepStrictEqual(crypto.getCurves(),['prime256v1','secp384r1']);
         assert.throws(()=>crypto.timingSafeEqual(Buffer.from('a'),Buffer.from('ab')),{code:'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH'});
         if(process.platform!=='win32'){
             const priority=os.getPriority();assert.strictEqual(os.getPriority(process.pid),priority);os.setPriority(priority);
@@ -923,6 +1011,299 @@ fn node_zlib_streams_crypto_digests_and_os_priority() {
         const line=new readline.promises.Readline(output);await line.clearLine(0).cursorTo(2,3).moveCursor(-1,1).clearScreenDown().commit();
         line.cursorTo(1).rollback();await line.commit();
         assert.deepStrictEqual(written,['\x1b[2K\x1b[4;3H\x1b[1D\x1b[1B\x1b[0J','']);
+    "#);
+}
+
+#[test]
+fn node_event_targets_timerify_loop_use_and_net_addresses_match_node() {
+    run(r#"
+        const {assert,events,util,tty,worker_threads,perf_hooks:{performance,PerformanceObserver,createHistogram}}=__apps,{BlockList,SocketAddress}=__apps.module.createRequire()('net');
+        const target=new EventTarget(),listener=()=>{},handler={handleEvent(){}},emitter=new events.EventEmitter(),controller=new AbortController();
+        target.addEventListener('foo',listener);target.addEventListener('foo',handler);emitter.on('x',listener);controller.signal.addEventListener('abort',listener);
+        assert.deepStrictEqual([events.getEventListeners(target,'foo'),events.getEventListeners(target,'bar'),events.getEventListeners(emitter,'x'),events.getEventListeners(controller.signal,'abort')],[[listener,handler],[],[listener],[listener]]);
+        const histogram=createHistogram(),add=function add(a,b){return a+b},timed=performance.timerify(add,{histogram});
+        const seen=new Promise(resolve=>new PerformanceObserver((list,observer)=>{observer.disconnect();resolve(list.getEntries().map(entry=>[entry.constructor.name,entry.entryType,entry.name,entry.detail]));}).observe({entryTypes:['function']}));
+        assert.deepStrictEqual([timed.name,timed.length,timed(1,2),histogram.count],['timerified add',2,3,1]);
+        assert.deepStrictEqual(await seen,[['PerformanceNodeEntry','function','add',[1,2]]]);assert.strictEqual(performance.getEntriesByType('function').length,0);
+        class K{constructor(x){this.x=x}}assert.ok(new (performance.timerify(K))(5) instanceof K);assert.strictEqual(await performance.timerify(async()=>7)(),7);
+        assert.deepStrictEqual(performance.eventLoopUtilization({idle:5,active:5},{idle:2,active:1}),{idle:3,active:4,utilization:4/7});
+        const worker=new worker_threads.Worker(`const{parentPort}=require('node:worker_threads');setTimeout(()=>{const first=performance.eventLoopUtilization(),delta=performance.eventLoopUtilization(first);parentPort.postMessage([first.idle,first.active,first.utilization,delta.idle>=0&&delta.active>=0]);},60);`,{eval:true});
+        const [idle,active,utilization,delta]=await new Promise(resolve=>worker.once('message',resolve));
+        assert.ok(idle>=40&&active>=0&&utilization<0.5&&delta,`${idle} ${active} ${utilization}`);
+        const list=new BlockList();list.addAddress('1.2.3.4');list.addRange('10.0.0.1','10.0.0.9');list.addSubnet('8592:757c:efae:4e45::',64,'ipv6');list.addSubnet(new SocketAddress({address:'192.168.0.0'}),16);
+        assert.deepStrictEqual(list.rules,['Subnet: IPv4 192.168.0.0/16','Subnet: IPv6 8592:757c:efae:4e45::/64','Range: IPv4 10.0.0.1-10.0.0.9','Address: IPv4 1.2.3.4']);
+        assert.deepStrictEqual([list.check('1.2.3.4'),list.check('::ffff:1.2.3.4','ipv6'),list.check('::ffff:10.0.0.5','ipv6'),list.check('192.168.3.4'),list.check('8592:757c:efae:4e45::f','ipv6'),list.check('10.0.0.10'),list.check('x'),list.check('::1.2.3.4','ipv6')],[true,true,true,true,true,false,false,false]);
+        const mapped=new BlockList();mapped.addSubnet('::ffff:0:0',96,'ipv6');assert.ok(mapped.check('1.2.3.4'));
+        const copy=new BlockList();copy.fromJSON(JSON.stringify(list));assert.deepStrictEqual(copy.rules,[...list.rules].reverse());
+        assert.ok(BlockList.isBlockList(list)&&!BlockList.isBlockList({})&&SocketAddress.isSocketAddress(new SocketAddress())&&!SocketAddress.isSocketAddress({}));
+        assert.throws(()=>list.addAddress('x'),{code:'ERR_INVALID_ADDRESS'});assert.throws(()=>list.addSubnet('1.2.3.4',33),{code:'ERR_OUT_OF_RANGE'});assert.throws(()=>list.addRange('1.2.3.9','1.2.3.4'),{code:'ERR_INVALID_ARG_VALUE'});
+        assert.strictEqual(util.inspect(mapped),"BlockList { rules: [ 'Subnet: IPv6 ::ffff:0:0/96' ] }");
+        assert.deepStrictEqual(new SocketAddress().toJSON(),{address:'127.0.0.1',port:0,family:'ipv4',flowlabel:0});
+        assert.deepStrictEqual(SocketAddress.parse('1.2.3.4:5').toJSON(),{address:'1.2.3.4',port:5,family:'ipv4',flowlabel:0});
+        assert.deepStrictEqual([SocketAddress.parse('[::1]:80').address,SocketAddress.parse('[::1]:80').port,SocketAddress.parse('x')],['::1',0,undefined]);
+        assert.strictEqual(util.inspect(new SocketAddress({address:'0:0::1',family:'IPv6',port:8})),"SocketAddress { address: '::1', port: 8, family: 'ipv6', flowlabel: 0 }");
+        assert.throws(()=>new SocketAddress({address:'x'}),{code:'ERR_INVALID_ADDRESS'});assert.throws(()=>new SocketAddress({port:70000}),{code:'ERR_SOCKET_BAD_PORT'});
+        assert.strictEqual(process.stdout.isTTY,tty.isatty(1)||undefined);
+        if(!process.stdout.isTTY)assert.deepStrictEqual([process.stdout.columns,typeof process.stdout.getWindowSize],[undefined,'undefined']);
+    "#);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn node_dns_resolver_reads_answers_like_node() {
+    // A local DNS server with the answers that Node 24 was checked against.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let label = |text: &str| {
+            let mut out: Vec<u8> = text
+                .split('.')
+                .flat_map(|part| [&[part.len() as u8][..], part.as_bytes()].concat())
+                .collect();
+            out.push(0);
+            out
+        };
+        let text = |value: &str| [&[value.len() as u8][..], value.as_bytes()].concat();
+        let numbers: Vec<u8> = [2024010101u32, 7200, 3600, 1209600, 300]
+            .iter()
+            .flat_map(|n| n.to_be_bytes())
+            .collect();
+        let records: Vec<(u16, u32, Vec<u8>)> = vec![
+            (1, 300, vec![192, 0, 2, 1]),
+            (1, 60, vec![192, 0, 2, 2]),
+            (
+                28,
+                300,
+                [0x20, 1, 0x0d, 0xb8]
+                    .into_iter()
+                    .chain([0; 11])
+                    .chain([1])
+                    .collect(),
+            ),
+            (15, 300, [vec![0, 10], label("mail.example.test")].concat()),
+            (16, 300, text("v=spf1 -all")),
+            (16, 300, [text("a"), text("b")].concat()),
+            (
+                33,
+                300,
+                [vec![0, 1, 0, 2, 1, 187], label("svc.example.test")].concat(),
+            ),
+            (5, 300, label("alias.example.test")),
+            (2, 300, label("ns1.example.test")),
+            (12, 300, label("host.example.test")),
+            (
+                6,
+                300,
+                [
+                    label("ns1.example.test"),
+                    label("admin.example.test"),
+                    numbers,
+                ]
+                .concat(),
+            ),
+            (
+                257,
+                300,
+                [&[0, 5][..], b"issue", b"letsencrypt.org"].concat(),
+            ),
+            (
+                257,
+                300,
+                [&[128, 5][..], b"iodef", b"mailto:x@example.test"].concat(),
+            ),
+            (
+                35,
+                300,
+                [
+                    vec![0, 100, 0, 10],
+                    text("S"),
+                    text("SIP+D2U"),
+                    text(""),
+                    label("_sip._udp.example.test"),
+                ]
+                .concat(),
+            ),
+            (52, 300, vec![3, 1, 1, 0xde, 0xad, 0xbe, 0xef]),
+        ];
+        let mut query = [0u8; 512];
+        while let Ok((size, peer)) = socket.recv_from(&mut query) {
+            let end = 12 + query[12..size].iter().position(|&byte| byte == 0).unwrap() + 5;
+            let name = String::from_utf8_lossy(&query[12..end - 5]).into_owned();
+            let kind = u16::from_be_bytes([query[end - 4], query[end - 3]]);
+            let rcode = if name.contains("missing") {
+                3
+            } else if name.contains("fail") {
+                2
+            } else {
+                0
+            };
+            let answers: Vec<_> = records
+                .iter()
+                .filter(|(ty, ..)| {
+                    rcode == 0 && !name.contains("empty") && (kind == 255 || *ty == kind)
+                })
+                .collect();
+            let mut reply = [
+                &query[..2],
+                &[0x81, 0x80 | rcode, 0, 1],
+                &(answers.len() as u16).to_be_bytes()[..],
+                &[0, 0, 0, 0],
+                &query[12..end],
+            ]
+            .concat();
+            for (ty, ttl, data) in answers {
+                reply.extend(
+                    [0xc0, 12]
+                        .into_iter()
+                        .chain(ty.to_be_bytes())
+                        .chain([0, 1])
+                        .chain(ttl.to_be_bytes())
+                        .chain((data.len() as u16).to_be_bytes())
+                        .chain(data.iter().copied()),
+                );
+            }
+            socket.send_to(&reply, peer).unwrap();
+        }
+    });
+    run(&r#"
+        const {assert,dns}=__apps,resolver=new dns.promises.Resolver({timeout:2000,tries:1}),server='127.0.0.1:PORT',name='example.test';
+        resolver.setServers([server]);assert.deepStrictEqual(resolver.getServers(),[server]);
+        assert.deepStrictEqual(await resolver.resolve4(name),['192.0.2.1','192.0.2.2']);
+        assert.deepStrictEqual(await resolver.resolve4(name,{ttl:true}),[{address:'192.0.2.1',ttl:300},{address:'192.0.2.2',ttl:60}]);
+        assert.deepStrictEqual(await resolver.resolve6(name),['2001:db8::1']);
+        assert.deepStrictEqual(await resolver.resolveMx(name),[{exchange:'mail.example.test',priority:10}]);
+        assert.deepStrictEqual(await resolver.resolveTxt(name),[['v=spf1 -all'],['a','b']]);
+        assert.deepStrictEqual(await resolver.resolveSrv(name),[{name:'svc.example.test',port:443,priority:1,weight:2}]);
+        assert.deepStrictEqual([await resolver.resolveCname(name),await resolver.resolveNs(name),await resolver.resolvePtr(name),await resolver.reverse('192.0.2.1')],[['alias.example.test'],['ns1.example.test'],['host.example.test'],['host.example.test']]);
+        assert.deepStrictEqual(await resolver.resolveSoa(name),{nsname:'ns1.example.test',hostmaster:'admin.example.test',serial:2024010101,refresh:7200,retry:3600,expire:1209600,minttl:300});
+        assert.deepStrictEqual(await resolver.resolveCaa(name),[{critical:0,issue:'letsencrypt.org'},{critical:128,iodef:'mailto:x@example.test'}]);
+        assert.deepStrictEqual(await resolver.resolveNaptr(name),[{flags:'S',service:'SIP+D2U',regexp:'',replacement:'_sip._udp.example.test',order:100,preference:10}]);
+        const [tlsa]=await resolver.resolveTlsa(name);assert.deepStrictEqual([tlsa.certUsage,tlsa.selector,tlsa.match,Buffer.from(tlsa.data).toString('hex'),tlsa.data instanceof ArrayBuffer],[3,1,1,'deadbeef',true]);
+        const any=await resolver.resolveAny(name);
+        assert.deepStrictEqual(any.map(record=>record.type),['A','A','AAAA','MX','TXT','TXT','SRV','CNAME','NS','PTR','SOA','CAA','CAA','NAPTR','TLSA']);
+        assert.deepStrictEqual([any[0],any[3],any[4]],[{address:'192.0.2.1',ttl:300,type:'A'},{exchange:'mail.example.test',priority:10,type:'MX'},{entries:['v=spf1 -all'],type:'TXT'}]);
+        for(const [host,code] of [['missing.test','ENOTFOUND'],['fail.test','ESERVFAIL'],['empty.test','ENODATA']])await assert.rejects(resolver.resolve4(host),{code,message:`queryA ${code} ${host}`,syscall:'queryA',hostname:host,errno:undefined});
+        assert.deepStrictEqual(await resolver.resolve(name,'MX'),[{exchange:'mail.example.test',priority:10}]);
+        assert.throws(()=>resolver.resolve(name,'BOGUS'),{code:'ERR_INVALID_ARG_VALUE'});assert.throws(()=>resolver.setServers(['x']),{code:'ERR_INVALID_IP_ADDRESS'});
+        await assert.rejects(resolver.reverse('x'),{code:'EINVAL',syscall:'getHostByAddr'});
+        dns.setServers([server]);
+        assert.deepStrictEqual(await new Promise((resolve,reject)=>dns.resolveMx(name,(error,value)=>error?reject(error):resolve(value))),[{exchange:'mail.example.test',priority:10}]);
+        assert.deepStrictEqual([await dns.promises.resolve6(name),dns.promises.getServers()],[['2001:db8::1'],[server]]);
+        const callbacks=new dns.Resolver();callbacks.setServers([server]);
+        assert.deepStrictEqual(await new Promise(resolve=>callbacks.reverse('192.0.2.1',(error,names)=>resolve(names))),['host.example.test']);
+        const cancelled=resolver.resolve4(name);resolver.cancel();await assert.rejects(cancelled,{code:'ECANCELLED'});
+        assert.deepStrictEqual([dns.NOTFOUND,dns.promises.TIMEOUT,dns.getDefaultResultOrder()],['ENOTFOUND','ETIMEOUT','verbatim']);
+    "#.replace("PORT", &port.to_string()));
+}
+
+#[test]
+fn node_fs_vectors_statfs_and_glob_match_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = serde_json::to_string(&dir.path()).unwrap();
+    run(&format!(
+        r#"
+        const {{assert,fs,path}}=__apps,root={root},fold=process.platform!=='linux',sort=list=>[...list].sort();
+        for(const file of ['a.js','b.ts','.hidden.js','src/c.js','src/d.JS','src/.e.js','src/deep/f.js','src/deep/g.txt','.dot/h.js','lib/i.js']){{fs.mkdirSync(path.join(root,path.dirname(file)),{{recursive:true}});fs.writeFileSync(path.join(root,file),'');}}
+        const glob=(pattern,o)=>sort(fs.globSync(pattern,{{cwd:root,...o}})),d=fold?['src/d.JS']:[];
+        assert.deepStrictEqual(glob('*.js'),['a.js']);
+        assert.deepStrictEqual(glob('**/*.js'),['a.js','lib/i.js','src/c.js',...d,'src/deep/f.js']);
+        assert.deepStrictEqual(glob('**'),['.','a.js','b.ts','lib','lib/i.js','src','src/c.js','src/d.JS','src/deep','src/deep/f.js','src/deep/g.txt']);
+        assert.deepStrictEqual(glob('src/**'),['src','src/c.js','src/d.JS','src/deep','src/deep/f.js','src/deep/g.txt']);
+        assert.deepStrictEqual(glob('*/*.{{js,ts}}'),['lib/i.js','src/c.js',...d]);
+        assert.deepStrictEqual(glob('src/[cd].js'),['src/c.js',...d]);
+        assert.deepStrictEqual(glob('src/[!c].*'),['src/d.JS']);
+        assert.deepStrictEqual(glob('**/*.js',{{exclude:['src/**']}}),['a.js','lib/i.js']);
+        assert.deepStrictEqual(glob('**/*.js',{{exclude:p=>p.includes('deep')}}),['a.js','lib/i.js','src/c.js',...d]);
+        assert.deepStrictEqual(glob(['a.js','nope.js','src']),['a.js','src']);
+        assert.deepStrictEqual([glob('./src/*.js'),glob('src/../a.js'),glob('.dot/*')],[['src/c.js',...d],['a.js'],['.dot/h.js']]);
+        assert.deepStrictEqual(fs.globSync('*.js',{{cwd:root,withFileTypes:true}}).map(entry=>[entry.name,entry.parentPath===root,entry.isFile()]),[['a.js',true,true]]);
+        assert.deepStrictEqual(fs.globSync(path.join(root,'src/*.js')),[path.join(root,'src/c.js'),...d.map(file=>path.join(root,file))]);
+        assert.deepStrictEqual(await new Promise((resolve,reject)=>fs.glob('*.js',{{cwd:root}},(error,list)=>error?reject(error):resolve(list))),['a.js']);
+        assert.deepStrictEqual(sort(await Array.fromAsync(fs.promises.glob('src/*',{{cwd:root}}))),['src/c.js','src/d.JS','src/deep']);
+        const stats=fs.statfsSync(root),big=await fs.promises.statfs(root,{{bigint:true}});
+        assert.deepStrictEqual(Object.keys(stats),['type','bsize','frsize','blocks','bfree','bavail','files','ffree']);
+        assert.ok(stats.bsize>0&&stats.blocks>=stats.bfree&&big.bsize===BigInt(stats.bsize));
+        assert.throws(()=>fs.statfsSync(path.join(root,'missing')),{{code:'ENOENT'}});
+        const fd=fs.openSync(path.join(root,'v.bin'),'w+');
+        assert.strictEqual(fs.writevSync(fd,[Buffer.from('abc'),new Uint8Array([100,101])]),5);
+        const a=Buffer.alloc(2),b=Buffer.alloc(4);assert.strictEqual(fs.readvSync(fd,[a,b],0),5);assert.deepStrictEqual([a.toString(),b.toString('latin1')],['ab','cde\0']);
+        const [written]=await new Promise(resolve=>fs.writev(fd,[Buffer.from('XY')],1,(error,count,buffers)=>resolve([count,buffers])));assert.strictEqual(written,2);
+        assert.strictEqual(await new Promise(resolve=>fs.readv(fd,[a],0,(error,count)=>resolve(count+a.toString()))),'2aX');
+        fs.closeSync(fd);
+        const handle=await fs.promises.open(path.join(root,'v.bin'),'r+');
+        assert.strictEqual((await handle.writev([Buffer.from('12')],3)).bytesWritten,2);
+        const c=Buffer.alloc(5);assert.deepStrictEqual([(await handle.readv([c],0)).bytesRead,c.toString()],[5,'aXY12']);
+        await handle.close();
+        assert.throws(()=>fs.readvSync(fd,'x'),{{code:'ERR_INVALID_ARG_TYPE'}});
+    "#
+    ));
+}
+
+#[test]
+fn node_crypto_keys_signatures_and_kdfs_match_node() {
+    // Keys, signatures and digests below come from Node 24.
+    run(r#"
+        const {assert,crypto,util}=__apps,msg=Buffer.from('hello h2o'),hash=value=>crypto.createHash('sha256').update(value).digest('hex');
+        const rsaDer='MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC1g8caNlHfV5pKM5XtVKZYhyipR8ftOOdvAKj8Nd1/AoU9cF42yGHO5PZxkCbIRYISOfLcGqyRqOp6kIPisVHvA/ixKUdGX0xEoCVhbHWMTTWiXlXXe+vnVcFbRMyMWA9sf6fDzlV1a1N75AnPzHfpbWsrLoS3gvZnsWE0TYHQeRRH5iz/VsMc62IJIhnPEhy1AiFCtKd4guycGbi5oT+HTfIy4Sw4xUrfjIB7H7Xn54mVeDR4dDEXtv/PQYtP1Wuq9NgPy0gFZ8fu7ENwyDBZY0QQ6/kzVgMua6C9DVxnFA2hTgnLO+AQLLaRN5iKWzfjQ4iz4harp0Nmze/Va7v7AgMBAAECggEAGWakr6yHU4pg+zOcg6xTZP3GY74O98mn9Wwxua2uCTk957r4VuaUGA20K8Xg734ZStn/fEFirIrnWUSCTZsZMf9WcjBVGuojdFJhjhsimKzbWGqmzPNjWqmxAnKDxLteroUaDI2CKbQzEsTMLLSv2SN976U1tFqS3IWW6pNSxcIBg4fSub9PgVwoo4SoOcr6njftKrH/U3D65TsoYshy8wEkbpIL7zOiaW3TuLceQMx9U6rEtEGza92mVKOsRTqNluOvXJr/nmQcrNxpShf9A3sXfz7TgHkAbUFwWKT8UYY0oIiFvMhirOulx14mbSOKqcUOx8QqTMxlHVuzXnVBpQKBgQD7RM2ALY7niUqjpb+/jUsfh+iexOXmdg9Cks0beiI3ZlRD4BCYkLTS55PtRqLi7vKY/nFlyPwvOVS3G1UFNiHQJJSqeu1hLR8X7vYwX3ZD/TuipAn8XaWSLu/xzZnLpEqne887QQuiVjqP3XhpUcQVIQChPFj94WaAciGfAQi5pwKBgQC47rzs4j+qPnWCoS+Vvf3bBxgVrlJM+q7ss7XLQYK26mNFPKboBeJzLzD6v83VtwlqYbynZqndgmgfKy4NrxrGyIJde34cLUPXt4qtbyhdxN6fjOP+wwBA9fpIUW7IswwlOz/yerPI9JHAMZs/MFjzKrP+nenfD6eVZy4CglANjQKBgQDmblSfxigWAnxm06yjuKo6QmN8p0nHLmIURZjAKCOU9s00ahoOMDcEa8fnhC4BO+1TjZTlKYrMrCEaw4AXBWvA/KsyJQXpZn3rbwRrnEBTXbsBDrrxq9gZ1d3KvSjb7tFgA1UrHB3VRIr0QMEapRfT4K45L6TVP47HIOPgdAxSZQKBgQCsSQXK7hB/ywZwtzd8mm6oIZjHggp8WsKiE94WSKa9P+lRtGqOGAVaZ6mKwSvCoW3tJLa7gcJYccgM2Y5jAzG/5UbGTmkzWNwuWHiikL8bdHAuVfSGACb5Xe9YdjzuTxfOi79MaBGb8nTih5RpLuJ/T9Y2K+mYfJ4UavaLMdngdQKBgQCn537D4+XAgxJKf0Z6fjSz1vUi39Tcmsn+oV7+nf7U8RfehFl69HarNpem5rfjmaUnghOSgd6gJVYPzlCI6AcyQfGdYUjeRxfl5/mWMtzSGX7rEM4wkhJVlmPAP3qth3i5zSfQ8/Mp8jX/+gn/FglHTOMOJDlncL8zJTi+FTEfuQ==';
+        const rsa=crypto.createPrivateKey({key:Buffer.from(rsaDer,'base64'),format:'der',type:'pkcs8'}),rsaPublic=crypto.createPublicKey(rsa);
+        const pkcs1=rsa.export({type:'pkcs1',format:'pem'});assert.strictEqual(hash(pkcs1),'d786c238780bf710c299c17e04599711a16629e2fb295f9ea39d34c2ba1ed4c2');
+        assert.ok(crypto.createPrivateKey(pkcs1).equals(rsa));assert.ok(!rsa.equals(rsaPublic));
+        assert.strictEqual(hash(rsaPublic.export({type:'spki',format:'der'})),'1dd714d2993e56cce33ceb3a100bac5b0e6238f3418d19c0a23d3ff5629ba6fe');
+        assert.strictEqual(hash(rsaPublic.export({type:'pkcs1',format:'der'})),'73cb3b74d10306fa7f03641e02320bce5788648d73f2d0e7212502736868c4d9');
+        assert.strictEqual(hash(JSON.stringify(rsa.export({format:'jwk'}))),'cc2cb7ddb9c0196c74cf1c44e46e21f4583678f0a46dbc62f930a7b2cfc4d108');
+        assert.ok(crypto.createPrivateKey({key:rsa.export({format:'jwk'}),format:'jwk'}).equals(rsa));
+        assert.deepStrictEqual([rsa.type,rsa.asymmetricKeyType,rsa.asymmetricKeyDetails,rsaPublic.type],['private','rsa',{modulusLength:2048,publicExponent:65537n},'public']);
+        assert.strictEqual(crypto.sign('sha256',msg,rsa).toString('hex').slice(0,64),'6e6d4069d6ca270c300d20ff6e3e3a063ff09f762d53298eb08555b790443fe9');
+        const signer=crypto.createSign('RSA-SHA256');signer.update('hello ');signer.update('h2o');assert.strictEqual(signer.sign(pkcs1,'hex').slice(0,64),'6e6d4069d6ca270c300d20ff6e3e3a063ff09f762d53298eb08555b790443fe9');
+        const pss='sz3NYpZrXeggOHhz3kCAIIUyoTDefQ3BfzeYwzGsERIsHRHvCP+wpz7d1ZQNJi8/9TFOCfv76lABkLuw20rwWGKDAqA/XfCN03w8xTfQkNUvk9BEe8SvCF0p6GMvZKQTGx8yGO69BDJFDmheo0O044B4yHfvko7UvXmO5KYnOuV7Nmo2gUZxpfoSE2Ey7PJu6WMNa6QeXwoMwIbIRLz/wtrjiQqoSo8dfdTs0yEL1ezgFJtBvsrz/VBt5V4HCGHad39JQpXzAmBkM34teFzJN9oP8iwkfjuj+bBBmYRKaTaoDJ3BZYpBF1TKlF0bvoQS1tysi+2blLEmg/Sgg5wkRA==';
+        const padding=crypto.constants.RSA_PKCS1_PSS_PADDING;
+        assert.ok(crypto.verify('sha384',msg,{key:rsaPublic,padding},Buffer.from(pss,'base64')));
+        assert.ok(crypto.verify('sha512',msg,{key:rsa,padding},crypto.sign('sha512',msg,{key:rsa,padding,saltLength:64})));
+        assert.ok(!crypto.verify('sha256',msg,rsaPublic,Buffer.alloc(256)));
+        assert.throws(()=>crypto.sign('sha256',msg,{key:rsa,padding,saltLength:10}),{code:'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM'});
+        const ec=crypto.createPrivateKey('-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIIG+s5J1c36/gJS8B3T4WZgsm/mVPw9h0Imbgyj/1GpzoAoGCCqGSM49\nAwEHoUQDQgAElI3PLMevVdcqqsX4mEbJnHxcvDwuu6/D/LilFYQZ8ezzk1D9eER9\nkZBPBpBv/kAEJEuuNxYJ1eDm9HcFChC1mw==\n-----END EC PRIVATE KEY-----\n');
+        const ecPem='-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElI3PLMevVdcqqsX4mEbJnHxcvDwu\nu6/D/LilFYQZ8ezzk1D9eER9kZBPBpBv/kAEJEuuNxYJ1eDm9HcFChC1mw==\n-----END PUBLIC KEY-----\n';
+        assert.deepStrictEqual(ec.export({format:'jwk'}),{kty:'EC',x:'lI3PLMevVdcqqsX4mEbJnHxcvDwuu6_D_LilFYQZ8ew',y:'85NQ_XhEfZGQTwaQb_5ABCRLrjcWCdXg5vR3BQoQtZs',crv:'P-256',d:'gb6zknVzfr-AlLwHdPhZmCyb-ZU_D2HQiZuDKP_UanM'});
+        assert.strictEqual(ec.export({type:'pkcs8',format:'der'}).toString('base64'),'MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQggb6zknVzfr+AlLwHdPhZmCyb+ZU/D2HQiZuDKP/UanOhRANCAASUjc8sx69V1yqqxfiYRsmcfFy8PC67r8P8uKUVhBnx7POTUP14RH2RkE8GkG/+QAQkS643FgnV4Ob0dwUKELWb');
+        assert.strictEqual(crypto.createPublicKey(ec).export({type:'spki',format:'pem'}),ecPem);assert.deepStrictEqual(ec.asymmetricKeyDetails,{namedCurve:'prime256v1'});
+        assert.ok(crypto.verify('sha256',msg,ecPem,Buffer.from('MEUCIQCZSBGRm9oo/Y6idzvsJxXFy3LZvZvQ4suw0KeOgGZp0AIgd0ZaM7YXh4KR9PFedOAd85uaHUI4+6TYZWRvJPNlC0I=','base64')));
+        assert.ok(crypto.verify('sha256',msg,{key:ecPem,dsaEncoding:'ieee-p1363'},Buffer.from('SHfQsOpqTWQGOP8Gnb4B1IO2JCUtO9LD4ihJBVU1Hw2yr0aVAdlypRqzwcIMAD8P4nUK93HOL8rnVTd88w+fhg==','base64')));
+        const p1363=crypto.sign(null,msg,{key:ec,dsaEncoding:'ieee-p1363'});assert.strictEqual(p1363.length,64);assert.ok(crypto.verify(null,msg,{key:ec,dsaEncoding:'ieee-p1363'},p1363));
+        const verifier=crypto.createVerify('sha256');verifier.update(msg);assert.ok(verifier.verify(ecPem,crypto.sign('sha256',msg,ec)));
+        assert.throws(()=>crypto.sign('sha512',msg,ec),/P-256 keys with SHA-256/);
+        const certificates=['-----BEGIN CERTIFICATE-----\nMIIBDDCBsgIJAJ0+4NzYE8qJMAoGCCqGSM49BAMCMA4xDDAKBgNVBAMMA2gybzAe\nFw0yNjExMDIwNzMzMjVaFw0zNjEwMzAwNzMzMjVaMA4xDDAKBgNVBAMMA2gybzBZ\nMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJhLmqF04CXNo2cwI3eUzBqspDNeZZcs\nY4hdET7UOD1eIBE0xc6gTDAOhK6vX98fjKeWgXUIKQOdETq9Wgcs44swCgYIKoZI\nzj0EAwIDSQAwRgIhAIjj9M6qgebs/3QmbVW6YaHBG/MbIPJj/V0PKfW+IDp7AiEA\ntzF4aVQYhNX4YqXPbHKtosLXAoa4OMfxbtqHSmp09dE=\n-----END CERTIFICATE-----\n','-----BEGIN CERTIFICATE-----\nMIIBIzCBy6ADAgECAgkArnKlMWQNvl4wCgYIKoZIzj0EAwIwDjEMMAoGA1UEAwwD\naDJvMB4XDTI2MTEwMjA3MzM0MFoXDTM2MTAzMDA3MzM0MFowDjEMMAoGA1UEAwwD\naDJvMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmEuaoXTgJc2jZzAjd5TMGqyk\nM15llyxjiF0RPtQ4PV4gETTFzqBMMA6Erq9f3x+Mp5aBdQgpA50ROr1aByzji6MS\nMBAwDgYDVR0RBAcwBYIDaDJvMAoGCCqGSM49BAMCA0cAMEQCIDhR+XN/BuK/LZGr\nLqCrh0ZlxYTQD5g/aMn2N4umdiN/AiA98y2nwnjq5OX3NV6mUyWhoLUYdQXBfieI\nV2WA6cE2hg==\n-----END CERTIFICATE-----\n'];
+        for(const pem of certificates)assert.strictEqual(crypto.createPublicKey(pem).export({type:'spki',format:'der'}).toString('base64'),'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmEuaoXTgJc2jZzAjd5TMGqykM15llyxjiF0RPtQ4PV4gETTFzqBMMA6Erq9f3x+Mp5aBdQgpA50ROr1aByzjiw==');
+        const ec384=crypto.createPrivateKey('-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBBGaOiYcvVt0Ti9NSA\nF/mVr6BFt95DB0/It+CuaspprPSc9zXk4bvJJM82VtnQZtahZANiAAQdZkCvhdUI\nYAQZtAa2L7QoQaSF3nye8v3u6TO6s/epQ17osHv/M2mMghG4miLZjo4oeRbLhhaN\ncDHea2SoXj+W97mOqeBAL3THY5NDx4NeSwQKX7ZdB84Za1FUWNlpEJs=\n-----END PRIVATE KEY-----\n');
+        assert.ok(crypto.verify('sha384',msg,ec384,Buffer.from('MGUCMQCLDkOAs1e4uxnhaW7rZntDHBUu6mf0Vf3RONP2zCNOKxCahEaNFYzu+UVYimuAOwoCMGiBbtVlaKns10HHSIi0K2vXPUHn04VFl1+iuZtfk2uIHM5zotjC1iFheYflXYlcPQ==','base64')));
+        assert.ok(crypto.verify('sha384',msg,ec384,crypto.sign('sha384',msg,ec384)));
+        const ed=crypto.createPrivateKey('-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICL95NdoRvNMwGUzfxxO354E/RxQrcT3ky9upJg3AGl2\n-----END PRIVATE KEY-----\n');
+        assert.strictEqual(crypto.createPublicKey(ed).export({type:'spki',format:'der'}).toString('hex'),'302a300506032b657003210068646bbae5e0ceaf8564a58545c400d6735345a7103f3fbabd3d45603b4f0dea');
+        assert.strictEqual(crypto.sign(undefined,msg,ed).toString('hex'),'d3780a92c554bd37eda3bf3b71ff5ae3ebfe31f8b717309374b07727e8fe75bb61b00c7b7628ed29590fabaf0b89da719d0e84f6b910ff91e13753b3ab5f310f');
+        assert.deepStrictEqual(ed.export({format:'jwk'}),{crv:'Ed25519',d:'Iv3k12hG80zAZTN_HE7fngT9HFCtxPeTL26kmDcAaXY',x:'aGRruuXgzq-FZKWFRcQA1nNTRacQPz-6vT1FYDtPDeo',kty:'OKP'});
+        assert.deepStrictEqual([ed.asymmetricKeyType,ed.asymmetricKeyDetails],['ed25519',{}]);
+        for(const [type,o,digest] of [['ec',{namedCurve:'P-384'},'sha384'],['ec',{namedCurve:'prime256v1'}],['ed25519',{}]]){
+            const {publicKey,privateKey}=await util.promisify(crypto.generateKeyPair)(type,o),data=Buffer.from('data');
+            assert.ok(crypto.verify(digest,data,publicKey,crypto.sign(digest,data,privateKey)),type);
+            const pem=crypto.generateKeyPairSync(type,{...o,privateKeyEncoding:{type:'pkcs8',format:'pem'}}).privateKey;assert.ok(crypto.createPrivateKey(pem).export({type:'pkcs8',format:'pem'})===pem);
+        }
+        assert.strictEqual(await new Promise((resolve,reject)=>crypto.sign(null,msg,ed,(error,value)=>error?reject(error):resolve(value.length))),64);
+        assert.throws(()=>crypto.generateKeyPairSync('rsa',{modulusLength:2048}),{code:'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM'});
+        assert.throws(()=>crypto.createPrivateKey('garbage'),{code:'ERR_OSSL_UNSUPPORTED'});
+        assert.throws(()=>crypto.createPrivateKey(ecPem),{code:'ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE'});
+        assert.throws(()=>ec.export({type:'pkcs1',format:'pem'}),{code:'ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS'});
+        assert.throws(()=>new crypto.KeyObject(),{code:'ERR_INVALID_ARG_VALUE'});
+        const secret=crypto.createSecretKey('abc','utf8');
+        assert.deepStrictEqual([secret.type,secret.symmetricKeySize,secret.asymmetricKeyType,secret.export().toString(),secret.export({format:'jwk'})],['secret',3,undefined,'abc',{kty:'oct',k:'YWJj'}]);
+        assert.ok(secret.equals(crypto.createSecretKey(Buffer.from('abc'))));assert.ok(util.types.isKeyObject(secret)&&!util.types.isKeyObject({}));
+        assert.strictEqual(crypto.createHmac('sha256',secret).update('x').digest('hex'),crypto.createHmac('sha256','abc').update('x').digest('hex'));
+        assert.strictEqual(crypto.generateKeySync('aes',{length:256}).symmetricKeySize,32);
+        assert.strictEqual(crypto.scryptSync('password','salt',32,{N:1024,r:8,p:2}).toString('hex'),'1765486cf4c5597fb5308d16b99794d7d3a0bd2e9464b9acb1ca32031a85dfed');
+        assert.strictEqual((await util.promisify(crypto.scrypt)('','',64,{cost:16,blockSize:1,parallelization:1})).toString('hex'),'77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906');
+        assert.throws(()=>crypto.scryptSync('p','s',16,{N:3}),{code:'ERR_CRYPTO_INVALID_SCRYPT_PARAMS'});
+        assert.throws(()=>crypto.scryptSync('p','s',16,{N:1024,maxmem:1024}),{code:'ERR_CRYPTO_INVALID_SCRYPT_PARAMS'});
+        assert.deepStrictEqual(['sha256','sha512','md5','sha224','sha1'].map(name=>Buffer.from(crypto.hkdfSync(name,'key','salt','info',42)).toString('hex').slice(0,20)),['9ca0d662557439e3b833','24156e2c35525baaf3d0','edd053d0030729baf813','0ff75af37d8684eb5b7a','a0bc90fe7a3fef57087f']);
+        const derived=await util.promisify(crypto.hkdf)('sha256',Buffer.alloc(0),'','',16);assert.ok(derived instanceof ArrayBuffer);assert.strictEqual(Buffer.from(derived).toString('hex'),'eb70f01dede9afafa449eee1b1286504');
+        assert.throws(()=>crypto.hkdfSync('sha256','k','s','i',255*32+1),{code:'ERR_CRYPTO_INVALID_KEYLEN'});
     "#);
 }
 

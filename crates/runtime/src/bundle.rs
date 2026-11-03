@@ -9,6 +9,22 @@ use std::{collections::HashMap, fs, path::Path};
 
 const HEADER: &[u8; 8] = b"H2O\0\x01\0\0\0";
 
+/// The attribute that carries the bundled CSS of a `<link rel="stylesheet">` in a bundled page.
+pub const LINK_SHEET: &str = "apps-sheet";
+
+/// Parses a bundled page, moving the CSS of its stylesheet links into the nodes.
+pub fn page(source: &str) -> Document {
+    let mut doc = Document::parse(source);
+    for node in &mut doc.nodes {
+        if node.tag == "link"
+            && let Some(css) = node.attrs.remove(LINK_SHEET)
+        {
+            node.stylesheet = Some(std::rc::Rc::new(Stylesheet::parse(&css)));
+        }
+    }
+    doc
+}
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct Bundle {
     #[serde(skip)]
@@ -46,14 +62,16 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
         .map(|value| value.as_str().context("package.json name must be a string"))
         .transpose()?
         .unwrap_or("App");
+    let rust = package["type"] == "rust";
     ensure!(
         name.len() >= 2
             && name.as_bytes()[0].is_ascii_alphabetic()
             && name
                 .bytes()
                 .skip(1)
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-        "Invalid executable name {name:?}; expected ^[a-zA-Z][a-zA-Z0-9_]+$"
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || rust && byte == b'-'),
+        "Invalid executable name {name:?}; expected ^[a-zA-Z][a-zA-Z0-9_{}]+$",
+        if rust { "-" } else { "" }
     );
     let product_name = package
         .get("productName")
@@ -179,6 +197,15 @@ pub fn disabled_features(source: Option<&str>) -> Result<u32> {
     Ok(disabled)
 }
 
+fn check_entry(files: &BBTreeMap<String, String>) -> Result<()> {
+    if !files.contains_key("app.js") {
+        let package: serde_json::Value =
+            serde_json::from_str(files.get("package.json").map_or("{}", String::as_str))?;
+        ensure!(package["type"] == "rust", "Missing app.js");
+    }
+    Ok(())
+}
+
 pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     #[derive(Serialize)]
     struct Packed<'a> {
@@ -186,7 +213,7 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
         #[serde(with = "map")]
         pages: BBTreeMap<String, Document>,
     }
-    ensure!(files.contains_key("app.js"), "Missing app.js");
+    check_entry(files)?;
     let mut owned = Vec::new();
     let mut bundle = Packed {
         files: Vec::new(),
@@ -194,7 +221,7 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     };
     for (name, source) in files {
         if name.ends_with(".html") {
-            let mut doc = Document::parse(source);
+            let mut doc = page(source);
             for id in 0..doc.nodes.len() {
                 if doc.nodes[id].tag == "style"
                     && let [text] = doc.nodes[id].children[..]
@@ -395,7 +422,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
     }
     bundle.packaged = path.is_file();
     bundle.root = directory;
-    ensure!(bundle.files.contains_key("app.js"), "Missing app.js");
+    check_entry(&bundle.files)?;
     Ok(bundle)
 }
 

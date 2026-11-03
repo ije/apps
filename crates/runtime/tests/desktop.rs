@@ -42,6 +42,8 @@ fn native_desktop_dispatches_application_events() {
             "-framework",
             "CoreGraphics",
             "-framework",
+            "ImageIO",
+            "-framework",
             "ServiceManagement",
             "-framework",
             "UniformTypeIdentifiers",
@@ -56,13 +58,15 @@ fn native_desktop_dispatches_application_events() {
         result.status,
         String::from_utf8_lossy(&result.stderr)
     );
-    let result = Command::new(binary).arg(template).output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}: {}",
-        result.status,
-        String::from_utf8_lossy(&result.stderr)
-    );
+    for argument in [Path::new("--tray"), &template] {
+        let result = Command::new(&binary).arg(argument).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{argument:?} {}: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
 
 #[test]
@@ -93,6 +97,29 @@ fn native_theme_properties_and_events() {
     engine
         .eval(include_str!("native_theme.js"), "native-theme-tests")
         .unwrap();
+}
+
+#[test]
+fn power_save_blocker_and_system_preferences() {
+    let engine = apps_runtime::jsc::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+        std::rc::Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    engine
+        .eval(include_str!("../js/browser.js"), "browser")
+        .unwrap();
+    engine
+        .eval(include_str!("native_shell.js"), "native-shell-tests")
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        engine
+            .eval("nativeShellAsync.sort().join()", "test")
+            .unwrap(),
+        "Canceled,true"
+    );
 }
 
 #[test]
@@ -150,6 +177,75 @@ fn oversized_windows_open_and_report_their_size() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success() && stdout.contains("OVERSIZED_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn page_zoom_shrinks_the_viewport_and_survives_reloads() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let main = r#"
+        const { app, BrowserWindow, ipcMain } = __apps;
+        let win, stage = 0, base;
+        const expect = (ok, what) => { if (!ok) { console.error('ZOOM_FAIL ' + what); process.exit(2); } };
+        ipcMain.on('size', async (_, width, height, ratio) => {
+            if (stage === 0 && width === 400) { base = ratio; stage = 1; win.webContents.zoomFactor = 2; }
+            else if (stage === 1 && width !== 400) { expect(width === 200 && height === 150 && ratio === base * 2, 'zoomed ' + [width, height, ratio]); stage = 2; win.webContents.reload(); }
+            else if (stage === 2) {
+                expect(width === 200 && ratio === base * 2 && win.webContents.getZoomFactor() === 2, 'reloaded ' + [width, height, ratio]);
+                stage = 3;
+                const size = (await win.webContents.capturePage({ x: 0, y: 0, width: 100, height: 100 })).getSize();
+                expect(size.width === 100 * base && size.height === 100 * base, 'capture ' + JSON.stringify(size));
+                console.log('ZOOM_OK'); app.quit();
+            }
+        });
+        app.whenReady().then(() => {
+            setTimeout(() => process.exit(3), 8000);
+            win = new BrowserWindow({ width: 400, height: 300, useContentSize: true });
+            win.loadFile('apps:///index.html');
+        });
+    "#;
+    let page = r#"
+        <body>
+        <script type='preload'>__apps.contextBridge.exposeInMainWorld('report', (...args) => __apps.ipcRenderer.send('size', ...args));</script>
+        <script>const send = () => report(innerWidth, innerHeight, devicePixelRatio); send(); addEventListener('resize', send);</script>
+    "#;
+    let bundle = serde_json::json!({"files": [
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+        ["index.html", page],
+    ], "pages": []});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bundle.to_string().as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("ZOOM_OK"),
         "{stdout}\n{stderr}"
     );
 }
@@ -390,6 +486,188 @@ fn native_browser_window_geometry_state_and_close() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success() && stdout.contains("BROWSER_WINDOW_OK"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn native_browser_window_extras_and_child_windows() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    // Lists the app's windows as the window server sees them.
+    let lister = r#"
+        #import <Foundation/Foundation.h>
+        #import <CoreGraphics/CoreGraphics.h>
+        int main(int argc, char **argv) {
+            NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID));
+            NSMutableArray *found = [NSMutableArray new];
+            for (NSDictionary *window in windows) if ([window[(id)kCGWindowOwnerPID] intValue] == atoi(argv[1]) && [window[(id)kCGWindowLayer] intValue] == 0)
+                [found addObject:@{ @"alpha": window[(id)kCGWindowAlpha], @"sharing": window[(id)kCGWindowSharingState], @"width": window[(id)kCGWindowBounds][@"Width"], @"height": window[(id)kCGWindowBounds][@"Height"] }];
+            puts([[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:found options:0 error:nil] encoding:NSUTF8StringEncoding].UTF8String);
+        }
+    "#;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("windows.m"), lister).unwrap();
+    let binary = dir.path().join("windows");
+    let result = Command::new("xcrun")
+        .args([
+            "clang",
+            "-fobjc-arc",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "CoreGraphics",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(dir.path().join("windows.m"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let main = r#"
+        const { app, BrowserWindow, child_process } = __apps;
+        const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const once = (win, name) => new Promise((resolve, reject) => { const timer = setTimeout(() => reject(Error('No ' + name + ' event')), 5000); win.once(name, () => { clearTimeout(timer); resolve(); }); });
+        const expect = (ok, what) => { if (!ok) throw Error(what); };
+        const native = (width, height) => new Promise((resolve, reject) => child_process.execFile(process.env.APPS_WINDOW_LIST, [String(process.pid)], (error, stdout) => error ? reject(error) : resolve(JSON.parse(stdout).find(win => win.width === width && win.height === height))));
+        const threw = call => { try { call(); return false; } catch { return true; } };
+        app.on('window-all-closed', () => {});
+        app.whenReady().then(async () => {
+            setTimeout(() => { throw Error('Window test timed out'); }, 25000);
+            const parent = new BrowserWindow({ x: 100, y: 100, width: 420, height: 320, opacity: 0.5, hasShadow: false, show: false });
+            parent.load('<body></body>');
+            await once(parent, 'ready-to-show');
+            const focus = once(parent, 'focus');
+            parent.show();
+            await focus;
+            await sleep(200);
+            let info = await native(420, 320);
+            expect(info && Math.abs(info.alpha - 0.5) < 0.01 && info.sharing !== 0 && !parent.hasShadow(), 'opacity option: ' + JSON.stringify(info));
+            parent.setOpacity(2);
+            parent.setContentProtection(true);
+            parent.setVisibleOnAllWorkspaces(true, { skipTransformProcessType: true });
+            await sleep(200);
+            info = await native(420, 320);
+            expect(info.alpha === 1 && info.sharing === 0 && parent.getOpacity() === 1 && parent.isContentProtected() && parent.isVisibleOnAllWorkspaces(), 'setters: ' + JSON.stringify(info));
+            parent.setContentProtection(false);
+            parent.setVisibleOnAllWorkspaces(false, { skipTransformProcessType: true });
+            const normal = parent.getBounds(), resized = once(parent, 'resized');
+            parent.maximize();
+            await once(parent, 'maximize');
+            await resized;
+            expect(parent.isMaximized() && same(parent.getNormalBounds(), normal) && !same(parent.getBounds(), normal), 'normal bounds ' + JSON.stringify([normal, parent.getNormalBounds(), parent.getBounds()]));
+            const restored = once(parent, 'resized');
+            parent.unmaximize();
+            await once(parent, 'unmaximize');
+            await restored;
+            expect(same(parent.getNormalBounds(), parent.getBounds()), 'normal bounds after restore');
+
+            const child = new BrowserWindow({ parent, x: 150, y: 160, width: 200, height: 120, show: false });
+            expect(child.getParentWindow() === parent && same(parent.getChildWindows(), [child]), 'child links');
+            child.show();
+            await once(child, 'show');
+            const [x, y] = child.getPosition(), [left, top] = parent.getPosition();
+            const moved = once(child, 'move');
+            parent.setPosition(left + 40, top + 30);
+            await moved;
+            expect(same(child.getPosition(), [x + 40, y + 30]), 'child follows its parent: ' + JSON.stringify(child.getPosition()));
+            // WARNING: the window server moves children a moment after the parent, so a child detached at once can still follow.
+            await sleep(300);
+            child.setParentWindow(null);
+            parent.setPosition(left, top);
+            await once(parent, 'move');
+            await sleep(100);
+            expect(same(child.getPosition(), [x + 40, y + 30]) && !parent.getChildWindows().length, 'detached child stays: ' + JSON.stringify([x, y, child.getPosition(), parent.getPosition(), parent.getChildWindows().length]));
+
+            const passive = new BrowserWindow({ x: 400, y: 300, width: 180, height: 110, focusable: false });
+            await sleep(300);
+            expect(passive.isVisible() && !passive.isFocused() && !passive.isFocusable(), 'focusable option');
+            passive.setFocusable(true);
+            const focused = once(passive, 'focus');
+            passive.focus();
+            await focused;
+
+            for (const round of [1, 2]) {
+                const sheet = new BrowserWindow({ parent, modal: true, width: 240, height: 140 - round, show: false });
+                expect(sheet.isModal() && threw(() => sheet.setParentWindow(null)), 'modal');
+                const shown = once(sheet, 'show');
+                sheet.show();
+                await shown;
+                await sleep(400);
+                const outer = parent.getBounds(), inner = sheet.getBounds();
+                expect(Math.abs(inner.x + inner.width / 2 - (outer.x + outer.width / 2)) <= 1 && inner.y > outer.y, 'sheet ' + round + ' on its parent: ' + JSON.stringify([outer, inner]));
+                sheet.close();
+                await once(sheet, 'closed');
+            }
+
+            child.setParentWindow(parent);
+            child.setIgnoreMouseEvents(true, { forward: true });
+            child.setIgnoreMouseEvents(false);
+            child.setAspectRatio(16 / 9, { width: 10, height: 0 });
+            child.setAspectRatio(0);
+            child.setProgressBar(0.5);
+            child.setProgressBar(2);
+            child.setProgressBar(-1);
+            child.flashFrame(true);
+            child.flashFrame(false);
+            child.setSkipTaskbar(true);
+            child.setMenu(null);
+            child.removeMenu();
+            expect(child.setIcon === undefined && threw(() => child.setMenu({})) && threw(() => child.setParentWindow(child)), 'misc');
+            const glass = new BrowserWindow({ width: 260, height: 160, vibrancy: 'sidebar', visualEffectState: 'active' });
+            glass.load('<body>glass</body>');
+            await once(glass, 'ready-to-show');
+            glass.setVibrancy('under-window');
+            glass.setVibrancy(null);
+            glass.close();
+            await once(glass, 'closed');
+            parent.close();
+            await once(parent, 'closed');
+            expect(!child.isDestroyed() && child.getParentWindow() === null, 'closing a parent keeps its children');
+            console.log('BROWSER_WINDOW_EXTRAS_OK');
+            app.quit();
+        });
+    "#;
+    let bundle = serde_json::json!({"files": [
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+    ], "pages": []});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .env("APPS_WINDOW_LIST", &binary)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bundle.to_string().as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("BROWSER_WINDOW_EXTRAS_OK"),
         "{stdout}\n{stderr}"
     );
 }

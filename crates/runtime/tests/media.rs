@@ -125,6 +125,23 @@ fn videos_decode_frames_seek_and_end() {
 }
 
 #[test]
+fn seeking_past_the_last_frame_shows_it() {
+    let (host, engine, base) = page(0);
+    engine
+        .eval(
+            &format!("globalThis.media = document.createElement('video'); document.body.replaceChildren(media); media.src = '{base}clip.mp4'"),
+            "media-test",
+        )
+        .unwrap();
+    wait(&engine, "media.readyState === 4 ? 'ready' : 'pending'");
+    let id: usize = engine.eval("media._id", "media-test").unwrap().parse().unwrap();
+    let first = host.borrow().dom[&1].images[&id].clone();
+    engine.eval("media.currentTime = media.duration", "media-test").unwrap();
+    wait(&engine, "media.seeking ? 'pending' : 'done'");
+    assert!(!std::sync::Arc::ptr_eq(&first, &host.borrow().dom[&1].images[&id]));
+}
+
+#[test]
 fn audio_plays_to_the_end_and_loops() {
     let (_host, engine, base) = page(0);
     engine

@@ -271,7 +271,10 @@ impl State {
                 let op = args[0].as_str().context("Expected operation")?.to_owned();
                 let payload = crate::jsc::payload::Payload::snapshot(args[1].take());
                 // Slow work uses its own pool so it cannot stall queued file operations.
-                let slow = matches!(op.as_str(), "lookup" | "zlib" | "pbkdf2");
+                let slow = matches!(
+                    op.as_str(),
+                    "lookup" | "resolve" | "zlib" | "pbkdf2" | "scrypt" | "hkdf"
+                );
                 let queue = if slow {
                     &mut self.pool
                 } else {
@@ -339,7 +342,12 @@ impl State {
             }
             "hash.new" | "hash.copy" => {
                 let hasher = if op == "hash.new" {
-                    Hasher::new(&args[0], &args[1])?
+                    let key = if args[1].is_null() {
+                        None
+                    } else {
+                        Some(bytes(&args[1])?)
+                    };
+                    Hasher::new(args[0].as_str().context("Expected digest")?, key)?
                 } else {
                     self.hashers
                         .get(&args[0].as_u64().context("Expected hash ID")?)
@@ -412,6 +420,65 @@ impl State {
             "zlib.free" => {
                 self.codecs
                     .remove(&args[0].as_u64().context("Expected zlib ID")?);
+                Ok(Value::Null)
+            }
+            "loop" => {
+                let (start, _, idle) = crate::host::IDLE.with(std::cell::Cell::get);
+                Ok(start.map_or(Value::Null, |start| {
+                    json!([
+                        idle.as_secs_f64() * 1000.,
+                        start.elapsed().as_secs_f64() * 1000.
+                    ])
+                }))
+            }
+            "tty.watch" => {
+                #[cfg(unix)]
+                {
+                    use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
+                    type Subscriber = (
+                        mpsc::Sender<crate::jsc::payload::Payload>,
+                        crate::host::Waker,
+                    );
+                    // WARNING: the handler may only write to a non-blocking pipe; a thread turns each byte into `resize` events.
+                    static PIPE: AtomicI32 = AtomicI32::new(-1);
+                    static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+                    extern "C" fn resized(_: libc::c_int) {
+                        unsafe { libc::write(PIPE.load(Relaxed), [1u8].as_ptr().cast(), 1) };
+                    }
+                    let mut subscribers = SUBSCRIBERS.lock().unwrap();
+                    if PIPE.load(Relaxed) < 0 {
+                        let mut fds = [0; 2];
+                        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
+                        std::thread::Builder::new()
+                            .name("apps-signal".into())
+                            .spawn(move || {
+                                let mut byte = 0u8;
+                                loop {
+                                    match unsafe { libc::read(fds[0], (&raw mut byte).cast(), 1) } {
+                                        0 => break,
+                                        1 => {
+                                            SUBSCRIBERS.lock().unwrap().retain(|(sender, wake)| {
+                                                let open = sender
+                                                    .send(json!({"resize":true}).into())
+                                                    .is_ok();
+                                                wake.wake();
+                                                open
+                                            })
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            })?;
+                        PIPE.store(fds[1], Relaxed);
+                        unsafe {
+                            libc::signal(libc::SIGWINCH, resized as *const () as libc::sighandler_t)
+                        };
+                    }
+                    subscribers.push((self.sender.clone(), crate::host::Waker::current()));
+                }
                 Ok(Value::Null)
             }
             "unwatch" => {

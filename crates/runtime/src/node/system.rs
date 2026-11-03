@@ -100,27 +100,23 @@ pub(super) enum Hasher {
 }
 
 impl Hasher {
-    pub(super) fn new(name: &Value, key: &Value) -> Result<Self> {
+    pub(super) fn new(name: &str, key: Option<&[u8]>) -> Result<Self> {
         use sha2::Digest;
-        let name = name.as_str().context("Expected digest")?;
-        if !key.is_null() {
+        if let Some(key) = key {
             let algorithm = match name {
                 "sha1" => ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
                 "sha256" => ring::hmac::HMAC_SHA256,
                 "sha384" => ring::hmac::HMAC_SHA384,
                 "sha512" => ring::hmac::HMAC_SHA512,
                 _ => {
-                    let mut block = bytes(key)?.to_vec();
+                    let mut block = key.to_vec();
                     if block.len() > 64 {
-                        let mut hasher = Self::new(&json!(name), &Value::Null)?;
+                        let mut hasher = Self::new(name, None)?;
                         hasher.update(&block);
                         block = hasher.digest();
                     }
                     block.resize(64, 0);
-                    let mut pads = [
-                        Self::new(&json!(name), &Value::Null)?,
-                        Self::new(&json!(name), &Value::Null)?,
-                    ];
+                    let mut pads = [Self::new(name, None)?, Self::new(name, None)?];
                     for (hasher, pad) in pads.iter_mut().zip([0x36, 0x5c]) {
                         hasher.update(&block.iter().map(|byte| byte ^ pad).collect::<Vec<_>>());
                     }
@@ -129,7 +125,7 @@ impl Hasher {
                 }
             };
             return Ok(Self::Hmac(ring::hmac::Context::with_key(
-                &ring::hmac::Key::new(algorithm, bytes(key)?),
+                &ring::hmac::Key::new(algorithm, key),
             )));
         }
         let algorithm = match name {
@@ -302,9 +298,132 @@ impl Codec {
 pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
     match op {
         "hash" => {
-            let mut hasher = Hasher::new(&args[0], &args[2])?;
+            let key = if args[2].is_null() {
+                None
+            } else {
+                Some(bytes(&args[2])?)
+            };
+            let mut hasher = Hasher::new(args[0].as_str().context("Expected digest")?, key)?;
             hasher.update(bytes(&args[1])?);
             Ok(hasher.finish())
+        }
+        "hkdf" => {
+            let name = args[0].as_str().context("Expected digest")?;
+            let length = args[4].as_u64().context("Expected key length")? as usize;
+            ensure!(length <= 255 * 64, "Invalid key length");
+            let mut extract = Hasher::new(name, Some(bytes(&args[2])?))?;
+            extract.update(bytes(&args[1])?);
+            let key = extract.digest();
+            let (mut output, mut block) = (Vec::with_capacity(length + 64), Vec::new());
+            for counter in 1..=255u8 {
+                if output.len() >= length {
+                    break;
+                }
+                let mut mac = Hasher::new(name, Some(&key))?;
+                mac.update(&block);
+                mac.update(bytes(&args[3])?);
+                mac.update(&[counter]);
+                block = mac.digest();
+                output.extend_from_slice(&block);
+            }
+            ensure!(output.len() >= length, "Invalid key length");
+            output.truncate(length);
+            Ok(crate::web::base64(&output))
+        }
+        "scrypt" => {
+            let [n, r, p, length, limit] =
+                [2, 3, 4, 5, 6].map(|index| args[index].as_u64().unwrap_or(0));
+            ensure!(
+                n > 1
+                    && n.is_power_of_two()
+                    && r > 0
+                    && p > 0
+                    && r.checked_mul(p).is_some_and(|size| size < 1 << 30)
+                    && length <= 1 << 26,
+                "Invalid scrypt params"
+            );
+            ensure!(
+                128u64
+                    .saturating_mul(r)
+                    .saturating_mul(n.saturating_add(2 + p))
+                    <= limit,
+                "Invalid scrypt params: memory limit exceeded"
+            );
+            let (n, r) = (n as usize, r as usize);
+            let password = bytes(&args[0])?;
+            let once = std::num::NonZeroU32::MIN;
+            let mut blocks = vec![0u8; 128 * r * p as usize];
+            ring::pbkdf2::derive(
+                ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                once,
+                bytes(&args[1])?,
+                password,
+                &mut blocks,
+            );
+            let (mut v, mut x, mut y) = (
+                vec![0u32; 32 * r * n],
+                vec![0u32; 32 * r],
+                vec![0u32; 32 * r],
+            );
+            // BlockMix with Salsa20/8 (RFC 7914): even outputs go to the first half of `y`, odd ones to the second.
+            let mix = |x: &mut [u32], y: &mut [u32]| {
+                let mut t: [u32; 16] = x[x.len() - 16..].try_into().unwrap();
+                for i in 0..2 * r {
+                    t.iter_mut().zip(&x[i * 16..]).for_each(|(a, b)| *a ^= b);
+                    let mut s = t;
+                    for _ in 0..4 {
+                        for [a, b, c, d] in [
+                            [0, 4, 8, 12],
+                            [5, 9, 13, 1],
+                            [10, 14, 2, 6],
+                            [15, 3, 7, 11],
+                            [0, 1, 2, 3],
+                            [5, 6, 7, 4],
+                            [10, 11, 8, 9],
+                            [15, 12, 13, 14],
+                        ] {
+                            s[b] ^= s[a].wrapping_add(s[d]).rotate_left(7);
+                            s[c] ^= s[b].wrapping_add(s[a]).rotate_left(9);
+                            s[d] ^= s[c].wrapping_add(s[b]).rotate_left(13);
+                            s[a] ^= s[d].wrapping_add(s[c]).rotate_left(18);
+                        }
+                    }
+                    t.iter_mut()
+                        .zip(s)
+                        .for_each(|(a, b)| *a = a.wrapping_add(b));
+                    let at = (i / 2 + i % 2 * r) * 16;
+                    y[at..at + 16].copy_from_slice(&t);
+                }
+                x.copy_from_slice(y);
+            };
+            for block in blocks.chunks_exact_mut(128 * r) {
+                for (word, chunk) in x.iter_mut().zip(block.as_chunks::<4>().0) {
+                    *word = u32::from_le_bytes(*chunk);
+                }
+                for chunk in v.chunks_exact_mut(32 * r) {
+                    chunk.copy_from_slice(&x);
+                    mix(&mut x, &mut y);
+                }
+                for _ in 0..n {
+                    let j = x[32 * r - 16] as usize & (n - 1);
+                    x.iter_mut()
+                        .zip(&v[j * 32 * r..])
+                        .for_each(|(a, b)| *a ^= b);
+                    mix(&mut x, &mut y);
+                }
+                for (chunk, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(&x) {
+                    *chunk = word.to_le_bytes();
+                }
+            }
+            let mut key = vec![0; length as usize];
+            ring::pbkdf2::derive(
+                ring::pbkdf2::PBKDF2_HMAC_SHA256,
+                once,
+                &blocks,
+                password,
+                &mut key,
+            );
+            Ok(crate::web::base64(&key))
         }
         "pbkdf2" => {
             let algorithm = match args[4].as_str().unwrap_or("") {
@@ -333,7 +452,7 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     &mut key,
                 );
             } else if length > 0 {
-                let mac = Hasher::new(&args[4], &args[0])?;
+                let mac = Hasher::new(args[4].as_str().unwrap_or(""), Some(bytes(&args[0])?))?;
                 for (index, block) in key
                     .chunks_mut(if args[4] == "md5" { 16 } else { 28 })
                     .enumerate()
@@ -383,6 +502,259 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 .collect();
             ensure!(!addresses.is_empty(), "No address found");
             Ok(json!(addresses))
+        }
+        // Sends one query through the system resolver (libresolv) and returns the answers of the asked type as
+        // [type, ...fields] in Node's field order. Errors are c-ares codes, like ENOTFOUND.
+        "resolve" => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                #[link(name = "resolv")]
+                unsafe extern "C" {
+                    #[cfg_attr(target_os = "macos", link_name = "res_9_ninit")]
+                    #[cfg_attr(target_os = "linux", link_name = "__res_ninit")]
+                    fn res_ninit(state: *mut u64) -> i32;
+                    #[cfg_attr(target_os = "macos", link_name = "res_9_nsend")]
+                    #[cfg_attr(target_os = "linux", link_name = "__res_nsend")]
+                    fn res_nsend(
+                        state: *mut u64,
+                        query: *const u8,
+                        size: i32,
+                        answer: *mut u8,
+                        capacity: i32,
+                    ) -> i32;
+                    #[cfg_attr(target_os = "macos", link_name = "res_9_ndestroy")]
+                    #[cfg_attr(target_os = "linux", link_name = "__res_nclose")]
+                    fn res_ndestroy(state: *mut u64);
+                }
+                let kind = args[1].as_u64().context("Expected record type")? as u16;
+                let mut name = args[0]
+                    .as_str()
+                    .context("Expected hostname")?
+                    .trim_end_matches('.')
+                    .to_owned();
+                if args[5] == true {
+                    name = match name
+                        .parse::<std::net::IpAddr>()
+                        .map_err(|_| anyhow::anyhow!("EINVAL"))?
+                    {
+                        std::net::IpAddr::V4(ip) => {
+                            ip.octets()
+                                .iter()
+                                .rev()
+                                .map(|byte| format!("{byte}."))
+                                .collect::<String>()
+                                + "in-addr.arpa"
+                        }
+                        std::net::IpAddr::V6(ip) => {
+                            ip.octets()
+                                .iter()
+                                .rev()
+                                .map(|byte| format!("{:x}.{:x}.", byte & 15, byte >> 4))
+                                .collect::<String>()
+                                + "ip6.arpa"
+                        }
+                    };
+                }
+                let mut query = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+                getrandom::fill(&mut query[..2]).map_err(|error| anyhow::anyhow!("{error}"))?;
+                for label in name.split('.') {
+                    ensure!(
+                        !label.is_empty() && label.len() < 64 && name.len() < 254,
+                        "EBADNAME"
+                    );
+                    query.push(label.len() as u8);
+                    query.extend_from_slice(label.as_bytes());
+                }
+                query.extend_from_slice(&[0, (kind >> 8) as u8, kind as u8, 0, 1]);
+                // WARNING: `__res_state` has the same head in BIND, macOS and glibc: retrans, retry, options, nscount at 16 and three sockaddr_in at 20.
+                let mut state = [0u64; 128];
+                let mut packet = vec![0u8; 65536];
+                let size = unsafe {
+                    ensure!(res_ninit(state.as_mut_ptr()) == 0, "ENOTINITIALIZED");
+                    let head = state.as_mut_ptr().cast::<u8>();
+                    if let Some(servers) = args[2].as_array() {
+                        for (index, server) in servers.iter().take(3).enumerate() {
+                            let address: std::net::SocketAddrV4 =
+                                server.as_str().unwrap_or("").parse()?;
+                            let mut entry: libc::sockaddr_in = std::mem::zeroed();
+                            #[cfg(target_os = "macos")]
+                            {
+                                entry.sin_len = size_of::<libc::sockaddr_in>() as u8;
+                            }
+                            entry.sin_family = libc::AF_INET as _;
+                            entry.sin_port = address.port().to_be();
+                            entry.sin_addr.s_addr = u32::from(*address.ip()).to_be();
+                            head.add(20)
+                                .cast::<libc::sockaddr_in>()
+                                .add(index)
+                                .write_unaligned(entry);
+                        }
+                        head.add(16)
+                            .cast::<i32>()
+                            .write(servers.len().min(3) as i32);
+                    }
+                    if let Some(seconds) = args[3].as_u64() {
+                        head.cast::<i32>().write(seconds.clamp(1, 60) as i32);
+                    }
+                    if let Some(tries) = args[4].as_u64() {
+                        head.add(4).cast::<i32>().write(tries.clamp(1, 16) as i32);
+                    }
+                    let size = res_nsend(
+                        state.as_mut_ptr(),
+                        query.as_ptr(),
+                        query.len() as i32,
+                        packet.as_mut_ptr(),
+                        packet.len() as i32,
+                    );
+                    let error = std::io::Error::last_os_error();
+                    res_ndestroy(state.as_mut_ptr());
+                    // WARNING: libresolv fails on SERVFAIL, NOTIMP and REFUSED but leaves that reply in the buffer.
+                    let replied = packet[..2] == query[..2] && packet[2] & 0x80 != 0;
+                    ensure!(
+                        size >= 12 || replied,
+                        if error.raw_os_error() == Some(libc::ECONNREFUSED) {
+                            "ECONNREFUSED"
+                        } else {
+                            "ETIMEOUT"
+                        }
+                    );
+                    (size.max(12) as usize).min(packet.len())
+                };
+                let packet = &packet[..size];
+                match packet[3] & 15 {
+                    0 => {}
+                    1 => bail!("EFORMERR"),
+                    2 => bail!("ESERVFAIL"),
+                    3 => bail!("ENOTFOUND"),
+                    4 => bail!("ENOTIMP"),
+                    5 => bail!("EREFUSED"),
+                    _ => bail!("EBADRESP"),
+                }
+                let read = |at: usize, size: usize| packet.get(at..at + size).context("EBADRESP");
+                let short =
+                    |at: usize| -> Result<u16> { Ok(u16::from_be_bytes(read(at, 2)?.try_into()?)) };
+                let long =
+                    |at: usize| -> Result<u32> { Ok(u32::from_be_bytes(read(at, 4)?.try_into()?)) };
+                // Reads a possibly compressed name and returns it with the offset after it.
+                let label = |mut at: usize| -> Result<(String, usize)> {
+                    let (mut labels, mut end) = (Vec::new(), None);
+                    for _ in 0..128 {
+                        let size = *packet.get(at).context("EBADRESP")? as usize;
+                        if size >= 0xc0 {
+                            end.get_or_insert(at + 2);
+                            at = usize::from(short(at)? & 0x3fff);
+                        } else if size == 0 {
+                            return Ok((labels.join("."), end.unwrap_or(at + 1)));
+                        } else {
+                            labels.push(String::from_utf8_lossy(read(at + 1, size)?).into_owned());
+                            at += 1 + size;
+                        }
+                    }
+                    bail!("EBADRESP")
+                };
+                let text = |at: &mut usize| -> Result<String> {
+                    let size = *packet.get(*at).context("EBADRESP")? as usize;
+                    let value = String::from_utf8_lossy(read(*at + 1, size)?).into_owned();
+                    *at += 1 + size;
+                    Ok(value)
+                };
+                let mut at = 12;
+                for _ in 0..short(4)? {
+                    at = label(at)?.1 + 4;
+                }
+                let mut records = Vec::new();
+                for _ in 0..short(6)? {
+                    let start = label(at)?.1 + 10;
+                    let (ty, ttl, data) = (
+                        short(start - 10)?,
+                        long(start - 6)?,
+                        read(start, short(start - 2)? as usize)?,
+                    );
+                    at = start + data.len();
+                    if kind != 255 && ty != kind {
+                        continue;
+                    }
+                    records.push(match ty {
+                        1 => json!([
+                            "A",
+                            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(data)?).to_string(),
+                            ttl
+                        ]),
+                        28 => json!([
+                            "AAAA",
+                            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(data)?).to_string(),
+                            ttl
+                        ]),
+                        2 => json!(["NS", label(start)?.0]),
+                        5 => json!(["CNAME", label(start)?.0]),
+                        12 => json!(["PTR", label(start)?.0]),
+                        15 => json!(["MX", label(start + 2)?.0, short(start)?]),
+                        16 => {
+                            let (mut entries, mut next) = (Vec::new(), start);
+                            while next < at {
+                                entries.push(text(&mut next)?);
+                            }
+                            json!(["TXT", entries])
+                        }
+                        33 => json!([
+                            "SRV",
+                            label(start + 6)?.0,
+                            short(start + 4)?,
+                            short(start)?,
+                            short(start + 2)?
+                        ]),
+                        6 => {
+                            let (nsname, next) = label(start)?;
+                            let (hostmaster, next) = label(next)?;
+                            json!([
+                                "SOA",
+                                nsname,
+                                hostmaster,
+                                long(next)?,
+                                long(next + 4)?,
+                                long(next + 8)?,
+                                long(next + 12)?,
+                                long(next + 16)?
+                            ])
+                        }
+                        35 => {
+                            let mut next = start + 4;
+                            let (flags, service, regexp) =
+                                (text(&mut next)?, text(&mut next)?, text(&mut next)?);
+                            json!([
+                                "NAPTR",
+                                flags,
+                                service,
+                                regexp,
+                                label(next)?.0,
+                                short(start)?,
+                                short(start + 2)?
+                            ])
+                        }
+                        52 if data.len() >= 3 => json!([
+                            "TLSA",
+                            data[0],
+                            data[1],
+                            data[2],
+                            crate::web::base64(&data[3..])
+                        ]),
+                        257 if data.len() >= 2 => {
+                            let tag = data.get(2..2 + data[1] as usize).context("EBADRESP")?;
+                            json!([
+                                "CAA",
+                                data[0],
+                                String::from_utf8_lossy(tag),
+                                String::from_utf8_lossy(&data[2 + tag.len()..])
+                            ])
+                        }
+                        _ => continue,
+                    });
+                }
+                ensure!(!records.is_empty(), "ENODATA");
+                Ok(json!(records))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            bail!("ENOTIMP")
         }
         "os.info" => {
             let mut info = json!({"machine":match std::env::consts::ARCH { "aarch64" if cfg!(windows) => "arm64", arch => arch },"release":"","version":"","model":"","speed":0,"totalmem":0,"ppid":null,"user":{"uid":-1,"gid":-1,"username":std::env::var("USERNAME").unwrap_or_default(),"homedir":std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default(),"shell":null}});
@@ -726,6 +1098,22 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             {
                 bail!("Process priority is unavailable on this platform")
             }
+        }
+        "tty.size" => {
+            #[cfg(unix)]
+            unsafe {
+                let mut size: libc::winsize = std::mem::zeroed();
+                if libc::ioctl(
+                    args[0].as_i64().unwrap_or(1) as i32,
+                    libc::TIOCGWINSZ,
+                    &mut size,
+                ) == 0
+                    && size.ws_col > 0
+                {
+                    return Ok(json!([size.ws_col, size.ws_row]));
+                }
+            }
+            Ok(Value::Null)
         }
         "isatty" => {
             use std::io::IsTerminal;

@@ -144,7 +144,7 @@ fn sqlite_online_backup() {
 #[test]
 fn tcp_half_close_and_peer_addresses() {
     run(r#"
-        const assert=(v,m)=>{if(!v)throw Error(m)},net=__apps.net;
+        const assert=(v,m)=>{if(!v)throw Error(m)},net=__apps.module.createRequire()('net');
         assert(net.isIP('::1')===6&&net.isIP('127.0.0.1')===4&&net.isIP('invalid')===0,'IP parsing');
         const server=net.createServer({allowHalfOpen:true},socket=>{
             let data='';socket.setEncoding('utf8');socket.on('data',chunk=>data+=chunk);

@@ -1,0 +1,7 @@
+<!doctype html>
+<title>Rust app</title>
+<h1></h1>
+<script type="module">
+  import { greet } from './preload.ts'
+  document.querySelector('h1').textContent = await greet('from Rust')
+</script>

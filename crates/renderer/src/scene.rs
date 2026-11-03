@@ -14,6 +14,8 @@ pub struct Scene {
     pub(crate) layers: Vec<SceneLayer>,
     active: Vec<usize>,
     spare: Vec<SceneLayer>,
+    /// The layers of effects painted with a key, by key.
+    pub(crate) keyed: Vec<(u64, usize)>,
 }
 
 /// The primitives painted into the window or into one effect.
@@ -41,6 +43,7 @@ impl Default for Scene {
             layers: vec![SceneLayer::default()],
             active: Vec::new(),
             spare: Vec::new(),
+            keyed: Vec::new(),
         }
     }
 }
@@ -71,13 +74,15 @@ impl SceneLayer {
         }
     }
 
+    /// Inserts a primitive drawn in `bounds`, ordered by `reach` when it can move within it.
     fn insert(
         &mut self,
         bounds: Bounds<ScaledPixels>,
         mask: Bounds<ScaledPixels>,
         primitive: Primitive,
+        reach: Option<Bounds<ScaledPixels>>,
     ) {
-        let clipped = bounds.intersect(&mask);
+        let clipped = reach.unwrap_or(bounds).intersect(&mask);
         if clipped.is_empty() {
             return;
         }
@@ -132,6 +137,7 @@ impl SceneLayer {
 impl Scene {
     pub fn clear(&mut self) {
         self.active.clear();
+        self.keyed.clear();
         for mut layer in self.layers.drain(1..) {
             layer.clear();
             self.spare.push(layer);
@@ -170,12 +176,15 @@ impl Scene {
             Primitive::Poly(sprite) => (sprite.bounds, sprite.content_mask.bounds),
             Primitive::Effect(effect) => (effect.bounds, effect.content_mask.bounds),
         };
-        self.current().insert(bounds, mask, primitive);
+        self.current().insert(bounds, mask, primitive, None);
     }
 
-    pub(crate) fn push_effect(&mut self, effect: EffectState) {
+    pub(crate) fn push_effect(&mut self, effect: EffectState, key: Option<u64>) {
         let mut layer = self.spare.pop().unwrap_or_default();
         layer.effect = Some(effect);
+        if let Some(key) = key {
+            self.keyed.push((key, self.layers.len()));
+        }
         self.active.push(self.layers.len());
         self.layers.push(layer);
     }
@@ -184,34 +193,100 @@ impl Scene {
         let Some(index) = self.active.pop() else {
             return;
         };
-        let layer = &self.layers[index];
-        let Some(effect) = layer.effect.as_ref() else {
+        let Some(effect) = self.layers[index].effect.as_ref() else {
             return;
         };
-        let mut bounds = layer.bounds.map(|content| {
-            let mut bounds = content.dilate(ScaledPixels(effect.blur * 3.));
-            if let Some((offset, sigma, _)) = effect.shadow {
-                let shadow = content.dilate(ScaledPixels(sigma * 3.));
-                bounds = bounds.union(&(shadow + offset.map(ScaledPixels)));
-            }
-            match &effect.transform {
-                Some(matrix) => transform_bounds(matrix, bounds),
-                None => bounds,
-            }
-        });
-        if let Some(backdrop) = &effect.backdrop {
-            bounds = Some(bounds.map_or(backdrop.bounds, |bounds| bounds.union(&backdrop.bounds)));
-        }
-        let Some(bounds) = bounds else {
+        let Some(bounds) = effect_bounds(&self.layers[index]) else {
             return;
         };
         let content_mask = effect.content_mask;
-        self.insert(Primitive::Effect(EffectPrimitive {
+        // WARNING: a keyed layer with a transform turns between frames, so in the window it is ordered by
+        // its whole clip: whatever paints before or after it there stays below or above it.
+        let reach = (self.active.is_empty()
+            && effect.transform.is_some()
+            && self.keyed.iter().any(|(_, layer)| *layer == index))
+        .then_some(content_mask.bounds);
+        let primitive = Primitive::Effect(EffectPrimitive {
             order: 0,
             layer: index,
             bounds,
             content_mask,
-        }));
+        });
+        self.current()
+            .insert(bounds, content_mask.bounds, primitive, reach);
+    }
+
+    /// Sets the opacity of the layer painted with `key`, and its transform unless `None`. `false`
+    /// without such a layer, or when a new transform needs a new frame.
+    pub(crate) fn patch(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
+        let Some(&(_, index)) = self.keyed.iter().find(|(keyed, _)| *keyed == key) else {
+            return false;
+        };
+        let Some(effect) = self.layers[index].effect.as_mut() else {
+            return false;
+        };
+        effect.opacity = opacity;
+        let Some(matrix) = transform else {
+            return true;
+        };
+        if effect.transform.is_none() {
+            return false;
+        }
+        effect.transform = Some(matrix);
+        let Some(bounds) = effect_bounds(&self.layers[index]) else {
+            return true;
+        };
+        // Only a layer painted in the window is ordered to turn, see `pop_effect`.
+        self.layers[0]
+            .effects
+            .iter_mut()
+            .find(|primitive| primitive.layer == index)
+            .map(|primitive| primitive.bounds = bounds)
+            .is_some()
+    }
+
+    /// Whether the window paints over the effect of scene layer `index` within `reach`, or the
+    /// effect is not painted in the window.
+    pub(crate) fn paints_over(&self, index: usize, reach: Bounds<ScaledPixels>) -> bool {
+        let window = &self.layers[0];
+        let Some(own) = window.effects.iter().find(|effect| effect.layer == index) else {
+            return true;
+        };
+        let over = |order: DrawOrder, bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>| {
+            order > own.order && bounds.intersect(&mask).intersects(&reach)
+        };
+        window.shadows.iter().any(|shadow| {
+            let bounds = shadow
+                .bounds
+                .dilate(ScaledPixels(shadow.blur_radius.0 * 3.));
+            over(shadow.order, bounds, shadow.content_mask.bounds)
+        }) || window
+            .quads
+            .iter()
+            .any(|quad| over(quad.order, quad.bounds, quad.content_mask.bounds))
+            || window.underlines.iter().any(|underline| {
+                over(
+                    underline.order,
+                    underline.bounds,
+                    underline.content_mask.bounds,
+                )
+            })
+            || window
+                .mono
+                .iter()
+                .any(|sprite| over(sprite.order, sprite.bounds, sprite.content_mask.bounds))
+            || window
+                .poly
+                .iter()
+                .any(|sprite| over(sprite.order, sprite.bounds, sprite.content_mask.bounds))
+            || window.effects.iter().any(|effect| {
+                effect.layer > index
+                    && effect.order >= own.order
+                    && effect
+                        .bounds
+                        .intersect(&effect.content_mask.bounds)
+                        .intersects(&reach)
+            })
     }
 
     pub(crate) fn finish(&mut self) {
@@ -223,6 +298,28 @@ impl Scene {
     /// The batches of a layer, in paint order, as keys of the layer's primitives.
     pub(crate) fn batches(&self, layer: usize) -> Batches<'_> {
         Batches(self.layers[layer].keys.each_ref().map(Vec::as_slice))
+    }
+}
+
+/// What an effect layer draws in its parent: its content with blur and shadow, transformed, and its backdrop.
+fn effect_bounds(layer: &SceneLayer) -> Option<Bounds<ScaledPixels>> {
+    let effect = layer.effect.as_ref()?;
+    let bounds = layer.bounds.map(|content| {
+        let mut bounds = content.dilate(ScaledPixels(effect.blur * 3.));
+        if let Some((offset, sigma, _)) = effect.shadow {
+            let shadow = content.dilate(ScaledPixels(sigma * 3.));
+            bounds = bounds.union(&(shadow + offset.map(ScaledPixels)));
+        }
+        match &effect.transform {
+            Some(matrix) => transform_bounds(matrix, bounds),
+            None => bounds,
+        }
+    });
+    match &effect.backdrop {
+        Some(backdrop) => {
+            Some(bounds.map_or(backdrop.bounds, |bounds| bounds.union(&backdrop.bounds)))
+        }
+        None => bounds,
     }
 }
 
@@ -346,6 +443,8 @@ pub struct PaintEffect {
     pub mask: Option<(std::sync::Arc<RenderImage>, Bounds<Pixels>)>,
     /// A filter for the content below the given rounded rectangle.
     pub backdrop: Option<Backdrop>,
+    /// Names the layer, so [`crate::Window::patch_opacity`] can change it in the kept scene.
+    pub key: Option<u64>,
 }
 
 impl Default for PaintEffect {
@@ -360,6 +459,7 @@ impl Default for PaintEffect {
             clip: None,
             mask: None,
             backdrop: None,
+            key: None,
         }
     }
 }
@@ -424,7 +524,9 @@ pub enum BorderStyle {
 #[repr(C)]
 pub(crate) struct Quad {
     pub order: DrawOrder,
-    pub border_style: BorderStyle,
+    /// The `BorderStyle` in the low byte, and in bits 8 to 11 the sides it keeps (top, right, bottom, left),
+    /// or none for all.
+    pub border_style: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Rgba,

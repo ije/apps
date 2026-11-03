@@ -3,9 +3,13 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import <UserNotifications/UserNotifications.h>
 #import <Carbon/Carbon.h>
+#import <CoreText/CoreText.h>
 #import <ImageIO/ImageIO.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <AVFoundation/AVCaptureDevice.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdint.h>
@@ -16,6 +20,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 bool apps_reduce_motion(void) { return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion; }
 
@@ -62,6 +67,69 @@ bool apps_image_decode(const uint8_t *bytes, size_t length, uint8_t *(*allocate)
         CGImageRelease(image);
         return bitmap;
     }
+}
+
+static int AppsTagOrder(const void *a, const void *b) {
+    CTFontTableTag x = *(const CTFontTableTag *)a, y = *(const CTFontTableTag *)b;
+    return (x > y) - (x < y);
+}
+
+#define AppsPut16(at, value) (at)[0] = (uint8_t)((value) >> 8), (at)[1] = (uint8_t)(value)
+#define AppsPut32(at, value) AppsPut16(at, (value) >> 16), AppsPut16((at) + 2, value)
+
+// Decodes WOFF and WOFF2 data with CoreText, and writes the first face back as an sfnt font.
+bool apps_font_sfnt(const uint8_t *bytes, size_t length, uint8_t *(*allocate)(void *, size_t), void *context) {
+    CFDataRef data = CFDataCreate(NULL, bytes, (CFIndex)length);
+    CFArrayRef descriptors = data ? CTFontManagerCreateFontDescriptorsFromData(data) : NULL;
+    if (data) CFRelease(data);
+    CTFontRef font = descriptors && CFArrayGetCount(descriptors) ? CTFontCreateWithFontDescriptor(CFArrayGetValueAtIndex(descriptors, 0), 0, NULL) : NULL;
+    if (descriptors) CFRelease(descriptors);
+    if (!font) return false;
+    // WARNING: the array holds the tags themselves, not CFNumbers.
+    CFArrayRef list = CTFontCopyAvailableTables(font, kCTFontTableOptionNoOptions);
+    CFIndex count = list ? CFArrayGetCount(list) : 0;
+    CTFontTableTag *tags = malloc(count * sizeof *tags);
+    CFDataRef *tables = malloc(count * sizeof *tables);
+    for (CFIndex i = 0; i < count; i++) tags[i] = (CTFontTableTag)(uintptr_t)CFArrayGetValueAtIndex(list, i);
+    if (list) CFRelease(list);
+    qsort(tags, count, sizeof *tags, AppsTagOrder);
+    uint32_t version = 0x00010000, kept = 0;
+    size_t size = 0;
+    for (CFIndex i = 0; i < count; i++) {
+        CFDataRef table = CTFontCopyTable(font, tags[i], kCTFontTableOptionNoOptions);
+        if (!table) continue;
+        if (tags[i] == 'CFF ' || tags[i] == 'CFF2') version = 'OTTO';
+        tags[kept] = tags[i];
+        tables[kept++] = table;
+        size += ((size_t)CFDataGetLength(table) + 3) & ~(size_t)3;
+    }
+    CFRelease(font);
+    uint32_t offset = 12 + 16 * kept;
+    uint8_t *out = kept ? allocate(context, offset + size) : NULL;
+    if (out) {
+        uint32_t power = 1, shift = 0;
+        while (power * 2 <= kept) power *= 2, shift++;
+        AppsPut32(out, version);
+        AppsPut16(out + 4, kept);
+        AppsPut16(out + 6, power * 16);
+        AppsPut16(out + 8, shift);
+        AppsPut16(out + 10, kept * 16 - power * 16);
+        for (uint32_t i = 0; i < kept; i++) {
+            uint32_t length = (uint32_t)CFDataGetLength(tables[i]), sum = 0;
+            uint8_t *record = out + 12 + 16 * i, *table = out + offset;
+            memcpy(table, CFDataGetBytePtr(tables[i]), length);
+            for (uint32_t at = 0; at < length; at += 4) sum += (uint32_t)table[at] << 24 | (uint32_t)table[at + 1] << 16 | (uint32_t)table[at + 2] << 8 | table[at + 3];
+            AppsPut32(record, tags[i]);
+            AppsPut32(record + 4, sum);
+            AppsPut32(record + 8, offset);
+            AppsPut32(record + 12, length);
+            offset += (length + 3) & ~3u;
+        }
+    }
+    for (uint32_t i = 0; i < kept; i++) CFRelease(tables[i]);
+    free(tags);
+    free(tables);
+    return out;
 }
 
 uint32_t apps_theme_state(void) {
@@ -191,6 +259,25 @@ static void AppsNativeEmit(NSDictionary *event) {
 }
 @end
 
+// The Dock tile progress bar of BrowserWindow.setProgressBar(), drawn like Electron's.
+@interface AppsDockProgress : NSView
+@property double value;
+@end
+@implementation AppsDockProgress
+- (void)drawRect:(NSRect)dirty {
+    NSRect rect = NSInsetRect(self.bounds, 1, 1);
+    NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:rect.size.height / 2 yRadius:rect.size.height / 2];
+    path.lineWidth = 2;
+    [NSColor.grayColor set];
+    [path stroke];
+    rect = NSInsetRect(rect, 2, 2);
+    [[NSBezierPath bezierPathWithRoundedRect:rect xRadius:rect.size.height / 2 yRadius:rect.size.height / 2] addClip];
+    rect.size.width = floor(rect.size.width * self.value);
+    [[NSColor colorWithSRGBRed:0.2 green:0.6 blue:1 alpha:1] set];
+    NSRectFill(rect);
+}
+@end
+
 static OSStatus AppsHotkey(EventHandlerCallRef handler, EventRef event, void *data) {
     (void)handler; (void)data;
     EventHotKeyID key;
@@ -261,6 +348,21 @@ static NSArray *AppsAccelerator(NSString *accelerator) {
     return key ? @[key[0], @(modifiers), key[1], key[2]] : nil;
 }
 
+static NSImage *AppsIcon(NSString *path, CGFloat maxHeight) {
+    if (!path.length) return nil;
+    NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
+    if (!image || !image.valid || image.size.height <= 0) return nil;
+    NSString *stem = path.stringByDeletingPathExtension;
+    if (![stem hasSuffix:@"@2x"]) {
+        NSString *retina = [[stem stringByAppendingString:@"@2x"] stringByAppendingPathExtension:path.pathExtension];
+        NSImageRep *rep = [NSImageRep imageRepWithContentsOfFile:retina];
+        if (rep) { rep.size = image.size; [image addRepresentation:rep]; }
+    }
+    image.template = [stem hasSuffix:@"Template"] || [stem hasSuffix:@"Template@2x"];
+    if (image.size.height > maxHeight) image.size = NSMakeSize(image.size.width * maxHeight / image.size.height, maxHeight);
+    return image;
+}
+
 static NSMenu *AppsMenu(NSArray *template) {
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
     menu.autoenablesItems = NO;
@@ -283,6 +385,8 @@ static NSMenu *AppsMenu(NSArray *template) {
         item.state = [description[@"checked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
         item.representedObject = description[@"type"];
         if (description[@"toolTip"]) item.toolTip = description[@"toolTip"];
+        if (description[@"icon"]) item.image = AppsIcon(description[@"icon"], 32);
+        if (@available(macOS 14.4, *)) item.subtitle = description[@"sublabel"];
         if (selector && keys[role]) {
             item.target = owner;
             item.action = @selector(keyAction:);
@@ -300,12 +404,79 @@ static NSMenu *AppsMenu(NSArray *template) {
     return menu;
 }
 
+@interface AppsTray : NSView <NSDraggingDestination>
+@property(nonatomic, strong) NSStatusItem *item;
+@property(nonatomic, strong) NSNumber *trayID;
+@property(nonatomic, copy) NSString *guid;
+@property(nonatomic, strong) NSMenu *contextMenu;
+@property(nonatomic) NSUInteger popupGeneration;
+@property(nonatomic) BOOL ignoreDoubleClick;
+@end
+
+@implementation AppsTray
+- (NSDictionary *)screenBounds {
+    NSRect frame = self.window.frame;
+    return @{ @"x": @(NSMinX(frame)), @"y": @(NSMaxY(NSScreen.screens.firstObject.frame) - NSMaxY(frame)), @"width": @(NSWidth(frame)), @"height": @(NSHeight(frame)) };
+}
+- (void)send:(NSString *)name event:(NSEvent *)event {
+    NSPoint point = event.window ? [event.window convertPointToScreen:event.locationInWindow] : NSEvent.mouseLocation;
+    NSEventModifierFlags flags = event ? event.modifierFlags : NSEvent.modifierFlags;
+    NSMutableDictionary *message = [@{ @"type": @"tray", @"id": self.trayID, @"event": name, @"shift": @((flags & NSEventModifierFlagShift) != 0), @"control": @((flags & NSEventModifierFlagControl) != 0), @"alt": @((flags & NSEventModifierFlagOption) != 0), @"meta": @((flags & NSEventModifierFlagCommand) != 0) } mutableCopy];
+    if ([name hasSuffix:@"click"]) message[@"bounds"] = self.screenBounds;
+    if ([name isEqual:@"click"] || [name hasPrefix:@"mouse-"]) message[@"position"] = @{ @"x": @(floor(point.x)), @"y": @(floor(NSMaxY(NSScreen.screens.firstObject.frame) - point.y)) };
+    AppsNativeEmit(message);
+}
+- (void)showMenu:(NSMenu *)menu {
+    if (!menu.numberOfItems || self.item.menu) return;
+    self.item.menu = menu;
+    [self.item.button performClick:nil];
+    self.item.menu = nil;
+}
+- (void)click:(NSEvent *)event {
+    [self send:event.clickCount == 2 && !self.ignoreDoubleClick ? @"double-click" : @"click" event:event];
+}
+- (void)press:(id)sender {
+    [self click:nil];
+    [self showMenu:self.contextMenu];
+}
+- (void)mouseDown:(NSEvent *)event {
+    [self send:@"mouse-down" event:event];
+    if (self.contextMenu.numberOfItems) {
+        [self click:event];
+        [self showMenu:self.contextMenu];
+    } else [self.item.button highlight:YES];
+}
+- (void)mouseUp:(NSEvent *)event {
+    [self.item.button highlight:NO];
+    if (!self.contextMenu.numberOfItems) {
+        [self send:@"mouse-up" event:event];
+        [self click:event];
+    }
+}
+- (void)rightMouseUp:(NSEvent *)event { [self send:@"right-click" event:event]; }
+- (void)mouseEntered:(NSEvent *)event { [self send:@"mouse-enter" event:event]; }
+- (void)mouseExited:(NSEvent *)event { [self send:@"mouse-leave" event:event]; }
+- (void)mouseMoved:(NSEvent *)event { [self send:@"mouse-move" event:event]; }
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender { [self send:@"drag-enter" event:nil]; return NSDragOperationCopy; }
+- (void)draggingExited:(id<NSDraggingInfo>)sender { [self send:@"drag-leave" event:nil]; }
+- (void)draggingEnded:(id<NSDraggingInfo>)sender { [self send:@"drag-end" event:nil]; }
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSPasteboard *board = sender.draggingPasteboard;
+    NSArray *urls = [board readObjectsForClasses:@[NSURL.class] options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    id data = urls.count ? [urls valueForKey:@"path"] : [board stringForType:NSPasteboardTypeString];
+    if (!data) return NO;
+    AppsNativeEmit(@{ @"type": @"tray", @"id": self.trayID, @"event": urls.count ? @"drop-files" : @"drop-text", @"data": data });
+    [self send:@"drop" event:nil];
+    return YES;
+}
+@end
+
 char *apps_native_call(const char *operation, const char *argumentsJSON) {
     NSString *op = AppsString(operation);
     id args = AppsValue(argumentsJSON);
     id result = [NSNull null];
     if (![NSThread isMainThread]) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
-    if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
+    if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."] || [op hasPrefix:@"tray."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
     if ([op isEqualToString:@"poll"]) { result = [AppsNativeEvents() copy]; [AppsNativeEvents() removeAllObjects]; }
     else if ([op isEqualToString:@"app.singleInstance"]) {
         AppsNative *owner = AppsNativeOwner();
@@ -342,6 +513,74 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         result = @(info && CFEqual(IOPSGetProvidingPowerSourceType(info), CFSTR(kIOPSBatteryPowerValue)));
         if (info) CFRelease(info);
     }
+    else if ([op hasPrefix:@"tray."]) {
+        static NSMutableDictionary<NSNumber *, AppsTray *> *trays;
+        NSNumber *identifier = args[@"id"];
+        AppsTray *tray = trays[identifier];
+        if (![op isEqual:@"tray.create"] && !tray) return strdup("{\"error\":\"Tray is destroyed\"}");
+        if ([op isEqual:@"tray.create"] || [op isEqual:@"tray.image"] || [op isEqual:@"tray.pressedImage"]) {
+            NSImage *image = AppsIcon(args[@"image"], 18);
+            if ([args[@"image"] length] && !image) return strdup("{\"error\":\"Cannot load the tray image\"}");
+            if ([op isEqual:@"tray.create"]) {
+                NSString *guid = args[@"guid"];
+                if (guid && ![[NSUUID alloc] initWithUUIDString:guid]) return strdup("{\"error\":\"Invalid tray GUID\"}");
+                if (tray) return strdup("{\"error\":\"Tray already exists\"}");
+                NSStatusItem *item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+                if (!item.button) return strdup("{\"error\":\"Cannot create a status bar item\"}");
+                tray = [[AppsTray alloc] initWithFrame:item.button.bounds];
+                tray.item = item;
+                tray.trayID = identifier;
+                tray.guid = guid;
+                if (guid) item.autosaveName = guid;
+                tray.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+                [item.button addSubview:tray];
+                [tray addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingInVisibleRect | NSTrackingActiveAlways | NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved owner:tray userInfo:nil]];
+                [tray registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypeString]];
+                item.button.target = tray;
+                item.button.action = @selector(press:);
+                if (!trays) trays = [NSMutableDictionary new];
+                trays[identifier] = tray;
+            }
+            if ([op isEqual:@"tray.pressedImage"]) {
+                [tray.item.button setButtonType:NSButtonTypeMomentaryChange];
+                tray.item.button.alternateImage = image;
+            } else tray.item.button.image = image;
+        } else if ([op isEqual:@"tray.destroy"]) {
+            [tray.item.menu cancelTracking];
+            [NSStatusBar.systemStatusBar removeStatusItem:tray.item];
+            [tray removeFromSuperview];
+            tray.item = nil;
+            [trays removeObjectForKey:identifier];
+        } else if ([op isEqual:@"tray.menu"]) {
+            tray.contextMenu = args[@"template"] == NSNull.null ? nil : AppsMenu(args[@"template"]);
+        } else if ([op isEqual:@"tray.popup"]) {
+            NSMenu *menu = args[@"template"] == NSNull.null ? tray.contextMenu : AppsMenu(args[@"template"]);
+            NSUInteger generation = ++tray.popupGeneration;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (tray.item && tray.popupGeneration == generation) [tray showMenu:menu];
+                AppsNativeEmit(@{ @"type": @"tray", @"id": identifier, @"request": args[@"request"] });
+            });
+        } else if ([op isEqual:@"tray.close"]) {
+            tray.popupGeneration++;
+            [tray.item.menu cancelTracking];
+        } else if ([op isEqual:@"tray.toolTip"]) tray.toolTip = args[@"text"];
+        else if ([op isEqual:@"tray.title"]) {
+            NSStatusBarButton *button = tray.item.button;
+            button.title = args[@"text"];
+            button.imagePosition = button.title.length ? NSImageLeft : NSImageOnly;
+            CGFloat size = NSFont.systemFontSize;
+            NSString *font = args[@"fontType"];
+            button.font = [font isEqual:@"monospaced"] ? [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular] : [font isEqual:@"monospacedDigit"] ? [NSFont monospacedDigitSystemFontOfSize:size weight:NSFontWeightRegular] : [NSFont systemFontOfSize:size];
+        } else if ([op isEqual:@"tray.getTitle"]) result = tray.item.button.title;
+        else if ([op isEqual:@"tray.guid"]) result = tray.guid ?: NSNull.null;
+        else if ([op isEqual:@"tray.ignoreDoubleClick"]) tray.ignoreDoubleClick = [args[@"ignore"] boolValue];
+        else if ([op isEqual:@"tray.getIgnoreDoubleClick"]) result = @(tray.ignoreDoubleClick);
+        else if ([op isEqual:@"tray.bounds"]) result = tray.screenBounds;
+    } else if ([op isEqualToString:@"power.block"]) {
+        IOPMAssertionID assertion = 0;
+        if (IOPMAssertionCreateWithName([args boolValue] ? kIOPMAssertionTypePreventUserIdleDisplaySleep : kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn, (__bridge CFStringRef)NSProcessInfo.processInfo.processName, &assertion) != kIOReturnSuccess) return strdup("{\"error\":\"Cannot start the power save blocker\"}");
+        result = @(assertion);
+    } else if ([op isEqualToString:@"power.unblock"]) IOPMAssertionRelease([args unsignedIntValue]);
     else if ([op isEqualToString:@"menu.set"]) NSApp.mainMenu = args == [NSNull null] ? nil : AppsMenu(args);
     else if ([op isEqualToString:@"menu.popup"]) {
         NSMenu *menu = AppsMenu(args[@"template"]);
@@ -467,7 +706,87 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSPoint point = NSEvent.mouseLocation;
         result = @{ @"x": @(floor(point.x)), @"y": @(floor(NSMaxY(NSScreen.screens.firstObject.frame) - point.y)) };
     }
+    else if ([op isEqualToString:@"prefs.color"]) {
+        if ([NSColor respondsToSelector:NSSelectorFromString(args)]) {
+            NSColor *color = [[NSColor valueForKey:args] colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
+            CGFloat parts[4] = { 0 };
+            [color getRed:&parts[0] green:&parts[1] blue:&parts[2] alpha:&parts[3]];
+            NSMutableString *hex = [NSMutableString stringWithString:@"#"];
+            for (int i = 0; i < 4; i++) [hex appendFormat:@"%02X", (int)lround(MIN(1, MAX(0, parts[i])) * 255)];
+            result = color ? hex : @"";
+        }
+    } else if ([op isEqualToString:@"prefs.appearance"]) {
+        NSAppearanceName name = [NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        result = [name isEqual:NSAppearanceNameDarkAqua] ? @"dark" : [name isEqual:NSAppearanceNameAqua] ? @"light" : @"unknown";
+    } else if ([op isEqualToString:@"prefs.animation"]) {
+        BOOL reduce = NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
+        result = @{ @"shouldRenderRichAnimation": @(!reduce), @"scrollAnimationsEnabledBySystem": @([NSUserDefaults.standardUserDefaults boolForKey:@"NSScrollAnimationEnabled"]), @"prefersReducedMotion": @(reduce) };
+    } else if ([op isEqualToString:@"prefs.swipe"]) result = @(NSEvent.isSwipeTrackingFromScrollEventsEnabled);
+    else if ([op isEqualToString:@"prefs.trusted"]) result = @(AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{ (__bridge id)kAXTrustedCheckOptionPrompt: @([args boolValue]) }));
+    else if ([op isEqualToString:@"prefs.media"] || [op isEqualToString:@"prefs.askMedia"]) {
+        // WARNING: AVFoundation and LocalAuthentication load on first use, so apps that never ask for them don't link or load them.
+        dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
+        BOOL ask = [op isEqualToString:@"prefs.askMedia"];
+        NSString *type = ask ? args[@"type"] : args, *media = [type isEqual:@"camera"] ? @"vide" : @"soun", *key = [type isEqual:@"camera"] ? @"NSCameraUsageDescription" : @"NSMicrophoneUsageDescription";
+        Class device = NSClassFromString(@"AVCaptureDevice");
+        if ([type isEqual:@"screen"]) {
+            result = @"granted";
+            if (@available(macOS 10.15, *)) result = CGPreflightScreenCaptureAccess() ? @"granted" : @"denied";
+        } else if (!ask) result = @[@"not-determined", @"restricted", @"denied", @"granted"][MIN(3, MAX(0, [device authorizationStatusForMediaType:media]))];
+        // WARNING: macOS kills an app that asks for camera or microphone access without a usage description in its Info.plist.
+        else if (!NSBundle.mainBundle.infoDictionary[key]) return strdup(AppsJSON(@{ @"error": [NSString stringWithFormat:@"askForMediaAccess() needs %@ in the app's Info.plist", key] }).UTF8String);
+        else [device requestAccessForMediaType:media completionHandler:^(BOOL granted) { AppsNativeEmit(@{ @"type": @"reply", @"id": args[@"async"], @"value": @(granted) }); }];
+    } else if ([op isEqualToString:@"prefs.touchID"] || [op isEqualToString:@"prefs.promptTouchID"]) {
+        dlopen("/System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication", RTLD_LAZY);
+        LAContext *context = [NSClassFromString(@"LAContext") new];
+        if ([op isEqualToString:@"prefs.touchID"]) {
+            result = @NO;
+            if (@available(macOS 10.13.2, *)) result = @([context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:nil] && context.biometryType == LABiometryTypeTouchID);
+        } else [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:args[@"reason"] reply:^(BOOL success, NSError *error) {
+            // WARNING: the prompt ends when its context is freed, so the reply keeps it.
+            (void)context;
+            AppsNativeEmit(@{ @"type": @"reply", @"id": args[@"async"], @"value": success ? @YES : error.localizedDescription ?: @"Authentication failed" });
+        }];
+    } else if ([op isEqualToString:@"prefs.getDefault"]) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *key = args[@"key"], *type = args[@"type"];
+        if ([type isEqual:@"string"]) result = [defaults stringForKey:key] ?: @"";
+        else if ([type isEqual:@"boolean"]) result = @([defaults boolForKey:key]);
+        else if ([type isEqual:@"integer"]) result = @([defaults integerForKey:key]);
+        else if ([type isEqual:@"float"]) result = @([defaults floatForKey:key]);
+        else if ([type isEqual:@"double"]) result = @([defaults doubleForKey:key]);
+        else if ([type isEqual:@"url"]) result = [defaults URLForKey:key].absoluteString ?: @"";
+        else {
+            id value = [type isEqual:@"array"] ? [defaults arrayForKey:key] ?: @[] : [defaults dictionaryForKey:key] ?: @{};
+            // WARNING: dates and data in defaults are not JSON, and NSJSONSerialization throws on them.
+            if ([NSJSONSerialization isValidJSONObject:value]) result = value;
+        }
+    } else if ([op isEqualToString:@"prefs.setDefault"] || [op isEqualToString:@"prefs.registerDefaults"]) {
+        BOOL set = [op isEqualToString:@"prefs.setDefault"], url = set && [args[@"type"] isEqual:@"url"];
+        id value = url ? [NSURL URLWithString:args[@"value"]] : set ? args[@"value"] : args;
+        // WARNING: NSUserDefaults throws on values that are not property lists, like JSON null.
+        if (!value || (!url && ![NSPropertyListSerialization propertyList:value isValidForFormat:NSPropertyListBinaryFormat_v1_0])) return strdup(AppsJSON(@{ @"error": set ? [@"Unable to convert value to: " stringByAppendingString:args[@"type"]] : @"Invalid user defaults" }).UTF8String);
+        if (!set) [NSUserDefaults.standardUserDefaults registerDefaults:value];
+        else if (url) [NSUserDefaults.standardUserDefaults setURL:value forKey:args[@"key"]];
+        else [NSUserDefaults.standardUserDefaults setObject:value forKey:args[@"key"]];
+    } else if ([op isEqualToString:@"prefs.removeDefault"]) [NSUserDefaults.standardUserDefaults removeObjectForKey:args];
     else if ([op isEqualToString:@"app.badge"]) NSApp.dockTile.badgeLabel = [args length] ? args : nil;
+    else if ([op isEqualToString:@"app.progress"]) {
+        NSDockTile *tile = NSApp.dockTile;
+        AppsDockProgress *bar = tile.contentView.subviews.lastObject;
+        if ([args doubleValue] < 0) tile.contentView = nil;
+        else {
+            if (![bar isKindOfClass:AppsDockProgress.class]) {
+                NSImageView *icon = [[NSImageView alloc] initWithFrame:NSMakeRect(0, 0, tile.size.width, tile.size.height)];
+                icon.image = NSApp.applicationIconImage;
+                bar = [[AppsDockProgress alloc] initWithFrame:NSMakeRect(0, 0, tile.size.width, 15)];
+                [icon addSubview:bar];
+                tile.contentView = icon;
+            }
+            bar.value = MIN([args doubleValue], 1);
+        }
+        [tile display];
+    }
     else if ([op isEqualToString:@"app.locale"]) result = @{ @"system": [[NSLocale.currentLocale.localeIdentifier componentsSeparatedByString:@"@"][0] stringByReplacingOccurrencesOfString:@"_" withString:@"-"], @"languages": NSLocale.preferredLanguages };
     else if ([op isEqualToString:@"app.hidden"]) { if ([args boolValue]) [NSApp hide:nil]; else [NSApp unhide:nil]; }
     else if ([op isEqualToString:@"app.state"]) result = @{ @"hidden": @(NSApp.isHidden), @"active": @(NSApp.isActive) };
@@ -482,6 +801,8 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSImage *image = [args length] ? [[NSImage alloc] initWithContentsOfFile:args] : nil;
         if ([args length] && !image) return strdup("{\"error\":\"Cannot load the icon image\"}");
         NSApp.applicationIconImage = image;
+        // The progress bar draws the icon itself.
+        if (NSApp.dockTile.contentView) { ((NSImageView *)NSApp.dockTile.contentView).image = NSApp.applicationIconImage; [NSApp.dockTile display]; }
     } else if ([op isEqualToString:@"app.about"]) {
         if (args == [NSNull null]) [NSApp orderFrontStandardAboutPanelWithOptions:AppsAboutOptions ?: @{}];
         else {
@@ -508,7 +829,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     else if ([op hasPrefix:@"dialog."]) {
         // WARNING: async dialogs must not run a modal loop: the app stays borrowed and the main queue stops while it runs.
         NSNumber *request = args[@"async"];
-        void (^emit)(NSDictionary *) = ^(NSDictionary *value) { AppsNativeEmit(@{ @"type": @"dialog", @"id": request, @"value": value }); };
+        void (^emit)(NSDictionary *) = ^(NSDictionary *value) { AppsNativeEmit(@{ @"type": @"reply", @"id": request, @"value": value }); };
         if ([op isEqualToString:@"dialog.open"] || [op isEqualToString:@"dialog.save"]) {
             BOOL open = [op isEqualToString:@"dialog.open"];
             NSSavePanel *panel = open ? [NSOpenPanel openPanel] : [NSSavePanel savePanel];

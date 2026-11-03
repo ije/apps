@@ -59,6 +59,8 @@ const WGHT: i64 = 0x77676874;
 
 unsafe extern "C" {
     static kCTFontVariationAttribute: core_foundation::string::CFStringRef;
+    static kCTFontVariationAxisIdentifierKey: core_foundation::string::CFStringRef;
+    static kCTFontVariationAxisDefaultValueKey: core_foundation::string::CFStringRef;
     fn CTFontCopyVariation(
         font: core_text::font::CTFontRef,
     ) -> core_foundation::dictionary::CFDictionaryRef;
@@ -106,6 +108,10 @@ struct AppleTextSystemState {
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
     families: Option<std::thread::JoinHandle<Vec<String>>>,
+    /// Faces at a point size, by font and size bits.
+    sized: HashMap<(FontId, u32), CTFont>,
+    /// The font of each shaped run's face, kept alive so its address stays unique.
+    natives: HashMap<usize, (CTFont, FontId)>,
 }
 
 fn font_families() -> Vec<String> {
@@ -128,6 +134,8 @@ impl TextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            sized: HashMap::default(),
+            natives: HashMap::default(),
             // WARNING: listing the font families takes about 20 ms, so it starts here, off the first frame's path.
             families: std::thread::Builder::new()
                 .name("font families".into())
@@ -206,9 +214,22 @@ impl TextSystem {
             },
         )?;
         let mut font_id = candidates[index];
-        // Like Chrome, the system font's weight axis takes the exact CSS weight, which differs from its
-        // named faces for weights like 500 and 600.
-        if &*font.family == ".SystemUIFont" && font.weight.0 != 400. {
+        // Like browsers, a variable font's weight axis takes the exact CSS weight, which differs from
+        // its named faces for weights like 500 and 600. A face at its default instance has no `wght`
+        // in its variation, so the axis default stands in.
+        // WARNING: old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their faces.
+        let native = state.fonts[font_id.0].native_font();
+        let default = native
+            .get_variation_axes()
+            .and_then(|axes| {
+                axes.iter().find_map(|axis| {
+                    let number = |key| axis.find(key)?.downcast::<CFNumber>();
+                    (number(unsafe { kCTFontVariationAxisIdentifierKey })?.to_i64()? == WGHT)
+                        .then(|| number(unsafe { kCTFontVariationAxisDefaultValueKey })?.to_f32())?
+                })
+            })
+            .filter(|weight| *weight >= 100.);
+        if default.is_some() && variation_weight(&native).or(default) != Some(font.weight.0) {
             font_id = state.weighted(font_id, font.weight.0);
         }
         state.font_selections.insert(font.clone(), font_id);
@@ -254,7 +275,7 @@ impl TextSystem {
         params: &RenderGlyphParams,
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.0.borrow().rasterize_glyph(params, raster_bounds)
+        self.0.borrow_mut().rasterize_glyph(params, raster_bounds)
     }
 
     pub fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
@@ -399,6 +420,24 @@ impl AppleTextSystemState {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
     }
 
+    /// The face at `size`, created once.
+    // WARNING: every new copy of a variable face, like the system font, builds its CoreText caches again,
+    // which took most of the time of shaping a line.
+    fn sized(&mut self, font_id: FontId, size: f32) -> CTFont {
+        if self.sized.len() >= 512 {
+            self.sized.clear();
+        }
+        let fonts = &self.fonts;
+        self.sized
+            .entry((font_id, size.to_bits()))
+            .or_insert_with(|| {
+                fonts[font_id.0]
+                    .native_font()
+                    .clone_with_font_size(size as CGFloat)
+            })
+            .clone()
+    }
+
     /// The face with its `wght` axis at `weight`, created once.
     fn weighted(&mut self, font_id: FontId, weight: f32) -> FontId {
         let base = self.fonts[font_id.0].native_font();
@@ -483,7 +522,7 @@ impl AppleTextSystemState {
     }
 
     fn rasterize_glyph(
-        &self,
+        &mut self,
         params: &RenderGlyphParams,
         glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
@@ -555,9 +594,7 @@ impl AppleTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            self.fonts[params.font_id.0]
-                .native_font()
-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
+            self.sized(params.font_id, f32::from(params.font_size))
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
                     &[CGPoint::new(
@@ -609,9 +646,7 @@ impl AppleTextSystemState {
 
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
-                let font = &self.fonts[run.font_id.0];
-
-                let font_metrics = font.metrics();
+                let font_metrics = self.fonts[run.font_id.0].metrics();
                 let font_scale = f32::from(run.font_size) / font_metrics.units_per_em as f32;
                 max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
                 max_descent = max_descent.max(-font_metrics.descent * font_scale);
@@ -621,12 +656,9 @@ impl AppleTextSystemState {
                 } else {
                     run.font_size
                 };
+                let font = self.sized(run.font_id, font_size.into());
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &font);
                 }
                 if length > 0 {
                     break_ligature = !break_ligature;
@@ -657,7 +689,18 @@ impl AppleTextSystemState {
                         .total_cmp(&(f32::from(*b) - shaped_size).abs())
                 })
                 .unwrap_or(font_size);
-            let font_id = self.id_for_native_font(font);
+            if self.natives.len() >= 512 {
+                self.natives.clear();
+            }
+            let key = font.as_concrete_TypeRef() as usize;
+            let font_id = match self.natives.get(&key) {
+                Some((_, font_id)) => *font_id,
+                None => {
+                    let font_id = self.id_for_native_font(font.clone());
+                    self.natives.insert(key, (font, font_id));
+                    font_id
+                }
+            };
             let is_emoji = self.is_emoji(font_id);
 
             let glyphs = match runs.last_mut() {

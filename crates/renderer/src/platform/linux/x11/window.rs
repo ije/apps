@@ -346,6 +346,22 @@ impl Window {
         let _ = xcb.flush();
     }
 
+    /// Keeps the window above `parent`, or detaches it.
+    pub fn set_parent(&self, parent: Option<rwh::RawWindowHandle>) {
+        let (xcb, id) = (&self.client.xcb, self.shared.id);
+        let _ = match parent {
+            Some(rwh::RawWindowHandle::Xcb(parent)) => xcb.change_property32(
+                xproto::PropMode::REPLACE,
+                id,
+                xproto::AtomEnum::WM_TRANSIENT_FOR,
+                xproto::AtomEnum::WINDOW,
+                &[parent.window.get()],
+            ),
+            _ => xcb.delete_property(id, xproto::AtomEnum::WM_TRANSIENT_FOR.into()),
+        };
+        let _ = xcb.flush();
+    }
+
     pub fn state(&self) -> WindowState {
         let state = self.shared.state.borrow();
         WindowState {

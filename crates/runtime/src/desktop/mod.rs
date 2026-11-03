@@ -1,3 +1,4 @@
+pub mod app;
 pub mod browser;
 pub mod devtools;
 pub(crate) mod mcp;
@@ -27,12 +28,14 @@ pub(crate) struct View {
     pub(crate) title: Option<String>,
     pub(crate) preload: Option<Rc<JsContext>>,
     pub(crate) renderer: Option<Rc<JsContext>>,
+    /// The page made the window fullscreen: whether it was fullscreen before, and whether it got there.
+    fullscreen: Option<[bool; 2]>,
 }
 
 pub struct Desktop {
     api: Rc<JavaScriptCore>,
     host: Rc<RefCell<Host>>,
-    pub(crate) main: JsContext,
+    pub(crate) main: Option<JsContext>,
     pub(crate) views: HashMap<u64, View>,
     devtools: HashMap<u64, devtools::DevTools>,
     files: BBTreeMap<String, String>,
@@ -47,8 +50,17 @@ pub struct Desktop {
 
 impl Desktop {
     pub fn from_bundle(bundle: crate::bundle::Bundle) -> Result<Self> {
-        let mut desktop =
-            Self::create(&bundle.files, bundle.scripts, bundle.packaged, bundle.root)?;
+        ensure!(
+            bundle.files.contains_key("app.js"),
+            "Start a Rust app with its Cargo executable"
+        );
+        let mut desktop = Self::create(
+            &bundle.files,
+            bundle.scripts,
+            bundle.packaged,
+            bundle.root,
+            false,
+        )?;
         desktop.pages = bundle.pages;
         Ok(desktop)
     }
@@ -99,7 +111,13 @@ impl Desktop {
     }
 
     pub fn new(files: &BBTreeMap<String, String>) -> Result<Self> {
-        Self::create(files, HashMap::new(), false, std::path::PathBuf::new())
+        Self::create(
+            files,
+            HashMap::new(),
+            false,
+            std::path::PathBuf::new(),
+            false,
+        )
     }
 
     fn create(
@@ -107,6 +125,7 @@ impl Desktop {
         scripts: HashMap<String, bytes::Bytes>,
         packaged: bool,
         root: std::path::PathBuf,
+        rust: bool,
     ) -> Result<Self> {
         let api = JavaScriptCore::load()?;
         let waker = Arc::new(OnceLock::<renderer::Waker>::new());
@@ -141,8 +160,16 @@ impl Desktop {
             ..Host::default()
         }));
         host.borrow_mut().browsers.application = name;
-        let main = JsContext::new(api.clone(), host.clone(), Role::Main)?;
-        main.load_bundle(files, "app.js")?;
+        let main = if rust {
+            let mut state = host.borrow_mut();
+            state.rust_handlers = Some(HashMap::new());
+            state.install(files)?;
+            None
+        } else {
+            let engine = JsContext::new(api.clone(), host.clone(), Role::Main)?;
+            engine.load_bundle(files, "app.js")?;
+            Some(engine)
+        };
         Ok(Self {
             pages: BBTreeMap::new(),
             api,
@@ -230,10 +257,17 @@ impl Desktop {
                         let height = limit(number("height", 600.), 1);
                         self.host.borrow_mut().viewports.insert(id, [width, height]);
                         let transparent = options["transparent"] == true;
+                        let vibrancy = options["vibrancy"]
+                            .as_i64()
+                            .filter(|_| cfg!(target_os = "macos"));
                         let background = options["backgroundColor"]
                             .as_str()
                             .and_then(crate::style::color)
-                            .unwrap_or(if transparent { (0, 0) } else { (0xffffff, 255) });
+                            .unwrap_or(if transparent || vibrancy.is_some() {
+                                (0, 0)
+                            } else {
+                                (0xffffff, 255)
+                            });
                         self.host.borrow_mut().backgrounds.insert(id, background);
                         let mut baseline = None;
                         let mut data = Weak::new();
@@ -255,6 +289,18 @@ impl Desktop {
                                 (Some(x), Some(y)) => point(px(x as f32), px(y as f32)),
                                 _ => cx.centered(outer).origin,
                             };
+                            let parent = options["parent"]
+                                .as_u64()
+                                .and_then(|parent| self.views.get(&parent)?.handle)
+                                .and_then(|parent| {
+                                    cx.update_window(parent, |window, _| {
+                                        window.raw_window_handle().ok()
+                                    })
+                                })
+                                .flatten();
+                            // WARNING: children and windows that can't take focus open hidden, so they show after those changes.
+                            let later = parent.is_some() || options["focusable"] == false;
+                            let show = options["show"] != false;
                             let window_options = WindowOptions {
                                 bounds: Bounds::new(origin, outer),
                                 outer_size: options["useContentSize"] != true,
@@ -263,7 +309,7 @@ impl Desktop {
                                 traffic_light_position,
                                 frameless: !frame,
                                 transparent,
-                                show: options["show"] != false,
+                                show: show && !later,
                                 resizable: options["resizable"] != false,
                                 minimizable: options["minimizable"] != false,
                                 movable: options["movable"] != false,
@@ -297,6 +343,28 @@ impl Desktop {
                                             (background.0 << 8) | background.1 as u32,
                                         )),
                                     ),
+                                    (
+                                        options["opacity"].is_number(),
+                                        WindowChange::Opacity(number("opacity", 1.)),
+                                    ),
+                                    (options["hasShadow"] == false, WindowChange::Shadow(false)),
+                                    (
+                                        options["focusable"] == false,
+                                        WindowChange::Focusable(false),
+                                    ),
+                                    (
+                                        vibrancy.is_some(),
+                                        WindowChange::Vibrancy(
+                                            vibrancy.map(|material| material as isize),
+                                            options["visualEffectState"].as_i64().unwrap_or(0)
+                                                as isize,
+                                        ),
+                                    ),
+                                    (
+                                        parent.is_some(),
+                                        WindowChange::Parent(parent, options["modal"] == true),
+                                    ),
+                                    (later && show, WindowChange::Show(true)),
                                 ] {
                                     if apply {
                                         window.change_window(change);
@@ -324,11 +392,12 @@ impl Desktop {
                                 title: None,
                                 preload: None,
                                 renderer: None,
+                                fullscreen: None,
                             },
                         );
                         if let Some(state) = baseline
-                            && let Err(error) = self
-                                .main
+                            && let Some(main) = &self.main
+                            && let Err(error) = main
                                 .eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
                         {
                             eprintln!("apps: {error}");
@@ -373,7 +442,7 @@ impl Desktop {
                                 let name = name.split(['?', '#']).next().unwrap();
                                 return match (self.pages.get(name), self.files.get(name)) {
                                     (Some(doc), _) => Ok(doc.clone()),
-                                    (_, Some(source)) => Ok(Document::parse(source)),
+                                    (_, Some(source)) => Ok(crate::bundle::page(source)),
                                     _ => Err(missing),
                                 };
                             }
@@ -397,16 +466,21 @@ impl Desktop {
                             Ok(loaded) => loaded,
                             Err((code, description)) => {
                                 let url = location.unwrap_or_else(|_| value.to_owned());
+                                if self.main.is_none() && !page {
+                                    bail!("Cannot load {value}: {description}");
+                                }
                                 if page {
                                     eprintln!(
                                         "apps: navigation: {description} ({code}) loading '{url}'"
                                     );
                                 }
                                 let event = serde_json::json!({"request":request,"url":url,"code":code,"description":description});
-                                if let Err(error) = self.main.eval(
-                                    &format!("__appsEvent('failed',{id},{event})"),
-                                    "apps:failed",
-                                ) {
+                                if let Some(main) = &self.main
+                                    && let Err(error) = main.eval(
+                                        &format!("__appsEvent('failed',{id},{event})"),
+                                        "apps:failed",
+                                    )
+                                {
                                     eprintln!("apps: {error}");
                                 }
                                 continue;
@@ -451,7 +525,8 @@ impl Desktop {
                                     .get("src")
                                     .and_then(|src| src.strip_prefix("apps:///"))
                                 else {
-                                    return Some((kind, Cow::Owned(doc.text(id))));
+                                    let text = doc.text(id);
+                                    return (!text.is_empty()).then_some((kind, Cow::Owned(text)));
                                 };
                                 let source = bundled
                                     .get(name)
@@ -480,6 +555,7 @@ impl Desktop {
                         view.preload = None;
                         view.renderer = None;
                         self.host.borrow_mut().bridge.remove(&id);
+                        self.host.borrow_mut().dropped.remove(&id);
                         let preload = (trusted
                             && scripts.iter().any(|(kind, _)| *kind == "preload"))
                         .then(|| {
@@ -520,20 +596,33 @@ impl Desktop {
                                 renderer.eval_page(source, url)
                             }
                         };
-                        for (source, url) in scripts
+                        // WARNING: a bundle runs one page script per `__appsNext` call, so the VM drains microtasks
+                        // between them like browsers do.
+                        const NEXT: &str = "this.__appsNext?.()";
+                        for (mut source, url) in scripts
                             .iter()
                             .filter(|(kind, _)| *kind == "module")
                             .map(|(_, script)| (&**script, "apps:page"))
                             .chain([("__appsLoaded()", "apps:loaded")])
                         {
-                            if let Err(error) = match cx.as_deref_mut() {
-                                Some(cx) => crate::render::scripted(cx, None, || page(source, url)),
-                                None => page(source, url),
-                            } {
-                                if cx.is_none() {
-                                    return Err(error);
+                            loop {
+                                let more = match match cx.as_deref_mut() {
+                                    Some(cx) => crate::render::scripted(cx, None, || page(source, url)),
+                                    None => page(source, url),
+                                } {
+                                    Ok(more) => more == "true",
+                                    Err(error) => {
+                                        if cx.is_none() {
+                                            return Err(error);
+                                        }
+                                        eprintln!("apps: page script: {error:#}");
+                                        true
+                                    }
+                                };
+                                if url != "apps:page" || source == NEXT && !more {
+                                    break;
                                 }
-                                eprintln!("apps: page script: {error:#}");
+                                source = NEXT;
                             }
                         }
                         if let Some(preload) = &preload {
@@ -558,12 +647,42 @@ impl Desktop {
                             cx.refresh_window(handle);
                         }
                         let event = serde_json::json!({"request":request,"url":location});
-                        if let Err(error) = self.main.eval(
-                            &format!("__appsEvent('loaded',{id},{event})"),
-                            "apps:loaded",
-                        ) {
+                        if let Some(main) = &self.main
+                            && let Err(error) = main.eval(
+                                &format!("__appsEvent('loaded',{id},{event})"),
+                                "apps:loaded",
+                            )
+                        {
                             eprintln!("apps: {error}");
                         }
+                    }
+                    "edit" => {
+                        if let Some(renderer) = self.views[&id].renderer.clone() {
+                            let command = args[2].as_str().unwrap_or_default();
+                            let text = args[3].as_str().unwrap_or_default();
+                            let app = cx.as_deref_mut().map(|cx| (cx, None));
+                            crate::render::edit(&renderer, app, command, text);
+                        }
+                    }
+                    "insertCSS" | "removeInsertedCSS" => {
+                        let mut host = self.host.borrow_mut();
+                        let host = &mut *host;
+                        let Some(page) = host.pages.get_mut(&id) else {
+                            continue;
+                        };
+                        let state = host.dom.entry(id).or_default();
+                        let key = args[2].as_str().unwrap_or_default();
+                        if action == "insertCSS" {
+                            let css = args[3].as_str().unwrap_or_default();
+                            let sheet = Rc::new(crate::style::Stylesheet::parse(css));
+                            state
+                                .inserted
+                                .push((key.to_owned(), sheet, args[4] == true));
+                        } else {
+                            state.inserted.retain(|(old, ..)| old != key);
+                        }
+                        state.computed = None;
+                        page.dirty = true;
                     }
                     "devtools" => {
                         if self.host.borrow().packaged {
@@ -575,7 +694,7 @@ impl Desktop {
                                 .insert(id, devtools::DevTools::new(&format!("Window {id}"))?);
                         }
                     }
-                    "close" => {
+                    "close" | "closing" if action == "close" || self.main.is_none() => {
                         self.devtools.remove(&id);
                         if let Some(view) = self.views.remove(&id) {
                             self.host.borrow_mut().browsers.close_window(id)?;
@@ -592,10 +711,17 @@ impl Desktop {
                             self.host.borrow_mut().backgrounds.remove(&id);
                             self.host.borrow_mut().dom.remove(&id);
                             self.host.borrow_mut().bridge.remove(&id);
+                            self.host.borrow_mut().dropped.remove(&id);
                             crate::web::storage::forget(id);
-                            if let Err(error) = self
-                                .main
-                                .eval(&format!("__appsEvent('closed',{id})"), "apps:closed")
+                            if self.main.is_none() && self.views.is_empty() {
+                                self.quit = true;
+                                if let Some(cx) = cx.as_deref_mut() {
+                                    cx.quit();
+                                }
+                            }
+                            if let Some(main) = &self.main
+                                && let Err(error) =
+                                    main.eval(&format!("__appsEvent('closed',{id})"), "apps:closed")
                             {
                                 eprintln!("apps: {error}");
                             }
@@ -610,7 +736,8 @@ impl Desktop {
                         {
                             let runtime = runtime.clone();
                             cx.update_window(handle, |window, _| {
-                                let scale = window.scale_factor();
+                                // Like Electron, the area is in window points, which the page zoom doesn't scale.
+                                let scale = window.scale_factor() / window.zoom();
                                 window.capture(move |frame, cx| {
                                     let data = match frame.and_then(|frame| png(frame, scale, &rect, false)) {
                                         Ok(([width, height], bytes)) => serde_json::json!({"id":request,"width":width,"height":height,"png":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}),
@@ -619,7 +746,7 @@ impl Desktop {
                                     // WARNING: the window is busy drawing here, so a capture requested by the reply must wait for the next drive.
                                     cx.defer(move |cx| {
                                         if let Ok(app) = runtime.try_borrow()
-                                            && let Err(error) = app.main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
+                                            && let Some(main) = &app.main && let Err(error) = main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
                                         {
                                             eprintln!("apps: {error}");
                                         }
@@ -646,7 +773,8 @@ impl Desktop {
                                 .map(|error| serde_json::json!({"error":error.to_string()}).to_string().into()),
                         };
                         if let Some(data) = result
-                            && let Err(error) = self.main.eval(
+                            && let Some(main) = &self.main
+                            && let Err(error) = main.eval(
                                 &format!(
                                     "__appsEvent('executed',{id},{})",
                                     serde_json::json!({"request":request,"data":data})
@@ -657,10 +785,37 @@ impl Desktop {
                             eprintln!("apps: {error}");
                         }
                     }
+                    "htmlFullscreen" => {
+                        let on = args[2] == true;
+                        let view = self.views.get_mut(&id).context("Window is closed")?;
+                        if on == view.fullscreen.is_some() {
+                            continue;
+                        }
+                        // Like Chrome, leaving keeps the window fullscreen when the page did not make it so.
+                        let before = view.fullscreen.take().map(|[before, _]| before);
+                        let mut was = false;
+                        if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
+                            cx.update_window(handle, |window, _| {
+                                was = window.is_fullscreen();
+                                if on && !was || before == Some(false) && was {
+                                    window.toggle_fullscreen();
+                                }
+                            });
+                        }
+                        view.fullscreen = on.then_some([was, was]);
+                        if let Some(main) = &self.main
+                            && let Err(error) = main.eval(
+                                &format!("__appsEvent('html-full-screen',{id},{on})"),
+                                "apps:fullscreen",
+                            )
+                        {
+                            eprintln!("apps: {error}");
+                        }
+                    }
                     "closing" => {
-                        if let Err(error) = self
-                            .main
-                            .eval(&format!("__appsEvent('close',{id})"), "apps:close")
+                        if let Some(main) = &self.main
+                            && let Err(error) =
+                                main.eval(&format!("__appsEvent('close',{id})"), "apps:close")
                         {
                             eprintln!("apps: {error}");
                         }
@@ -690,13 +845,25 @@ impl Desktop {
                     "show" | "title" | "bounds" | "center" | "minimize" | "maximize"
                     | "unmaximize" | "restore" | "fullscreen" | "focus" | "blur" | "hide"
                     | "showInactive" | "limits" | "resizable" | "minimizable" | "maximizable"
-                    | "closable" | "movable" | "alwaysOnTop" | "buttons" => {
+                    | "closable" | "movable" | "alwaysOnTop" | "buttons" | "zoom" | "opacity"
+                    | "shadow" | "ignoreMouse" | "workspaces" | "contentProtection"
+                    | "focusable" | "aspectRatio" | "parent" | "vibrancy" => {
                         if let (Some(handle), Some(cx)) =
                             (self.views[&id].handle, cx.as_deref_mut())
                         {
                             let number =
                                 |index: usize| px(args[index].as_f64().unwrap_or(0.) as f32);
                             let on = args[2] == true;
+                            let parent = args[2]
+                                .as_u64()
+                                .filter(|_| action == "parent")
+                                .and_then(|parent| self.views.get(&parent)?.handle)
+                                .and_then(|parent| {
+                                    cx.update_window(parent, |window, _| {
+                                        window.raw_window_handle().ok()
+                                    })
+                                })
+                                .flatten();
                             cx.update_window(handle, |window, _| {
                                 let change = match action {
                                     "title" => {
@@ -726,6 +893,10 @@ impl Desktop {
                                         return;
                                     }
                                     "minimize" => return window.minimize_window(),
+                                    "zoom" => {
+                                        return window
+                                            .set_zoom(args[2].as_f64().unwrap_or(1.) as f32);
+                                    }
                                     "maximize" | "unmaximize" => {
                                         if window.window_state().maximized != (action == "maximize")
                                         {
@@ -743,6 +914,23 @@ impl Desktop {
                                     "show" | "focus" | "restore" => {
                                         return window.activate_window();
                                     }
+                                    "opacity" => WindowChange::Opacity(number(2).0),
+                                    "shadow" => WindowChange::Shadow(on),
+                                    "ignoreMouse" => WindowChange::IgnoreMouse(on, args[3] == true),
+                                    "workspaces" => {
+                                        WindowChange::AllWorkspaces(on, args[3] == true)
+                                    }
+                                    "contentProtection" => WindowChange::ContentProtection(on),
+                                    "focusable" => WindowChange::Focusable(on),
+                                    "aspectRatio" => WindowChange::AspectRatio(
+                                        number(2).0,
+                                        size(number(3), number(4)),
+                                    ),
+                                    "parent" => WindowChange::Parent(parent, false),
+                                    "vibrancy" => WindowChange::Vibrancy(
+                                        args[2].as_i64().map(|material| material as isize),
+                                        args[3].as_i64().unwrap_or(0) as isize,
+                                    ),
                                     "center" => WindowChange::Center,
                                     "blur" => WindowChange::Blur,
                                     "hide" => WindowChange::Hide,
@@ -787,14 +975,14 @@ impl Desktop {
             }
             let text = title.as_deref().unwrap_or("");
             view.title = title.clone();
-            let allowed = self
-                .main
-                .eval(
+            let allowed = self.main.as_ref().is_none_or(|main| {
+                main.eval(
                     &format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
                     "apps:title",
                 )
                 .inspect_err(|error| eprintln!("apps: {error}"))
-                .is_ok_and(|allowed| allowed != "false");
+                .is_ok_and(|allowed| allowed != "false")
+            });
             if allowed && let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                 cx.update_window(handle, |window, _| window.set_window_title(text));
             }
@@ -806,6 +994,7 @@ impl Desktop {
         if runtime.try_borrow_mut().is_err() {
             return;
         }
+        crate::host::idle(false);
         let result = (|| -> Result<Option<u64>> {
             let mut app = runtime.borrow_mut();
             app.host.borrow_mut().sync_theme();
@@ -818,12 +1007,21 @@ impl Desktop {
                 let Some([width, height]) = app.host.borrow().viewports.get(&id).copied() else {
                     continue;
                 };
+                // The page viewport is zoomed, the content view is in window points.
+                let zoom = app
+                    .views
+                    .get(&id)
+                    .and_then(|view| view.handle)
+                    .and_then(|handle| cx.update_window(handle, |window, _| window.zoom()))
+                    .unwrap_or(1.);
                 let event = format!(
                     "__appsEvent('resize',{id},{{width:{},height:{}}})",
-                    width.round(),
-                    height.round()
+                    (width * zoom).round(),
+                    (height * zoom).round()
                 );
-                if let Err(error) = app.main.eval(&event, "apps:resize") {
+                if let Some(main) = &app.main
+                    && let Err(error) = main.eval(&event, "apps:resize")
+                {
                     eprintln!("apps: {error}");
                 }
                 if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
@@ -836,23 +1034,59 @@ impl Desktop {
             }
             let changed = std::mem::take(&mut app.host.borrow_mut().window_changes);
             for id in changed {
-                if let Some(handle) = app.views.get(&id).and_then(|view| view.handle)
-                    && let Some(state) = cx.update_window(handle, |window, _| window_state(window))
-                    && let Err(error) = app
-                        .main
-                        .eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
+                let Some(state) = app
+                    .views
+                    .get(&id)
+                    .and_then(|view| view.handle)
+                    .and_then(|handle| cx.update_window(handle, |window, _| window_state(window)))
+                else {
+                    continue;
+                };
+                if let Some(main) = &app.main
+                    && let Err(error) =
+                        main.eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
                 {
                     eprintln!("apps: {error}");
+                }
+                // A page's fullscreen ends when its window leaves fullscreen.
+                let Some(view) = app.views.get_mut(&id) else {
+                    continue;
+                };
+                match &mut view.fullscreen {
+                    Some([_, seen]) if state["fullscreen"] == true => *seen = true,
+                    Some([_, true]) => {
+                        view.fullscreen = None;
+                        if let Some(renderer) = &view.renderer
+                            && let Err(error) = crate::render::scripted(cx, None, || {
+                                renderer
+                                    .eval("__appsDispatch('fullscreen:exit',[])", "apps:fullscreen")
+                            })
+                        {
+                            eprintln!("apps: {error}");
+                        }
+                        if let Some(main) = &app.main
+                            && let Err(error) = main.eval(
+                                &format!("__appsEvent('html-full-screen',{id},false)"),
+                                "apps:fullscreen",
+                            )
+                        {
+                            eprintln!("apps: {error}");
+                        }
+                    }
+                    _ => {}
                 }
             }
             let mut delay = i64::MAX;
             for (fatal, engine) in
-                std::iter::once((true, &app.main)).chain(app.views.values().flat_map(|v| {
-                    v.preload
-                        .iter()
-                        .chain(v.renderer.iter())
-                        .map(|engine| (false, engine.as_ref()))
-                }))
+                app.main
+                    .iter()
+                    .map(|main| (true, main))
+                    .chain(app.views.values().flat_map(|v| {
+                        v.preload
+                            .iter()
+                            .chain(v.renderer.iter())
+                            .map(|engine| (false, engine.as_ref()))
+                    }))
             {
                 let next = match crate::render::scripted(cx, None, || engine.tick()) {
                     Ok(next) => next,
@@ -870,7 +1104,7 @@ impl Desktop {
             let start = Instant::now();
             while start.elapsed() < Duration::from_millis(4) {
                 let mut busy = false;
-                for engine in std::iter::once(&app.main).chain(
+                for engine in app.main.iter().chain(
                     app.views
                         .values()
                         .filter_map(|view| view.preload.as_deref()),
@@ -900,11 +1134,14 @@ impl Desktop {
                 }
             }
             for (&id, tools) in &app.devtools {
-                let engine = app
+                let Some(engine) = app
                     .views
                     .get(&id)
                     .and_then(|view| view.renderer.as_deref())
-                    .unwrap_or(&app.main);
+                    .or(app.main.as_ref())
+                else {
+                    continue;
+                };
                 for command in tools.commands() {
                     let request = command["id"].as_u64().unwrap_or(0);
                     match devtools::dispatch(&command, engine, &app.host, id) {
@@ -974,7 +1211,7 @@ impl Desktop {
             drop(host);
             app.titles(Some(cx))?;
             // WARNING: IPC, microtasks and the scripts above can add timers after an engine's tick, so read all delays again.
-            for engine in std::iter::once(&app.main).chain(
+            for engine in app.main.iter().chain(
                 app.views
                     .values()
                     .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref)),
@@ -1055,6 +1292,7 @@ impl Desktop {
                 cx.quit();
             }
         }
+        crate::host::idle(true);
     }
 
     /// Quits with a failure code, because AppKit exits with 0 after its quit hook.
@@ -1067,11 +1305,13 @@ impl Desktop {
     }
 
     pub fn check(mut self) -> Result<i32> {
-        self.main.eval("__appsEvent('ready')", "apps:ready")?;
+        if let Some(main) = &self.main {
+            main.eval("__appsEvent('ready')", "apps:ready")?;
+        }
         self.pump(None, None)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            for engine in std::iter::once(&self.main).chain(self.views.values().flat_map(|view| {
+            for engine in self.main.iter().chain(self.views.values().flat_map(|view| {
                 view.preload
                     .iter()
                     .chain(view.renderer.iter())
@@ -1081,7 +1321,7 @@ impl Desktop {
             }
             self.pump(None, None)?;
             let mut pending = false;
-            for engine in std::iter::once(&self.main).chain(self.views.values().flat_map(|view| {
+            for engine in self.main.iter().chain(self.views.values().flat_map(|view| {
                 view.preload
                     .iter()
                     .chain(view.renderer.iter())
@@ -1126,10 +1366,12 @@ impl Desktop {
         renderer::run(move |cx| {
             let reopen = runtime.clone();
             cx.on_reopen(move |cx, visible| {
-                if let Err(error) = reopen.borrow().main.eval(
-                    &format!("__appsEvent('activate',0,{visible})"),
-                    "apps:activate",
-                ) {
+                if let Some(main) = &reopen.borrow().main
+                    && let Err(error) = main.eval(
+                        &format!("__appsEvent('activate',0,{visible})"),
+                        "apps:activate",
+                    )
+                {
                     eprintln!("apps: {error}");
                 }
                 Self::drive(reopen.clone(), cx);
@@ -1139,10 +1381,12 @@ impl Desktop {
                 let Ok(app) = terminate.try_borrow() else {
                     return true;
                 };
-                if app.quit {
+                if app.quit || app.main.is_none() {
                     return true;
                 }
-                if let Err(error) = app.main.eval("__appsEvent('before-quit')", "apps:quit") {
+                if let Some(main) = &app.main
+                    && let Err(error) = main.eval("__appsEvent('before-quit')", "apps:quit")
+                {
                     eprintln!("apps: {error}");
                     return true;
                 }
@@ -1166,7 +1410,9 @@ impl Desktop {
                         }
                         None => format!("__appsEvent('open-url',0,{})", serde_json::json!(url)),
                     };
-                    if let Err(error) = runtime.borrow().main.eval(&event, "apps:open") {
+                    if let Some(main) = &runtime.borrow().main
+                        && let Err(error) = main.eval(&event, "apps:open")
+                    {
                         eprintln!("apps: {error}");
                     }
                 }
@@ -1207,10 +1453,8 @@ impl Desktop {
             let _ = runtime.borrow().waker.set(cx.waker());
             #[cfg(target_os = "macos")]
             native::observe();
-            if let Err(error) = runtime
-                .borrow()
-                .main
-                .eval("__appsEvent('ready')", "apps:ready")
+            if let Some(main) = &runtime.borrow().main
+                && let Err(error) = main.eval("__appsEvent('ready')", "apps:ready")
             {
                 eprintln!("apps: {error}");
                 runtime.borrow_mut().fail();
@@ -1224,7 +1468,8 @@ impl Desktop {
                 let menu = runtime.clone();
                 let init = move || {
                     if let Ok(app) = menu.try_borrow()
-                        && let Err(error) = app.main.eval("__appsInitMenu()", "apps:menu")
+                        && let Some(main) = &app.main
+                        && let Err(error) = main.eval("__appsInitMenu()", "apps:menu")
                     {
                         eprintln!("apps: {error}");
                     }
@@ -1307,8 +1552,14 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
                     "x" | "y" => position(value),
                     "useContentSize" | "center" | "resizable" | "movable" | "minimizable"
                     | "maximizable" | "closable" | "alwaysOnTop" | "fullscreen" | "show"
-                    | "frame" | "transparent" => value.is_boolean(),
-                    "title" => value.is_string(),
+                    | "frame" | "transparent" | "hasShadow" | "focusable" | "modal"
+                    | "skipTaskbar" => value.is_boolean(),
+                    "title" | "icon" => value.is_string(),
+                    "opacity" => number(value, 0., 1.),
+                    "parent" => value.is_u64(),
+                    // `bootstrap.js` maps the names to NSVisualEffectMaterial and NSVisualEffectState values.
+                    "vibrancy" => number(value, 0., 22.),
+                    "visualEffectState" => number(value, 0., 2.),
                     "titleBarStyle" => {
                         matches!(value.as_str(), Some("default" | "hidden" | "hiddenInset"))
                     }
@@ -1328,7 +1579,28 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             "Window size limits must be between 0 and 16384"
         ),
         "fullscreen" | "resizable" | "minimizable" | "maximizable" | "closable" | "movable"
-        | "alwaysOnTop" => ensure!(args[2].is_boolean(), "Expected a boolean"),
+        | "alwaysOnTop" | "shadow" | "contentProtection" | "focusable" => {
+            ensure!(args[2].is_boolean(), "Expected a boolean")
+        }
+        "ignoreMouse" | "workspaces" => ensure!(
+            args[2].is_boolean() && args[3].is_boolean(),
+            "Expected booleans"
+        ),
+        "opacity" => ensure!(number(&args[2], 0., 1.), "Opacity must be between 0 and 1"),
+        "aspectRatio" => ensure!(
+            number(&args[2], 0., 1e6)
+                && number(&args[3], 0., 16384.)
+                && number(&args[4], 0., 16384.),
+            "Invalid aspect ratio"
+        ),
+        "parent" => ensure!(
+            args[2].is_null() || args[2].as_u64().is_some_and(|parent| parent != args[1]),
+            "Invalid parent window"
+        ),
+        "vibrancy" => ensure!(
+            (args[2].is_null() || number(&args[2], 0., 22.)) && number(&args[3], 0., 2.),
+            "Invalid vibrancy"
+        ),
         "background" => ensure!(
             args[2].as_str().and_then(crate::style::color).is_some(),
             "Invalid background color"
@@ -1342,6 +1614,34 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             "Invalid script request"
         ),
         "capture" => ensure!(args[2].is_u64(), "Invalid capture request"),
+        "zoom" => ensure!(
+            number(&args[2], 0.25, 5.),
+            "Zoom must be between 0.25 and 5"
+        ),
+        "insertCSS" => ensure!(
+            args[2].is_string() && args[3].is_string() && args[4].is_boolean(),
+            "Invalid CSS"
+        ),
+        "removeInsertedCSS" => ensure!(args[2].is_string(), "Invalid CSS key"),
+        "edit" => ensure!(
+            matches!(
+                args[2].as_str(),
+                Some(
+                    "undo"
+                        | "redo"
+                        | "cut"
+                        | "copy"
+                        | "paste"
+                        | "pasteAndMatchStyle"
+                        | "delete"
+                        | "selectAll"
+                        | "unselect"
+                        | "replace"
+                        | "insertText"
+                )
+            ) && (args[3].is_null() || args[3].is_string()),
+            "Invalid edit command"
+        ),
         "executed" => bail!("Unsupported window action: executed"),
         _ => {}
     }
@@ -1417,6 +1717,12 @@ fn png(
 mod tests {
     use super::*;
 
+    impl Desktop {
+        fn js(&self) -> &JsContext {
+            self.main.as_ref().unwrap()
+        }
+    }
+
     fn app(code: &str, extra: &[(&str, &str)], root: std::path::PathBuf) -> Desktop {
         let mut files = BBTreeMap::from([(
             "app.js".into(),
@@ -1428,8 +1734,8 @@ mod tests {
         for (name, source) in extra {
             files.insert((*name).into(), (*source).into());
         }
-        let mut desktop = Desktop::create(&files, HashMap::new(), false, root).unwrap();
-        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        let mut desktop = Desktop::create(&files, HashMap::new(), false, root, false).unwrap();
+        desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         desktop
     }
@@ -1451,20 +1757,20 @@ mod tests {
         let mut desktop = app(&code, &[("bundled.html", page)], root.clone());
         let step = |desktop: &mut Desktop, script: &str, preload: bool, pwned: &str| {
             if !script.is_empty() {
-                desktop.main.eval(script, "test").unwrap();
+                desktop.js().eval(script, "test").unwrap();
                 desktop.pump(None, None).unwrap();
             }
-            desktop.main.tick().unwrap();
+            desktop.js().tick().unwrap();
             assert_eq!(desktop.views[&1].preload.is_some(), preload, "{script}");
             assert_eq!(
-                desktop.main.eval("pwned", "test").unwrap(),
+                desktop.js().eval("pwned", "test").unwrap(),
                 pwned,
                 "{script}"
             );
         };
         step(&mut desktop, "", false, "0");
         desktop
-            .main
+            .js()
             .eval("win.webContents.send('unused',42)", "test")
             .unwrap();
         let url = url::Url::from_file_path(root.join("page.html")).unwrap();
@@ -1519,7 +1825,7 @@ mod tests {
             });
         "#;
         let mut desktop = app(code, &[], std::path::PathBuf::from("/app"));
-        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
         assert!(!desktop.quit && desktop.views.contains_key(&1));
         assert_eq!(
             eval(&desktop, "log.join('|')"),
@@ -1543,10 +1849,7 @@ mod tests {
             "globalThis.results = []; for (const code of ['document.title', 'new Promise(r => setTimeout(() => r({list: [1, 2]}), 0))', 'throw new TypeError(\"inner\")', 'undefined']) win.webContents.executeJavaScript(code).then(v => results.push(JSON.stringify(v) ?? 'undefined'), e => results.push('error:' + e.message))",
         );
         desktop.pump(None, None).unwrap();
-        for engine in [
-            &desktop.main,
-            desktop.views[&1].renderer.as_deref().unwrap(),
-        ] {
+        for engine in [desktop.js(), desktop.views[&1].renderer.as_deref().unwrap()] {
             engine.tick().unwrap();
         }
         desktop.pump(None, None).unwrap();
@@ -1602,17 +1905,17 @@ mod tests {
         "#;
         let desktop = app(code, &[], std::path::PathBuf::new());
         assert_eq!(
-            desktop.main.eval("ids", "test").unwrap(),
+            desktop.js().eval("ids", "test").unwrap(),
             "1,1,2,true,2,true"
         );
         assert_eq!(
-            desktop.main.eval("log.join('|')", "test").unwrap(),
+            desktop.js().eval("log.join('|')", "test").unwrap(),
             "destroyed|closed|true|true|1|Object has been destroyed|Object has been destroyed|Object has been destroyed|Object has been destroyed"
         );
         assert!(!desktop.views.contains_key(&1) && desktop.views.contains_key(&2));
-        desktop.main.eval("other.destroy()", "test").unwrap();
+        desktop.js().eval("other.destroy()", "test").unwrap();
         assert_eq!(
-            desktop.main.eval("log.at(-1)", "test").unwrap(),
+            desktop.js().eval("log.at(-1)", "test").unwrap(),
             "all-closed"
         );
     }
@@ -1630,7 +1933,7 @@ mod tests {
             ),
         )]);
         let mut desktop = Desktop::new(&files).unwrap();
-        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         let navigate = |desktop: &Desktop, url: &str| {
             desktop.host.borrow_mut().call(
@@ -1687,16 +1990,15 @@ mod tests {
             ),
         )]);
         let mut desktop = Desktop::new(&files).unwrap();
-        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         assert_eq!(
-            desktop
-                .main
+            desktop.js()
                 .eval("rejected+':'+__apps.BrowserWindow.getAllWindows().length+':'+win.isDestroyed()", "test")
                 .unwrap(),
             "Unsupported BrowserWindow option: webPreferences:0:true"
         );
-        assert!(desktop.main.eval("win.show()", "test").is_err());
+        assert!(desktop.js().eval("win.show()", "test").is_err());
         desktop
             .host
             .borrow_mut()
@@ -1721,7 +2023,7 @@ mod tests {
             });
         "#;
         let mut desktop = app(code, &[], std::path::PathBuf::new());
-        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
         eval(
             &desktop,
             "globalThis.results = []; for (const contents of [a.webContents, a.webContents]) contents.executeJavaScript('new Promise(() => {})').then(value => results.push(value)); a.webContents.capturePage().then(value => results.push(typeof value), error => results.push(error.message))",
@@ -1738,7 +2040,7 @@ mod tests {
             .eval("__appsExecuted(2, 'own', false)", "test")
             .unwrap();
         desktop.pump(None, None).unwrap();
-        desktop.main.tick().unwrap();
+        desktop.js().tick().unwrap();
         assert_eq!(eval(&desktop, "results.join()"), "own");
         assert_eq!(eval(&desktop, "a.getTitle()"), "a\u{fffd}");
         eval(&desktop, "a.close(); b.close()");
@@ -1769,22 +2071,22 @@ mod tests {
             ),
         )]);
         let mut desktop = Desktop::new(&files).unwrap();
-        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
-        desktop.main.eval("__appsEvent('state',1,{frame:[0,0,800,600],content:[0,28,800,572],minimized:false,maximized:false,fullscreen:false,visible:true,focused:true,resizing:false});__appsEvent('activate',0,true);__appsEvent('open-url',0,'myapp://x');__appsEvent('open-file',0,'/tmp/a');__appsEvent('before-quit')", "test").unwrap();
+        desktop.js().eval("__appsEvent('ready')", "test").unwrap();
+        desktop.js().eval("__appsEvent('state',1,{frame:[0,0,800,600],content:[0,28,800,572],minimized:false,maximized:false,fullscreen:false,visible:true,focused:true,resizing:false});__appsEvent('activate',0,true);__appsEvent('open-url',0,'myapp://x');__appsEvent('open-file',0,'/tmp/a');__appsEvent('before-quit')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         assert!(!desktop.quit);
         desktop
-            .main
+            .js()
             .eval("__appsEvent('before-quit')", "test")
             .unwrap();
         desktop.pump(None, None).unwrap();
         assert!(desktop.quit);
         assert_eq!(
-            desktop.main.eval("state", "test").unwrap(),
+            desktop.js().eval("state", "test").unwrap(),
             "true,true,on,App"
         );
         assert_eq!(
-            desktop.main.eval("log.join()", "test").unwrap(),
+            desktop.js().eval("log.join()", "test").unwrap(),
             "will-finish-launching,ready,web-contents-created,browser-window-created,browser-window-focus,activate:true,open-url:myapp://x,open-file:/tmp/a,before-quit,before-quit,will-quit,quit:0"
         );
         for (listener, quits) in [
@@ -1802,7 +2104,7 @@ mod tests {
                 ),
             )]);
             let mut desktop = Desktop::new(&files).unwrap();
-            desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+            desktop.js().eval("__appsEvent('ready')", "test").unwrap();
             desktop.pump(None, None).unwrap();
             assert_eq!(desktop.quit, quits);
         }
@@ -1831,9 +2133,9 @@ mod tests {
             ),
         )]);
         let mut desktop = Desktop::new(&files).unwrap();
-        desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+        desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
-        let eval = |desktop: &Desktop, script: &str| desktop.main.eval(script, "test").unwrap();
+        let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
         assert_eq!(
             eval(
                 &desktop,
@@ -1929,6 +2231,121 @@ mod tests {
     }
 
     #[test]
+    fn window_extras_follow_electron() {
+        let code = r#"
+            const {app, BrowserWindow} = __apps;
+            app.on('window-all-closed', () => {});
+            app.whenReady().then(() => {
+                globalThis.parent = new BrowserWindow({width: 400, height: 300, opacity: 3, vibrancy: 'sidebar', hasShadow: false, focusable: false, skipTaskbar: true, icon: 'icon.png'});
+                globalThis.child = new BrowserWindow({parent, show: false});
+                globalThis.sheet = new BrowserWindow({parent, modal: true});
+            });
+        "#;
+        let mut desktop = app(code, &[], std::path::PathBuf::new());
+        let eval = |desktop: &Desktop, script: &str| desktop.js().eval(script, "test").unwrap();
+        let thrown = |desktop: &Desktop, script: &str| {
+            eval(
+                desktop,
+                &format!(
+                    "(() => {{ try {{ {script}; return 'ok' }} catch (error) {{ return error.message }} }})()"
+                ),
+            )
+        };
+        assert_eq!(
+            eval(
+                &desktop,
+                "JSON.stringify([parent.getOpacity(), parent.hasShadow(), parent.isFocusable(), parent.getChildWindows().map(win => win.id), child.getParentWindow() === parent, sheet.isModal(), child.isModal(), parent.getParentWindow(), parent.setIcon])"
+            ),
+            "[1,false,false,[2,3],true,true,false,null,null]"
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(desktop.host.borrow().backgrounds[&1], (0, 0));
+        }
+        for (script, error) in [
+            (
+                "sheet.setParentWindow(null)",
+                "Can not be called for modal window",
+            ),
+            (
+                "parent.setParentWindow(child)",
+                "A window cannot be its own ancestor",
+            ),
+            (
+                "child.setParentWindow({})",
+                "Expected a BrowserWindow or null",
+            ),
+            ("child.setOpacity(NaN)", "Expected a number for opacity"),
+            ("child.setMenu({})", "Invalid Menu"),
+            (
+                "new __apps.BrowserWindow({vibrancy: 'nope'})",
+                "Invalid vibrancy type: nope",
+            ),
+            (
+                "new __apps.BrowserWindow({visualEffectState: 'x'})",
+                "Invalid visualEffectState: x",
+            ),
+            (
+                "new __apps.BrowserWindow({opacity: '1'})",
+                "Invalid BrowserWindow option opacity: \"1\"",
+            ),
+            (
+                "new __apps.BrowserWindow({parent: {}})",
+                "Expected a BrowserWindow for parent",
+            ),
+        ] {
+            assert_eq!(thrown(&desktop, script), error, "{script}");
+        }
+        let state = |frame: [i32; 4], extra: &str| {
+            let [x, y, width, height] = frame;
+            format!(
+                "__appsEvent('state',1,{{frame:[{x},{y},{width},{height}],content:[{x},{y},{width},{height}],minimized:false,maximized:false,fullscreen:false,visible:true,focused:true,resizing:false,{extra}}})"
+            )
+        };
+        eval(&desktop, &state([10, 20, 400, 300], ""));
+        eval(&desktop, &state([0, 0, 900, 700], "maximized:true"));
+        assert_eq!(
+            eval(
+                &desktop,
+                "JSON.stringify([parent.getNormalBounds(), parent.getBounds()])"
+            ),
+            r#"[{"x":10,"y":20,"width":400,"height":300},{"x":0,"y":0,"width":900,"height":700}]"#
+        );
+        eval(&desktop, &state([0, 0, 900, 700], ""));
+        desktop.host.borrow_mut().commands.clear();
+        eval(
+            &desktop,
+            "parent.setOpacity(0.5); parent.setAspectRatio(-1, {width: 5}); parent.setVibrancy(''); parent.setSkipTaskbar(true); parent.removeMenu(); parent.close()",
+        );
+        let commands: Vec<_> = desktop
+            .host
+            .borrow()
+            .commands
+            .iter()
+            .map(|command| command["args"].clone())
+            .collect();
+        assert_eq!(
+            serde_json::Value::from(commands),
+            serde_json::json!([
+                ["opacity", 1, 0.5],
+                ["aspectRatio", 1, 0, 5, 0],
+                ["vibrancy", 1, null, 0],
+                ["background", 1, "#fff"],
+                ["parent", 2, null],
+                ["parent", 3, null],
+                ["close", 1]
+            ])
+        );
+        desktop.pump(None, None).unwrap();
+        assert_eq!(
+            eval(
+                &desktop,
+                "JSON.stringify([parent.isDestroyed(), child.isDestroyed(), child.getParentWindow()])"
+            ),
+            "[true,false,null]"
+        );
+    }
+
+    #[test]
     fn window_titles_follow_the_document() {
         for (html, title) in [
             ("<h1>Page</h1>", None),
@@ -1953,7 +2370,7 @@ mod tests {
                 ),
             )]);
             let mut desktop = Desktop::new(&files).unwrap();
-            desktop.main.eval("__appsEvent('ready')", "test").unwrap();
+            desktop.js().eval("__appsEvent('ready')", "test").unwrap();
             desktop.pump(None, None).unwrap();
             assert_eq!(desktop.views[&1].title.as_deref(), title);
             let renderer = desktop.views[&1].renderer.clone().unwrap();
@@ -2007,5 +2424,130 @@ mod tests {
                 "rgb(128, 0, 128)"
             );
         }
+    }
+
+    #[test]
+    fn web_contents_zoom_css_and_edit_commands() {
+        let page = "<style>p{color:red;margin:1px}</style><p id=p>x</p><input id=i value=hello><div id=e contenteditable>ab</div>";
+        let code = format!(
+            "__apps.app.whenReady().then(()=>{{globalThis.win=new __apps.BrowserWindow();win.load({})}})",
+            serde_json::json!(page)
+        );
+        let mut desktop = app(&code, &[], std::path::PathBuf::new());
+        let main = |desktop: &mut Desktop, script: &str| {
+            let value = desktop.js().eval(script, "test").unwrap();
+            desktop.js().tick().unwrap();
+            desktop.pump(None, None).unwrap();
+            value
+        };
+        let page = |desktop: &Desktop, script: &str| {
+            let renderer = desktop.views[&1].renderer.as_ref().unwrap();
+            renderer.eval(script, "test").unwrap()
+        };
+        assert_eq!(
+            main(
+                &mut desktop,
+                "win.webContents.zoomLevel=1;[win.webContents.getZoomFactor(),win.webContents.zoomLevel,(win.webContents.setZoomFactor(1.5),win.webContents.zoomFactor),win.webContents.getZoomLevel().toFixed(3)].join()"
+            ),
+            "1.2,1,1.5,2.224"
+        );
+        assert!(
+            main(
+                &mut desktop,
+                "try{win.webContents.setZoomFactor(0)}catch(e){e.message}"
+            )
+            .contains("greater than 0")
+        );
+        let style = "(s=>[s.color,s.marginTop,s.paddingTop].join())(getComputedStyle(document.getElementById('p')))";
+        main(
+            &mut desktop,
+            "win.webContents.insertCSS('p{color:blue!important;margin:2px}',{cssOrigin:'user'}).then(key=>globalThis.user=key);win.webContents.insertCSS('p{padding:3px}')",
+        );
+        assert_eq!(page(&desktop, style), "rgb(0, 0, 255),1px,3px");
+        main(&mut desktop, "win.webContents.removeInsertedCSS(user)");
+        assert_eq!(page(&desktop, style), "rgb(255, 0, 0),1px,3px");
+        main(&mut desktop, "win.reload()");
+        assert_eq!(page(&desktop, style), "rgb(255, 0, 0),1px,0px");
+        let field =
+            "(i=>[i.value,i.selectionStart,i.selectionEnd].join())(document.getElementById('i'))";
+        page(
+            &desktop,
+            "document.getElementById('i').focus();document.getElementById('i').setSelectionRange(5,5)",
+        );
+        main(
+            &mut desktop,
+            "const contents=win.webContents;contents.insertText(' world');contents.selectAll();contents.replace('hi');contents.undo();contents.undo();contents.redo();contents.delete()",
+        );
+        assert_eq!(page(&desktop, field), "hello worl,10,10");
+        main(&mut desktop, "contents.selectAll();contents.unselect()");
+        assert_eq!(page(&desktop, field), "hello worl,10,10");
+        assert_eq!(
+            page(
+                &desktop,
+                "(i=>[document.queryCommandSupported('insertText'),document.queryCommandSupported('bold'),document.execCommand('insertText',false,'!'),i.value,document.execCommand('undo'),i.value,document.execCommand('redo'),i.value,document.queryCommandEnabled('copy'),document.execCommand('copy'),document.execCommand('delete'),i.value].join())(document.getElementById('i'))"
+            ),
+            "true,false,true,hello worl!,true,hello worl,true,hello worl!,false,false,true,hello worl"
+        );
+        assert_eq!(
+            page(
+                &desktop,
+                "(e=>{e.focus();getSelection().collapse(e.firstChild,2);document.execCommand('insertText',false,'c');const typed=e.textContent;document.execCommand('undo');return typed+','+e.textContent})(document.getElementById('e'))"
+            ),
+            "abc,ab"
+        );
+    }
+
+    #[test]
+    fn window_open_asks_the_open_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.html"), "<title>child</title>").unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<a id=a href='child.html' target='_blank'>x</a>",
+        )
+        .unwrap();
+        let code = r#"
+            globalThis.log = [];
+            __apps.app.whenReady().then(() => {
+                globalThis.win = new __apps.BrowserWindow();
+                win.webContents.on('did-create-window', (child, details) => log.push('created:' + child.id + ':' + details.disposition + ':' + details.options.width));
+                win.loadFile('index.html');
+            });
+        "#;
+        let mut desktop = app(code, &[], dir.path().to_path_buf());
+        let page = |desktop: &mut Desktop, script: &str| {
+            let renderer = desktop.views[&1].renderer.clone().unwrap();
+            let value = renderer.eval(script, "test").unwrap();
+            desktop.pump(None, None).unwrap();
+            value
+        };
+        assert_eq!(
+            page(
+                &mut desktop,
+                "globalThis.child=open('child.html','','width=300,height=200');[open('https://example.com/'),child===null,child.closed].join()"
+            ),
+            ",false,false"
+        );
+        assert!(desktop.views[&2].renderer.is_some());
+        desktop
+            .js()
+            .eval(
+                "win.webContents.setWindowOpenHandler(details => { log.push([details.url.endsWith('/child.html'), details.frameName, details.features, details.disposition, details.referrer.url.endsWith('/index.html')].join()); return details.frameName === 'deny' ? { action: 'deny' } : { action: 'allow', overrideBrowserWindowOptions: { width: 320 } }; })",
+                "test",
+            )
+            .unwrap();
+        assert_eq!(
+            page(
+                &mut desktop,
+                "[open('child.html','deny'),document.getElementById('a').click(),child.close()].join()"
+            ),
+            ",,"
+        );
+        assert!(desktop.views.contains_key(&3) && !desktop.views.contains_key(&2));
+        assert_eq!(page(&mut desktop, "child.closed"), "true");
+        assert_eq!(
+            desktop.js().eval("log.join('|')", "test").unwrap(),
+            "created:2:new-window:300|true,deny,,foreground-tab,true|true,_blank,,foreground-tab,true|created:3:foreground-tab:320"
+        );
     }
 }

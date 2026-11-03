@@ -291,6 +291,7 @@ pub(super) fn css_background(
         else {
             continue;
         };
+        let strip = super::effects::gradient_axis(&kind, &body);
         let view = view.clone();
         layers.push(
             renderer::canvas(
@@ -301,32 +302,81 @@ pub(super) fn css_background(
                     if width <= 0. || height <= 0. {
                         return;
                     }
-                    let Some(source) = super::effects::gradient_svg(
-                        &kind, &body, &size, &position, &repeat, units, width, height,
-                    ) else {
-                        return;
+                    // A layer that fills the box with a gradient along one axis is drawn as a strip three pixels
+                    // across. The GPU stretches the middle pixel over the box.
+                    // WARNING: the outer pixels stay outside the box, so filtering never reads other atlas tiles.
+                    let scale = window.scale_factor();
+                    let axis = strip.filter(|_| {
+                        matches!(size.as_str(), "" | "auto" | "auto auto")
+                            && style::components(&position, ' ').iter().all(|token| {
+                                token.ends_with('%')
+                                    || matches!(
+                                        *token,
+                                        "left" | "right" | "top" | "bottom" | "center"
+                                    )
+                            })
+                    });
+                    let (width, height) = match axis {
+                        Some(1) => (3., height),
+                        Some(_) => (width, 3.),
+                        None => (width, height),
                     };
+                    let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
+                    let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
+                    let [rw, rh] = match axis {
+                        Some(1) => [3, rh],
+                        Some(_) => [rw, 3],
+                        None => [rw, rh],
+                    };
+                    // WARNING: building the gradient's SVG costs more than drawing the box, so the bitmap is
+                    // kept by its exact inputs: the strings, then the box size and units as hex bits.
+                    let mut inputs = String::with_capacity(
+                        kind.len() + body.len() + size.len() + position.len() + repeat.len() + 168,
+                    );
+                    for part in [&kind, &body, &size, &position, &repeat] {
+                        inputs.push_str(part);
+                        inputs.push('\0');
+                    }
+                    super::effects::push_bits(&mut inputs, [width, height], &units);
                     let view = &*view;
                     let mut host = view.host.borrow_mut();
                     let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
-                    let scale = window.scale_factor();
-                    let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
-                    let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
                     let key = (id, slot * 64 + index);
                     if backgrounds.get(&key).is_none_or(|(old, image)| {
-                        old != &source
+                        old != &inputs
                             || u32::from(image.size().width) != rw
                             || u32::from(image.size().height) != rh
-                    }) && let Ok(image) = super::canvas::svg(&source, rw, rh, None)
-                        && let Some((_, old)) = backgrounds.insert(key, (source, image))
-                        && Arc::strong_count(&old) == 1
-                    {
-                        window.drop_image(old);
+                    }) {
+                        let image = super::effects::gradient_svg(
+                            &kind, &body, &size, &position, &repeat, units, width, height,
+                        )
+                        .and_then(|source| super::canvas::svg(&source, rw, rh, None).ok());
+                        let old = match image {
+                            Some(image) => backgrounds.insert(key, (inputs, image)),
+                            None => backgrounds.remove(&key),
+                        };
+                        if let Some((_, old)) = old
+                            && Arc::strong_count(&old) == 1
+                        {
+                            window.drop_image(old);
+                        }
                     }
                     if let Some((_, image)) = backgrounds.get(&key) {
+                        let (origin, size) = (bounds.origin, bounds.size);
+                        let target = match axis {
+                            Some(1) => renderer::Bounds::new(
+                                renderer::point(origin.x - size.width, origin.y),
+                                renderer::size(size.width * 3., size.height),
+                            ),
+                            Some(_) => renderer::Bounds::new(
+                                renderer::point(origin.x, origin.y - size.height),
+                                renderer::size(size.width, size.height * 3.),
+                            ),
+                            None => bounds,
+                        };
                         window.paint_image(
                             bounds,
-                            bounds,
+                            target,
                             radius.resolve(bounds.size),
                             image.clone(),
                             false,
