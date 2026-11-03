@@ -21,7 +21,7 @@ use std::{
 
 const SHADERS: &str = include_str!("shaders.wgsl");
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
-/// Grayscale text with a gamma of 1.8, as GPUI draws it on Linux.
+/// Grayscale text with a gamma of 1.8.
 const TEXT: TextParams = TextParams {
     gamma_ratios: [
         0.1469 * 65536. / 65025.,

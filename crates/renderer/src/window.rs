@@ -2,7 +2,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Backdrop, BorderStyle, Bounds, BoxShadow, ContentMask,
     CursorStyle, DevicePixels, Edges, ElementId, LayoutId, Modifiers, MouseEvent, PaintEffect,
     Pixels, PlatformInput, Point, Radii, RenderImage, Rgba, ScaledPixels, Size, Style, TextStyle,
-    TextStyleRefinement, Utf16Selection, WindowControlArea,
+    TextStyleRefinement, Utf16Selection,
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
     input::{DEFAULT_LINE_HEIGHT, DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
@@ -157,7 +157,6 @@ pub struct WindowState {
     pub fullscreen: bool,
     /// Shown. A minimized window is not.
     pub visible: bool,
-    /// The user is resizing the window.
     pub resizing: bool,
 }
 
@@ -223,8 +222,6 @@ pub enum HitboxBehavior {
     /// Doesn't change how other hitboxes are hit.
     #[default]
     Normal,
-    /// Hitboxes behind this one are not hit.
-    BlockMouse,
     /// Hitboxes behind this one are not hovered, but still scroll.
     BlockMouseExceptScroll,
 }
@@ -347,7 +344,6 @@ fn invert3(m: &[f32; 9]) -> Option<[f32; 9]> {
     })
 }
 
-/// A rectangle with a background, a border and rounded corners.
 #[derive(Clone, Debug)]
 pub struct PaintQuad {
     pub bounds: Bounds<Pixels>,
@@ -407,17 +403,6 @@ pub fn fill(bounds: Bounds<Pixels>, background: Rgba) -> PaintQuad {
     )
 }
 
-pub fn outline(bounds: Bounds<Pixels>, color: Rgba, style: BorderStyle) -> PaintQuad {
-    quad(
-        bounds,
-        px(0.),
-        crate::transparent_black(),
-        px(1.),
-        color,
-        style,
-    )
-}
-
 pub(crate) type MouseListener =
     Box<dyn FnMut(&PlatformInput, DispatchPhase, &mut Window, &mut App)>;
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
@@ -427,8 +412,8 @@ pub(crate) type CaptureCallback = Box<dyn FnOnce(Result<([u32; 2], Vec<u8>)>, &m
 struct Frame {
     hitboxes: Vec<Hitbox>,
     mouse_listeners: Vec<Option<MouseListener>>,
-    cursors: Vec<(Option<HitboxId>, CursorStyle)>,
-    controls: Vec<(WindowControlArea, HitboxId)>,
+    cursors: Vec<(HitboxId, CursorStyle)>,
+    drag_areas: Vec<HitboxId>,
 }
 
 impl Frame {
@@ -436,7 +421,7 @@ impl Frame {
         self.hitboxes.clear();
         self.mouse_listeners.clear();
         self.cursors.clear();
-        self.controls.clear();
+        self.drag_areas.clear();
     }
 
     /// Maps hitboxes under the transform keyed `key` with the new transform `matrix`.
@@ -469,7 +454,6 @@ impl Frame {
             if local.is_some_and(|local| bounds.contains(&local)) {
                 ids.push(hitbox.id);
                 match hitbox.behavior {
-                    HitboxBehavior::BlockMouse => break,
                     HitboxBehavior::BlockMouseExceptScroll if hovered.is_none() => {
                         hovered = Some(ids.len())
                     }
@@ -515,10 +499,8 @@ pub struct Window {
     drawing: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
-    pub(crate) pending_clicks: Vec<(ElementId, crate::MouseDownEvent)>,
     pub(crate) removed: bool,
     cursor: Option<CursorStyle>,
-    /// When the view last drew.
     drawn_at: std::time::Instant,
     /// The transforms the compositor plays for promoted layers: key, start, step and transforms,
     /// so hit testing follows them.
@@ -565,7 +547,6 @@ impl Window {
             drawing: false,
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
-            pending_clicks: Vec::new(),
             removed: false,
             cursor: None,
         }
@@ -587,10 +568,6 @@ impl Window {
         self.viewport_size
     }
 
-    pub fn mouse_position(&self) -> Point<Pixels> {
-        self.mouse_position
-    }
-
     pub fn zoom(&self) -> f32 {
         self.zoom
     }
@@ -603,10 +580,6 @@ impl Window {
             self.zoom = zoom;
             self.mark_resized(self.native.0, self.native.1);
         }
-    }
-
-    pub fn modifiers(&self) -> Modifiers {
-        self.modifiers
     }
 
     /// Draws the window on the next frame. Does nothing while drawing; see [`Self::redraw`].
@@ -632,7 +605,6 @@ impl Window {
         self.redraw[1]
     }
 
-    /// Whether the window draws in this frame.
     pub fn will_draw(&self) -> bool {
         self.drawing || self.dirty || !self.captures.is_empty()
     }
@@ -796,7 +768,6 @@ impl Window {
         self.platform.force_frame();
     }
 
-    /// Runs `f` with this window after `delay`.
     pub fn timer(
         &self,
         delay: std::time::Duration,
@@ -1016,7 +987,7 @@ impl Window {
             .cursors
             .iter()
             .rev()
-            .find(|(hitbox, _)| hitbox.is_none_or(|id| id.is_hovered(self)))
+            .find(|(hitbox, _)| hitbox.is_hovered(self))
             .map_or(CursorStyle::Arrow, |(_, style)| *style);
         if self.cursor != Some(style) && self.platform.is_active() {
             self.cursor = Some(style);
@@ -1024,15 +995,12 @@ impl Window {
         }
     }
 
-    /// The window control area under the mouse, from the last frame.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub(crate) fn control_area(&self) -> Option<WindowControlArea> {
-        let top = self.hit_test.first()?;
-        self.rendered
-            .controls
-            .iter()
-            .find(|(_, id)| id == top)
-            .map(|(area, _)| *area)
+    /// Whether the mouse is over a drag area, from the last frame.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn in_drag_area(&self) -> bool {
+        self.hit_test
+            .first()
+            .is_some_and(|top| self.rendered.drag_areas.contains(top))
     }
 
     /// Sends an input event to the mouse listeners or the view. Returns whether it was handled.
@@ -1091,9 +1059,6 @@ impl Window {
             if self.rendered.mouse_listeners.is_empty() {
                 self.rendered.mouse_listeners = listeners;
             }
-            if matches!(event, PlatformInput::MouseUp(_)) {
-                self.pending_clicks.clear();
-            }
         } else if let Some(mut view) = self.view.take() {
             view.event(&event, self, cx);
             if self.view.is_none() {
@@ -1109,7 +1074,6 @@ impl Window {
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
                 is_held: false,
-                prefer_character_input: keystroke.key_char.is_some(),
             }),
             cx,
         );
@@ -1135,8 +1099,6 @@ impl Window {
         }
         Some(result)
     }
-
-    // Layout.
 
     pub fn request_layout(
         &mut self,
@@ -1240,8 +1202,6 @@ impl Window {
         bounds + self.element_offset()
     }
 
-    // Prepaint and paint state.
-
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         let id = HitboxId(self.next_hitbox);
         self.next_hitbox += 1;
@@ -1256,16 +1216,12 @@ impl Window {
         hitbox
     }
 
-    pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: &Hitbox) {
-        self.next.controls.push((area, hitbox.id));
+    pub fn insert_window_drag_hitbox(&mut self, hitbox: &Hitbox) {
+        self.next.drag_areas.push(hitbox.id);
     }
 
     pub fn set_cursor_style(&mut self, style: CursorStyle, hitbox: &Hitbox) {
-        self.next.cursors.push((Some(hitbox.id), style));
-    }
-
-    pub fn set_window_cursor_style(&mut self, style: CursorStyle) {
-        self.next.cursors.push((None, style));
+        self.next.cursors.push((hitbox.id, style));
     }
 
     /// Listens to mouse events of this frame.
@@ -1458,8 +1414,6 @@ impl Window {
         self.hit_transform = self.hit_transform.take().and_then(|own| own.outer.clone());
         result
     }
-
-    // Painting.
 
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale = self.scale_factor;

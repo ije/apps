@@ -49,9 +49,6 @@ impl Radii<Length> {
 }
 
 impl Length {
-    pub fn is_auto(&self) -> bool {
-        *self == Self::Auto
-    }
     /// The taffy calc handle of `Calc`, or `None` when it is a plain fraction. Taffy treats the handle as
     /// opaque, so it holds the fraction's bits and the offset in 1/64 device pixels instead of a pointer.
     fn calc(fraction: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
@@ -171,8 +168,6 @@ pub enum FlexWrap {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlignItems {
-    Start,
-    End,
     FlexStart,
     FlexEnd,
     Center,
@@ -209,7 +204,6 @@ pub enum ObjectFit {
 }
 
 impl ObjectFit {
-    /// The bounds of the image within `bounds`.
     pub fn get_bounds(&self, bounds: Bounds<Pixels>, image: Size<DevicePixels>) -> Bounds<Pixels> {
         let image = image.map(|value| px(value.0 as f32));
         let image_ratio = image.width / image.height;
@@ -299,7 +293,6 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
-/// The layout and paint style of a box.
 #[derive(Clone, Debug)]
 pub struct Style {
     pub display: Display,
@@ -386,8 +379,6 @@ impl Style {
     pub(crate) fn to_taffy(&self, scale: f32) -> taffy::Style {
         use taffy::style as t;
         let align_items = |value: AlignItems| match value {
-            AlignItems::Start => t::AlignItems::START,
-            AlignItems::End => t::AlignItems::END,
             AlignItems::FlexStart => t::AlignItems::FLEX_START,
             AlignItems::FlexEnd => t::AlignItems::FLEX_END,
             AlignItems::Center => t::AlignItems::CENTER,
@@ -706,7 +697,6 @@ impl TextStyleRefinement {
     }
 }
 
-/// Builder methods shared by every element with a style.
 pub trait Styled: Sized {
     fn style(&mut self) -> &mut Style;
 
@@ -714,10 +704,6 @@ pub trait Styled: Sized {
         &mut self.style().text
     }
 
-    fn block(mut self) -> Self {
-        self.style().display = Display::Block;
-        self
-    }
     fn flex(mut self) -> Self {
         self.style().display = Display::Flex;
         self
@@ -759,10 +745,6 @@ pub trait Styled: Sized {
     }
     fn flex_shrink_0(mut self) -> Self {
         self.style().flex_shrink = 0.;
-        self
-    }
-    fn flex_grow(mut self) -> Self {
-        self.style().flex_grow = 1.;
         self
     }
     fn items_start(mut self) -> Self {
@@ -832,10 +814,6 @@ pub trait Styled: Sized {
     }
     fn w_full(mut self) -> Self {
         self.style().size.width = relative(1.);
-        self
-    }
-    fn h_full(mut self) -> Self {
-        self.style().size.height = relative(1.);
         self
     }
     fn min_w(mut self, value: impl Into<Length>) -> Self {
@@ -932,26 +910,6 @@ pub trait Styled: Sized {
     }
     fn border_color(mut self, color: Rgba) -> Self {
         self.style().border_color = Some(color);
-        self
-    }
-    fn rounded_tl(mut self, value: Pixels) -> Self {
-        let radii = &mut self.style().corner_radii;
-        (radii.x.top_left, radii.y.top_left) = (Length::Px(value), Length::Px(value));
-        self
-    }
-    fn rounded_tr(mut self, value: Pixels) -> Self {
-        let radii = &mut self.style().corner_radii;
-        (radii.x.top_right, radii.y.top_right) = (Length::Px(value), Length::Px(value));
-        self
-    }
-    fn rounded_br(mut self, value: Pixels) -> Self {
-        let radii = &mut self.style().corner_radii;
-        (radii.x.bottom_right, radii.y.bottom_right) = (Length::Px(value), Length::Px(value));
-        self
-    }
-    fn rounded_bl(mut self, value: Pixels) -> Self {
-        let radii = &mut self.style().corner_radii;
-        (radii.x.bottom_left, radii.y.bottom_left) = (Length::Px(value), Length::Px(value));
         self
     }
     fn rounded_full(mut self) -> Self {

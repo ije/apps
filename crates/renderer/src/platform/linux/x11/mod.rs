@@ -13,8 +13,7 @@ use super::{
 use crate::{
     Bounds, Capslock, CursorStyle, FileDropEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, app::Callbacks, point,
-    px, size,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, app::Callbacks, point, px, size,
 };
 use anyhow::{Context as _, Result, anyhow};
 use calloop::{
@@ -863,8 +862,6 @@ impl Client {
                     .callbacks
                     .input(PlatformInput::MouseExited(MouseExitEvent {
                         position: self.position(event.event_x, event.event_y),
-                        pressed_button: pressed_button(event.buttons[0]),
-                        modifiers,
                     }));
             }
             Event::XinputHierarchy(event) => {
@@ -1070,7 +1067,6 @@ fn scroll_event(position: Point<Pixels>, delta: Point<f32>, modifiers: Modifiers
         position,
         delta: ScrollDelta::Lines(delta),
         modifiers,
-        touch_phase: TouchPhase::default(),
     })
 }
 

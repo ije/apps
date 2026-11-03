@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, CursorStyle, FileDropEvent, Pixels, PlatformInput, Point, ScrollDelta, Size,
-    TextSystem, Utf16Selection, View, Window, WindowControlArea, WindowId, WindowOptions, platform,
+    Bounds, FileDropEvent, Pixels, PlatformInput, Point, ScrollDelta, Size, TextSystem,
+    Utf16Selection, View, Window, WindowId, WindowOptions, platform,
 };
 use anyhow::Result;
 use std::{
@@ -185,10 +185,6 @@ impl Drop for Timer {
 }
 
 impl App {
-    pub fn text_system(&self) -> &Rc<TextSystem> {
-        &self.text_system
-    }
-
     /// Keeps the current mouse or key event from the listeners after this one.
     pub fn stop_propagation(&mut self) {
         self.propagate_event = false;
@@ -239,7 +235,6 @@ impl App {
         }
     }
 
-    /// Runs once when the app quits.
     pub fn on_quit(&mut self, f: impl FnOnce(&mut App) + 'static) {
         self.on_quit = Some(Box::new(f));
     }
@@ -258,10 +253,6 @@ impl App {
 
     pub fn write_to_clipboard(&self, text: String) {
         self.platform.write_clipboard(&text);
-    }
-
-    pub fn set_cursor(&self, style: CursorStyle) {
-        self.platform.set_cursor(style);
     }
 
     /// The visible area of the main display, in screen points.
@@ -429,10 +420,10 @@ impl Callbacks {
         self.queue(|window, _| window.refresh());
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
-    pub fn control_area(&self) -> Option<WindowControlArea> {
-        self.with(|window, _| window.control_area()).flatten()
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn in_drag_area(&self) -> bool {
+        self.with(|window, _| window.in_drag_area())
+            .unwrap_or(false)
     }
 
     pub fn accepts_text_input(&self) -> bool {
@@ -464,8 +455,7 @@ impl Callbacks {
         .flatten()
     }
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn text_for_range(
         &self,
         range: Range<usize>,
@@ -521,8 +511,7 @@ impl Callbacks {
         .flatten()
     }
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn character_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
         self.with(|window, app| {
             let point = point / window.zoom;
@@ -535,12 +524,10 @@ impl Callbacks {
     }
 }
 
-/// App level events from the platform.
 pub(crate) mod events {
     use super::*;
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn reopen(visible: bool) {
         update(move |app| {
             if let Some(mut callback) = app.on_reopen.take() {
@@ -571,8 +558,7 @@ pub(crate) mod events {
         });
     }
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn open_urls(urls: Vec<String>) {
         update(move |app| match app.on_open_urls.take() {
             Some(mut callback) => {

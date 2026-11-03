@@ -155,7 +155,9 @@ impl Canvas {
         })
     }
 
-    /// Runs the operations of `CanvasRenderingContext2D` in `dom.js`: a code and its arguments, with strings as UTF-16 lengths of consecutive parts of `strings` and `putImageData` bytes in `data`. `image` returns the pixels of another canvas or image node. Text needs the window's text system and font aliases.
+    /// Runs the `CanvasRenderingContext2D` operations from `dom.js`: a code and its arguments. Strings are
+    /// UTF-16 lengths of consecutive parts of `strings`, and `putImageData` bytes are in `data`. `image`
+    /// returns the pixels of another canvas or image node.
     pub fn draw(
         &mut self,
         ops: &[f32],

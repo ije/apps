@@ -306,7 +306,6 @@ impl SelectorCache {
         })
     }
 
-    /// Makes room for `count` more stored dependencies.
     fn reserve(&mut self, count: usize) {
         self.size += count;
         if self.size > 2_000_000 {

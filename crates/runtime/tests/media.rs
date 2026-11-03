@@ -134,11 +134,20 @@ fn seeking_past_the_last_frame_shows_it() {
         )
         .unwrap();
     wait(&engine, "media.readyState === 4 ? 'ready' : 'pending'");
-    let id: usize = engine.eval("media._id", "media-test").unwrap().parse().unwrap();
+    let id: usize = engine
+        .eval("media._id", "media-test")
+        .unwrap()
+        .parse()
+        .unwrap();
     let first = host.borrow().dom[&1].images[&id].clone();
-    engine.eval("media.currentTime = media.duration", "media-test").unwrap();
+    engine
+        .eval("media.currentTime = media.duration", "media-test")
+        .unwrap();
     wait(&engine, "media.seeking ? 'pending' : 'done'");
-    assert!(!std::sync::Arc::ptr_eq(&first, &host.borrow().dom[&1].images[&id]));
+    assert!(!std::sync::Arc::ptr_eq(
+        &first,
+        &host.borrow().dom[&1].images[&id]
+    ));
 }
 
 #[test]

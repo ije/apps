@@ -17,10 +17,8 @@ const MAX_AGE: u32 = 60;
 // WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
 // one to read a tile, is done before the frame after the free paints. More drawables need more.
 const IN_FLIGHT: u32 = 2;
-/// The smallest side of an atlas texture.
 pub(crate) const MIN_TEXTURE_SIDE: i32 = 1024;
 
-/// What an atlas tile holds.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub(crate) enum AtlasKey {
     Glyph(RenderGlyphParams),
@@ -37,7 +35,6 @@ impl AtlasKey {
     }
 }
 
-/// The GPU textures of an atlas.
 pub(crate) trait AtlasBackend {
     fn insert(
         &mut self,
@@ -179,7 +176,7 @@ impl<B: AtlasBackend> Atlas<B> {
     }
 
     /// Drops every tile, for a lost device.
-    #[allow(dead_code)]
+    #[cfg(not(target_os = "macos"))]
     pub fn clear(&self, reset: impl FnOnce(&mut B)) {
         self.tiles.borrow_mut().clear();
         self.retired.borrow_mut().clear();
@@ -234,7 +231,6 @@ impl<T> TextureList<T> {
         }
     }
 
-    /// Stores a texture and returns its index.
     pub fn push(&mut self, texture: impl FnOnce(usize) -> T) -> usize {
         match self.free.pop() {
             Some(index) => {

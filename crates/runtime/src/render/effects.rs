@@ -720,7 +720,6 @@ pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]
     radii
 }
 
-/// The corner radii of a box as render corners.
 pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     Corners {
         top_left: px(radii[0]),

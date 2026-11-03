@@ -150,24 +150,14 @@ impl TextSystem {
             ascent: metrics.ascent,
             descent: -metrics.descent,
             line_gap: metrics.leading,
-            underline_position: metrics.underline_offset,
-            underline_thickness: metrics.stroke_size,
             cap_height: metrics.cap_height,
             x_height: metrics.x_height,
-            average_width: metrics.average_width,
             tall_ascent: false,
             bounding_box: Bounds {
                 origin: point(0., 0.),
                 size: size(metrics.max_width, metrics.ascent + metrics.descent),
             },
         }
-    }
-
-    pub fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        Ok(Bounds {
-            origin: point(0., 0.),
-            size: self.advance(font_id, glyph_id)?,
-        })
     }
 
     pub fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {

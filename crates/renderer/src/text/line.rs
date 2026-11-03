@@ -8,17 +8,14 @@ use std::{ops::Range, rc::Rc};
 // Leaves room below the underline for its stroke while keeping it below the baseline.
 const UNDERLINE_DESCENT_OFFSET_FACTOR: f32 = 0.618;
 
-/// The vertical offset of an underline within a line.
 pub fn underline_y_offset(line_height: Pixels, ascent: Pixels, descent: Pixels) -> Pixels {
     let padding_top = (line_height - ascent - descent) / 2.;
     padding_top + ascent + descent * UNDERLINE_DESCENT_OFFSET_FACTOR
 }
 
-/// A line of text that has been shaped and decorated.
 #[derive(Clone, Default, Debug)]
 pub struct ShapedLine {
     pub(crate) layout: Rc<LineLayout>,
-    pub text: SharedString,
     pub(crate) decoration_runs: Vec<DecorationRun>,
 }
 
@@ -30,15 +27,6 @@ impl std::ops::Deref for ShapedLine {
 }
 
 impl ShapedLine {
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.layout.len
-    }
-
-    pub fn width(&self) -> Pixels {
-        self.layout.width
-    }
-
     pub fn paint(
         &self,
         origin: Point<Pixels>,
@@ -60,31 +48,8 @@ impl ShapedLine {
             window,
         )
     }
-
-    pub fn paint_background(
-        &self,
-        origin: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        align_width: Option<Pixels>,
-        window: &mut Window,
-    ) {
-        paint_line_background(
-            LinePaint {
-                origin,
-                layout: &self.layout,
-                line_height,
-                align,
-                align_width,
-                decoration_runs: &self.decoration_runs,
-                wrap_boundaries: &[],
-            },
-            window,
-        )
-    }
 }
 
-/// A line of text that has been shaped, decorated and wrapped.
 #[derive(Default, Debug, Clone)]
 pub struct WrappedLine {
     pub(crate) layout: Rc<WrappedLineLayout>,

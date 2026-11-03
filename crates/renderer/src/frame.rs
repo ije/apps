@@ -36,7 +36,6 @@ pub struct Globals {
     pub pad: [u32; 2],
 }
 
-/// Text rendering settings of a renderer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TextParams {
     pub gamma_ratios: [f32; 4],
@@ -202,7 +201,6 @@ fn radii(radii: &crate::Radii<ScaledPixels>) -> [f32; 8] {
     ]
 }
 
-/// The instance data as raw bytes.
 pub fn bytes<T>(items: &[T]) -> &[u8] {
     // SAFETY: the instance types are `repr(C)` plain data that the shaders read as raw bytes.
     unsafe { std::slice::from_raw_parts(items.as_ptr() as *const u8, mem::size_of_val(items)) }

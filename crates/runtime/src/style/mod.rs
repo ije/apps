@@ -239,8 +239,9 @@ pub(crate) const SVG: [Prop; 43] = [
 /// The property that an SVG presentation attribute sets. `transform` is not one, because its syntax differs
 /// from CSS.
 pub(crate) fn presentation(name: &str) -> Option<Prop> {
-    Prop::find(name)
-        .filter(|prop| SVG.contains(prop) && !matches!(*prop, Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN))
+    Prop::find(name).filter(|prop| {
+        SVG.contains(prop) && !matches!(*prop, Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN)
+    })
 }
 
 /// An SVG `transform` attribute as a CSS `transform`, or `None` when it doesn't parse.
@@ -4136,12 +4137,21 @@ pub(crate) fn cascade(
                                 | Prop::LETTER_SPACING
                                 | Prop::WORD_SPACING
                         ) && value.parse::<f32>().is_ok();
-                        hints.push((prop, if pixels { format!("{value}px").into() } else { value.into() }));
+                        hints.push((
+                            prop,
+                            if pixels {
+                                format!("{value}px").into()
+                            } else {
+                                value.into()
+                            },
+                        ));
                     }
                 }
                 if (graphic || !hints.is_empty()) && node.tag != "svg" {
                     let mut up = node.parent;
-                    while let Some(parent) = up.filter(|&parent| !matches!(doc.nodes[parent].tag.as_str(), "svg" | "foreignObject")) {
+                    while let Some(parent) = up.filter(|&parent| {
+                        !matches!(doc.nodes[parent].tag.as_str(), "svg" | "foreignObject")
+                    }) {
                         up = doc.nodes[parent].parent;
                     }
                     if up.is_none_or(|parent| doc.nodes[parent].tag != "svg") {

@@ -8,7 +8,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::{CStr, c_char},
-    path::Path,
     ptr,
     rc::{Rc, Weak},
 };
@@ -614,7 +613,7 @@ impl State {
         #[cfg(unix)]
         let library: Library = unsafe {
             libloading::os::unix::Library::open(
-                Some(Path::new(&path)),
+                Some(std::path::Path::new(&path)),
                 libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
             )?
         }

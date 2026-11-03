@@ -799,8 +799,6 @@ pub unsafe extern "C" fn apps_media_open(
     );
 }
 
-/// Runs a control op of element `id` with its value.
-///
 /// # Safety
 /// `media` comes from `apps_media_new`.
 #[unsafe(no_mangle)]
@@ -847,8 +845,6 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
     shared.signal.notify_one();
 }
 
-/// Closes element `id`.
-///
 /// # Safety
 /// `media` comes from `apps_media_new`.
 #[unsafe(no_mangle)]

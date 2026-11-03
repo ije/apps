@@ -1,8 +1,5 @@
-use crate::{
-    AvailableSpace, Bounds, LayoutId, ObjectFit, Pixels, Point, RenderImage, Size, Style, Styled,
-    Window,
-};
-use std::{any::Any, mem, sync::Arc};
+use crate::{Bounds, LayoutId, ObjectFit, Pixels, Point, RenderImage, Style, Styled, Window};
+use std::{mem, sync::Arc};
 
 /// Something that can be laid out and painted. Every frame builds a new tree of elements.
 ///
@@ -57,9 +54,6 @@ pub trait FluentBuilder: Sized {
     fn when(self, condition: bool, f: impl FnOnce(Self) -> Self) -> Self {
         if condition { f(self) } else { self }
     }
-    fn map<U>(self, f: impl FnOnce(Self) -> U) -> U {
-        f(self)
-    }
 }
 
 impl<T: IntoElement> FluentBuilder for T {}
@@ -106,8 +100,6 @@ trait ElementObject {
     fn request_layout(&mut self, window: &mut Window) -> LayoutId;
     fn prepaint(&mut self, window: &mut Window);
     fn paint(&mut self, window: &mut Window);
-    fn layout_id(&self) -> Option<LayoutId>;
-    fn inner(&mut self) -> &mut dyn Any;
 }
 
 impl<E: Element> ElementObject for Drawable<E> {
@@ -146,20 +138,8 @@ impl<E: Element> ElementObject for Drawable<E> {
                 .paint(bounds, &mut layout, &mut prepaint, window);
         }
     }
-
-    fn layout_id(&self) -> Option<LayoutId> {
-        match &self.phase {
-            Phase::Layout(id, _) => Some(*id),
-            _ => None,
-        }
-    }
-
-    fn inner(&mut self) -> &mut dyn Any {
-        &mut self.element
-    }
 }
 
-/// An element of any type.
 pub struct AnyElement(Box<dyn ElementObject>);
 
 impl AnyElement {
@@ -168,10 +148,6 @@ impl AnyElement {
             element,
             phase: Phase::Start,
         }))
-    }
-
-    pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.0.inner().downcast_mut()
     }
 
     pub fn request_layout(&mut self, window: &mut Window) -> LayoutId {
@@ -186,21 +162,7 @@ impl AnyElement {
         self.0.paint(window)
     }
 
-    /// Lays the element out on its own in the given space and returns its size.
-    pub fn layout_as_root(
-        &mut self,
-        space: Size<AvailableSpace>,
-        window: &mut Window,
-    ) -> Size<Pixels> {
-        let id = match self.0.layout_id() {
-            Some(id) => id,
-            None => self.0.request_layout(window),
-        };
-        window.compute_layout(id, space);
-        window.layout_bounds(id).size
-    }
-
-    /// Prepaints the element with its origin at `origin`, in window coordinates.
+    /// `origin` is in window coordinates.
     pub fn prepaint_at(&mut self, origin: Point<Pixels>, window: &mut Window) {
         window.with_absolute_element_offset(origin, |window| self.prepaint(window))
     }
@@ -302,26 +264,6 @@ impl<T: 'static> Element for Canvas<T> {
             paint(bounds, state, window)
         });
     }
-}
-
-/// An empty element.
-pub struct Empty;
-
-impl IntoElement for Empty {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for Empty {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-    fn request_layout(&mut self, window: &mut Window) -> (LayoutId, ()) {
-        (window.request_layout(&Style::default(), []), ())
-    }
-    fn prepaint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut Window) {}
-    fn paint(&mut self, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window) {}
 }
 
 /// An image that fills its box.

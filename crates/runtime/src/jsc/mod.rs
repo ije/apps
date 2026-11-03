@@ -754,7 +754,6 @@ unsafe extern "C" fn call(
     }
 }
 
-/// Runs one host operation for the context of `binding`.
 fn dispatch(
     binding: &Binding,
     ctx: Ptr,

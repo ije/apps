@@ -52,11 +52,10 @@ pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
 /// A face's family, `src`, `unicode-range` and status.
 pub(crate) type Face = (String, String, Option<String>, &'static str);
 
-/// Loads the fonts of the `@font-face` rules that the latest style pass used, once per URL. Each
-/// face tries its sources in order until one loads. A face with a `unicode-range` loads only when
-/// the page text uses one of its characters, and faces that cover more of them load first, since
-/// the first face of several with one name is the one that draws. Returns whether fonts changed, and
-/// each face's family, `src`, `unicode-range` and status.
+/// Loads the `@font-face` fonts that the latest style pass used, once per URL. Each face tries its
+/// sources in order until one loads. A face with a `unicode-range` loads only when the page text
+/// uses one of its characters, and faces that cover more of them load first, since the first face
+/// of several with one name is the one that draws. Returns whether fonts changed, and the faces.
 pub(crate) fn load(
     doc: &Document,
     state: &mut State,

@@ -10,7 +10,7 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 pub(crate) use linux::*;

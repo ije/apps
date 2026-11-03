@@ -77,7 +77,6 @@ struct Node {
 /// children and measure inputs keeps its node, so taffy's caches skip its subtree.
 pub(crate) struct LayoutEngine {
     tree: Vec<Node>,
-    /// Slots of freed nodes.
     free: Vec<usize>,
     /// This frame's and the last frame's nodes by identity and occurrence.
     nodes: [FxHashMap<(u64, u32), NodeId>; 2],

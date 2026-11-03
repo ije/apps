@@ -1,8 +1,7 @@
 use crate::{
-    AnyElement, App, Bounds, ClickEvent, Element, ElementId, Hitbox, HitboxBehavior, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement,
-    Pixels, Point, ScrollWheelEvent, Style, Styled, Visibility, Window, WindowControlArea,
-    input::DispatchPhase, point, px, quad,
+    AnyElement, App, Bounds, Element, ElementId, Hitbox, HitboxBehavior, IntoElement, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Overflow, ParentElement, Pixels, Point,
+    ScrollWheelEvent, Style, Styled, Visibility, Window, input::DispatchPhase, point, px, quad,
 };
 use std::{
     cell::RefCell,
@@ -12,7 +11,6 @@ use std::{
 
 type Listener<E> = Box<dyn FnMut(&E, &mut Window, &mut App)>;
 
-/// A box: the building block of every page.
 #[derive(Default)]
 pub struct Div {
     style: Style,
@@ -25,9 +23,8 @@ struct Events {
     id: Option<ElementId>,
     mouse_down: Vec<(MouseButton, Rc<RefCell<Listener<MouseDownEvent>>>)>,
     mouse_move: Vec<Rc<RefCell<Listener<MouseMoveEvent>>>>,
-    click: Vec<Rc<RefCell<Listener<ClickEvent>>>>,
     scroll: Option<ScrollHandle>,
-    control: Option<WindowControlArea>,
+    drag: bool,
 }
 
 pub fn div() -> Div {
@@ -61,25 +58,15 @@ impl Div {
         self
     }
 
-    /// A left button press and release on this box. Needs an [`Self::id`].
-    pub fn on_click(
-        mut self,
-        listener: impl FnMut(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.events
-            .click
-            .push(Rc::new(RefCell::new(Box::new(listener))));
-        self
-    }
-
     /// Scrolls the overflow with the wheel and keeps the offset in `handle`.
     pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
         self.events.scroll = Some(handle.clone());
         self
     }
 
-    pub fn window_control_area(mut self, area: WindowControlArea) -> Self {
-        self.events.control = Some(area);
+    /// Moves the window when dragged, like `app-region: drag`.
+    pub fn window_drag_area(mut self) -> Self {
+        self.events.drag = true;
         self
     }
 }
@@ -88,10 +75,9 @@ impl Events {
     fn needs_hitbox(&self, style: &Style) -> bool {
         style.mouse_cursor.is_some()
             || self.scroll.is_some()
-            || self.control.is_some()
+            || self.drag
             || !self.mouse_down.is_empty()
             || !self.mouse_move.is_empty()
-            || !self.click.is_empty()
     }
 
     fn paint(&self, style: &Style, hitbox: &Hitbox, window: &mut Window) {
@@ -111,41 +97,6 @@ impl Events {
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     (listener.borrow_mut())(event, window, cx);
-                }
-            });
-        }
-        if let (false, Some(id)) = (self.click.is_empty(), self.id) {
-            let down = hitbox.clone();
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
-                if phase == DispatchPhase::Bubble
-                    && event.button == MouseButton::Left
-                    && down.is_hovered(window)
-                {
-                    window.pending_clicks.push((id, event.clone()));
-                }
-            });
-            let (listeners, up) = (self.click.clone(), hitbox.clone());
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || event.button != MouseButton::Left
-                    || !up.is_hovered(window)
-                {
-                    return;
-                }
-                let Some(down) = window
-                    .pending_clicks
-                    .iter()
-                    .find(|(pending, _)| *pending == id)
-                    .map(|(_, down)| down.clone())
-                else {
-                    return;
-                };
-                let click = ClickEvent {
-                    down,
-                    up: event.clone(),
-                };
-                for listener in &listeners {
-                    (listener.borrow_mut())(&click, window, cx);
                 }
             });
         }
@@ -320,8 +271,8 @@ impl Element for Div {
                         if let Some(cursor) = style.mouse_cursor {
                             window.set_cursor_style(cursor, hitbox);
                         }
-                        if let Some(area) = self.events.control {
-                            window.insert_window_control_hitbox(area, hitbox);
+                        if self.events.drag {
+                            window.insert_window_drag_hitbox(hitbox);
                         }
                         self.events.paint(style, hitbox, window);
                     }
@@ -402,10 +353,6 @@ impl std::fmt::Debug for ScrollHandle {
 }
 
 impl ScrollHandle {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn offset(&self) -> Point<Pixels> {
         self.0.borrow().offset
     }
@@ -579,7 +526,7 @@ mod tests {
             }
         }
 
-        let handle = ScrollHandle::new();
+        let handle = ScrollHandle::default();
         handle.animate_to(point(px(0.), px(-100.)), true);
         assert_eq!(handle.target().y, px(-100.));
         assert_eq!(handle.0.borrow().animation.as_ref().unwrap().slope.y, 3.);

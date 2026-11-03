@@ -858,8 +858,6 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             return Ok(json!(meminfo("MemAvailable")));
             #[cfg(windows)]
             return Ok(json!(win::memory().available));
-            #[allow(unreachable_code)]
-            Ok(json!(0))
         }
         "os.uptime" => {
             #[cfg(target_os = "macos")]
@@ -880,21 +878,23 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             ));
             #[cfg(windows)]
             return Ok(json!(unsafe { win::GetTickCount64() } / 1000));
-            #[allow(unreachable_code)]
-            Ok(json!(0))
         }
         "os.loadavg" => {
-            let mut load = [0f64; 3];
+            #[cfg(windows)]
+            return Ok(json!([0, 0, 0]));
             #[cfg(unix)]
             unsafe {
+                let mut load = [0f64; 3];
                 libc::getloadavg(load.as_mut_ptr(), 3);
+                Ok(json!(load))
             }
-            Ok(json!(load))
         }
         "os.interfaces" => {
-            let mut result = serde_json::Map::new();
+            #[cfg(windows)]
+            return Ok(json!({}));
             #[cfg(unix)]
             unsafe {
+                let mut result = serde_json::Map::new();
                 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
                 let ip = |address: *const libc::sockaddr| -> Option<(IpAddr, u32)> {
                     if address.is_null() {
@@ -988,15 +988,15 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                         list.push(entry);
                     }
                 }
+                Ok(Value::Object(result))
             }
-            Ok(Value::Object(result))
         }
         "process.memory" => {
             #[cfg(target_os = "macos")]
             unsafe {
                 let mut info: libc::proc_taskinfo = std::mem::zeroed();
                 let size = size_of::<libc::proc_taskinfo>() as i32;
-                return Ok(json!(if libc::proc_pidinfo(
+                Ok(json!(if libc::proc_pidinfo(
                     std::process::id() as i32,
                     libc::PROC_PIDTASKINFO,
                     0,
@@ -1007,7 +1007,7 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     info.pti_resident_size
                 } else {
                     0
-                }));
+                }))
             }
             #[cfg(target_os = "linux")]
             return Ok(json!(
@@ -1026,10 +1026,8 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     &mut counters,
                     counters.size,
                 );
-                return Ok(json!(counters.working_set));
+                Ok(json!(counters.working_set))
             }
-            #[allow(unreachable_code)]
-            Ok(json!(0))
         }
         "process.cpu" => {
             #[cfg(unix)]
@@ -1038,7 +1036,7 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 libc::getrusage(libc::RUSAGE_SELF, &mut usage);
                 let micros =
                     |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
-                return Ok(json!({"user":micros(usage.ru_utime),"system":micros(usage.ru_stime)}));
+                Ok(json!({"user":micros(usage.ru_utime),"system":micros(usage.ru_stime)}))
             }
             #[cfg(windows)]
             unsafe {
@@ -1050,10 +1048,8 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     &mut kernel,
                     &mut user,
                 );
-                return Ok(json!({"user":user / 10,"system":kernel / 10}));
+                Ok(json!({"user":user / 10,"system":kernel / 10}))
             }
-            #[allow(unreachable_code)]
-            Ok(json!({"user":0,"system":0}))
         }
         "umask" => {
             #[cfg(unix)]
@@ -1063,10 +1059,10 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 if args[0].is_null() {
                     libc::umask(old);
                 }
-                return Ok(json!(old));
+                Ok(json!(old))
             }
-            #[allow(unreachable_code)]
-            Ok(json!(0))
+            #[cfg(windows)]
+            return Ok(json!(0));
         }
         "os.priority" => {
             #[cfg(unix)]
@@ -1092,12 +1088,10 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 if priority == -1 && error.raw_os_error() != Some(0) {
                     return Err(error.into());
                 }
-                return Ok(json!(priority));
+                Ok(json!(priority))
             }
-            #[allow(unreachable_code)]
-            {
-                bail!("Process priority is unavailable on this platform")
-            }
+            #[cfg(windows)]
+            bail!("Process priority is unavailable on this platform");
         }
         "tty.size" => {
             #[cfg(unix)]

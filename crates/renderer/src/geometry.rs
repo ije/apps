@@ -3,7 +3,6 @@ use std::{
     ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
-/// A value that geometry types can hold.
 pub trait Unit:
     Copy + Debug + Default + PartialEq + PartialOrd + Add<Output = Self> + Sub<Output = Self> + Half
 {
@@ -363,23 +362,6 @@ impl<T: Copy> Size<T> {
     }
 }
 
-impl<T: Copy + PartialOrd> Size<T> {
-    pub fn max(self, other: Self) -> Self {
-        Self {
-            width: if self.width >= other.width {
-                self.width
-            } else {
-                other.width
-            },
-            height: if self.height >= other.height {
-                self.height
-            } else {
-                other.height
-            },
-        }
-    }
-}
-
 impl Size<Pixels> {
     pub fn scale(self, factor: f32) -> Size<ScaledPixels> {
         self.map(|value| value.scale(factor))
@@ -431,10 +413,6 @@ pub struct Bounds<T> {
     pub size: Size<T>,
 }
 
-pub fn bounds<T>(origin: Point<T>, size: Size<T>) -> Bounds<T> {
-    Bounds { origin, size }
-}
-
 impl<T: Unit> Bounds<T> {
     pub const fn new(origin: Point<T>, size: Size<T>) -> Self {
         Self { origin, size }
@@ -443,12 +421,6 @@ impl<T: Unit> Bounds<T> {
         Self {
             origin: top_left,
             size: size(bottom_right.x - top_left.x, bottom_right.y - top_left.y),
-        }
-    }
-    pub fn centered_at(center: Point<T>, size: Size<T>) -> Self {
-        Self {
-            origin: point(center.x - size.width.half(), center.y - size.height.half()),
-            size,
         }
     }
     pub fn left(&self) -> T {
@@ -462,9 +434,6 @@ impl<T: Unit> Bounds<T> {
     }
     pub fn bottom(&self) -> T {
         self.origin.y + self.size.height
-    }
-    pub fn top_left(&self) -> Point<T> {
-        self.origin
     }
     pub fn top_right(&self) -> Point<T> {
         point(self.right(), self.top())
@@ -528,15 +497,6 @@ impl<T: Unit> Bounds<T> {
             ),
         }
     }
-    pub fn extend(&self, edges: Edges<T>) -> Self {
-        Self {
-            origin: point(self.origin.x - edges.left, self.origin.y - edges.top),
-            size: size(
-                self.size.width + edges.left + edges.right,
-                self.size.height + edges.top + edges.bottom,
-            ),
-        }
-    }
     pub fn map<U>(self, f: impl Fn(T) -> U) -> Bounds<U> {
         Bounds {
             origin: point(f(self.origin.x), f(self.origin.y)),
@@ -551,18 +511,6 @@ impl Bounds<Pixels> {
     }
     pub fn to_device_pixels(&self, factor: f32) -> Bounds<DevicePixels> {
         self.map(|value| DevicePixels((value.0 * factor).round() as i32))
-    }
-}
-
-impl Bounds<ScaledPixels> {
-    pub fn to_device_pixels(&self) -> Bounds<DevicePixels> {
-        let origin = self
-            .origin
-            .map(|value| DevicePixels(value.0.floor() as i32));
-        let far = self
-            .bottom_right()
-            .map(|value| DevicePixels(value.0.ceil() as i32));
-        Bounds::from_corners(origin, far)
     }
 }
 
@@ -631,12 +579,6 @@ impl<T: Copy> Edges<T> {
     }
     pub fn any(&self, f: impl Fn(T) -> bool) -> bool {
         f(self.top) || f(self.right) || f(self.bottom) || f(self.left)
-    }
-}
-
-impl Edges<Pixels> {
-    pub fn scale(&self, factor: f32) -> Edges<ScaledPixels> {
-        self.map(|value| value.scale(factor))
     }
 }
 

@@ -11,12 +11,6 @@ pub struct Modifiers {
     pub function: bool,
 }
 
-impl Modifiers {
-    pub fn modified(&self) -> bool {
-        self.control || self.alt || self.shift || self.platform || self.function
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capslock {
     pub on: bool,
@@ -86,14 +80,6 @@ pub enum NavigationDirection {
     Forward,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TouchPhase {
-    Started,
-    #[default]
-    Moved,
-    Ended,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollDelta {
     /// Precise pixels, from a trackpad.
@@ -125,8 +111,6 @@ pub struct KeyDownEvent {
     pub keystroke: Keystroke,
     /// The key is held down and repeating.
     pub is_held: bool,
-    /// The key types text, so an input handler should get it before key bindings.
-    pub prefer_character_input: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,24 +142,6 @@ pub struct MouseUpEvent {
     pub click_count: usize,
 }
 
-#[derive(Clone, Debug)]
-pub struct ClickEvent {
-    pub down: MouseDownEvent,
-    pub up: MouseUpEvent,
-}
-
-impl ClickEvent {
-    pub fn position(&self) -> Point<Pixels> {
-        self.up.position
-    }
-    pub fn click_count(&self) -> usize {
-        self.up.click_count
-    }
-    pub fn modifiers(&self) -> Modifiers {
-        self.up.modifiers
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct MouseMoveEvent {
     pub position: Point<Pixels>,
@@ -192,8 +158,6 @@ impl MouseMoveEvent {
 #[derive(Clone, Debug, Default)]
 pub struct MouseExitEvent {
     pub position: Point<Pixels>,
-    pub pressed_button: Option<MouseButton>,
-    pub modifiers: Modifiers,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -201,7 +165,6 @@ pub struct ScrollWheelEvent {
     pub position: Point<Pixels>,
     pub delta: ScrollDelta,
     pub modifiers: Modifiers,
-    pub touch_phase: TouchPhase,
 }
 
 /// Files dragged onto a window from another app.
@@ -220,7 +183,6 @@ pub enum FileDropEvent {
     Exited,
 }
 
-/// An input event from the platform.
 #[derive(Clone, Debug)]
 pub enum PlatformInput {
     KeyDown(KeyDownEvent),
@@ -250,7 +212,6 @@ impl PlatformInput {
     }
 }
 
-/// A mouse event a listener can subscribe to.
 pub trait MouseEvent: Sized + 'static {
     fn from_input(input: &PlatformInput) -> Option<&Self>;
 }
@@ -295,15 +256,6 @@ impl DispatchPhase {
 pub struct Utf16Selection {
     pub range: Range<usize>,
     pub reversed: bool,
-}
-
-/// The parts of a window the platform handles, like the title bar drag area.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowControlArea {
-    Drag,
-    Close,
-    Max,
-    Min,
 }
 
 pub(crate) const DEFAULT_LINE_HEIGHT: Pixels = px(20.);

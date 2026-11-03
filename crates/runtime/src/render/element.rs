@@ -24,7 +24,6 @@ pub(super) struct Build<'a> {
     pub(super) pixel_ratio: f32,
     pub(super) view: &'a Rc<PageState>,
     pub(super) layers: PaintLayers,
-    /// The boxes from the root to the parent.
     pub(super) ancestors: Rc<[usize]>,
     /// Where the boxes after the stacking context root start in `ancestors`.
     pub(super) stacking: usize,
@@ -67,7 +66,6 @@ const SVG_SOURCE: [Prop; 13] = [
 struct SvgSource<'a> {
     doc: &'a Document,
     styles: &'a ComputedStyles,
-    /// The `<svg>` node.
     root: usize,
     /// The viewBox scale, which `vector-effect: non-scaling-stroke` undoes.
     scale: f32,
@@ -905,20 +903,21 @@ pub(super) fn element(
                     .get("href")
                     .or_else(|| child.attrs.get("xlink:href"))
                     .and_then(|value| value.strip_prefix('#'))
-                && let Some(target) = super::effects::index(ids, doc)
-                    .get(reference)
-                    .and_then(|targets| {
-                        targets.iter().copied().find(|&target| {
-                            let mut root = target;
-                            while let Some(parent) = doc.nodes[root].parent {
-                                if parent == id {
-                                    return false;
+                && let Some(target) =
+                    super::effects::index(ids, doc)
+                        .get(reference)
+                        .and_then(|targets| {
+                            targets.iter().copied().find(|&target| {
+                                let mut root = target;
+                                while let Some(parent) = doc.nodes[root].parent {
+                                    if parent == id {
+                                        return false;
+                                    }
+                                    root = parent;
                                 }
-                                root = parent;
-                            }
-                            root == scope
+                                root == scope
+                            })
                         })
-                    })
                 && !visited.contains(&target)
             {
                 targets.push(target);
@@ -927,17 +926,26 @@ pub(super) fn element(
         }
         let key = ([width, height], std::hash::Hasher::finish(&hasher));
         let props = || style::SVG.iter().chain(&SVG_SOURCE);
-        let kept = view.svgs.borrow().get(&id).and_then(|(old, at, source, boxes)| {
-            (*at == key
-                && old.len() == painted.len()
-                && old.iter().zip(&painted).enumerate().all(|(index, (old, new))| {
-                    Rc::ptr_eq(old, new)
-                        || props().all(|&prop| {
-                            index == 0 && !prop.inherited() || old.get(prop) == new.get(prop)
-                        })
-                }))
-            .then(|| (source.clone(), boxes.clone()))
-        });
+        let kept = view
+            .svgs
+            .borrow()
+            .get(&id)
+            .and_then(|(old, at, source, boxes)| {
+                (*at == key
+                    && old.len() == painted.len()
+                    && old
+                        .iter()
+                        .zip(&painted)
+                        .enumerate()
+                        .all(|(index, (old, new))| {
+                            Rc::ptr_eq(old, new)
+                                || props().all(|&prop| {
+                                    index == 0 && !prop.inherited()
+                                        || old.get(prop) == new.get(prop)
+                                })
+                        }))
+                .then(|| (source.clone(), boxes.clone()))
+            });
         let built = kept.is_none();
         let (source, boxes) = kept.unwrap_or_else(|| {
             let view_box = node
@@ -1106,10 +1114,7 @@ pub(super) fn element(
                     word_spacing: px(0.),
                     font_size: None,
                 };
-                f32::from(
-                    text.shape_line(label.to_owned().into(), em, &[run], None)
-                        .width,
-                )
+                f32::from(text.shape_line(label, em, &[run], None).width)
             };
             let zero = text
                 .ch_advance(face, em)
@@ -1658,9 +1663,8 @@ pub(super) fn element(
                                 word_spacing: px(0.),
                                 font_size: None,
                             };
-                            widest = widest.max(f32::from(
-                                text.shape_line(label.into(), size, &[run], None).width,
-                            ));
+                            widest = widest
+                                .max(f32::from(text.shape_line(&label, size, &[run], None).width));
                         }
                         _ => {}
                     }
@@ -3295,10 +3299,8 @@ pub(super) fn element(
                 || style
                     .get(Prop::FLEX_BASIS)
                     .is_some_and(|v| v != "auto" && v != "content"));
-        // An auto width grid in a box sized by its content, like a row flex item, gets its
-        // width from the flex layout. Its tracks use the width from the last layout.
         // In a box that shrinks to fit, like a float, an absolute box, an inline-block or a row flex item, an
-        // auto width grid gets its width from the layout.
+        // auto width grid gets its width from the layout. Its tracks use the width from the last layout.
         let shrunk = style.get(Prop::DISPLAY).is_some_and(|v| v == "grid")
             && slot.is_none()
             && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
@@ -4053,23 +4055,21 @@ pub(super) fn element(
             )))
             .h(px((bounds[3] - margin[0] - margin[2]).max(0.)));
     }
-    // WARNING: Windows moves the window in the native hit test (`window_control_area`), macOS and Linux on the first drag.
+    // WARNING: Windows moves the window in the native hit test (`window_drag_area`), macOS and Linux on the first drag.
     if drag {
-        el = el
-            .window_control_area(renderer::WindowControlArea::Drag)
-            .on_mouse_down(MouseButton::Left, {
-                let view = view.clone();
-                move |event: &renderer::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    if event.click_count != 2 {
-                        view.moving.set(true);
-                    } else if cfg!(target_os = "macos") {
-                        window.titlebar_double_click();
-                    } else {
-                        window.zoom_window();
-                    }
+        el = el.window_drag_area().on_mouse_down(MouseButton::Left, {
+            let view = view.clone();
+            move |event: &renderer::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                if event.click_count != 2 {
+                    view.moving.set(true);
+                } else if cfg!(target_os = "macos") {
+                    window.titlebar_double_click();
+                } else {
+                    window.zoom_window();
                 }
-            });
+            }
+        });
     }
     let parent_display = parent
         .and_then(|parent| styles.values[parent].get(Prop::DISPLAY))
@@ -4517,10 +4517,7 @@ pub(super) fn field_size(
                         word_spacing: px(0.),
                         font_size: None,
                     };
-                    f32::from(
-                        text.shape_line(line.to_owned().into(), em, &[run], None)
-                            .width,
-                    )
+                    f32::from(text.shape_line(line, em, &[run], None).width)
                 })
                 .fold(0., f32::max)
                 + 1.
@@ -5202,8 +5199,10 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> AnyElement 
                 if entry.0 != *source {
                     // WARNING: paint draws the tree parsed here, so a changed source is parsed once.
                     let tree = super::canvas::svg_tree(source).ok();
-                    let (size, content, boxes) =
-                        tree.as_ref().map(super::canvas::svg_boxes).unwrap_or_default();
+                    let (size, content, boxes) = tree
+                        .as_ref()
+                        .map(super::canvas::svg_boxes)
+                        .unwrap_or_default();
                     if let Some(tree) = tree {
                         state.svg_trees.insert(id, tree);
                     }

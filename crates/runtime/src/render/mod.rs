@@ -237,7 +237,6 @@ impl PageState {
     }
 }
 
-/// The view of a window.
 pub(crate) struct PageView(pub(crate) Rc<PageState>);
 
 impl std::ops::Deref for PageView {
@@ -414,7 +413,10 @@ impl PageView {
             let zoom = window.zoom() as f64;
             let bounds = [0., 0., width as f64 * zoom, height as f64 * zoom];
             let mut frames = self.frames.borrow_mut();
-            let set = &mut frames.entry(usize::MAX).or_insert(([f64::NAN; 4], 0, true)).0;
+            let set = &mut frames
+                .entry(usize::MAX)
+                .or_insert(([f64::NAN; 4], 0, true))
+                .0;
             if *set != bounds {
                 *set = bounds;
                 let _ = browser.set_bounds(bounds);

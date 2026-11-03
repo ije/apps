@@ -14,7 +14,7 @@ use crate::{
     Bounds, Capslock, CursorStyle, FileDropEvent, KeyUpEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, point, px, size,
+    point, px, size,
 };
 use anyhow::{Context as _, Result};
 use calloop::{
@@ -66,7 +66,7 @@ use xkbcommon::xkb;
 
 /// Linux key codes are XKB key codes minus 8.
 const MIN_KEYCODE: u32 = 8;
-/// The text formats we offer, then the ones we read.
+/// The text formats offered, then the ones read.
 const TEXT_MIME_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 const READ_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
 const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
@@ -294,7 +294,7 @@ impl Client {
                 clipboard: None,
                 cached: None,
                 drag: Drag::default(),
-                // Removed, so the apps we start don't take it.
+                // Removed from the environment below, so child processes don't take it.
                 startup_token: std::env::var("XDG_ACTIVATION_TOKEN")
                     .ok()
                     .filter(|token| !token.is_empty()),
@@ -1229,10 +1229,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
             }
             wl_pointer::Event::Leave { .. } => {
                 let window = state.focused(&state.mouse_focus);
+                state.button = None;
                 let input = PlatformInput::MouseExited(MouseExitEvent {
                     position: state.mouse,
-                    pressed_button: state.button.take(),
-                    modifiers: state.modifiers,
                 });
                 state.mouse_focus = None;
                 drop(state);
@@ -1366,7 +1365,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                     position: state.mouse,
                     delta,
                     modifiers: state.modifiers,
-                    touch_phase: TouchPhase::Moved,
                 });
                 drop(state);
                 if let Some(window) = window {

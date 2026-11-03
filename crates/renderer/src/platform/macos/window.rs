@@ -2017,7 +2017,6 @@ extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
         let handled = callbacks.input(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
             is_held: false,
-            prefer_character_input: false,
         }));
         if let Ok(mut lock) = state.try_borrow_mut() {
             lock.do_command_handled = Some(handled);

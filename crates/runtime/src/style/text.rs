@@ -176,6 +176,7 @@ pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
         "alias" => DragLink,
         "copy" => DragCopy,
         "context-menu" => ContextualMenu,
+        "none" => None,
         _ => return Option::None,
     })
 }

@@ -52,7 +52,6 @@ pub(crate) struct Hud {
 }
 
 impl Hud {
-    /// Shows or hides the HUD of `view`.
     pub(crate) fn toggle(view: &Rc<PageState>, window: &mut Window) {
         if view.hud.take().is_none() {
             static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
@@ -149,7 +148,7 @@ extern "C" fn paint(window: *mut c_void, item: &Item) {
         return;
     }
     let text = unsafe { std::slice::from_raw_parts(item.text, item.len) };
-    let text = String::from_utf8_lossy(text).into_owned();
+    let text = String::from_utf8_lossy(text);
     let run = TextRun {
         len: text.len(),
         font: renderer::font(FONT),
@@ -163,7 +162,7 @@ extern "C" fn paint(window: *mut c_void, item: &Item) {
     };
     let line = window
         .text_system()
-        .shape_line(text.into(), px(item.size), &[run], None);
+        .shape_line(&text, px(item.size), &[run], None);
     let align = match item.align {
         1 => TextAlign::Center,
         2 => TextAlign::Right,

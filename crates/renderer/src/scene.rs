@@ -506,7 +506,6 @@ pub(crate) struct EffectPrimitive {
     pub content_mask: ContentMask<ScaledPixels>,
 }
 
-/// The style of a border.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum BorderStyle {

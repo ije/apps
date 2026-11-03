@@ -66,7 +66,6 @@ struct Library {
     recycle: unsafe extern "C" fn(*mut c_void, u64, *mut u8, u32, u32),
 }
 
-/// The file name of the media library.
 pub fn library_name(platform: &str) -> &'static str {
     match platform {
         "macos" => "libapps_media.dylib",
@@ -153,7 +152,6 @@ impl Media {
         Ok(*self.raw.insert((raw, library)))
     }
 
-    /// Starts to load element `id` from a file or from bytes.
     pub fn open(&mut self, id: u64, source: Result<&Path, &[u8]>, video: bool) -> Result<()> {
         let (raw, library) = self.raw()?;
         let (data, file) = match source {

@@ -3336,7 +3336,10 @@ fn classic_scripts_share_the_global_scope_and_run_before_modules() {
             "src/main.ts",
             "const order: string[] = (globalThis as any).order; if (order.join() !== 'inline,classic') throw Error('module ' + order); order.push('module');",
         ),
-        ("web/deferred.js", "order.push('deferred'); order.scripts.push(document.currentScript.getAttribute('src'));"),
+        (
+            "web/deferred.js",
+            "order.push('deferred'); order.scripts.push(document.currentScript.getAttribute('src'));",
+        ),
         ("web/style.css", "@import '/web/base.css';"),
         ("web/base.css", "#color { color: rgb(1, 2, 3) }"),
         ("web/alt.css", "#color { color: rgb(9, 9, 9) }"),

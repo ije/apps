@@ -58,10 +58,10 @@ pub(super) fn key_event(
         VK_PACKET => None,
         _ => {
             let scan_code = (lparam.0 >> 16) as u32 & 0xFF;
-            let (key_char, prefer_character_input) = if down {
+            let key_char = if down {
                 key_char(vkey, scan_code)
             } else {
-                (None, false)
+                None
             };
             let key = named_key(vkey).map(str::to_owned).or_else(|| {
                 if modifiers.shift && shifts_to_symbol(vkey) {
@@ -88,7 +88,6 @@ pub(super) fn key_event(
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
                     is_held: lparam.0 & (1 << 30) != 0,
-                    prefer_character_input,
                 })
             } else {
                 PlatformInput::KeyUp(KeyUpEvent { keystroke })
@@ -179,46 +178,17 @@ fn translate(vkey: VIRTUAL_KEY, scan_code: u32, shift: bool) -> Option<String> {
         .filter(|text| text.chars().next().is_some_and(|char| !char.is_control()))
 }
 
-/// The text a key types, and whether it is a dead key or differs from the key without modifiers.
-fn key_char(vkey: VIRTUAL_KEY, scan_code: u32) -> (Option<String>, bool) {
+/// The text a key types.
+fn key_char(vkey: VIRTUAL_KEY, scan_code: u32) -> Option<String> {
     let mut state = [0u8; 256];
     // SAFETY: plain keyboard state query into a local buffer.
-    if unsafe { GetKeyboardState(&mut state) }.is_err() {
-        return (None, false);
-    }
+    unsafe { GetKeyboardState(&mut state) }.ok()?;
     let mut buffer = [0u16; 8];
     // SAFETY: flag 4 keeps the keyboard state; the buffer is local.
     let len = unsafe { ToUnicode(vkey.0 as u32, scan_code, Some(&state), &mut buffer, 0x4) };
-    let typed = &buffer[..len.unsigned_abs() as usize];
-    let text = String::from_utf16(typed)
+    String::from_utf16(&buffer[..len.unsigned_abs() as usize])
         .ok()
-        .filter(|text| text.chars().next().is_some_and(|char| !char.is_control()));
-    if len < 0 || text.is_none() {
-        return (text, len < 0);
-    }
-    let held = |key: VIRTUAL_KEY| state[key.0 as usize] & 0x80 != 0;
-    if !held(VK_CONTROL) && !held(VK_MENU) && !held(VK_LWIN) && !held(VK_RWIN) {
-        return (text, false);
-    }
-    for key in [
-        VK_CONTROL,
-        VK_LCONTROL,
-        VK_RCONTROL,
-        VK_MENU,
-        VK_LMENU,
-        VK_RMENU,
-        VK_LWIN,
-        VK_RWIN,
-    ] {
-        state[key.0 as usize] = 0;
-    }
-    let mut plain = [0u16; 8];
-    // SAFETY: as above.
-    let plain_len = unsafe { ToUnicode(vkey.0 as u32, scan_code, Some(&state), &mut plain, 0x4) };
-    (
-        text,
-        len != plain_len || typed != &plain[..plain_len.unsigned_abs() as usize],
-    )
+        .filter(|text| text.chars().next().is_some_and(|char| !char.is_control()))
 }
 
 /// A composition string of the IME.

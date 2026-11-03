@@ -607,7 +607,9 @@ impl Desktop {
                         {
                             loop {
                                 let more = match match cx.as_deref_mut() {
-                                    Some(cx) => crate::render::scripted(cx, None, || page(source, url)),
+                                    Some(cx) => {
+                                        crate::render::scripted(cx, None, || page(source, url))
+                                    }
                                     None => page(source, url),
                                 } {
                                     Ok(more) => more == "true",
@@ -1295,7 +1297,6 @@ impl Desktop {
         crate::host::idle(true);
     }
 
-    /// Quits with a failure code, because AppKit exits with 0 after its quit hook.
     fn fail(&mut self) {
         self.quit = true;
         let mut host = self.host.borrow_mut();
@@ -1517,7 +1518,6 @@ impl Desktop {
     }
 }
 
-/// Collects garbage once JS has been quiet for a second.
 fn shrink_when_quiet(api: Rc<JavaScriptCore>, cx: &mut App) {
     let busy = api.busy.get();
     cx.timer(Duration::from_secs(1), move |cx| {

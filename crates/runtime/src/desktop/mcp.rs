@@ -925,7 +925,6 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
                     ScrollDelta::Pixels(delta.map(px))
                 },
                 modifiers,
-                touch_phase: Default::default(),
             }));
         }
         "key" => {

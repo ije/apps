@@ -2783,7 +2783,7 @@ impl Config {
             return value.to_owned();
         }
         // WARNING: one pass resolves the innermost calls first, at their `)`. Scanning again per
-        // function and per failed call was exponential.
+        // function and per failed call is exponential.
         let mut out = String::with_capacity(value.len());
         let mut open: Vec<(usize, Option<&str>)> = Vec::new();
         // WARNING: each call reads all of its arguments, so calls nested past this depth stay as written.
@@ -2963,7 +2963,7 @@ impl Config {
             return functional(&class[..index], Some(&class[index + 1..]));
         }
         // WARNING: a value is a named value, so only dashes after the last character it can't hold
-        // start one. Checking each suffix again was quadratic.
+        // start one. Checking each suffix again is quadratic.
         let named = class
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '%' | '-')))
             .map_or(0, |index| index + 1);

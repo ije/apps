@@ -209,7 +209,6 @@ impl Host {
             children.retain(|&child| doc.nodes[child].parent == Some(parent));
             doc.nodes[parent].children = children;
         }
-        /// Inserts the children of a run before `before`, or at the end.
         fn insert(
             doc: &mut Document,
             (parent, before): (usize, Option<usize>),

@@ -1,6 +1,6 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// WARNING: `js/` files are embedded deflated by build.rs (773 KB → 214 KB) and inflated on use.
+// WARNING: build.rs embeds `js/` files deflated, so each use inflates them.
 macro_rules! js {
     ($path:literal) => {
         $crate::inflate(include_bytes!(concat!(env!("OUT_DIR"), "/js/", $path)))

@@ -6,8 +6,8 @@ use super::{
 use crate::{
     CursorStyle, FileDropEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, Scene,
-    ScrollDelta, ScrollWheelEvent, Size, TouchPhase, WindowChange, WindowControlArea,
-    WindowOptions, WindowState, app::Callbacks, point, px,
+    ScrollDelta, ScrollWheelEvent, Size, WindowChange, WindowOptions, WindowState, app::Callbacks,
+    point, px,
 };
 use anyhow::{Context as _, Result};
 use raw_window_handle as rwh;
@@ -948,14 +948,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                     return None;
                 }
                 let movable = inner.movable.get();
-                let area = callbacks.control_area().and_then(|area| match area {
-                    WindowControlArea::Drag => movable.then_some(HTCAPTION),
-                    WindowControlArea::Close => Some(HTCLOSE),
-                    WindowControlArea::Max if has(WS_MAXIMIZEBOX) => Some(HTMAXBUTTON),
-                    WindowControlArea::Min if has(WS_MINIMIZEBOX) => Some(HTMINBUTTON),
-                    _ if movable => Some(HTCAPTION),
-                    _ => Some(HTNOWHERE),
-                });
+                let area = (movable && callbacks.in_drag_area()).then_some(HTCAPTION);
                 if !inner.hide_title_bar {
                     return area.map(|area| area as isize);
                 }
@@ -1062,8 +1055,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 inner.hovered.set(false);
                 callbacks.input(PlatformInput::MouseExited(MouseExitEvent {
                     position: inner.position.get(),
-                    pressed_button: None,
-                    modifiers: events::modifiers(),
                 }));
                 Some(0)
             }
@@ -1182,7 +1173,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                         point(0., distance)
                     }),
                     modifiers,
-                    touch_phase: TouchPhase::Moved,
                 }));
                 Some(0)
             }

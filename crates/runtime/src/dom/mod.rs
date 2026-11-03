@@ -2,7 +2,7 @@ mod document;
 mod entities;
 mod selector;
 
-pub use document::{Attrs, Document, Node, decode, escape};
+pub use document::{Attrs, Document, Node, escape};
 pub(crate) use selector::{
     ACTIVE, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache, SelectorList,
 };
@@ -212,7 +212,6 @@ impl LayoutMirror {
         }
     }
 
-    /// Counts a layout in the third header float, so pages know when cached box sizes are old.
     /// Whether frames turned boxes since the last layout, so their bounds are stale.
     pub(crate) fn moved(&self) -> bool {
         self.memory
@@ -227,6 +226,7 @@ impl LayoutMirror {
         }
     }
 
+    /// Counts a layout in the third header float, so pages know when cached box sizes are old.
     pub(crate) fn touch(&mut self) {
         self.reserve(0);
         if let Some(memory) = &self.memory {
@@ -627,7 +627,6 @@ pub fn call(
             | "dom.assignedNodes"
             | "dom.queryWithin"
             | "dom.html"
-            | "dom.style"
             | "dom.focus"
             | "dom.hover"
             | "dom.active"
@@ -1685,28 +1684,6 @@ pub fn call(
                 state.computed = None;
                 state.dirty = true;
                 Ok(result.unwrap_or_else(|error| json!({ "error": error })))
-            }
-            "dom.style" => {
-                let system = state.text_system.clone();
-                let styles = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
-                );
-                let style = &styles.values[id];
-                Ok(match args[1].as_array() {
-                    Some(names) => json!(
-                        names
-                            .iter()
-                            .filter_map(|name| {
-                                let name = name.as_str()?;
-                                Some((name, style.get(Prop::find(name)?)?))
-                            })
-                            .collect::<HashMap<_, _>>()
-                    ),
-                    None => json!(&**style),
-                })
             }
             "dom.selection" => {
                 state.selection.clear();

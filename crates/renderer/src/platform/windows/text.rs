@@ -157,63 +157,25 @@ impl TextSystem {
     pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         let state = self.0.borrow();
         let face = &state.fonts[font_id.0].face;
-        // SAFETY: the OS/2 table is read while DirectWrite holds it.
-        unsafe {
-            let mut metrics = DWRITE_FONT_METRICS1::default();
-            face.GetMetrics(&mut metrics);
-            let (mut data, mut len, mut context, mut exists) =
-                (std::ptr::null_mut(), 0u32, std::ptr::null_mut(), BOOL(0));
-            let mut average_width = 0.;
-            if face
-                .TryGetFontTable(
-                    u32::from_le_bytes(*b"OS/2"),
-                    &mut data,
-                    &mut len,
-                    &mut context,
-                    &mut exists,
-                )
-                .is_ok()
-                && exists.as_bool()
-            {
-                if len >= 4 {
-                    let table = std::slice::from_raw_parts(data as *const u8, 4);
-                    average_width = i16::from_be_bytes([table[2], table[3]]) as f32;
-                }
-                face.ReleaseFontTable(context);
-            }
-            FontMetrics {
-                units_per_em: metrics.Base.designUnitsPerEm as u32,
-                ascent: metrics.Base.ascent as f32,
-                descent: -(metrics.Base.descent as f32),
-                line_gap: metrics.Base.lineGap as f32,
-                underline_position: metrics.Base.underlinePosition as f32,
-                underline_thickness: metrics.Base.underlineThickness as f32,
-                cap_height: metrics.Base.capHeight as f32,
-                x_height: metrics.Base.xHeight as f32,
-                bounding_box: Bounds::new(
-                    point(metrics.glyphBoxLeft as f32, metrics.glyphBoxBottom as f32),
-                    size(
-                        (metrics.glyphBoxRight - metrics.glyphBoxLeft) as f32,
-                        (metrics.glyphBoxTop - metrics.glyphBoxBottom) as f32,
-                    ),
+        let mut metrics = DWRITE_FONT_METRICS1::default();
+        // SAFETY: plain metrics query into a local struct.
+        unsafe { face.GetMetrics(&mut metrics) };
+        FontMetrics {
+            units_per_em: metrics.Base.designUnitsPerEm as u32,
+            ascent: metrics.Base.ascent as f32,
+            descent: -(metrics.Base.descent as f32),
+            line_gap: metrics.Base.lineGap as f32,
+            cap_height: metrics.Base.capHeight as f32,
+            x_height: metrics.Base.xHeight as f32,
+            bounding_box: Bounds::new(
+                point(metrics.glyphBoxLeft as f32, metrics.glyphBoxBottom as f32),
+                size(
+                    (metrics.glyphBoxRight - metrics.glyphBoxLeft) as f32,
+                    (metrics.glyphBoxTop - metrics.glyphBoxBottom) as f32,
                 ),
-                average_width,
-                tall_ascent: false,
-            }
+            ),
+            tall_ascent: false,
         }
-    }
-
-    pub fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        let metrics = self.0.borrow().glyph_metrics(font_id, glyph_id)?;
-        let width =
-            metrics.advanceWidth as i32 - (metrics.leftSideBearing + metrics.rightSideBearing);
-        let height =
-            metrics.advanceHeight as i32 - (metrics.topSideBearing + metrics.bottomSideBearing);
-        let y = metrics.verticalOriginY + metrics.bottomSideBearing - metrics.advanceHeight as i32;
-        Ok(Bounds::new(
-            point(metrics.leftSideBearing as f32, y as f32),
-            size(width as f32, height as f32),
-        ))
     }
 
     pub fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {

@@ -19,25 +19,11 @@ pub fn rgba(hex: u32) -> Rgba {
     }
 }
 
-/// An opaque color from `0xRRGGBB`.
-pub fn rgb(hex: u32) -> Rgba {
-    rgba(hex << 8 | 0xff)
-}
-
 pub const fn black() -> Rgba {
     Rgba {
         r: 0.,
         g: 0.,
         b: 0.,
-        a: 1.,
-    }
-}
-
-pub const fn white() -> Rgba {
-    Rgba {
-        r: 1.,
-        g: 1.,
-        b: 1.,
         a: 1.,
     }
 }

@@ -1,8 +1,8 @@
 # Architecture
 
 - Electron compatible API
-- Stanard Web API
-- DOM and CSS renderer on GPU renderer with builtin tailwindCSS support
+- Standard Web API
+- DOM and CSS drawn by a GPU renderer, with built-in Tailwind CSS
 - JavaScriptCore runs page scripts and preloads. A Rust app uses its Cargo binary as the main entry and registers native handlers on the main thread. JavaScript apps also use JavaScriptCore for the main entry.
 
 ## Security
@@ -17,7 +17,7 @@ By default script execute and dynamic importing are disabled:
 
 To enable the two features, add `jsExecute` and `httpImport` in `features` option in `package.json`
 
-> The limtation is only applied to `BrowserWindow` class, `WebContentsView` respects the webview sandboxing.
+> The limitation applies only to the `BrowserWindow` class, `WebContentsView` respects the webview sandboxing.
 
 ## Node Integration
 
@@ -26,7 +26,7 @@ To enable the two features, add `jsExecute` and `httpImport` in `features` optio
 - Support NAPI (`.node` module)
 - Support FFI via `node:ffi`
 
-> Unlike eletron bundles nodejs, `@pierre/apps` provides limited node integration via rust code.
+> Unlike Electron, which bundles Node.js, `@pierre/apps` provides limited node integration via rust code.
 
 ## Renderer
 

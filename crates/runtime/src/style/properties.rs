@@ -474,7 +474,6 @@ impl Prop {
         }
     }
 
-    /// A `--*` custom property.
     pub(crate) fn is_custom(self) -> bool {
         self.0 & CUSTOM != 0
     }

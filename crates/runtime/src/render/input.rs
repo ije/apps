@@ -698,7 +698,7 @@ impl renderer::View for PageView {
         };
         let line = window
             .text_system()
-            .shape_line(selected.into(), px(font_size), &[run], None);
+            .shape_line(selected, px(font_size), &[run], None);
         let index = line.closest_index_for_x(point.x - px(bounds[0]));
         Some((offset + selected[..index].encode_utf16().count()).min(text.encode_utf16().count()))
     }

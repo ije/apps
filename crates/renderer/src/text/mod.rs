@@ -48,13 +48,7 @@ impl Hash for FontWeight {
 impl Eq for FontWeight {}
 
 impl FontWeight {
-    pub const THIN: Self = Self(100.);
-    pub const LIGHT: Self = Self(300.);
     pub const NORMAL: Self = Self(400.);
-    pub const MEDIUM: Self = Self(500.);
-    pub const SEMIBOLD: Self = Self(600.);
-    pub const BOLD: Self = Self(700.);
-    pub const BLACK: Self = Self(900.);
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default)]
@@ -72,12 +66,6 @@ pub struct FontFeatures(pub Rc<[(String, u32)]>);
 impl FontFeatures {
     pub fn tag_value_list(&self) -> &[(String, u32)] {
         &self.0
-    }
-    pub fn is_calt_enabled(&self) -> Option<bool> {
-        self.0
-            .iter()
-            .find(|(tag, _)| tag == "calt")
-            .map(|(_, value)| *value == 1)
     }
 }
 
@@ -128,13 +116,9 @@ pub struct FontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub line_gap: f32,
-    pub underline_position: f32,
-    pub underline_thickness: f32,
     pub cap_height: f32,
     pub x_height: f32,
     pub bounding_box: Bounds<f32>,
-    /// `xAvgCharWidth` from the OpenType `OS/2` table; zero when missing.
-    pub average_width: f32,
     /// Browsers on macOS add 15% of the height to the ascent of Times, Helvetica and Courier.
     pub tall_ascent: bool,
 }
@@ -214,7 +198,6 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
-/// A styled run of text.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct TextRun {
     /// The length in UTF-8 bytes.
@@ -349,12 +332,12 @@ impl TextSystem {
         names
     }
 
-    /// Adds font files. Cached layouts and font choices are dropped.
     /// Advances whenever fonts are added.
     pub(crate) fn generation(&self) -> usize {
         self.shared.generation.get()
     }
 
+    /// Drops cached layouts and font choices.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform.add_fonts(fonts)?;
         self.fonts.borrow_mut().clear();
@@ -404,22 +387,6 @@ impl TextSystem {
         })
     }
 
-    pub fn typographic_bounds(
-        &self,
-        font_id: FontId,
-        font_size: Pixels,
-        character: char,
-    ) -> Result<Bounds<Pixels>> {
-        let glyph = self
-            .platform
-            .glyph_for_char(font_id, character)
-            .with_context(|| format!("glyph not found for character '{character}'"))?;
-        let bounds = self.platform.typographic_bounds(font_id, glyph)?;
-        Ok(self.read_metrics(font_id, |metrics| {
-            (bounds / metrics.units_per_em as f32 * font_size.0).map(px)
-        }))
-    }
-
     pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
         let glyph = self
             .platform
@@ -447,13 +414,6 @@ impl TextSystem {
     pub fn x_height(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| {
             metrics.scale(metrics.x_height, font_size)
-        })
-    }
-
-    /// The OS/2 average character width; zero when the font has none.
-    pub fn average_width(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| {
-            metrics.scale(metrics.average_width, font_size)
         })
     }
 
@@ -601,7 +561,7 @@ impl TextSystem {
     /// Shapes one line, without newlines, for painting.
     pub fn shape_line(
         &self,
-        text: SharedString,
+        text: &str,
         font_size: Pixels,
         runs: &[TextRun],
         force_width: Option<Pixels>,
@@ -617,10 +577,9 @@ impl TextSystem {
                 _ => decoration_runs.push(DecorationRun::new(run, run.len)),
             }
         }
-        let layout = self.layout_line(&text, font_size, runs, force_width);
+        let layout = self.layout_line(text, font_size, runs, force_width);
         ShapedLine {
             layout,
-            text,
             decoration_runs,
         }
     }

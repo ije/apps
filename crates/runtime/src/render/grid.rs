@@ -1498,7 +1498,7 @@ pub(crate) fn layout(
             value
         }
     };
-    // WARNING: large grids have thousands of tracks, so track starts are summed once, in the same order as before.
+    // WARNING: large grids have thousands of tracks, so track starts are summed once, in track order.
     let starts = |sizes: &[f32]| {
         let mut sum = 0f32;
         std::iter::once(0.)
@@ -1930,8 +1930,18 @@ mod tests {
         let rows: Vec<_> = (0..doc.nodes.len())
             .filter(|&id| doc.nodes[id].tag == "main")
             .map(|main| {
-                layout(&doc, main, &styles, Some(800.), None, None, None, &text, &mut Default::default())
-                    .rows
+                layout(
+                    &doc,
+                    main,
+                    &styles,
+                    Some(800.),
+                    None,
+                    None,
+                    None,
+                    &text,
+                    &mut Default::default(),
+                )
+                .rows
             })
             .collect();
         // 300px / 1.25, and a 200px border box gives 160px; a clipping box keeps 30px, others fit their content.

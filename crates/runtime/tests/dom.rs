@@ -1487,8 +1487,17 @@ fn range_inputs_sanitize_slide_and_step() {
         check('min, max and step reflect and sanitize ' + values, () => values.join() === '1,1,0.5,1,0.8,-0.1');
         "#,
     );
-    let id: usize = engine.eval("document.getElementById('r')._id", "test").unwrap().parse().unwrap();
-    host.borrow_mut().dom.entry(1).or_default().bounds.insert(id, [0., 0., 116., 16.]);
+    let id: usize = engine
+        .eval("document.getElementById('r')._id", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
+    host.borrow_mut()
+        .dom
+        .entry(1)
+        .or_default()
+        .bounds
+        .insert(id, [0., 0., 116., 16.]);
     engine.eval(r#"
         const r = document.getElementById('r'), seen = [];
         r.removeAttribute('min'); r.removeAttribute('max'); r.removeAttribute('step'); r.value = '50';

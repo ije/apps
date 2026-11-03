@@ -342,11 +342,7 @@ fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool) {
     let text = keystroke.key_char.clone().filter(|_| {
         !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.function
     });
-    let handled = callbacks.input(PlatformInput::KeyDown(KeyDownEvent {
-        keystroke,
-        is_held,
-        prefer_character_input: false,
-    }));
+    let handled = callbacks.input(PlatformInput::KeyDown(KeyDownEvent { keystroke, is_held }));
     if !handled && let Some(text) = text {
         callbacks.replace_text_in_range(None, &text);
     }

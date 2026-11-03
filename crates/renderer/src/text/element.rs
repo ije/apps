@@ -100,7 +100,6 @@ impl IntoElement for &'static str {
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
 struct TextLayoutInner {
-    len: usize,
     lines: Vec<WrappedLine>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
@@ -196,7 +195,6 @@ impl TextLayout {
                     }
                     None => (text.clone(), Cow::Borrowed(runs), false),
                 };
-                let len = text.len();
                 // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
                 let lines = system
                     .shape_text_indented(
@@ -272,7 +270,6 @@ impl TextLayout {
                 // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
                 if probe.is_none() || layout.0.borrow().is_none() {
                     *layout.0.borrow_mut() = Some(TextLayoutInner {
-                        len,
                         lines,
                         line_height,
                         wrap_width,
@@ -356,22 +353,6 @@ impl TextLayout {
         None
     }
 
-    pub fn line_layout_for_index(&self, index: usize) -> Option<Rc<WrappedLineLayout>> {
-        let inner = self.0.borrow();
-        let mut start = 0;
-        for line in &inner.as_ref()?.lines {
-            let end = start + line.len();
-            if index < start {
-                break;
-            } else if index > end {
-                start = end + 1;
-            } else {
-                return Some(line.layout.clone());
-            }
-        }
-        None
-    }
-
     pub fn line_layouts(&self) -> Vec<Rc<WrappedLineLayout>> {
         self.0
             .borrow()
@@ -393,14 +374,6 @@ impl TextLayout {
             .borrow()
             .as_ref()
             .map_or(px(0.), |inner| inner.line_height)
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.borrow().as_ref().map_or(0, |inner| inner.len)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

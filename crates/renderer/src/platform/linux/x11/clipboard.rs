@@ -90,7 +90,7 @@ enum Handover {
 struct Inner {
     server: Connection,
     atoms: Atoms,
-    /// Our text while we own the clipboard.
+    /// The text while this app owns the clipboard.
     text: Mutex<Option<Vec<u8>>>,
     handover: Mutex<Handover>,
     handover_done: Condvar,
@@ -390,7 +390,7 @@ impl Inner {
                 )?;
                 true
             }
-            // We lost the clipboard, or the format is not text.
+            // The clipboard was lost, or the format is not text.
             _ => false,
         };
         conn.send_event(
@@ -415,7 +415,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Asks the clipboard manager to keep our text after we quit.
+    /// Asks the clipboard manager to keep the text after the app quits.
     fn hand_over(&self) -> Result<()> {
         if self.text.lock().unwrap().is_none() || !self.is_owner()? {
             return Ok(());

@@ -180,8 +180,8 @@ impl TextSystem {
                 font_ids
             }
         };
-        // font-kit puts Medium (0.23) at weight 530, so 500 picked Regular. Apple's weight
-        // constants are CSS weights 100 to 900, as in browsers.
+        // font-kit maps Medium (0.23) to weight 530, so 500 would pick Regular. Map Apple's weight
+        // constants to CSS weights 100 to 900 instead, as browsers do.
         let properties = candidates
             .iter()
             .map(|font_id| {
@@ -240,22 +240,12 @@ impl TextSystem {
         let state = self.0.borrow();
         let font = &state.fonts[font_id.0];
         FontMetrics {
-            average_width: font
-                .load_font_table(u32::from_be_bytes(*b"OS/2"))
-                .filter(|table| table.len() >= 4)
-                .map_or(0., |table| i16::from_be_bytes([table[2], table[3]]) as f32),
             tall_ascent: matches!(
                 font.family_name().as_str(),
                 "Times" | "Helvetica" | "Courier"
             ),
             ..font_kit_metrics_to_metrics(font.metrics())
         }
-    }
-
-    pub fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        Ok(bounds_from_rect(
-            self.0.borrow().fonts[font_id.0].typographic_bounds(glyph_id.0)?,
-        ))
     }
 
     pub fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -363,9 +353,7 @@ impl AppleTextSystemState {
 
             apply_features_and_fallbacks(&mut font, features, fallbacks)?;
 
-            // We've seen a number of panics in production caused by calling font.properties()
-            // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
-            // and to try and identify the incalcitrant font.
+            // WARNING: `font.properties()` panics on fonts whose traits are not CFNumbers.
             let traits = font.native_font().all_traits();
             if unsafe {
                 !(traits
@@ -391,11 +379,8 @@ impl AppleTextSystemState {
             let Some(postscript_name) = font.postscript_name() else {
                 continue;
             };
-            // Dedup is scoped to this single `load_family` call (issue #55472).
-            // The same family can be reloaded later under a different `FontKey`
-            // (different features/fallbacks); a global check against
-            // `font_ids_by_postscript_name` would skip every already-registered
-            // font and leave the second call's `font_ids` empty.
+            // Dedup only within this call: a family can load again under another `FontKey`, and
+            // a check against `font_ids_by_postscript_name` would leave that call empty.
             if !postscript_names_seen.insert(postscript_name.clone()) {
                 continue;
             }
@@ -421,8 +406,8 @@ impl AppleTextSystemState {
     }
 
     /// The face at `size`, created once.
-    // WARNING: every new copy of a variable face, like the system font, builds its CoreText caches again,
-    // which took most of the time of shaping a line.
+    // WARNING: every new copy of a variable face, like the system font, builds its CoreText caches
+    // again, which costs most of the time of shaping a line.
     fn sized(&mut self, font_id: FontId, size: f32) -> CTFont {
         if self.sized.len() >= 512 {
             self.sized.clear();
@@ -517,7 +502,7 @@ impl AppleTextSystemState {
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
         )?);
 
-        // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
+        // 1 pixel of room on each side for CoreGraphics anti-aliasing.
         Ok(bounds.dilate(DevicePixels(1)))
     }
 
@@ -529,7 +514,7 @@ impl AppleTextSystemState {
         if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
             anyhow::bail!("glyph bounds are empty");
         } else {
-            // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
+            // A subpixel offset needs 1 more pixel for anti-aliasing.
             let mut bitmap_size = glyph_bounds.size;
             if params.subpixel_variant.x > 0 {
                 bitmap_size.width += DevicePixels(1);
@@ -565,8 +550,7 @@ impl AppleTextSystemState {
                 )
             };
 
-            // Move the origin to bottom left and account for scaling, this
-            // makes drawing text consistent with the font-kit's raster_bounds.
+            // Bottom-left origin and scale, to match font-kit's `raster_bounds`.
             cx.translate(
                 -glyph_bounds.origin.x.0 as CGFloat,
                 (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
@@ -622,7 +606,6 @@ impl AppleTextSystemState {
     }
 
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
@@ -640,7 +623,7 @@ impl AppleTextSystemState {
                 (text_run, text) = text.split_at(run.len);
 
                 let utf16_start = string.char_len(); // insert at end of string
-                // note: replace_str may silently ignore codepoints it dislikes (e.g., BOM at start of string)
+                // WARNING: `replace_str` can drop some code points, like a BOM at the start.
                 string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
                 let utf16_end = string.char_len();
 
@@ -665,7 +648,6 @@ impl AppleTextSystemState {
                 }
             }
         }
-        // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
         let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
         let glyph_runs = line.glyph_runs();
         let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
@@ -744,9 +726,7 @@ impl AppleTextSystemState {
 #[derive(Debug, Clone)]
 struct StringIndexConverter<'a> {
     text: &'a str,
-    /// Index in UTF-8 bytes
     utf8_ix: usize,
-    /// Index in UTF-16 code units
     utf16_ix: usize,
 }
 
@@ -784,11 +764,8 @@ fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
         ascent: metrics.ascent,
         descent: metrics.descent,
         line_gap: metrics.line_gap,
-        underline_position: metrics.underline_position,
-        underline_thickness: metrics.underline_thickness,
         cap_height: metrics.cap_height,
         x_height: metrics.x_height,
-        average_width: 0.,
         tall_ascent: false,
         bounding_box: bounds_from_rect(metrics.bounding_box),
     }
@@ -807,27 +784,6 @@ fn bounds_from_rect_i(rect: RectI) -> Bounds<DevicePixels> {
         size: size(DevicePixels(rect.width()), DevicePixels(rect.height())),
     }
 }
-
-// impl From<Vector2I> for Size<DevicePixels> {
-//     fn from(value: Vector2I) -> Self {
-//         size(value.x().into(), value.y().into())
-//     }
-// }
-
-// impl From<RectI> for Bounds<i32> {
-//     fn from(rect: RectI) -> Self {
-//         Bounds {
-//             origin: point(rect.origin_x(), rect.origin_y()),
-//             size: size(rect.width(), rect.height()),
-//         }
-//     }
-// }
-
-// impl From<Point<u32>> for Vector2I {
-//     fn from(size: Point<u32>) -> Self {
-//         Vector2I::new(size.x as i32, size.y as i32)
-//     }
-// }
 
 fn size_from_vector2f(vec: Vector2F) -> Size<f32> {
     size(vec.x(), vec.y())
