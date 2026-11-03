@@ -250,15 +250,45 @@ fn page_zoom_shrinks_the_viewport_and_survives_reloads() {
     );
 }
 
-#[test]
 #[cfg(target_os = "macos")]
-#[ignore = "requires the macOS window server"]
-fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
+fn run_window_test(main: &str, page: &str) -> std::process::Output {
     use std::{
         io::Write,
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
+    let bundle = serde_json::json!({"files": [
+        ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
+        ["index.html", page],
+    ], "pages": []});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .arg("--bundle-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bundle.to_string().as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
     let capture = r#"
         const { app, BrowserWindow } = __apps;
         app.whenReady().then(async () => {
@@ -274,32 +304,7 @@ fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
         (capture, true, "CAPTURE_OK"),
         (fatal, false, "FATAL_IN_TIMER"),
     ] {
-        let bundle = serde_json::json!({"files": [
-            ["app.js", format!("$appsDefine({});", serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":main}))],
-            ["index.html", "<body style='background:red'>x</body>"],
-        ], "pages": []});
-        let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
-            .arg("--bundle-stdin")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(bundle.to_string().as_bytes())
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(12);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let output = child.wait_with_output().unwrap();
+        let output = run_window_test(main, "<body style='background:red'>x</body>");
         let text =
             String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -310,6 +315,39 @@ fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
             output.status
         );
     }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn layout_callbacks_can_request_the_next_frame() {
+    let main = r#"
+        const { app, BrowserWindow, ipcMain } = __apps;
+        ipcMain.on('done', () => { console.log('FRAME_OK'); app.quit(); });
+        app.whenReady().then(() => {
+            new BrowserWindow({ width: 280, height: 120 }).loadFile('apps:///index.html');
+        });
+    "#;
+    let page = r#"
+        <body><div style='height:10px'></div>
+        <script type='preload'>__apps.contextBridge.exposeInMainWorld('done', () => __apps.ipcRenderer.send('done'));</script>
+        <script>
+            const box = document.querySelector('div');
+            let frames = 0;
+            const observer = new ResizeObserver(() => requestAnimationFrame(() => {
+                if (++frames === 4) done();
+                else box.style.height = (20 + frames) + 'px';
+            }));
+            setTimeout(() => { observer.observe(box); box.style.height = '20px'; }, 300);
+        </script>
+    "#;
+    let output = run_window_test(main, page);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FRAME_OK"));
 }
 
 #[test]

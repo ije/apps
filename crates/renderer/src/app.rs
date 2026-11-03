@@ -388,8 +388,16 @@ impl Callbacks {
             if window.dirty || !window.captures.is_empty() {
                 window.draw(app);
             }
-            window.wants_frame()
-        })
+        })?;
+        // WARNING: deferred work can request another frame after drawing, before the display link stops.
+        let cell = cell()?;
+        let app = cell.app.borrow();
+        Some(
+            app.windows
+                .get(&self.id)
+                .and_then(Option::as_deref)
+                .is_some_and(Window::wants_frame),
+        )
     }
 
     pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
