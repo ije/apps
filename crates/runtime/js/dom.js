@@ -2428,7 +2428,8 @@
       query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
     }
   };
-  globalThis.__appsLayout=()=>{for(const id of call('dom.scrollEvents'))wrap(id)?.dispatchEvent(new Event('scroll',{bubbles:!id}));resizeLayout();__appsMediaChanged();};
+  // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
+  globalThis.__appsLayout=()=>{resizeLayout();for(const id of call('dom.scrollEvents'))wrap(id)?.dispatchEvent(new Event('scroll',{bubbles:!id}));__appsMediaChanged();};
   const mediaLayout=globalThis.__appsLayout;
   globalThis.__appsLayout=()=>{
     mediaLayout();

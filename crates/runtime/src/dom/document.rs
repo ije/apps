@@ -118,6 +118,15 @@ pub struct Nodes {
 }
 
 impl Nodes {
+    /// Cuts the arena to `len` nodes and gives back the room it had.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.list.truncate(len);
+        self.list.shrink_to_fit();
+        self.revisions.truncate(len);
+        self.revisions.shrink_to_fit();
+        self.latest = stamp();
+    }
+
     pub fn push(&mut self, node: Node) {
         self.list.push(node);
         self.latest = stamp();
@@ -141,6 +150,15 @@ impl Nodes {
     // WARNING: the revision stays, so the frame must put the old children back before it ends.
     pub fn compose_children(&mut self, id: usize, children: Vec<usize>) -> Vec<usize> {
         std::mem::replace(&mut self.list[id].children, children)
+    }
+
+    /// Puts back the revisions of nodes that a pass only swapped out and back, and the newest revision.
+    // WARNING: only for passes that change no other node, so nothing misses a real change.
+    pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64) {
+        for &(id, revision) in revisions {
+            self.revisions[id] = revision;
+        }
+        self.latest = latest;
     }
 
     /// The newest revision of any node, so it changes whenever a node does.

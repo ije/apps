@@ -1,6 +1,10 @@
-use super::{Document, Node};
+use super::Document;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, Hash, Hasher},
+    rc::Rc,
+};
 
 pub(crate) type SelectorList = Rc<Vec<Selector>>;
 
@@ -150,12 +154,23 @@ type Positions = Rc<HashMap<usize, [usize; 4]>>;
 
 type NthPositions = Rc<(rustc_hash::FxHashMap<usize, usize>, Vec<(usize, u64)>)>;
 
-/// A node as selectors last saw it, with a revision per dependency kind.
-type Snapshot = Box<(Node, [u64; 6])>;
+/// A node as selectors last saw it: a value and a revision per dependency kind, which are tag and attributes,
+/// parent, children, emptiness, tag, state, and the `style` attribute. Values are hashes, since a copy of every
+/// node per scope costs far more than the rare missed change.
+// WARNING: the `style` attribute has a kind of its own, so script that sets styles keeps the matches of the
+// subtree. Only the node's own style and `[style]` selectors depend on it.
+// WARNING: revisions come from one counter, so a freed node's snapshot can go: values that depended on it
+// never match a node that later takes its id.
+#[derive(Default)]
+struct Snapshot {
+    values: [u64; KINDS],
+    revisions: [u64; KINDS],
+}
+const KINDS: usize = 7;
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
-    nodes: Vec<Option<Snapshot>>,
+    nodes: Vec<Option<Box<Snapshot>>>,
     /// The document revision of each node when `nodes` last compared it.
     seen: Vec<u64>,
     values: Matches,
@@ -166,11 +181,33 @@ pub(crate) struct SelectorCache {
     /// and what matching S on the children depends on.
     nth: rustc_hash::FxHashMap<(usize, usize, Option<usize>), NthPositions>,
     pub(crate) dependencies: Vec<(usize, u64)>,
+    /// The last revision given to a node.
+    revision: u64,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<usize>)>,
 }
 
 impl SelectorCache {
+    /// Drops the snapshot of a node that left the document.
+    pub fn forget(&mut self, id: usize) {
+        if let Some(snapshot) = self.nodes.get_mut(id) {
+            *snapshot = None;
+            self.seen[id] = 0;
+        }
+    }
+
+    /// Drops what the next matches can compute again, and the room for ids past `len`.
+    pub fn trim(&mut self, len: usize) {
+        self.values = Default::default();
+        self.size = 0;
+        self.positions = Default::default();
+        self.dependencies = Vec::new();
+        self.nodes.truncate(len);
+        self.nodes.shrink_to_fit();
+        self.seen.truncate(len);
+        self.seen.shrink_to_fit();
+    }
+
     pub fn update(&mut self, doc: &Document, order: &[usize]) {
         if self.values.len() > 131072 {
             self.values.clear();
@@ -192,58 +229,58 @@ impl SelectorCache {
                 continue;
             }
             let node = &doc.nodes[id];
-            let (old, revisions) = &mut **self.nodes[id].get_or_insert_default();
-            let changed = [
-                node.tag != old.tag || node.attrs != old.attrs || node.inline != old.inline,
-                node.parent != old.parent,
-                node.children != old.children,
-                node.text.is_empty() != old.text.is_empty()
-                    || node.value.as_deref().map(str::is_empty)
-                        != old.value.as_deref().map(str::is_empty),
-                node.tag != old.tag,
-                node.state != old.state,
-            ];
-            debug_assert!(
-                fresh || !changed.contains(&true),
-                "node {id} changed without a new revision"
-            );
-            if changed.iter().any(|&value| value) {
-                for (kind, (revision, changed)) in revisions.iter_mut().zip(changed).enumerate() {
-                    if changed {
-                        *revision += 1;
-                        changes.push(id * 6 + kind);
-                    }
-                }
-                if changed[4]
-                    && let Some(parent) = node.parent
-                {
-                    retagged.push(parent);
-                }
-                *old = Node {
-                    tag: node.tag.clone(),
-                    attrs: node.attrs.clone(),
-                    inline: node.inline.clone(),
-                    parent: node.parent,
-                    children: node.children.clone(),
-                    state: node.state,
-                    text: if node.text.is_empty() {
-                        String::new()
-                    } else {
-                        "x".into()
-                    },
-                    value: node
+            let Snapshot { values, revisions } = &mut **self.nodes[id].get_or_insert_default();
+            let hash = rustc_hash::FxBuildHasher;
+            let tag = hash.hash_one(&node.tag);
+            let attributes = node
+                .attrs
+                .iter()
+                .filter(|(key, _)| key.as_str() != "style")
+                .fold(rustc_hash::FxHasher::default(), |mut state, pair| {
+                    pair.hash(&mut state);
+                    state
+                });
+            let new = [
+                hash.hash_one((tag, attributes.finish())),
+                node.parent.map_or(0, |parent| parent as u64 + 1),
+                hash.hash_one(&node.children),
+                u64::from(!node.text.is_empty())
+                    | node
                         .value
                         .as_deref()
-                        .map(|value| if value.is_empty() { "" } else { "x" }.into()),
-                    ..Default::default()
-                };
+                        .map_or(0, |value| 2 << u64::from(value.is_empty())),
+                tag,
+                u64::from(node.state),
+                hash.hash_one((node.attrs.get("style"), &node.inline)),
+            ];
+            debug_assert!(
+                fresh || new == *values,
+                "node {id} changed without a new revision"
+            );
+            for (kind, (revision, (old, new))) in revisions
+                .iter_mut()
+                .zip(values.iter_mut().zip(new))
+                .enumerate()
+            {
+                if *old != new {
+                    if kind == 4
+                        && let Some(parent) = node.parent
+                    {
+                        retagged.push(parent);
+                    }
+                    *old = new;
+                    self.revision += 1;
+                    *revision = self.revision;
+                    changes.push(id * KINDS + kind);
+                }
             }
         }
         // WARNING: sibling selectors depend only on the parent's children, so a tag change counts as one.
         for parent in retagged {
             if let Some(slot) = self.nodes.get_mut(parent) {
-                slot.get_or_insert_default().1[2] += 1;
-                changes.push(parent * 6 + 2);
+                self.revision += 1;
+                slot.get_or_insert_default().revisions[2] = self.revision;
+                changes.push(parent * KINDS + 2);
             }
         }
         // WARNING: `:nth-child(An+B of S)` results depend only on their parent's children, so a change to anything
@@ -275,8 +312,9 @@ impl SelectorCache {
             });
             for parent in stale {
                 if let Some(slot) = self.nodes.get_mut(parent) {
-                    slot.get_or_insert_default().1[2] += 1;
-                    changes.push(parent * 6 + 2);
+                    self.revision += 1;
+                    slot.get_or_insert_default().revisions[2] = self.revision;
+                    changes.push(parent * KINDS + 2);
                 }
             }
         }
@@ -291,17 +329,19 @@ impl SelectorCache {
 
     pub(crate) fn depend(&mut self, id: usize, kind: usize) {
         if let Some(node) = self.nodes.get(id) {
-            self.dependencies
-                .push((id * 6 + kind, node.as_ref().map_or(0, |node| node.1[kind])));
+            self.dependencies.push((
+                id * KINDS + kind,
+                node.as_ref().map_or(0, |node| node.revisions[kind]),
+            ));
         }
     }
 
     pub(crate) fn valid(&self, dependencies: &[(usize, u64)]) -> bool {
         dependencies.iter().all(|(id, revision)| {
             self.nodes
-                .get(*id / 6)
+                .get(*id / KINDS)
                 .and_then(Option::as_ref)
-                .map_or(0, |node| node.1[*id % 6])
+                .map_or(0, |node| node.revisions[*id % KINDS])
                 == *revision
         })
     }
@@ -962,6 +1002,11 @@ impl Selector {
         }
         let start = memo.dependencies.len();
         memo.depend(id, 0);
+        if self.simple.iter().any(|simple| {
+            matches!(simple, SimpleSelector::Attribute(name, ..) if name.eq_ignore_ascii_case("style"))
+        }) {
+            memo.depend(id, 6);
+        }
         let result = (|| {
             let node = &doc.nodes[id];
             if node.tag.starts_with('#')
@@ -1341,7 +1386,7 @@ impl Selector {
                                         .nodes
                                         .get(parent)
                                         .and_then(Option::as_ref)
-                                        .map_or(0, |node| node.1[2]);
+                                        .map_or(0, |node| node.revisions[2]);
                                     let positions = match memo.positions.get(&parent) {
                                         Some((cached, positions)) if *cached == revision => {
                                             positions.clone()

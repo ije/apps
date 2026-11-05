@@ -17,24 +17,16 @@ use std::{
 
 type Callback = Box<dyn FnOnce(&mut App)>;
 type WakeCallback = Rc<RefCell<dyn FnMut(&mut App)>>;
-type ReopenCallback = Box<dyn FnMut(&mut App, bool)>;
-type ShouldQuitCallback = Box<dyn FnMut(&mut App) -> bool>;
-type OpenUrlsCallback = Box<dyn FnMut(&mut App, Vec<String>)>;
 
-/// The app state, owned by the main thread.
+/// The app state, owned by the thread that draws: its own thread on macOS, the main thread on
+/// other platforms.
 pub struct App {
     pub(crate) platform: Rc<platform::Platform>,
     text_system: Rc<TextSystem>,
     windows: BTreeMap<WindowId, Option<Box<Window>>>,
-    next_window: u64,
     deferred: Vec<Callback>,
     pub(crate) propagate_event: bool,
     on_wake: Option<WakeCallback>,
-    pub(crate) on_reopen: Option<ReopenCallback>,
-    pub(crate) on_should_quit: Option<ShouldQuitCallback>,
-    pub(crate) on_open_urls: Option<OpenUrlsCallback>,
-    pending_urls: Vec<String>,
-    pub(crate) on_quit: Option<Callback>,
     waker: Arc<AtomicBool>,
 }
 
@@ -97,22 +89,14 @@ fn drain(cell: &AppCell) {
     }
 }
 
-/// Starts the platform loop and calls `init` once the app has launched. Returns after quitting.
-pub fn run(init: impl FnOnce(&mut App) + 'static) {
-    let platform = Rc::new(platform::Platform::new());
+fn install(platform: Rc<platform::Platform>) {
     let app = App {
-        platform: platform.clone(),
+        platform,
         text_system: Rc::new(TextSystem::new()),
         windows: BTreeMap::new(),
-        next_window: 1,
         deferred: Vec::new(),
         propagate_event: true,
         on_wake: None,
-        on_reopen: None,
-        on_should_quit: None,
-        on_open_urls: None,
-        pending_urls: Vec::new(),
-        on_quit: None,
         waker: Arc::default(),
     };
     APP.with_borrow_mut(|slot| {
@@ -121,31 +105,70 @@ pub fn run(init: impl FnOnce(&mut App) + 'static) {
             queue: RefCell::default(),
         }))
     });
-    platform.run(Box::new(move || update(init)));
-    // WARNING: windows hold native views whose callbacks reach for the app, so they close first.
-    let windows = cell().map(|cell| std::mem::take(&mut cell.app.borrow_mut().windows));
-    drop(windows);
-    APP.with_borrow_mut(|slot| *slot = None);
 }
 
-/// Wakes the main thread from any thread, to run the app's [`App::on_wake`] callback.
+/// Whether each [`spawn`] gets its own thread, so its windows don't share a thread with others.
+pub const THREAD_PER_APP: bool = cfg!(target_os = "macos");
+
+/// Starts an `App` with `init`: on its own thread on macOS, with one thread and event loop until
+/// [`App::end_thread`]. Other platforms have one `App`, on the main thread.
+pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
+    #[cfg(target_os = "macos")]
+    platform::spawn_render(
+        move || {
+            install(Rc::new(platform::Platform::new()));
+            update(init);
+        },
+        // WARNING: windows and their state can hold things that need other thread locals.
+        || {
+            APP.with_borrow_mut(|slot| *slot = None);
+        },
+    );
+    #[cfg(not(target_os = "macos"))]
+    update(init);
+}
+
+/// Starts the platform loop, and calls `native` on the main thread once the app has launched.
+/// Returns after quitting.
+pub fn run(native: impl FnOnce() + 'static) {
+    let platform = Rc::new(platform::Platform::new());
+    #[cfg(target_os = "macos")]
+    platform.run(Box::new(native));
+    #[cfg(not(target_os = "macos"))]
+    {
+        install(platform.clone());
+        platform.run(Box::new(native));
+        // WARNING: windows hold native views whose callbacks reach for the app, so they close first.
+        let windows = cell().map(|cell| std::mem::take(&mut cell.app.borrow_mut().windows));
+        drop(windows);
+        APP.with_borrow_mut(|slot| *slot = None);
+    }
+}
+
+/// Wakes the app's thread from any thread, to run the app's [`App::on_wake`] callback.
 #[derive(Clone)]
 pub struct Waker {
     pending: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    thread: platform::AppThread,
 }
 
 impl Waker {
     pub fn wake(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {
             let pending = self.pending.clone();
-            platform::post(Box::new(move || {
+            let wake = Box::new(move || {
                 pending.store(false, Ordering::Release);
                 update(|app| {
                     if let Some(callback) = app.on_wake.clone() {
                         (callback.borrow_mut())(app);
                     }
                 });
-            }));
+            });
+            #[cfg(target_os = "macos")]
+            platform::post(self.thread, wake);
+            #[cfg(not(target_os = "macos"))]
+            platform::post(wake);
         }
     }
 }
@@ -195,7 +218,7 @@ impl App {
         self.deferred.push(Box::new(f));
     }
 
-    /// Runs `f` after `delay`, on the main thread.
+    /// Runs `f` after `delay`, on the app's thread.
     pub fn timer(&mut self, delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Timer {
         timer(delay, f)
     }
@@ -203,40 +226,20 @@ impl App {
     pub fn waker(&self) -> Waker {
         Waker {
             pending: self.waker.clone(),
+            #[cfg(target_os = "macos")]
+            thread: platform::app_thread(),
         }
     }
 
-    /// Runs on the main thread after any [`Waker::wake`].
+    /// Ends this app's thread after the current work, once its window has closed.
+    pub fn end_thread(&self) {
+        #[cfg(target_os = "macos")]
+        platform::end_thread();
+    }
+
+    /// Runs on the app's thread after any [`Waker::wake`].
     pub fn on_wake(&mut self, f: impl FnMut(&mut App) + 'static) {
         self.on_wake = Some(Rc::new(RefCell::new(f)));
-    }
-
-    /// The Dock icon was clicked; `true` when windows are visible.
-    pub fn on_reopen(&mut self, f: impl FnMut(&mut App, bool) + 'static) {
-        self.on_reopen = Some(Box::new(f));
-    }
-
-    /// Asked before quitting; `false` cancels.
-    pub fn on_should_quit(&mut self, f: impl FnMut(&mut App) -> bool + 'static) {
-        self.on_should_quit = Some(Box::new(f));
-    }
-
-    /// URLs or files the app was asked to open.
-    pub fn on_open_urls(&mut self, f: impl FnMut(&mut App, Vec<String>) + 'static) {
-        self.on_open_urls = Some(Box::new(f));
-        let urls = std::mem::take(&mut self.pending_urls);
-        if !urls.is_empty() {
-            self.defer(move |app| {
-                if let Some(mut callback) = app.on_open_urls.take() {
-                    callback(app, urls);
-                    app.on_open_urls.get_or_insert(callback);
-                }
-            });
-        }
-    }
-
-    pub fn on_quit(&mut self, f: impl FnOnce(&mut App) + 'static) {
-        self.on_quit = Some(Box::new(f));
     }
 
     pub fn quit(&mut self) {
@@ -277,9 +280,16 @@ impl App {
         options: WindowOptions,
         build: impl FnOnce(&mut Window, &mut App) -> Box<dyn View>,
     ) -> Result<WindowId> {
-        let id = WindowId(self.next_window);
-        self.next_window += 1;
-        let platform = self.platform.open_window(&options, Callbacks { id })?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = WindowId(NEXT.fetch_add(1, Ordering::Relaxed));
+        let platform = self.platform.open_window(
+            &options,
+            Callbacks {
+                id,
+                #[cfg(target_os = "macos")]
+                thread: platform::app_thread(),
+            },
+        )?;
         let mut window = Box::new(Window::new(
             id,
             platform,
@@ -334,48 +344,79 @@ impl App {
 #[derive(Clone, Copy)]
 pub(crate) struct Callbacks {
     pub id: WindowId,
+    /// The thread of the app that owns the window.
+    #[cfg(target_os = "macos")]
+    pub thread: platform::AppThread,
+}
+
+/// Sends platform input, whose positions are in window points, so the page zoom maps them.
+pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformInput) -> bool {
+    let zoom = window.zoom;
+    if zoom != 1. {
+        match &mut input {
+            PlatformInput::MouseDown(event) => event.position = event.position / zoom,
+            PlatformInput::MouseUp(event) => event.position = event.position / zoom,
+            PlatformInput::MouseMove(event) => event.position = event.position / zoom,
+            PlatformInput::MouseExited(event) => event.position = event.position / zoom,
+            PlatformInput::ScrollWheel(event) => {
+                event.position = event.position / zoom;
+                if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                    *delta = *delta / zoom;
+                }
+            }
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => *position = *position / zoom,
+            _ => {}
+        }
+    }
+    window.dispatch_event(input, app)
 }
 
 impl Callbacks {
-    fn with<R>(&self, f: impl FnOnce(&mut Window, &mut App) -> R) -> Option<R> {
+    /// Runs `f` with the window and returns its result. On macOS the main thread asks the render
+    /// thread and gets `None` when that takes too long.
+    pub(crate) fn with<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
+    ) -> Option<R> {
         let id = self.id;
-        try_update(|app| app.update_window(id, f)).flatten()
+        let run = move || try_update(|app| app.update_window(id, f)).flatten();
+        #[cfg(target_os = "macos")]
+        if cell().is_none() {
+            return platform::ask(self.thread, run).flatten();
+        }
+        run()
     }
 
-    fn queue(&self, f: impl FnOnce(&mut Window, &mut App) + 'static) {
+    pub(crate) fn queue(&self, f: impl FnOnce(&mut Window, &mut App) + Send + 'static) {
         let id = self.id;
-        update(move |app| {
-            app.update_window(id, f);
+        let run = move || {
+            update(move |app| {
+                app.update_window(id, f);
+            })
+        };
+        #[cfg(target_os = "macos")]
+        if cell().is_none() {
+            return platform::post(self.thread, Box::new(run));
+        }
+        run();
+    }
+
+    /// Sends input and returns whether the view handled it.
+    pub fn input(&self, input: PlatformInput) -> bool {
+        self.with(move |window, app| dispatch(window, app, input))
+            .unwrap_or(false)
+    }
+
+    /// Sends input whose result nothing needs, so a busy view holds up nothing.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn input_later(&self, input: PlatformInput) {
+        self.queue(move |window, app| {
+            dispatch(window, app, input);
         });
-    }
-
-    /// Sends platform input, whose positions are in window points, so the page zoom maps them.
-    pub fn input(&self, mut input: PlatformInput) -> bool {
-        self.with(|window, app| {
-            let zoom = window.zoom;
-            if zoom != 1. {
-                match &mut input {
-                    PlatformInput::MouseDown(event) => event.position = event.position / zoom,
-                    PlatformInput::MouseUp(event) => event.position = event.position / zoom,
-                    PlatformInput::MouseMove(event) => event.position = event.position / zoom,
-                    PlatformInput::MouseExited(event) => event.position = event.position / zoom,
-                    PlatformInput::ScrollWheel(event) => {
-                        event.position = event.position / zoom;
-                        if let ScrollDelta::Pixels(delta) = &mut event.delta {
-                            *delta = *delta / zoom;
-                        }
-                    }
-                    PlatformInput::FileDrop(
-                        FileDropEvent::Entered { position, .. }
-                        | FileDropEvent::Pending { position }
-                        | FileDropEvent::Submit { position },
-                    ) => *position = *position / zoom,
-                    _ => {}
-                }
-            }
-            window.dispatch_event(input, app)
-        })
-        .unwrap_or(false)
     }
 
     /// The display is ready for a frame. Returns whether more frames are wanted, or `None` while
@@ -401,6 +442,7 @@ impl Callbacks {
     }
 
     pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
+        native::window_event(self.id, native::WindowEvent::Changed);
         self.queue(move |window, app| {
             window.mark_resized(size, scale_factor);
             window.with_view(app, |view, window, app| view.window_changed(window, app));
@@ -409,23 +451,28 @@ impl Callbacks {
 
     /// The window moved, was activated, minimized, or changed in another way the view may track.
     pub fn changed(&self) {
+        native::window_event(self.id, native::WindowEvent::Changed);
         self.queue(|window, app| {
             window.refresh();
             window.with_view(app, |view, window, app| view.window_changed(window, app));
         });
     }
 
-    /// The user asked to close the window; `false` keeps it open.
+    /// The user asked to close the window. The main side decides, so the native window stays for now.
     pub fn should_close(&self) -> bool {
-        self.with(|window, app| {
-            window.with_view(app, |view, window, app| view.should_close(window, app))
-        })
-        .flatten()
-        .unwrap_or(false)
+        native::window_event(self.id, native::WindowEvent::CloseRequested);
+        false
     }
 
     pub fn appearance_changed(&self) {
         self.queue(|window, _| window.refresh());
+    }
+
+    /// The window stopped drawing, so its renderer can free what the last frame didn't use.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn trim(&self) {
+        #[cfg(target_os = "macos")]
+        self.queue(|window, _| window.platform.trim());
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -463,26 +510,27 @@ impl Callbacks {
         .flatten()
     }
 
+    /// The text of `range`, and the range it really covers when that differs.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn text_for_range(
-        &self,
-        range: Range<usize>,
-        adjusted: &mut Option<Range<usize>>,
-    ) -> Option<String> {
-        self.with(|window, app| {
-            window.with_view(app, |view, window, app| {
-                view.text_for_range(range, adjusted, window, app)
-            })
+    pub fn text_for_range(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
+        self.with(move |window, app| {
+            let mut adjusted = None;
+            window
+                .with_view(app, |view, window, app| {
+                    view.text_for_range(range, &mut adjusted, window, app)
+                })
+                .flatten()
+                .map(|text| (text, adjusted))
         })
-        .flatten()
         .flatten()
     }
 
     pub fn replace_text_in_range(&self, range: Option<Range<usize>>, text: &str) {
-        self.with(|window, app| {
+        let text = text.to_owned();
+        self.queue(move |window, app| {
             window.with_view(app, |view, window, app| {
-                view.replace_text_in_range(range, text, window, app)
-            })
+                view.replace_text_in_range(range, &text, window, app)
+            });
         });
     }
 
@@ -492,22 +540,23 @@ impl Callbacks {
         text: &str,
         selected: Option<Range<usize>>,
     ) {
-        self.with(|window, app| {
+        let text = text.to_owned();
+        self.queue(move |window, app| {
             window.with_view(app, |view, window, app| {
-                view.replace_and_mark_text_in_range(range, text, selected, window, app)
-            })
+                view.replace_and_mark_text_in_range(range, &text, selected, window, app)
+            });
         });
     }
 
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&self) {
-        self.with(|window, app| {
-            window.with_view(app, |view, window, app| view.unmark_text(window, app))
+        self.queue(|window, app| {
+            window.with_view(app, |view, window, app| view.unmark_text(window, app));
         });
     }
 
     pub fn bounds_for_range(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
-        self.with(|window, app| {
+        self.with(move |window, app| {
             let zoom = window.zoom;
             window
                 .with_view(app, |view, window, app| {
@@ -521,7 +570,7 @@ impl Callbacks {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn character_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
-        self.with(|window, app| {
+        self.with(move |window, app| {
             let point = point / window.zoom;
             window.with_view(app, |view, window, app| {
                 view.character_index_for_point(point, window, app)
@@ -532,48 +581,156 @@ impl Callbacks {
     }
 }
 
-pub(crate) mod events {
+/// The app as the OS sees it. These run on the main thread, unless they say otherwise.
+pub mod native {
     use super::*;
 
+    /// What a native window tells the main side, without the thread that draws it.
+    #[derive(Clone, Copy)]
+    pub enum WindowEvent {
+        /// It moved, resized, was activated, minimized or otherwise changed.
+        Changed,
+        /// The user asked to close it.
+        CloseRequested,
+    }
+
+    #[derive(Default)]
+    struct Handlers {
+        window: Option<Box<dyn FnMut(WindowId, WindowEvent)>>,
+        reopen: Option<Box<dyn FnMut(bool)>>,
+        should_quit: Option<Box<dyn FnMut() -> bool>>,
+        open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
+        pending_urls: Vec<String>,
+        quit: Option<Box<dyn FnOnce()>>,
+    }
+
+    thread_local! { static HANDLERS: RefCell<Handlers> = RefCell::default(); }
+
+    pub fn on_window_event(f: impl FnMut(WindowId, WindowEvent) + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.window = Some(Box::new(f)));
+    }
+
+    pub(crate) fn window_event(id: WindowId, event: WindowEvent) {
+        if let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.window.take()) {
+            callback(id, event);
+            HANDLERS.with_borrow_mut(|handlers| {
+                handlers.window.get_or_insert(callback);
+            });
+        }
+    }
+
+    /// The Dock icon was clicked; `true` when windows are visible.
+    pub fn on_reopen(f: impl FnMut(bool) + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.reopen = Some(Box::new(f)));
+    }
+
+    /// Asked before quitting; `false` cancels.
+    pub fn on_should_quit(f: impl FnMut() -> bool + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.should_quit = Some(Box::new(f)));
+    }
+
+    /// URLs or files the app was asked to open.
+    pub fn on_open_urls(mut f: impl FnMut(Vec<String>) + 'static) {
+        let urls = HANDLERS.with_borrow_mut(|handlers| std::mem::take(&mut handlers.pending_urls));
+        if !urls.is_empty() {
+            f(urls);
+        }
+        HANDLERS.with_borrow_mut(|handlers| handlers.open_urls = Some(Box::new(f)));
+    }
+
+    pub fn on_quit(f: impl FnOnce() + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.quit = Some(Box::new(f)));
+    }
+
+    /// Runs `f` on the main thread, from any thread.
+    pub fn post(f: Box<dyn FnOnce() + Send>) {
+        #[cfg(target_os = "macos")]
+        platform::native_post(f);
+        #[cfg(not(target_os = "macos"))]
+        platform::post(f);
+    }
+
+    /// Runs `f` on the main thread after `delay`.
+    pub fn after(delay: Duration, f: impl FnOnce() + 'static) {
+        #[cfg(target_os = "macos")]
+        platform::native_after(delay, f);
+        #[cfg(not(target_os = "macos"))]
+        platform::run_after(delay, f);
+    }
+
+    /// Runs `f` on the main thread and waits for it, from any thread.
+    pub fn sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+        #[cfg(target_os = "macos")]
+        return platform::native_sync(f);
+        #[cfg(not(target_os = "macos"))]
+        f()
+    }
+
+    /// Stops the thread that draws, before the process exits without AppKit.
+    pub fn before_exit() {
+        #[cfg(target_os = "macos")]
+        platform::park_render();
+    }
+
+    /// Brings the app to the front, from any thread.
+    pub fn activate(ignoring_other_apps: bool) {
+        #[cfg(target_os = "macos")]
+        platform::Platform::new().activate(ignoring_other_apps);
+        #[cfg(not(target_os = "macos"))]
+        update(move |app| app.activate(ignoring_other_apps));
+    }
+
+    /// Ends the app, from any thread.
+    pub fn quit() {
+        #[cfg(target_os = "macos")]
+        platform::Platform::new().quit();
+        #[cfg(not(target_os = "macos"))]
+        update(|app| app.quit());
+    }
+
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn reopen(visible: bool) {
-        update(move |app| {
-            if let Some(mut callback) = app.on_reopen.take() {
-                callback(app, visible);
-                app.on_reopen.get_or_insert(callback);
-            }
-        });
+    pub(crate) fn reopen(visible: bool) {
+        if let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.reopen.take()) {
+            callback(visible);
+            HANDLERS.with_borrow_mut(|handlers| { handlers.reopen.get_or_insert(callback); });
+        }
     }
 
     /// Returns `false` to cancel quitting.
-    pub fn should_quit() -> bool {
-        try_update(|app| match app.on_should_quit.take() {
+    pub(crate) fn should_quit() -> bool {
+        match HANDLERS.with_borrow_mut(|handlers| handlers.should_quit.take()) {
             Some(mut callback) => {
-                let quit = callback(app);
-                app.on_should_quit.get_or_insert(callback);
+                let quit = callback();
+                HANDLERS.with_borrow_mut(|handlers| { handlers.should_quit.get_or_insert(callback); });
                 quit
             }
             None => true,
-        })
-        .unwrap_or(true)
+        }
     }
 
-    pub fn quit() {
-        try_update(|app| {
-            if let Some(callback) = app.on_quit.take() {
-                callback(app);
-            }
-        });
+    pub(crate) fn quit_handler() {
+        if let Some(callback) = HANDLERS.with_borrow_mut(|handlers| handlers.quit.take()) {
+            callback();
+        }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn open_urls(urls: Vec<String>) {
-        update(move |app| match app.on_open_urls.take() {
+    pub(crate) fn open_urls(urls: Vec<String>) {
+        match HANDLERS.with_borrow_mut(|handlers| handlers.open_urls.take()) {
             Some(mut callback) => {
-                callback(app, urls);
-                app.on_open_urls.get_or_insert(callback);
+                callback(urls);
+                HANDLERS.with_borrow_mut(|handlers| { handlers.open_urls.get_or_insert(callback); });
             }
-            None => app.pending_urls.extend(urls),
-        });
+            None => HANDLERS.with_borrow_mut(|handlers| handlers.pending_urls.extend(urls)),
+        }
+    }
+}
+
+pub(crate) mod events {
+    pub(crate) use super::native::{should_quit};
+    #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+    pub(crate) use super::native::{open_urls, reopen};
+    pub fn quit() {
+        super::native::quit_handler();
     }
 }

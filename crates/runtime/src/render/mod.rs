@@ -32,6 +32,8 @@ use std::{
 /// The page of one window, shared with the elements that paint it.
 pub(crate) struct PageState {
     pub(crate) id: u64,
+    /// The animation frame callbacks wait for the next frame.
+    queued: Cell<bool>,
     pub(crate) runtime: Rc<RefCell<Desktop>>,
     pub(crate) host: Rc<RefCell<Host>>,
     pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
@@ -75,6 +77,8 @@ pub(crate) struct PageState {
     /// By element, what its kept boxes were built from, and the frame they hold for: viewport size,
     /// scale, font loads and the top layer.
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
+    /// The entries of `kept` that this build replaced, to undo when the window never gets the build.
+    kept_log: RefCell<Vec<(usize, Option<element::Reuse>)>>,
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
 }
 
@@ -183,9 +187,19 @@ pub(crate) fn reflow(id: u64) {
     }
 }
 
+/// Runs the page's animation frame callbacks on the next frame.
+// WARNING: once per frame: a second queued run would call the callbacks the first one requested in the same
+// frame, and both would queue again, so every request outside a frame added a run per frame.
+pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
+    if !view.queued.replace(true) {
+        window.on_next_frame(move |window, cx| animation_frame(view, window, cx));
+    }
+}
+
 /// Runs the page's animation frame callbacks before the frame lays out, and again on the next
 /// frame while the page asks for one.
-pub(crate) fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
+fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
+    view.queued.set(false);
     let renderer = view.runtime.try_borrow().ok().and_then(|app| {
         app.views
             .get(&view.id)
@@ -210,8 +224,7 @@ pub(crate) fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut
         })
         .unwrap_or(false)
     {
-        let view = view.clone();
-        window.on_next_frame(move |window, cx| animation_frame(view, window, cx));
+        queue_animation_frame(view.clone(), window);
     }
     let runtime = view.runtime.clone();
     cx.defer(move |cx| Desktop::drive(runtime, cx));
@@ -259,6 +272,7 @@ impl PageView {
     ) -> Self {
         let view = Rc::new(PageState {
             id,
+            queued: Cell::new(false),
             runtime,
             host,
             images: RefCell::default(),
@@ -282,6 +296,7 @@ impl PageView {
             caret: RefCell::default(),
             hud: RefCell::default(),
             kept: RefCell::default(),
+            kept_log: RefCell::default(),
             kept_frame: RefCell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
@@ -361,10 +376,37 @@ impl PageView {
             let view = data.clone();
             // WARNING: wheel events reach the page only once it listens to them, and a canceled one does not scroll.
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase.capture() && view.host.try_borrow().is_ok_and(|host| host.dom.get(&view.id).is_some_and(|dom| dom.wheel)) {
+                if !phase.capture() {
+                    return;
+                }
+                // Like browsers, the wheel scrolls only the boxes around the element under the pointer, so a
+                // box that an overlay covers doesn't scroll. The hit test uses the styles of the frame on screen.
+                let (mut target, mut wheel) = (None, false);
+                if let Ok(host) = view.host.try_borrow() {
+                    let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
+                    if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.dom.get(&view.id)) {
+                        let seen = state.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.computed.clone());
+                        target = seen.as_ref().and_then(|computed| {
+                            let at = [event.position.x, event.position.y].map(f32::from);
+                            crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false).as_u64()
+                        })
+                        .map(|id| id as usize);
+                        if let Some(target) = target {
+                            let mut chain = Vec::new();
+                            let mut node = Some(target);
+                            while let Some(id) = node {
+                                chain.extend(state.scroll.get(&id).cloned());
+                                node = seen.as_ref().and_then(|computed| crate::dom::flat_parent(&page.doc, state, computed, id));
+                            }
+                            window.scroll_only(chain);
+                        }
+                        wheel = state.wheel;
+                    }
+                }
+                if wheel {
                     let delta = event.delta.pixel_delta(renderer::px(16.));
                     let [x, y] = view.screen(window, event.position);
-                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
+                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
                         cx.stop_propagation();
                     }
                 }
@@ -614,6 +656,9 @@ impl PageView {
         self.svgs
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
+        self.kept
+            .borrow_mut()
+            .retain(|&id, _| visible.get(id) == Some(&true));
         self.fields
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
@@ -736,6 +781,7 @@ impl PageView {
                 info.get(*id)
                     .is_some_and(|info| info.flags & flags == flags)
             });
+        let settled = unchanged && !dom.container_pass;
         if unchanged {
             for info in &mut info {
                 info.flags &= !(cull::CHANGED
@@ -746,6 +792,7 @@ impl PageView {
                     | cull::ANIMATED);
             }
         } else {
+            dom.cull.inputs.clear();
             let mut order = Vec::new();
             let mut pending = vec![0];
             while let Some(id) = pending.pop() {
@@ -868,7 +915,7 @@ impl PageView {
                         .map(|old| old.geometry);
                     let children = children().collect();
                     dom.layout_revision += 1;
-                    dom.layout_nodes[id] = Some(crate::dom::LayoutNode {
+                    dom.layout_nodes[id] = Some(Box::new(crate::dom::LayoutNode {
                         node: node.clone(),
                         seen: revision,
                         style: style.clone(),
@@ -877,20 +924,19 @@ impl PageView {
                         revision: dom.layout_revision,
                         geometry: geometry.unwrap_or(dom.layout_revision),
                         flags,
-                    });
+                    }));
                     changed.push(id);
                 } else if let Some(old) = &mut dom.layout_nodes[id] {
                     old.seen = revision;
                 }
-                // WARNING: these boxes build from their siblings, native state or counters, which no revision
-                // tracks, so the window never keeps them.
+                // WARNING: these boxes build from native state, which no revision tracks, so the window never
+                // keeps them.
                 let volatile = matches!(
                     node.tag.as_str(),
-                    "br" | "img"
+                    "img"
                         | "video"
                         | "audio"
                         | "canvas"
-                        | "svg"
                         | "iframe"
                         | "webview"
                         | "embed"
@@ -898,10 +944,16 @@ impl PageView {
                         | "input"
                         | "textarea"
                         | "select"
-                        | "button"
                         | "option"
                         | "optgroup"
-                        | "fieldset"
+                        | "progress"
+                        | "meter"
+                ) || node.tag == "button"
+                    && control::kind("button", None, false, style).is_some_and(|(_, boxed)| boxed);
+                // These build from their siblings or counters, see `cull::FRAMED`.
+                let framed = matches!(
+                    node.tag.as_str(),
+                    "br" | "fieldset"
                         | "legend"
                         | "details"
                         | "summary"
@@ -918,8 +970,6 @@ impl PageView {
                         | "colgroup"
                         | "col"
                         | "q"
-                        | "progress"
-                        | "meter"
                         | "slot"
                 ) || styles.pseudos.get(&id).is_some_and(|pair| {
                     pair.iter().any(|pseudo| {
@@ -928,6 +978,16 @@ impl PageView {
                         })
                     })
                 });
+                if flags & cull::HIDDEN == 0
+                    && (node.tag == "svg"
+                        || matches!(
+                            style.get(Prop::POSITION),
+                            Some("absolute" | "fixed" | "sticky")
+                        )
+                        || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid")))
+                {
+                    dom.cull.inputs.push(id);
+                }
                 info[id] = cull::Info {
                     revision: dom.layout_nodes[id]
                         .as_ref()
@@ -944,11 +1004,16 @@ impl PageView {
                                 | (u16::from(reshaped) * cull::CHANGED)
                                 | (u16::from(relisted) * cull::RELISTED)
                                 | (u16::from(volatile) * cull::VOLATILE)
-                                | (u16::from(dom.focus == Some(id)) * cull::BLOCKED),
+                                | (u16::from(framed) * cull::FRAMED)
+                                | (u16::from(dom.focus == Some(id))
+                                    * (cull::BLOCKED | cull::VOLATILE)),
                             |flags, &child| {
                                 flags
                                     | info[child].flags
-                                        & (cull::BLOCKED | cull::VIEWPORT | cull::VOLATILE)
+                                        & (cull::BLOCKED
+                                            | cull::VIEWPORT
+                                            | cull::VOLATILE
+                                            | cull::FRAMED)
                             },
                         )
                     },
@@ -1011,20 +1076,28 @@ impl PageView {
                 });
             }
         }
-        // WARNING: fonts, the viewport and container sizes change measurements without moving any box's geometry revision.
-        if dom.container_pass || dom.cull.frame != frame {
+        // WARNING: fonts, the viewport and container units change measurements without moving any box's geometry
+        // revision. A container query that matches anew restyles its boxes, which moves their revisions.
+        if dom.container_pass && dom.style_cache.units || dom.cull.frame != frame {
             dom.measurements.sizes.clear();
             dom.grids.clear();
         }
         let mut stale = false;
+        let mut around = rustc_hash::FxHashSet::default();
         for &id in &changed {
             dom.inline_text.remove(&id);
             if dom.layout_nodes[id]
                 .as_ref()
                 .is_some_and(|node| node.geometry == node.revision)
             {
-                dom.grids.remove(&id);
-                info[id].flags |= cull::STALE;
+                // WARNING: the intrinsic sizes and grid tracks of the boxes around come from their content, so
+                // their cached measurements go too, also when kept boxes don't build them again.
+                let mut node = Some(id);
+                while let Some(id) = node.filter(|&id| around.insert(id)) {
+                    dom.grids.remove(&id);
+                    info[id].flags |= cull::STALE;
+                    node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                }
                 stale = true;
             }
         }
@@ -1222,8 +1295,11 @@ impl PageView {
                     && doc.nodes[id].tag != "html"
             })
             .collect();
-        dom.containers.clear();
-        dom.flexed_grids.clear();
+        // WARNING: kept containers don't build, so their sizes stay from the frame that built them.
+        dom.containers
+            .retain(|&id, _| visible.get(id) == Some(&true));
+        dom.flexed_grids
+            .retain(|&id, _| visible.get(id) == Some(&true));
         dom.measurements.pixel_ratio = window.scale_factor();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
@@ -1242,7 +1318,28 @@ impl PageView {
             }
             ids.1.clone()
         };
+        // What inline SVGs and positioned boxes read beyond their subtree goes into the keys of the boxes around
+        // them, so a kept box never holds one that would build differently.
+        let mut inputs = rustc_hash::FxHashMap::<usize, u64>::default();
+        {
+            let host = self.host.borrow();
+            if let Some(dom) = host.dom.get(&self.id) {
+                for &id in &dom.cull.inputs {
+                    if visible.get(id) != Some(&true) {
+                        continue;
+                    }
+                    let own = element::own_inputs(&doc, &styles, dom, &ids, id)
+                        ^ (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let mut node = Some(id);
+                    while let Some(at) = node {
+                        *inputs.entry(at).or_default() ^= own;
+                        node = crate::dom::flat_parent(&doc, dom, &styles, at);
+                    }
+                }
+            }
+        }
         let mut build = Build {
+            inputs: &inputs,
             doc: &doc,
             styles: &styles,
             text: &text_system,
@@ -1262,6 +1359,7 @@ impl PageView {
             tree,
             culls: &Cell::new(0),
             resized: false,
+            settled: false,
         };
         {
             // WARNING: the scale and fonts resize boxes without new revisions, and the top layer takes boxes out
@@ -1273,8 +1371,13 @@ impl PageView {
                 self.kept.borrow_mut().clear();
             }
             build.resized = kept.0[..2] != frame[..2];
+            // WARNING: a frame's second pass sees the nodes of its first one, but corrects what that pass built
+            // from the last layout, so it never counts as settled.
+            build.settled =
+                settled && !build.resized && !window.redrawing() && !self.reflowing.get();
             kept.0 = frame;
         }
+        self.kept_log.borrow_mut().clear();
         let root = element(
             &build,
             0,
@@ -1401,6 +1504,16 @@ impl PageView {
             dom.container_pass = repass;
             if repass {
                 drop(host);
+                // WARNING: the window never gets this build, so boxes it keyed are not in the tree and the
+                // next build must not link them.
+                let mut kept = self.kept.borrow_mut();
+                for (id, old) in self.kept_log.borrow_mut().drain(..).rev() {
+                    match old {
+                        Some(old) => kept.insert(id, old),
+                        None => kept.remove(&id),
+                    };
+                }
+                drop(kept);
                 return self.render_page(tree, window, cx);
             }
         }

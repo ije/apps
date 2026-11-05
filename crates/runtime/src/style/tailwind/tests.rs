@@ -764,10 +764,11 @@ fn theme_variables_used_outside_utilities_are_defined() {
         </body></html>",
         None,
     );
-    let root = &styles.values[id(&doc, "html")];
-    assert!(root.get(Prop::new("--color-teal-700")).is_some());
-    assert!(root.get(Prop::new("--color-lime-300")).is_some());
-    assert_eq!(root.get(Prop::new("--color-indigo-600")), None);
+    let root = &styles.vars[id(&doc, "html")];
+    let get = |name| root.iter().find(|(prop, _)| *prop == Prop::new(name));
+    assert!(get("--color-teal-700").is_some());
+    assert!(get("--color-lime-300").is_some());
+    assert_eq!(get("--color-indigo-600"), None);
 }
 
 #[test]
@@ -1072,7 +1073,14 @@ fn custom_utilities_resolve_values_from_inline_theme() {
     assert_eq!(&p["--tw-enter-opacity"], ".95");
     assert_eq!(&p["animation-play-state"], "running");
     assert_eq!(&p["animation"], "enter 1s ease");
-    assert_eq!(&styles.values[id(&doc, "b")]["--tw-enter-opacity"], "0.3");
+    let b = &styles.vars[id(&doc, "b")];
+    let opacity = Prop::new("--tw-enter-opacity");
+    assert_eq!(
+        b.iter()
+            .find(|(prop, _)| *prop == opacity)
+            .map(|(_, value)| &**value),
+        Some("0.3")
+    );
 }
 
 #[test]

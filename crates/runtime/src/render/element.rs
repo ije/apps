@@ -15,6 +15,8 @@ use renderer::{Bounds, Child, MouseButton, SharedString, img, point, px, relativ
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 pub(super) struct Build<'a> {
+    /// By node, what the inline SVGs and positioned boxes in its subtree read beyond it.
+    pub(super) inputs: &'a rustc_hash::FxHashMap<usize, u64>,
     pub(super) doc: &'a Document,
     pub(super) styles: &'a ComputedStyles,
     pub(super) text: &'a renderer::TextSystem,
@@ -41,6 +43,8 @@ pub(super) struct Build<'a> {
     pub(super) culls: &'a std::cell::Cell<usize>,
     /// The viewport has a new size, so subtrees with viewport units build again.
     pub(super) resized: bool,
+    /// No node, style, focus or viewport changed since the last build, so framed subtrees keep their boxes.
+    pub(super) settled: bool,
 }
 
 /// What an element's boxes were built from, besides its subtree's nodes and styles. Equal inputs keep the boxes.
@@ -54,6 +58,94 @@ pub(super) struct Reuse {
     margin: [f32; 4],
     /// A script scrolled the clipped box, which gave it a scroll handle.
     scrolled: bool,
+    /// What the inline SVGs and positioned boxes of the subtree read beyond it, see [`own_inputs`].
+    inputs: u64,
+    /// For a grid item, its cell's size, whether it gives or takes a baseline, and the tracks a subgrid
+    /// inherits. The cell box around it places it.
+    cell: Option<([f32; 2], bool, bool, u64)>,
+}
+
+/// What an inline SVG, a positioned box or a grid builds from beyond its own nodes and place: the nodes of the
+/// SVG and those its `<use>` elements show, which may be anywhere and have no layout revision; the parent's
+/// style and the containing blocks and viewport of the last frame, which size and place a positioned box; and a
+/// grid's size and its items' baselines in the last frame, which size its tracks.
+pub(super) fn own_inputs(
+    doc: &Document,
+    styles: &ComputedStyles,
+    dom: &crate::dom::State,
+    ids: &super::effects::Ids,
+    id: usize,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    if doc.nodes[id].tag == "svg" {
+        let mut pending = vec![id];
+        let mut visited = rustc_hash::FxHashSet::default();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            (
+                node,
+                doc.nodes.revision(node),
+                Rc::as_ptr(&styles.values[node]),
+            )
+                .hash(&mut hasher);
+            let current = &doc.nodes[node];
+            pending.extend(&current.children);
+            if current.tag == "use"
+                && let Some(name) = current
+                    .attrs
+                    .get("href")
+                    .or_else(|| current.attrs.get("xlink:href"))
+                    .and_then(|value| value.strip_prefix('#'))
+            {
+                pending.extend(
+                    super::effects::index(ids, doc)
+                        .get(name)
+                        .into_iter()
+                        .flatten(),
+                );
+            }
+        }
+        return hasher.finish();
+    }
+    if styles.values[id]
+        .get(Prop::DISPLAY)
+        .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
+    {
+        for value in dom.cull.widths.get(&id).into_iter().flatten() {
+            value.to_bits().hash(&mut hasher);
+        }
+        for child in &doc.nodes[id].children {
+            for baseline in dom.baselines.get(child).into_iter().flatten() {
+                baseline.map(f32::to_bits).hash(&mut hasher);
+            }
+        }
+    }
+    if !styles.values[id]
+        .get(Prop::POSITION)
+        .is_some_and(|value| matches!(value, "absolute" | "fixed" | "sticky"))
+    {
+        return hasher.finish();
+    }
+    let mut ancestor = doc.nodes[id].parent;
+    if let Some(parent) = ancestor {
+        Rc::as_ptr(&styles.values[parent]).hash(&mut hasher);
+    }
+    while let Some(block) = ancestor {
+        if let Some(bounds) = dom.blocks.get(&block) {
+            (block, f32::from(bounds.size.width).to_bits()).hash(&mut hasher);
+            f32::from(bounds.size.height).to_bits().hash(&mut hasher);
+        }
+        ancestor = doc.nodes[block]
+            .parent
+            .or_else(|| dom.hosts.get(&block).copied());
+    }
+    for value in styles.lengths[id].viewport {
+        value.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
@@ -203,21 +295,26 @@ impl SvgSource<'_> {
                 }
                 Prop::VECTOR_EFFECT => continue,
                 Prop::FONT_SIZE => format!("{}px", units.font.em),
+                // resvg resolves `currentColor` with the `color` the element inherits in the source, which for
+                // `<use>` content is the `<use>`'s color, not the color where the content is defined.
+                Prop::FILL
+                | Prop::STROKE
+                | Prop::STOP_COLOR
+                | Prop::FLOOD_COLOR
+                | Prop::LIGHTING_COLOR
+                    if value.eq_ignore_ascii_case("currentcolor") =>
+                {
+                    "currentColor".to_owned()
+                }
                 Prop::FILL
                 | Prop::STROKE
                 | Prop::COLOR
                 | Prop::STOP_COLOR
                 | Prop::FLOOD_COLOR
-                | Prop::LIGHTING_COLOR => {
-                    let color = if value.eq_ignore_ascii_case("currentcolor") {
-                        own.get(Prop::COLOR).unwrap_or("black")
-                    } else {
-                        value
-                    };
-                    style::color(color).map_or(value.to_owned(), |(rgb, alpha)| {
+                | Prop::LIGHTING_COLOR => style::color(value)
+                    .map_or(value.to_owned(), |(rgb, alpha)| {
                         format!("#{rgb:06x}{alpha:02x}")
-                    })
-                }
+                    }),
                 _ if factor != 1. => value
                     .split(|c: char| c == ',' || c.is_ascii_whitespace())
                     .filter(|part| !part.is_empty())
@@ -342,13 +439,11 @@ pub(super) fn element(
 ) -> Child {
     let info = build.info[id];
     // WARNING: a 3D parent resolves the box's transform with its own units, so such boxes build again.
-    if slot.is_some()
-        || build.perspective.is_some()
+    if build.perspective.is_some()
         || build.doc.nodes[id].tag.starts_with('#')
         || build.ancestors.len() >= 256
         || info.flags
-            & (cull::BLOCKED
-                | cull::VOLATILE
+            & (cull::VOLATILE
                 | cull::ANIMATED
                 | cull::HIDDEN
                 | cull::MOVED
@@ -388,7 +483,14 @@ pub(super) fn element(
                 .get(Prop::DISPLAY)
                 .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
         }),
-        margin: margins(build, id, &units, containing[0], build.flex_parent, false),
+        margin: margins(
+            build,
+            id,
+            &units,
+            containing[0],
+            build.flex_parent,
+            slot.is_some(),
+        ),
         scrolled: [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
             .into_iter()
             .any(|prop| {
@@ -403,19 +505,37 @@ pub(super) fn element(
                 .dom
                 .get(&build.view.id)
                 .is_some_and(|dom| dom.scroll.contains_key(&id)),
+        inputs: build.inputs.get(&id).copied().unwrap_or(0),
+        cell: slot.as_ref().map(|(bounds, grid)| {
+            use std::hash::{Hash, Hasher};
+            let mut tracks = rustc_hash::FxHasher::default();
+            for value in grid.columns.iter().chain(&grid.rows).chain(&grid.gap) {
+                value.to_bits().hash(&mut tracks);
+            }
+            (
+                [bounds[2], bounds[3]],
+                grid.baseline,
+                grid.first_item.is_some(),
+                tracks.finish(),
+            )
+        }),
     };
-    if build.tree.contains(id) && build.view.kept.borrow().get(&id) == Some(&key) {
+    if (build.settled || info.flags & cull::FRAMED == 0)
+        && build.tree.contains(id)
+        && build.view.kept.borrow().get(&id) == Some(&key)
+    {
         return Child::Kept(id.into());
     }
     let culls = build.culls.get();
     let child = create(build, id, containing, container, slot);
     let mut kept = build.view.kept.borrow_mut();
     // WARNING: culled runs depend on the scroll position, so a subtree with spacers is built again.
-    if build.culls.get() == culls {
-        kept.insert(id, key);
+    let old = if build.culls.get() == culls {
+        kept.insert(id, key)
     } else {
-        kept.remove(&id);
-    }
+        kept.remove(&id)
+    };
+    build.view.kept_log.borrow_mut().push((id, old));
     child
 }
 
@@ -427,6 +547,7 @@ fn create(
     slot: Option<([f32; 4], super::grid::Grid)>,
 ) -> Child {
     let Build {
+        inputs,
         doc,
         styles,
         text,
@@ -446,6 +567,7 @@ fn create(
         tree,
         culls,
         resized,
+        settled,
     } = *build;
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -499,6 +621,7 @@ fn create(
             .is_some_and(|value| value < 1.);
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
+        inputs,
         doc,
         styles,
         text,
@@ -514,6 +637,7 @@ fn create(
         tree,
         culls,
         resized,
+        settled,
         zone: zone
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVED) == 0)
@@ -1107,18 +1231,13 @@ fn create(
                 }
                 pending.extend(&doc.nodes[child].children);
             }
-            // CSS keywords ignore case, and resvg does not parse every CSS color, so `currentcolor` in
-            // attributes becomes the resolved color in hex.
-            let current = style::color(style.get(Prop::COLOR).unwrap_or(""))
-                .map_or("black".to_owned(), |(rgb, alpha)| {
-                    format!("#{rgb:06x}{alpha:02x}")
-                });
+            // CSS keywords ignore case, but resvg only reads `currentColor`.
             let lower = source.to_ascii_lowercase();
             let mut end = 0;
             let mut replaced = String::with_capacity(source.len());
             for (start, _) in lower.match_indices("currentcolor") {
                 replaced.push_str(&source[end..start]);
-                replaced.push_str(&current);
+                replaced.push_str("currentColor");
                 end = start + "currentcolor".len();
             }
             replaced.push_str(&source[end..]);
@@ -3491,14 +3610,15 @@ fn create(
                     } else {
                         None
                     };
+                // WARNING: entries stay while the grid is kept, so its size is checked in each frame.
+                let mut host = view.host.borrow_mut();
+                let flexed = &mut host.dom.entry(view.id).or_default().flexed_grids;
                 if tracked.iter().any(Option::is_some) {
-                    let mut host = view.host.borrow_mut();
-                    host.dom
-                        .entry(view.id)
-                        .or_default()
-                        .flexed_grids
-                        .insert(id, tracked);
+                    flexed.insert(id, tracked);
+                } else {
+                    flexed.remove(&id);
                 }
+                drop(host);
                 let cached = view
                     .host
                     .borrow()
@@ -3900,7 +4020,24 @@ fn create(
                         },
                     ))
                 });
+                // A grid item sits in a box at its cell, so a kept item moves with its cell.
+                let cell = placement
+                    .as_ref()
+                    .map(|(bounds, grid)| (*bounds, grid.first_item.is_some()));
                 let child_element = element(build, child, content, container, placement);
+                let child_element: renderer::Child = match cell {
+                    Some((bounds, first)) => {
+                        let mut cell = renderer::node()
+                            .absolute()
+                            .left(px(bounds[0]))
+                            .top(px(bounds[1]))
+                            .w(px(bounds[2]))
+                            .h(px(bounds[3]));
+                        cell.style().baseline_source = first;
+                        cell.child(child_element).into()
+                    }
+                    None => child_element,
+                };
                 let out_of_flow = styles.values[child]
                     .get(Prop::POSITION)
                     .is_some_and(|value| matches!(value, "absolute" | "fixed"));
@@ -4140,8 +4277,8 @@ fn create(
         el.style().baseline_source = grid.first_item.is_some();
         el = el
             .absolute()
-            .left(px(bounds[0]))
-            .top(px(bounds[1]))
+            .left(px(0.))
+            .top(px(0.))
             .mt(px(margin[0]))
             .mr(px(margin[1]))
             .mb(px(margin[2]))

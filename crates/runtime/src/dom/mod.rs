@@ -300,7 +300,12 @@ impl std::ops::Index<&usize> for LayoutMirror {
 #[derive(Default)]
 pub struct State {
     pub base: Option<url::Url>,
-    pub(crate) free: Vec<usize>,
+    /// Free node ids, the lowest first, so the end of the arena empties and `trim` can cut it.
+    pub(crate) free: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
+    /// Nodes taken out of the document since the last style pass.
+    pub(crate) removed: Vec<usize>,
+    /// Nodes allocated since the page last reported them to JSC as memory.
+    pub(crate) created: usize,
     /// Nodes that lost their parent since the last release, as candidate roots of garbage subtrees.
     pub(crate) detached: Vec<usize>,
     live: HashSet<usize>,
@@ -310,7 +315,10 @@ pub struct State {
     pub scroll: HashMap<usize, renderer::ScrollHandle>,
     scroll_offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
-    pub(crate) grids: HashMap<
+    /// The last styles while `computed` is out of date, so a restyle keeps the old style of nodes whose values
+    /// stay the same.
+    previous: Option<Rc<style::ComputedStyles>>,
+    pub(crate) grids: rustc_hash::FxHashMap<
         usize,
         (
             f32,
@@ -321,9 +329,11 @@ pub struct State {
     >,
     /// Grids sized by a flex layout: per axis, the content size their tracks used and the
     /// padding and borders. Prepaint renders again when the laid-out size differs.
-    pub(crate) flexed_grids: HashMap<usize, [Option<(f32, f32)>; 2]>,
+    pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
     pub(crate) baselines: crate::render::grid::Baselines,
-    pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
+    /// Boxed, since the list is as long as the node arena, whose free slots outnumber the nodes after a big page
+    /// shrinks.
+    pub(crate) layout_nodes: Vec<Option<Box<LayoutNode>>>,
     pub(crate) measurements: crate::render::grid::Measurements,
     /// When each box last painted, counted across frames. Hit tests take the box painted last.
     pub painted: Vec<u64>,
@@ -379,6 +389,9 @@ pub struct State {
     pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
+    /// Gradient bitmaps by their inputs, oldest first, that boxes built again reuse, like the rows of a
+    /// scrolling list.
+    pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
     /// The `@font-face` URLs tried, with the font family of the ones that loaded.
     pub(crate) fonts: HashMap<String, Option<String>>,
@@ -401,9 +414,9 @@ pub struct State {
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
     pub(crate) container_pass: bool,
-    pub(crate) anchors: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
+    pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
     /// The padding boxes of containing blocks. They stay between frames, so absolute boxes size in last frame's.
-    pub(crate) blocks: HashMap<usize, renderer::Bounds<renderer::Pixels>>,
+    pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
     /// The top layer: modal dialogs, shown popovers and fullscreen elements, in the order they went in.
     pub top_layer: Vec<usize>,
@@ -426,21 +439,93 @@ impl State {
         }
     }
 
+    /// Drops the caches of nodes that left the document.
+    // WARNING: such nodes wait for a GC to be freed, and a scrolling list makes them much faster than GCs run,
+    // so they would outnumber the nodes in the document. A node that comes back computes them again.
+    fn drop_removed(&mut self, doc: &Document) {
+        let mut gone = Vec::new();
+        for root in std::mem::take(&mut self.removed) {
+            if doc.nodes.get(root).is_none_or(|node| node.parent.is_some())
+                || self.hosts.contains_key(&root)
+            {
+                continue;
+            }
+            let mut next = gone.len();
+            gone.push(root);
+            while next < gone.len() {
+                let id = gone[next];
+                next += 1;
+                gone.extend(&doc.nodes[id].children);
+                gone.extend(self.shadows.get(&id));
+            }
+        }
+        self.style_cache.forget(&gone);
+        for id in gone {
+            self.inline_text.remove(&id);
+            if let Some(node) = self.layout_nodes.get_mut(id) {
+                *node = None;
+            }
+        }
+    }
+
+    /// Gives back memory while the page is quiet: cuts the free end of the node arena, and drops caches that
+    /// the next style pass fills again. Returns whether the arena shrank, so arrays by node need a new frame.
+    pub(crate) fn trim(&mut self, doc: &mut Document) -> bool {
+        self.drop_removed(doc);
+        let before = doc.nodes.len();
+        let mut free = std::mem::take(&mut self.free).into_sorted_vec();
+        let mut len = before;
+        let cut = free
+            .iter()
+            .take_while(|id| {
+                let last = id.0 + 1 == len;
+                if last {
+                    len = id.0;
+                }
+                last
+            })
+            .count();
+        free.drain(..cut);
+        free.shrink_to_fit();
+        self.free = free.into();
+        self.style_cache.trim(len);
+        self.layout_nodes.truncate(len);
+        self.layout_nodes.shrink_to_fit();
+        self.painted.truncate(len);
+        self.painted.shrink_to_fit();
+        self.motion.trim(len);
+        self.cull.trim(len);
+        if len < before {
+            doc.nodes.truncate(len);
+            self.invalidate();
+        }
+        len < before
+    }
+
+    /// Marks the styles out of date.
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(computed) = self.computed.take() {
+            self.previous = Some(computed);
+        }
+    }
+
     pub(crate) fn update_containers(&mut self) -> bool {
-        let changed = self
-            .style_cache
-            .set_containers(std::mem::take(&mut self.containers));
+        let changed = self.style_cache.set_containers(&self.containers);
         if changed {
-            self.computed = None;
+            self.invalidate();
         }
         changed
     }
 
     pub(crate) fn allocate(&mut self, doc: &mut Document, node: Node) -> usize {
-        let id = self.free.pop().unwrap_or_else(|| {
-            doc.nodes.push(Node::default());
-            doc.nodes.len() - 1
-        });
+        self.created += 1;
+        let id = self.free.pop().map_or_else(
+            || {
+                doc.nodes.push(Node::default());
+                doc.nodes.len() - 1
+            },
+            |id| id.0,
+        );
         self.place(doc, id, node);
         id
     }
@@ -464,7 +549,7 @@ impl State {
                     .resize(doc.nodes.len(), (style::UserSelect::None, 0));
                 computed.user_select[id] = (style::UserSelect::None, 0);
             } else if id >= cached.values.len() {
-                self.computed = None;
+                self.invalidate();
             }
             // WARNING: a frame keeps a clone of the styles, so they can't grow in place. Detached nodes have empty styles in them, and new nodes are detached, so only a new id makes them stale.
         }
@@ -925,7 +1010,7 @@ pub fn call(
                     }
                 }
             };
-            state.computed = None;
+            state.invalidate();
             state.dirty = true;
             return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
         }
@@ -943,10 +1028,11 @@ pub fn call(
                     state.live.remove(&(id as usize));
                 }
             }
+            state.drop_removed(doc);
             let mut roots = std::mem::take(&mut state.detached);
             roots.sort_unstable();
             roots.dedup();
-            let mut freed = HashSet::new();
+            let mut freed = Vec::new();
             let mut canvases = Vec::new();
             let retired = state.retired.len();
             for root in roots {
@@ -1025,11 +1111,13 @@ pub fn call(
                     if let Some(order) = state.painted.get_mut(id) {
                         *order = 0;
                     }
-                    state.free.push(id);
-                    freed.insert(id);
+                    state.free.push(std::cmp::Reverse(id));
+                    freed.push(id);
                 }
             }
             if !freed.is_empty() {
+                state.style_cache.forget(&freed);
+                let freed: HashSet<usize> = freed.into_iter().collect();
                 state.top_layer.retain(|node| !freed.contains(node));
                 state
                     .measurements
@@ -1121,172 +1209,16 @@ pub fn call(
                 viewport,
                 system.as_deref().map(|system| (system, state.pixel_ratio)),
             );
-            let first = args[2].as_bool().unwrap_or(false);
-            let caret = args[3].as_bool().unwrap_or(false);
-            let mut nearest = Vec::new();
-            let screen = [0., 0., viewport[0], viewport[1]];
-            let up = |id: usize| {
-                doc.nodes[id]
-                    .parent
-                    .or_else(|| state.hosts.get(&id).copied())
-            };
-            // Boxes of the top layer escape the clips of their ancestors.
-            let top: Vec<usize> = state
-                .top_layer
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    doc.nodes[id].state & TOP_LAYER != 0
-                        && doc.nodes[id].tag != "html"
-                        && std::iter::successors(Some(id), |&id| up(id))
-                            .all(|id| computed.values[id].get(Prop::DISPLAY) != Some("none"))
-                        && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
-                })
-                .collect();
-            let mut pending = vec![(0, screen, false)];
-            pending.extend(top.iter().map(|&id| (id, screen, false)));
-            let mut hits = Vec::new();
-            while let Some((id, mut clip, hit)) = pending.pop() {
-                if hit {
-                    hits.push(id);
-                    continue;
-                }
-                let node = &doc.nodes[id];
-                let style = &computed.values[id];
-                if style
-                    .get(Prop::DISPLAY)
-                    .is_some_and(|value| value == "none")
-                {
-                    continue;
-                }
-                if let Some(&[left, top, width, height]) = state.bounds.get(&id) {
-                    let selectable = !style
-                        .get(Prop::POINTER_EVENTS)
-                        .is_some_and(|value| value == "none")
-                        && !style
-                            .get(Prop::VISIBILITY)
-                            .is_some_and(|value| matches!(value, "hidden" | "collapse"));
-                    if caret
-                        && node.tag == "#text"
-                        && selectable
-                        && height > 0.
-                        && x >= clip[0]
-                        && x < clip[2]
-                        && y >= clip[1]
-                        && y < clip[3]
-                    {
-                        let distance = (left - x).max(0.).max(x - left - width).powi(2)
-                            + (top - y).max(0.).max(y - top - height).powi(2);
-                        nearest.push((id, distance));
-                    }
-                    if (caret || !node.tag.starts_with('#'))
-                        && width > 0.
-                        && height > 0.
-                        && x >= left
-                        && x < left + width
-                        && y >= top
-                        && y < top + height
-                        && x >= clip[0]
-                        && x < clip[2]
-                        && y >= clip[1]
-                        && y < clip[3]
-                        && selectable
-                    {
-                        pending.push((id, clip, true));
-                    }
-                    for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
-                        if style
-                            .get(prop)
-                            .or_else(|| style.get(Prop::OVERFLOW))
-                            .is_some_and(|value| {
-                                matches!(value, "hidden" | "clip" | "auto" | "scroll")
-                            })
-                        {
-                            clip[axis] = clip[axis].max([left, top][axis]);
-                            clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);
-                        }
-                    }
-                }
-                if x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3] {
-                    let children = computed
-                        .children
-                        .get(&id)
-                        .unwrap_or(&doc.nodes[id].children);
-                    pending.extend(
-                        children
-                            .iter()
-                            .filter(|child| !top.contains(child))
-                            .map(|&child| (child, clip, false)),
-                    );
-                }
-            }
-            // Hits come deepest and last in the tree first. The box painted last is on top, so z-index
-            // and positioned boxes win over later siblings. Text and boxes that don't paint use their
-            // nearest painted ancestor.
-            hits.sort_by_key(|&id| {
-                std::cmp::Reverse(
-                    std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
-                        .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
-                        .unwrap_or(0),
-                )
-            });
-            // A `::backdrop` covers what paints before its box and hits as that box.
-            for &id in top.iter().rev() {
-                if hits.first().is_some_and(|&hit| {
-                    std::iter::successors(Some(hit), |&hit| up(hit)).any(|hit| hit == id)
-                }) {
-                    break;
-                }
-                if computed.backdrops.get(&id).is_some_and(|backdrop| {
-                    backdrop.get(Prop::POINTER_EVENTS) != Some("none")
-                        && backdrop
-                            .get(Prop::VISIBILITY)
-                            .is_none_or(|value| value == "visible")
-                        && backdrop.get(Prop::DISPLAY) != Some("none")
-                }) && x >= 0.
-                    && y >= 0.
-                    && x < viewport[0]
-                    && y < viewport[1]
-                {
-                    hits.insert(0, id);
-                    break;
-                }
-            }
-            if caret {
-                if let Some(&id) = hits.first()
-                    && doc.nodes[id].tag == "#text"
-                {
-                    return Ok(json!(id));
-                }
-                let target = hits.first().copied();
-                let text = nearest
-                    .into_iter()
-                    .filter(|(id, _)| {
-                        let mut parent = doc.nodes[*id].parent;
-                        while let Some(id) = parent {
-                            if Some(id) == target {
-                                return true;
-                            }
-                            parent = doc.nodes[id].parent;
-                        }
-                        false
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(id, _)| id);
-                return Ok(json!(text.or(target)));
-            }
-            if first && let Some(&id) = hits.first() {
-                return Ok(json!(id));
-            }
-            if first && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
-                return Ok(json!(
-                    doc.nodes[0]
-                        .children
-                        .iter()
-                        .find(|&&id| !doc.nodes[id].tag.starts_with('#'))
-                ));
-            }
-            return Ok(if first { Value::Null } else { json!(hits) });
+            let (first, caret) = (args[2].as_bool(), args[3].as_bool());
+            return Ok(hit_test(
+                doc,
+                state,
+                &computed,
+                viewport,
+                [x, y],
+                first.unwrap_or(false),
+                caret.unwrap_or(false),
+            ));
         }
         if matches!(op, "dom.focus" | "dom.hover" | "dom.active") {
             let ids = args[0]
@@ -1341,7 +1273,7 @@ pub fn call(
             }
             state.interaction[index] = ids;
             if used {
-                state.computed = None;
+                state.invalidate();
             }
             state.dirty |= used || focus != 0 || repaint;
             return Ok(Value::Null);
@@ -1464,6 +1396,7 @@ pub fn call(
                 for child in std::mem::take(&mut doc.nodes[id].children) {
                     doc.nodes[child].parent = None;
                     state.detached.push(child);
+                    state.removed.push(child);
                 }
                 doc.nodes[id].text.clear();
                 let mut ids = vec![id];
@@ -1580,6 +1513,20 @@ pub fn call(
                     }
                     (style, _) => style,
                 };
+                // Styles hold no custom properties, unless they animate or declare their own.
+                let mut full = None;
+                let style = match style {
+                    Some(style)
+                        if style.vars().is_empty()
+                            && !styles.vars[id].is_empty()
+                            && args[1].as_str().is_none_or(|name| name.starts_with("--")) =>
+                    {
+                        let mut copy = style.clone();
+                        copy.set_vars(styles.vars[id].clone());
+                        Some(&*full.insert(copy))
+                    }
+                    style => style,
+                };
                 let Some(style) = style.filter(|style| !style.is_empty()) else {
                     return Ok(json!(if args[1].is_string() {
                         json!("")
@@ -1681,7 +1628,7 @@ pub fn call(
                         sheet.edit(&path, edit(kind, text))
                     },
                 );
-                state.computed = None;
+                state.invalidate();
                 state.dirty = true;
                 Ok(result.unwrap_or_else(|error| json!({ "error": error })))
             }
@@ -2562,7 +2509,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
     // WARNING: a new style cache would drop constructed and CSSOM-edited sheets, so only the values that used font metrics go.
     state.style_cache.metrics = None;
-    state.computed = None;
+    state.invalidate();
     if !same {
         state
             .font_aliases
@@ -2612,6 +2559,205 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
     }
 }
 
+/// The parent of a node in the flat tree: slotted nodes go up to their slot, shadow roots to their host.
+pub(crate) fn flat_parent(
+    doc: &Document,
+    state: &State,
+    styles: &style::ComputedStyles,
+    id: usize,
+) -> Option<usize> {
+    match doc.nodes[id].parent {
+        Some(parent) if state.shadows.contains_key(&parent) => styles
+            .children
+            .iter()
+            .find_map(|(&slot, kids)| (slot != parent && kids.contains(&id)).then_some(slot)),
+        Some(parent) => Some(parent),
+        None => state.hosts.get(&id).copied(),
+    }
+}
+
+/// The nodes at `x`, `y`, topmost first, or with `first` only the topmost element. With `caret`, the
+/// text node nearest to the point within the topmost element.
+pub(crate) fn hit_test(
+    doc: &Document,
+    state: &State,
+    computed: &style::ComputedStyles,
+    viewport: [f32; 2],
+    [x, y]: [f32; 2],
+    first: bool,
+    caret: bool,
+) -> Value {
+    let mut nearest = Vec::new();
+    let screen = [0., 0., viewport[0], viewport[1]];
+    let up = |id: usize| {
+        doc.nodes[id]
+            .parent
+            .or_else(|| state.hosts.get(&id).copied())
+    };
+    // Boxes of the top layer escape the clips of their ancestors.
+    let top: Vec<usize> = state
+        .top_layer
+        .iter()
+        .copied()
+        .filter(|&id| {
+            doc.nodes[id].state & TOP_LAYER != 0
+                && doc.nodes[id].tag != "html"
+                && std::iter::successors(Some(id), |&id| up(id)).all(|id| {
+                    computed
+                        .values
+                        .get(id)
+                        .is_none_or(|style| style.get(Prop::DISPLAY) != Some("none"))
+                })
+                && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
+        })
+        .collect();
+    let mut pending = vec![(0, screen, false)];
+    pending.extend(top.iter().map(|&id| (id, screen, false)));
+    let mut hits = Vec::new();
+    while let Some((id, mut clip, hit)) = pending.pop() {
+        if hit {
+            hits.push(id);
+            continue;
+        }
+        let node = &doc.nodes[id];
+        // WARNING: the styles can be older than the tree, from the last frame.
+        let Some(style) = computed.values.get(id) else {
+            continue;
+        };
+        if style
+            .get(Prop::DISPLAY)
+            .is_some_and(|value| value == "none")
+        {
+            continue;
+        }
+        if let Some(&[left, top, width, height]) = state.bounds.get(&id) {
+            let selectable = !style
+                .get(Prop::POINTER_EVENTS)
+                .is_some_and(|value| value == "none")
+                && !style
+                    .get(Prop::VISIBILITY)
+                    .is_some_and(|value| matches!(value, "hidden" | "collapse"));
+            if caret
+                && node.tag == "#text"
+                && selectable
+                && height > 0.
+                && x >= clip[0]
+                && x < clip[2]
+                && y >= clip[1]
+                && y < clip[3]
+            {
+                let distance = (left - x).max(0.).max(x - left - width).powi(2)
+                    + (top - y).max(0.).max(y - top - height).powi(2);
+                nearest.push((id, distance));
+            }
+            if (caret || !node.tag.starts_with('#'))
+                && width > 0.
+                && height > 0.
+                && x >= left
+                && x < left + width
+                && y >= top
+                && y < top + height
+                && x >= clip[0]
+                && x < clip[2]
+                && y >= clip[1]
+                && y < clip[3]
+                && selectable
+            {
+                pending.push((id, clip, true));
+            }
+            for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
+                if style
+                    .get(prop)
+                    .or_else(|| style.get(Prop::OVERFLOW))
+                    .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
+                {
+                    clip[axis] = clip[axis].max([left, top][axis]);
+                    clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);
+                }
+            }
+        }
+        if x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3] {
+            let children = computed
+                .children
+                .get(&id)
+                .unwrap_or(&doc.nodes[id].children);
+            pending.extend(
+                children
+                    .iter()
+                    .filter(|child| !top.contains(child))
+                    .map(|&child| (child, clip, false)),
+            );
+        }
+    }
+    // Hits come deepest and last in the tree first. The box painted last is on top, so z-index
+    // and positioned boxes win over later siblings. Text and boxes that don't paint use their
+    // nearest painted ancestor.
+    hits.sort_by_key(|&id| {
+        std::cmp::Reverse(
+            std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
+                .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
+                .unwrap_or(0),
+        )
+    });
+    // A `::backdrop` covers what paints before its box and hits as that box.
+    for &id in top.iter().rev() {
+        if hits.first().is_some_and(|&hit| {
+            std::iter::successors(Some(hit), |&hit| up(hit)).any(|hit| hit == id)
+        }) {
+            break;
+        }
+        if computed.backdrops.get(&id).is_some_and(|backdrop| {
+            backdrop.get(Prop::POINTER_EVENTS) != Some("none")
+                && backdrop
+                    .get(Prop::VISIBILITY)
+                    .is_none_or(|value| value == "visible")
+                && backdrop.get(Prop::DISPLAY) != Some("none")
+        }) && x >= 0.
+            && y >= 0.
+            && x < viewport[0]
+            && y < viewport[1]
+        {
+            hits.insert(0, id);
+            break;
+        }
+    }
+    if caret {
+        if let Some(&id) = hits.first()
+            && doc.nodes[id].tag == "#text"
+        {
+            return json!(id);
+        }
+        let target = hits.first().copied();
+        let text = nearest
+            .into_iter()
+            .filter(|(id, _)| {
+                let mut parent = doc.nodes[*id].parent;
+                while let Some(id) = parent {
+                    if Some(id) == target {
+                        return true;
+                    }
+                    parent = doc.nodes[id].parent;
+                }
+                false
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id);
+        return json!(text.or(target));
+    }
+    if first && let Some(&id) = hits.first() {
+        return json!(id);
+    }
+    if first && x >= 0. && y >= 0. && x < viewport[0] && y < viewport[1] {
+        return json!(
+            doc.nodes[0]
+                .children
+                .iter()
+                .find(|&&id| !doc.nodes[id].tag.starts_with('#'))
+        );
+    }
+    if first { Value::Null } else { json!(hits) }
+}
+
 pub(crate) fn styles(
     doc: &mut Document,
     state: &mut State,
@@ -2634,6 +2780,7 @@ pub(crate) fn styles(
     {
         return computed.clone();
     }
+    state.drop_removed(doc);
     let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
     let mut context = style::StyleContext {
         reduced_motion,
@@ -2646,7 +2793,7 @@ pub(crate) fn styles(
             .iter()
             .map(|(_, sheet, user)| (sheet.clone(), *user))
             .collect(),
-        previous: state.computed.clone(),
+        previous: state.computed.clone().or_else(|| state.previous.take()),
         ..Default::default()
     };
     if !state.shadows.is_empty() {
@@ -2676,6 +2823,13 @@ pub(crate) fn styles(
         Some(&context),
     );
     // WARNING: the first pass computes only hosts, roots, slots and their ancestors to collect `:host` declarations and slot styles; pass 1 recomputes every node with them.
+    // WARNING: each shadow tree cascades with its root swapped in as the document, which stamps both nodes, so
+    // their revisions go back afterwards: the style pass changed no node, and kept boxes compare revisions.
+    let latest = doc.nodes.latest();
+    let swapped: Vec<(usize, u64)> = std::iter::once(0)
+        .chain(state.shadows.values().copied())
+        .map(|id| (id, doc.nodes.revision(id)))
+        .collect();
     for pass in 0..if state.shadows.is_empty() { 0 } else { 2 } {
         if pass == 1 {
             context.required = None;
@@ -2766,7 +2920,11 @@ pub(crate) fn styles(
                 scoped_root.inline = None;
                 scoped_root.attrs.remove("style");
                 scoped_root.state = doc.nodes[id].state;
-                let host = (result.values[id].clone(), result.lengths[id]);
+                let host = (
+                    result.values[id].clone(),
+                    result.lengths[id],
+                    result.vars[id].clone(),
+                );
                 if pass == 0 {
                     context.inherited.insert(root, host);
                 } else {
@@ -2779,7 +2937,12 @@ pub(crate) fn styles(
                 };
                 let document = std::mem::replace(&mut doc.nodes[0], scoped_doc);
                 let shadow = std::mem::replace(&mut doc.nodes[root], scoped_root);
-                let top = (result.values[0].clone(), result.lengths[0], result.flags[0]);
+                let top = (
+                    result.values[0].clone(),
+                    result.lengths[0],
+                    result.flags[0],
+                    result.vars[0].clone(),
+                );
                 style::cascade(
                     doc,
                     viewport,
@@ -2789,7 +2952,12 @@ pub(crate) fn styles(
                     Some(&context),
                     &mut result,
                 );
-                (result.values[0], result.lengths[0], result.flags[0]) = top;
+                (
+                    result.values[0],
+                    result.lengths[0],
+                    result.flags[0],
+                    result.vars[0],
+                ) = top;
                 doc.nodes[0] = document;
                 doc.nodes[root] = shadow;
                 if pass == 0 {
@@ -2804,9 +2972,14 @@ pub(crate) fn styles(
         if pass == 0 {
             for (&slot, assigned) in &slots {
                 for &child in assigned {
-                    context
-                        .inherited
-                        .insert(child, (result.values[slot].clone(), result.lengths[slot]));
+                    context.inherited.insert(
+                        child,
+                        (
+                            result.values[slot].clone(),
+                            result.lengths[slot],
+                            result.vars[slot].clone(),
+                        ),
+                    );
                 }
                 let Some(rules) = result.slotted.get(&slot).cloned() else {
                     continue;
@@ -2832,6 +3005,7 @@ pub(crate) fn styles(
             }
         }
     }
+    doc.nodes.restore(&swapped, latest);
     state.style_cache.finish();
     state.sheets.retain(|text, _| Rc::strong_count(text) > 1);
     for (&host, &root) in &state.shadows {
@@ -2915,6 +3089,7 @@ pub(crate) fn styles(
     let result = Rc::new(result);
     state.linted = false;
     state.computed = Some(result.clone());
+    state.previous = None;
     result
 }
 
@@ -2963,6 +3138,14 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kept_containers_keep_their_sizes_between_frames() {
+        let mut state = super::State::default();
+        state.containers.insert(1, [150., 20.]);
+        state.update_containers();
+        assert_eq!(state.containers.get(&1), Some(&[150., 20.]));
+    }
+
     #[test]
     fn password_fields_show_a_bullet_per_code_point() {
         let doc = Document::parse("<input type=password><input>");
@@ -3313,5 +3496,60 @@ mod tests {
         styles(&mut doc, &mut state, [800., 600.], None);
         assert_eq!(state.sheets.len(), 199);
         assert!(!state.sheets.contains_key(".replacement{color:blue}"));
+    }
+
+    #[test]
+    fn removed_nodes_drop_caches_and_style_again_when_they_return() {
+        let mut doc = Document::parse(
+            "<style>.on p{color:red}p:first-child{width:1px}</style><div class=on><p>x</p></div><div id=b></div>",
+        );
+        let find = |doc: &Document, tag: &str| doc.nodes.iter().position(|node| node.tag == tag);
+        let p = find(&doc, "p").unwrap();
+        let on = doc.nodes[p].parent.unwrap();
+        let mut state = State::default();
+        let viewport = [800., 600.];
+        styles(&mut doc, &mut state, viewport, None);
+        doc.nodes[on].children.retain(|&id| id != p);
+        doc.nodes[p].parent = None;
+        state.removed.push(p);
+        state.invalidate();
+        styles(&mut doc, &mut state, viewport, None);
+        assert!(state.removed.is_empty());
+        doc.nodes[on].children.push(p);
+        doc.nodes[p].parent = Some(on);
+        state.invalidate();
+        let returned = styles(&mut doc, &mut state, viewport, None);
+        let fresh = styles(&mut doc, &mut State::default(), viewport, None);
+        assert_eq!(returned.values[p], fresh.values[p]);
+        assert_eq!(returned.values[p].get(Prop::COLOR), Some("red"));
+    }
+
+    #[test]
+    fn trim_cuts_the_free_end_of_the_arena_and_ids_come_back_lowest_first() {
+        let mut doc = Document::parse("<div></div>");
+        let mut state = State::default();
+        let viewport = [800., 600.];
+        let node = || Node {
+            tag: "p".into(),
+            ..Default::default()
+        };
+        let ids: Vec<usize> = (0..4).map(|_| state.allocate(&mut doc, node())).collect();
+        styles(&mut doc, &mut state, viewport, None);
+        for id in [ids[3], ids[1], ids[2]] {
+            doc.nodes[id] = Node::default();
+            state.free.push(std::cmp::Reverse(id));
+        }
+        assert!(state.trim(&mut doc));
+        assert_eq!(doc.nodes.len(), ids[1]);
+        assert_eq!(state.free.len(), 0);
+        assert!(!state.trim(&mut doc));
+        styles(&mut doc, &mut state, viewport, None);
+        assert_eq!(state.allocate(&mut doc, node()), ids[1]);
+        assert_eq!(state.allocate(&mut doc, node()), ids[1] + 1);
+        doc.nodes[ids[1]] = Node::default();
+        state.free.push(std::cmp::Reverse(ids[1]));
+        doc.nodes[ids[0]] = Node::default();
+        state.free.push(std::cmp::Reverse(ids[0]));
+        assert_eq!(state.allocate(&mut doc, node()), ids[0]);
     }
 }

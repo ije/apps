@@ -70,9 +70,19 @@ impl NodeChildren {
     }
 }
 
+/// Empties a list kept from frame to frame. One huge frame, like a very long line, leaves a capacity that
+/// later frames don't need, so a list much bigger than its last use shrinks.
+pub(crate) fn clear_list<T>(list: &mut Vec<T>) {
+    let used = list.len();
+    list.clear();
+    if list.capacity() > 4096 && list.capacity() > used * 4 {
+        list.shrink_to(used * 2);
+    }
+}
+
 impl<U: Unit> BoundsTree<U> {
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        clear_list(&mut self.nodes);
         self.root = None;
         self.max_leaf = None;
         self.insert_path.clear();

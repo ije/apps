@@ -25,6 +25,21 @@ pub fn page(source: &str) -> Document {
     doc
 }
 
+/// Packs a page for other threads, because its documents can't cross threads.
+pub(crate) fn pack_page(doc: &Document) -> Result<Vec<u8>> {
+    Ok(postcard::to_allocvec(doc)?)
+}
+
+pub(crate) fn unpack_page(bytes: &[u8]) -> Result<Document> {
+    let mut doc: Document = postcard::from_bytes(bytes)?;
+    for node in &mut doc.nodes {
+        if let Some(sheet) = &mut node.stylesheet {
+            std::rc::Rc::make_mut(sheet).bind_parents()?;
+        }
+    }
+    Ok(doc)
+}
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct Bundle {
     #[serde(skip)]

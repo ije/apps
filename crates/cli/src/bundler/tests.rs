@@ -2132,10 +2132,9 @@ fn package_features_reach_the_runtime() {
         }
     }
     let gpu = |disabled| {
-        let host = Rc::new(RefCell::new(apps_runtime::host::Host {
-            disabled,
-            ..Default::default()
-        }));
+        let mut host = apps_runtime::host::Host::default();
+        host.disabled = disabled;
+        let host = Rc::new(RefCell::new(host));
         host.borrow_mut().pages.insert(
             1,
             apps_runtime::host::Page {

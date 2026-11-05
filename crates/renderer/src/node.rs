@@ -767,10 +767,23 @@ impl Events {
             let (handle, hitbox) = (handle.clone(), hitbox.clone());
             let (overflow, restrict) = (style.overflow, style.restrict_scroll_to_axis);
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
+                if phase != DispatchPhase::Bubble
+                    || !hitbox.should_handle_scroll(window)
+                    || window.scroll_chain.as_ref().is_some_and(|chain| {
+                        !chain.iter().any(|other| Rc::ptr_eq(&other.0, &handle.0))
+                    })
+                {
                     return;
                 }
-                let delta = event.delta.pixel_delta(line_height);
+                let mut delta = event.delta.pixel_delta(line_height);
+                if event.delta.precise() {
+                    let [x, y] = window.rails.0;
+                    if y >= x {
+                        delta.x = Pixels::ZERO;
+                    } else {
+                        delta.y = Pixels::ZERO;
+                    }
+                }
                 let axis = |own: Overflow, along: Pixels, across: Pixels, other: Overflow| match own
                 {
                     Overflow::Scroll if !along.is_zero() => along,

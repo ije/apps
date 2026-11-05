@@ -1,6 +1,7 @@
 use crate::{
     Bounds, ContentMask, DevicePixels, Edges, Pixels, Point, Radii, Rgba, ScaledPixels, Size,
-    bounds_tree::BoundsTree, point,
+    bounds_tree::{BoundsTree, clear_list},
+    point,
 };
 
 pub type DrawOrder = u32;
@@ -63,14 +64,14 @@ impl SceneLayer {
         self.stack.clear();
         self.effect = None;
         self.bounds = None;
-        self.shadows.clear();
-        self.quads.clear();
-        self.underlines.clear();
-        self.mono.clear();
-        self.poly.clear();
-        self.effects.clear();
+        clear_list(&mut self.shadows);
+        clear_list(&mut self.quads);
+        clear_list(&mut self.underlines);
+        clear_list(&mut self.mono);
+        clear_list(&mut self.poly);
+        clear_list(&mut self.effects);
         for keys in &mut self.keys {
-            keys.clear();
+            clear_list(keys);
         }
     }
 

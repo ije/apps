@@ -3,9 +3,9 @@
 //! It speaks streamable HTTP without sessions, so clients stay connected across `--watch` restarts.
 //! Tool calls run on the main thread in `Desktop::drive`, or in `paused` while the debugger holds the thread.
 
-use super::{Desktop, png, window_state};
+use super::{Desktop, link::Link, png, window_state};
 use crate::{
-    host::{Role, Waker},
+    host::Role,
     jsc,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -21,7 +21,7 @@ use std::{
     net::{TcpListener, TcpStream},
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -41,6 +41,8 @@ struct Call {
 struct Shared {
     paused: Mutex<Option<String>>,
     pauses: AtomicU64,
+    /// The page side that a debugger paused, plus one.
+    page_paused: AtomicU64,
 }
 
 struct Script {
@@ -69,13 +71,43 @@ struct State {
     sessions: HashMap<usize, Session>,
     paused: Option<(usize, Value)>,
     stepping: Option<Reply>,
-    logs: VecDeque<String>,
     profile: Option<Profile>,
     samples: Option<Value>,
 }
 
+/// The calls of the page sides, by their window.
+type Pages = Arc<Mutex<std::collections::BTreeMap<u64, mpsc::Sender<Call>>>>;
+
+/// Lets a page side take its calls on its thread.
+#[derive(Clone)]
+pub(crate) struct Handle(Pages, Arc<Shared>);
+
+impl Handle {
+    pub(crate) fn install(&self, key: u64) {
+        let (sender, calls) = mpsc::channel();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, sender);
+        CHANNEL.with(|channel| channel.set((calls, self.1.clone(), key))).ok();
+    }
+}
+
+/// Stops the calls of a page side whose window closed.
+pub(crate) fn uninstall() {
+    if let Some(pages) = PAGES.get()
+        && let Some(key) = CHANNEL.with(|channel| channel.get().map(|(_, _, key)| *key))
+    {
+        pages.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
+    }
+}
+
+static PAGES: std::sync::OnceLock<Pages> = std::sync::OnceLock::new();
+static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
 thread_local! {
-    static CHANNEL: OnceCell<(mpsc::Receiver<Call>, Arc<Shared>)> = const { OnceCell::new() };
+    static CHANNEL: OnceCell<(mpsc::Receiver<Call>, Arc<Shared>, u64)> = const { OnceCell::new() };
+    static MAIN_CHANNEL: OnceCell<(mpsc::Receiver<Call>, Arc<Shared>)> = const { OnceCell::new() };
     static STATE: RefCell<State> = RefCell::default();
     static FRAMES: RefCell<Option<Vec<(u64, Duration)>>> = const { RefCell::new(None) };
 }
@@ -85,35 +117,46 @@ const PAUSED: &str = "The app is paused in the debugger. Resume it with the debu
 // WARNING: pages can redefine globals, so this formatter uses only syntax and builtins it checks itself.
 const SHOW: &str = r#"function(){const seen=new WeakSet(),plain=(v,d)=>{if(typeof v==='bigint')return v+'n';if(typeof v==='symbol'||v===undefined)return String(v);if(typeof v==='function')return`[Function ${v.name||'(anonymous)'}]`;if(v===null||typeof v!=='object')return v;if(typeof Node==='function'&&v instanceof Node)return String(v.outerHTML??v.textContent??'').slice(0,4000);if(v instanceof Error)return`${v.name}: ${v.message}`+(v.stack?'\n'+v.stack:'');if(v instanceof Date)return v.toISOString();if(seen.has(v))return'[Circular]';if(d>4)return Array.isArray(v)?`[Array(${v.length})]`:`[${v.constructor?.name??'Object'}]`;seen.add(v);if(v instanceof Map||v instanceof Set||Array.isArray(v)||ArrayBuffer.isView(v))return Array.from(v).slice(0,100).map(e=>plain(e,d+1));const o={};for(const k of Object.keys(v).slice(0,100)){try{o[k]=plain(v[k],d+1)}catch{o[k]='[Thrown]'}}return o},show=v=>{const p=plain(v,0),s=typeof p==='string'?p:JSON.stringify(p)??String(p);return s.length>120&&typeof p==='object'?JSON.stringify(p,null,1):s};return this instanceof Promise?this.then(show,e=>{throw show(e)}):show(this)}"#;
 
-pub(crate) fn start(port: u16) -> Result<()> {
+/// Starts the server on this thread, which runs the main side. Returns what page sides need.
+pub(crate) fn start(port: u16, link: Link) -> Result<Handle> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("Cannot start the devtools MCP server on port {port}"))?;
-    let (sender, calls) = mpsc::channel();
+    let (main_sender, main_calls) = mpsc::channel();
     let shared = Arc::new(Shared::default());
-    CHANNEL
-        .with(|channel| channel.set((calls, shared.clone())))
+    MAIN_CHANNEL
+        .with(|channel| channel.set((main_calls, shared.clone())))
         .ok();
-    let waker = Waker::current();
+    let pages = Pages::default();
+    let _ = PAGES.set(pages.clone());
+    let handle = Handle(pages.clone(), shared.clone());
     std::thread::Builder::new()
         .name("apps-mcp".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (sender, shared, waker) = (sender.clone(), shared.clone(), waker.clone());
+                let route = Route {
+                    pages: pages.clone(),
+                    main: main_sender.clone(),
+                    link: link.clone(),
+                };
+                let shared = shared.clone();
                 let _ = std::thread::Builder::new()
                     .name("apps-mcp-client".into())
-                    .spawn(move || serve(stream, &sender, &shared, &waker));
+                    .spawn(move || serve(stream, &route, &shared));
             }
         })?;
     println!("apps: devtools MCP server at http://127.0.0.1:{port}/mcp");
-    Ok(())
+    Ok(handle)
 }
 
-fn serve(
-    mut stream: TcpStream,
-    sender: &mpsc::Sender<Call>,
-    shared: &Shared,
-    waker: &Waker,
-) -> Result<()> {
+/// Where a call goes. Tools that name no window run on the main side's thread or on the first
+/// window's, and the rest on the thread of their window.
+struct Route {
+    pages: Pages,
+    main: mpsc::Sender<Call>,
+    link: Link,
+}
+
+fn serve(mut stream: TcpStream, route: &Route, shared: &Shared) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let local = |host: &str| {
         let host = host
@@ -177,14 +220,14 @@ fn serve(
             (false, ..) => ("403 Forbidden", "text/plain", b"Only local clients may connect".to_vec()),
             (_, "GET", "/", _) => ("200 OK", "text/plain; charset=utf-8", help().into_bytes()),
             (_, "POST", "/mcp", _) => match serde_json::from_slice::<Value>(&body) {
-                Ok(request) => match rpc(&request, sender, shared, waker) {
+                Ok(request) => match rpc(&request, route, shared) {
                     Some(response) => ("200 OK", "application/json", response.to_string().into_bytes()),
                     None => ("202 Accepted", "application/json", Vec::new()),
                 },
                 Err(error) => ("400 Bad Request", "application/json", json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}).to_string().into_bytes()),
             },
             // Plain HTTP for agents without an MCP client: JSON arguments in, text or PNG out.
-            (_, "POST", _, Some(tool)) => match serde_json::from_slice::<Value>(&body).map_err(anyhow::Error::from).and_then(|args| call(tool, args, sender, shared, waker)) {
+            (_, "POST", _, Some(tool)) => match serde_json::from_slice::<Value>(&body).map_err(anyhow::Error::from).and_then(|args| call(tool, args, route, shared)) {
                 Ok(Value::Object(image)) if image.contains_key("image") => (
                     "200 OK",
                     "image/png",
@@ -211,9 +254,8 @@ fn serve(
 
 fn rpc(
     request: &Value,
-    sender: &mpsc::Sender<Call>,
+    route: &Route,
     shared: &Shared,
-    waker: &Waker,
 ) -> Option<Value> {
     let id = request.get("id")?.clone();
     let params = &request["params"];
@@ -229,9 +271,8 @@ fn rpc(
         "tools/call" => match call(
             params["name"].as_str().unwrap_or(""),
             params["arguments"].clone(),
-            sender,
+            route,
             shared,
-            waker,
         ) {
             Ok(Value::String(text)) => json!({"content": [{"type": "text", "text": text}]}),
             Ok(Value::Object(image)) if image.contains_key("image") => json!({"content": [
@@ -252,17 +293,65 @@ fn rpc(
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-fn call(
+fn call(tool: &str, args: Value, route: &Route, shared: &Shared) -> Result<Value> {
+    let pages = route.pages.lock().unwrap_or_else(PoisonError::into_inner);
+    // `windows` lists what each page side knows of its windows.
+    if tool == "windows" {
+        let keys: Vec<_> = pages.keys().copied().collect();
+        drop(pages);
+        let mut list = Vec::new();
+        for key in keys {
+            // A stuck window must not hide the others.
+            if let Ok(Value::Array(windows)) = dispatch(tool, args.clone(), Some(key), route, shared) {
+                list.extend(windows);
+            }
+        }
+        list.sort_by_key(|window| window["id"].as_u64());
+        return Ok(list.into());
+    }
+    // WARNING: while a page is paused only its thread can answer the debugger.
+    let paused = shared.page_paused.load(Ordering::Acquire);
+    let key = if args["window"].is_null()
+        && (tool == "evaluate" || tool == "debugger" || tool == "console" && pages.is_empty())
+        && paused == 0
+    {
+        None
+    } else {
+        let wanted = args["window"]
+            .as_u64()
+            .filter(|window| pages.contains_key(window))
+            .or((paused > 0).then(|| paused - 1));
+        Some(
+            wanted
+                .or_else(|| pages.keys().next().copied())
+                .context("The app has no windows")?,
+        )
+    };
+    drop(pages);
+    dispatch(tool, args, key, route, shared)
+}
+
+fn dispatch(
     tool: &str,
     args: Value,
-    sender: &mpsc::Sender<Call>,
+    key: Option<u64>,
+    route: &Route,
     shared: &Shared,
-    waker: &Waker,
 ) -> Result<Value> {
     let timeout =
         Duration::from_millis(30_000 + args["duration"].as_u64().unwrap_or(0).min(60_000));
     let (reply, result) = mpsc::channel();
     let pauses = shared.pauses.load(Ordering::Acquire);
+    let sender = match key {
+        None => route.main.clone(),
+        Some(key) => route
+            .pages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .context("The window is closed")?,
+    };
     sender
         .send(Call {
             tool: tool.into(),
@@ -270,7 +359,10 @@ fn call(
             reply,
         })
         .map_err(|_| anyhow!("The app has quit"))?;
-    waker.wake();
+    match key {
+        None => route.link.wake_main(),
+        Some(key) => route.link.wake_page(Some(key)),
+    }
     let started = Instant::now();
     let value = loop {
         match result.recv_timeout(Duration::from_millis(100)) {
@@ -401,19 +493,20 @@ pub(crate) fn enabled() -> bool {
 }
 
 fn next(wait: bool) -> Option<Call> {
-    CHANNEL.with(|channel| {
-        let (calls, _) = channel.get()?;
+    let take = |calls: &mpsc::Receiver<Call>| {
         if wait {
             calls.recv_timeout(Duration::from_millis(50)).ok()
         } else {
             calls.try_recv().ok()
         }
-    })
+    };
+    CHANNEL
+        .with(|channel| channel.get().and_then(|(calls, ..)| take(calls)))
+        .or_else(|| MAIN_CHANNEL.with(|channel| channel.get().and_then(|(calls, _)| take(calls))))
 }
 
-/// Runs the calls that arrived. Returns true when it ran one.
-pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
-    pump();
+/// Answers a debugger step that ended without pausing again.
+fn settle_step() {
     if STATE.with_borrow(|state| state.paused.is_none())
         && let Some(reply) = STATE.with_borrow_mut(|state| state.stepping.take())
     {
@@ -421,6 +514,27 @@ pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
             "Resumed. The code finished without pausing again.".into()
         ));
     }
+}
+
+/// Runs the calls for the main side that arrived. Returns true when it ran one.
+pub(crate) fn poll_main() -> bool {
+    if !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
+        return false;
+    }
+    pump();
+    settle_step();
+    let mut ran = false;
+    while let Some(call) = MAIN_CHANNEL.with(|channel| channel.get()?.0.try_recv().ok()) {
+        ran = true;
+        run(call, None);
+    }
+    ran
+}
+
+/// Runs the calls that arrived. Returns true when it ran one.
+pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
+    pump();
+    settle_step();
     let mut ran = false;
     while let Some(call) = next(false) {
         ran = true;
@@ -430,7 +544,8 @@ pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
 }
 
 pub(crate) fn logs(logs: &[Value]) {
-    STATE.with_borrow_mut(|state| {
+    let mut state = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+    {
         for log in logs {
             let text = if log["type"] == "error" {
                 format!("[error] {}", log["message"].as_str().unwrap_or(""))
@@ -449,12 +564,12 @@ pub(crate) fn logs(logs: &[Value]) {
                     log["params"]["text"].as_str().unwrap_or("")
                 )
             };
-            if state.logs.len() == 1000 {
-                state.logs.pop_front();
+            if state.len() == 1000 {
+                state.pop_front();
             }
-            state.logs.push_back(text);
+            state.push_back(text);
         }
-    });
+    }
 }
 
 pub(crate) fn profiling() -> bool {
@@ -473,8 +588,10 @@ pub(crate) fn frame(window: u64, started: Instant) {
 /// Runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
 pub(crate) fn paused(ctx: usize, done: *mut bool) {
     pump();
-    let Some(shared) = CHANNEL.with(|channel| channel.get().map(|(_, shared)| shared.clone()))
-    else {
+    let page = CHANNEL.with(|channel| channel.get().map(|(_, shared, key)| (shared.clone(), *key)));
+    let Some(shared) = page.as_ref().map(|(shared, _)| shared.clone()).or_else(|| {
+        MAIN_CHANNEL.with(|channel| channel.get().map(|(_, shared)| shared.clone()))
+    }) else {
         let _ = send(ctx, "Debugger.resume", json!({}));
         return;
     };
@@ -493,6 +610,9 @@ pub(crate) fn paused(ctx: usize, done: *mut bool) {
     });
     *shared.paused.lock().unwrap() = Some(at.unwrap_or_else(|| "a statement".into()));
     shared.pauses.fetch_add(1, Ordering::AcqRel);
+    shared
+        .page_paused
+        .store(page.map_or(0, |(_, key)| key + 1), Ordering::Release);
     // WARNING: JSC sets `done` while a dispatched message runs, so read it again each time.
     while !unsafe { std::ptr::read_volatile(done) } {
         if let Some(call) = next(true) {
@@ -501,6 +621,7 @@ pub(crate) fn paused(ctx: usize, done: *mut bool) {
         pump();
     }
     *shared.paused.lock().unwrap() = None;
+    shared.page_paused.store(0, Ordering::Release);
     STATE.with_borrow_mut(|state| state.paused = None);
 }
 
@@ -963,32 +1084,25 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
 }
 
 fn console(args: &Value) -> Value {
-    STATE.with_borrow_mut(|state| {
-        let text = state.logs.iter().cloned().collect::<Vec<_>>().join("\n");
-        if args["keep"] != true {
-            state.logs.clear();
-        }
-        if text.is_empty() {
-            "No console messages.".into()
-        } else {
-            text.into()
-        }
-    })
+    let mut logs = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+    let text = logs.iter().cloned().collect::<Vec<_>>().join("\n");
+    if args["keep"] != true {
+        logs.clear();
+    }
+    if text.is_empty() {
+        "No console messages.".into()
+    } else {
+        text.into()
+    }
 }
 
 fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
     let context = desktop
-        .main
-        .as_ref()
-        .map(|main| (Role::Main, main))
-        .or_else(|| {
-            desktop
-                .views
-                .iter()
-                .filter_map(|(&id, v)| v.renderer.as_deref().map(|engine| (id, engine)))
-                .min_by_key(|(id, _)| *id)
-                .map(|(id, engine)| (Role::Renderer(id), engine))
-        });
+        .views
+        .iter()
+        .filter_map(|(&id, v)| v.renderer.as_deref().map(|engine| (id, engine)))
+        .min_by_key(|(id, _)| *id)
+        .map(|(id, engine)| (Role::Renderer(id), engine));
     let engine = context.map(|(_, engine)| engine);
     if args["gc"] == true
         && let Some(engine) = engine
@@ -1025,7 +1139,8 @@ fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
                 attached += 1;
                 pending.extend(&page.doc.nodes[node].children);
             }
-            (format!("window {id}"), json!({"attached": attached, "allocated": page.doc.nodes.len()}))
+            let free = host.dom.get(id).map_or(0, |state| state.free.len());
+            (format!("window {id}"), json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}))
         }).collect::<serde_json::Map<_, _>>(),
     });
     drop(host);

@@ -1,7 +1,7 @@
 use crate::{
     App, Backdrop, BorderStyle, Bounds, BoxShadow, Child, ContentMask, CursorStyle, DevicePixels,
     Edges, ElementId, Modifiers, MouseEvent, PaintEffect, Pixels, PlatformInput, Point, Radii,
-    RenderImage, Rgba, ScaledPixels, Size, Tree, Utf16Selection,
+    RenderImage, Rgba, ScaledPixels, ScrollDelta, ScrollHandle, Size, Tree, Utf16Selection,
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
     input::{DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
@@ -39,11 +39,6 @@ pub trait View: 'static {
 
     /// The window was resized, moved, activated, minimized or otherwise changed.
     fn window_changed(&mut self, _window: &mut Window, _cx: &mut App) {}
-
-    /// The user asked to close the window; `false` keeps it open.
-    fn should_close(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
-        true
-    }
 
     /// Key, modifier and file drop events. Call [`App::stop_propagation`] to keep the event from
     /// the input method.
@@ -158,6 +153,69 @@ pub struct WindowState {
     /// Shown. A minimized window is not.
     pub visible: bool,
     pub resizing: bool,
+}
+
+/// What any thread can ask of a native window, without the thread that draws it.
+#[cfg(target_os = "macos")]
+pub use crate::platform::WindowControl;
+
+/// What the main side can ask of a native window. Everything runs on one thread on this platform.
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy)]
+pub struct WindowControl(WindowId);
+
+#[cfg(not(target_os = "macos"))]
+impl WindowControl {
+    fn run(&self, f: impl FnOnce(&platform::Window) + 'static) {
+        let id = self.0;
+        crate::app::update(move |app| {
+            app.update_window(id, |window, _| f(&window.platform));
+        });
+    }
+    pub fn change(&self, change: WindowChange) {
+        self.run(move |window| window.change(change));
+    }
+    pub fn set_title(&self, title: &str) {
+        let title = title.to_owned();
+        self.run(move |window| window.set_title(&title));
+    }
+    pub fn set_button_visibility(&self, visible: bool) {
+        self.run(move |window| window.set_button_visibility(visible));
+    }
+    pub fn minimize(&self) {
+        self.run(|window| window.minimize());
+    }
+    pub fn zoom(&self) {
+        self.run(|window| window.zoom());
+    }
+    pub fn toggle_fullscreen(&self) {
+        self.run(|window| window.toggle_fullscreen());
+    }
+    pub fn activate(&self) {
+        self.run(|window| window.activate());
+    }
+    pub fn resize(&self, size: Size<Pixels>) {
+        self.run(move |window| window.resize(size));
+    }
+    pub fn is_active(&self) -> bool {
+        let id = self.0;
+        crate::app::try_update(|app| app.update_window(id, |window, _| window.platform.is_active()))
+            .flatten()
+            .unwrap_or(false)
+    }
+    pub fn state(&self) -> Option<WindowState> {
+        let id = self.0;
+        crate::app::try_update(|app| app.update_window(id, |window, _| window.platform.state()))
+            .flatten()
+    }
+    pub fn raw_window_handle(&self) -> Result<raw_window_handle::RawWindowHandle> {
+        let id = self.0;
+        crate::app::try_update(|app| {
+            app.update_window(id, |window, _| window.platform.raw_window_handle())
+        })
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("The window is closed"))?
+    }
 }
 
 /// A change to a native window. Platforms ignore the changes they don't support.
@@ -506,6 +564,11 @@ pub struct Window {
     /// The transforms the compositor plays for promoted layers: key, start, step and transforms,
     /// so hit testing follows them.
     tracks: Vec<(u64, std::time::Instant, f32, Vec<[f32; 16]>)>,
+    /// Decayed trackpad movement on x and y, and when it last moved. The larger one is the axis
+    /// the gesture scrolls.
+    pub(crate) rails: ([f32; 2], std::time::Instant),
+    /// The boxes that may scroll for the wheel event being dispatched, innermost first.
+    pub(crate) scroll_chain: Option<Vec<ScrollHandle>>,
 }
 
 impl Window {
@@ -542,6 +605,8 @@ impl Window {
             next_frame_callbacks: Vec::new(),
             drawn_at: std::time::Instant::now(),
             tracks: Vec::new(),
+            rails: ([0.; 2], std::time::Instant::now()),
+            scroll_chain: None,
             captures: Vec::new(),
             dirty: false,
             redraw: [false; 2],
@@ -797,6 +862,14 @@ impl Window {
         self.platform.change(change);
     }
 
+    /// A handle to the native window for the main side.
+    pub fn control(&self) -> WindowControl {
+        #[cfg(target_os = "macos")]
+        return self.platform.control().clone();
+        #[cfg(not(target_os = "macos"))]
+        WindowControl(self.id)
+    }
+
     pub fn is_fullscreen(&self) -> bool {
         self.platform.state().fullscreen
     }
@@ -995,7 +1068,24 @@ impl Window {
             PlatformInput::MouseDown(event) => self.modifiers = event.modifiers,
             PlatformInput::MouseUp(event) => self.modifiers = event.modifiers,
             PlatformInput::MouseMove(event) => self.modifiers = event.modifiers,
-            PlatformInput::ScrollWheel(event) => self.modifiers = event.modifiers,
+            PlatformInput::ScrollWheel(event) => {
+                self.modifiers = event.modifiers;
+                self.scroll_chain = None;
+                // Like Chrome on macOS, a trackpad gesture scrolls on the axis that leads its recent
+                // movement, so a vertical swipe doesn't drift sideways. A pause starts a new gesture.
+                if let ScrollDelta::Pixels(delta) = event.delta {
+                    let now = std::time::Instant::now();
+                    let [x, y] = if now - self.rails.1 > std::time::Duration::from_millis(100) {
+                        [0.; 2]
+                    } else {
+                        self.rails.0.map(|value| value * 0.8)
+                    };
+                    self.rails = (
+                        [x + f32::from(delta.x).abs(), y + f32::from(delta.y).abs()],
+                        now,
+                    );
+                }
+            }
             PlatformInput::ModifiersChanged(event) => self.modifiers = event.modifiers,
             PlatformInput::KeyDown(event) => self.modifiers = event.keystroke.modifiers,
             PlatformInput::KeyUp(event) => self.modifiers = event.keystroke.modifiers,
@@ -1049,6 +1139,11 @@ impl Window {
             }
         }
         !cx.propagate_event
+    }
+
+    /// Lets only these boxes scroll for the wheel event being dispatched, innermost first.
+    pub fn scroll_only(&mut self, chain: Vec<ScrollHandle>) {
+        self.scroll_chain = Some(chain);
     }
 
     /// Sends a key press like a keyboard would, typing its text when nothing handles it.

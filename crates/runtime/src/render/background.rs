@@ -315,9 +315,25 @@ pub(super) fn css_background(
                                     )
                             })
                     });
+                    // A gradient repeated in tiles of whole device pixels draws from one bitmap of a few tiles,
+                    // the same for every box, so new boxes don't raster their whole area.
+                    let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
+                    let radii = radius.resolve(bounds.size);
+                    let [[tw, th], [x, y]] =
+                        super::effects::tile(&size, &position, &units, width, height);
+                    let [cw, ch] =
+                        [tw, th].map(|side| side * (256. / (side * scale)).ceil().max(1.));
+                    let tiled = (axis.is_none()
+                        && matches!(repeat.trim(), "" | "repeat" | "repeat repeat")
+                        && radii.is_zero()
+                        && [tw, th, x, y].into_iter().all(whole)
+                        && cw * ch < width * height
+                        && super::effects::tile(&size, "0 0", &units, cw, ch)[0] == [tw, th])
+                    .then_some([x.rem_euclid(tw), y.rem_euclid(th)]);
                     let (width, height) = match axis {
                         Some(1) => (3., height),
                         Some(_) => (width, 3.),
+                        None if tiled.is_some() => (cw, ch),
                         None => (width, height),
                     };
                     let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
@@ -327,32 +343,78 @@ pub(super) fn css_background(
                         Some(_) => [rw, 3],
                         None => [rw, rh],
                     };
+                    let position = if tiled.is_some() {
+                        "0 0"
+                    } else {
+                        position.as_str()
+                    };
                     // WARNING: building the gradient's SVG costs more than drawing the box, so the bitmap is
                     // kept by its exact inputs: the strings, then the box size and units as hex bits.
                     let mut inputs = String::with_capacity(
                         kind.len() + body.len() + size.len() + position.len() + repeat.len() + 168,
                     );
-                    for part in [&kind, &body, &size, &position, &repeat] {
+                    for part in [
+                        kind.as_str(),
+                        body.as_str(),
+                        size.as_str(),
+                        position,
+                        repeat.as_str(),
+                    ] {
                         inputs.push_str(part);
                         inputs.push('\0');
                     }
                     super::effects::push_bits(&mut inputs, [width, height], &units);
                     let view = &*view;
                     let mut host = view.host.borrow_mut();
-                    let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
+                    let dom = host.dom.entry(view.id).or_default();
                     let key = (id, slot * 64 + index);
-                    if backgrounds.get(&key).is_none_or(|(old, image)| {
-                        old != &inputs
-                            || u32::from(image.size().width) != rw
-                            || u32::from(image.size().height) != rh
-                    }) {
-                        let image = super::effects::gradient_svg(
-                            &kind, &body, &size, &position, &repeat, units, width, height,
-                        )
-                        .and_then(|source| super::canvas::svg(&source, rw, rh, None).ok());
+                    let fits = |image: &renderer::RenderImage| {
+                        [image.size().width, image.size().height].map(u32::from) == [rw, rh]
+                    };
+                    let entry = dom.backgrounds.get(&key);
+                    if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
+                        // WARNING: only new boxes take and fill the cache, so a gradient that animates
+                        // doesn't keep its old frames.
+                        let new = entry.is_none();
+                        let cached = new
+                            .then(|| {
+                                let at = dom
+                                    .gradients
+                                    .iter()
+                                    .rposition(|(old, image)| old == &inputs && fits(image))?;
+                                let cached = dom.gradients.remove(at);
+                                dom.gradients.push(cached.clone());
+                                Some(cached.1)
+                            })
+                            .flatten();
+                        let image = cached.or_else(|| {
+                            let image = super::effects::gradient_svg(
+                                &kind, &body, &size, position, &repeat, units, width, height,
+                            )
+                            .and_then(|source| super::canvas::svg(&source, rw, rh, None).ok())?;
+                            const LIMIT: u32 = 8 << 20;
+                            if new && rw * rh * 4 <= LIMIT / 4 {
+                                dom.gradients.push((inputs.clone(), image.clone()));
+                                let bytes = |image: &renderer::RenderImage| {
+                                    u32::from(image.size().width)
+                                        * u32::from(image.size().height)
+                                        * 4
+                                };
+                                let mut total: u32 =
+                                    dom.gradients.iter().map(|(_, image)| bytes(image)).sum();
+                                while total > LIMIT {
+                                    let (_, old) = dom.gradients.remove(0);
+                                    total -= bytes(&old);
+                                    if Arc::strong_count(&old) == 1 {
+                                        window.drop_image(old);
+                                    }
+                                }
+                            }
+                            Some(image)
+                        });
                         let old = match image {
-                            Some(image) => backgrounds.insert(key, (inputs, image)),
-                            None => backgrounds.remove(&key),
+                            Some(image) => dom.backgrounds.insert(key, (inputs, image)),
+                            None => dom.backgrounds.remove(&key),
                         };
                         if let Some((_, old)) = old
                             && Arc::strong_count(&old) == 1
@@ -360,7 +422,28 @@ pub(super) fn css_background(
                             window.drop_image(old);
                         }
                     }
-                    if let Some((_, image)) = backgrounds.get(&key) {
+                    if let Some((_, image)) = dom.backgrounds.get(&key)
+                        && let Some([x, y]) = tiled
+                    {
+                        // WARNING: tiles sit on device pixels, so their edges never sample other atlas tiles.
+                        let start = |edge: renderer::Pixels, at: f32, side: f32| {
+                            let at = f32::from(edge) + at - if at > 0. { side } else { 0. };
+                            px((at * scale).round() / scale)
+                        };
+                        let mut top = start(bounds.top(), y, th);
+                        while top < bounds.bottom() {
+                            let mut left = start(bounds.left(), x, tw);
+                            while left < bounds.right() {
+                                let target = renderer::Bounds::new(
+                                    renderer::point(left, top),
+                                    renderer::size(px(cw), px(ch)),
+                                );
+                                window.paint_image(bounds, target, radii, image.clone(), false);
+                                left += px(cw);
+                            }
+                            top += px(ch);
+                        }
+                    } else if let Some((_, image)) = dom.backgrounds.get(&key) {
                         let (origin, size) = (bounds.origin, bounds.size);
                         let target = match axis {
                             Some(1) => renderer::Bounds::new(

@@ -351,10 +351,95 @@ thread_local! {
     // WARNING: the render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
     pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
     pub(crate) static CLIPBOARD: std::cell::Cell<Option<Clipboard>> = const { std::cell::Cell::new(None) };
+    // WARNING: the render thread sets this, because only the main thread can make native calls.
+    pub(crate) static NATIVE: std::cell::Cell<Option<NativeCall>> = const { std::cell::Cell::new(None) };
+    // WARNING: the render thread must stop before statics go, so the main thread sets this.
+    pub(crate) static BEFORE_EXIT: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    /// When the script that runs long started, and its last tick.
+    /// The `busy` value of the run that the last tick belongs to, and the ticks of that run.
+    static RUN_TICKS: std::cell::Cell<(std::time::Duration, u32)> = const { std::cell::Cell::new((std::time::Duration::ZERO, 0)) };
 }
 
 /// Writes text to the clipboard, or reads it without text.
 type Clipboard = fn(Option<String>) -> Option<String>;
+/// Makes a native call on the main thread.
+type NativeCall = fn(&str, &serde_json::Value) -> Result<serde_json::Value>;
+
+/// Calls bridge function `function` of a context with message `payload`.
+fn bridge(
+    api: &JavaScriptCore,
+    context: Ptr,
+    function: &str,
+    payload: payload::Payload,
+) -> Result<Ptr> {
+    let name = api.string(function);
+    let mut error = ptr::null_mut();
+    let receiver = unsafe { (api.get)(context, (api.global)(context), name, &mut error) };
+    unsafe {
+        (api.string_release)(name);
+    }
+    // WARNING: JSC casts call targets to objects without checking, so a primitive would crash.
+    anyhow::ensure!(
+        error.is_null()
+            && unsafe { (api.value_type)(context, receiver) } == 5
+            && unsafe { (api.is_function)(context, receiver) },
+        "Bridge target is unavailable"
+    );
+    let argument = payload::output(api, context, payload);
+    unsafe {
+        (api.protect)(context, argument);
+    }
+    let result = unsafe { (api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
+    unsafe {
+        (api.unprotect)(context, argument);
+    }
+    if !error.is_null() {
+        bail!("{}", api.text(context, error));
+    }
+    Ok(result)
+}
+
+/// Runs bridge message `payload` in a context, and returns what it answers.
+fn receive(
+    api: &JavaScriptCore,
+    context: Ptr,
+    payload: payload::Payload,
+) -> Result<payload::Payload> {
+    let result = bridge(api, context, "__appsBridgeReceiveBytes", payload)?;
+    anyhow::ensure!(
+        !result.is_null() && unsafe { (api.value_type)(context, result) } == 5,
+        "Invalid bridge reply"
+    );
+    unsafe {
+        (api.protect)(context, result);
+    }
+    let mut error = ptr::null_mut();
+    let decoded = (|| -> Result<_> {
+        let name = api.string("json");
+        let json = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let mut json = api.text(context, json);
+        well_formed(&mut json);
+        let value = serde_json::from_str(&json)?;
+        let name = api.string("buffers");
+        let buffers = unsafe { (api.get)(context, result, name, &mut error) };
+        unsafe {
+            (api.string_release)(name);
+        }
+        let buffers = payload::input(api, context, buffers)?
+            .0
+            .iter()
+            .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
+            .collect();
+        Ok(payload::Payload { value, buffers })
+    })();
+    unsafe {
+        (api.unprotect)(context, result);
+    }
+    decoded
+}
 
 /// Returns the context of this thread with `role`.
 pub(crate) fn context(role: Role) -> Option<usize> {
@@ -614,9 +699,13 @@ unsafe extern "C" fn call(
                 return run(buffers, &mut || gpu(&binding, ctx, id, op, json.as_bytes()));
             }
             let mut args = Some(serde_json::from_str(&json)?);
-            return run(buffers, &mut || {
+            let result = run(buffers, &mut || {
                 dispatch(&binding, ctx, op, args.take().unwrap_or_default())
             });
+            if let Role::Renderer(id) = binding.2 {
+                report_nodes(&binding, ctx, id);
+            }
+            return result;
         }
         let role = binding.2;
         // WARNING: a forced layout builds the page, which borrows the host, so it runs before any borrow.
@@ -645,6 +734,7 @@ unsafe extern "C" fn call(
                 .try_borrow_mut()
                 .context("Host is busy")?
                 .batch(id, codes, &text)?;
+            report_nodes(&binding, ctx, id);
             return Ok(output(&api, ctx, errors.into()));
         }
         if let Role::Renderer(id) = role
@@ -714,9 +804,13 @@ unsafe extern "C" fn call(
             });
         }
         let mut args = Some(Value::Array(args));
-        run(buffers, &mut || {
+        let result = run(buffers, &mut || {
             dispatch(&binding, ctx, op, args.take().unwrap_or_default())
-        })
+        });
+        if let Role::Renderer(id) = role {
+            report_nodes(&binding, ctx, id);
+        }
+        result
     }));
     let (message, code) = match result {
         Ok(Ok(value)) => return value,
@@ -810,9 +904,14 @@ fn dispatch(
             !matches!(role, Role::Renderer(_)),
             "Native desktop APIs require a preload bridge"
         );
-        let result = crate::desktop::native::native_call(op, &values[0])?;
+        let result = match NATIVE.get() {
+            Some(native) => native(op, &values[0]),
+            None => crate::desktop::native::native_call(op, &values[0]),
+        }?;
         if op == "theme.set" {
-            host.borrow_mut().sync_theme();
+            let mut host = host.borrow_mut();
+            host.sync_theme();
+            host.command(serde_json::json!({"op":"theme"}));
         }
         return Ok(result);
     }
@@ -869,22 +968,6 @@ fn dispatch(
                 .collect(),
         ));
     }
-    if op == "rust.invoke" {
-        let Role::Preload(id) = role else {
-            bail!("Rust handlers require a preload")
-        };
-        let channel = args[0].as_str().context("Expected a channel name")?;
-        let handler = host
-            .try_borrow()
-            .context("Host is busy")?
-            .rust_handlers
-            .as_ref()
-            .and_then(|handlers| handlers.get(channel))
-            .cloned()
-            .with_context(|| format!("No Rust handler registered for {channel:?}"))?;
-        let args = serde_json::from_str(args[1].as_str().context("Expected JSON arguments")?)?;
-        return Ok(handler(id, args)?.to_string().into());
-    }
     if op == "bridge.dispatch" {
         let target = &values[0];
         if let Role::Renderer(id) = role {
@@ -895,6 +978,43 @@ fn dispatch(
             );
         }
         let target = serde_json::from_value::<Role>(target.clone()).ok();
+        let (link, rust) = {
+            let host = host.try_borrow().context("Host is busy")?;
+            (host.link.clone(), host.rust_main)
+        };
+        if let Some(link) = link {
+            use crate::desktop::link::{ToMain, ToPage};
+            use crate::jsc::payload::Payload;
+            match (role, target) {
+                (Role::Main, Some(Role::Preload(id))) => {
+                    let mut message = args[1].take();
+                    message["sender"] = serde_json::to_value(role)?;
+                    link.page(ToPage::Bridge(id, Payload::snapshot(message)));
+                    return Ok(serde_json::Value::Null);
+                }
+                (Role::Preload(_), Some(Role::Main)) => {
+                    let mut message = args[1].take();
+                    message["sender"] = serde_json::to_value(role)?;
+                    let kind = message["kind"].as_str().unwrap_or_default().to_owned();
+                    anyhow::ensure!(rust == (kind == "rust"), "Bridge target is unavailable");
+                    let message = Payload::snapshot(message);
+                    return Ok(match kind.as_str() {
+                        "sync" => link
+                            .ask(|answer| ToMain::Sync(message, answer))?
+                            .into_value(),
+                        "event" => {
+                            link.main(ToMain::Bridge(message));
+                            serde_json::Value::Null
+                        }
+                        _ => {
+                            link.main(ToMain::Bridge(message));
+                            serde_json::json!({"pending":true})
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
         let destination = HOSTS.with(|hosts| {
             hosts.borrow().iter().find_map(|(&ctx, binding)| {
                 if Rc::ptr_eq(host, &binding.1) && target == Some(binding.2) {
@@ -910,70 +1030,12 @@ fn dispatch(
         let (destination, target_api) = destination.context("Bridge target is unavailable")?;
         let mut message = args[1].take();
         message["sender"] = serde_json::to_value(role)?;
-        let context = destination as Ptr;
-        let name = target_api.string("__appsBridgeReceiveBytes");
-        let mut error = ptr::null_mut();
-        let receiver =
-            unsafe { (target_api.get)(context, (target_api.global)(context), name, &mut error) };
-        unsafe {
-            (target_api.string_release)(name);
-        }
-        // WARNING: JSC casts call targets to objects without checking, so a primitive would crash.
-        anyhow::ensure!(
-            error.is_null()
-                && unsafe { (target_api.value_type)(context, receiver) } == 5
-                && unsafe { (target_api.is_function)(context, receiver) },
-            "Bridge target is unavailable"
-        );
-        let argument = crate::jsc::payload::output(
+        return Ok(receive(
             &target_api,
-            context,
+            destination as Ptr,
             crate::jsc::payload::Payload::snapshot(message),
-        );
-        unsafe {
-            (target_api.protect)(context, argument);
-        }
-        let result = unsafe {
-            (target_api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error)
-        };
-        unsafe {
-            (target_api.unprotect)(context, argument);
-        }
-        if !error.is_null() {
-            bail!("{}", target_api.text(context, error));
-        }
-        anyhow::ensure!(
-            !result.is_null() && unsafe { (target_api.value_type)(context, result) } == 5,
-            "Invalid bridge reply"
-        );
-        unsafe {
-            (target_api.protect)(context, result);
-        }
-        let decoded = (|| -> Result<_> {
-            let name = target_api.string("json");
-            let json = unsafe { (target_api.get)(context, result, name, &mut error) };
-            unsafe {
-                (target_api.string_release)(name);
-            }
-            let mut json = target_api.text(context, json);
-            well_formed(&mut json);
-            let value = serde_json::from_str(&json)?;
-            let name = target_api.string("buffers");
-            let buffers = unsafe { (target_api.get)(context, result, name, &mut error) };
-            unsafe {
-                (target_api.string_release)(name);
-            }
-            let buffers = crate::jsc::payload::input(&target_api, context, buffers)?
-                .0
-                .iter()
-                .map(|bytes| bytes::Bytes::copy_from_slice(bytes))
-                .collect();
-            Ok(crate::jsc::payload::Payload { value, buffers }.into_value())
-        })();
-        unsafe {
-            (target_api.unprotect)(context, result);
-        }
-        return decoded;
+        )?
+        .into_value());
     }
     if let Some(op) = op.strip_prefix("child.") {
         children
@@ -1008,23 +1070,11 @@ fn dispatch(
             .context("Host is busy")?
             .media(id, op, &args)
     } else if let (Role::Renderer(id), "dom.open") = (role, op) {
-        // WARNING: the main handler can open windows, which borrows the host, so none is held here.
-        let (main, api) = HOSTS
-            .with_borrow(|hosts| {
-                hosts.iter().find_map(|(&ctx, binding)| {
-                    (Rc::ptr_eq(host, &binding.1) && binding.2 == Role::Main)
-                        .then(|| (ctx as Ptr, binding.0.clone()))
-                })
-            })
-            .context("The main process is unavailable")?;
-        let result = call_json(
-            &api,
-            main,
-            "__appsWindowOpen",
-            &[&id.to_string(), &args.to_string()],
-            |value| api.text(main, value),
-        )?;
-        Ok(serde_json::from_str(&result)?)
+        let link = host.try_borrow().context("Host is busy")?.link.clone();
+        Ok(link
+            .context("The main process is unavailable")?
+            .ask(|answer| crate::desktop::link::ToMain::Open(id, args.clone(), answer))?
+            .into_value())
     } else if let (Role::Renderer(_), "dom.clipboard") = (role, op) {
         // WARNING: `execCommand` checks for user input before it calls this.
         Ok(CLIPBOARD
@@ -1035,6 +1085,24 @@ fn dispatch(
         host.try_borrow_mut()
             .context("Host is busy")?
             .call(role, op, args)
+    }
+}
+
+/// Reports new DOM nodes to JSC as memory.
+// WARNING: JSC cannot see the native DOM, so the wrappers that keep removed nodes and their styles alive
+// would wait for an unrelated GC, and a page that rebuilds rows as it scrolls would grow without bound.
+fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
+    let created = binding
+        .1
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.created)));
+    if let Some(report) = binding.0.extra_memory
+        && let Some(created) = created.filter(|&created| created > 0)
+    {
+        // WARNING: a removed node is freed only after a GC finds its wrapper dead, and a scrolling list makes nodes
+        // much faster than GCs run. Each node counts for more than it costs, so young GCs keep the dead ones few.
+        unsafe { report(ctx, created * 65536) };
     }
 }
 
@@ -1296,22 +1364,84 @@ fn call_json<T>(
     result
 }
 
-/// Stops page scripts that run too long; other contexts keep running because returning false re-arms the timer.
+/// Runs while a script of a page thread takes long: it stops the scripts of closing windows and
+/// page scripts past the limit. Returning false lets the script run for another tick.
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
-    let page = HOSTS.with(|hosts| {
-        hosts.try_borrow().is_ok_and(|hosts| {
-            hosts
-                .get(&(ctx as usize))
-                .is_some_and(|binding| matches!(binding.2, Role::Renderer(_)))
-        })
+    let binding = HOSTS.with(|hosts| {
+        hosts
+            .try_borrow()
+            .ok()
+            .and_then(|hosts| hosts.get(&(ctx as usize)).map(|binding| (binding.0.clone(), binding.2)))
     });
-    if page {
-        eprintln!("apps: stopped a page script that ran for more than {PAGE_LIMIT} seconds");
+    let Some((api, role)) = binding else {
+        return false;
+    };
+    let (Role::Renderer(id) | Role::Preload(id)) = role else {
+        return false;
+    };
+    // WARNING: the limit ends with this call, so a script that goes on needs a new one.
+    let again = || {
+        if let Some(limit) = api.execution_limit {
+            unsafe { limit(api.group, PAGE_TICK, Some(page_limit), ptr::null_mut()) };
+        }
+        false
+    };
+    if stopping(id) {
+        return true;
     }
-    page
+    if !matches!(role, Role::Renderer(_)) {
+        return again();
+    }
+    // WARNING: JSC doesn't say which run a tick belongs to, and restarts its budget per run, but
+    // `busy` changes only when a run returns.
+    let busy = api.busy.get();
+    let ticks = match RUN_TICKS.get() {
+        (last, ticks) if last == busy => ticks + 1,
+        _ => 1,
+    };
+    RUN_TICKS.set((busy, ticks));
+    if f64::from(ticks) * PAGE_TICK >= PAGE_LIMIT as f64 {
+        eprintln!("apps: stopped a page script that ran for more than {PAGE_LIMIT} seconds");
+        return true;
+    }
+    again()
 }
 
-const PAGE_LIMIT: f64 = 10.;
+const PAGE_LIMIT: u64 = 10;
+/// How often a long script is checked, in seconds of its CPU time.
+const PAGE_TICK: f64 = 0.1;
+
+static STOPPING: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+static STOP_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn stopping(id: u64) -> bool {
+    STOP_ALL.load(std::sync::atomic::Ordering::Acquire)
+        || STOPPING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id)
+}
+
+/// Stops the long scripts of a closing window at their next tick, from any thread.
+pub(crate) fn stop_page(id: u64) {
+    STOPPING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(id);
+}
+
+/// The closing window's page is gone.
+pub(crate) fn page_stopped(id: u64) {
+    STOPPING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|&other| other != id);
+}
+
+/// Stops the long scripts of all pages for good, because the app is quitting.
+pub(crate) fn stop_pages() {
+    STOP_ALL.store(true, std::sync::atomic::Ordering::Release);
+}
 
 struct Interrupt {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1401,7 +1531,7 @@ impl JsContext {
             unsafe {
                 limit(
                     engine.api.group,
-                    PAGE_LIMIT,
+                    PAGE_TICK,
                     Some(page_limit),
                     ptr::null_mut(),
                 )
@@ -1653,6 +1783,16 @@ impl JsContext {
                 );
             }
         });
+    }
+
+    /// Runs bridge message `payload` here, and returns what this context answers.
+    pub(crate) fn receive(&self, payload: payload::Payload) -> Result<payload::Payload> {
+        receive(&self.api, self.ctx, payload)
+    }
+
+    /// Runs a bridge message from the other side of the app, and its listeners.
+    pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
+        bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
     }
 
     pub fn sources(&self) -> HashMap<String, String> {
@@ -1964,7 +2104,9 @@ mod tests {
         unsafe {
             (api.execution_limit.unwrap())(api.group, 0.2, Some(page_limit), ptr::null_mut())
         };
+        stop_page(1);
         assert!(page.eval("while(true){}", "test").is_err());
+        page_stopped(1);
         assert_eq!(page.eval("1+1", "test").unwrap(), "2");
         let started = std::time::Instant::now();
         assert_eq!(

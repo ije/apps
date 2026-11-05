@@ -34,6 +34,10 @@ pub(crate) const TRANSFORMED: u16 = 2048;
 pub(crate) const VOLATILE: u16 = 4096;
 /// Something in the subtree animates this frame, so its boxes are built again.
 pub(crate) const ANIMATED: u16 = 8192;
+/// The subtree builds from the last frame's layout or from other nodes, like grids, positioned boxes,
+/// tables and lists. Nothing it reads changes in a frame where no node, style, focus or viewport changed,
+/// so only such frames keep its boxes.
+pub(crate) const FRAMED: u16 = 16384;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {
@@ -65,6 +69,9 @@ pub(crate) struct Cull {
     pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     /// The nodes that are not hidden, built with `info`.
     pub(crate) visible: Vec<bool>,
+    /// Inline SVGs, positioned boxes and grids, which build from more than their subtree, see
+    /// `element::own_inputs`.
+    pub(crate) inputs: Vec<usize>,
     /// The newest node revision, focus and styles that `info` was built from, without animated paint.
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
     pub(crate) subtrees: Subtrees,
@@ -72,6 +79,21 @@ pub(crate) struct Cull {
 
 /// The nodes of each subtree that `shift` moved, by root, and the document revision they were listed at.
 pub(crate) type Subtrees = (u64, rustc_hash::FxHashMap<usize, Vec<usize>>);
+
+impl Cull {
+    /// Gives back the room for node ids past `len`. A new frame builds the rest again.
+    pub(crate) fn trim(&mut self, len: usize) {
+        self.placed.truncate(len);
+        self.placed.shrink_to_fit();
+        if self.info.len() > len {
+            self.info.truncate(len);
+            self.info.shrink_to_fit();
+            self.visible.truncate(len);
+            self.visible.shrink_to_fit();
+            self.seen = None;
+        }
+    }
+}
 
 /// The visible vertical range of a subtree, from the last frame's bounds of its clipping ancestors.
 pub(super) struct Zone {
@@ -252,18 +274,30 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         ]
         .into_iter()
         .any(|name| style.get(name).is_some_and(|value| value.contains('%')));
-    let volatile = !matches!(
-        display,
-        "block" | "inline" | "inline-block" | "flex" | "inline-flex" | "contents"
-    ) || matches!(position, "absolute" | "fixed" | "sticky")
-        || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
-        || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+    // WARNING: scroll boxes build their bars from the scroll state, which changes without a new revision.
+    let volatile = display != "none"
+        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
             .into_iter()
             .any(|prop| {
                 style
                     .get(prop)
                     .is_some_and(|value| matches!(value, "scroll" | "auto"))
-            })
+            });
+    // A box with `display: none` builds nothing, so it never makes its parent framed. Grids and positioned boxes
+    // key on what they read, see `element::Reuse`.
+    let framed = !matches!(
+        display,
+        "block"
+            | "inline"
+            | "inline-block"
+            | "flex"
+            | "inline-flex"
+            | "grid"
+            | "inline-grid"
+            | "flow-root"
+            | "contents"
+            | "none"
+    ) || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
         || [
             Prop::FILTER,
             Prop::WEBKIT_FILTER,
@@ -275,7 +309,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             Prop::WEBKIT_BACKDROP_FILTER,
         ]
         .into_iter()
-        .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
+        .any(|prop| style.get(prop).is_some_and(|value| value.contains("url(")))
         || [
             Prop::COUNTER_RESET,
             Prop::COUNTER_INCREMENT,
@@ -285,14 +319,12 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
         || [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH, Prop::COLUMNS]
             .into_iter()
-            .any(|prop| style.get(prop).is_some_and(|value| value != "auto"))
-        || style
-            .get(Prop::CONTAINER_TYPE)
-            .is_some_and(|value| value != "normal");
+            .any(|prop| style.get(prop).is_some_and(|value| value != "auto"));
     [
         (moved, MOVED),
         (blocked, BLOCKED),
         (volatile, VOLATILE),
+        (framed, FRAMED),
         (
             display == "none" || matches!(position, "absolute" | "fixed"),
             OUT,
@@ -641,7 +673,8 @@ mod tests {
              <div id=o style='flex-grow:1'></div><div id=p style='height:50%'></div>\
              <div id=q style='height:20px'></div><div id=r style='margin:auto'></div>\
              <div id=u style='margin-bottom:2%'></div><ul><li id=v></li></ul>\
-             <div id=w style='min-height:100dvh'></div><div id=x style='padding:0 .5vw;overflow:visible'></div>",
+             <div id=w style='min-height:100dvh'></div><div id=x style='padding:0 .5vw;overflow:visible'></div>\
+             <div id=y style='overflow:auto'></div>",
         );
         let flags = |name: &str| {
             let node = id(name);
@@ -687,23 +720,26 @@ mod tests {
             ("u", SOLID),
             ("v", SOLID),
         ] {
-            assert_eq!(flags(name) & !VOLATILE, expected, "{name}");
+            assert_eq!(flags(name) & !(VOLATILE | FRAMED), expected, "{name}");
         }
-        // Boxes placed or numbered by more than their style build again each frame.
-        for (name, volatile) in [
+        // Boxes placed or numbered by their siblings build again in frames that change something.
+        for (name, framed) in [
             ("a", false),
             ("b", false),
-            ("c", true),
-            ("d", true),
-            ("f", true),
-            ("g", true),
+            ("c", false),
+            ("d", false),
+            ("f", false),
+            ("g", false),
             ("k", false),
             ("l", true),
             ("m", false),
             ("v", true),
         ] {
-            assert_eq!(flags(name) & VOLATILE != 0, volatile, "{name}");
+            assert_eq!(flags(name) & FRAMED != 0, framed, "{name}");
         }
+        // Scroll boxes build their bars from the scroll state, so they build again each frame.
+        assert_eq!(flags("y") & VOLATILE, VOLATILE);
+        assert_eq!(flags("a") & VOLATILE, 0);
     }
 
     #[test]

@@ -90,7 +90,8 @@ pub struct Page {
 
 #[derive(Default)]
 pub struct Host {
-    pub rust_handlers: Option<HashMap<String, crate::desktop::app::Handler>>,
+    pub(crate) link: Option<crate::desktop::link::Link>,
+    pub rust_main: bool,
     pub app_name: Option<String>,
     pub app_version: Option<String>,
     pub app_path: PathBuf,
@@ -104,7 +105,7 @@ pub struct Host {
     pub scripts: std::sync::Arc<HashMap<String, bytes::Bytes>>,
     pub commands: Vec<Value>,
     pub pages: HashMap<u64, Page>,
-    pub dom: HashMap<u64, crate::dom::State>,
+    pub dom: rustc_hash::FxHashMap<u64, crate::dom::State>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
     /// By page, the paths of the files dropped on it. Page `File`s carry only the index, see `webUtils.getPathForFile`.
     pub dropped: HashMap<u64, Vec<String>>,
@@ -116,7 +117,6 @@ pub struct Host {
     pub resized: Vec<u64>,
     pub window_changes: Vec<u64>,
     pub backgrounds: HashMap<u64, (u32, u8)>,
-    pub exit_code: i32,
     pub theme: u32,
     pub theme_changed: bool,
 }
@@ -138,6 +138,17 @@ impl Host {
                 .extend(scripts.map(|(name, source)| (name.clone(), source.clone().into())));
         }
         Ok(())
+    }
+
+    /// Queues a window or app command. A host without a link belongs to a worker or a test.
+    pub(crate) fn command(&mut self, command: Value) {
+        use crate::desktop::link::{ToMain, ToPage, native_command};
+        match &self.link {
+            Some(link) if native_command(&command) => link.main(ToMain::Native(command)),
+            Some(link) if command["args"][0] == "create" => link.create_window(command),
+            Some(link) => link.page(ToPage::Command(command)),
+            None => self.commands.push(command),
+        }
     }
 
     pub fn enabled(&self, feature: &str) -> bool {
@@ -190,7 +201,7 @@ impl Host {
             page.dirty = true;
         }
         for state in self.dom.values_mut() {
-            state.computed = None;
+            state.invalidate();
         }
     }
 
@@ -299,13 +310,14 @@ impl Host {
                             && state.computed.is_some()
                             && connected(doc, &state.hosts, id)
                         {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         doc.nodes[id].text = value.into();
                         doc.nodes[id].stylesheet = None;
                         for child in std::mem::take(&mut doc.nodes[id].children) {
                             doc.nodes[child].parent = None;
                             state.detached.push(child);
+                            state.removed.push(child);
                         }
                         true
                     }
@@ -336,7 +348,7 @@ impl Host {
                             && (connected(doc, &state.hosts, parent)
                                 || connected(doc, &state.hosts, child))
                         {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         if before == Some(child) {
                             return Ok(false);
@@ -395,10 +407,11 @@ impl Host {
                             prune(doc, previous);
                         }
                         if state.computed.is_some() && connected(doc, &state.hosts, parent) {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         doc.nodes[child].parent = None;
                         state.detached.push(child);
+                        state.removed.push(child);
                         true
                     }
                     4 | 5 => {
@@ -411,7 +424,7 @@ impl Host {
                             return Ok(false);
                         }
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         let current = &mut doc.nodes[id];
                         match value {
@@ -443,7 +456,7 @@ impl Host {
                                 .or_else(|| state.hosts.get(&id).copied());
                         }
                         if state.computed.is_some() && connected(doc, &state.hosts, host) {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         state.shadows.insert(host, root);
                         state.hosts.insert(root, host);
@@ -468,7 +481,7 @@ impl Host {
                             && empty(current.value.as_ref()) != empty(value.as_ref())
                             && connected(doc, &state.hosts, id)
                         {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         doc.nodes[id].value = value;
                         true
@@ -487,7 +500,7 @@ impl Host {
                             return Ok(false);
                         }
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
-                            state.computed = None;
+                            state.invalidate();
                         }
                         let node = &mut doc.nodes[id];
                         node.state = node.state & !mask | bits;
@@ -628,14 +641,12 @@ impl Host {
                     url.starts_with("apps:///") || url.starts_with("file:///"),
                     "Pages can only navigate to bundled or local files"
                 );
-                self.commands
-                    .push(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
+                self.command(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
                 return Ok(Value::Null);
             }
             if op == "dom.fullscreen" {
                 ensure!(self.pages.contains_key(&id), "Window is closed");
-                self.commands
-                    .push(json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}));
+                self.command(json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}));
                 return Ok(Value::Null);
             }
             if op == "dom.executed" {
@@ -643,8 +654,7 @@ impl Host {
                     args[0].is_u64() && args[1].is_string(),
                     "Invalid script result"
                 );
-                self.commands
-                    .push(json!({"op":"window", "args":["executed",id,args[0],args[1]]}));
+                self.command(json!({"op":"window", "args":["executed",id,args[0],args[1]]}));
                 return Ok(Value::Null);
             }
             let page = self.pages.get_mut(&id).context("Window is closed")?;
@@ -699,7 +709,7 @@ impl Host {
                         .as_u64()
                         .is_some_and(|id| connected(&page.doc, &state.hosts, id as usize))
             {
-                state.computed = None;
+                state.invalidate();
             }
             let result = crate::dom::call(
                 op,
@@ -743,6 +753,9 @@ impl Host {
                     matches!(role, Role::Main),
                     "process.exit() is only available in the main process and workers"
                 );
+                if let Some(before) = crate::jsc::BEFORE_EXIT.get() {
+                    before();
+                }
                 let _ = std::io::stdout().flush();
                 let _ = std::io::stderr().flush();
                 std::process::exit(code)
@@ -834,7 +847,7 @@ impl Host {
                     .map(|(name, value)| (lossy(name), lossy(value)))
                     .collect();
                 Ok(
-                    json!({"rustMain":self.rust_handlers.is_some(),"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             "cwd" => Ok(json!(std::env::current_dir()?)),
@@ -853,7 +866,12 @@ impl Host {
                 if op == "window" {
                     crate::desktop::validate(args)?;
                 }
-                self.commands.push(json!({"op": op, "args": args}));
+                if op == "quit"
+                    && let Some(link) = &self.link
+                {
+                    link.quit(args[0].as_i64().unwrap_or(0) as i32);
+                }
+                self.command(json!({"op": op, "args": args}));
                 Ok(Value::Null)
             }
             _ => bail!("Unsupported host operation: {op}"),

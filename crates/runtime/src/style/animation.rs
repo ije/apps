@@ -200,7 +200,7 @@ fn tracks(
                     Some((key, value.clone()))
                 }),
         );
-        resolve_style(&mut frame, Some(style), &custom, registry);
+        resolve_style(&mut frame, Some(style), None, &custom, registry);
         resolve_keywords(&mut frame, Some(style));
         for (key, value) in declarations.iter() {
             // Custom properties that can't interpolate switch halfway, like in browsers.
@@ -438,8 +438,8 @@ pub(crate) struct Scripted {
     /// Keyframes as `(offset, declarations, easing)`.
     rules: Vec<(f64, Style, String)>,
     effect: Animation,
-    /// What owns the style that the keyframes were resolved against.
-    base: Option<Rc<dyn std::any::Any>>,
+    /// What owns the style that the keyframes were resolved against, and its custom properties.
+    base: Option<(Rc<dyn std::any::Any>, super::Vars)>,
     /// The current time in seconds at `since`, and the playback rate while time runs.
     time: f64,
     rate: Option<f64>,
@@ -500,14 +500,26 @@ impl Scripted {
         &self,
         id: usize,
         styles: &'a ComputedStyles,
-    ) -> Option<(Rc<dyn std::any::Any>, &'a Style)> {
-        match self.effect.pseudo {
-            0 => Some((styles.values[id].clone(), &*styles.values[id])),
+    ) -> Option<(Rc<dyn std::any::Any>, Cow<'a, Style>)> {
+        let (owner, style): (Rc<dyn std::any::Any>, &Style) = match self.effect.pseudo {
+            0 => (styles.values[id].clone(), &*styles.values[id]),
             slot => {
                 let pair = styles.pseudos.get(&id)?;
-                Some((pair.clone(), &pair[usize::from(slot) - 1]))
+                (pair.clone(), &pair[usize::from(slot) - 1])
             }
-        }
+        };
+        // Styles without CSS animations hold no custom properties, so the keyframes get the node's.
+        let vars = &styles.vars[id];
+        Some((
+            owner,
+            if style.vars().is_empty() && !vars.is_empty() {
+                let mut style = style.clone();
+                style.set_vars(vars.clone());
+                Cow::Owned(style)
+            } else {
+                Cow::Borrowed(style)
+            },
+        ))
     }
 
     /// Resolves the keyframes again when the style changed.
@@ -515,10 +527,10 @@ impl Scripted {
         if self
             .base
             .as_ref()
-            .is_none_or(|old| !Rc::ptr_eq(old, &owner))
+            .is_none_or(|(old, vars)| !Rc::ptr_eq(old, &owner) || !Rc::ptr_eq(vars, base.vars()))
         {
             self.effect.tracks = tracks(base, &self.rules, registry);
-            self.base = Some(owner);
+            self.base = Some((owner, base.vars().clone()));
         }
     }
 }
@@ -643,6 +655,12 @@ impl Motion {
             .filter(|seconds| seconds.is_finite())
             .map(|seconds| now + std::time::Duration::from_secs_f64(seconds.max(0.)))
             .min()
+    }
+
+    /// Gives back the room for node ids past `len`.
+    pub fn trim(&mut self, len: usize) {
+        self.previous.truncate(len);
+        self.previous.shrink_to_fit();
     }
 
     pub fn forget(&mut self, id: usize) {
@@ -921,10 +939,10 @@ impl Motion {
             let Some((owner, base)) = animation.base(node, styles) else {
                 continue;
             };
-            animation.resolve(owner, base, &styles.registry);
+            animation.resolve(owner, &base, &styles.registry);
             animation
                 .effect
-                .sample(animation.local(now), base, &styles.registry, &mut out);
+                .sample(animation.local(now), &base, &styles.registry, &mut out);
         }
         (!out.is_empty()).then_some(out)
     }
@@ -1258,13 +1276,13 @@ impl Motion {
                 let Some((owner, base)) = animation.base(id, styles) else {
                     continue;
                 };
-                animation.resolve(owner, base, registry);
+                animation.resolve(owner, &base, registry);
                 let out = match animation.effect.pseudo {
                     0 => animated.entry(id).or_default(),
                     slot => pseudo.entry((id, slot)).or_default(),
                 };
                 let local = animation.local(now);
-                let (wake, _) = animation.effect.sample(local, base, registry, out);
+                let (wake, _) = animation.effect.sample(local, &base, registry, out);
                 let Some(rate) = animation.rate else {
                     continue;
                 };

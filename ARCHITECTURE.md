@@ -3,7 +3,24 @@
 - Electron compatible API
 - Standard Web API
 - DOM and CSS drawn by a GPU renderer, with built-in Tailwind CSS
-- JavaScriptCore runs page scripts and preloads. A Rust app uses its Cargo binary as the main entry and registers native handlers on the main thread. JavaScript apps also use JavaScriptCore for the main entry.
+- JavaScriptCore runs page scripts and preloads. A Rust app uses its Cargo binary as the main entry and registers native handlers, which run on a thread pool. JavaScript apps also use JavaScriptCore for the main entry.
+
+## Threads
+
+| Thread | Runs |
+|---|---|
+| Main | AppKit, native windows, menus and web views, and the main side: the main script or the Rust startup callback |
+| Render | One for each `BrowserWindow`: its page scripts and preloads in their own JavaScriptCore VM and heap, its event loop, DOM, CSS, layout, paint and Metal. It takes display link ticks directly, so a busy main thread or another window stops no frames |
+| Handlers | The Rust handlers of `ipcRenderer.invoke()`, on a pool of up to 4 threads |
+| Workers | Each JS worker, and any thread that Rust code starts. Rust threads reach pages with `AppHandle` |
+
+The main side and the pages share no JavaScript state. Each has its own `Host`, and they talk only through the queues in `crates/runtime/src/desktop/link.rs`. These are threads, not OS processes, so a crash in native code ends the whole app.
+
+A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard and opening a window. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key, the IME ranges and a frame for a live resize, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question.
+
+Window commands like `setBounds()`, `minimize()` and `close()` run on main and don't wait for the page. `close()` and quitting also stop a running page script, so a hung page can't hold them up.
+
+Render threads exist on macOS. On Windows and Linux the main side and all pages run on the main thread, so a busy script delays page frames there.
 
 ## Security
 

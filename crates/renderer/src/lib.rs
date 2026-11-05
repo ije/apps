@@ -19,7 +19,7 @@ pub mod text;
 mod tree;
 mod window;
 
-pub use app::{App, Timer, Waker, run};
+pub use app::{App, THREAD_PER_APP, Timer, Waker, native, run, spawn};
 pub use color::*;
 pub use geometry::*;
 pub use input::*;

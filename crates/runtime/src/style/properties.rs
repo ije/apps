@@ -439,7 +439,24 @@ impl Prop {
                 if let Some(&prop) = ids.get(name) {
                     return prop;
                 }
-                let name: &'static str = Box::leak(name.into());
+                // WARNING: each page thread has its own ids, so threads share the leaked names.
+                static LEAKED: std::sync::Mutex<rustc_hash::FxHashSet<&'static str>> =
+                    std::sync::Mutex::new(rustc_hash::FxHashSet::with_hasher(
+                        rustc_hash::FxBuildHasher,
+                    ));
+                let name: &'static str = {
+                    let mut leaked = LEAKED
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match leaked.get(name) {
+                        Some(&name) => name,
+                        None => {
+                            let name: &'static str = Box::leak(name.into());
+                            leaked.insert(name);
+                            name
+                        }
+                    }
+                };
                 let index = names.len() as u32;
                 let prop = Prop(
                     if name.starts_with("--") {
@@ -454,6 +471,11 @@ impl Prop {
                 prop
             })
         })
+    }
+
+    /// How many names are interned. A name that `find` doesn't know yet gets an id only by growing it.
+    pub(crate) fn interned() -> usize {
+        INTERNED.with(|interned| interned.borrow().0.len())
     }
 
     /// The property if any style can hold it.

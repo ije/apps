@@ -188,7 +188,23 @@ fn main() -> apps::Result<()> {
 
 An extension can be a Rust crate with a function such as `pub fn register(app: &apps::App) -> apps::Result<()>`. Call it from the startup callback to register its handlers.
 
-The callback and its registered handlers run on the app's main thread. A handler receives the window ID and a list of JSON arguments. Its result resolves the preload's promise, and an error rejects it. Keep handlers short so the window can draw and respond to input.
+The callback runs on the app's main thread. Handlers run on a small thread pool, so a slow handler doesn't stop the window. A handler receives the window ID and a list of JSON arguments. Its result resolves the preload's promise, and an error rejects it.
+
+A handler that runs for a long time should start its own thread, so it doesn't hold a place in the pool. Use `app.app_handle()` to reach a window from any thread:
+
+```rust
+let handle = app.app_handle();
+app.handle("start", move |window, _args| {
+    let handle = handle.clone();
+    std::thread::spawn(move || handle.send(window, "progress", 42.into()));
+    Ok(apps::Value::Null)
+})?;
+```
+
+```ts
+// preload.ts
+ipcRenderer.on('progress', (_event, value) => console.log(value))
+```
 
 ```ts
 // preload.ts

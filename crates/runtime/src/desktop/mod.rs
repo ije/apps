@@ -1,6 +1,7 @@
 pub mod app;
 pub mod browser;
 pub mod devtools;
+pub(crate) mod link;
 pub(crate) mod mcp;
 pub(crate) mod native;
 
@@ -12,13 +13,17 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
+use link::{Link, Main, PageQueue, ToMain, ToPage, state_json};
 use renderer::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
 use std::{
     borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     rc::{Rc, Weak},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -32,20 +37,49 @@ pub(crate) struct View {
     fullscreen: Option<[bool; 2]>,
 }
 
+/// The page side of an app: its windows and pages. The main side is reached through `link`.
 pub struct Desktop {
     api: Rc<JavaScriptCore>,
     host: Rc<RefCell<Host>>,
-    pub(crate) main: Option<JsContext>,
+    /// The main side, while no thread drives it: at startup, in checks and in tests.
+    pub(crate) main: Option<Rc<Main>>,
+    pub(crate) link: Link,
+    queue: Arc<PageQueue>,
     pub(crate) views: HashMap<u64, View>,
     devtools: HashMap<u64, devtools::DevTools>,
-    files: BBTreeMap<String, String>,
+    /// The logs of the main side, for developer tools.
+    main_logs: Vec<serde_json::Value>,
+    files: Arc<HashMap<String, String>>,
     pages: BBTreeMap<String, Document>,
-    error: Option<anyhow::Error>,
+    /// The bundled pages, for a page side on its own thread.
+    packed: Arc<HashMap<String, Vec<u8>>>,
+    /// The window that this page side runs alone on its thread, which ends with it.
+    owner: Option<u64>,
+    ended: bool,
     quit: bool,
     wake: Option<(Instant, renderer::Timer)>,
-    /// The waker of the running app, which async ops started before it ran use too.
-    waker: Arc<OnceLock<renderer::Waker>>,
     scheduled: bool,
+}
+
+thread_local! {
+    /// The page side of this thread.
+    // WARNING: no destructor, because at exit it would run after `HOSTS`, which its drop needs.
+    static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
+}
+
+/// What each page side starts from.
+struct Template {
+    rust_main: bool,
+    version: Option<String>,
+    disabled: u32,
+    name: Option<String>,
+    path: std::path::PathBuf,
+    packaged: bool,
+    scripts: Arc<HashMap<String, bytes::Bytes>>,
+    assets: HashMap<String, std::path::PathBuf>,
+    native_modules: HashMap<String, std::path::PathBuf>,
+    files: Arc<HashMap<String, String>>,
+    packed: Arc<HashMap<String, Vec<u8>>>,
 }
 
 impl Desktop {
@@ -128,64 +162,80 @@ impl Desktop {
         rust: bool,
     ) -> Result<Self> {
         let api = JavaScriptCore::load()?;
-        let waker = Arc::new(OnceLock::<renderer::Waker>::new());
+        let link = Link::new();
+        // WARNING: native producers of this thread capture this waker before the app runs.
         crate::host::Waker::install({
-            let waker = waker.clone();
+            let link = link.clone();
+            move || link.wake_main()
+        });
+        apps_webview::on_event({
+            let link = link.clone();
             move || {
-                if let Some(waker) = waker.get() {
-                    waker.wake();
-                }
+                link.wake_main();
+                link.wake_pages();
             }
         });
-        apps_webview::on_event(|| crate::host::Waker::current().wake());
         let package = files.get("package.json").map(String::as_str);
         let (_, name, version, _) = crate::bundle::package_metadata(package)?;
-        let host = Rc::new(RefCell::new(Host {
-            app_version: Some(version),
-            disabled: crate::bundle::disabled_features(package)?,
-            app_name: Some(name.clone()),
-            app_path: if root.as_os_str().is_empty() {
-                std::env::current_dir().unwrap_or_default()
-            } else {
-                root
-            },
-            packaged,
-            scripts: Arc::new(scripts),
-            assets: files
-                .get("assets.json")
-                .map(|source| serde_json::from_str(source))
-                .transpose()
-                .context("Invalid assets.json")?
-                .unwrap_or_default(),
-            ..Host::default()
-        }));
-        host.borrow_mut().browsers.application = name;
-        let main = if rust {
-            let mut state = host.borrow_mut();
-            state.rust_handlers = Some(HashMap::new());
-            state.install(files)?;
+        let disabled = crate::bundle::disabled_features(package)?;
+        let path = if root.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_default()
+        } else {
+            root
+        };
+        let scripts = Arc::new(scripts);
+        let assets: HashMap<String, std::path::PathBuf> = files
+            .get("assets.json")
+            .map(|source| serde_json::from_str(source))
+            .transpose()
+            .context("Invalid assets.json")?
+            .unwrap_or_default();
+        let side = || {
+            Rc::new(RefCell::new(Host {
+                link: Some(link.clone()),
+                rust_main: rust,
+                app_version: Some(version.clone()),
+                disabled,
+                app_name: Some(name.clone()),
+                app_path: path.clone(),
+                packaged,
+                scripts: scripts.clone(),
+                assets: assets.clone(),
+                ..Host::default()
+            }))
+        };
+        let (host, main_host) = (side(), side());
+        host.borrow_mut().install(files)?;
+        main_host.borrow_mut().browsers.application = name.clone();
+        let engine = if rust {
             None
         } else {
-            let engine = JsContext::new(api.clone(), host.clone(), Role::Main)?;
+            let engine = JsContext::new(api.clone(), main_host.clone(), Role::Main)?;
             engine.load_bundle(files, "app.js")?;
             Some(engine)
         };
         Ok(Self {
             pages: BBTreeMap::new(),
+            main: Some(Main::new(engine, main_host, link.clone(), api.clone())),
             api,
             host,
-            main,
+            queue: link.shared_queue(),
+            link,
             views: HashMap::new(),
             devtools: HashMap::new(),
-            files: files
-                .iter()
-                .filter(|(name, _)| name.ends_with(".html"))
-                .map(|(name, source)| (name.clone(), source.clone()))
-                .collect(),
-            error: None,
+            main_logs: Vec::new(),
+            files: Arc::new(
+                files
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(".html"))
+                    .map(|(name, source)| (name.clone(), source.clone()))
+                    .collect(),
+            ),
+            packed: Arc::default(),
+            owner: None,
+            ended: false,
             quit: false,
             wake: None,
-            waker,
             scheduled: false,
         })
     }
@@ -196,40 +246,57 @@ impl Desktop {
         runtime: Option<&Rc<RefCell<Self>>>,
     ) -> Result<()> {
         for _ in 0..64 {
-            let commands = std::mem::take(&mut self.host.borrow_mut().commands);
-            if commands.is_empty() {
+            if let Some(main) = &self.main {
+                main.receive();
+            }
+            let messages = self.queue.take();
+            if messages.is_empty() {
                 // WARNING: titles walk the document, so windowed apps sync them once per drive.
                 if runtime.is_none() {
                     self.titles(cx.as_deref_mut())?;
                 }
-                let attaches = self.host.borrow_mut().browsers.take_attaches();
-                for (browser, parent) in attaches {
-                    if let Some(cx) = cx.as_deref_mut()
-                        && let Some(handle) = self.views.get(&parent).and_then(|view| view.handle)
-                        && let Some(result) = cx.update_window(handle, |window, _| {
-                            self.host.borrow().browsers.attach(browser, window)
-                        })
-                    {
-                        result?;
-                    }
+                // Titles tell the main side.
+                if !self.queue.pending() && !(self.main.is_some() && self.link.main_pending())
+                {
+                    return Ok(());
                 }
-                return Ok(());
+                continue;
             }
-            for command in commands {
+            for message in messages {
+                let command = match message {
+                    ToPage::Bridge(id, message) => {
+                        if let Some(preload) = self.views.get(&id).and_then(|v| v.preload.clone()) {
+                            let deliver = || preload.deliver(message);
+                            if let Err(error) = match cx.as_deref_mut() {
+                                Some(cx) => crate::render::scripted(cx, None, deliver),
+                                None => deliver(),
+                            } {
+                                eprintln!("apps: {error:#}");
+                            }
+                        }
+                        continue;
+                    }
+                    ToPage::Command(command) => command,
+                };
                 let args = &command["args"];
+                if command["op"] == "theme" {
+                    self.host.borrow_mut().sync_theme();
+                    continue;
+                }
+                if command["op"] == "logs" {
+                    if !self.devtools.is_empty() {
+                        self.main_logs
+                            .extend(args.as_array().into_iter().flatten().cloned());
+                    }
+                    continue;
+                }
                 if command["op"] == "quit" {
-                    self.host.borrow_mut().exit_code = args[0].as_i64().unwrap_or(0) as i32;
+                    self.link.quit(args[0].as_i64().unwrap_or(0) as i32);
                     self.quit = true;
                     if let Some(cx) = cx.as_deref_mut() {
                         cx.quit();
                     }
                     return Ok(());
-                }
-                if command["op"] == "focus" {
-                    if let Some(cx) = cx.as_deref_mut() {
-                        cx.activate(args[0] == true);
-                    }
-                    continue;
                 }
                 let action = args[0].as_str().context("Missing window action")?;
                 let id = args[1].as_u64().context("Missing window id")?;
@@ -289,17 +356,9 @@ impl Desktop {
                                 (Some(x), Some(y)) => point(px(x as f32), px(y as f32)),
                                 _ => cx.centered(outer).origin,
                             };
-                            let parent = options["parent"]
-                                .as_u64()
-                                .and_then(|parent| self.views.get(&parent)?.handle)
-                                .and_then(|parent| {
-                                    cx.update_window(parent, |window, _| {
-                                        window.raw_window_handle().ok()
-                                    })
-                                })
-                                .flatten();
                             // WARNING: children and windows that can't take focus open hidden, so they show after those changes.
-                            let later = parent.is_some() || options["focusable"] == false;
+                            let child = options["parent"].is_u64();
+                            let later = child || options["focusable"] == false;
                             let show = options["show"] != false;
                             let window_options = WindowOptions {
                                 bounds: Bounds::new(origin, outer),
@@ -320,6 +379,8 @@ impl Desktop {
                                 Box::new(view)
                             })?;
                             cx.update_window(handle, |window, _| {
+                                self.link
+                                    .main(ToMain::Window(id, window.id(), window.control()));
                                 for (apply, change) in [
                                     (
                                         min != [0.; 2] || max != [0.; 2],
@@ -360,11 +421,8 @@ impl Desktop {
                                                 as isize,
                                         ),
                                     ),
-                                    (
-                                        parent.is_some(),
-                                        WindowChange::Parent(parent, options["modal"] == true),
-                                    ),
-                                    (later && show, WindowChange::Show(true)),
+                                    // The main side joins and shows a child, see `create_window`.
+                                    (later && show && !child, WindowChange::Show(true)),
                                 ] {
                                     if apply {
                                         window.change_window(change);
@@ -395,12 +453,9 @@ impl Desktop {
                                 fullscreen: None,
                             },
                         );
-                        if let Some(state) = baseline
-                            && let Some(main) = &self.main
-                            && let Err(error) = main
-                                .eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
-                        {
-                            eprintln!("apps: {error}");
+                        if let Some(state) = baseline {
+                            self.link
+                                .event(format!("__appsEvent('state',{id},{state})"), "apps:state");
                         }
                     }
                     "load" | "loadFile" => {
@@ -440,6 +495,10 @@ impl Desktop {
                             }
                             if let Some(name) = value.strip_prefix("apps:///") {
                                 let name = name.split(['?', '#']).next().unwrap();
+                                if let Some(bytes) = self.packed.get(name) {
+                                    return crate::bundle::unpack_page(bytes)
+                                        .map_err(|_| (-2, "ERR_FAILED"));
+                                }
                                 return match (self.pages.get(name), self.files.get(name)) {
                                     (Some(doc), _) => Ok(doc.clone()),
                                     (_, Some(source)) => Ok(crate::bundle::page(source)),
@@ -466,7 +525,7 @@ impl Desktop {
                             Ok(loaded) => loaded,
                             Err((code, description)) => {
                                 let url = location.unwrap_or_else(|_| value.to_owned());
-                                if self.main.is_none() && !page {
+                                if self.host.borrow().rust_main && !page {
                                     bail!("Cannot load {value}: {description}");
                                 }
                                 if page {
@@ -475,14 +534,10 @@ impl Desktop {
                                     );
                                 }
                                 let event = serde_json::json!({"request":request,"url":url,"code":code,"description":description});
-                                if let Some(main) = &self.main
-                                    && let Err(error) = main.eval(
-                                        &format!("__appsEvent('failed',{id},{event})"),
-                                        "apps:failed",
-                                    )
-                                {
-                                    eprintln!("apps: {error}");
-                                }
+                                self.link.event(
+                                    format!("__appsEvent('failed',{id},{event})"),
+                                    "apps:failed",
+                                );
                                 continue;
                             }
                         };
@@ -561,13 +616,15 @@ impl Desktop {
                         .then(|| {
                             JsContext::new(self.api.clone(), self.host.clone(), Role::Preload(id))
                         })
-                        .transpose()?
-                        .map(Rc::new);
-                        let renderer = Rc::new(JsContext::new(
-                            self.api.clone(),
-                            self.host.clone(),
-                            Role::Renderer(id),
-                        )?);
+                        .transpose();
+                        let renderer =
+                            JsContext::new(self.api.clone(), self.host.clone(), Role::Renderer(id));
+                        // WARNING: closing a window during its load stops these too, which is no failure.
+                        if (preload.is_err() || renderer.is_err()) && crate::jsc::stopping(id) {
+                            continue;
+                        }
+                        let preload = preload?.map(Rc::new);
+                        let renderer = Rc::new(renderer?);
                         for (kind, script) in &scripts {
                             if *kind == "preload"
                                 && let Some(preload) = &preload
@@ -649,14 +706,8 @@ impl Desktop {
                             cx.refresh_window(handle);
                         }
                         let event = serde_json::json!({"request":request,"url":location});
-                        if let Some(main) = &self.main
-                            && let Err(error) = main.eval(
-                                &format!("__appsEvent('loaded',{id},{event})"),
-                                "apps:loaded",
-                            )
-                        {
-                            eprintln!("apps: {error}");
-                        }
+                        self.link
+                            .event(format!("__appsEvent('loaded',{id},{event})"), "apps:loaded");
                     }
                     "edit" => {
                         if let Some(renderer) = self.views[&id].renderer.clone() {
@@ -683,7 +734,7 @@ impl Desktop {
                         } else {
                             state.inserted.retain(|(old, ..)| old != key);
                         }
-                        state.computed = None;
+                        state.invalidate();
                         page.dirty = true;
                     }
                     "devtools" => {
@@ -696,10 +747,9 @@ impl Desktop {
                                 .insert(id, devtools::DevTools::new(&format!("Window {id}"))?);
                         }
                     }
-                    "close" | "closing" if action == "close" || self.main.is_none() => {
+                    "close" => {
                         self.devtools.remove(&id);
                         if let Some(view) = self.views.remove(&id) {
-                            self.host.borrow_mut().browsers.close_window(id)?;
                             if let Some(data) = view.data.upgrade() {
                                 data.browsers.borrow_mut().clear();
                             }
@@ -715,18 +765,25 @@ impl Desktop {
                             self.host.borrow_mut().bridge.remove(&id);
                             self.host.borrow_mut().dropped.remove(&id);
                             crate::web::storage::forget(id);
-                            if self.main.is_none() && self.views.is_empty() {
-                                self.quit = true;
-                                if let Some(cx) = cx.as_deref_mut() {
-                                    cx.quit();
-                                }
+                            crate::jsc::page_stopped(id);
+                            self.ended = self.owner == Some(id);
+                            if self.ended {
+                                mcp::uninstall();
                             }
-                            if let Some(main) = &self.main
-                                && let Err(error) =
-                                    main.eval(&format!("__appsEvent('closed',{id})"), "apps:closed")
-                            {
-                                eprintln!("apps: {error}");
-                            }
+                        }
+                    }
+                    "menuAfterFrame" => {
+                        if let (Some(handle), Some(cx)) =
+                            (self.views[&id].handle, cx.as_deref_mut())
+                        {
+                            let link = self.link.clone();
+                            cx.update_window(handle, |window, _| {
+                                window.on_next_frame(|window, _| {
+                                    window.on_next_frame(move |_, _| {
+                                        link.event("__appsInitMenu()".into(), "apps:menu")
+                                    })
+                                })
+                            });
                         }
                     }
                     "capture" => {
@@ -737,6 +794,7 @@ impl Desktop {
                             (view.handle, cx.as_deref_mut(), runtime)
                         {
                             let runtime = runtime.clone();
+                            let link = self.link.clone();
                             cx.update_window(handle, |window, _| {
                                 // Like Electron, the area is in window points, which the page zoom doesn't scale.
                                 let scale = window.scale_factor() / window.zoom();
@@ -747,11 +805,7 @@ impl Desktop {
                                     };
                                     // WARNING: the window is busy drawing here, so a capture requested by the reply must wait for the next drive.
                                     cx.defer(move |cx| {
-                                        if let Ok(app) = runtime.try_borrow()
-                                            && let Some(main) = &app.main && let Err(error) = main.eval(&format!("__appsEvent('captured',{id},{data})"), "apps:capture")
-                                        {
-                                            eprintln!("apps: {error}");
-                                        }
+                                        link.event(format!("__appsEvent('captured',{id},{data})"), "apps:capture");
                                         Desktop::drive(runtime, cx);
                                     });
                                 });
@@ -774,17 +828,14 @@ impl Desktop {
                             }
                                 .map(|error| serde_json::json!({"error":error.to_string()}).to_string().into()),
                         };
-                        if let Some(data) = result
-                            && let Some(main) = &self.main
-                            && let Err(error) = main.eval(
-                                &format!(
+                        if let Some(data) = result {
+                            self.link.event(
+                                format!(
                                     "__appsEvent('executed',{id},{})",
                                     serde_json::json!({"request":request,"data":data})
                                 ),
                                 "apps:executed",
-                            )
-                        {
-                            eprintln!("apps: {error}");
+                            );
                         }
                     }
                     "htmlFullscreen" => {
@@ -805,22 +856,10 @@ impl Desktop {
                             });
                         }
                         view.fullscreen = on.then_some([was, was]);
-                        if let Some(main) = &self.main
-                            && let Err(error) = main.eval(
-                                &format!("__appsEvent('html-full-screen',{id},{on})"),
-                                "apps:fullscreen",
-                            )
-                        {
-                            eprintln!("apps: {error}");
-                        }
-                    }
-                    "closing" => {
-                        if let Some(main) = &self.main
-                            && let Err(error) =
-                                main.eval(&format!("__appsEvent('close',{id})"), "apps:close")
-                        {
-                            eprintln!("apps: {error}");
-                        }
+                        self.link.event(
+                            format!("__appsEvent('html-full-screen',{id},{on})"),
+                            "apps:fullscreen",
+                        );
                     }
                     "background" => {
                         let color = args[2]
@@ -844,111 +883,24 @@ impl Desktop {
                             });
                         }
                     }
-                    "show" | "title" | "bounds" | "center" | "minimize" | "maximize"
-                    | "unmaximize" | "restore" | "fullscreen" | "focus" | "blur" | "hide"
-                    | "showInactive" | "limits" | "resizable" | "minimizable" | "maximizable"
-                    | "closable" | "movable" | "alwaysOnTop" | "buttons" | "zoom" | "opacity"
-                    | "shadow" | "ignoreMouse" | "workspaces" | "contentProtection"
-                    | "focusable" | "aspectRatio" | "parent" | "vibrancy" => {
+                    "zoom" => {
                         if let (Some(handle), Some(cx)) =
                             (self.views[&id].handle, cx.as_deref_mut())
                         {
-                            let number =
-                                |index: usize| px(args[index].as_f64().unwrap_or(0.) as f32);
-                            let on = args[2] == true;
-                            let parent = args[2]
-                                .as_u64()
-                                .filter(|_| action == "parent")
-                                .and_then(|parent| self.views.get(&parent)?.handle)
-                                .and_then(|parent| {
-                                    cx.update_window(parent, |window, _| {
-                                        window.raw_window_handle().ok()
-                                    })
-                                })
-                                .flatten();
                             cx.update_window(handle, |window, _| {
-                                let change = match action {
-                                    "title" => {
-                                        window.set_window_title(args[2].as_str().unwrap_or(""));
-                                        return;
-                                    }
-                                    "bounds" if cfg!(target_os = "macos") => {
-                                        WindowChange::Frame(Bounds::new(
-                                            renderer::point(number(2), number(3)),
-                                            size(number(4), number(5)),
-                                        ))
-                                    }
-                                    "bounds" => {
-                                        let state = window.window_state();
-                                        return window.resize(size(
-                                            number(4)
-                                                - (state.frame.size.width
-                                                    - state.content.size.width),
-                                            number(5)
-                                                - (state.frame.size.height
-                                                    - state.content.size.height),
-                                        ));
-                                    }
-                                    "buttons" => {
-                                        #[cfg(target_os = "macos")]
-                                        window.set_window_button_visibility(on);
-                                        return;
-                                    }
-                                    "minimize" => return window.minimize_window(),
-                                    "zoom" => {
-                                        return window
-                                            .set_zoom(args[2].as_f64().unwrap_or(1.) as f32);
-                                    }
-                                    "maximize" | "unmaximize" => {
-                                        if window.window_state().maximized != (action == "maximize")
-                                        {
-                                            window.zoom_window();
-                                        }
-                                        return;
-                                    }
-                                    "fullscreen" => {
-                                        if window.is_fullscreen() != on {
-                                            window.toggle_fullscreen();
-                                        }
-                                        return;
-                                    }
-                                    "restore" if cfg!(target_os = "macos") => WindowChange::Restore,
-                                    "show" | "focus" | "restore" => {
-                                        return window.activate_window();
-                                    }
-                                    "opacity" => WindowChange::Opacity(number(2).0),
-                                    "shadow" => WindowChange::Shadow(on),
-                                    "ignoreMouse" => WindowChange::IgnoreMouse(on, args[3] == true),
-                                    "workspaces" => {
-                                        WindowChange::AllWorkspaces(on, args[3] == true)
-                                    }
-                                    "contentProtection" => WindowChange::ContentProtection(on),
-                                    "focusable" => WindowChange::Focusable(on),
-                                    "aspectRatio" => WindowChange::AspectRatio(
-                                        number(2).0,
-                                        size(number(3), number(4)),
-                                    ),
-                                    "parent" => WindowChange::Parent(parent, false),
-                                    "vibrancy" => WindowChange::Vibrancy(
-                                        args[2].as_i64().map(|material| material as isize),
-                                        args[3].as_i64().unwrap_or(0) as isize,
-                                    ),
-                                    "center" => WindowChange::Center,
-                                    "blur" => WindowChange::Blur,
-                                    "hide" => WindowChange::Hide,
-                                    "showInactive" => WindowChange::Show(false),
-                                    "limits" => WindowChange::SizeLimits(
-                                        size(number(2), number(3)),
-                                        size(number(4), number(5)),
-                                    ),
-                                    "resizable" => WindowChange::Resizable(on),
-                                    "minimizable" => WindowChange::Minimizable(on),
-                                    "maximizable" => WindowChange::Maximizable(on),
-                                    "closable" => WindowChange::Closable(on),
-                                    "movable" => WindowChange::Movable(on),
-                                    _ => WindowChange::AlwaysOnTop(on),
-                                };
-                                window.change_window(change);
+                                window.set_zoom(args[2].as_f64().unwrap_or(1.) as f32)
+                            });
+                        }
+                    }
+                    "vibrancy" => {
+                        if let (Some(handle), Some(cx)) =
+                            (self.views[&id].handle, cx.as_deref_mut())
+                        {
+                            cx.update_window(handle, |window, _| {
+                                window.change_window(WindowChange::Vibrancy(
+                                    args[2].as_i64().map(|material| material as isize),
+                                    args[3].as_i64().unwrap_or(0) as isize,
+                                ));
                             });
                         }
                     }
@@ -977,19 +929,34 @@ impl Desktop {
             }
             let text = title.as_deref().unwrap_or("");
             view.title = title.clone();
-            let allowed = self.main.as_ref().is_none_or(|main| {
-                main.eval(
-                    &format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
+            // A main script can prevent the change, so it sets the title itself.
+            if !self.host.borrow().rust_main {
+                self.link.event(
+                    format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
                     "apps:title",
-                )
-                .inspect_err(|error| eprintln!("apps: {error}"))
-                .is_ok_and(|allowed| allowed != "false")
-            });
-            if allowed && let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
+                );
+            } else if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                 cx.update_window(handle, |window, _| window.set_window_title(text));
             }
         }
         Ok(())
+    }
+
+    /// Frees the nodes that the last GC found dead, and gives back what the pages can build again.
+    fn trim(&self) {
+        for view in self.views.values() {
+            if let Some(page) = &view.renderer {
+                let _ = page.eval("__appsDomSweep?.(true)", "apps:trim");
+            }
+        }
+        let host = &mut *self.host.borrow_mut();
+        for (id, dom) in &mut host.dom {
+            if let Some(page) = host.pages.get_mut(id)
+                && dom.trim(&mut page.doc)
+            {
+                page.dirty = true;
+            }
+        }
     }
 
     pub(crate) fn drive(runtime: Rc<RefCell<Self>>, cx: &mut App) {
@@ -1021,11 +988,7 @@ impl Desktop {
                     (width * zoom).round(),
                     (height * zoom).round()
                 );
-                if let Some(main) = &app.main
-                    && let Err(error) = main.eval(&event, "apps:resize")
-                {
-                    eprintln!("apps: {error}");
-                }
+                app.link.event(event, "apps:resize");
                 if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
                     && let Err(error) = crate::render::scripted(cx, None, || {
                         renderer.eval("__appsDispatch('window:resize',[0])", "apps:resize")
@@ -1044,12 +1007,6 @@ impl Desktop {
                 else {
                     continue;
                 };
-                if let Some(main) = &app.main
-                    && let Err(error) =
-                        main.eval(&format!("__appsEvent('state',{id},{state})"), "apps:state")
-                {
-                    eprintln!("apps: {error}");
-                }
                 // A page's fullscreen ends when its window leaves fullscreen.
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
@@ -1066,62 +1023,41 @@ impl Desktop {
                         {
                             eprintln!("apps: {error}");
                         }
-                        if let Some(main) = &app.main
-                            && let Err(error) = main.eval(
-                                &format!("__appsEvent('html-full-screen',{id},false)"),
-                                "apps:fullscreen",
-                            )
-                        {
-                            eprintln!("apps: {error}");
-                        }
+                        app.link.event(
+                            format!("__appsEvent('html-full-screen',{id},false)"),
+                            "apps:fullscreen",
+                        );
                     }
                     _ => {}
                 }
             }
             let mut delay = i64::MAX;
-            for (fatal, engine) in
-                app.main
-                    .iter()
-                    .map(|main| (true, main))
-                    .chain(app.views.values().flat_map(|v| {
-                        v.preload
-                            .iter()
-                            .chain(v.renderer.iter())
-                            .map(|engine| (false, engine.as_ref()))
-                    }))
+            for engine in app
+                .views
+                .values()
+                .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref))
             {
                 let next = match crate::render::scripted(cx, None, || engine.tick()) {
                     Ok(next) => next,
-                    Err(error) if !fatal => {
+                    Err(error) => {
                         eprintln!("apps: page script: {error:#}");
                         continue;
                     }
-                    Err(error) => return Err(error),
                 };
                 if next >= 0 {
                     delay = delay.min(next);
                 }
             }
-            // WARNING: IPC listeners run in a later task than their sender, so queued messages are delivered here in rounds, for at most 4 ms; the rest waits for the next wake.
+            // WARNING: IPC messages are delivered here in rounds, for at most 4 ms; the rest waits for the next wake.
             let start = Instant::now();
-            while start.elapsed() < Duration::from_millis(4) {
-                let mut busy = false;
-                for engine in app.main.iter().chain(
-                    app.views
-                        .values()
-                        .filter_map(|view| view.preload.as_deref()),
-                ) {
-                    busy |=
-                        crate::render::scripted(cx, None, || engine.call("__appsBridgeDrain", &[]))
-                            .is_ok_and(|drained| drained == "true");
+            loop {
+                app.pump(Some(cx), Some(&runtime))?;
+                if app.quit {
+                    return Ok(None);
                 }
-                if !busy {
+                if !app.queue.pending() || start.elapsed() >= Duration::from_millis(4) {
                     break;
                 }
-            }
-            app.pump(Some(cx), Some(&runtime))?;
-            if app.quit {
-                return Ok(None);
             }
             if std::mem::take(&mut app.host.borrow_mut().theme_changed) {
                 delay = delay.min(0);
@@ -1136,11 +1072,7 @@ impl Desktop {
                 }
             }
             for (&id, tools) in &app.devtools {
-                let Some(engine) = app
-                    .views
-                    .get(&id)
-                    .and_then(|view| view.renderer.as_deref())
-                    .or(app.main.as_ref())
+                let Some(engine) = app.views.get(&id).and_then(|view| view.renderer.as_deref())
                 else {
                     continue;
                 };
@@ -1160,8 +1092,10 @@ impl Desktop {
             let mcp = mcp::enabled();
             if !app.devtools.is_empty() || mcp {
                 let logs: Vec<_> = app.host.borrow_mut().logs.drain(..).collect();
+                let main_logs = std::mem::take(&mut app.main_logs);
                 for tools in app.devtools.values() {
                     tools.events(&logs)?;
+                    tools.events(&main_logs)?;
                 }
                 mcp::logs(&logs);
                 if !app.devtools.is_empty() {
@@ -1203,21 +1137,18 @@ impl Desktop {
                     }
                 }
             }
+            app.titles(Some(cx))?;
             let host = app.host.borrow();
-            if !host.commands.is_empty()
-                || !host.resized.is_empty()
-                || !host.window_changes.is_empty()
-            {
+            if app.queue.pending() || !host.resized.is_empty() || !host.window_changes.is_empty() {
                 delay = delay.min(0);
             }
             drop(host);
-            app.titles(Some(cx))?;
             // WARNING: IPC, microtasks and the scripts above can add timers after an engine's tick, so read all delays again.
-            for engine in app.main.iter().chain(
-                app.views
-                    .values()
-                    .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref)),
-            ) {
+            for engine in app
+                .views
+                .values()
+                .flat_map(|v| v.preload.iter().chain(v.renderer.iter()).map(Rc::as_ref))
+            {
                 if let Ok(next) = engine
                     .call("__appsDelay", &[])
                     .map(|next| next.parse::<f64>().unwrap_or(-1.))
@@ -1240,9 +1171,7 @@ impl Desktop {
                     && let (Some(handle), Some(data)) = (view.handle, view.data.upgrade())
                     && cx
                         .update_window(handle, |window, _| {
-                            window.on_next_frame(move |window, cx| {
-                                crate::render::animation_frame(data, window, cx)
-                            })
+                            crate::render::queue_animation_frame(data, window)
                         })
                         .is_some()
                     && let Some(dom) = app.host.borrow_mut().dom.get_mut(&id)
@@ -1259,11 +1188,18 @@ impl Desktop {
                 Some(delay.clamp(1, 1 << 31) as u64)
             })
         })();
+        // The window is gone, and its thread with it.
+        if runtime.try_borrow().is_ok_and(|app| app.ended) {
+            cx.defer(|cx| {
+                PAGE_SIDE.with(|side| side.take());
+                cx.end_thread();
+            });
+        }
         // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the VM
         // is collected once, when JS has been quiet for a second.
         let api = runtime.borrow().api.clone();
         if api.shrink_pending() && !api.idle.replace(true) {
-            shrink_when_quiet(api, cx);
+            shrink_when_quiet(runtime.clone(), cx);
         }
         match result {
             Ok(Some(delay)) => {
@@ -1288,10 +1224,7 @@ impl Desktop {
             Ok(None) => runtime.borrow_mut().wake = None,
             Err(error) => {
                 eprintln!("apps: {error:#}");
-                let mut app = runtime.borrow_mut();
-                app.fail();
-                app.error = Some(error);
-                cx.quit();
+                runtime.borrow_mut().fail();
             }
         }
         crate::host::idle(true);
@@ -1299,37 +1232,44 @@ impl Desktop {
 
     fn fail(&mut self) {
         self.quit = true;
-        let mut host = self.host.borrow_mut();
-        if host.exit_code == 0 {
-            host.exit_code = 1;
-        }
+        self.link.fail();
     }
 
     pub fn check(mut self) -> Result<i32> {
-        if let Some(main) = &self.main {
+        let main = self.main.clone().context("Missing the main side")?;
+        if let Some(main) = &main.engine {
             main.eval("__appsEvent('ready')", "apps:ready")?;
         }
         self.pump(None, None)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            for engine in self.main.iter().chain(self.views.values().flat_map(|view| {
-                view.preload
-                    .iter()
-                    .chain(view.renderer.iter())
-                    .map(Rc::as_ref)
-            })) {
+            for engine in main
+                .engine
+                .iter()
+                .chain(self.views.values().flat_map(|view| {
+                    view.preload
+                        .iter()
+                        .chain(view.renderer.iter())
+                        .map(Rc::as_ref)
+                }))
+            {
                 engine.tick()?;
             }
             self.pump(None, None)?;
             let mut pending = false;
-            for engine in self.main.iter().chain(self.views.values().flat_map(|view| {
-                view.preload
-                    .iter()
-                    .chain(view.renderer.iter())
-                    .map(Rc::as_ref)
-            })) {
+            for engine in main
+                .engine
+                .iter()
+                .chain(self.views.values().flat_map(|view| {
+                    view.preload
+                        .iter()
+                        .chain(view.renderer.iter())
+                        .map(Rc::as_ref)
+                }))
+            {
                 pending |= engine.eval("__appsPending()", "apps:startup")? == "true";
             }
+            pending |= self.queue.pending() || self.link.main_pending();
             if !pending || self.quit {
                 break;
             }
@@ -1351,7 +1291,7 @@ impl Desktop {
             }
         }
         println!("apps: checked {} window(s)", self.views.len());
-        Ok(self.host.borrow().exit_code)
+        Ok(self.link.exit_code())
     }
 
     pub fn run(self, devtools: bool, mcp: Option<u16>) -> Result<i32> {
@@ -1359,47 +1299,97 @@ impl Desktop {
             !(devtools || mcp.is_some()) || !self.host.borrow().packaged,
             "Developer tools are unavailable in packaged apps"
         );
-        if let Some(port) = mcp {
-            mcp::start(port)?;
+        let Self {
+            api,
+            host,
+            main,
+            link,
+            files,
+            pages,
+            ..
+        } = self;
+        drop(api);
+        let main = main.context("Missing the main side")?;
+        apps_webview::on_main_thread(
+            |task| renderer::native::sync(|| task()),
+            renderer::native::post,
+        );
+        let mcp = mcp.map(|port| mcp::start(port, link.clone())).transpose()?;
+        let packed = pages
+            .iter()
+            .map(|(name, doc)| Ok((name.clone(), crate::bundle::pack_page(doc)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let template = {
+            let host = host.borrow();
+            Arc::new(Template {
+                rust_main: host.rust_main,
+                version: host.app_version.clone(),
+                disabled: host.disabled,
+                name: host.app_name.clone(),
+                path: host.app_path.clone(),
+                packaged: host.packaged,
+                scripts: host.scripts.clone(),
+                assets: host.assets.clone(),
+                native_modules: host.native_modules.clone(),
+                files,
+                packed: Arc::new(packed),
+            })
+        };
+        drop((host, pages));
+        if renderer::THREAD_PER_APP {
+            link.set_per_window();
+            let (template, link, mcp) = (template.clone(), link.clone(), mcp.clone());
+            main.set_spawner(Box::new(move |id, queue| {
+                let (template, link, mcp) = (template.clone(), link.clone(), mcp.clone());
+                renderer::spawn(move |cx| Self::start(template, link, queue, mcp, Some(id), cx));
+            }));
         }
-        let runtime = Rc::new(RefCell::new(self));
-        let result = runtime.clone();
-        renderer::run(move |cx| {
-            let reopen = runtime.clone();
-            cx.on_reopen(move |cx, visible| {
-                if let Some(main) = &reopen.borrow().main
-                    && let Err(error) = main.eval(
-                        &format!("__appsEvent('activate',0,{visible})"),
-                        "apps:activate",
-                    )
-                {
-                    eprintln!("apps: {error}");
+        let exit = link.clone();
+        renderer::run(move || {
+            let pending = Arc::new(AtomicBool::new(false));
+            link.set_wake_main(move || {
+                if !pending.swap(true, Ordering::AcqRel) {
+                    let pending = pending.clone();
+                    renderer::native::post(Box::new(move || {
+                        pending.store(false, Ordering::Release);
+                        link::drive_main();
+                    }));
                 }
-                Self::drive(reopen.clone(), cx);
             });
-            let terminate = runtime.clone();
-            cx.on_should_quit(move |cx| {
-                let Ok(app) = terminate.try_borrow() else {
-                    return true;
-                };
-                if app.quit || app.main.is_none() {
-                    return true;
-                }
-                if let Some(main) = &app.main
-                    && let Err(error) = main.eval("__appsEvent('before-quit')", "apps:quit")
-                {
-                    eprintln!("apps: {error}");
-                    return true;
-                }
-                drop(app);
-                Self::drive(terminate.clone(), cx);
-                terminate.try_borrow().is_ok_and(|app| app.quit)
+            let events = main.clone();
+            renderer::native::on_window_event(move |window, event| {
+                events.window_event(window, event);
             });
-            let opened = Rc::downgrade(&runtime);
-            cx.on_open_urls(move |cx, list| {
-                let Some(runtime) = opened.upgrade() else {
-                    return;
+            let reopen = main.clone();
+            renderer::native::on_reopen(move |visible| {
+                reopen.link().event(
+                    format!("__appsEvent('activate',0,{visible})"),
+                    "apps:activate",
+                );
+                reopen.drive();
+            });
+            let terminate = main.clone();
+            renderer::native::on_should_quit(move || {
+                let quit = match terminate.engine.as_ref().filter(|_| !terminate.link().quitting()) {
+                    None => true,
+                    Some(engine) => match engine.eval("__appsEvent('before-quit')", "apps:quit") {
+                        Err(error) => {
+                            eprintln!("apps: {error}");
+                            true
+                        }
+                        Ok(_) => {
+                            terminate.drive();
+                            terminate.link().quitting()
+                        }
+                    },
                 };
+                if quit {
+                    crate::jsc::stop_pages();
+                }
+                quit
+            });
+            let opened = main.clone();
+            renderer::native::on_open_urls(move |list| {
                 for url in list {
                     let event = match url::Url::parse(&url)
                         .ok()
@@ -1411,124 +1401,190 @@ impl Desktop {
                         }
                         None => format!("__appsEvent('open-url',0,{})", serde_json::json!(url)),
                     };
-                    if let Some(main) = &runtime.borrow().main
-                        && let Err(error) = main.eval(&event, "apps:open")
-                    {
-                        eprintln!("apps: {error}");
-                    }
+                    opened.link().event(event, "apps:open");
                 }
-                Self::drive(runtime, cx);
+                opened.drive();
             });
-            let host = runtime.borrow().host.clone();
-            cx.on_quit(move |_| {
-                if let Ok(host) = host.try_borrow() {
-                    if let Some(command) = &host.relaunch {
-                        #[cfg(unix)]
-                        let _ = std::os::unix::process::CommandExt::process_group(
-                            std::process::Command::new("/bin/sh")
-                                .args([
-                                    "-c",
-                                    r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; exec "$@""#,
-                                    &std::process::id().to_string(),
-                                ])
-                                .args(command),
-                            0,
-                        )
-                        .stdin(std::process::Stdio::null())
-                        .spawn();
-                        #[cfg(not(unix))]
-                        let _ = std::process::Command::new(&command[0]).args(&command[1..]).spawn();
-                    }
-                    // AppKit exits with 0 after this hook, so a failure code must exit here.
-                    if host.exit_code != 0 {
-                        std::process::exit(host.exit_code);
-                    }
+            let host = main.host.clone();
+            let exit = link.clone();
+            renderer::native::on_quit(move || {
+                if let Ok(host) = host.try_borrow()
+                    && let Some(command) = &host.relaunch
+                {
+                    #[cfg(unix)]
+                    let _ = std::os::unix::process::CommandExt::process_group(
+                        std::process::Command::new("/bin/sh")
+                            .args([
+                                "-c",
+                                r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; exec "$@""#,
+                                &std::process::id().to_string(),
+                            ])
+                            .args(command),
+                        0,
+                    )
+                    .stdin(std::process::Stdio::null())
+                    .spawn();
+                    #[cfg(not(unix))]
+                    let _ = std::process::Command::new(&command[0]).args(&command[1..]).spawn();
+                }
+                // AppKit exits with 0 after this hook, so a failure code must exit here.
+                if exit.exit_code() != 0 {
+                    std::process::exit(exit.exit_code());
                 }
             });
-            let woken = Rc::downgrade(&runtime);
-            cx.on_wake(move |cx| {
-                if let Some(runtime) = woken.upgrade() {
-                    Self::drive(runtime, cx);
-                }
-            });
-            let _ = runtime.borrow().waker.set(cx.waker());
+            crate::jsc::BEFORE_EXIT.set(Some(|| {
+                crate::jsc::stop_pages();
+                renderer::native::before_exit();
+            }));
             #[cfg(target_os = "macos")]
             native::observe();
-            if let Some(main) = &runtime.borrow().main
-                && let Err(error) = main.eval("__appsEvent('ready')", "apps:ready")
+            if let Some(engine) = &main.engine
+                && let Err(error) = engine.eval("__appsEvent('ready')", "apps:ready")
             {
                 eprintln!("apps: {error}");
-                runtime.borrow_mut().fail();
-                cx.quit();
-                return;
+                link.fail();
             }
-            Self::drive(runtime.clone(), cx);
+            main.drive();
+            if !renderer::THREAD_PER_APP {
+                let (link, queue) = (link.clone(), link.shared_queue());
+                renderer::spawn(move |cx| Self::start(template, link, queue, mcp, None, cx));
+            }
+            let first = main.first_window();
+            if devtools {
+                match first {
+                    Some(id) => link.page(ToPage::Command(
+                        serde_json::json!({"op":"window","args":["devtools",id]}),
+                    )),
+                    None => link.main(ToMain::OpenTools),
+                }
+            }
             // WARNING: the first main menu costs AppKit 20-30 ms, so the default menu waits for the first frame.
             #[cfg(target_os = "macos")]
-            {
-                let menu = runtime.clone();
-                let init = move || {
-                    if let Ok(app) = menu.try_borrow()
-                        && let Some(main) = &app.main
-                        && let Err(error) = main.eval("__appsInitMenu()", "apps:menu")
-                    {
-                        eprintln!("apps: {error}");
-                    }
-                };
-                let handle = runtime.borrow().views.values().find_map(|view| view.handle);
-                match handle {
-                    Some(handle) => {
-                        cx.update_window(handle, |window, _| {
-                            window
-                                .on_next_frame(|window, _| window.on_next_frame(move |_, _| init()))
-                        });
-                    }
-                    None => init(),
-                }
+            match first {
+                Some(id) => link.page(ToPage::Command(
+                    serde_json::json!({"op":"window","args":["menuAfterFrame",id]}),
+                )),
+                None => link.event("__appsInitMenu()".into(), "apps:menu"),
             }
-            if devtools && !runtime.borrow().quit {
-                let mut app = runtime.borrow_mut();
-                let id = app.views.keys().copied().min().unwrap_or(0);
-                let title = if id == 0 {
-                    "Main".to_owned()
-                } else {
-                    format!("Window {id}")
-                };
-                match devtools::DevTools::new(&title) {
-                    Ok(tools) => {
-                        app.devtools.insert(id, tools);
-                    }
-                    Err(error) => {
-                        app.error = Some(error);
-                        app.fail();
-                        cx.quit();
-                        return;
-                    }
-                }
-                drop(app);
-                Self::drive(runtime.clone(), cx);
-            }
-            cx.activate(true);
+            renderer::native::activate(true);
+            // WARNING: the main side lives as long as the app.
+            std::mem::forget(main);
         });
-        let mut app = result.borrow_mut();
-        if let Some(error) = app.error.take() {
-            return Err(error);
+        Ok(exit.exit_code())
+    }
+
+    /// Starts a page side on the thread that draws its windows. `owner` is its one window, when the
+    /// thread is that window's alone.
+    fn start(
+        template: Arc<Template>,
+        link: Link,
+        queue: Arc<PageQueue>,
+        mcp: Option<mcp::Handle>,
+        owner: Option<u64>,
+        cx: &mut App,
+    ) {
+        let api = match JavaScriptCore::load() {
+            Ok(api) => api,
+            Err(error) => {
+                eprintln!("apps: {error:#}");
+                link.fail();
+                return;
+            }
+        };
+        let waker = cx.waker();
+        queue.set_wake(move || waker.wake());
+        // WARNING: without a thread per window this one also runs the main side, which must wake too.
+        let (main, page) = (crate::host::Waker::current(), queue.clone());
+        crate::host::Waker::install(move || {
+            main.wake();
+            page.wake_now();
+        });
+        crate::jsc::NATIVE.set(Some(|op, args| {
+            renderer::native::sync(|| native::native_call(op, args))
+        }));
+        if let Some(mcp) = mcp {
+            mcp.install(owner.unwrap_or(0));
         }
-        Ok(app.host.borrow().exit_code)
+        let mut host = Host {
+            link: Some(link.clone()),
+            rust_main: template.rust_main,
+            app_version: template.version.clone(),
+            disabled: template.disabled,
+            app_name: template.name.clone(),
+            app_path: template.path.clone(),
+            packaged: template.packaged,
+            scripts: template.scripts.clone(),
+            assets: template.assets.clone(),
+            native_modules: template.native_modules.clone(),
+            ..Host::default()
+        };
+        host.browsers.application = template.name.clone().unwrap_or_default();
+        let runtime = Rc::new(RefCell::new(Self {
+            api,
+            host: Rc::new(RefCell::new(host)),
+            main: None,
+            link,
+            queue,
+            views: HashMap::new(),
+            devtools: HashMap::new(),
+            main_logs: Vec::new(),
+            files: template.files.clone(),
+            pages: BBTreeMap::new(),
+            packed: template.packed.clone(),
+            owner,
+            ended: false,
+            quit: false,
+            wake: None,
+            scheduled: false,
+        }));
+        let woken = Rc::downgrade(&runtime);
+        cx.on_wake(move |cx| {
+            if let Some(runtime) = woken.upgrade() {
+                Self::drive(runtime, cx);
+            }
+        });
+        PAGE_SIDE.with(|side| side.replace(Some(runtime.clone())));
+        Self::drive(runtime, cx);
     }
 }
 
-fn shrink_when_quiet(api: Rc<JavaScriptCore>, cx: &mut App) {
+fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
+    let api = runtime.borrow().api.clone();
     let busy = api.busy.get();
     cx.timer(Duration::from_secs(1), move |cx| {
-        if api.busy.get() == busy {
-            api.idle.set(false);
-            api.shrink();
-        } else {
-            shrink_when_quiet(api, cx);
+        if api.busy.get() != busy {
+            return shrink_when_quiet(runtime, cx);
         }
+        api.idle.set(false);
+        api.shrink();
+        if let Ok(app) = runtime.try_borrow() {
+            app.trim();
+        }
+        Desktop::drive(runtime, cx);
+        // The frame that the trim asks for frees the old arrays, then free pages go back to the system.
+        cx.timer(Duration::from_secs(1), |_| {
+            std::thread::spawn(release_free_memory);
+        })
+        .detach();
     })
     .detach();
+}
+
+/// Returns freed pages that the system allocator keeps to the system.
+fn release_free_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means all zones, and a goal of 0 means as much as possible.
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: it only returns free heap memory.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// Checks a window host call, so bad input throws in JS and never reaches `Desktop::pump`.
@@ -1650,20 +1706,9 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
 
 /// The window state that `BrowserWindow` caches, in screen points.
 fn window_state(window: &renderer::Window) -> serde_json::Value {
-    let state = window.window_state();
-    let rect = |bounds: Bounds<renderer::Pixels>| {
-        [
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bounds.size.height,
-        ]
-        .map(|value| f32::from(value).round())
-    };
-    serde_json::json!({"frame":rect(state.frame),"content":rect(state.content),"minimized":state.minimized,"maximized":state.maximized,"fullscreen":state.fullscreen,"visible":state.visible,"focused":window.is_window_active(),"resizing":state.resizing})
+    state_json(&window.window_state(), window.is_window_active())
 }
 
-/// Crops a captured frame to `rect` (in window points) and encodes it as PNG, in CSS pixels when `css` is set.
 fn png(
     ([width, height], pixels): ([u32; 2], Vec<u8>),
     scale: f32,
@@ -1719,7 +1764,27 @@ mod tests {
 
     impl Desktop {
         fn js(&self) -> &JsContext {
-            self.main.as_ref().unwrap()
+            self.main.as_ref().unwrap().engine.as_ref().unwrap()
+        }
+
+        fn command(&self, command: serde_json::Value) {
+            if link::native_command(&command) {
+                self.link.main(ToMain::Native(command));
+            } else {
+                self.link.page(ToPage::Command(command));
+            }
+        }
+
+        /// The arguments of the queued commands, which stay queued: native ones first.
+        fn commands(&self) -> Vec<serde_json::Value> {
+            let mut commands = self.link.native_commands();
+            for message in self.queue.take() {
+                if let ToPage::Command(command) = &message {
+                    commands.push(command["args"].clone());
+                }
+                self.link.page(message);
+            }
+            commands
         }
     }
 
@@ -1879,10 +1944,10 @@ mod tests {
     fn fatal_errors_quit_with_a_failure_code() {
         let mut desktop = app("", &[], std::path::PathBuf::new());
         desktop.fail();
-        assert!(desktop.quit && desktop.host.borrow().exit_code == 1);
-        desktop.host.borrow_mut().exit_code = 3;
+        assert!(desktop.quit && desktop.link.exit_code() == 1);
+        desktop.link.quit(3);
         desktop.fail();
-        assert_eq!(desktop.host.borrow().exit_code, 3);
+        assert_eq!(desktop.link.exit_code(), 3);
     }
 
     #[test]
@@ -1999,11 +2064,7 @@ mod tests {
             "Unsupported BrowserWindow option: webPreferences:0:true"
         );
         assert!(desktop.js().eval("win.show()", "test").is_err());
-        desktop
-            .host
-            .borrow_mut()
-            .commands
-            .push(serde_json::json!({"op":"window","args":["title",2,"stale"]}));
+        desktop.command(serde_json::json!({"op":"window","args":["title",2,"stale"]}));
         desktop.pump(None, None).unwrap();
     }
 
@@ -2184,7 +2245,7 @@ mod tests {
             ),
             r#"[{"x":0,"y":0,"width":900,"height":700},[900,672],true,false,true,true,{"x":0,"y":0,"width":900,"height":672}]"#
         );
-        desktop.host.borrow_mut().commands.clear();
+        desktop.queue.take();
         assert_eq!(
             eval(
                 &desktop,
@@ -2193,7 +2254,7 @@ mod tests {
             r#"[{"x":0,"y":72,"width":200,"height":100},{"x":0,"y":100,"width":200,"height":72}]"#
         );
         assert_eq!(
-            desktop.host.borrow().commands[1]["args"],
+            desktop.commands()[1],
             serde_json::json!(["bounds", 1, 0, 72, 200, 100])
         );
         for script in [
@@ -2213,11 +2274,7 @@ mod tests {
             );
         }
         eval(&desktop, "__apps.app.quit()");
-        desktop
-            .host
-            .borrow_mut()
-            .commands
-            .push(serde_json::json!({"op":"window","args":["closing",1]}));
+        eval(&desktop, "__appsEvent('close',1)");
         desktop.pump(None, None).unwrap();
         assert!(!desktop.quit && desktop.views.contains_key(&1));
         assert_eq!(
@@ -2311,28 +2368,22 @@ mod tests {
             r#"[{"x":10,"y":20,"width":400,"height":300},{"x":0,"y":0,"width":900,"height":700}]"#
         );
         eval(&desktop, &state([0, 0, 900, 700], ""));
-        desktop.host.borrow_mut().commands.clear();
+        desktop.queue.take();
         eval(
             &desktop,
             "parent.setOpacity(0.5); parent.setAspectRatio(-1, {width: 5}); parent.setVibrancy(''); parent.setSkipTaskbar(true); parent.removeMenu(); parent.close()",
         );
-        let commands: Vec<_> = desktop
-            .host
-            .borrow()
-            .commands
-            .iter()
-            .map(|command| command["args"].clone())
-            .collect();
+        let commands = desktop.commands();
         assert_eq!(
             serde_json::Value::from(commands),
             serde_json::json!([
                 ["opacity", 1, 0.5],
                 ["aspectRatio", 1, 0, 5, 0],
-                ["vibrancy", 1, null, 0],
-                ["background", 1, "#fff"],
                 ["parent", 2, null],
                 ["parent", 3, null],
-                ["close", 1]
+                ["close", 1],
+                ["vibrancy", 1, null, 0],
+                ["background", 1, "#fff"]
             ])
         );
         desktop.pump(None, None).unwrap();
@@ -2412,7 +2463,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(desktop.host.borrow().dom[&1].computed.is_some());
-            desktop.host.borrow_mut().commands.push(serde_json::json!({
+            desktop.command(serde_json::json!({
                 "op":"window", "args":["load",1,"<html><body style='color:purple'>New page</body></html>"]
             }));
             desktop.pump(None, None).unwrap();

@@ -103,7 +103,11 @@ impl State {
     pub fn take_attaches(&mut self) -> Vec<(u64, u64)> {
         std::mem::take(&mut self.attaches)
     }
-    pub fn attach(&self, id: u64, window: &renderer::Window) -> Result<()> {
+    /// Asks for the attach again, because the window is still on its way.
+    pub fn defer_attach(&mut self, id: u64, window: u64) {
+        self.attaches.push((id, window));
+    }
+    pub fn attach(&self, id: u64, window: &impl raw_window_handle::HasWindowHandle) -> Result<()> {
         self.views
             .get(&id)
             .context("Browser is destroyed")?

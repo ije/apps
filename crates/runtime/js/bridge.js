@@ -110,7 +110,6 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
       try{return{immediate:encode(capability.action(...decode(message.args,message.sender)),message.sender,false)};}catch(error){return{thrown:encode(error,message.sender,false)};}
     }
     if(message.kind!=='invoke'||role!=='main')throw new Error('Unknown bridge message');
-    if(!queue.length)return invoke(message);
     enqueue(()=>{const result=invoke(message);if(!result.pending)reply(message,result);});
     return{pending:true};
   };
@@ -144,5 +143,5 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   }
   const webUtils=Object.freeze({getPathForFile(file){if(!(file instanceof File))throw new TypeError('Expected a File');const index=files.get(file);return index===undefined?'':call('bridge.file',index);}});
   const poll=()=>{if(queue.length)drain();};poll.pending=()=>pending.size>0||queue.length>0;poll.queued=()=>queue.length>0;
-  return{contextBridge,ipcMain,ipcRenderer,webUtils,send:(id,channel,...args)=>send({preload:id},{kind:'event',channel,args:encode(args,{preload:id})}),poll};
+  return{contextBridge,ipcMain,ipcRenderer,webUtils,rpc,send:(id,channel,...args)=>send({preload:id},{kind:'event',channel,args:encode(args,{preload:id})}),poll};
 };

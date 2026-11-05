@@ -226,7 +226,8 @@ impl State {
                             host.borrow_mut().pages.insert(0, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
                             Role::Renderer(0)
                         };
-                        let engine = JsContext::new_interruptible(JavaScriptCore::load()?, host, role, Some(cancelled.clone()))?;
+                        let api = JavaScriptCore::load()?;
+                        let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire();", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());
@@ -238,7 +239,13 @@ impl State {
                             // WARNING: a native worker ends when only unreferenced timers are left, like in Node, so it checks before each wait.
                             if native && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
                             crate::host::idle(true);
-                            let message = if delay < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(delay as u64)) };
+                            // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the worker's VM
+                            // is collected once, when it has been quiet for a second, like the main thread's.
+                            let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
+                            let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
+                            if wait != delay && matches!(message, Err(mpsc::RecvTimeoutError::Timeout)) {
+                                api.shrink();
+                            }
                             crate::host::idle(false);
                             match message {
                                 Ok(message) => for message in std::iter::once(message).chain(inbox.try_iter().take(63)) {

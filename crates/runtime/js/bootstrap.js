@@ -43,6 +43,8 @@
     return native(op, ...args);
   };
   Object.defineProperty(globalThis, '__appsBridgeReceiveBytes', { value: value => pack(__appsBridgeReceive(unpack(value))) });
+  // WARNING: a message from the other side of the app arrives in its own task, so its listeners run now.
+  Object.defineProperty(globalThis, '__appsBridgeDeliver', { value: value => { __appsBridgeReceive(unpack(value)); __appsBridgeDrain(); } });
   const finalizers = new Set();
   let collected = new WeakRef({});
   globalThis.__appsFinalizers = class {
@@ -243,7 +245,7 @@
   }
   const info = call('info');
   if (info.rustMain && typeof role === 'object' && 'preload' in role) {
-    bridge.ipcRenderer.invoke = async (channel, ...args) => parse(call('rust.invoke', channel, stringify(args)));
+    bridge.ipcRenderer.invoke = (channel, ...args) => new Promise(resolve => resolve(bridge.rpc('main', { kind: 'rust', channel, args: stringify(args) })));
   }
   globalThis.global = globalThis;
   // WARNING: V8 call sites are parsed from JSC's stack text, so getThis(), getFunction() and getTypeName() know nothing.
@@ -823,12 +825,11 @@
     else if (name === 'close') win?.close();
     else if (name === 'html-full-screen') win?.emit(data ? 'enter-html-full-screen' : 'leave-html-full-screen');
     else if (name === 'title') {
-      if (!win) return true;
+      if (!win) return;
       const updated = event();
       win.webContents._event('title', data);
       win.emit('page-title-updated', updated, data, true);
-      if (!updated.defaultPrevented) states.get(win).title = data;
-      return !updated.defaultPrevented;
+      if (!updated.defaultPrevented) { states.get(win).title = data; call('window', 'title', id, data); }
     }
     else if (name === 'loaded' || name === 'failed') { win?.webContents._event(name, data); if (name === 'loaded') win?.emit('ready-to-show'); }
     else if (name === 'activate') app.emit('activate', event(), !!data);

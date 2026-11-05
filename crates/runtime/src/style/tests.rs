@@ -48,7 +48,7 @@ fn container_queries_parse_and_follow_container_sizes() {
         compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None).values
     };
     assert!(compute(&mut cache)[outer].get(Prop::COLOR) != Some("red"));
-    assert!(cache.set_containers(HashMap::from([(a, [500., 50.]), (b, [200., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 100.])])));
     let values = compute(&mut cache);
     assert_eq!(&values[outer]["color"], "red");
     assert_eq!(&values[outer]["order"], "5");
@@ -56,8 +56,8 @@ fn container_queries_parse_and_follow_container_sizes() {
     assert_eq!(&values[inner]["color"], "red");
     assert_eq!(&values[inner]["width"], "1px");
     assert!(!values[inner].contains(Prop::ORDER) && !values[inner].contains(Prop::HEIGHT));
-    assert!(!cache.set_containers(HashMap::from([(a, [450., 50.]), (b, [200., 100.])])));
-    assert!(cache.set_containers(HashMap::from([(a, [90., 50.]), (b, [200., 100.])])));
+    assert!(!cache.set_containers(&HashMap::from([(a, [450., 50.]), (b, [200., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [90., 50.]), (b, [200., 100.])])));
     let values = compute(&mut cache);
     assert!(values[outer].get(Prop::COLOR) != Some("red"));
     assert_eq!(&values[outer]["z-index"], "3");
@@ -81,7 +81,7 @@ fn custom_property_initial_uses_the_var_fallback() {
 #[test]
 fn selector_dependencies_follow_tree_and_attribute_changes() {
     let mut doc = Document::parse(
-        "<style>.on span{color:red}i+span{font-weight:700}span:nth-child(2){background-color:yellow}div:has(.mark) span{color:blue}span:empty::before{content:'empty'}</style><div><i>head</i><span id=a>alpha</span><span id=b></span></div>",
+        "<style>.on span{color:red}i+span{font-weight:700}span:nth-child(2){background-color:yellow}div:has(.mark) span{color:blue}span:empty::before{content:'empty'}div[style*='--on'] span{outline-style:solid}span{width:var(--w)}</style><div><i>head</i><span id=a>alpha</span><span id=b></span></div>",
     );
     let parent = element(&doc, "div");
     let a = element(&doc, "#a");
@@ -118,6 +118,21 @@ fn selector_dependencies_follow_tree_and_attribute_changes() {
                 doc.nodes[b].children.push(a);
                 doc.nodes[a].parent = Some(b);
             }
+            9 => {
+                doc.nodes[parent]
+                    .attrs
+                    .insert("style".into(), "--w:3px".into());
+            }
+            10 => {
+                doc.nodes[parent]
+                    .attrs
+                    .insert("style".into(), "--w:4px;--on:1".into());
+            }
+            11 => {
+                doc.nodes[parent]
+                    .attrs
+                    .insert("style".into(), "--w:4px".into());
+            }
             _ => {
                 doc.nodes[b].attrs.insert("title".into(), step.to_string());
             }
@@ -134,6 +149,72 @@ fn selector_dependencies_follow_tree_and_attribute_changes() {
         );
         assert_eq!(cached.values, fresh.values, "mutation {step}");
         assert_eq!(cached.pseudos, fresh.pseudos, "mutation {step}");
+    }
+}
+
+#[test]
+fn custom_property_changes_keep_the_styles_that_dont_read_them() {
+    let mut doc = Document::parse(
+        "<style>p{color:var(--ink)}p::before{content:'+';color:var(--ink)}b{color:var(--t)}</style><div id=a><p>x</p><span>y</span><i style='--t:var(--w)'>z</i><b style='--t:red'>q</b></div>",
+    );
+    let [a, p, span, i, b] = ["#a", "p", "span", "i", "b"].map(|selector| element(&doc, selector));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let mut last: Option<Rc<ComputedStyles>> = None;
+    for (step, inline) in [
+        "--w:1px;--ink:blue",
+        "--w:2px;--ink:blue",
+        "--w:2px;--ink:red",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        doc.nodes[a].inline = Some(Declarations::parse(inline));
+        let context = StyleContext {
+            previous: last.clone(),
+            ..Default::default()
+        };
+        let cached = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut cache,
+            Some(&context),
+        );
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values, "step {step}");
+        assert_eq!(cached.vars, fresh.vars, "step {step}");
+        assert_eq!(cached.pseudos, fresh.pseudos, "step {step}");
+        let var = |id: usize, name: &str| {
+            let prop = Prop::find(name).unwrap();
+            cached.vars[id]
+                .iter()
+                .find(|(key, _)| *key == prop)
+                .map(|(_, value)| value.to_string())
+        };
+        assert_eq!(var(i, "--t").as_deref(), Some(&inline[4..7]));
+        assert_eq!(var(b, "--t").as_deref(), Some("red"));
+        if let Some(last) = &last {
+            let kept = |id: usize| Rc::ptr_eq(&last.values[id], &cached.values[id]);
+            assert!(kept(span) && kept(b) && kept(i), "step {step}");
+            assert_eq!(kept(p), step == 1, "step {step}");
+            assert_eq!(
+                Rc::ptr_eq(&last.pseudos[&p], &cached.pseudos[&p]),
+                step == 1,
+                "step {step}"
+            );
+        }
+        last = Some(Rc::new(cached));
     }
 }
 
@@ -1828,15 +1909,21 @@ fn inherited_custom_properties_are_shared_until_a_node_sets_one() {
         &mut StyleCache::default(),
         None,
     );
-    let vars = |selector| computed.values[element(&doc, selector)].vars().clone();
+    let vars = |selector| computed.vars[element(&doc, selector)].clone();
     assert_eq!(vars("html").len(), 300);
     assert!(Rc::ptr_eq(&vars("html"), &vars("#a")));
     assert!(Rc::ptr_eq(&vars("#a"), &vars("#c")));
     assert!(!Rc::ptr_eq(&vars("#a"), &vars("#d")));
+    let v7 = Prop::find("--v7").unwrap();
     assert_eq!(
-        computed.values[element(&doc, "#d")].get(Prop::find("--v7").unwrap()),
+        vars("#d")
+            .iter()
+            .find(|(prop, _)| *prop == v7)
+            .map(|(_, value)| &**value),
         Some("1px")
     );
+    // Styles hold no custom properties, so nodes that read none of them share one style.
+    assert!(computed.values[element(&doc, "#d")].vars().is_empty());
 }
 
 #[test]
@@ -2033,7 +2120,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed
     };
     compute(&mut cache);
-    assert!(cache.set_containers(HashMap::from([(container, [500., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(container, [500., 100.])])));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2047,7 +2134,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed.values[element(&doc, "#v")].get(Prop::FONT_SIZE),
         Some("8px")
     );
-    assert!(cache.set_containers(HashMap::from([(container, [300., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(container, [300., 100.])])));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2358,12 +2445,12 @@ fn container_units_follow_each_container_and_the_viewport() {
         computed
     };
     compute(&mut cache, 800.);
-    assert!(cache.set_containers(HashMap::from([(a, [500., 50.]), (b, [200., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 50.])])));
     let computed = compute(&mut cache, 800.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "8px");
     assert_eq!(&computed.values[v]["font-size"], "40px");
-    assert!(cache.set_containers(HashMap::from([(a, [500., 50.]), (b, [300., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])])));
     let computed = compute(&mut cache, 400.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "12px");
@@ -2385,11 +2472,11 @@ fn container_queries_flip_after_a_resize_that_keeps_media_results() {
         computed
     };
     compute(&mut cache, 800.);
-    cache.set_containers(HashMap::from([(a, [300., 50.])]));
+    cache.set_containers(&HashMap::from([(a, [300., 50.])]));
     let red = Some("red");
     assert_ne!(compute(&mut cache, 800.).values[p].get(Prop::COLOR), red);
     assert_ne!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
-    assert!(cache.set_containers(HashMap::from([(a, [500., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.])])));
     assert_eq!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
 }
 

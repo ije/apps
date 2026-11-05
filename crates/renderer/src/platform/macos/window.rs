@@ -1,15 +1,17 @@
 use super::{
-    NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
+    NSRange, NSStringExt, Sendable, TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
+    ask,
     display_link::WindowFrameSource,
     events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     metal::{MetalAtlas, Renderer},
-    ns_string, post_local,
+    native_after, native_post, native_sync, ns_string, post, post_local,
 };
 use crate::{
     Bounds, CursorStyle, FileDropEvent, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
-    PlatformInput, Point, Scene, Size, WindowChange, WindowOptions, WindowState, app::Callbacks,
+    PlatformInput, Point, Scene, ScrollDelta, Size, WindowChange, WindowOptions, WindowState,
+    app::{Callbacks, dispatch},
     point, px, size,
 };
 use anyhow::Result;
@@ -40,15 +42,19 @@ use objc2_foundation::{
     NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
     NSSize, NSString, NSUInteger,
 };
+use objc2_core_foundation::CGSize;
+use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle as rwh;
 use std::{
     cell::RefCell,
     ffi::{CStr, c_void},
-    ops::Range,
     path::PathBuf,
     ptr::{self, NonNull},
     rc::{Rc, Weak},
-    sync::OnceLock,
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -312,14 +318,83 @@ struct TrafficLightButtons {
     zoom: Retained<NSButton>,
 }
 
+/// What the render thread reads of a native window, which only the main thread can touch.
+#[derive(Clone, Copy, Default)]
+struct Mirror {
+    scale: f32,
+    content: Size<Pixels>,
+    active: bool,
+    state: WindowState,
+}
+
+/// The display link frames of a window. The main thread knows where the window is, and the render
+/// thread whether it wants frames, so frames don't wait for a busy main thread.
+struct Frames {
+    source: WindowFrameSource,
+    wants: bool,
+    visible: bool,
+    display: Option<CGDirectDisplayID>,
+    closed: bool,
+}
+
+impl Frames {
+    fn sync(&mut self) {
+        match self
+            .display
+            .filter(|_| self.wants && self.visible && !self.closed)
+        {
+            Some(display) => {
+                if let Err(error) = self.source.start(display) {
+                    eprintln!("apps: display link: {error:#}");
+                }
+            }
+            None => self.source.stop(),
+        }
+    }
+}
+
+/// A display link tick, which draws a frame on the render thread unless one is on its way.
+struct Tick {
+    callbacks: Callbacks,
+    pending: AtomicBool,
+}
+
+extern "C" fn tick(context: *mut c_void) {
+    // SAFETY: the context is an `Arc` that the frame source owns until it frees it.
+    let tick = unsafe {
+        Arc::increment_strong_count(context as *const Tick);
+        Arc::from_raw(context as *const Tick)
+    };
+    if !tick.pending.swap(true, Ordering::AcqRel) {
+        post(tick.callbacks.thread, Box::new(move || {
+            tick.pending.store(false, Ordering::Release);
+            step(tick.callbacks);
+        }));
+    }
+}
+
+extern "C" fn free_tick(context: *mut c_void) {
+    // SAFETY: the frame source gives up its `Arc` once.
+    drop(unsafe { Arc::from_raw(context as *const Tick) });
+}
+
+/// Draws a frame on the render thread.
+fn step(callbacks: Callbacks) {
+    // An idle window stops its display link, so it gets no callbacks until it changes.
+    if callbacks.frame() == Some(false) {
+        callbacks.with(|window, _| window.platform.stop_frames());
+    }
+}
+
 struct State {
     callbacks: Callbacks,
     native_window: *mut AnyObject,
     native_view: NonNull<AnyObject>,
-    renderer: Renderer,
-    frame_source: Option<WindowFrameSource>,
-    /// The app wants display link frames.
-    wants_frames: bool,
+    layer: Retained<CAMetalLayer>,
+    mirror: Arc<Mutex<Mirror>>,
+    frames: Arc<Mutex<Frames>>,
+    /// The last mouse move or wheel event, while a busy page has not taken it.
+    motion: Option<Arc<Mutex<Option<PlatformInput>>>>,
     cursor: CursorStyle,
     last_key_equivalent: Option<KeyDownEvent>,
     last_modifiers: Option<ModifiersChangedEvent>,
@@ -329,6 +404,8 @@ struct State {
     synthetic_drag_counter: usize,
     /// The next left click also focuses the window.
     first_mouse: bool,
+    /// The newest left press or drag, for a window move that the page starts later.
+    last_press: Option<Retained<AnyObject>>,
     /// The whole view is app-owned title bar content, so AppKit neither drags the window from it
     /// nor delays title bar clicks. The app moves the window with `start_window_move`.
     app_owns_titlebar_drag: bool,
@@ -382,42 +459,59 @@ impl State {
             .contains(NSWindowOcclusionState::Visible)
     }
 
-    fn request_frames(&mut self) {
-        if !self.wants_frames
-            || !self
-                .frame_source
-                .as_ref()
-                .is_some_and(WindowFrameSource::is_running)
-        {
-            self.wants_frames = true;
-            self.start_display_link();
+    fn window_state(&self) -> WindowState {
+        let window = self.native_window();
+        let top = primary_screen_top(MainThreadMarker::new().unwrap());
+        let flip = |rect: NSRect| {
+            Bounds::new(
+                point(
+                    px(rect.origin.x as f32),
+                    px((top - rect.origin.y - rect.size.height) as f32),
+                ),
+                size(px(rect.size.width as f32), px(rect.size.height as f32)),
+            )
+        };
+        let frame = window.frame();
+        let minimized = window.isMiniaturized();
+        let fullscreen = self.is_fullscreen();
+        let zoomed = if window.styleMask().contains(NSWindowStyleMask::Resizable) {
+            window.isZoomed()
+        } else {
+            let visible = window
+                .screen()
+                .map_or_else(Default::default, |screen| screen.visibleFrame());
+            frame.size.width == visible.size.width && frame.size.height == visible.size.height
+        };
+        WindowState {
+            frame: flip(frame),
+            content: flip(window.contentRectForFrameRect(frame)),
+            minimized,
+            maximized: zoomed && !minimized && !fullscreen,
+            fullscreen,
+            visible: window.isVisible(),
+            resizing: window.inLiveResize(),
         }
     }
 
-    fn start_display_link(&mut self) {
-        if !self.wants_frames || !self.is_visible() {
-            return;
-        }
+    /// Publishes the window's state to the render thread.
+    fn update_mirror(&self) {
+        *self.mirror.lock().unwrap_or_else(PoisonError::into_inner) = Mirror {
+            scale: self.scale_factor(),
+            content: self.content_size(),
+            active: self.native_window().isKeyWindow(),
+            state: self.window_state(),
+        };
+    }
+
+    /// Tells the frames where the window is now.
+    fn locate_frames(&self) {
         // SAFETY: plain property reads on a live window.
         let screen: *mut AnyObject = unsafe { msg_send![self.native_window, screen] };
+        let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        frames.visible = self.is_visible();
         // AppKit can report no screen while displays are reconfigured.
-        let Some(display) = display_id_for_screen(screen) else {
-            return;
-        };
-        let view = self.native_view.as_ptr() as *mut c_void;
-        let source = self
-            .frame_source
-            .get_or_insert_with(|| WindowFrameSource::new(view, step));
-        if let Err(error) = source.start(display) {
-            eprintln!("apps: display link: {error:#}");
-        }
-    }
-
-    fn stop_display_link(&mut self) {
-        if let Some(source) = &mut self.frame_source {
-            source.stop();
-        }
-        self.renderer.trim();
+        frames.display = display_id_for_screen(screen);
+        frames.sync();
     }
 
     fn traffic_light_buttons(&self) -> Option<TrafficLightButtons> {
@@ -508,164 +602,277 @@ impl State {
 
 type Shared = Rc<RefCell<State>>;
 
-/// A native window and its Metal layer.
+/// What the render thread keeps of a native window that the main thread opened.
+struct Opened {
+    window: *mut AnyObject,
+    view: NonNull<AnyObject>,
+    mirror: Arc<Mutex<Mirror>>,
+    frames: Arc<Mutex<Frames>>,
+}
+
+fn open_native(
+    options: &WindowOptions,
+    callbacks: Callbacks,
+    layer: Retained<CAMetalLayer>,
+) -> Result<Sendable<Opened>> {
+    let marker = MainThreadMarker::new().unwrap();
+    let (window_class, view_class) = classes();
+    autoreleasepool(|_| unsafe {
+        let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::NO];
+        let mut style_mask = NSWindowStyleMask::Closable | NSWindowStyleMask::Titled;
+        if options.resizable {
+            style_mask |= NSWindowStyleMask::Resizable;
+        }
+        if options.minimizable {
+            style_mask |= NSWindowStyleMask::Miniaturizable;
+        }
+        if options.titlebar_hidden || options.frameless {
+            style_mask |= NSWindowStyleMask::FullSizeContentView;
+        }
+        let screens = NSScreen::screens(marker);
+        let screen = screens
+            .iter()
+            .next()
+            .or_else(|| NSScreen::mainScreen(marker));
+        let screen_frame = screen
+            .as_ref()
+            .map_or_else(Default::default, |screen| screen.frame());
+        let bounds = options.bounds;
+        let mut content = NSSize::new(bounds.size.width.0 as f64, bounds.size.height.0 as f64);
+        if options.outer_size {
+            content = NSWindow::contentRectForFrameRect_styleMask(
+                NSRect::new(NSPoint::new(0., 0.), content),
+                style_mask,
+                marker,
+            )
+            .size;
+        }
+        let rect = NSRect::new(
+            NSPoint::new(
+                screen_frame.origin.x + bounds.origin.x.0 as f64,
+                screen_frame.origin.y + screen_frame.size.height - bounds.origin.y.0 as f64,
+            ),
+            content,
+        );
+        let native_window: *mut AnyObject = msg_send![window_class, alloc];
+        let native_window: *mut AnyObject = msg_send![
+            native_window,
+            initWithContentRect: rect,
+            styleMask: style_mask,
+            backing: NSBackingStoreType::Buffered,
+            defer: Bool::NO,
+            screen: screen.as_deref()
+        ];
+        anyhow::ensure!(!native_window.is_null(), "AppKit did not create the window");
+        #[expect(
+            deprecated,
+            reason = "file drops are decoded from a property list of paths"
+        )]
+        let () = msg_send![native_window, registerForDraggedTypes: &*NSArray::from_slice(&[NSFilenamesPboardType])];
+        let () = msg_send![native_window, setReleasedWhenClosed: Bool::NO];
+        let content_view: *mut AnyObject = msg_send![native_window, contentView];
+        let content_bounds: NSRect = msg_send![content_view, bounds];
+        let native_view: *mut AnyObject = msg_send![view_class, alloc];
+        let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
+        anyhow::ensure!(!native_view.is_null(), "AppKit did not create the view");
+        if options.transparent {
+            let () = msg_send![native_window, setOpaque: Bool::NO];
+            // Not `clearColor`, which breaks the window shadow.
+            let color = NSColor::colorWithSRGBRed_green_blue_alpha(0., 0., 0., 0.0001);
+            let () = msg_send![native_window, setBackgroundColor: &*color];
+        }
+        let frames = Arc::new(Mutex::new(Frames {
+            source: {
+                let tick = Arc::new(Tick {
+                    callbacks,
+                    pending: AtomicBool::new(false),
+                });
+                WindowFrameSource::new(Arc::into_raw(tick) as *mut c_void, self::tick, free_tick)
+            },
+            wants: false,
+            visible: false,
+            display: None,
+            closed: false,
+        }));
+        let state = Rc::new(RefCell::new(State {
+            callbacks,
+            native_window,
+            native_view: NonNull::new_unchecked(native_view),
+            layer,
+            mirror: Arc::default(),
+            frames: frames.clone(),
+            motion: None,
+            cursor: CursorStyle::Arrow,
+            last_key_equivalent: None,
+            last_modifiers: None,
+            keystroke_for_do_command: None,
+            do_command_handled: None,
+            external_files_dragged: false,
+            synthetic_drag_counter: 0,
+            first_mouse: false,
+            last_press: None,
+            app_owns_titlebar_drag: options.titlebar_hidden || options.frameless,
+            traffic_light_position: options
+                .traffic_light_position
+                .filter(|_| options.titlebar_hidden),
+            traffic_light_frames: None,
+            pre_fullscreen_traffic_light_frames: None,
+            transparent_titlebar: options.titlebar_hidden || options.frameless,
+            is_exiting_fullscreen: false,
+            closed: false,
+            focusable: true,
+            aspect: None,
+            parent: None,
+            sheet: false,
+        }));
+        for object in [native_window, native_view] {
+            (*object)
+                .class()
+                .instance_variable(STATE_IVAR)
+                .unwrap()
+                .load_ptr::<*mut c_void>(&*object)
+                .write(Rc::into_raw(state.clone()).cast_mut().cast());
+        }
+        let () = msg_send![native_window, setDelegate: native_window];
+        set_title(native_window, &state, &options.title);
+        let () = msg_send![native_window, setMovable: Bool::new(options.movable)];
+        if options.titlebar_hidden || options.frameless {
+            let () = msg_send![native_window, setTitlebarAppearsTransparent: Bool::YES];
+            let () =
+                msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
+        }
+        let () = msg_send![native_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
+        // Views become layer backed on their own after joining a window, which breaks the
+        // Metal layer, so this one is layer backed from the start.
+        let () = msg_send![native_view, setWantsLayer: Bool::YES];
+        let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
+        let native_view: *mut AnyObject = msg_send![native_view, autorelease];
+        let () = msg_send![content_view, addSubview: native_view];
+        let _: Bool = msg_send![native_window, makeFirstResponder: native_view];
+        let () = msg_send![native_window, setLevel: NSNormalWindowLevel];
+        let () = msg_send![native_window, setAcceptsMouseMovedEvents: Bool::NO];
+        add_mouse_tracking_area(&*native_view.cast::<NSView>());
+        if options.show {
+            let () =
+                msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
+        }
+        // The origin from `initWithContentRect` can be off when the key screen is not the primary one.
+        let () = msg_send![native_window, setFrameTopLeftPoint: rect.origin];
+        if options.frameless {
+            set_button_visibility(&state, false);
+        }
+        let lock = state.borrow();
+        lock.update_mirror();
+        lock.locate_frames();
+        let mirror = lock.mirror.clone();
+        drop(lock);
+        state.borrow_mut().move_traffic_light();
+        // WARNING: the two strong references live in the ivars of the window and the view.
+        drop(state);
+        Ok(Sendable::new(Opened {
+            window: native_window,
+            view: NonNull::new_unchecked(native_view),
+            mirror,
+            frames,
+        }))
+    })
+}
+
+fn set_title(window: *mut AnyObject, state: &Shared, title: &str) {
+    // SAFETY: plain AppKit calls on a live window.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let title = ns_string(title);
+        let () = msg_send![app, changeWindowsItem: window, title: title, filename: false];
+        let () = msg_send![window, setTitle: title];
+    }
+    if let Ok(mut state) = state.try_borrow_mut() {
+        state.move_traffic_light();
+    }
+}
+
+fn set_button_visibility(state: &Shared, visible: bool) {
+    if let Some(buttons) = state.borrow().traffic_light_buttons() {
+        for button in [buttons.close, buttons.minimize, buttons.zoom] {
+            button.setHidden(!visible);
+        }
+    }
+}
+
+/// The strong reference to a native window. AppKit must release it on the main thread.
+struct NativeRef(*mut AnyObject);
+// SAFETY: only the main thread sends the window messages.
+unsafe impl Send for NativeRef {}
+unsafe impl Sync for NativeRef {}
+
+impl Drop for NativeRef {
+    fn drop(&mut self) {
+        let window = Sendable::new(self.0);
+        // SAFETY: this balances the `alloc` of `open_native`.
+        native_post(Box::new(move || unsafe {
+            let () = msg_send![window.take(), release];
+        }));
+    }
+}
+
+/// What any thread can ask of a native window, without the thread that draws it.
+#[derive(Clone)]
+pub struct WindowControl {
+    native: Arc<NativeRef>,
+    view: NonNull<AnyObject>,
+    mirror: Arc<Mutex<Mirror>>,
+}
+// SAFETY: the view pointer is only handed out, and the rest is locked or thread safe.
+unsafe impl Send for WindowControl {}
+unsafe impl Sync for WindowControl {}
+
+/// The render thread's side of a native window: its Metal renderer, and what it reads and asks of
+/// the window on the main thread.
 pub(crate) struct Window {
-    state: Shared,
+    control: WindowControl,
+    callbacks: Callbacks,
+    renderer: RefCell<Renderer>,
     atlas: Rc<MetalAtlas>,
-    marker: MainThreadMarker,
+    frames: Arc<Mutex<Frames>>,
+    transparent: bool,
+}
+
+impl std::ops::Deref for Window {
+    type Target = WindowControl;
+    fn deref(&self) -> &WindowControl {
+        &self.control
+    }
 }
 
 impl Window {
-    pub fn open(
-        options: &WindowOptions,
-        callbacks: Callbacks,
-        marker: MainThreadMarker,
-    ) -> Result<Self> {
-        let (window_class, view_class) = classes();
-        autoreleasepool(|_| unsafe {
-            let mut renderer = Renderer::new(options.transparent)?;
-            let atlas = renderer.atlas().clone();
-            let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::NO];
-            let mut style_mask = NSWindowStyleMask::Closable | NSWindowStyleMask::Titled;
-            if options.resizable {
-                style_mask |= NSWindowStyleMask::Resizable;
-            }
-            if options.minimizable {
-                style_mask |= NSWindowStyleMask::Miniaturizable;
-            }
-            if options.titlebar_hidden || options.frameless {
-                style_mask |= NSWindowStyleMask::FullSizeContentView;
-            }
-            let screens = NSScreen::screens(marker);
-            let screen = screens
-                .iter()
-                .next()
-                .or_else(|| NSScreen::mainScreen(marker));
-            let screen_frame = screen
-                .as_ref()
-                .map_or_else(Default::default, |screen| screen.frame());
-            let bounds = options.bounds;
-            let mut content = NSSize::new(bounds.size.width.0 as f64, bounds.size.height.0 as f64);
-            if options.outer_size {
-                content = NSWindow::contentRectForFrameRect_styleMask(
-                    NSRect::new(NSPoint::new(0., 0.), content),
-                    style_mask,
-                    marker,
-                )
-                .size;
-            }
-            let rect = NSRect::new(
-                NSPoint::new(
-                    screen_frame.origin.x + bounds.origin.x.0 as f64,
-                    screen_frame.origin.y + screen_frame.size.height - bounds.origin.y.0 as f64,
-                ),
-                content,
-            );
-            let native_window: *mut AnyObject = msg_send![window_class, alloc];
-            let native_window: *mut AnyObject = msg_send![
-                native_window,
-                initWithContentRect: rect,
-                styleMask: style_mask,
-                backing: NSBackingStoreType::Buffered,
-                defer: Bool::NO,
-                screen: screen.as_deref()
-            ];
-            anyhow::ensure!(!native_window.is_null(), "AppKit did not create the window");
-            #[expect(
-                deprecated,
-                reason = "file drops are decoded from a property list of paths"
-            )]
-            let () = msg_send![native_window, registerForDraggedTypes: &*NSArray::from_slice(&[NSFilenamesPboardType])];
-            let () = msg_send![native_window, setReleasedWhenClosed: Bool::NO];
-            let content_view: *mut AnyObject = msg_send![native_window, contentView];
-            let content_bounds: NSRect = msg_send![content_view, bounds];
-            let native_view: *mut AnyObject = msg_send![view_class, alloc];
-            let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
-            anyhow::ensure!(!native_view.is_null(), "AppKit did not create the view");
-            if options.transparent {
-                renderer.update_transparency(true);
-                let () = msg_send![native_window, setOpaque: Bool::NO];
-                // Not `clearColor`, which breaks the window shadow.
-                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0., 0., 0., 0.0001);
-                let () = msg_send![native_window, setBackgroundColor: &*color];
-            }
-            let state = Rc::new(RefCell::new(State {
-                callbacks,
-                native_window,
-                native_view: NonNull::new_unchecked(native_view),
-                renderer,
-                frame_source: None,
-                wants_frames: false,
-                cursor: CursorStyle::Arrow,
-                last_key_equivalent: None,
-                last_modifiers: None,
-                keystroke_for_do_command: None,
-                do_command_handled: None,
-                external_files_dragged: false,
-                synthetic_drag_counter: 0,
-                first_mouse: false,
-                app_owns_titlebar_drag: options.titlebar_hidden || options.frameless,
-                traffic_light_position: options
-                    .traffic_light_position
-                    .filter(|_| options.titlebar_hidden),
-                traffic_light_frames: None,
-                pre_fullscreen_traffic_light_frames: None,
-                transparent_titlebar: options.titlebar_hidden || options.frameless,
-                is_exiting_fullscreen: false,
-                closed: false,
-                focusable: true,
-                aspect: None,
-                parent: None,
-                sheet: false,
-            }));
-            for object in [native_window, native_view] {
-                (*object)
-                    .class()
-                    .instance_variable(STATE_IVAR)
-                    .unwrap()
-                    .load_ptr::<*mut c_void>(&*object)
-                    .write(Rc::into_raw(state.clone()).cast_mut().cast());
-            }
-            let () = msg_send![native_window, setDelegate: native_window];
-            let window = Self {
-                state,
-                atlas,
-                marker,
-            };
-            window.set_title(&options.title);
-            let () = msg_send![native_window, setMovable: Bool::new(options.movable)];
-            if options.titlebar_hidden || options.frameless {
-                let () = msg_send![native_window, setTitlebarAppearsTransparent: Bool::YES];
-                let () =
-                    msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
-            }
-            let () = msg_send![native_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
-            // Views become layer backed on their own after joining a window, which breaks the
-            // Metal layer, so this one is layer backed from the start.
-            let () = msg_send![native_view, setWantsLayer: Bool::YES];
-            let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
-            let native_view: *mut AnyObject = msg_send![native_view, autorelease];
-            let () = msg_send![content_view, addSubview: native_view];
-            let _: Bool = msg_send![native_window, makeFirstResponder: native_view];
-            let () = msg_send![native_window, setLevel: NSNormalWindowLevel];
-            let () = msg_send![native_window, setAcceptsMouseMovedEvents: Bool::NO];
-            add_mouse_tracking_area(&*native_view.cast::<NSView>());
-            if options.show {
-                let () =
-                    msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
-            }
-            // The origin from `initWithContentRect` can be off when the key screen is not the primary one.
-            let () = msg_send![native_window, setFrameTopLeftPoint: rect.origin];
-            if options.frameless {
-                window.set_button_visibility(false);
-            }
-            window.state.borrow_mut().move_traffic_light();
-            Ok(window)
+    pub fn open(options: &WindowOptions, callbacks: Callbacks) -> Result<Self> {
+        let mut renderer = Renderer::new(options.transparent)?;
+        if options.transparent {
+            renderer.update_transparency(true);
+        }
+        let atlas = renderer.atlas().clone();
+        let layer = Sendable::new(renderer.layer().clone());
+        let opened = native_sync(move || {
+            autoreleasepool(|_| open_native(options, callbacks, layer.take())).map(Sendable::new)
+        })?
+        .take()
+        .take();
+        Ok(Self {
+            control: WindowControl {
+                native: Arc::new(NativeRef(opened.window)),
+                view: opened.view,
+                mirror: opened.mirror,
+            },
+            callbacks,
+            renderer: RefCell::new(renderer),
+            atlas,
+            frames: opened.frames,
+            transparent: options.transparent,
         })
     }
 
-    fn native_window(&self) -> *mut AnyObject {
-        self.state.borrow().native_window
+    pub(crate) fn control(&self) -> &WindowControl {
+        &self.control
     }
 
     pub fn atlas(&self) -> &Rc<MetalAtlas> {
@@ -673,45 +880,45 @@ impl Window {
     }
 
     pub fn scale_factor(&self) -> f32 {
-        self.state.borrow().scale_factor()
+        self.control.mirror().scale
     }
 
     pub fn content_size(&self) -> Size<Pixels> {
-        self.state.borrow().content_size()
+        self.control.mirror().content
     }
 
     /// Starts display link frames until a frame wants no more.
     pub fn request_frame(&self) {
-        match self.state.try_borrow_mut() {
-            Ok(mut state) => state.request_frames(),
-            // WARNING: an AppKit callback up the stack holds the state, and a dropped request would
-            // leave the window dirty without frames, so it runs after that callback.
-            Err(_) => self.later(|_, state| {
-                if let Ok(mut state) = state.try_borrow_mut() {
-                    state.request_frames();
-                }
-            }),
+        let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+        frames.wants = true;
+        frames.sync();
+    }
+
+    pub(crate) fn stop_frames(&self) {
+        {
+            let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            frames.wants = false;
+            frames.sync();
         }
+        self.trim();
+    }
+
+    pub(crate) fn trim(&self) {
+        self.renderer.borrow_mut().trim();
+    }
+
+    pub(crate) fn set_presents_with_transaction(&self, on: bool) {
+        self.renderer.borrow_mut().set_presents_with_transaction(on);
     }
 
     /// Draws once even when the window is hidden or covered, for captures.
     pub fn force_frame(&self) {
-        let view = self.state.borrow().native_view.as_ptr();
-        // SAFETY: the view is retained until the posted frame ran.
-        unsafe {
-            let _: *mut AnyObject = msg_send![view, retain];
-        }
-        post_local(move || {
-            step(view as *mut c_void);
-            // SAFETY: balances the retain above.
-            unsafe {
-                let _: () = msg_send![view, release];
-            }
-        });
+        let callbacks = self.callbacks;
+        post(callbacks.thread, Box::new(move || step(callbacks)));
     }
 
     pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
-        self.state.borrow_mut().renderer.draw(scene, capture)
+        self.renderer.borrow_mut().draw(scene, capture)
     }
 
     /// See [`super::metal::Renderer::promote`].
@@ -724,107 +931,84 @@ impl Window {
         opacities: &[f32],
         transforms: &[[f64; 16]],
     ) -> bool {
-        self.state
+        self.renderer
             .borrow_mut()
-            .renderer
             .promote(key, index, region, step, opacities, transforms)
     }
 
     pub fn demote(&self) {
-        self.state.borrow_mut().renderer.demote();
+        self.renderer.borrow_mut().demote();
     }
 
     pub fn is_active(&self) -> bool {
-        self.state.borrow().native_window().isKeyWindow()
-    }
-
-    pub fn set_title(&self, title: &str) {
-        let window = self.native_window();
-        // SAFETY: plain AppKit calls on a live window.
-        unsafe {
-            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let title = ns_string(title);
-            let () = msg_send![app, changeWindowsItem: window, title: title, filename: false];
-            let () = msg_send![window, setTitle: title];
-        }
-        if let Ok(mut state) = self.state.try_borrow_mut() {
-            state.move_traffic_light();
-        }
-    }
-
-    pub fn set_button_visibility(&self, visible: bool) {
-        if let Some(buttons) = self.state.borrow().traffic_light_buttons() {
-            for button in [buttons.close, buttons.minimize, buttons.zoom] {
-                button.setHidden(!visible);
-            }
-        }
+        self.control.mirror().active
     }
 
     pub fn state(&self) -> WindowState {
-        let state = self.state.borrow();
-        let window = state.native_window();
-        let top = primary_screen_top(self.marker);
-        let flip = |rect: NSRect| {
-            Bounds::new(
-                point(
-                    px(rect.origin.x as f32),
-                    px((top - rect.origin.y - rect.size.height) as f32),
-                ),
-                size(px(rect.size.width as f32), px(rect.size.height as f32)),
-            )
-        };
-        let frame = window.frame();
-        let minimized = window.isMiniaturized();
-        let fullscreen = state.is_fullscreen();
-        let zoomed = if window.styleMask().contains(NSWindowStyleMask::Resizable) {
-            window.isZoomed()
-        } else {
-            let visible = window
-                .screen()
-                .map_or_else(Default::default, |screen| screen.visibleFrame());
-            frame.size.width == visible.size.width && frame.size.height == visible.size.height
-        };
-        WindowState {
-            frame: flip(frame),
-            content: flip(window.contentRectForFrameRect(frame)),
-            minimized,
-            maximized: zoomed && !minimized && !fullscreen,
-            fullscreen,
-            visible: window.isVisible(),
-            resizing: window.inLiveResize(),
-        }
+        self.control.mirror().state
     }
 
-    /// Runs `f` with the window after the current event, unless it closed by then.
-    fn later(&self, f: impl FnOnce(&NSWindow, &Shared) + 'static) {
-        let state = Rc::downgrade(&self.state);
-        post_local(move || {
-            let Some(state) = state.upgrade() else {
-                return;
-            };
-            let window = {
-                let state = state.borrow();
-                if state.closed {
-                    return;
-                }
-                state.native_window
-            };
-            // SAFETY: the window lives while the state does.
-            f(unsafe { &*window.cast::<NSWindow>() }, &state);
+    /// See [`WindowControl::change`]. The layer also turns transparent now, so the next frame
+    /// clears to transparent.
+    pub fn change(&self, change: WindowChange) {
+        if let WindowChange::Vibrancy(material, _) = change {
+            self.renderer
+                .borrow_mut()
+                .update_transparency(material.is_some() || self.transparent);
+        }
+        self.control.change(change);
+    }
+}
+
+impl WindowControl {
+    fn mirror(&self) -> Mirror {
+        *self.mirror.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.mirror().active
+    }
+
+    pub fn set_title(&self, title: &str) {
+        let title = title.to_owned();
+        self.later(move |window, state| {
+            set_title(ptr::from_ref(window).cast_mut().cast(), state, &title)
         });
     }
 
+    pub fn set_button_visibility(&self, visible: bool) {
+        self.later(move |_, state| set_button_visibility(state, visible));
+    }
+
+    pub fn state(&self) -> Option<WindowState> {
+        Some(self.mirror().state)
+    }
+
+    /// Runs `f` with the window on the main thread, unless it closed by then.
+    fn later(&self, f: impl FnOnce(&NSWindow, &Shared) + Send + 'static) {
+        let native = self.native.clone();
+        native_post(Box::new(move || {
+            let window = native.0;
+            // SAFETY: `native` keeps the window, and so its state, alive.
+            let Some(state) = (unsafe { get_state(&*window) }) else {
+                return;
+            };
+            if state.try_borrow().is_ok_and(|state| state.closed) {
+                return;
+            }
+            // SAFETY: the object is an NSWindow.
+            f(unsafe { &*window.cast::<NSWindow>() }, &state);
+        }));
+    }
+
     pub fn change(&self, change: WindowChange) {
-        // The layer turns transparent now, so the next frame clears to transparent.
-        if let WindowChange::Vibrancy(material, _) = change
-            && let Ok(mut state) = self.state.try_borrow_mut()
-        {
-            let transparent = material.is_some() || !state.native_window().isOpaque();
-            state.renderer.update_transparency(transparent);
-        }
-        let marker = self.marker;
-        let view = self.state.borrow().native_view;
+        let change = Sendable::new(change);
         self.later(move |window, state| {
+            let change = change.take();
+            let marker = MainThreadMarker::new().unwrap();
+            let Ok(view) = state.try_borrow().map(|state| state.native_view) else {
+                return;
+            };
             let zoom = || window.standardWindowButton(NSWindowButton::ZoomButton);
             let style = |flag: NSWindowStyleMask, on: bool| {
                 // WARNING: a style mask change resets the zoom button.
@@ -1033,13 +1217,20 @@ impl Window {
     }
 
     pub fn start_window_move(&self) {
-        let window = self.native_window();
-        // SAFETY: the current event drives the drag loop.
-        unsafe {
-            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let event: *mut AnyObject = msg_send![app, currentEvent];
-            let () = msg_send![window, performWindowDragWithEvent: event];
-        }
+        self.later(|window, state| {
+            let Some(event) = state.try_borrow().ok().and_then(|state| state.last_press.clone())
+            else {
+                return;
+            };
+            // SAFETY: the event was this window's, and it starts the drag loop. WARNING: the page
+            // asks late, so the button can be up by now, and a drag without a button never ends.
+            unsafe {
+                let pressed: NSUInteger = msg_send![class!(NSEvent), pressedMouseButtons];
+                if pressed & 1 != 0 {
+                    let () = msg_send![window, performWindowDragWithEvent: &*event];
+                }
+            }
+        });
     }
 
     /// Does what the user set for a double click on a title bar.
@@ -1072,30 +1263,37 @@ impl Window {
 
     pub fn raw_window_handle(&self) -> Result<rwh::RawWindowHandle> {
         Ok(rwh::RawWindowHandle::AppKit(rwh::AppKitWindowHandle::new(
-            self.state.borrow().native_view.cast(),
+            self.view.cast(),
         )))
     }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        let window = {
-            let mut state = self.state.borrow_mut();
-            state.frame_source.take();
-            state.closed = true;
-            state.native_window
-        };
-        // SAFETY: the window stays retained until the posted close.
-        unsafe {
-            let () = msg_send![window, setDelegate: ptr::null_mut::<AnyObject>()];
-            // WARNING: a sheet that is not ended blocks its parent, a sheet shown next and quitting,
-            // which can already be posted, so it ends now.
-            detach(&*window.cast::<NSWindow>());
+        {
+            let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            frames.closed = true;
+            frames.sync();
         }
-        post_local(move || unsafe {
-            let () = msg_send![window, close];
-            let _: *mut AnyObject = msg_send![window, autorelease];
-        });
+        let control = self.control.clone();
+        native_post(Box::new(move || {
+            let native = control.native.0;
+            // SAFETY: the window stays retained until the posted close.
+            unsafe {
+                if let Some(state) = get_state(&*native)
+                    && let Ok(mut state) = state.try_borrow_mut()
+                {
+                    state.closed = true;
+                }
+                let () = msg_send![native, setDelegate: ptr::null_mut::<AnyObject>()];
+                // WARNING: a sheet that is not ended blocks its parent, a sheet shown next and quitting,
+                // which can already be posted, so it ends now.
+                detach(&*native.cast::<NSWindow>());
+            }
+            post_local(move || unsafe {
+                let () = msg_send![control.native.0, close];
+            });
+        }));
     }
 }
 
@@ -1134,11 +1332,75 @@ fn detach(window: &NSWindow) {
 
 /// Tells the view about a window change after the current event.
 fn report_change(state: &Shared) {
-    // WARNING: the callback can run app code that closes the window, so it runs without a borrow.
-    let callbacks = state.try_borrow().map(|state| state.callbacks);
+    let callbacks = state.try_borrow().map(|state| {
+        state.update_mirror();
+        state.callbacks
+    });
     if let Ok(callbacks) = callbacks {
         callbacks.changed();
     }
+}
+
+/// Merges `new` into the waiting `old`, when it only moves further.
+fn merge_motion(old: &mut PlatformInput, new: &PlatformInput) -> bool {
+    match (old, new) {
+        (PlatformInput::MouseMove(old), PlatformInput::MouseMove(new))
+            if old.modifiers == new.modifiers && old.pressed_button == new.pressed_button =>
+        {
+            *old = new.clone();
+            true
+        }
+        (PlatformInput::ScrollWheel(old), PlatformInput::ScrollWheel(new))
+            if old.modifiers == new.modifiers =>
+        {
+            let delta = match (old.delta, new.delta) {
+                (ScrollDelta::Pixels(a), ScrollDelta::Pixels(b)) => ScrollDelta::Pixels(a + b),
+                (ScrollDelta::Lines(a), ScrollDelta::Lines(b)) => ScrollDelta::Lines(a + b),
+                _ => return false,
+            };
+            *old = new.clone();
+            old.delta = delta;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Sends a mouse or wheel event to the render thread. A busy page gets the newest mouse move and
+/// the sum of the wheel events, as AppKit does for a busy main thread.
+fn send_pointer(state: &Shared, callbacks: Callbacks, input: PlatformInput) {
+    let motion = matches!(
+        input,
+        PlatformInput::MouseMove(_) | PlatformInput::ScrollWheel(_)
+    );
+    let Ok(mut lock) = state.try_borrow_mut() else {
+        callbacks.input_later(input);
+        return;
+    };
+    if !motion {
+        lock.motion = None;
+        drop(lock);
+        callbacks.input_later(input);
+        return;
+    }
+    if let Some(slot) = &lock.motion
+        && slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|waiting| merge_motion(waiting, &input))
+    {
+        return;
+    }
+    let slot = Arc::new(Mutex::new(Some(input)));
+    lock.motion = Some(slot.clone());
+    drop(lock);
+    callbacks.queue(move |window, app| {
+        let input = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(input) = input {
+            dispatch(window, app, input);
+        }
+    });
 }
 
 pub(crate) fn set_cursor(style: CursorStyle) {
@@ -1506,6 +1768,19 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
         }
         _ => {}
     }
+    if matches!(
+        input,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            ..
+        }) | PlatformInput::MouseMove(MouseMoveEvent {
+            pressed_button: Some(MouseButton::Left),
+            ..
+        })
+    ) {
+        // SAFETY: AppKit passes a live NSEvent.
+        lock.last_press = unsafe { Retained::retain(event) };
+    }
     match &input {
         PlatformInput::MouseDown(_) => {
             drop(lock);
@@ -1545,11 +1820,11 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
         }
         _ => drop(lock),
     }
-    callbacks.input(input);
+    send_pointer(&state, callbacks, input);
 }
 
 fn synthetic_drag(state: Weak<RefCell<State>>, id: usize, event: MouseMoveEvent) {
-    super::run_after(Duration::from_millis(16), move || {
+    native_after(Duration::from_millis(16), move || {
         let Some(state) = state.upgrade() else {
             return;
         };
@@ -1575,7 +1850,7 @@ fn synthetic_drag(state: Weak<RefCell<State>>, id: usize, event: MouseMoveEvent)
             }
             lock.callbacks
         };
-        callbacks.input(PlatformInput::MouseMove(event.clone()));
+        send_pointer(&state, callbacks, PlatformInput::MouseMove(event.clone()));
         synthetic_drag(Rc::downgrade(&state), id, event);
     });
 }
@@ -1585,13 +1860,16 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
     let Some(state) = (unsafe { get_state(this) }) else {
         return;
     };
-    if let Ok(mut lock) = state.try_borrow_mut() {
-        if lock.is_visible() {
-            lock.move_traffic_light();
-            lock.start_display_link();
-        } else {
-            lock.stop_display_link();
+    if let Ok(lock) = state.try_borrow() {
+        lock.locate_frames();
+        if !lock.is_visible() {
+            lock.callbacks.trim();
         }
+    }
+    if let Ok(mut lock) = state.try_borrow_mut()
+        && lock.is_visible()
+    {
+        lock.move_traffic_light();
     }
     report_change(&state);
 }
@@ -1709,18 +1987,16 @@ extern "C" fn window_did_change_state(this: &AnyObject, _: Sel, _: *mut AnyObjec
 
 /// Matches the drawable to the view's size and scale, then tells the app.
 fn update_drawable(state: &Shared) {
-    let Ok(mut lock) = state.try_borrow_mut() else {
+    let Ok(lock) = state.try_borrow() else {
         return;
     };
     let scale = lock.scale_factor();
     let content = lock.content_size();
-    let layer = lock.renderer.layer_ptr().cast::<AnyObject>();
-    // SAFETY: the layer belongs to the renderer.
-    unsafe {
-        let () = msg_send![layer, setContentsScale: scale as f64];
-    }
-    lock.renderer
-        .update_drawable_size(content.to_device_pixels(scale));
+    lock.layer.setContentsScale(scale as f64);
+    let pixels = content.to_device_pixels(scale);
+    lock.layer
+        .setDrawableSize(CGSize::new(pixels.width.0 as f64, pixels.height.0 as f64));
+    lock.update_mirror();
     let callbacks = lock.callbacks;
     drop(lock);
     callbacks.resized(content, scale);
@@ -1731,10 +2007,9 @@ extern "C" fn window_did_change_screen(this: &AnyObject, _: Sel, _: *mut AnyObje
     let Some(state) = (unsafe { get_state(this) }) else {
         return;
     };
-    if let Ok(mut lock) = state.try_borrow_mut() {
+    if let Ok(lock) = state.try_borrow() {
         // The display link follows the new screen.
-        lock.stop_display_link();
-        lock.start_display_link();
+        lock.locate_frames();
     }
     update_drawable(&state);
     report_change(&state);
@@ -1778,7 +2053,9 @@ extern "C" fn close_window(this: &AnyObject, _: Sel) {
             && let Ok(mut lock) = state.try_borrow_mut()
         {
             lock.closed = true;
-            lock.frame_source.take();
+            let mut frames = lock.frames.lock().unwrap_or_else(PoisonError::into_inner);
+            frames.closed = true;
+            frames.sync();
         }
         let () = msg_send![super(this, class!(NSWindow)), close];
     }
@@ -1790,7 +2067,7 @@ extern "C" fn make_backing_layer(this: &AnyObject, _: Sel) -> *mut AnyObject {
         return ptr::null_mut();
     };
 
-    state.borrow().renderer.layer_ptr() as *mut AnyObject
+    Retained::as_ptr(&state.borrow().layer) as *mut AnyObject
 }
 
 extern "C" fn view_did_change_backing_properties(this: &AnyObject, _: Sel) {
@@ -1817,46 +2094,17 @@ extern "C" fn set_frame_size(this: &AnyObject, _: Sel, new: NSSize) {
     update_drawable(&state);
 }
 
-/// AppKit asks for the layer's contents, during a live resize for one. The frame is drawn now and
-/// presented in the same Core Animation transaction.
+/// AppKit asks for the layer's contents, during a live resize for one. The render thread draws the
+/// frame now, and this thread presents it in the same Core Animation transaction.
 extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
-    // SAFETY: AppKit calls this on our views.
-    let Some(state) = (unsafe { get_state(this) }) else {
+    let Some(callbacks) = callbacks(this) else {
         return;
     };
-    let callbacks = {
-        let Ok(mut lock) = state.try_borrow_mut() else {
-            return;
-        };
-        lock.renderer.set_presents_with_transaction(true);
-        lock.callbacks
-    };
-    let more = callbacks.frame();
-    if let Ok(mut lock) = state.try_borrow_mut() {
-        lock.renderer.set_presents_with_transaction(false);
-        if more == Some(false) {
-            lock.wants_frames = false;
-            lock.stop_display_link();
-        }
-    }
-}
-
-/// A display link tick.
-extern "C" fn step(view: *mut c_void) {
-    // SAFETY: the context is our view, retained while the frame source lives.
-    let Some(state) = (unsafe { get_state(&*(view as *mut AnyObject)) }) else {
-        return;
-    };
-    let Some(callbacks) = state.try_borrow().ok().map(|state| state.callbacks) else {
-        return;
-    };
-    // An idle window stops its display link, so it gets no callbacks until it changes.
-    if callbacks.frame() == Some(false)
-        && let Ok(mut lock) = state.try_borrow_mut()
-    {
-        lock.wants_frames = false;
-        lock.stop_display_link();
-    }
+    ask(callbacks.thread, move || {
+        callbacks.with(|window, _| window.platform.set_presents_with_transaction(true));
+        step(callbacks);
+        callbacks.with(|window, _| window.platform.set_presents_with_transaction(false));
+    });
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &AnyObject, _: Sel) -> *mut AnyObject {
@@ -1981,9 +2229,8 @@ extern "C" fn attributed_substring_for_proposed_range(
     let Some(range) = range.to_range().filter(|range| !range.is_empty()) else {
         return ptr::null_mut();
     };
-    let mut adjusted: Option<Range<usize>> = None;
-    let Some(text) = callbacks(this)
-        .and_then(|callbacks| callbacks.text_for_range(range.clone(), &mut adjusted))
+    let Some((text, adjusted)) =
+        callbacks(this).and_then(|callbacks| callbacks.text_for_range(range.clone()))
     else {
         return ptr::null_mut();
     };
@@ -2106,7 +2353,7 @@ fn send_drop(this: &AnyObject, event: FileDropEvent) -> bool {
     let Some(callbacks) = state.try_borrow().ok().map(|state| state.callbacks) else {
         return false;
     };
-    callbacks.input(PlatformInput::FileDrop(event));
+    callbacks.input_later(PlatformInput::FileDrop(event));
     if let Some(dragged) = dragged
         && let Ok(mut lock) = state.try_borrow_mut()
     {

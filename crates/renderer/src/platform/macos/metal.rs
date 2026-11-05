@@ -417,20 +417,14 @@ impl Renderer {
         &self.atlas
     }
 
-    pub fn layer_ptr(&self) -> *mut CAMetalLayer {
-        Retained::as_ptr(&self.layer).cast_mut()
+    pub fn layer(&self) -> &Retained<CAMetalLayer> {
+        &self.layer
     }
 
-    /// Presents in the Core Animation transaction, so a live resize shows the new frame in step
-    /// with the window.
+    /// Presents in the Core Animation transaction of the main thread, so a live resize shows the
+    /// new frame in step with the window.
     pub fn set_presents_with_transaction(&mut self, on: bool) {
         self.presents_with_transaction = on;
-        self.layer.setPresentsWithTransaction(on);
-    }
-
-    pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
-        self.layer
-            .setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -458,8 +452,7 @@ impl Renderer {
     /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         let size = self.layer.drawableSize();
-        let window = [size.width.ceil() as u32, size.height.ceil() as u32];
-        if window[0] == 0 || window[1] == 0 {
+        if size.width < 1. || size.height < 1. {
             return capture.then(|| Err(anyhow::anyhow!("The window has no size")));
         }
         if capture {
@@ -467,26 +460,39 @@ impl Renderer {
         }
         // WARNING: new or removed sublayers show in the Core Animation transaction, so the frame that
         // draws their layers elsewhere presents in it too.
-        let transact = self.presents_with_transaction || mem::take(&mut self.restacked);
+        let resizing = self.presents_with_transaction;
+        let transact = resizing || mem::take(&mut self.restacked);
         self.layer.setPresentsWithTransaction(transact);
         let Some(drawable) = self.layer.nextDrawable() else {
-            eprintln!("apps: no drawable for a {window:?} window");
+            eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
-        let (commands, sublayers) = match self.render_frame(scene, &drawable.texture(), window) {
+        // WARNING: the main thread can resize the layer at any time, so only the texture is sure.
+        let texture = drawable.texture();
+        let window = [texture.width() as u32, texture.height() as u32];
+        let (commands, sublayers) = match self.render_frame(scene, &texture, window) {
             Ok(commands) => commands,
             Err(error) => {
                 eprintln!("apps: failed to render: {error:#}");
                 return capture.then(|| Err(error));
             }
         };
-        let readback = capture.then(|| self.read_back(&commands, &drawable.texture(), window));
+        let readback = capture.then(|| self.read_back(&commands, &texture, window));
         if transact {
             commands.commit();
             commands.waitUntilScheduled();
-            drawable.present();
-            for sublayer in &sublayers {
-                sublayer.present();
+            let present = move || {
+                drawable.present();
+                for sublayer in &sublayers {
+                    sublayer.present();
+                }
+            };
+            if resizing {
+                // WARNING: AppKit waits in its transaction on the main thread for this frame.
+                let present = super::Sendable::new(present);
+                super::native_sync(move || present.take()());
+            } else {
+                present();
             }
         } else {
             commands.presentDrawable(ProtocolObject::from_ref(&*drawable));
@@ -657,12 +663,13 @@ impl Renderer {
         }
         self.frame = frame;
         result?;
-        // WARNING: Metal may call the completion handler off the main thread, so the buffer goes
-        // back to the pool from a main queue task.
+        // WARNING: Metal calls the completion handler on its own thread, so the buffer goes back to
+        // the pool in a task of the thread that drew.
         let done = Cell::new(Some(SendBuffer(writer.finish())));
+        let thread = super::app_thread();
         let block = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             if let Some(buffer) = done.take() {
-                super::post(Box::new(move || {
+                super::post(thread, Box::new(move || {
                     let buffer = buffer.into_inner();
                     let pool = POOL.with(Rc::clone);
                     let mut pool = pool.borrow_mut();

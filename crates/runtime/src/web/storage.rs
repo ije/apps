@@ -393,6 +393,9 @@ type Session = (usize, BTreeMap<String, String>);
 static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
 /// Contexts whose IndexedDB transaction found the database busy, woken when a write transaction ends.
 static WAITING: Mutex<Vec<crate::host::Waker>> = Mutex::new(Vec::new());
+// WARNING: SQLite doesn't wait for a connection that switches the journal mode, whatever the busy
+// timeout, and each window opens its databases on its own thread.
+static SETUP: Mutex<()> = Mutex::new(());
 struct Transaction {
     database: Database,
     name: String,
@@ -492,6 +495,7 @@ impl State {
             };
         }
         if self.database.is_none() {
+            let _setup = SETUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             ensure!(
                 !self.path.as_os_str().is_empty(),
                 "Browser storage namespace is not configured"
@@ -506,6 +510,7 @@ impl State {
                 )?;
             }
             let database = Database::open(&self.path)?;
+            unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
             database.query("PRAGMA journal_mode=WAL", &[])?;
             database.query("PRAGMA synchronous=NORMAL", &[])?;
             database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
@@ -532,6 +537,7 @@ impl State {
         let db = self.database.as_ref().unwrap();
         if let Some(op) = op.strip_prefix("local.") {
             if self.local_database.is_none() {
+                let _setup = SETUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let database = Database::open(&self.path.with_file_name("local.sqlite"))?;
                 unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
                 database.query("PRAGMA journal_mode=WAL", &[])?;

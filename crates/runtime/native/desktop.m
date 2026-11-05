@@ -22,7 +22,9 @@
 #include <errno.h>
 #include <dlfcn.h>
 
-bool apps_reduce_motion(void) { return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion; }
+uint32_t apps_theme_state(void);
+
+bool apps_reduce_motion(void) { return apps_theme_state() & 32; }
 
 static NSString *AppsThemeSource = @"system";
 static NSDictionary *AppsAboutOptions;
@@ -40,10 +42,12 @@ static uint32_t AppsReadTheme(void) {
         | (workspace.accessibilityDisplayShouldReduceMotion << 5);
 }
 
+// WARNING: pages read this on their thread, and only the main thread can ask NSScreen.
+static _Atomic(int) AppsDisplayP3 = -1;
+
 bool apps_display_p3(void) {
-    static int p3 = -1;
-    if (p3 < 0) p3 = [NSScreen.mainScreen canRepresentDisplayGamut:NSDisplayGamutP3];
-    return p3;
+    int p3 = atomic_load_explicit(&AppsDisplayP3, memory_order_relaxed);
+    return p3 < 0 ? [NSScreen.mainScreen canRepresentDisplayGamut:NSDisplayGamutP3] : p3;
 }
 
 bool apps_image_decode(const uint8_t *bytes, size_t length, uint8_t *(*allocate)(void *, size_t, size_t), void *context) {
@@ -307,6 +311,7 @@ static AppsNative *AppsNativeOwner(void) {
 
 void apps_theme_observe(void (*wake)(void)) {
     AppsWake = wake;
+    atomic_store_explicit(&AppsDisplayP3, [NSScreen.mainScreen canRepresentDisplayGamut:NSDisplayGamutP3], memory_order_relaxed);
     NSApp.appearance = [AppsThemeSource isEqual:@"system"] ? nil : [NSAppearance appearanceNamed:[AppsThemeSource isEqual:@"dark"] ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     AppsNative *owner = AppsNativeOwner();
     atomic_store_explicit(&AppsThemeCache, owner.themeState, memory_order_relaxed);

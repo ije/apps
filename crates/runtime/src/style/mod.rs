@@ -25,8 +25,8 @@ pub(crate) use text::{
 pub use value::length;
 pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components};
 
-pub(crate) use properties::Prop;
 pub use properties::Style;
+pub(crate) use properties::{Prop, Vars};
 
 pub(crate) const DISPLAY_NONE: u8 = 1;
 pub(crate) const DISPLAY_CONTENTS: u8 = 2;
@@ -283,6 +283,51 @@ pub(crate) fn svg_transform(value: &str) -> Option<String> {
     })
 }
 
+/// The value of a custom property in a sorted list.
+fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {
+    vars.binary_search_by_key(&prop, |entry| entry.0)
+        .ok()
+        .map(|index| &vars[index].1)
+}
+
+/// `vars` with `own` set over them.
+fn merged(vars: Vars, own: &[(Prop, Option<Rc<str>>)]) -> Vars {
+    if own
+        .iter()
+        .all(|(prop, value)| var(&vars, *prop) == value.as_ref())
+    {
+        return vars;
+    }
+    let mut list = (*vars).clone();
+    for (prop, value) in own {
+        match (list.binary_search_by_key(prop, |entry| entry.0), value) {
+            (Ok(index), Some(value)) => list[index].1 = value.clone(),
+            (Err(index), Some(value)) => list.insert(index, (*prop, value.clone())),
+            (Ok(index), None) => {
+                list.remove(index);
+            }
+            (Err(_), None) => {}
+        }
+    }
+    Rc::new(list)
+}
+
+/// Adds the custom properties that `var()` calls in `value` read. Names that no style has yet are left out and
+/// set `unknown`.
+fn references(value: &str, names: &mut Option<Vec<Prop>>, unknown: &mut bool) {
+    let mut rest = value;
+    while let Some(list) = names.as_mut()
+        && let Some(start) = rest.find("var(")
+    {
+        rest = &rest[start + 4..];
+        let name = rest[..rest.find([',', ')']).unwrap_or(rest.len())].trim();
+        match Prop::find(name) {
+            Some(prop) => list.push(prop),
+            None => *unknown = true,
+        }
+    }
+}
+
 #[derive(Hash, PartialEq, Eq)]
 struct StyleKey {
     scope: usize,
@@ -304,6 +349,9 @@ struct StyleKey {
 
 struct CachedNode {
     parent: Option<StyleRef>,
+    /// The parent's custom properties, and the node's.
+    inherited: Option<Vars>,
+    vars: Vars,
     font: [u32; 6],
     root: [u32; 6],
     host: Option<Style>,
@@ -313,9 +361,11 @@ struct CachedNode {
 }
 
 impl CachedNode {
-    fn new(key: &StyleKey, value: Rc<CachedStyle>) -> Self {
+    fn new(key: &StyleKey, value: Rc<CachedStyle>, inherited: Option<&Vars>, vars: &Vars) -> Self {
         Self {
             parent: key.parent.clone(),
+            inherited: inherited.cloned(),
+            vars: vars.clone(),
             font: key.font,
             root: key.root,
             host: key.host.clone(),
@@ -329,6 +379,16 @@ impl CachedNode {
 struct CachedStyle {
     used: std::cell::Cell<u64>,
     style: Rc<Style>,
+    /// The parent's custom properties and the node's, from the latest node that used the styles. Later nodes
+    /// with the same parent list then get the same list.
+    vars: std::cell::RefCell<(Option<Vars>, Vars)>,
+    /// The inherited custom properties that the styles read, with their values, when the styles hold none,
+    /// so other inherited changes keep the styles.
+    reads: Option<Box<[(Prop, Option<Rc<str>>)]>>,
+    /// The node's own custom properties as they resolved, `None` for invalid ones, which go away.
+    own: Box<[(Prop, Option<Rc<str>>)]>,
+    /// `Prop::interned()` when the styles read names that no style had, else 0. A new name may be one of them.
+    interned: usize,
     flags: u8,
     lengths: Lengths,
     pseudos: Option<Rc<[Style; 2]>>,
@@ -375,7 +435,8 @@ struct StyleScope {
     /// Interaction states the selectors use.
     states: u16,
     matches: SelectorCache,
-    nodes: Vec<Option<MatchedRules>>,
+    /// By node id. Boxed, since the list is as long as the document's node arena in every scope.
+    nodes: Vec<Option<Box<MatchedRules>>>,
     /// The cascade order of each rule. Tailwind's generated rules share one block of keys in
     /// Tailwind's order, so new utilities join the scope without rebuilding it.
     keys: Vec<u64>,
@@ -547,7 +608,8 @@ fn has_key(node: &crate::dom::Node, key: &Key) -> bool {
 struct MatchedRules {
     checked: std::cell::Cell<u64>,
     cached: Option<CachedNode>,
-    dependencies: Vec<(usize, u64)>,
+    // WARNING: matching collects many duplicates before the dedup, so the list is boxed to its length.
+    dependencies: Box<[(usize, u64)]>,
     rules: Vec<(usize, [usize; 3])>,
     pseudos: Vec<usize>,
     columns: usize,
@@ -646,10 +708,14 @@ pub(crate) struct StyleCache {
     containers: HashMap<usize, [f32; 2]>,
     sized: std::collections::HashSet<usize>,
     queries: QueryCache,
-    queried: bool,
+    /// The last `set_containers` changed the size of a container that container units use.
+    pub(crate) units: bool,
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
+    /// Lists of custom properties without the registered ones that don't inherit, by the list they come
+    /// from, which they keep alive. Kept across passes, so children keep the same list.
+    inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Vars)>,
     pub(crate) scripted: Registry,
     scheme: Option<Rc<str>>,
 }
@@ -677,8 +743,31 @@ type CollapsedTable = (
 );
 
 impl StyleCache {
-    pub(crate) fn set_containers(&mut self, sizes: HashMap<usize, [f32; 2]>) -> bool {
-        if sizes == self.containers {
+    /// Drops what the scopes keep for nodes that left the document.
+    pub(crate) fn forget(&mut self, gone: &[usize]) {
+        for scope in &mut self.scopes {
+            for &id in gone {
+                if let Some(node) = scope.nodes.get_mut(id) {
+                    *node = None;
+                }
+                scope.matches.forget(id);
+            }
+        }
+    }
+
+    /// Drops what the next style pass can compute again, and the room for node ids past `len`.
+    pub(crate) fn trim(&mut self, len: usize) {
+        self.values = Default::default();
+        for scope in &mut self.scopes {
+            scope.nodes.truncate(len);
+            scope.nodes.shrink_to_fit();
+            scope.matches.trim(len);
+        }
+    }
+
+    pub(crate) fn set_containers(&mut self, sizes: &HashMap<usize, [f32; 2]>) -> bool {
+        self.units = false;
+        if *sizes == self.containers {
             return false;
         }
         if self
@@ -686,6 +775,7 @@ impl StyleCache {
             .iter()
             .any(|id| sizes.get(id) != self.containers.get(id))
         {
+            self.units = true;
             self.sized.clear();
             self.values.clear();
             self.queries.clear();
@@ -694,33 +784,33 @@ impl StyleCache {
                     node.cached = None;
                 }
             }
-            self.containers = sizes;
+            self.containers = sizes.clone();
             return true;
         }
-        let changed = self.queried
-            && (sizes.len() != self.containers.len()
-                || sizes.keys().any(|id| !self.containers.contains_key(id)))
-            || self.queries.iter().any(
-                |(&(scope, order, index, container), &(inline, matched, font))| {
-                    let query = self
-                        .scopes
-                        .iter()
-                        .find(|cached| cached.id == scope)
-                        .and_then(|scope| scope.containers.get(order)?.as_ref()?.get(index));
-                    query.is_none_or(|(_, _, query)| {
-                        sizes.get(&container).is_some_and(|size| {
-                            query.matches(
-                                size[0],
-                                if inline { f32::NAN } else { size[1] },
-                                false,
-                                0,
-                                font,
-                            ) == Some(true)
-                        }) != matched
-                    })
-                },
-            );
-        self.containers = sizes;
+        // WARNING: queries record their container even while it has no size yet, and container units are in
+        // `sized`, so new or removed containers that no query result depends on don't style again. A list
+        // that builds rows with containers as it scrolls would otherwise style and lay out every frame twice.
+        let changed = self.queries.iter().any(
+            |(&(scope, order, index, container), &(inline, matched, font))| {
+                let query = self
+                    .scopes
+                    .iter()
+                    .find(|cached| cached.id == scope)
+                    .and_then(|scope| scope.containers.get(order)?.as_ref()?.get(index));
+                query.is_none_or(|(_, _, query)| {
+                    sizes.get(&container).is_some_and(|size| {
+                        query.matches(
+                            size[0],
+                            if inline { f32::NAN } else { size[1] },
+                            false,
+                            0,
+                            font,
+                        ) == Some(true)
+                    }) != matched
+                })
+            },
+        );
+        self.containers = sizes.clone();
         if changed {
             self.queries.clear();
             for scope in &mut self.scopes {
@@ -910,6 +1000,8 @@ impl StyleCache {
         }
         self.sheets.retain(|_, (used, ..)| *used == pass);
         self.tables.retain(|_, (used, ..)| *used == pass);
+        self.inheritable
+            .retain(|_, (from, _)| Rc::strong_count(from) > 1);
         self.derived.clear();
         self.cssom.retain(|_, (used, ..)| *used >= pass);
         if self.values.len() > 4096 {
@@ -925,10 +1017,10 @@ impl StyleCache {
 type CascadeRank = (bool, i32, [usize; 4], u64);
 type Declared = (Prop, Rc<str>, bool);
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Declarations(Vec<Declaration>);
 
-#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 enum Declaration {
     Property(String, String),
     Apply(Vec<String>),
@@ -3153,8 +3245,8 @@ pub(crate) struct StyleContext {
     pub hosts: FxHashMap<usize, Style>,
     pub slotted: FxHashMap<usize, Vec<Declared>>,
     pub parts: FxHashMap<usize, Vec<Declared>>,
-    pub inherited: FxHashMap<usize, (Rc<Style>, Lengths)>,
-    pub roots: FxHashMap<usize, (Rc<Style>, Lengths)>,
+    pub inherited: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
+    pub roots: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
     pub required: Option<std::collections::HashSet<usize>>,
     pub animated: HashMap<usize, Style>,
     pub reduced_motion: bool,
@@ -3171,7 +3263,11 @@ pub(crate) struct StyleContext {
 
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
+    /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
+    /// that don't read it. Only nodes with animations or transitions keep theirs, for the keyframes.
     pub values: Vec<Rc<Style>>,
+    /// The custom properties of each node.
+    pub vars: Vec<Vars>,
     pub flags: Vec<u8>,
     pub lengths: Vec<Lengths>,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
@@ -3207,7 +3303,7 @@ pub(crate) enum UserSelect {
 
 /// The computed styles of all nodes by property name.
 pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BTreeMap<String, String>> {
-    compute_styles(
+    let out = compute_styles(
         doc,
         width,
         height,
@@ -3215,16 +3311,18 @@ pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BTreeMap<String, S
         &mut HashMap::new(),
         &mut StyleCache::default(),
         None,
-    )
-    .values
-    .iter()
-    .map(|style| {
-        style
-            .iter()
-            .map(|(prop, value)| (prop.name().to_owned(), value.to_string()))
-            .collect()
-    })
-    .collect()
+    );
+    out.values
+        .iter()
+        .zip(&out.vars)
+        .map(|(style, vars)| {
+            style
+                .own()
+                .chain(vars.iter().map(|(prop, value)| (*prop, value)))
+                .map(|(prop, value)| (prop.name().to_owned(), value.to_string()))
+                .collect()
+        })
+        .collect()
 }
 
 pub(crate) fn compute_styles(
@@ -3238,6 +3336,7 @@ pub(crate) fn compute_styles(
 ) -> ComputedStyles {
     let mut out = ComputedStyles {
         values: vec![Rc::default(); doc.nodes.len()],
+        vars: vec![Vars::default(); doc.nodes.len()],
         flags: vec![0; doc.nodes.len()],
         lengths: vec![Lengths::new(16., width, height); doc.nodes.len()],
         user_select: vec![(UserSelect::None, 0); doc.nodes.len()],
@@ -3415,7 +3514,6 @@ pub(crate) fn cascade(
         // for `set_containers`.
         if !resized {
             style_cache.queries.clear();
-            style_cache.queried = false;
         }
         // WARNING: a new `@media` result rebuilds the scopes that collected its rules, unless it holds
         // style rules only: they stay in the scope and restyle the nodes they match. Scopes can share
@@ -3861,6 +3959,7 @@ pub(crate) fn cascade(
         if registry != *style_cache.registry {
             style_cache.registry = Rc::new(registry);
             style_cache.values.clear();
+            style_cache.inheritable.clear();
             for scope in &mut style_cache.scopes {
                 for node in scope.nodes.iter_mut().flatten() {
                     node.cached = None;
@@ -3879,8 +3978,32 @@ pub(crate) fn cascade(
     }
     let registry = style_cache.registry.clone();
     out.registry = registry.clone();
-    let mut inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, properties::Vars> =
-        FxHashMap::default();
+    let mut inheritable = std::mem::take(&mut style_cache.inheritable);
+    let filtered = registry.values().any(|(_, inherits, _)| !inherits);
+    // Registered properties that don't inherit leave the parent's list.
+    let mut inherit = |vars: &Vars| -> Vars {
+        if !filtered {
+            return vars.clone();
+        }
+        inheritable
+            .entry(Rc::as_ptr(vars))
+            .or_insert_with(|| {
+                let kept: Vec<_> = vars
+                    .iter()
+                    .filter(|(prop, _)| registry.get(prop).is_none_or(|(_, inherits, _)| *inherits))
+                    .cloned()
+                    .collect();
+                let kept = if kept.len() == vars.len() {
+                    vars.clone()
+                } else {
+                    Rc::new(kept)
+                };
+                (vars.clone(), kept)
+            })
+            .1
+            .clone()
+    };
+    let empty = Vars::default();
     let scoped = &mut style_cache.scopes[scope];
     let scope = scoped.id;
     scoped.used = style_cache.pass;
@@ -3894,6 +4017,7 @@ pub(crate) fn cascade(
     let mut candidates: Vec<usize> = Vec::new();
     let ComputedStyles {
         values: styles,
+        vars: custom,
         flags: style_flags,
         lengths,
         pseudos,
@@ -3920,19 +4044,24 @@ pub(crate) fn cascade(
             continue;
         }
         let node = &doc.nodes[id];
-        if let Some((style, units)) = context.and_then(|context| context.roots.get(&id)) {
+        if let Some((style, units, vars)) = context.and_then(|context| context.roots.get(&id)) {
             styles[id] = style.clone();
+            custom[id] = vars.clone();
             style_flags[id] = flags(style);
             lengths[id] = *units;
             continue;
         }
         let inherited = context.and_then(|context| context.inherited.get(&id));
         let parent_style = inherited
-            .map(|(style, _)| style)
+            .map(|(style, ..)| style)
             .or_else(|| node.parent.map(|parent| &styles[parent]));
+        let parent_vars = inherited
+            .map(|(.., vars)| vars)
+            .or_else(|| node.parent.map(|parent| &custom[parent]))
+            .filter(|_| !matches!(node.tag.as_str(), "#text" | "#comment"));
         let parent = inherited.map_or_else(
             || node.parent.map_or(FontUnits::new(16.), |p| lengths[p].font),
-            |(_, units)| units.font,
+            |(_, units, _)| units.font,
         );
         let font_key = [
             parent.em, parent.ch, parent.ex, parent.cap, parent.ic, parent.lh,
@@ -3947,6 +4076,23 @@ pub(crate) fn cascade(
         ];
         let animated = context.and_then(|context| context.animated.get(&id));
         let mut key = None;
+        let mut moved = false;
+        // Styles stay with the parent's same list of custom properties, or with the same values of the names
+        // they read, which then gives the node a new list.
+        let mut reuse =
+            |value: &CachedStyle, old: Option<&Vars>, vars: &Vars| match (old, parent_vars) {
+                (None, None) => Some((vars.clone(), false)),
+                (Some(old), Some(new)) if Rc::ptr_eq(old, new) => Some((vars.clone(), false)),
+                (Some(_), Some(new)) => {
+                    let reads = value.reads.as_ref()?;
+                    ((value.interned == 0 || value.interned == Prop::interned())
+                        && reads
+                            .iter()
+                            .all(|(prop, value)| var(new, *prop) == value.as_ref()))
+                    .then(|| (merged(inherit(new), &value.own), true))
+                }
+                _ => None,
+            };
         let cached = scoped.nodes[id]
             .as_ref()
             .filter(|node| {
@@ -3962,7 +4108,12 @@ pub(crate) fn cascade(
                     && cached.selection.as_ref() == selection
                     && cached.shadowed.each_ref().map(Option::as_ref) == shadowed
             })
-            .map(|cached| cached.value.clone())
+            .and_then(|cached| {
+                let (vars, changed) =
+                    reuse(&cached.value, cached.inherited.as_ref(), &cached.vars)?;
+                moved = changed;
+                Some((cached.value.clone(), vars))
+            })
             .or_else(|| {
                 let (matched, matched_pseudos, columns) = if let Some(cached) =
                     scoped.nodes[id].as_ref()
@@ -3972,6 +4123,7 @@ pub(crate) fn cascade(
                 } else {
                     matches.dependencies.clear();
                     matches.depend(id, 0);
+                    matches.depend(id, 6);
                     candidates.clear();
                     if !node.tag.starts_with('#') {
                         candidates.extend(&scoped.universal);
@@ -4038,14 +4190,14 @@ pub(crate) fn cascade(
                     }
                     matches.dependencies.sort_unstable();
                     matches.dependencies.dedup();
-                    scoped.nodes[id] = Some(MatchedRules {
+                    scoped.nodes[id] = Some(Box::new(MatchedRules {
                         checked: std::cell::Cell::new(matches.epoch),
                         cached: None,
-                        dependencies: std::mem::take(&mut matches.dependencies),
+                        dependencies: matches.dependencies.as_slice().into(),
                         rules: matched.clone(),
                         pseudos: matched_pseudos.clone(),
                         columns,
-                    });
+                    }));
                     (matched, matched_pseudos, columns)
                 };
                 let (mut matched, mut matched_pseudos) = (matched, matched_pseudos);
@@ -4059,7 +4211,6 @@ pub(crate) fn cascade(
                     let Some(conditions) = &scoped.containers[order] else {
                         return true;
                     };
-                    style_cache.queried = true;
                     conditions
                         .iter()
                         .enumerate()
@@ -4183,18 +4334,32 @@ pub(crate) fn cascade(
                     .values
                     .get(&resolved)
                     .filter(|_| animated.is_none())
-                    .cloned();
+                    .and_then(|value| {
+                        let (vars, changed) = {
+                            let held = value.vars.borrow();
+                            reuse(value, held.0.as_ref(), &held.1)?
+                        };
+                        if changed {
+                            *value.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
+                        }
+                        Some((value.clone(), vars))
+                    });
                 key = Some(resolved);
                 value
             });
-        if let Some(cached) = cached {
+        if let Some((cached, vars)) = cached {
             cached.used.set(style_cache.pass);
-            if let Some(key) = &key
-                && let Some(node) = scoped.nodes[id].as_mut()
-            {
-                node.cached = Some(CachedNode::new(key, cached.clone()));
+            if let Some(node) = scoped.nodes[id].as_mut() {
+                if let Some(key) = &key {
+                    node.cached = Some(CachedNode::new(key, cached.clone(), parent_vars, &vars));
+                } else if moved && let Some(node) = node.cached.as_mut() {
+                    node.inherited = parent_vars.cloned();
+                    node.vars = vars.clone();
+                    *cached.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
+                }
             }
             styles[id] = cached.style.clone();
+            custom[id] = vars;
             style_flags[id] = cached.flags;
             lengths[id] = Lengths {
                 viewport: [width, height],
@@ -4244,30 +4409,9 @@ pub(crate) fn cascade(
                     .filter(|(prop, _)| prop.inherited())
                     .map(|(prop, value)| (prop, value.clone())),
             );
-            if !matches!(node.tag.as_str(), "#text" | "#comment") {
-                let vars = parent.vars();
-                style.set_vars(if registry.values().any(|(_, inherits, _)| !inherits) {
-                    inheritable
-                        .entry(Rc::as_ptr(vars))
-                        .or_insert_with(|| {
-                            let kept: Vec<_> = vars
-                                .iter()
-                                .filter(|(prop, _)| {
-                                    registry.get(prop).is_none_or(|(_, inherits, _)| *inherits)
-                                })
-                                .cloned()
-                                .collect();
-                            if kept.len() == vars.len() {
-                                vars.clone()
-                            } else {
-                                Rc::new(kept)
-                            }
-                        })
-                        .clone()
-                } else {
-                    vars.clone()
-                });
-            }
+        }
+        if let Some(vars) = parent_vars {
+            style.set_vars(inherit(vars));
         }
         let mut cascade: BTreeMap<Prop, (CascadeRank, Rc<str>)> = BTreeMap::new();
         for &(order, [ids, classes, tags]) in &key.rules {
@@ -4505,6 +4649,21 @@ pub(crate) fn cascade(
         }
         physical(&mut cascade, &style);
         let explicit_size = cascade.contains_key(&Prop::FONT_SIZE);
+        let mut reads = Some(Vec::new());
+        let mut unknown = false;
+        let mut owned = Vec::new();
+        for (prop, (_, value)) in &cascade {
+            if prop.is_custom() {
+                if matches!(
+                    &**value,
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                ) {
+                    reads = None;
+                }
+                owned.push(*prop);
+            }
+            references(value, &mut reads, &mut unknown);
+        }
         let mut declared = Vec::new();
         style.extend(cascade.into_iter().filter_map(|(prop, (_, value))| {
             if prop.is_custom() {
@@ -4516,6 +4675,7 @@ pub(crate) fn cascade(
         resolve_style(
             &mut style,
             parent_style.map(Rc::as_ref),
+            parent_vars,
             &declared,
             &registry,
         );
@@ -4836,6 +4996,26 @@ pub(crate) fn cascade(
                 }
             }
         }
+        for (prop, (_, value)) in pseudo_cascade.iter().flatten() {
+            if prop.is_custom() {
+                reads = None;
+            }
+            references(value, &mut reads, &mut unknown);
+        }
+        // WARNING: keyframes and transitions read custom properties from the styles, so animated nodes keep theirs.
+        let keep = [
+            Prop::ANIMATION,
+            Prop::ANIMATION_NAME,
+            Prop::TRANSITION,
+            Prop::TRANSITION_PROPERTY,
+        ]
+        .into_iter()
+        .any(|prop| {
+            style.contains(prop)
+                || pseudo_cascade[..2]
+                    .iter()
+                    .any(|cascade| cascade.contains_key(&prop))
+        });
         let [
             before,
             after,
@@ -4867,10 +5047,14 @@ pub(crate) fn cascade(
             resolve_style(
                 &mut values,
                 parent_style.map(Rc::as_ref),
+                parent_vars,
                 &declared,
                 &registry,
             );
             resolve_keywords(&mut values, parent_style.map(Rc::as_ref));
+            if !keep && declared.is_empty() {
+                values.set_vars(empty.clone());
+            }
             let values = Rc::new(values);
             starts.insert(id, values.clone());
             values
@@ -4892,8 +5076,11 @@ pub(crate) fn cascade(
                     }
                     Some((prop, value.clone()))
                 }));
-                resolve_style(&mut values, Some(&style), &declared, &registry);
+                resolve_style(&mut values, Some(&style), None, &declared, &registry);
                 resolve_keywords(&mut values, Some(&style));
+                if !keep && declared.is_empty() {
+                    values.set_vars(empty.clone());
+                }
                 values
             })
         };
@@ -4979,7 +5166,10 @@ pub(crate) fn cascade(
                 }
             }
             let colored = values.contains(Prop::COLOR);
-            resolve_style(&mut values, parent, &[], &registry);
+            resolve_style(&mut values, parent, None, &[], &registry);
+            if !keep {
+                values.set_vars(empty.clone());
+            }
             // WARNING: resolve_style gives an element without a color the root `canvastext`, but a
             // `::selection` without one keeps the text color.
             if !colored {
@@ -5079,6 +5269,28 @@ pub(crate) fn cascade(
                     .map(|bits| (bits, font.absolute))
             })
         };
+        // A list made again with the same values keeps last frame's, so the children keep theirs.
+        let vars = match context
+            .and_then(|context| context.previous.as_deref())
+            .and_then(|previous| previous.vars.get(id))
+        {
+            Some(old) if !Rc::ptr_eq(old, style.vars()) && **old == **style.vars() => old.clone(),
+            _ => style.vars().clone(),
+        };
+        let reads = reads.filter(|_| !keep).map(|mut names| {
+            names.sort_unstable();
+            names.dedup();
+            names
+                .into_iter()
+                .filter(|prop| !owned.contains(prop))
+                .map(|prop| (prop, parent_vars.and_then(|vars| var(vars, prop)).cloned()))
+                .collect()
+        });
+        let own = owned
+            .into_iter()
+            .map(|prop| (prop, var(&vars, prop).cloned()))
+            .collect();
+        style.set_vars(if keep { vars.clone() } else { empty.clone() });
         let style = match context.and_then(|context| context.previous.as_deref()) {
             Some(previous)
                 if previous.values.get(id).is_some_and(|old| **old == style)
@@ -5107,6 +5319,10 @@ pub(crate) fn cascade(
         let cached = Rc::new(CachedStyle {
             used: std::cell::Cell::new(style_cache.pass),
             style: style.clone(),
+            vars: std::cell::RefCell::new((parent_vars.cloned(), vars.clone())),
+            reads,
+            own,
+            interned: if unknown { Prop::interned() } else { 0 },
             flags: style_flags[id],
             lengths: units,
             pseudos: pseudos.get(&id).cloned(),
@@ -5126,7 +5342,7 @@ pub(crate) fn cascade(
         });
         if animated.is_none() {
             if let Some(node) = scoped.nodes[id].as_mut() {
-                node.cached = Some(CachedNode::new(&key, cached.clone()));
+                node.cached = Some(CachedNode::new(&key, cached.clone(), parent_vars, &vars));
             }
             // WARNING: the key doesn't hold the container, so styles with container units are not shared.
             if !queried {
@@ -5134,8 +5350,10 @@ pub(crate) fn cascade(
             }
         }
         styles[id] = style;
+        custom[id] = vars;
         lengths[id] = units;
     }
+    style_cache.inheritable = inheritable;
     if context.is_some_and(|context| context.required.is_some()) {
         return;
     }
@@ -5881,6 +6099,7 @@ struct Substitution<'a> {
     state: Vec<(u8, usize, Option<Rc<str>>)>,
     inherited: &'a Style,
     parent: Option<&'a Style>,
+    vars: Option<&'a Vars>,
     registry: &'a Registry,
     depth: usize,
     cycle: usize,
@@ -5905,12 +6124,14 @@ impl Substitution<'_> {
         }
         let raw = self.declared[index].1.clone();
         let registered = self.registry.get(&prop);
-        let parent = self.parent;
+        let (parent, vars) = (self.parent, self.vars);
         let initial = || registered.and_then(|(_, _, initial)| initial.clone());
         let inherit = || {
-            parent
-                .and_then(|parent| parent.value(prop).cloned())
-                .or_else(initial)
+            match vars {
+                Some(vars) => var(vars, prop).cloned(),
+                None => parent.and_then(|parent| parent.value(prop).cloned()),
+            }
+            .or_else(initial)
         };
         let unset = || {
             if registered.is_some_and(|(_, inherits, _)| !inherits) {
@@ -5957,9 +6178,11 @@ impl Substitution<'_> {
     }
 }
 
+/// `parent_vars` holds the parent's custom properties when `parent` has none.
 fn resolve_style(
     style: &mut Style,
     parent: Option<&Style>,
+    parent_vars: Option<&Vars>,
     declared: &[(Prop, Rc<str>)],
     registry: &Registry,
 ) {
@@ -5970,6 +6193,7 @@ fn resolve_style(
             state: vec![(0, 0, None); declared.len()],
             inherited: &inherited,
             parent,
+            vars: parent_vars,
             registry,
             depth: 0,
             cycle: usize::MAX,

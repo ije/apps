@@ -354,15 +354,6 @@ impl renderer::View for PageView {
         self.drive(cx);
     }
 
-    fn should_close(&mut self, _: &mut Window, cx: &mut App) -> bool {
-        if let Ok(mut host) = self.host.try_borrow_mut() {
-            host.commands
-                .push(serde_json::json!({"op":"window","args":["closing",self.id]}));
-        }
-        self.drive(cx);
-        false
-    }
-
     fn event(&mut self, event: &PlatformInput, window: &mut Window, cx: &mut App) {
         let id = self.id;
         match event {
@@ -390,8 +381,7 @@ impl renderer::View for PageView {
                 {
                     self.host
                         .borrow_mut()
-                        .commands
-                        .push(serde_json::json!({"op":"window","args":["devtools",id]}));
+                        .command(serde_json::json!({"op":"window","args":["devtools",id]}));
                     self.drive(cx);
                     cx.stop_propagation();
                     return;

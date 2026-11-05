@@ -135,10 +135,16 @@ pub(crate) fn transform(
         if let Some(percent) = value.strip_suffix('%') {
             return percent.parse::<f32>().ok().map(|value| value / 100.);
         }
-        units
-            .math(value, 0., &[])
-            .filter(|(_, kind)| *kind == parser::Kind::Number)
-            .map(|(value, _)| value as f32)
+        // A percentage in `calc()`, like Tailwind's `scale: calc(100% * -1)`, resolves against 100.
+        match units.math(value, 100., &[])? {
+            (value, parser::Kind::Number) => Some(value as f32),
+            (percent, parser::Kind::Length)
+                if units.math(value, 0., &[]) == Some((0., parser::Kind::Length)) =>
+            {
+                Some(percent as f32 / 100.)
+            }
+            _ => None,
+        }
     };
     let angle = |value: &str| {
         units
@@ -788,19 +794,14 @@ pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
     }
 }
 
-/// The SVG of a CSS gradient layer covering a `width` by `height` box, sized, placed and
-/// repeated like a background or mask layer.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gradient_svg(
-    kind: &str,
-    body: &str,
+/// The size of a gradient's tile in a box and where the first tile sits.
+pub(crate) fn tile(
     size: &str,
     position: &str,
-    repeat: &str,
-    units: Lengths,
+    units: &Lengths,
     width: f32,
     height: f32,
-) -> Option<String> {
+) -> [[f32; 2]; 2] {
     let dims = style::components(size, ' ');
     let dim = |axis: usize| {
         let extent = [width, height][axis];
@@ -822,12 +823,29 @@ pub(crate) fn gradient_svg(
         [a, b, ..] => (*a, *b),
         [] => ("0%", "0%"),
     };
-    let [x, y] = [(x, width - tw), (y, height - th)].map(|(token, free)| match token {
+    let at = [(x, width - tw), (y, height - th)].map(|(token, free)| match token {
         "left" | "top" => 0.,
         "center" => free / 2.,
         "right" | "bottom" => free,
         value => units.resolve(value, free).unwrap_or(0.),
     });
+    [[tw, th], at]
+}
+
+/// The SVG of a CSS gradient layer covering a `width` by `height` box, sized, placed and
+/// repeated like a background or mask layer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gradient_svg(
+    kind: &str,
+    body: &str,
+    size: &str,
+    position: &str,
+    repeat: &str,
+    units: Lengths,
+    width: f32,
+    height: f32,
+) -> Option<String> {
+    let [[tw, th], [x, y]] = tile(size, position, &units, width, height);
     let parts = style::components(body, ',');
     let (first, space) = first_argument(body);
     let first = first.as_str();

@@ -7,7 +7,8 @@
 //!
 //! WARNING: The output callback takes the registry lock on the link's io thread, maybe while it
 //! holds CoreVideo locks. Never call CoreVideo while holding the registry lock. Registry changes
-//! and link start/stop run on the main thread only.
+//! and link start/stop hold `CHANGES`, which the callback never takes, because the render thread
+//! and the main thread both make them.
 //!
 //! `std::sync::Mutex` is used because on macOS it is an `os_unfair_lock`, whose priority
 //! donation helps the high-priority io thread.
@@ -15,7 +16,8 @@
 use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
-    _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
+    _dispatch_source_type_data_add, DispatchObject, DispatchQoS, DispatchQueue, DispatchRetained,
+    DispatchSource, GlobalQueueIdentifier,
 };
 use std::{
     collections::{BTreeMap, btree_map},
@@ -24,6 +26,7 @@ use std::{
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
+static CHANGES: Mutex<()> = Mutex::new(());
 
 struct Registry {
     displays: BTreeMap<CGDirectDisplayID, DisplayEntry>,
@@ -170,22 +173,34 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 }
 
 /// Per-window frame requests. The dispatch source merges vsync ticks from the display's io thread
-/// and calls `callback(data)` on the main queue.
+/// and calls `callback(data)` on a system queue, so a busy main thread holds up no frames. `free`
+/// gets `data` when the source is gone.
 pub(crate) struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
 }
 
+// SAFETY: the dispatch source is a thread-safe GCD object, and `Frames` locks the rest.
+unsafe impl Send for WindowFrameSource {}
+
 impl WindowFrameSource {
-    pub fn new(data: *mut c_void, callback: extern "C" fn(*mut c_void)) -> Self {
+    pub fn new(
+        data: *mut c_void,
+        callback: extern "C" fn(*mut c_void),
+        free: extern "C" fn(*mut c_void),
+    ) -> Self {
+        let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+            DispatchQoS::UserInteractive,
+        ));
         let frame_requests = unsafe {
             let frame_requests = DispatchSource::new(
                 &raw const _dispatch_source_type_data_add as *mut _,
                 0,
                 0,
-                Some(DispatchQueue::main()),
+                Some(&queue),
             );
             frame_requests.set_context(data);
+            frame_requests.set_finalizer_f(free);
             frame_requests.set_event_handler_f(callback);
             // WARNING: Destroying a suspended dispatch source is undefined behavior.
             frame_requests.resume();
@@ -197,10 +212,6 @@ impl WindowFrameSource {
         }
     }
 
-    pub fn is_running(&self) -> bool {
-        self.registration.is_some()
-    }
-
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
         if self
             .registration
@@ -209,6 +220,7 @@ impl WindowFrameSource {
             return Ok(());
         }
         self.stop();
+        let _changes = CHANGES.lock().unwrap_or_else(PoisonError::into_inner);
         let subscriber_id = subscribe(display_id, self.frame_requests.clone())?;
         self.registration = Some((display_id, subscriber_id));
         Ok(())
@@ -216,6 +228,7 @@ impl WindowFrameSource {
 
     pub fn stop(&mut self) {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
+            let _changes = CHANGES.lock().unwrap_or_else(PoisonError::into_inner);
             unsubscribe(display_id, subscriber_id);
         }
     }
@@ -225,7 +238,7 @@ impl Drop for WindowFrameSource {
     fn drop(&mut self) {
         self.stop();
         // The callback can't reach this source after `stop`. Cancel so the handler never runs
-        // again: its context is the window's native view, which may be freed after this.
+        // again, and the finalizer frees its context.
         self.frame_requests.cancel();
     }
 }
