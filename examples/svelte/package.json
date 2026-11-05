@@ -1,0 +1,16 @@
+{
+  "name": "svelte",
+  "productName": "Svelte",
+  "private": true,
+  "main": "main.ts",
+  "loaders": {
+    ".svelte": "./svelte-loader.ts"
+  },
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  },
+  "dependencies": {
+    "svelte": "5.57.3"
+  }
+}
