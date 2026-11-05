@@ -1,0 +1,585 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant light (&:is(.light *));
+@custom-variant dark (&:is(.dark *, .dark));
+
+@theme {
+  --font-geist: var(--font-geist-sans);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-border-opaque: var(--border-opaque);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root,
+.light {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --border-opaque: color-mix(
+    in oklch,
+    var(--border) 100%,
+    var(--diffshub-sidebar-bg) 0%
+  );
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+
+  --diffshub-sidebar-bg: #f7f7f7;
+
+  color-scheme: light;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --border-opaque: color-mix(
+    in oklch,
+    var(--diffshub-sidebar-bg) 90%,
+    oklch(1 0 0)
+  );
+  --color-border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+  --diffshub-sidebar-bg: #101010;
+  color-scheme: dark;
+}
+
+/* Match the two default Shiki themes before their async modules resolve. A
+   cached custom theme is injected later in <head> and overrides these rules. */
+:where(.light) .diffshub-theme-bootstrap.diffshub-theme-bootstrap {
+  background-color: #f7f7f7;
+  color: #737373;
+  --color-foreground: #737373;
+  --foreground: #737373;
+  --color-muted-foreground: #737373;
+  --muted-foreground: #737373;
+  --color-border: color-mix(in srgb, #737373 20%, transparent);
+  --border: color-mix(in srgb, #737373 20%, transparent);
+  --color-border-opaque: color-mix(in srgb, #737373 22%, #f7f7f7);
+  --border-opaque: color-mix(in srgb, #737373 22%, #f7f7f7);
+  --diffshub-card-bg: color-mix(in srgb, #737373 6%, #f7f7f7);
+  --diffshub-card-hover-bg: color-mix(in srgb, #737373 12%, #f7f7f7);
+  --diffshub-card-border: color-mix(in srgb, #737373 12%, #f7f7f7);
+  --diffshub-popover-bg: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --diffshub-popover-fg: #737373;
+  --diffshub-popover-muted-fg: #737373;
+  --diffshub-popover-hover-bg: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --diffshub-popover-selected-bg: color-mix(in srgb, #737373 20%, #f7f7f7);
+  --diffshub-popover-border: color-mix(in srgb, #737373 18%, #f7f7f7);
+  --diffshub-popover-shadow:
+    0 8px 16px rgb(0 0 0 / 7%), 0 2px 4px rgb(0 0 0 / 5%);
+  --diffshub-annotation-bg: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --diffshub-annotation-fg: #737373;
+  --diffshub-annotation-border: color-mix(in srgb, #737373 18%, #f7f7f7);
+  --diffshub-annotation-hover-border: color-mix(in srgb, #737373 28%, #f7f7f7);
+  --diffshub-annotation-shadow:
+    0 8px 16px rgb(0 0 0 / 7%), 0 2px 4px rgb(0 0 0 / 5%);
+  --color-popover: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --popover: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --color-popover-foreground: #737373;
+  --popover-foreground: #737373;
+  --color-card: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --card: color-mix(in srgb, #737373 7%, #f7f7f7);
+  --color-card-foreground: #737373;
+  --card-foreground: #737373;
+  --color-background: #f7f7f7;
+  --background: #f7f7f7;
+  --color-accent: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --accent: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --color-accent-foreground: #737373;
+  --accent-foreground: #737373;
+  --color-secondary: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --secondary: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --color-secondary-foreground: #737373;
+  --secondary-foreground: #737373;
+  --color-input: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --input: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --color-muted: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --muted: color-mix(in srgb, #737373 14%, #f7f7f7);
+  --color-primary: #737373;
+  --primary: #737373;
+  --color-primary-foreground: #f7f7f7;
+  --primary-foreground: #f7f7f7;
+  --color-ring: #737373;
+  --ring: #737373;
+  --diffshub-comment-add-fg: #047857;
+  --diffshub-comment-del-fg: #be123c;
+  --diffshub-diff-separator: color-mix(in srgb, #525252 22%, #ffffff);
+  --diffshub-scrollbar-thumb-bg: color-mix(in lab, #ffffff 85%, black);
+  --diffshub-scrollbar-track-bg: #ffffff;
+}
+
+:where(.dark) .diffshub-theme-bootstrap.diffshub-theme-bootstrap {
+  background-color: #101010;
+  color: #8a8a8a;
+  --color-foreground: #8a8a8a;
+  --foreground: #8a8a8a;
+  --color-muted-foreground: #7e7e7e;
+  --muted-foreground: #7e7e7e;
+  --color-border: color-mix(in srgb, #8a8a8a 20%, transparent);
+  --border: color-mix(in srgb, #8a8a8a 20%, transparent);
+  --color-border-opaque: color-mix(in srgb, #8a8a8a 22%, #101010);
+  --border-opaque: color-mix(in srgb, #8a8a8a 22%, #101010);
+  --diffshub-card-bg: color-mix(in srgb, #8a8a8a 6%, #101010);
+  --diffshub-card-hover-bg: color-mix(in srgb, #8a8a8a 12%, #101010);
+  --diffshub-card-border: color-mix(in srgb, #8a8a8a 12%, #101010);
+  --diffshub-popover-bg: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --diffshub-popover-fg: #8a8a8a;
+  --diffshub-popover-muted-fg: #7e7e7e;
+  --diffshub-popover-hover-bg: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --diffshub-popover-selected-bg: color-mix(in srgb, #8a8a8a 20%, #101010);
+  --diffshub-popover-border: color-mix(in srgb, #8a8a8a 18%, #101010);
+  --diffshub-popover-shadow:
+    0 8px 16px rgb(0 0 0 / 7%), 0 2px 4px rgb(0 0 0 / 5%);
+  --diffshub-annotation-bg: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --diffshub-annotation-fg: #8a8a8a;
+  --diffshub-annotation-border: color-mix(in srgb, #8a8a8a 18%, #101010);
+  --diffshub-annotation-hover-border: color-mix(in srgb, #8a8a8a 28%, #101010);
+  --diffshub-annotation-shadow:
+    0 8px 16px rgb(0 0 0 / 7%), 0 2px 4px rgb(0 0 0 / 5%);
+  --color-popover: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --popover: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --color-popover-foreground: #8a8a8a;
+  --popover-foreground: #8a8a8a;
+  --color-card: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --card: color-mix(in srgb, #8a8a8a 7%, #101010);
+  --color-card-foreground: #8a8a8a;
+  --card-foreground: #8a8a8a;
+  --color-background: #101010;
+  --background: #101010;
+  --color-accent: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --accent: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --color-accent-foreground: #8a8a8a;
+  --accent-foreground: #8a8a8a;
+  --color-secondary: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --secondary: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --color-secondary-foreground: #8a8a8a;
+  --secondary-foreground: #8a8a8a;
+  --color-input: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --input: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --color-muted: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --muted: color-mix(in srgb, #8a8a8a 14%, #101010);
+  --color-primary: #8a8a8a;
+  --primary: #8a8a8a;
+  --color-primary-foreground: #101010;
+  --primary-foreground: #101010;
+  --color-ring: #8a8a8a;
+  --ring: #8a8a8a;
+  --diffshub-comment-add-fg: #34d399;
+  --diffshub-comment-del-fg: #fb7185;
+  --diffshub-diff-separator: color-mix(in srgb, #8a8a8a 22%, #101010);
+  --diffshub-scrollbar-thumb-bg: color-mix(in lab, #171717 80%, white);
+  --diffshub-scrollbar-track-bg: #171717;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --border-opaque: color-mix(
+      in oklch,
+      var(--diffshub-sidebar-bg) 90%,
+      oklch(1 0 0)
+    );
+    --color-border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.488 0.243 264.376);
+    --chart-2: oklch(0.696 0.17 162.48);
+    --chart-3: oklch(0.769 0.188 70.08);
+    --chart-4: oklch(0.627 0.265 303.9);
+    --chart-5: oklch(0.645 0.246 16.439);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+    color-scheme: dark;
+  }
+}
+
+@media (width <= 768px) {
+  body.diffshub {
+    background-color: light-dark(#fff, oklch(14.5% 0 0));
+  }
+}
+
+/* next/font loads Geist on diffshub.com; the geist package has the same font. */
+@font-face {
+  font-family: 'Geist';
+  src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Regular.ttf') format('truetype');
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Medium.ttf') format('truetype');
+  font-weight: 500;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-SemiBold.ttf') format('truetype');
+  font-weight: 600;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Bold.ttf') format('truetype');
+  font-weight: 700;
+}
+
+:root {
+  --font-geist-sans: 'Geist', system-ui, sans-serif;
+  --font-berkeley-mono: 'Berkeley Mono', Menlo, 'DejaVu Sans Mono', 'Liberation Mono', monospace;
+  --diffs-font-family: var(--font-berkeley-mono);
+  --cv-gutter-vertical: 0px;
+  --cv-gutter-horizontal: 0px;
+  --cv-mini-gutter-vertical: 0px;
+  --cv-mini-gutter-horizontal: 0px;
+  color-scheme: light;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-geist;
+  }
+  body.diffshub {
+    background-color: var(--diffshub-sidebar-bg);
+  }
+  textarea {
+    @apply outline-offset-1;
+  }
+  code {
+    font-family: var(--diffs-font-family);
+    font-size: 95%;
+    font-weight: 500;
+    color: var(--color-primary);
+    letter-spacing: -0.025em;
+  }
+
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply scroll-mt-5;
+  }
+
+  /* Heading anchor links */
+  .heading-anchor {
+    @apply text-muted-foreground hover:text-foreground ml-2 opacity-0 transition-opacity duration-200;
+    text-decoration: none !important;
+    font-weight: 400;
+    display: inline-flex;
+    align-items: center;
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.2em;
+  }
+
+  .heading-anchor svg {
+    display: block;
+  }
+
+  :is(h2, h3, h4):hover .heading-anchor,
+  .heading-anchor:focus-visible {
+    @apply opacity-50;
+  }
+
+  :is(h2, h3, h4):hover .heading-anchor:hover {
+    @apply opacity-75;
+  }
+
+  .docs-prose code {
+    color: color-mix(in lab, var(--color-primary), currentcolor) !important;
+  }
+
+  .inline-link {
+    @apply text-foreground hover:text-foreground decoration-muted-foreground hover:decoration-foreground underline decoration-[1px] underline-offset-3 transition-[text-decoration-color,text-underline-offset];
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+.gridstack {
+  display: grid;
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+
+  > * {
+    grid-column-start: 1;
+    grid-row-start: 1;
+  }
+}
+
+.diff-container {
+  @apply overflow-hidden rounded-lg border border-transparent dark:border-neutral-800;
+}
+
+.cv-scrollbar {
+  /* Themed thumb from the diffshub chrome mapping (deriveChromeTokens);
+     light-dark fallback for non-themed contexts. */
+  --cv-scrollbar-thumb-bg: var(
+    --diffshub-scrollbar-thumb-bg,
+    light-dark(
+      color-mix(in lab, var(--background) 85%, black),
+      color-mix(in lab, var(--background) 80%, white)
+    )
+  );
+  scrollbar-gutter: stable;
+}
+
+.cv-scrollbar::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+.cv-scrollbar::-webkit-scrollbar-track {
+  /* Themed editor surface so the gutter isn't a dark band beside the diff;
+     transparent fallback keeps default behavior. */
+  background: var(--diffshub-scrollbar-track-bg, transparent);
+  /* Reuse the inter-file separator so the gutter edge reads as one hairline
+     with the file boundaries. */
+  border-left: 1px solid
+    var(--diffshub-diff-separator, var(--color-border-opaque));
+  margin-top: -1px;
+}
+
+.cv-scrollbar::-webkit-scrollbar-thumb {
+  background-color: var(--cv-scrollbar-thumb-bg);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: 6px;
+}
+
+.cv-mini-scrollbar {
+  --cv-mini-scrollbar-thumb-bg: transparent;
+  scrollbar-gutter: stable;
+}
+
+.cv-mini-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.cv-mini-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.cv-mini-scrollbar:hover {
+  --cv-mini-scrollbar-thumb-bg: light-dark(
+    color-mix(in lab, var(--background) 85%, black),
+    color-mix(in lab, var(--background) 80%, white)
+  );
+}
+
+.cv-mini-scrollbar::-webkit-scrollbar-thumb {
+  background-color: var(--cv-mini-scrollbar-thumb-bg);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 5px;
+}
+
+@supports (-moz-appearance: none) {
+  .cv-scrollbar {
+    scrollbar-color: var(--cv-scrollbar-thumb-bg)
+      var(--diffshub-scrollbar-track-bg, transparent);
+  }
+  .cv-mini-scrollbar {
+    scrollbar-color: var(--cv-mini-scrollbar-thumb-bg) transparent;
+    scrollbar-width: thin;
+  }
+}
+
+[data-slot='header'] {
+  @apply border-b border-transparent transition-[border-color] duration-200;
+}
+[data-slot='header'].is-stuck {
+  @apply border-foreground/10;
+}
+
+/* Shared mobile popover surface (docs sidebar, header menu, playground drawer) */
+.mobile-popover {
+  @apply bg-background fixed top-16 right-4 left-4 z-[60];
+  @apply max-h-[80dvh] overflow-y-auto;
+  @apply -translate-y-2;
+  @apply rounded-xl border border-[rgb(0_0_0_/_0.15)] bg-clip-padding p-4 dark:border-[rgb(255_255_255_/_0.1)];
+  @apply opacity-0 shadow-2xl;
+  @apply pointer-events-none transition-all duration-200 ease-out;
+  @apply [scrollbar-color:transparent_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin];
+  @apply hover:[scrollbar-color:auto];
+
+  &.is-open {
+    @apply pointer-events-auto translate-y-0 opacity-100;
+  }
+}
+
+/* FAQ accordion: animate expand/collapse using the ::details-content pseudo-element
+   (Chrome 131+, Firefox 143+, Safari 18.4+). In older browsers the items still
+   work — they just open instantly. height animates to `auto` via interpolate-size
+   when supported; falls back to a fixed cap with scroll otherwise. */
+@supports selector(::details-content) {
+  .faq-item {
+    interpolate-size: allow-keywords;
+  }
+
+  .faq-item::details-content {
+    block-size: 0;
+    overflow-y: clip;
+    transition:
+      content-visibility 0.2s ease allow-discrete,
+      block-size 0.2s;
+  }
+
+  .faq-item[open]::details-content {
+    block-size: auto;
+  }
+}
+
+.diffshub-border-deleted {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.diffshub-border-deleted::before {
+  flex-shrink: 0;
+  display: block;
+  content: '';
+  width: 4px;
+  height: 24px;
+  background-image: linear-gradient(
+    0deg,
+    light-dark(#ff2e3f, #ff6762) 50%,
+    light-dark(#ffdbd6, #3e1715) 50%
+  );
+  background-repeat: repeat;
+  background-size: 2px 2px;
+  background-size: calc(1lh / round(1lh / 2px)) calc(1lh / round(1lh / 2px));
+  border-radius: 4px 0 0 4px;
+}
+
+/* Docs sidebar: shares mobile popover styles, adds desktop sticky overrides */
+.docs-sidebar {
+  /* Desktop sticky sidebar */
+  @apply md:pointer-events-auto md:relative md:z-auto;
+  @apply md:top-auto md:right-auto md:left-auto;
+  @apply md:translate-y-0 md:transform-none;
+  @apply md:rounded-none md:border-none md:bg-transparent;
+  @apply md:p-0 md:opacity-100 md:shadow-none md:transition-none;
+  @apply md:sticky md:top-22 md:max-h-[calc(100vh-112px)];
+}
