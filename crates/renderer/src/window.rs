@@ -1,7 +1,8 @@
 use crate::{
     App, Backdrop, BorderStyle, Bounds, BoxShadow, Child, ContentMask, CursorStyle, DevicePixels,
     Edges, ElementId, Modifiers, MouseEvent, PaintEffect, Pixels, PlatformInput, Point, Radii,
-    RenderImage, Rgba, ScaledPixels, ScrollDelta, ScrollHandle, Size, Tree, Utf16Selection,
+    RenderImage, Rgba, ScaledPixels, ScrollDelta, ScrollHandle, ScrollPhase, Size, Tree,
+    Utf16Selection,
     atlas::AtlasKey,
     geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
     input::{DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
@@ -524,6 +525,19 @@ impl Frame {
 }
 
 /// A native window and the state of the frame it draws.
+/// The trackpad gesture going on in a window.
+#[derive(Default)]
+pub(crate) struct ScrollGesture {
+    /// The box that takes the whole gesture, as in browsers.
+    pub(crate) latch: Option<ScrollHandle>,
+    /// The box's bounce started, so the rest of the momentum does nothing.
+    pub(crate) spent: bool,
+    /// Pixels per second, in the direction of the deltas.
+    pub(crate) speed: Point<f32>,
+    /// The outermost box seen at its edge, with the rest of the delta. It stretches when no box moves.
+    pub(crate) edge: Option<(ScrollHandle, Point<Pixels>)>,
+}
+
 pub struct Window {
     pub(crate) id: WindowId,
     pub(crate) platform: platform::Window,
@@ -555,6 +569,7 @@ pub struct Window {
     pub(crate) captures: Vec<CaptureCallback>,
     pub(crate) dirty: bool,
     redraw: [bool; 2],
+    rebuild: bool,
     drawing: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
@@ -569,6 +584,7 @@ pub struct Window {
     pub(crate) rails: ([f32; 2], std::time::Instant),
     /// The boxes that may scroll for the wheel event being dispatched, innermost first.
     pub(crate) scroll_chain: Option<Vec<ScrollHandle>>,
+    pub(crate) gesture: ScrollGesture,
 }
 
 impl Window {
@@ -607,9 +623,11 @@ impl Window {
             tracks: Vec::new(),
             rails: ([0.; 2], std::time::Instant::now()),
             scroll_chain: None,
+            gesture: ScrollGesture::default(),
             captures: Vec::new(),
             dirty: false,
             redraw: [false; 2],
+            rebuild: false,
             drawing: false,
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
@@ -664,6 +682,12 @@ impl Window {
         } else {
             self.refresh();
         }
+    }
+
+    /// Builds the view again before layout, when called while it builds. The boxes of this build stay in
+    /// the tree, so the next one links what did not change.
+    pub fn rebuild(&mut self) {
+        self.rebuild = true;
     }
 
     /// Whether this draw replaces one that called [`Self::redraw`].
@@ -953,14 +977,16 @@ impl Window {
             }
             if let Some(mut view) = self.view.take() {
                 let mut tree = self.tree.take().unwrap_or_default();
-                tree.begin(self.scale_factor, self.text_system.generation());
-                let root = view.render(&tree, self, cx);
+                let root = self.build(&mut tree, cx, |tree, window, cx| view.render(tree, window, cx));
                 self.view = Some(view);
-                if let Some(root) = tree.commit_root(root, self.viewport_size, self.scale_factor) {
+                if let Some(root) = root {
                     tree.layout(root, self.viewport_size, self);
                     tree.prepaint(root, self);
                     self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
-                    tree.paint(root, self);
+                    // WARNING: a pass that draws again replaces this scene, so it is not painted.
+                    if !self.redraw[0] || self.redraw[1] {
+                        tree.paint(root, self);
+                    }
                 }
                 self.tree = Some(tree);
             }
@@ -980,6 +1006,8 @@ impl Window {
         mem::swap(&mut self.states, &mut self.next_states);
         self.scene.finish();
         let captures = mem::take(&mut self.captures);
+        #[cfg(target_os = "macos")]
+        self.platform.set_drawable_size(self.native.0, self.native.1);
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
         self.text_system.finish_frame();
         self.platform.atlas().finish_frame();
@@ -996,6 +1024,22 @@ impl Window {
             );
         }
         self.update_cursor(cx);
+    }
+
+    fn build(
+        &mut self,
+        tree: &mut Tree,
+        cx: &mut App,
+        mut render: impl FnMut(&Tree, &mut Self, &mut App) -> Child,
+    ) -> Option<taffy::NodeId> {
+        loop {
+            tree.begin(self.scale_factor, self.text_system.generation());
+            let child = render(tree, self, cx);
+            let root = tree.commit_root(child, self.viewport_size, self.scale_factor);
+            if !mem::take(&mut self.rebuild) {
+                return root;
+            }
+        }
     }
 
     /// Commits, lays out and prepaints `render`'s content without painting or showing it, so a
@@ -1015,9 +1059,7 @@ impl Window {
             self.next.clear();
             self.next_hitbox = 0;
             let mut tree = self.tree.take().unwrap_or_default();
-            tree.begin(self.scale_factor, self.text_system.generation());
-            let root = render(&tree, self, cx);
-            if let Some(root) = tree.commit_root(root, self.viewport_size, self.scale_factor) {
+            if let Some(root) = self.build(&mut tree, cx, &mut render) {
                 tree.layout(root, self.viewport_size, self);
                 tree.prepaint(root, self);
             }
@@ -1071,11 +1113,14 @@ impl Window {
             PlatformInput::ScrollWheel(event) => {
                 self.modifiers = event.modifiers;
                 self.scroll_chain = None;
+                self.gesture.edge = None;
                 // Like Chrome on macOS, a trackpad gesture scrolls on the axis that leads its recent
                 // movement, so a vertical swipe doesn't drift sideways. A pause starts a new gesture.
                 if let ScrollDelta::Pixels(delta) = event.delta {
                     let now = std::time::Instant::now();
-                    let [x, y] = if now - self.rails.1 > std::time::Duration::from_millis(100) {
+                    let elapsed = now - self.rails.1;
+                    let paused = elapsed > std::time::Duration::from_millis(100);
+                    let [x, y] = if paused {
                         [0.; 2]
                     } else {
                         self.rails.0.map(|value| value * 0.8)
@@ -1084,6 +1129,35 @@ impl Window {
                         [x + f32::from(delta.x).abs(), y + f32::from(delta.y).abs()],
                         now,
                     );
+                    if paused {
+                        self.gesture.speed = Point::default();
+                    } else if delta != Point::default() {
+                        let seconds = elapsed.as_secs_f32().max(1. / 120.);
+                        let speed =
+                            |old: f32, delta: Pixels| (old + f32::from(delta) / seconds) / 2.;
+                        self.gesture.speed = point(
+                            speed(self.gesture.speed.x, delta.x),
+                            speed(self.gesture.speed.y, delta.y),
+                        );
+                    }
+                    let phase = event.phase;
+                    if phase == ScrollPhase::Began || phase == ScrollPhase::None && paused {
+                        if let Some(handle) = self.gesture.latch.take() {
+                            handle.release(Point::default(), self);
+                        }
+                        self.gesture.spent = false;
+                    }
+                    if matches!(phase, ScrollPhase::Ended | ScrollPhase::MomentumEnded)
+                        && let Some(handle) = self.gesture.latch.clone()
+                        && handle.release(self.gesture.speed, self)
+                    {
+                        self.gesture.spent = true;
+                    }
+                    if phase == ScrollPhase::MomentumEnded {
+                        self.gesture.latch = None;
+                    }
+                } else if let Some(handle) = self.gesture.latch.take() {
+                    handle.release(Point::default(), self);
                 }
             }
             PlatformInput::ModifiersChanged(event) => self.modifiers = event.modifiers,
@@ -1132,6 +1206,11 @@ impl Window {
             if self.rendered.mouse_listeners.is_empty() {
                 self.rendered.mouse_listeners = listeners;
             }
+            if let (PlatformInput::ScrollWheel(event), Some((handle, rest))) =
+                (&event, self.gesture.edge.take())
+            {
+                self.overscroll(handle, rest, event.phase);
+            }
         } else if let Some(mut view) = self.view.take() {
             view.event(&event, self, cx);
             if self.view.is_none() {
@@ -1139,6 +1218,27 @@ impl Window {
             }
         }
         !cx.propagate_event
+    }
+
+    /// Stretches a box past its edges by the rest of a trackpad delta. Momentum bounces at once.
+    pub(crate) fn overscroll(
+        &mut self,
+        handle: ScrollHandle,
+        rest: Point<Pixels>,
+        phase: ScrollPhase,
+    ) {
+        handle.stretch_by(rest);
+        self.gesture.edge = None;
+        self.gesture.latch = Some(handle.clone());
+        match phase {
+            ScrollPhase::Momentum => {
+                self.gesture.spent = true;
+                handle.release(self.gesture.speed, self);
+            }
+            ScrollPhase::None => handle.loosen(self),
+            _ => {}
+        }
+        self.refresh();
     }
 
     /// Lets only these boxes scroll for the wheel event being dispatched, innermost first.

@@ -1364,6 +1364,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
                     position: state.mouse,
                     delta,
+                    phase: Default::default(),
                     modifiers: state.modifiers,
                 });
                 drop(state);

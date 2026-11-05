@@ -287,17 +287,19 @@ impl Scrollbar {
                 (state.clone(), state)
             },
         );
-        let (bounds, max, offset) = (
+        let (bounds, max, offset, stretch) = (
             self.handle.bounds(),
             self.handle.max_offset(),
             self.handle.offset(),
+            self.handle.stretch(),
         );
         {
             let mut state = state.borrow_mut();
-            if state.offset.is_some_and(|old| old != offset) {
+            let drawn = offset + stretch;
+            if state.offset.is_some_and(|old| old != drawn) {
                 state.active = Some(Instant::now());
             }
-            state.offset = Some(offset);
+            state.offset = Some(drawn);
         }
         let shown = look.shown(self.axes, max);
         // WARNING: custom bars take layout space from last frame's overflow, so a change lays the frame out again.
@@ -319,9 +321,10 @@ impl Scrollbar {
             None => OVERLAY[usize::from(look.thin)][0],
         });
         let space = look.space(shown);
-        let (max, offset) = (
+        let (max, offset, stretch) = (
             [max.x, max.y].map(f32::from),
             [offset.x, offset.y].map(f32::from),
+            [stretch.x, stretch.y].map(f32::from),
         );
         let inset = if look.custom.is_some() { 0. } else { INSET };
         let bars = [0, 1].map(|axis| {
@@ -354,6 +357,14 @@ impl Scrollbar {
                     .max(shortest)
                     .min(track[1]);
                 thumb[0] += (track[1] - thumb[1]) * (-offset[axis] / max[axis]).clamp(0., 1.);
+                // Like NSScroller, overlay knobs shrink against the edge while the box bounces.
+                if look.custom.is_none() && stretch[axis] != 0. {
+                    let end = thumb[0] + thumb[1];
+                    thumb[1] = (thumb[1] - stretch[axis].abs()).max(shortest.min(thumb[1]));
+                    if stretch[axis] < 0. {
+                        thumb[0] = end - thumb[1];
+                    }
+                }
             }
             Some(Bar {
                 hitbox: window.insert_hitbox(zone, HitboxBehavior::BlockMouseExceptScroll),

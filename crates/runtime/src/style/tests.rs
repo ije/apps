@@ -48,7 +48,7 @@ fn container_queries_parse_and_follow_container_sizes() {
         compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None).values
     };
     assert!(compute(&mut cache)[outer].get(Prop::COLOR) != Some("red"));
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 100.])]), &doc));
     let values = compute(&mut cache);
     assert_eq!(&values[outer]["color"], "red");
     assert_eq!(&values[outer]["order"], "5");
@@ -56,8 +56,8 @@ fn container_queries_parse_and_follow_container_sizes() {
     assert_eq!(&values[inner]["color"], "red");
     assert_eq!(&values[inner]["width"], "1px");
     assert!(!values[inner].contains(Prop::ORDER) && !values[inner].contains(Prop::HEIGHT));
-    assert!(!cache.set_containers(&HashMap::from([(a, [450., 50.]), (b, [200., 100.])])));
-    assert!(cache.set_containers(&HashMap::from([(a, [90., 50.]), (b, [200., 100.])])));
+    assert!(!cache.set_containers(&HashMap::from([(a, [450., 50.]), (b, [200., 100.])]), &doc));
+    assert!(cache.set_containers(&HashMap::from([(a, [90., 50.]), (b, [200., 100.])]), &doc));
     let values = compute(&mut cache);
     assert!(values[outer].get(Prop::COLOR) != Some("red"));
     assert_eq!(&values[outer]["z-index"], "3");
@@ -1782,7 +1782,7 @@ fn collapsed_table_borders_straddle_grid_lines() {
     assert_eq!(edges("#separate", PADDING), [3.; 4]);
 }
 
-fn typed(values: &BTreeMap<String, String>) -> Style {
+fn typed(values: &BBTreeMap<String, String>) -> Style {
     values
         .iter()
         .map(|(name, value)| (Prop::new(name), value.as_str().into()))
@@ -2120,7 +2120,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed
     };
     compute(&mut cache);
-    assert!(cache.set_containers(&HashMap::from([(container, [500., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(container, [500., 100.])]), &doc));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2134,7 +2134,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed.values[element(&doc, "#v")].get(Prop::FONT_SIZE),
         Some("8px")
     );
-    assert!(cache.set_containers(&HashMap::from([(container, [300., 100.])])));
+    assert!(cache.set_containers(&HashMap::from([(container, [300., 100.])]), &doc));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2355,6 +2355,33 @@ fn elliptical_border_radii_keep_both_axes() {
 }
 
 #[test]
+fn overscroll_behavior_sets_both_axes() {
+    let axes = |source: &str| {
+        let style = declarations(source);
+        [Prop::OVERSCROLL_BEHAVIOR_X, Prop::OVERSCROLL_BEHAVIOR_Y]
+            .map(|prop| style.get(prop).map(str::to_owned))
+    };
+    let pair = |x: &str, y: &str| [Some(x.to_owned()), Some(y.to_owned())];
+    assert_eq!(axes("overscroll-behavior: none"), pair("none", "none"));
+    assert_eq!(
+        axes("overscroll-behavior: contain none"),
+        pair("contain", "none")
+    );
+    assert_eq!(
+        axes("overscroll-behavior-inline: contain; overscroll-behavior-block: none"),
+        pair("contain", "none")
+    );
+    assert_eq!(supports("overscroll-behavior", "auto contain"), Some(true));
+    assert_eq!(supports("overscroll-behavior-y", "none"), Some(true));
+    assert_eq!(supports("overscroll-behavior-block", "contain"), Some(true));
+    assert_eq!(supports("overscroll-behavior", "scroll"), Some(false));
+    assert_eq!(
+        declare("overscroll-behavior-block: none")[0][0],
+        "overscroll-behavior-y"
+    );
+}
+
+#[test]
 fn syntax_checks_never_split_multibyte_text() {
     assert!(!syntax_matches("x(", "aéé"));
     assert!(!syntax_matches("<length> | fit-content(", "aaéé"));
@@ -2445,16 +2472,86 @@ fn container_units_follow_each_container_and_the_viewport() {
         computed
     };
     compute(&mut cache, 800.);
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 50.])]), &doc));
     let computed = compute(&mut cache, 800.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "8px");
     assert_eq!(&computed.values[v]["font-size"], "40px");
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])]), &doc));
     let computed = compute(&mut cache, 400.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "12px");
     assert_eq!(&computed.values[v]["font-size"], "20px");
+}
+
+#[test]
+fn a_container_query_flip_restyles_only_inside_its_container() {
+    let doc = Document::parse(
+        "<style>@container (width > 400px){.x{color:red}}</style><div id=a style='container-type:inline-size'><p class=x></p></div><div id=b style='container-type:inline-size'><p class=x></p></div>",
+    );
+    let [a, b] = ["#a", "#b"].map(|selector| element(&doc, selector));
+    let [p, q] = [a, b].map(|id| doc.nodes[id].children[0]);
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let mut compute = |cache: &mut StyleCache| {
+        let computed = compute_styles(&doc, 800., 600., None, &mut sheets, cache, None);
+        cache.finish();
+        computed
+    };
+    compute(&mut cache);
+    cache.set_containers(&HashMap::from([(a, [300., 50.]), (b, [300., 50.])]), &doc);
+    let before = compute(&mut cache);
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])]), &doc));
+    let after = compute(&mut cache);
+    assert_eq!(after.values[p].get(Prop::COLOR), Some("red"));
+    assert_ne!(after.values[q].get(Prop::COLOR), Some("red"));
+    assert!(Rc::ptr_eq(&before.values[q], &after.values[q]));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [500., 50.])]), &doc));
+    assert_eq!(compute(&mut cache).values[q].get(Prop::COLOR), Some("red"));
+}
+
+#[test]
+fn children_keep_their_styles_when_a_parent_changes_what_it_does_not_pass_on() {
+    let mut doc = Document::parse(
+        "<div id=a style='height:1px;color:red'><p id=b></p><p id=c style='height:inherit'></p></div>",
+    );
+    let [a, b, c] = ["#a", "#b", "#c"].map(|selector| element(&doc, selector));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let mut compute = |doc: &Document, cache: &mut StyleCache| {
+        let computed = compute_styles(doc, 800., 600., None, &mut sheets, cache, None);
+        cache.finish();
+        computed
+    };
+    let first = compute(&doc, &mut cache);
+    doc.nodes[a].attrs.insert("style".into(), "height:2px;color:red".into());
+    let second = compute(&doc, &mut cache);
+    assert!(Rc::ptr_eq(&first.values[b], &second.values[b]));
+    assert_eq!(second.values[c].get(Prop::HEIGHT), Some("2px"));
+    doc.nodes[a].attrs.insert("style".into(), "height:2px;color:blue".into());
+    assert_eq!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("blue"));
+}
+
+#[test]
+fn attributes_that_no_selector_reads_keep_matches() {
+    let mut doc = Document::parse(
+        "<style>[data-on] p{color:red}[aria-x=y]{color:blue}</style><div id=a><p id=b></p></div><i id=c></i>",
+    );
+    let [a, b, c] = ["#a", "#b", "#c"].map(|selector| element(&doc, selector));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let mut compute = |doc: &Document, cache: &mut StyleCache| {
+        let computed = compute_styles(doc, 800., 600., None, &mut sheets, cache, None);
+        cache.finish();
+        computed
+    };
+    compute(&doc, &mut cache);
+    doc.nodes[a].attrs.insert("data-off".into(), "1".into());
+    assert_ne!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("red"));
+    doc.nodes[a].attrs.insert("data-on".into(), "1".into());
+    assert_eq!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("red"));
+    doc.nodes[c].attrs.insert("aria-x".into(), "y".into());
+    assert_eq!(compute(&doc, &mut cache).values[c].get(Prop::COLOR), Some("blue"));
 }
 
 #[test]
@@ -2472,11 +2569,11 @@ fn container_queries_flip_after_a_resize_that_keeps_media_results() {
         computed
     };
     compute(&mut cache, 800.);
-    cache.set_containers(&HashMap::from([(a, [300., 50.])]));
+    cache.set_containers(&HashMap::from([(a, [300., 50.])]), &doc);
     let red = Some("red");
     assert_ne!(compute(&mut cache, 800.).values[p].get(Prop::COLOR), red);
     assert_ne!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.])])));
+    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.])]), &doc));
     assert_eq!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
 }
 

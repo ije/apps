@@ -55,6 +55,8 @@ pub(crate) struct LayoutNode {
     /// A hash of the units the style's lengths resolve with.
     pub units: u64,
     pub children: Vec<(usize, u64)>,
+    /// The summed revisions of the children out of the flow.
+    pub(crate) out: u64,
     pub revision: u64,
     /// The revision of the last change that could move or resize a box in the subtree.
     pub geometry: u64,
@@ -330,6 +332,8 @@ pub struct State {
     /// Grids sized by a flex layout: per axis, the content size their tracks used and the
     /// padding and borders. Prepaint renders again when the laid-out size differs.
     pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
+    /// The max-content width of grids that shrink to fit, when their tracks were last sized.
+    pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
     pub(crate) baselines: crate::render::grid::Baselines,
     /// Boxed, since the list is as long as the node arena, whose free slots outnumber the nodes after a big page
     /// shrinks.
@@ -388,6 +392,9 @@ pub struct State {
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
     pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    /// The geometry and small rasters of inline SVGs by source, so the icons of a list that recycles its rows are
+    /// parsed and drawn once.
+    pub(crate) svg_cache: HashMap<String, (crate::render::canvas::SvgGeometry, Vec<Arc<renderer::RenderImage>>)>,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     /// Gradient bitmaps by their inputs, oldest first, that boxes built again reuse, like the rows of a
     /// scrolling list.
@@ -509,8 +516,8 @@ impl State {
         }
     }
 
-    pub(crate) fn update_containers(&mut self) -> bool {
-        let changed = self.style_cache.set_containers(&self.containers);
+    pub(crate) fn update_containers(&mut self, doc: &Document) -> bool {
+        let changed = self.style_cache.set_containers(&self.containers, doc);
         if changed {
             self.invalidate();
         }
@@ -1086,7 +1093,13 @@ pub fn call(
                         .extend(state.canvases.remove(&id).map(|canvas| canvas.image));
                     state
                         .retired
-                        .extend(state.svgs.remove(&id).map(|(_, image)| image));
+                        .extend(
+                            state
+                                .svgs
+                                .remove(&id)
+                                .map(|(_, image)| image)
+                                .filter(|image| Arc::strong_count(image) == 1),
+                        );
                     state
                         .retired
                         .extend(state.masks.remove(&id).map(|(_, image)| image));
@@ -3142,7 +3155,7 @@ mod tests {
     fn kept_containers_keep_their_sizes_between_frames() {
         let mut state = super::State::default();
         state.containers.insert(1, [150., 20.]);
-        state.update_containers();
+        state.update_containers(&Document::default());
         assert_eq!(state.containers.get(&1), Some(&[150., 20.]));
     }
 

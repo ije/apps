@@ -84,7 +84,7 @@ export default {
 }
 ```
 
-`apps run` and `apps build` run the loaders with Node APIs. `load()` gets the absolute path and the text of each imported file with that extension, in main, preload and page scripts, `node_modules` included. It returns `type` (`js`, `jsx`, `ts` or `tsx`), `code` and an optional source map, as an object or a JSON string, or a Promise of them. Errors and stack traces map to the original file. See [examples/vue](examples/vue).
+`apps run` and `apps build` run the loaders with Node APIs. `load()` gets the absolute path and the text of each imported file with that extension, in main, preload and page scripts, `node_modules` included. It returns `type` (`js`, `jsx`, `ts` or `tsx`), `code` and an optional source map, as an object or a JSON string, or a Promise of them. Errors and stack traces map to the original file. See [examples/vue](examples/vue) and [examples/svelte](examples/svelte).
 
 WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by default. Turn them on with `features` in `package.json`:
 
@@ -217,4 +217,4 @@ Page scripts run in JavaScriptCore. They can import `greet` from the preload. Th
 
 Run `apps run` or `apps build` from the app folder. The CLI uses Cargo to compile the executable. It creates a manifest in `.apps/cargo/` if the app has no `Cargo.toml`. Set `APPS_RUST_SDK` to the `crates/runtime` directory if the CLI has moved away from its source checkout.
 
-To add a crate, put a `Cargo.toml` next to `package.json`. Add `apps = { package = "apps-runtime", path = "/path/to/h2o/crates/runtime" }` under `[dependencies]`. The path in `main` must match a Cargo binary target. Cargo detects `src/main.rs` by default. See [examples/rust](examples/rust) for a complete app.
+To add a crate, put a `Cargo.toml` next to `package.json`. Add `apps = { package = "apps-runtime", path = "/path/to/apps/crates/runtime" }` under `[dependencies]`. The path in `main` must match a Cargo binary target. Cargo detects `src/main.rs` by default. See [examples/rust](examples/rust) for a complete app.

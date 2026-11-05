@@ -170,6 +170,8 @@ const KINDS: usize = 7;
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
+    /// The attributes the scope's selectors read.
+    pub(crate) attributes: rustc_hash::FxHashSet<String>,
     nodes: Vec<Option<Box<Snapshot>>>,
     /// The document revision of each node when `nodes` last compared it.
     seen: Vec<u64>,
@@ -235,7 +237,15 @@ impl SelectorCache {
             let attributes = node
                 .attrs
                 .iter()
-                .filter(|(key, _)| key.as_str() != "style")
+                // WARNING: only selectors read these, as pseudo-classes read none of them, so a list that recycles
+                // its rows keeps the matches of rows that changed only their labels.
+                .filter(|(key, _)| {
+                    key.as_str() != "style"
+                        && (!(key.starts_with("data-")
+                            || key.starts_with("aria-")
+                            || matches!(key.as_str(), "key" | "title" | "role" | "tabindex"))
+                            || self.attributes.contains(key.as_str()))
+                })
                 .fold(rustc_hash::FxHasher::default(), |mut state, pair| {
                     pair.hash(&mut state);
                     state
@@ -500,6 +510,26 @@ impl Selector {
     }
 
     /// Interaction states and `:has()` used here; nested `&` lists are added to `parents`.
+    /// Adds the attributes that the selector reads, without those of `&` parents.
+    pub(crate) fn attributes(&self, names: &mut rustc_hash::FxHashSet<String>) {
+        if let Some((_, previous)) = &self.previous {
+            previous.attributes(names);
+        }
+        for simple in &self.simple {
+            match simple {
+                SimpleSelector::Attribute(name, ..) => {
+                    names.insert(name.to_ascii_lowercase());
+                }
+                SimpleSelector::Pseudo(_, _, parsed, _) => {
+                    for selector in parsed {
+                        selector.attributes(names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) fn states(&self, parents: &mut Vec<SelectorList>) -> u16 {
         let mut states = self
             .previous

@@ -112,9 +112,9 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     let name = library_name(platform)?;
     // WARNING: a built app must never load a library named by the environment or the build machine.
     if [
-        "app.h2o",
+        "app.bundle",
         "app.js",
-        "../Resources/app.h2o",
+        "../Resources/app.bundle",
         "../Resources/app.js",
     ]
     .iter()

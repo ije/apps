@@ -253,7 +253,7 @@ impl Hooks for DomBox {
                     0 => dom.scroll.get(&0).map(|scroll| {
                         let [width, height] = self.units.viewport;
                         Bounds::new(
-                            scroll.bounds().origin + scroll.offset(),
+                            scroll.bounds().origin + scroll.offset() + scroll.stretch(),
                             renderer::size(px(width), px(height)),
                         )
                     }),

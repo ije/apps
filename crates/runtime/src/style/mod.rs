@@ -1,6 +1,6 @@
 use crate::dom::{Document, Selector, SelectorCache, SelectorList};
 use rustc_hash::FxHashMap;
-use std::collections::BTreeMap;
+use bbtree::unsync::BBTreeMap;
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 mod animation;
@@ -402,6 +402,8 @@ struct CachedStyle {
     starting: Option<Rc<Style>>,
     /// The font size or line height uses viewport units, so a resize changes the values.
     viewport: bool,
+    /// A keyword took the value of a property that the parent doesn't pass on by itself.
+    keyword: bool,
 }
 
 /// A bucket key: id, class, tag or attribute name.
@@ -520,6 +522,7 @@ impl StyleScope {
             if seen.insert(Rc::as_ptr(&list)) {
                 for selector in list.iter() {
                     self.states |= selector.states(&mut lists);
+                    selector.attributes(&mut self.matches.attributes);
                 }
             }
         }
@@ -765,7 +768,7 @@ impl StyleCache {
         }
     }
 
-    pub(crate) fn set_containers(&mut self, sizes: &HashMap<usize, [f32; 2]>) -> bool {
+    pub(crate) fn set_containers(&mut self, sizes: &HashMap<usize, [f32; 2]>, doc: &Document) -> bool {
         self.units = false;
         if *sizes == self.containers {
             return false;
@@ -790,36 +793,48 @@ impl StyleCache {
         // WARNING: queries record their container even while it has no size yet, and container units are in
         // `sized`, so new or removed containers that no query result depends on don't style again. A list
         // that builds rows with containers as it scrolls would otherwise style and lay out every frame twice.
-        let changed = self.queries.iter().any(
-            |(&(scope, order, index, container), &(inline, matched, font))| {
-                let query = self
-                    .scopes
-                    .iter()
-                    .find(|cached| cached.id == scope)
-                    .and_then(|scope| scope.containers.get(order)?.as_ref()?.get(index));
-                query.is_none_or(|(_, _, query)| {
-                    sizes.get(&container).is_some_and(|size| {
-                        query.matches(
-                            size[0],
-                            if inline { f32::NAN } else { size[1] },
-                            false,
-                            0,
-                            font,
-                        ) == Some(true)
-                    }) != matched
-                })
-            },
-        );
+        let mut flipped = Vec::new();
+        for (&(scope, order, index, container), &(inline, matched, font)) in &self.queries {
+            let query = self
+                .scopes
+                .iter()
+                .find(|cached| cached.id == scope)
+                .and_then(|scope| scope.containers.get(order)?.as_ref()?.get(index));
+            if query.is_none_or(|(_, _, query)| {
+                sizes.get(&container).is_some_and(|size| {
+                    query.matches(
+                        size[0],
+                        if inline { f32::NAN } else { size[1] },
+                        false,
+                        0,
+                        font,
+                    ) == Some(true)
+                }) != matched
+            }) {
+                flipped.push(container);
+            }
+        }
         self.containers = sizes.clone();
-        if changed {
-            self.queries.clear();
+        if flipped.is_empty() {
+            return false;
+        }
+        // WARNING: a query result reaches only the boxes inside its container. Other boxes keep their styles and
+        // recorded queries, or every flip in a long list would style the whole page again.
+        self.queries
+            .retain(|&(_, _, _, container), _| !flipped.contains(&container));
+        let mut pending = flipped;
+        while let Some(id) = pending.pop() {
+            let Some(node) = doc.nodes.get(id) else {
+                continue;
+            };
+            pending.extend(&node.children);
             for scope in &mut self.scopes {
-                for node in scope.nodes.iter_mut().flatten() {
+                if let Some(Some(node)) = scope.nodes.get_mut(id) {
                     node.cached = None;
                 }
             }
         }
-        changed
+        true
     }
 
     /// The `@font-face` rules of the sheets that the latest pass used, in order.
@@ -1063,7 +1078,7 @@ enum MediaQuery {
     Or(Vec<MediaQuery>),
 }
 
-// WARNING: keep sorted; `@supports`, `CSS.supports()`, `el.style` and the devtools lint all read this, so list only what h2o applies.
+// WARNING: keep sorted; `@supports`, `CSS.supports()`, `el.style` and the devtools lint all read this, so list only what @pierre/apps applies.
 const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
     ("-moz-osx-font-smoothing", "auto|grayscale"),
     ("-webkit-app-region", "none|drag|no-drag"),
@@ -1448,6 +1463,11 @@ const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
     ("overflow-wrap", "normal|break-word|anywhere"),
     ("overflow-x", "visible|hidden|clip|scroll|auto|overlay"),
     ("overflow-y", "visible|hidden|clip|scroll|auto|overlay"),
+    ("overscroll-behavior", "[auto|contain|none]+"),
+    ("overscroll-behavior-block", "auto|contain|none"),
+    ("overscroll-behavior-inline", "auto|contain|none"),
+    ("overscroll-behavior-x", "auto|contain|none"),
+    ("overscroll-behavior-y", "auto|contain|none"),
     ("padding", "[<length-percentage>]+"),
     ("padding-block", "[<length-percentage>]+"),
     ("padding-block-end", "<length-percentage>"),
@@ -1714,6 +1734,8 @@ const INITIAL: &[(&str, &str)] = &[
     ("overflow-wrap", "normal"),
     ("overflow-x", "visible"),
     ("overflow-y", "visible"),
+    ("overscroll-behavior-x", "auto"),
+    ("overscroll-behavior-y", "auto"),
     ("padding-bottom", "0px"),
     ("padding-left", "0px"),
     ("padding-right", "0px"),
@@ -1826,6 +1848,10 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
     ("flex-flow", &["flex-direction", "flex-wrap"]),
     ("gap", &["row-gap", "column-gap"]),
     ("overflow", &["overflow-x", "overflow-y"]),
+    (
+        "overscroll-behavior",
+        &["overscroll-behavior-x", "overscroll-behavior-y"],
+    ),
     ("place-content", &["align-content", "justify-content"]),
     ("place-items", &["align-items", "justify-items"]),
     ("place-self", &["align-self", "justify-self"]),
@@ -3302,7 +3328,7 @@ pub(crate) enum UserSelect {
 }
 
 /// The computed styles of all nodes by property name.
-pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BTreeMap<String, String>> {
+pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, String>> {
     let out = compute_styles(
         doc,
         width,
@@ -4036,6 +4062,7 @@ pub(crate) fn cascade(
     } = out;
     let mut root = FontUnits::new(16.);
     let mut font_metrics = HashMap::new();
+    let mut passed_on = FxHashMap::default();
     for &id in &order {
         if context
             .and_then(|context| context.required.as_ref())
@@ -4100,9 +4127,30 @@ pub(crate) fn cascade(
             })
             .and_then(|node| node.cached.as_ref())
             .filter(|cached| {
-                cached.parent.as_ref().map(|parent| Rc::as_ptr(&parent.0))
-                    == parent_style.map(Rc::as_ptr)
-                    && cached.font == font_key
+                // WARNING: children read only what a parent passes on, so its height or position can change
+                // without restyling the subtree.
+                let same = match (&cached.parent, parent_style) {
+                    (None, None) => true,
+                    (Some(old), Some(new)) => {
+                        Rc::ptr_eq(&old.0, new)
+                            || !cached.value.keyword
+                                && *passed_on
+                                    .entry((Rc::as_ptr(&old.0), Rc::as_ptr(new)))
+                                    .or_insert_with(|| {
+                                        let own = |style: &'_ Rc<Style>| {
+                                            style
+                                                .own()
+                                                .filter(|(prop, _)| prop.inherited())
+                                                .map(|(prop, value)| (prop, value.clone()))
+                                                .collect::<Vec<_>>()
+                                        };
+                                        old.0.get(Prop::DISPLAY) == new.get(Prop::DISPLAY)
+                                            && own(&old.0) == own(new)
+                                    })
+                    }
+                    _ => false,
+                };
+                same && cached.font == font_key
                     && cached.root == root_font
                     && cached.host.as_ref() == host
                     && cached.selection.as_ref() == selection
@@ -4352,10 +4400,15 @@ pub(crate) fn cascade(
             if let Some(node) = scoped.nodes[id].as_mut() {
                 if let Some(key) = &key {
                     node.cached = Some(CachedNode::new(key, cached.clone(), parent_vars, &vars));
-                } else if moved && let Some(node) = node.cached.as_mut() {
-                    node.inherited = parent_vars.cloned();
-                    node.vars = vars.clone();
-                    *cached.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
+                } else if let Some(node) = node.cached.as_mut() {
+                    if let Some(parent) = parent_style {
+                        node.parent = Some(StyleRef(parent.clone()));
+                    }
+                    if moved {
+                        node.inherited = parent_vars.cloned();
+                        node.vars = vars.clone();
+                        *cached.vars.borrow_mut() = (parent_vars.cloned(), vars.clone());
+                    }
                 }
             }
             styles[id] = cached.style.clone();
@@ -4413,7 +4466,7 @@ pub(crate) fn cascade(
         if let Some(vars) = parent_vars {
             style.set_vars(inherit(vars));
         }
-        let mut cascade: BTreeMap<Prop, (CascadeRank, Rc<str>)> = BTreeMap::new();
+        let mut cascade: BBTreeMap<Prop, (CascadeRank, Rc<str>)> = BBTreeMap::new();
         for &(order, [ids, classes, tags]) in &key.rules {
             let (_, declarations, layer) = &rules[order];
             for &(prop, ref value, important) in declarations {
@@ -4679,7 +4732,7 @@ pub(crate) fn cascade(
             &declared,
             &registry,
         );
-        resolve_keywords(&mut style, parent_style.map(Rc::as_ref));
+        let mut keyword = resolve_keywords(&mut style, parent_style.map(Rc::as_ref));
         if decorating
             && style
                 .get(Prop::TEXT_DECORATION_COLOR)
@@ -4964,7 +5017,7 @@ pub(crate) fn cascade(
         }
         units.root = root;
         style.insert(Prop::FONT_SIZE, format!("{size}px"));
-        let mut pseudo_cascade: [BTreeMap<Prop, (CascadeRank, &Rc<str>)>; 16] = Default::default();
+        let mut pseudo_cascade: [BBTreeMap<Prop, (CascadeRank, &Rc<str>)>; 16] = Default::default();
         let mut shadowed: Vec<(CascadeRank, bool, &Rc<str>, &Vec<Declared>)> = Vec::new();
         for &index in &key.pseudos {
             let (pseudo, selector, order, _) = &scoped.pseudos[index];
@@ -5051,7 +5104,7 @@ pub(crate) fn cascade(
                 &declared,
                 &registry,
             );
-            resolve_keywords(&mut values, parent_style.map(Rc::as_ref));
+            keyword |= resolve_keywords(&mut values, parent_style.map(Rc::as_ref));
             if !keep && declared.is_empty() {
                 values.set_vars(empty.clone());
             }
@@ -5059,7 +5112,7 @@ pub(crate) fn cascade(
             starts.insert(id, values.clone());
             values
         });
-        let derive = |mut cascade: BTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
+        let derive = |mut cascade: BBTreeMap<Prop, (CascadeRank, &Rc<str>)>| {
             (!cascade.is_empty()).then(|| {
                 physical(&mut cascade, &style);
                 let mut values: Style = style
@@ -5339,6 +5392,7 @@ pub(crate) fn cascade(
             shadowed,
             starting,
             viewport,
+            keyword,
         });
         if animated.is_none() {
             if let Some(node) = scoped.nodes[id].as_mut() {
@@ -5826,7 +5880,7 @@ pub(crate) fn cascade(
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
 
 /// Moves logical sides in a cascade to the physical sides of its direction, or of the parent's.
-fn physical<V: AsRef<str>>(cascade: &mut BTreeMap<Prop, (CascadeRank, V)>, parent: &Style) {
+fn physical<V: AsRef<str>>(cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>, parent: &Style) {
     if !LOGICAL
         .iter()
         .any(|(logical, ..)| cascade.contains_key(logical))
@@ -6401,7 +6455,8 @@ pub(crate) fn dark(style: &Style) -> bool {
     })
 }
 
-fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
+fn resolve_keywords(style: &mut Style, parent: Option<&Style>) -> bool {
+    let mut keyword = false;
     style.retain(|prop, value| {
         let inherit = match &**value {
             _ if prop.is_custom() => return true,
@@ -6410,6 +6465,7 @@ fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
             "initial" => false,
             _ => return true,
         };
+        keyword |= inherit && !prop.inherited();
         match parent
             .and_then(|parent| parent.value(prop))
             .filter(|_| inherit)
@@ -6433,7 +6489,7 @@ fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
         }
     }
     let Some(current) = style.value(Prop::COLOR).cloned() else {
-        return;
+        return keyword;
     };
     style.retain(|prop, slot| {
         if prop.is_custom() || prop == Prop::COLOR || prop.inherited() {
@@ -6455,6 +6511,7 @@ fn resolve_keywords(style: &mut Style, parent: Option<&Style>) {
         }
         true
     });
+    keyword
 }
 
 pub fn declarations(source: &str) -> Style {

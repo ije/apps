@@ -78,8 +78,11 @@ pub(crate) struct PageState {
     /// scale, font loads and the top layer.
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
     /// The entries of `kept` that this build replaced, to undo when the window never gets the build.
-    kept_log: RefCell<Vec<(usize, Option<element::Reuse>)>>,
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
+    layout_queued: Cell<bool>,
+    /// The canvas color that the native window has.
+    #[cfg(target_os = "macos")]
+    canvas: std::cell::Cell<(u32, u8)>,
 }
 
 /// Clipping ancestors with their clipped axes, see [`clips`].
@@ -185,6 +188,31 @@ pub(crate) fn reflow(id: u64) {
             cx.update_window(view.window, run);
         }
     }
+}
+
+/// Runs the page's resize observers and scroll listeners at the start of the next frame.
+fn queue_layout(view: Rc<PageState>, window: &mut Window) {
+    if view.layout_queued.replace(true) {
+        return;
+    }
+    window.on_next_frame(move |window, cx| {
+        view.layout_queued.set(false);
+        let renderer = view
+            .runtime
+            .borrow()
+            .views
+            .get(&view.id)
+            .and_then(|view| view.renderer.clone());
+        if let Some(renderer) = renderer
+            && let Err(error) = scripted(cx, Some(window), || {
+                renderer.eval("__appsLayout()", "apps:layout")
+            })
+        {
+            eprintln!("apps: {error}");
+        }
+        let runtime = view.runtime.clone();
+        cx.defer(move |cx| Desktop::drive(runtime, cx));
+    });
 }
 
 /// Runs the page's animation frame callbacks on the next frame.
@@ -296,8 +324,10 @@ impl PageView {
             caret: RefCell::default(),
             hud: RefCell::default(),
             kept: RefCell::default(),
-            kept_log: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            canvas: Default::default(),
             kept_frame: RefCell::default(),
+            layout_queued: Cell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);
@@ -379,6 +409,9 @@ impl PageView {
                 if !phase.capture() {
                     return;
                 }
+                // WARNING: like browsers, listeners run before the frame that shows the new offset, so what they
+                // place by the scroll position never lags it, also on the first event after an idle frame.
+                queue_layout(view.clone(), window);
                 // Like browsers, the wheel scrolls only the boxes around the element under the pointer, so a
                 // box that an overlay covers doesn't scroll. The hit test uses the styles of the frame on screen.
                 let (mut target, mut wheel) = (None, false);
@@ -767,6 +800,17 @@ impl PageView {
                 color => color,
             })
             .unwrap_or((0xffffff, 255));
+        // WARNING: a frame that is late for a live resize leaves the native window's color at its edge.
+        // A transparent window keeps its own, or the page could never become see-through again.
+        #[cfg(target_os = "macos")]
+        if background.1 == 255
+            && state.backgrounds.get(&self.id).is_none_or(|color| color.1 != 0)
+            && self.canvas.replace(background) != background
+        {
+            window.change_window(renderer::WindowChange::Background(renderer::rgba(
+                (background.0 << 8) | 255,
+            )));
+        }
         dom.layout_nodes.resize_with(doc.nodes.len(), || None);
         let frame = [width, height, window.scale_factor(), dom.font_loads as f32];
         let mut changed = Vec::new();
@@ -900,8 +944,23 @@ impl PageView {
                         )
                     })
                 };
+                // WARNING: boxes out of the flow don't move this box, but it links them, so they renew its revision
+                // and not its geometry. A kept box would hide them.
+                let out = node
+                    .children
+                    .iter()
+                    .filter(|&&child| info[child].flags & cull::OUT != 0)
+                    .fold(0, |sum: u64, &child| {
+                        sum.wrapping_add(
+                            dom.layout_nodes[child].as_ref().map_or(0, |node| node.revision),
+                        )
+                    });
                 let mut relisted = false;
-                if own || old.is_some_and(|old| !old.children.iter().copied().eq(children())) {
+                if own
+                    || old.is_some_and(|old| {
+                        old.out != out || !old.children.iter().copied().eq(children())
+                    })
+                {
                     relisted = old.is_none_or(|old| {
                         !old.children.iter().map(|&(child, _)| child).eq(flowed())
                     });
@@ -921,6 +980,7 @@ impl PageView {
                         style: style.clone(),
                         units: units(&styles.lengths[id]),
                         children,
+                        out,
                         revision: dom.layout_revision,
                         geometry: geometry.unwrap_or(dom.layout_revision),
                         flags,
@@ -1005,6 +1065,11 @@ impl PageView {
                                 | (u16::from(relisted) * cull::RELISTED)
                                 | (u16::from(volatile) * cull::VOLATILE)
                                 | (u16::from(framed) * cull::FRAMED)
+                                | (u16::from(
+                                    styles.pseudos.get(&id).is_some_and(|pair| {
+                                        pair.iter().any(cull::reads_height)
+                                    }),
+                                ) * cull::HEIGHTED)
                                 | (u16::from(dom.focus == Some(id))
                                     * (cull::BLOCKED | cull::VOLATILE)),
                             |flags, &child| {
@@ -1013,7 +1078,8 @@ impl PageView {
                                         & (cull::BLOCKED
                                             | cull::VIEWPORT
                                             | cull::VOLATILE
-                                            | cull::FRAMED)
+                                            | cull::FRAMED
+                                            | cull::HEIGHTED)
                             },
                         )
                     },
@@ -1242,6 +1308,10 @@ impl PageView {
             .and_then(|id| styles.values[id].get(Prop::OVERFLOW_Y))
             .unwrap_or("visible");
         let page_scrolls = !matches!(overflow, "hidden" | "clip");
+        // Like browsers, only the root element's value applies to the page, not the body's.
+        let page_overscroll = html.map_or_else(Default::default, |html| {
+            element::overscroll(&styles.values[html])
+        });
         // Like Chromium, the page's bar takes the body's `::-webkit-scrollbar` styles, then the root's.
         let page_bar = html.filter(|_| page_scrolls).and_then(|html| {
             let parts = body
@@ -1300,6 +1370,8 @@ impl PageView {
             .retain(|&id, _| visible.get(id) == Some(&true));
         dom.flexed_grids
             .retain(|&id, _| visible.get(id) == Some(&true));
+        dom.grid_widest
+            .retain(|&id, _| visible.get(id) == Some(&true));
         dom.measurements.pixel_ratio = window.scale_factor();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
@@ -1352,6 +1424,7 @@ impl PageView {
             perspective: None,
             siblings: &RefCell::default(),
             margins: &RefCell::default(),
+            blocks: &RefCell::default(),
             ids: &ids,
             info: &info,
             zone,
@@ -1377,7 +1450,6 @@ impl PageView {
                 settled && !build.resized && !window.redrawing() && !self.reflowing.get();
             kept.0 = frame;
         }
-        self.kept_log.borrow_mut().clear();
         let root = element(
             &build,
             0,
@@ -1468,11 +1540,8 @@ impl PageView {
         for (node, children) in children.into_iter().rev() {
             doc.nodes.compose_children(node, children);
         }
-        {
+        let repass = {
             let mut host = self.host.borrow_mut();
-            if let Some(page) = host.pages.get_mut(&self.id) {
-                page.doc = doc;
-            }
             let dom = host.dom.entry(self.id).or_default();
             dom.cull.info = info;
             dom.cull.visible = visible;
@@ -1499,49 +1568,28 @@ impl PageView {
                 dom.computed = Some(styles);
             }
             // WARNING: one extra pass per frame at most, so container queries that resize their container cannot loop.
-            let changed = dom.update_containers();
+            let changed = dom.update_containers(&doc);
             let repass = changed && !dom.container_pass;
             dom.container_pass = repass;
-            if repass {
-                drop(host);
-                // WARNING: the window never gets this build, so boxes it keyed are not in the tree and the
-                // next build must not link them.
-                let mut kept = self.kept.borrow_mut();
-                for (id, old) in self.kept_log.borrow_mut().drain(..).rev() {
-                    match old {
-                        Some(old) => kept.insert(id, old),
-                        None => kept.remove(&id),
-                    };
-                }
-                drop(kept);
-                return self.render_page(tree, window, cx);
+            if let Some(page) = host.pages.get_mut(&self.id) {
+                page.doc = doc;
             }
+            repass
+        };
+        if repass {
+            window.rebuild();
         }
-        let runtime = self.runtime.clone();
         let id = self.id;
-        if !window.redrawing() && !self.reflowing.get() {
-            window.on_next_frame(move |window, cx| {
-                let renderer = runtime
-                    .borrow()
-                    .views
-                    .get(&id)
-                    .and_then(|v| v.renderer.clone());
-                if let Some(renderer) = renderer
-                    && let Err(error) = scripted(cx, Some(window), || {
-                        renderer.eval("__appsLayout()", "apps:layout")
-                    })
-                {
-                    eprintln!("apps: {error}");
-                }
-                cx.defer(move |cx| Desktop::drive(runtime, cx));
-            });
+        if !window.redrawing() && !self.reflowing.get() && !repass {
+            queue_layout(self.0.clone(), window);
         }
         let page = renderer::node().id(("apps-page", 0)).size_full();
-        let page = if page_scrolls {
+        let mut page = if page_scrolls {
             page.overflow_y_scroll()
         } else {
             page.overflow_y_hidden()
         };
+        page.style().overscroll = page_overscroll;
         let page = page
             .pr(renderer::px(page_space[1]))
             .restrict_scroll_to_axis()
@@ -1930,7 +1978,9 @@ fn retire(
 ) {
     dom.svgs.retain(|id, (_, image)| {
         visible.get(*id) == Some(&true) || {
-            release(image.clone());
+            if Arc::strong_count(image) == 1 {
+                release(image.clone());
+            }
             false
         }
     });

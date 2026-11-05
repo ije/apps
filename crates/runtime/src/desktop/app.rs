@@ -137,7 +137,8 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
     } else {
         dir.to_owned()
     };
-    let dev = !resources.join("app.h2o").is_file() && std::env::var_os("APPS_RUST_DEV").is_some();
+    let dev =
+        !resources.join("app.bundle").is_file() && std::env::var_os("APPS_RUST_DEV").is_some();
     let bundle: Bundle = if dev {
         if let Some(path) = std::env::var_os("APPS_RUST_LIBRARIES") {
             let _ = DEV_LIBRARIES.set(path.into());

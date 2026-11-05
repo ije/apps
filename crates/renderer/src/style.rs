@@ -141,6 +141,18 @@ pub enum Overflow {
     Scroll,
 }
 
+/// What a scroll box does at its edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Overscroll {
+    /// Scrolling goes on in the boxes around it, and it bounces when none of them moves.
+    #[default]
+    Auto,
+    /// Scrolling stops here, and it bounces.
+    Contain,
+    /// Scrolling stops here. It never bounces.
+    None,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Visibility {
     #[default]
@@ -299,6 +311,7 @@ pub struct Style {
     pub overflow: Point<Overflow>,
     /// Wheel input scrolls only the axis it moves along.
     pub restrict_scroll_to_axis: bool,
+    pub overscroll: Point<Overscroll>,
     pub position: Position,
     pub inset: Edges<Length>,
     pub size: Size<Length>,
@@ -344,6 +357,7 @@ impl Default for Style {
             visibility: Visibility::Visible,
             overflow: Point::default(),
             restrict_scroll_to_axis: false,
+            overscroll: Point::default(),
             position: Position::Relative,
             inset: Edges::all(Length::Auto),
             size: Size::default(),

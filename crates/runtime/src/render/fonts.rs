@@ -3,7 +3,7 @@ use crate::style::{FONT_FORMATS, FONT_TECHS};
 use std::{collections::HashMap, path::PathBuf};
 
 /// The `src` entries of `@font-face` and `FontFace` that can load, in order: `("local", name)` or
-/// `("url", url)`. URLs with a `format()` or `tech()` that h2o doesn't support are left out.
+/// `("url", url)`. URLs with a `format()` or `tech()` that `@pierre/apps` doesn't support are left out.
 pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
     crate::style::components(src, ',')
         .into_iter()

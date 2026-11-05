@@ -5,7 +5,7 @@ use super::{
 use crate::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
-    PlatformInput, ScrollDelta, ScrollWheelEvent, point, px,
+    PlatformInput, ScrollDelta, ScrollPhase, ScrollWheelEvent, point, px,
 };
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
@@ -171,12 +171,29 @@ pub(crate) unsafe fn platform_input_from_native(
                     ScrollDelta::Lines(raw_data)
                 };
 
+                let (fingers, momentum) = (native_event.phase(), native_event.momentumPhase());
+                let done = NSEventPhase::Ended | NSEventPhase::Cancelled;
+                let phase = if momentum.intersects(done) {
+                    ScrollPhase::MomentumEnded
+                } else if !momentum.is_empty() {
+                    ScrollPhase::Momentum
+                } else if fingers.intersects(NSEventPhase::Began | NSEventPhase::MayBegin) {
+                    ScrollPhase::Began
+                } else if fingers.intersects(done) {
+                    ScrollPhase::Ended
+                } else if !fingers.is_empty() {
+                    ScrollPhase::Changed
+                } else {
+                    ScrollPhase::None
+                };
+
                 PlatformInput::ScrollWheel(ScrollWheelEvent {
                     position: point(
                         px(native_event.locationInWindow().x as f32),
                         window_height - px(native_event.locationInWindow().y as f32),
                     ),
                     delta,
+                    phase,
                     modifiers: read_modifiers(native_event),
                 })
             }),

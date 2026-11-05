@@ -1,16 +1,17 @@
 use super::{
     NSRange, NSStringExt, Sendable, TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
-    ask,
+    ask_within,
     display_link::WindowFrameSource,
     events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    metal::{MetalAtlas, Renderer},
+    metal::{MetalAtlas, Present, Renderer},
     native_after, native_post, native_sync, ns_string, post, post_local,
 };
 use crate::{
     Bounds, CursorStyle, FileDropEvent, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
-    PlatformInput, Point, Scene, ScrollDelta, Size, WindowChange, WindowOptions, WindowState,
+    PlatformInput, Point, Scene, ScrollDelta, ScrollPhase, Size, WindowChange, WindowOptions,
+    WindowState,
     app::{Callbacks, dispatch},
     point, px, size,
 };
@@ -34,7 +35,8 @@ use objc2::{
 use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSDragOperation, NSScreen,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSWindow,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsPlacement,
+    NSViewLayerContentsRedrawPolicy, NSWindow,
     NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
     NSWindowSharingType, NSWindowStyleMask, NSWindowTitleVisibility,
 };
@@ -352,6 +354,9 @@ impl Frames {
         }
     }
 }
+
+/// How long `displayLayer` waits for the frame of a new size.
+const RESIZE_WAIT: Duration = Duration::from_millis(8);
 
 /// A display link tick, which draws a frame on the render thread unless one is on its way.
 struct Tick {
@@ -746,6 +751,10 @@ fn open_native(
         // Metal layer, so this one is layer backed from the start.
         let () = msg_send![native_view, setWantsLayer: Bool::YES];
         let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
+        // WARNING: during a resize a frame can show with the bounds of another size. Here it keeps its
+        // place, where the default placement would stretch the whole window for that frame. AppKit
+        // owns the gravity of this layer, so setting it on the layer does nothing.
+        let () = msg_send![native_view, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];
         let native_view: *mut AnyObject = msg_send![native_view, autorelease];
         let () = msg_send![content_view, addSubview: native_view];
         let _: Bool = msg_send![native_window, makeFirstResponder: native_view];
@@ -905,6 +914,17 @@ impl Window {
 
     pub(crate) fn trim(&self) {
         self.renderer.borrow_mut().trim();
+    }
+
+    pub(crate) fn set_drawable_size(&self, size: Size<Pixels>, scale: f32) {
+        let pixels = size.to_device_pixels(scale);
+        self.renderer
+            .borrow()
+            .set_drawable_size(CGSize::new(pixels.width.0 as f64, pixels.height.0 as f64));
+    }
+
+    pub(crate) fn take_present(&self) -> Option<Present> {
+        self.renderer.borrow_mut().take_present()
     }
 
     pub(crate) fn set_presents_with_transaction(&self, on: bool) {
@@ -1351,8 +1371,11 @@ fn merge_motion(old: &mut PlatformInput, new: &PlatformInput) -> bool {
             true
         }
         (PlatformInput::ScrollWheel(old), PlatformInput::ScrollWheel(new))
-            if old.modifiers == new.modifiers =>
+            if old.modifiers == new.modifiers
+                && (old.phase == new.phase
+                    || (old.phase == ScrollPhase::Began && new.phase == ScrollPhase::Changed)) =>
         {
+            let phase = old.phase;
             let delta = match (old.delta, new.delta) {
                 (ScrollDelta::Pixels(a), ScrollDelta::Pixels(b)) => ScrollDelta::Pixels(a + b),
                 (ScrollDelta::Lines(a), ScrollDelta::Lines(b)) => ScrollDelta::Lines(a + b),
@@ -1360,6 +1383,7 @@ fn merge_motion(old: &mut PlatformInput, new: &PlatformInput) -> bool {
             };
             *old = new.clone();
             old.delta = delta;
+            old.phase = phase;
             true
         }
         _ => false,
@@ -1985,17 +2009,14 @@ extern "C" fn window_did_change_state(this: &AnyObject, _: Sel, _: *mut AnyObjec
     }
 }
 
-/// Matches the drawable to the view's size and scale, then tells the app.
-fn update_drawable(state: &Shared) {
+/// Publishes the view's size and scale, then tells the app.
+fn update_size(state: &Shared) {
     let Ok(lock) = state.try_borrow() else {
         return;
     };
     let scale = lock.scale_factor();
     let content = lock.content_size();
     lock.layer.setContentsScale(scale as f64);
-    let pixels = content.to_device_pixels(scale);
-    lock.layer
-        .setDrawableSize(CGSize::new(pixels.width.0 as f64, pixels.height.0 as f64));
     lock.update_mirror();
     let callbacks = lock.callbacks;
     drop(lock);
@@ -2011,7 +2032,7 @@ extern "C" fn window_did_change_screen(this: &AnyObject, _: Sel, _: *mut AnyObje
         // The display link follows the new screen.
         lock.locate_frames();
     }
-    update_drawable(&state);
+    update_size(&state);
     report_change(&state);
 }
 
@@ -2073,7 +2094,7 @@ extern "C" fn make_backing_layer(this: &AnyObject, _: Sel) -> *mut AnyObject {
 extern "C" fn view_did_change_backing_properties(this: &AnyObject, _: Sel) {
     // SAFETY: AppKit calls this on our views.
     if let Some(state) = unsafe { get_state(this) } {
-        update_drawable(&state);
+        update_size(&state);
     }
 }
 
@@ -2091,7 +2112,7 @@ extern "C" fn set_frame_size(this: &AnyObject, _: Sel, new: NSSize) {
     unsafe {
         let () = msg_send![super(this, class!(NSView)), setFrameSize: new];
     }
-    update_drawable(&state);
+    update_size(&state);
 }
 
 /// AppKit asks for the layer's contents, during a live resize for one. The render thread draws the
@@ -2100,11 +2121,20 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let Some(callbacks) = callbacks(this) else {
         return;
     };
-    ask(callbacks.thread, move || {
-        callbacks.with(|window, _| window.platform.set_presents_with_transaction(true));
-        step(callbacks);
-        callbacks.with(|window, _| window.platform.set_presents_with_transaction(false));
-    });
+    // WARNING: the window server takes the new window size at once. Until the commit of this
+    // transaction it shows the old layers displaced by the resize, so a frame that takes long moves
+    // the whole window, even with its frame in sync. A late frame shows after the commit instead,
+    // and only the bottom edge can tell. While one is on its way, more would only queue up.
+    if callbacks.thread.late.load(Ordering::Acquire) == 0 {
+        drop(ask_within(callbacks.thread, RESIZE_WAIT, move || {
+            callbacks.with(|window, _| window.platform.set_presents_with_transaction(true));
+            step(callbacks);
+            callbacks.with(|window, _| {
+                window.platform.set_presents_with_transaction(false);
+                window.platform.take_present()
+            })
+        }));
+    }
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &AnyObject, _: Sel) -> *mut AnyObject {

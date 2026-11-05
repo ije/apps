@@ -204,7 +204,7 @@ fn packages_every_platform_and_arch_with_matching_jsc() {
                 fs::read(out.join(format!("{resources}asset.txt"))).unwrap(),
                 b"asset"
             );
-            assert!(out.join(format!("{resources}app.h2o")).is_file());
+            assert!(out.join(format!("{resources}app.bundle")).is_file());
             assert!(
                 apps_runtime::bundle::read(&out)
                     .unwrap()
@@ -218,7 +218,7 @@ fn packages_every_platform_and_arch_with_matching_jsc() {
             let mut zip =
                 zip::ZipArchive::new(fs::File::open(out.join("Tea App.zip")).unwrap()).unwrap();
             assert!(zip.by_name(library).is_ok());
-            assert!(zip.by_name(&format!("{resources}app.h2o")).is_ok());
+            assert!(zip.by_name(&format!("{resources}app.bundle")).is_ok());
             assert!(zip.by_name(&format!("{resources}asset.txt")).is_ok());
             let mut file = zip.by_name(executable).unwrap();
             if platform != "windows" {

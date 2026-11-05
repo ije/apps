@@ -237,6 +237,15 @@ pub(crate) fn ask<R: Send + 'static>(
     thread: AppThread,
     f: impl FnOnce() -> R + Send + 'static,
 ) -> Option<R> {
+    ask_within(thread, ASK_LIMIT, f)
+}
+
+/// Like [`ask`], with a limit of its own.
+pub(crate) fn ask_within<R: Send + 'static>(
+    thread: AppThread,
+    limit: Duration,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
     if thread.closed.load(Ordering::Relaxed) {
         return None;
     }
@@ -256,7 +265,7 @@ pub(crate) fn ask<R: Send + 'static>(
         drop(MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner));
         MAIN.ready.notify_all();
     }));
-    let deadline = Instant::now() + ASK_LIMIT;
+    let deadline = Instant::now() + limit;
     let waits = thread.late.load(Ordering::Acquire) == 0;
     let mut tasks = MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner);
     loop {

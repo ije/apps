@@ -71,7 +71,7 @@ pub fn package_app(
         !files.contains_key(&executable_name)
             && !matches!(
                 executable_name.to_ascii_lowercase().as_str(),
-                "app.h2o" | ".apps-build" | "node_modules"
+                "app.bundle" | ".apps-build" | "node_modules"
             ),
         "Executable name conflicts with a bundle file: {executable_name}"
     );
@@ -151,7 +151,7 @@ pub fn package_app(
     };
     fs::create_dir_all(&assets)?;
     let mut bytes = if production {
-        apps_runtime::bundle::write(&assets.join("app.h2o"), files)?
+        apps_runtime::bundle::write(&assets.join("app.bundle"), files)?
     } else {
         for (name, source) in files {
             if name == "native.json" {
@@ -276,7 +276,7 @@ pub fn package_app(
                     && !matches!(
                         relative.to_str(),
                         Some(
-                            "app.h2o"
+                            "app.bundle"
                                 | "native.json"
                                 | "assets.json"
                                 | "package.json"
@@ -480,7 +480,7 @@ mod tests {
                     )));
                     assert!(apps_runtime::bundle::read(&app).is_ok());
                     let resources = app.join("Contents/Resources");
-                    assert_eq!(resources.join("app.h2o").is_file(), production);
+                    assert_eq!(resources.join("app.bundle").is_file(), production);
                     assert_eq!(resources.join("package.json").is_file(), !production);
                 }
             }
@@ -738,7 +738,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(assets.join("app.h2o").is_file());
+        assert!(assets.join("app.bundle").is_file());
         assert!(!assets.join("app.js").exists());
         assert!(!assets.join("page-0.html").exists());
         assert!(!assets.join("apps.json").exists());
@@ -753,7 +753,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!assets.join("app.h2o").exists());
+        assert!(!assets.join("app.bundle").exists());
         assert!(assets.join("app.js").is_file());
     }
 
@@ -858,7 +858,7 @@ mod tests {
             .unwrap();
             for name in [
                 "app.js",
-                "app.h2o",
+                "app.bundle",
                 "native.json",
                 "package.json",
                 ".apps-build",

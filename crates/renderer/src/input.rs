@@ -160,10 +160,27 @@ pub struct MouseExitEvent {
     pub position: Point<Pixels>,
 }
 
+/// Where a scroll event is in a trackpad gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollPhase {
+    /// The device reports no gestures.
+    #[default]
+    None,
+    /// Fingers touched the trackpad or began to move.
+    Began,
+    Changed,
+    /// Fingers left the trackpad.
+    Ended,
+    /// The system goes on scrolling after the fingers left.
+    Momentum,
+    MomentumEnded,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScrollWheelEvent {
     pub position: Point<Pixels>,
     pub delta: ScrollDelta,
+    pub phase: ScrollPhase,
     pub modifiers: Modifiers,
 }
 

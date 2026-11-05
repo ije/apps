@@ -16,7 +16,7 @@
 
 The main side and the pages share no JavaScript state. Each has its own `Host`, and they talk only through the queues in `crates/runtime/src/desktop/link.rs`. These are threads, not OS processes, so a crash in native code ends the whole app.
 
-A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard and opening a window. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key, the IME ranges and a frame for a live resize, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question.
+A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard and opening a window. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key and the IME ranges, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question. A frame for a live resize gets 8 ms, because the window server moves the old frame until AppKit's transaction commits. A later frame shows after the commit, anchored to the top left, so a slow page lags only at the window's edge.
 
 Window commands like `setBounds()`, `minimize()` and `close()` run on main and don't wait for the page. `close()` and quitting also stop a running page script, so a hung page can't hold them up.
 
@@ -44,6 +44,19 @@ To enable the two features, add `jsExecute` and `httpImport` in `features` optio
 - Support FFI via `node:ffi`
 
 > Unlike Electron, which bundles Node.js, `@pierre/apps` provides limited node integration via rust code.
+
+## App File
+
+`apps build` packs the app into one file, `app.bundle`. It sits next to the executable, or in `Contents/Resources` of a macOS app.
+
+The file starts with an 8-byte header, `APP\0` and the format version, followed by [postcard](https://postcard.jamesmunns.com/) data:
+
+- `files`: `app.js`, script chunks (`script-*.js`), `package.json`, `native.json`, `assets.json` and packed `.node` addons
+- `pages`: the bundled HTML pages, already parsed, with their `<style>` and `style` attributes parsed too
+
+The runtime maps the file into memory. Script chunks and addons stay in the mapping until they are used, so the file must not change while the app runs, and a new build replaces it instead of rewriting it. `crates/runtime/src/bundle.rs` reads and writes the file.
+
+A folder with `app.bundle` or `app.js` is a built app. It passes all of its arguments to `process.argv`, and it loads JavaScriptCore only from its own folder.
 
 ## Renderer
 

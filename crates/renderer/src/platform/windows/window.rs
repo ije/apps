@@ -1172,6 +1172,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                     } else {
                         point(0., distance)
                     }),
+                    phase: Default::default(),
                     modifiers,
                 }));
                 Some(0)

@@ -38,6 +38,33 @@ pub(crate) const ANIMATED: u16 = 8192;
 /// tables and lists. Nothing it reads changes in a frame where no node, style, focus or viewport changed,
 /// so only such frames keep its boxes.
 pub(crate) const FRAMED: u16 = 16384;
+/// The subtree reads the height of its containing block.
+pub(crate) const HEIGHTED: u16 = 32768;
+
+/// Whether a box's own values read the height of its containing block.
+pub(crate) fn reads_height(style: &style::Style) -> bool {
+    [
+        Prop::HEIGHT,
+        Prop::MIN_HEIGHT,
+        Prop::MAX_HEIGHT,
+        Prop::FLEX_BASIS,
+        Prop::TOP,
+        Prop::BOTTOM,
+        Prop::ROW_GAP,
+        Prop::BORDER_TOP_LEFT_RADIUS,
+        Prop::BORDER_TOP_RIGHT_RADIUS,
+        Prop::BORDER_BOTTOM_LEFT_RADIUS,
+        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+    ]
+    .into_iter()
+    .any(|prop| style.get(prop).is_some_and(|value| value.contains('%')))
+        || style
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            && [Prop::TOP, Prop::BOTTOM]
+                .into_iter()
+                .all(|prop| style.get(prop).is_some_and(|value| value != "auto"))
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {
@@ -332,6 +359,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         (display == "none", HIDDEN),
         (solid, SOLID),
         (!auto(Prop::HEIGHT) || !auto(Prop::FLEX_BASIS), SIZED),
+        (reads_height(style), HEIGHTED),
         (
             style.iter().any(|(prop, value)| {
                 let bytes = value.as_bytes();
@@ -714,7 +742,7 @@ mod tests {
             ("m", 0),
             ("n", SOLID),
             ("o", 0),
-            ("p", SIZED),
+            ("p", SIZED | HEIGHTED),
             ("q", SOLID | SIZED),
             ("r", 0),
             ("u", SOLID),

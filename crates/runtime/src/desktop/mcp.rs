@@ -11,7 +11,7 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use renderer::{
     App, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, ScrollDelta, ScrollWheelEvent, point, px,
+    PlatformInput, ScrollDelta, ScrollPhase, ScrollWheelEvent, point, px,
 };
 use serde_json::{Value, json};
 use std::{
@@ -431,6 +431,7 @@ fn tools() -> Value {
             "key": {"type": "string"}, "text": {"type": "string"},
             "delta_x": {"type": "number"}, "delta_y": {"type": "number"},
             "lines": {"type": "boolean", "description": "Scroll deltas are mouse wheel lines instead of trackpad pixels."},
+            "phase": {"type": "string", "enum": ["began", "changed", "ended", "momentum", "momentum_ended"], "description": "Where a trackpad scroll is in its gesture. Without it, the box bounces back 100 ms after the last scroll."},
         }, "required": ["action"]}},
         {"name": "console", "description": "Returns console messages and uncaught errors from all contexts since the last call.", "inputSchema": {"type": "object", "properties": {
             "keep": {"type": "boolean", "description": "Keep the messages for the next call."},
@@ -1044,6 +1045,14 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
                     ScrollDelta::Lines(delta)
                 } else {
                     ScrollDelta::Pixels(delta.map(px))
+                },
+                phase: match args["phase"].as_str() {
+                    Some("began") => ScrollPhase::Began,
+                    Some("changed") => ScrollPhase::Changed,
+                    Some("ended") => ScrollPhase::Ended,
+                    Some("momentum") => ScrollPhase::Momentum,
+                    Some("momentum_ended") => ScrollPhase::MomentumEnded,
+                    _ => ScrollPhase::None,
                 },
                 modifiers,
             }));

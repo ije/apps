@@ -1,8 +1,8 @@
 use crate::{
     AlignItems, App, Baseline, Bounds, Corners, CursorStyle, Display, Edges, FlexDirection,
     FlexWrap, FontWeight, Hitbox, JustifyContent, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Overflow, Pixels, Point, Position, RenderImage, Rgba,
-    ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
+    MouseMoveEvent, ObjectFit, Overflow, Overscroll, Pixels, Point, Position, RenderImage, Rgba,
+    ScrollPhase, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
     TextStyleRefinement, WhiteSpace, Window, input::DispatchPhase, point, px, relative,
 };
 use std::{
@@ -766,12 +766,22 @@ impl Events {
         if let Some(handle) = &self.scroll {
             let (handle, hitbox) = (handle.clone(), hitbox.clone());
             let (overflow, restrict) = (style.overflow, style.restrict_scroll_to_axis);
+            let overscroll = style.overscroll;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || !hitbox.should_handle_scroll(window)
-                    || window.scroll_chain.as_ref().is_some_and(|chain| {
-                        !chain.iter().any(|other| Rc::ptr_eq(&other.0, &handle.0))
-                    })
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let latched = window
+                    .gesture
+                    .latch
+                    .as_ref()
+                    .map(|latch| Rc::ptr_eq(&latch.0, &handle.0));
+                if latched == Some(false)
+                    || latched.is_none()
+                        && (!hitbox.should_handle_scroll(window)
+                            || window.scroll_chain.as_ref().is_some_and(|chain| {
+                                !chain.iter().any(|other| Rc::ptr_eq(&other.0, &handle.0))
+                            }))
                 {
                     return;
                 }
@@ -799,28 +809,69 @@ impl Events {
                         x = Pixels::ZERO;
                     }
                 }
-                // WARNING: a wheel tick adds to where a running scroll stops, so fast ticks lose no distance.
-                let wheel = !event.delta.precise();
-                let from = if wheel {
-                    handle.target()
-                } else {
-                    handle.offset()
-                };
                 let max = handle.max_offset();
-                let to = point(
-                    (from.x + x).clamp(-max.x, px(0.)),
-                    (from.y + y).clamp(-max.y, px(0.)),
-                );
-                if to == from {
+                let stops = |own: Overscroll, delta: Pixels| {
+                    !delta.is_zero() && matches!(own, Overscroll::Contain | Overscroll::None)
+                };
+                let stops = stops(overscroll.x, delta.x) || stops(overscroll.y, delta.y);
+                if !event.delta.precise() {
+                    // WARNING: a wheel tick adds to where a running scroll stops, so fast ticks lose no distance.
+                    let from = handle.target();
+                    let to = point(
+                        (from.x + x).clamp(-max.x, px(0.)),
+                        (from.y + y).clamp(-max.y, px(0.)),
+                    );
+                    // WARNING: like browsers, only the innermost box that can scroll moves. Outer boxes get the event at its edge.
+                    if to != from {
+                        cx.stop_propagation();
+                        handle.animate_to(to, true);
+                        handle.drive(window);
+                    } else if stops {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
-                // WARNING: like browsers, only the innermost box that can scroll moves. Outer boxes get the event at its edge.
-                cx.stop_propagation();
-                if wheel {
-                    handle.animate_to(to, true);
-                    handle.drive(window);
-                } else {
-                    handle.set_offset(to);
+                let momentum = event.phase == ScrollPhase::Momentum;
+                if momentum && window.gesture.spent {
+                    cx.stop_propagation();
+                    return;
+                }
+                let held = event.phase == ScrollPhase::Began && handle.hold();
+                let (moved, over) = handle.pan(point(x, y));
+                let latched = latched == Some(true) || held || moved;
+                if latched {
+                    window.gesture.latch = Some(handle.clone());
+                    window.gesture.edge = None;
+                }
+                let elastic = |own: Overscroll, max: Pixels, over: Pixels| {
+                    if matches!(own, Overscroll::Auto | Overscroll::Contain) && max > px(0.) {
+                        over
+                    } else {
+                        px(0.)
+                    }
+                };
+                let rest = point(
+                    elastic(overscroll.x, max.x, over.x),
+                    elastic(overscroll.y, max.y, over.y),
+                );
+                if rest != Point::default() {
+                    // WARNING: a box at its edge at the start of a gesture passes it on, and only the
+                    // outermost one that can scroll stretches when no box around it moves.
+                    if !latched && !stops {
+                        window.gesture.edge = Some((handle.clone(), rest));
+                        return;
+                    }
+                    window.overscroll(handle.clone(), rest, event.phase);
+                } else if momentum && latched && over != Point::default() {
+                    window.gesture.spent = true;
+                }
+                if latched || stops {
+                    cx.stop_propagation();
+                }
+                if moved {
+                    if event.phase == ScrollPhase::None {
+                        handle.loosen(window);
+                    }
                     window.refresh();
                 }
             });
@@ -835,8 +886,39 @@ struct ScrollState {
     max_offset: Point<Pixels>,
     bounds: Bounds<Pixels>,
     animation: Option<Animation>,
-    /// A frame callback advances `animation`.
+    /// A frame callback advances `animation` and `spring`.
     driven: bool,
+    /// How far the content draws past the edges. `offset` stays in range, so scripts don't see it.
+    stretch: Point<Pixels>,
+    spring: Option<Spring>,
+    /// Stretched by a device that reports no gesture end, so it springs back after a pause.
+    loose: bool,
+}
+
+/// Trackpad pixels past an edge for each pixel of stretch, from AppKit's `_NSElasticDeltaForReboundDelta`.
+const STIFFNESS: f32 = 20.;
+
+/// A stretched box going back to its edge, from AppKit's `_NSElasticDeltaForTimeDelta`.
+struct Spring {
+    from: Point<Pixels>,
+    /// Pixels per second as it starts, which carries it further out first.
+    speed: Point<f32>,
+    start: Instant,
+}
+
+impl Spring {
+    /// The stretch at `now`, or `None` once it is back.
+    fn at(&self, now: Instant) -> Option<Point<Pixels>> {
+        let t = now.saturating_duration_since(self.start).as_secs_f32();
+        let damping = (-12.5 * t).exp();
+        let axis = |from: Pixels, speed: f32| px((f32::from(from) + 0.31 * speed * t) * damping);
+        let at = point(
+            axis(self.from.x, self.speed.x),
+            axis(self.from.y, self.speed.y),
+        );
+        // It only falls after the peak, at 1 / 12.5 seconds at the latest.
+        (t < 0.08 || at.x.abs() >= px(0.25) || at.y.abs() >= px(0.25)).then_some(at)
+    }
 }
 
 /// How long a wheel tick scrolls when the box is still.
@@ -886,11 +968,103 @@ impl ScrollHandle {
         self.0.borrow().offset
     }
 
-    /// Moves at once and stops a smooth scroll.
+    /// How far the content draws past the edges, on top of `offset`.
+    pub fn stretch(&self) -> Point<Pixels> {
+        self.0.borrow().stretch
+    }
+
+    /// Moves at once and stops a smooth scroll and a bounce.
     pub fn set_offset(&self, offset: Point<Pixels>) {
         let mut state = self.0.borrow_mut();
         state.offset = offset;
         state.animation = None;
+        state.stretch = Point::default();
+        state.spring = None;
+        state.loose = false;
+    }
+
+    /// Moves by a trackpad delta, taking back the stretch first. Returns whether the box moved and
+    /// what is left past its edges.
+    fn pan(&self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
+        let state = &mut *self.0.borrow_mut();
+        let axis = |offset: &mut Pixels, stretch: &mut Pixels, max: Pixels, mut delta: Pixels| {
+            let mut moved = false;
+            if !stretch.is_zero() && !delta.is_zero() {
+                moved = true;
+                let next = *stretch + delta / STIFFNESS;
+                if next.signum() == stretch.signum() {
+                    *stretch = next;
+                    return (moved, px(0.));
+                }
+                *stretch = px(0.);
+                delta = next * STIFFNESS;
+            }
+            let to = (*offset + delta).clamp(-max, px(0.));
+            let rest = *offset + delta - to;
+            moved |= to != *offset;
+            *offset = to;
+            (moved, rest)
+        };
+        let max = state.max_offset;
+        let (moved_x, x) = axis(&mut state.offset.x, &mut state.stretch.x, max.x, delta.x);
+        let (moved_y, y) = axis(&mut state.offset.y, &mut state.stretch.y, max.y, delta.y);
+        if moved_x || moved_y {
+            state.animation = None;
+            state.spring = None;
+        }
+        (moved_x || moved_y, point(x, y))
+    }
+
+    pub(crate) fn stretch_by(&self, rest: Point<Pixels>) {
+        let mut state = self.0.borrow_mut();
+        state.stretch += rest.map(|value| value / STIFFNESS);
+        state.spring = None;
+    }
+
+    /// Springs back after a pause in the scroll events, for devices that report no gesture end.
+    pub(crate) fn loosen(&self, window: &mut Window) {
+        {
+            let mut state = self.0.borrow_mut();
+            state.loose = state.stretch != Point::default();
+        }
+        self.drive(window);
+    }
+
+    /// Stops a bounce under new fingers. Returns whether the box is stretched.
+    fn hold(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        state.spring = None;
+        state.stretch != Point::default()
+    }
+
+    /// Springs back, going on at `speed` first when that is further out. Returns whether the box is
+    /// stretched.
+    pub(crate) fn release(&self, speed: Point<f32>, window: &mut Window) -> bool {
+        {
+            let mut state = self.0.borrow_mut();
+            let stretch = state.stretch;
+            if stretch == Point::default() {
+                return false;
+            }
+            if state.spring.is_some() {
+                return true;
+            }
+            let outward = |stretch: Pixels, speed: f32| {
+                if f32::from(stretch) * speed > 0. {
+                    speed
+                } else {
+                    0.
+                }
+            };
+            state.loose = false;
+            state.spring = Some(Spring {
+                from: stretch,
+                speed: point(outward(stretch.x, speed.x), outward(stretch.y, speed.y)),
+                start: Instant::now(),
+            });
+        }
+        self.drive(window);
+        true
     }
 
     /// Where the box stops: the end of a smooth scroll, or the offset.
@@ -947,12 +1121,12 @@ impl ScrollHandle {
         state.animation = animation;
     }
 
-    /// Advances the smooth scroll at the start of each frame, before the view renders, so the
-    /// frame lays out at the new offset.
+    /// Advances the smooth scroll and the bounce at the start of each frame, before the view
+    /// renders, so the frame lays out at the new offset.
     pub(crate) fn drive(&self, window: &mut Window) {
         {
             let mut state = self.0.borrow_mut();
-            if state.animation.is_none() || state.driven {
+            if state.driven || state.animation.is_none() && state.spring.is_none() && !state.loose {
                 return;
             }
             state.driven = true;
@@ -960,23 +1134,41 @@ impl ScrollHandle {
         let handle = self.clone();
         window.on_next_frame(move |window, _| {
             let now = Instant::now();
-            let mut state = handle.0.borrow_mut();
-            state.driven = false;
-            let Some(animation) = &state.animation else {
-                return;
-            };
-            let offset = if now < animation.start + animation.duration {
-                animation.at(now).0
-            } else {
-                let to = animation.to;
-                state.animation = None;
-                to
-            };
-            if offset != state.offset {
-                state.offset = offset;
-                window.refresh();
+            {
+                let state = &mut *handle.0.borrow_mut();
+                state.driven = false;
+                if let Some(animation) = &state.animation {
+                    let offset = if now < animation.start + animation.duration {
+                        animation.at(now).0
+                    } else {
+                        let to = animation.to;
+                        state.animation = None;
+                        to
+                    };
+                    if offset != state.offset {
+                        state.offset = offset;
+                        window.refresh();
+                    }
+                }
+                if state.loose && now - window.rails.1 > Duration::from_millis(100) {
+                    state.loose = false;
+                    state.spring = (state.stretch != Point::default()).then_some(Spring {
+                        from: state.stretch,
+                        speed: Point::default(),
+                        start: now,
+                    });
+                }
+                if let Some(spring) = &state.spring {
+                    match spring.at(now) {
+                        Some(stretch) => state.stretch = stretch,
+                        None => {
+                            state.stretch = Point::default();
+                            state.spring = None;
+                        }
+                    }
+                    window.refresh();
+                }
             }
-            drop(state);
             handle.drive(window);
         });
     }
@@ -1021,15 +1213,63 @@ impl ScrollHandle {
         state.offset.y = state.offset.y.clamp(-max.y, px(0.));
         state.max_offset = max;
         state.bounds = bounds;
-        state.offset
+        state.offset + state.stretch
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Animation, ScrollHandle};
+    use super::{Animation, ScrollHandle, Spring};
     use crate::{point, px};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn stretch_follows_the_pan_and_gives_way_to_scrolling() {
+        let delta = |y: f32| point(px(0.), px(y));
+        let handle = ScrollHandle::default();
+        handle.0.borrow_mut().max_offset = delta(100.);
+
+        assert_eq!(handle.pan(delta(-30.)), (true, delta(0.)));
+        assert_eq!(handle.pan(delta(50.)), (true, delta(20.)));
+        assert_eq!(handle.offset().y, px(0.));
+        assert_eq!(handle.pan(delta(10.)), (false, delta(10.)));
+
+        handle.stretch_by(delta(40.));
+        assert_eq!(handle.stretch().y, px(2.));
+        assert_eq!(handle.pan(delta(20.)), (true, delta(0.)));
+        assert_eq!(handle.stretch().y, px(3.));
+        // Going back takes the stretch away first, and the rest scrolls.
+        assert_eq!(handle.pan(delta(-80.)), (true, delta(0.)));
+        assert_eq!(handle.stretch().y, px(0.));
+        assert_eq!(handle.offset().y, px(-20.));
+
+        assert_eq!(handle.pan(delta(-100.)), (true, delta(-20.)));
+        handle.stretch_by(delta(-20.));
+        assert_eq!(handle.stretch().y, px(-1.));
+        handle.set_offset(delta(-50.));
+        assert_eq!(handle.stretch(), Default::default());
+    }
+
+    #[test]
+    fn springs_go_further_with_speed_and_end_at_the_edge() {
+        let start = Instant::now();
+        let spring = |from: f32, speed: f32| Spring {
+            from: point(px(0.), px(from)),
+            speed: point(0., speed),
+            start,
+        };
+        let at = |spring: &Spring, ms: u64| {
+            spring
+                .at(start + Duration::from_millis(ms))
+                .map(|at| f32::from(at.y))
+        };
+        // The values of `_NSElasticDeltaForTimeDelta`.
+        assert!((at(&spring(100., 0.), 50).unwrap() - 53.53).abs() < 0.01);
+        assert!((at(&spring(0., 4000.), 100).unwrap() - 35.53).abs() < 0.01);
+        assert_eq!(at(&spring(0., 4000.), 0), Some(0.));
+        assert_eq!(at(&spring(100., 0.), 600), None);
+        assert_eq!(at(&spring(0., 4000.), 800), None);
+    }
 
     #[test]
     fn smooth_scrolls_keep_position_and_speed() {

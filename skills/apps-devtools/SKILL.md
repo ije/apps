@@ -39,7 +39,7 @@ Omit `window` to use the main process. Window ids come from `windows`. Lines and
 | `evaluate` | Run JavaScript in the main process or a page. Promises are awaited |
 | `screenshot` | PNG of a window, or of one element with `selector` |
 | `dom` | HTML of the page or of an element, its box, and computed `styles` |
-| `input` | Real input: `click`, `move`, `scroll` (trackpad pixels, or mouse wheel lines with `"lines":true`), `key` (`enter`, `cmd-a`), `type` |
+| `input` | Real input: `click`, `move`, `scroll` (trackpad pixels, or mouse wheel lines with `"lines":true`, and a gesture `"phase"`: `began`, `changed`, `ended`, `momentum`, `momentum_ended`), `key` (`enter`, `cmd-a`), `type` |
 | `console` | Console messages and uncaught errors since the last call |
 | `memory` | Process memory, JavaScript heap, DOM nodes. `gc`, `snapshot` |
 | `profile` | JavaScript samples, frame times, CPU. `{"duration":3000}`, or `action` `start` and `stop` |

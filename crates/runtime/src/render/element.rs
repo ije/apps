@@ -12,7 +12,7 @@ use crate::{
     style::{self, ComputedStyles},
 };
 use renderer::{Bounds, Child, MouseButton, SharedString, img, point, px, relative, rgba, size};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 pub(super) struct Build<'a> {
     /// By node, what the inline SVGs and positioned boxes in its subtree read beyond it.
@@ -31,6 +31,8 @@ pub(super) struct Build<'a> {
     /// The in-flow children (`false`) and list items (`true`) of a parent, with their indexes.
     pub(super) siblings: &'a RefCell<HashMap<(usize, bool), Rc<Siblings>>>,
     pub(super) margins: &'a RefCell<Margins>,
+    /// The padding boxes of the positioned grids built in this pass, whose sizes are known before layout.
+    pub(super) blocks: &'a RefCell<rustc_hash::FxHashMap<usize, [f32; 2]>>,
     pub(super) ids: &'a Rc<super::effects::Ids>,
     pub(super) info: &'a [cull::Info],
     /// The visible range for culling children, or `None` where nothing is culled.
@@ -114,8 +116,15 @@ pub(super) fn own_inputs(
         .get(Prop::DISPLAY)
         .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
     {
-        for value in dom.cull.widths.get(&id).into_iter().flatten() {
-            value.to_bits().hash(&mut hasher);
+        // WARNING: grids read only the axes they track, and a size that prepaint would not draw again for is
+        // the size they were built with.
+        if let (Some(axes), Some(sizes)) = (dom.flexed_grids.get(&id), dom.cull.widths.get(&id)) {
+            for (axis, size) in axes.iter().zip(sizes) {
+                if let Some((used, _)) = axis {
+                    let size = if (size - used).abs() <= 0.5 { used } else { size };
+                    size.to_bits().hash(&mut hasher);
+                }
+            }
         }
         for child in &doc.nodes[id].children {
             for baseline in dom.baselines.get(child).into_iter().flatten() {
@@ -475,7 +484,11 @@ pub(super) fn element(
     units.container = Some(container);
     let key = Reuse {
         subtree: info.subtree,
-        containing,
+        containing: if info.flags & cull::HEIGHTED != 0 {
+            containing
+        } else {
+            [containing[0], 0.]
+        },
         container,
         flex_parent: build.flex_parent,
         grid_parent: build.doc.nodes[id].parent.is_some_and(|parent| {
@@ -530,12 +543,11 @@ pub(super) fn element(
     let child = create(build, id, containing, container, slot);
     let mut kept = build.view.kept.borrow_mut();
     // WARNING: culled runs depend on the scroll position, so a subtree with spacers is built again.
-    let old = if build.culls.get() == culls {
-        kept.insert(id, key)
+    if build.culls.get() == culls {
+        kept.insert(id, key);
     } else {
-        kept.remove(&id)
-    };
-    build.view.kept_log.borrow_mut().push((id, old));
+        kept.remove(&id);
+    }
     child
 }
 
@@ -547,6 +559,7 @@ fn create(
     slot: Option<([f32; 4], super::grid::Grid)>,
 ) -> Child {
     let Build {
+        blocks,
         inputs,
         doc,
         styles,
@@ -631,6 +644,7 @@ fn create(
         inline_text,
         siblings,
         margins: margin_cache,
+        blocks,
         ids,
         info,
         top_layer,
@@ -728,6 +742,9 @@ fn create(
             .and_then(|block| {
                 if block == 0 {
                     return Some(units.viewport);
+                }
+                if let Some(&size) = blocks.borrow().get(&block) {
+                    return Some(size);
                 }
                 let host = view.host.borrow();
                 let bounds = host.dom.get(&view.id)?.blocks.get(&block)?.size;
@@ -1222,8 +1239,27 @@ fn create(
                 source.push_str(&doc.serialize_svg(*child, true, &attrs));
             }
             source.push_str("</svg>");
-            // Elements keep their own ids in the source, so their geometry is found by id.
+            // WARNING: marks count from 0 in the source, so a picture has one source on all nodes and shares its
+            // raster. `names` starts with their nodes.
             let mut names = Vec::new();
+            let mut counted = String::with_capacity(source.len());
+            let mut rest = &*source;
+            const MARK: &str = " id=\"h2o-";
+            while let Some(start) = rest.find(MARK) {
+                let (before, after) = rest.split_at(start + MARK.len());
+                counted.push_str(before);
+                rest = after;
+                if let Some(end) = after.find('"')
+                    && let Ok(marked) = after[..end].parse()
+                {
+                    counted.push_str(&names.len().to_string());
+                    names.push((String::new(), marked));
+                    rest = &after[end..];
+                }
+            }
+            counted.push_str(rest);
+            let source = counted;
+            // Elements keep their own ids in the source, so their geometry is found by id.
             let mut pending = node.children.clone();
             while let Some(child) = pending.pop() {
                 if let Some(name) = doc.nodes[child].attrs.get("id") {
@@ -1253,6 +1289,7 @@ fn create(
             // WARNING: paint only checks the raster size of inline SVGs, so a changed source drops the raster here.
             if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
                 && let Some((_, image)) = state.svgs.remove(&id)
+                && Arc::strong_count(&image) == 1
             {
                 state.retired.push(image);
             }
@@ -1449,6 +1486,7 @@ fn create(
             .text_size(px(font_size))
             .line_height(px(line_height));
         clip.style().restrict_scroll_to_axis = true;
+        clip.style().overscroll = overscroll(style);
         // Like browsers, an input clips its line to the content box and centers it, while a textarea
         // wraps its text and scrolls it under its padding.
         el = el
@@ -2786,11 +2824,17 @@ fn create(
     {
         el = el.child(super::control::layer(id, look, view.clone()));
     }
-    // WARNING: `overflow: hidden` boxes track a scroll handle only once a script scrolls them.
+    let overscroll = overscroll(style);
+    // WARNING: `overflow: hidden` boxes track a scroll handle only once a script scrolls them, or
+    // when `overscroll-behavior` stops scrolling at them.
     let handle = {
         let mut host = view.host.borrow_mut();
         let scroll = &mut host.dom.entry(view.id).or_default().scroll;
-        if scrolls.contains(&true) {
+        if scrolls.contains(&true)
+            || !page
+                && overflow.contains(&renderer::Overflow::Hidden)
+                && overscroll != renderer::Point::default()
+        {
             Some(scroll.entry(id).or_default().clone())
         } else if overflow.contains(&renderer::Overflow::Hidden) {
             scroll.get(&id).cloned()
@@ -2803,6 +2847,7 @@ fn create(
         if !editable {
             el = el.track_scroll(&handle);
             el.style().restrict_scroll_to_axis = true;
+            el.style().overscroll = overscroll;
         }
         bars = Some(scrollbar::Scrollbar {
             id,
@@ -3584,10 +3629,15 @@ fn create(
                     let max = (max - horizontal - margin[1] - margin[3]).max(0.);
                     widest = Some(max);
                     // WARNING: tracks size the untransformed box, so they read its laid-out size, not its window bounds.
-                    let last =
-                        view.host.borrow().dom.get(&view.id).and_then(|state| {
-                            state.cull.widths.get(&id).map(|size| size[0].max(0.))
-                        });
+                    // New content makes the last size meaningless. Most content fits, so tracks take its full width,
+                    // and prepaint draws again when the layout disagrees.
+                    let last = {
+                        let mut host = view.host.borrow_mut();
+                        let dom = host.dom.entry(view.id).or_default();
+                        let same = dom.grid_widest.insert(id, max) == Some(max);
+                        same.then(|| dom.cull.widths.get(&id).map(|size| size[0].max(0.)))
+                            .flatten()
+                    };
                     // Laid-out bounds are in layout units, so a fitting grid may look narrower.
                     content[0] = last.map_or(content[0].min(max), |last| {
                         if last + 0.5 >= max {
@@ -3596,7 +3646,7 @@ fn create(
                             last
                         }
                     });
-                    tracked[0] = Some((last.unwrap_or(f32::NAN), horizontal));
+                    tracked[0] = Some((last.unwrap_or(content[0]), horizontal));
                 }
                 let height =
                     if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
@@ -3678,13 +3728,20 @@ fn create(
                     + borders[1]
                     + borders[3])),
             };
-            if style.get(Prop::HEIGHT).is_none_or(|v| v == "auto") && !flexed {
-                el = el.h(px(grid.rows.iter().sum::<f32>()
-                    + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1]
-                    + padding[0]
-                    + padding[2]
-                    + borders[0]
-                    + borders[2]));
+            let auto = style.get(Prop::HEIGHT).is_none_or(|v| v == "auto");
+            let rows = grid.rows.iter().sum::<f32>()
+                + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1];
+            if auto && !flexed {
+                el = el.h(px(rows + padding[0] + padding[2] + borders[0] + borders[2]));
+            }
+            if !flexed && contains(style, false) {
+                blocks.borrow_mut().insert(
+                    id,
+                    [
+                        content[0] + padding[1] + padding[3],
+                        if auto { rows } else { content[1] } + padding[0] + padding[2],
+                    ],
+                );
             }
         }
         let mut children = if grid.is_some() {
@@ -5032,6 +5089,19 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
 }
 
 /// `Some(true)` for a box floated right, `Some(false)` for left.
+/// The `overscroll-behavior` of a box.
+pub(super) fn overscroll(style: &style::Style) -> renderer::Point<renderer::Overscroll> {
+    let axis = |prop| match style.get(prop) {
+        Some("contain") => renderer::Overscroll::Contain,
+        Some("none") => renderer::Overscroll::None,
+        _ => renderer::Overscroll::Auto,
+    };
+    point(
+        axis(Prop::OVERSCROLL_BEHAVIOR_X),
+        axis(Prop::OVERSCROLL_BEHAVIOR_Y),
+    )
+}
+
 fn float_side(style: &style::Style) -> Option<bool> {
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     match style.get(Prop::FLOAT) {
@@ -5420,14 +5490,25 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
             {
                 if entry.0 != *source {
                     // WARNING: paint draws the tree parsed here, so a changed source is parsed once.
-                    let tree = super::canvas::svg_tree(source).ok();
-                    let (size, content, boxes) = tree
-                        .as_ref()
-                        .map(super::canvas::svg_boxes)
-                        .unwrap_or_default();
-                    if let Some(tree) = tree {
-                        state.svg_trees.insert(id, tree);
-                    }
+                    // WARNING: a draw that repeats skips paint, so a tree of the old source can still wait here.
+                    state.svg_trees.remove(&id);
+                    let (size, content, boxes) = match state.svg_cache.get(source) {
+                        Some((geometry, _)) => geometry.clone(),
+                        None => {
+                            let tree = super::canvas::svg_tree(source).ok();
+                            let geometry = tree
+                                .as_ref()
+                                .map(super::canvas::svg_boxes)
+                                .unwrap_or_default();
+                            if let Some(tree) = tree {
+                                state.svg_trees.insert(id, tree);
+                                state
+                                    .svg_cache
+                                    .insert(source.clone(), (geometry.clone(), Vec::new()));
+                            }
+                            geometry
+                        }
+                    };
                     let names = &entry.1;
                     entry.2 = size;
                     entry.4 = content;
@@ -5435,7 +5516,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                         .into_iter()
                         .filter_map(|(name, canvas, object)| {
                             let node = match name.strip_prefix("h2o-") {
-                                Some(node) => node.parse().ok()?,
+                                Some(mark) => names.get(mark.parse::<usize>().ok()?)?.1,
                                 None => names.iter().find(|(other, _)| *other == name)?.1,
                             };
                             Some((node, canvas, object))
@@ -5495,13 +5576,39 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                     || u32::from(image.size().width) != raster[0]
                     || u32::from(image.size().height) != raster[1]
             }) {
-                let image = match state.svg_trees.remove(&id).filter(|_| inline) {
-                    Some(tree) => super::canvas::render_svg(&tree, raster[0], raster[1], None),
-                    None => super::canvas::svg(source, raster[0], raster[1], None),
+                let shared = state
+                    .svg_cache
+                    .get(source)
+                    .filter(|_| inline)
+                    .and_then(|(_, images)| {
+                        images.iter().find(|image| {
+                            [u32::from(image.size().width), u32::from(image.size().height)] == raster
+                        })
+                    })
+                    .cloned();
+                let image = match (&shared, state.svg_trees.remove(&id).filter(|_| inline)) {
+                    (Some(image), _) => Ok(image.clone()),
+                    (_, Some(tree)) => super::canvas::render_svg(&tree, raster[0], raster[1], None),
+                    _ => super::canvas::svg(source, raster[0], raster[1], None),
                 };
                 match image {
                     Ok(image) => {
-                        if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image)) {
+                        // WARNING: only icon sizes stay, so at most 256 of them hold under 10 MB.
+                        if inline && shared.is_none() && raster[0] <= 96 && raster[1] <= 96 {
+                            if let Some((_, images)) = state.svg_cache.get_mut(source) {
+                                images.push(image.clone());
+                            }
+                            if state.svg_cache.len() > 256 {
+                                for image in state.svg_cache.drain().flat_map(|(_, entry)| entry.1) {
+                                    if Arc::strong_count(&image) == 1 {
+                                        window.drop_image(image);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image))
+                            && Arc::strong_count(&old) == 1
+                        {
                             window.drop_image(old);
                         }
                     }

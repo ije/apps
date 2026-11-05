@@ -16,7 +16,7 @@ fn main() {
             home = home.parent().unwrap().join("Resources");
         }
         // A built app passes all of its arguments to process.argv. Otherwise the arguments after `--` go there.
-        let packaged = home.join("app.h2o").is_file() || home.join("app.js").is_file();
+        let packaged = home.join("app.bundle").is_file() || home.join("app.js").is_file();
         for os in std::env::args_os().skip(1).filter(|_| !packaged) {
             let arg = os.to_string_lossy();
             if arg == "--" {

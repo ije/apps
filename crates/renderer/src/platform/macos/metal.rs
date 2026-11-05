@@ -97,11 +97,24 @@ impl BufferPool {
     }
 }
 
+/// A drawn frame that shows where this value drops: on the main thread inside AppKit's transaction,
+/// or on the render thread when the main thread stopped waiting for it.
+pub(crate) struct Present(Option<super::Sendable<Box<dyn FnOnce()>>>);
+
+impl Drop for Present {
+    fn drop(&mut self) {
+        if let Some(present) = self.0.take() {
+            present.take()();
+        }
+    }
+}
+
 pub(crate) struct Renderer {
     device: Device,
     layer: Retained<CAMetalLayer>,
     unified: bool,
     presents_with_transaction: bool,
+    present: Option<Present>,
     opaque: bool,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Pipelines,
@@ -248,6 +261,7 @@ impl Renderer {
             layer,
             unified,
             presents_with_transaction: false,
+            present: None,
             opaque: !transparent,
             queue,
             atlas,
@@ -421,8 +435,21 @@ impl Renderer {
         &self.layer
     }
 
-    /// Presents in the Core Animation transaction of the main thread, so a live resize shows the
-    /// new frame in step with the window.
+    /// Sets the size of the next drawables. Only the thread that draws changes it, so a frame always
+    /// fits its scene.
+    pub fn set_drawable_size(&self, size: CGSize) {
+        if self.layer.drawableSize() != size {
+            self.layer.setDrawableSize(size);
+        }
+    }
+
+    /// The last frame drawn with [`Self::set_presents_with_transaction`].
+    pub fn take_present(&mut self) -> Option<Present> {
+        self.present.take()
+    }
+
+    /// Keeps the next frame for [`Self::take_present`], so it can show in the Core Animation
+    /// transaction of the main thread and a live resize shows it in step with the window.
     pub fn set_presents_with_transaction(&mut self, on: bool) {
         self.presents_with_transaction = on;
     }
@@ -467,7 +494,6 @@ impl Renderer {
             eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
-        // WARNING: the main thread can resize the layer at any time, so only the texture is sure.
         let texture = drawable.texture();
         let window = [texture.width() as u32, texture.height() as u32];
         let (commands, sublayers) = match self.render_frame(scene, &texture, window) {
@@ -488,9 +514,7 @@ impl Renderer {
                 }
             };
             if resizing {
-                // WARNING: AppKit waits in its transaction on the main thread for this frame.
-                let present = super::Sendable::new(present);
-                super::native_sync(move || present.take()());
+                self.present = Some(Present(Some(super::Sendable::new(Box::new(present)))));
             } else {
                 present();
             }

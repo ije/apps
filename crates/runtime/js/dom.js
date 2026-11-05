@@ -376,7 +376,7 @@
       if (parented) forgetRemoved();
       if (removal) change(removal);
       if (observed) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling });
-      // WARNING: only the bundler loads stylesheets and h2o never preloads, so these links fail when a script inserts them, like links that can't load.
+      // WARNING: only the bundler loads stylesheets and @pierre/apps never preloads, so these links fail when a script inserts them, like links that can't load.
       if (kid.tag === 'link' && kid.attrs.has('href') && /(^|\s)(stylesheet|preload|modulepreload)(\s|$)/i.test(kid.attrs.get('rel') ?? '') && child.isConnected) setTimeout(() => child.dispatchEvent(new Event('error')));
       return child;
     }
@@ -474,7 +474,7 @@
     border: [...sides('border-', '-width'), ...sides('border-', '-style'), ...sides('border-', '-color')], 'border-width': sides('border-', '-width'), 'border-style': sides('border-', '-style'), 'border-color': sides('border-', '-color'),
     'border-top': ['border-top-width', 'border-top-style', 'border-top-color'], 'border-right': ['border-right-width', 'border-right-style', 'border-right-color'], 'border-bottom': ['border-bottom-width', 'border-bottom-style', 'border-bottom-color'], 'border-left': ['border-left-width', 'border-left-style', 'border-left-color'],
     margin: sides('margin-'), padding: sides('padding-'), inset: sides(''), 'scroll-margin': sides('scroll-margin-'), 'scroll-padding': sides('scroll-padding-'), 'border-radius': ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius'],
-    gap: ['row-gap', 'column-gap'], overflow: ['overflow-x', 'overflow-y'], 'flex-flow': ['flex-direction', 'flex-wrap'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'], 'place-content': ['align-content', 'justify-content'], 'place-items': ['align-items', 'justify-items'], 'place-self': ['align-self', 'justify-self'],
+    gap: ['row-gap', 'column-gap'], overflow: ['overflow-x', 'overflow-y'], 'overscroll-behavior': ['overscroll-behavior-x', 'overscroll-behavior-y'], 'flex-flow': ['flex-direction', 'flex-wrap'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'], 'place-content': ['align-content', 'justify-content'], 'place-items': ['align-items', 'justify-items'], 'place-self': ['align-self', 'justify-self'],
     'text-decoration': ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'], 'list-style': ['list-style-type', 'list-style-position', 'list-style-image'], outline: ['outline-width', 'outline-style', 'outline-color'], container: ['container-name', 'container-type'],
   });
   const shorthandValue = (name, values) => {

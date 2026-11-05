@@ -303,6 +303,8 @@ props! {
     OVERFLOW_X "overflow-x",
     OVERFLOW_Y "overflow-y",
     OVERSCROLL_BEHAVIOR "overscroll-behavior",
+    OVERSCROLL_BEHAVIOR_BLOCK "overscroll-behavior-block",
+    OVERSCROLL_BEHAVIOR_INLINE "overscroll-behavior-inline",
     OVERSCROLL_BEHAVIOR_X "overscroll-behavior-x",
     OVERSCROLL_BEHAVIOR_Y "overscroll-behavior-y",
     PADDING "padding",
@@ -500,7 +502,7 @@ impl Prop {
         self.0 & CUSTOM != 0
     }
 
-    /// A property that h2o knows. Other names are kept for the CSSOM but never applied.
+    /// A property that `@pierre/apps` knows. Other names are kept for the CSSOM but never applied.
     pub(crate) fn is_known(self) -> bool {
         (self.0 as usize) < NAMES.len()
     }

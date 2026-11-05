@@ -1066,6 +1066,7 @@ fn scroll_event(position: Point<Pixels>, delta: Point<f32>, modifiers: Modifiers
     PlatformInput::ScrollWheel(ScrollWheelEvent {
         position,
         delta: ScrollDelta::Lines(delta),
+        phase: Default::default(),
         modifiers,
     })
 }

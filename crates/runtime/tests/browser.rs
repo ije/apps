@@ -72,7 +72,7 @@ fn iframe_delivers_load_after_native_layout() {
         ("app.js".to_owned(), format!("$appsDefine({app});")),
         ("index.html".to_owned(), "<html><body><script type='module'>const frame=document.createElement('iframe');frame.setAttribute('srcdoc','<h1>Native iframe</h1>');frame.style.width='600px';frame.style.height='150px';frame.addEventListener('load',()=>console.log('IFRAME_NATIVE_LOAD',frame.getBoundingClientRect().width,frame.getBoundingClientRect().height));document.body.append(frame);</script></body></html>".to_owned()),
     ]);
-    apps_runtime::bundle::write(&output.path().join("app.h2o"), &files).unwrap();
+    apps_runtime::bundle::write(&output.path().join("app.bundle"), &files).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
         .arg(output.path())
         .stdout(Stdio::piped())
@@ -120,7 +120,7 @@ fn page_error_survives_and_native_window_runs_finalizers() {
         ),
         ("index.html".to_owned(), page.to_owned()),
     ]);
-    apps_runtime::bundle::write(&output.path().join("app.h2o"), &files).unwrap();
+    apps_runtime::bundle::write(&output.path().join("app.bundle"), &files).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
         .arg(output.path())
         .stdout(Stdio::piped())

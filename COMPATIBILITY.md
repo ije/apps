@@ -38,8 +38,8 @@ Pages get the standard DOM API (nodes, elements, events, ranges, selection, obse
 
 ## CSS
 
-Pages use standard CSS, drawn by h2o on the GPU. Transforms, filters, blend modes, masks and clip paths paint through offscreen GPU layers.
-These parts differ from browsers. The ones that don't work show an error in the Developer Tools console (`apps run -D`): properties and at-rules that h2o reads but does not apply, like `hyphens`, `tab-size` and `@counter-style`, and values it rejects. `@supports` and `CSS.supports()` return false for them.
+Pages use standard CSS, drawn by `@pierre/apps` on the GPU. Transforms, filters, blend modes, masks and clip paths paint through offscreen GPU layers.
+These parts differ from browsers. The ones that don't work show an error in the Developer Tools console (`apps run -D`): properties and at-rules that `@pierre/apps` reads but does not apply, like `hyphens`, `tab-size` and `@counter-style`, and values it rejects. `@supports` and `CSS.supports()` return false for them.
 
 | Feature | Support |
 |---|---|
@@ -53,6 +53,7 @@ These parts differ from browsers. The ones that don't work show an error in the 
 | Multi-column layout | Columns break between child blocks. One paragraph doesn't split across columns |
 | `writing-mode: vertical-lr` | Lines are ordered right to left, like `vertical-rl` |
 | Tailwind CSS v4 | `@import "tailwindcss"` compiles the classes in the page when they appear, with `@theme`, `@custom-variant`, `@utility` and `@apply`. `@plugin`, `@source`, `@config` and the `prefix()`, `source()` and `important` import options are not supported. An `@utility` that applies itself, directly or through other utilities, skips that `@apply`, where Tailwind reports an error |
+| Overscroll | A trackpad bounces any box that scrolls at its edges, like Safari, with AppKit's curve. Boxes and pages with nothing to scroll and mouse wheels don't bounce. `scrollTop` and scroll events stay in range during a bounce. `overscroll-behavior` on the root element applies to the page, not on the body. `contain` and `none` also stop scrolling at boxes with `overflow: hidden` or nothing to scroll, as in Chromium |
 | Scrollbars | Drawn as macOS overlay bars on all platforms. They show while the box scrolls or the pointer is on them, then fade out, and they take no space. The knob is light on a dark `color-scheme` or background. The macOS "Always" scroll bar setting is ignored. `scrollbar-width` and `scrollbar-color` work |
 | `::-webkit-scrollbar` | Gives bars that always show and take space, as in Chromium. `-track`, `-thumb`, `-thumb:hover` and `-corner` use the background color, border, `border-radius` and `background-clip`. Buttons, other scrollbar states and background images are not drawn. `scrollbar-gutter: stable` works only with these bars |
 | `app-region`, `-webkit-app-region` | `drag` and `no-drag` work as in Electron. The value is inherited, so `getComputedStyle()` returns it for children, and a box that only overlaps a drag area doesn't move the window |
@@ -110,7 +111,7 @@ These parts differ from Electron:
 
 The main process, preload scripts and workers can import these built-in modules, with or without the `node:` prefix: `assert`, `buffer`, `child_process`, `crypto`, `dns`, `events`, `fs`, `http`, `https`, `module`, `net`, `os`, `path`, `perf_hooks`, `process`, `querystring`, `readline`, `stream`, `string_decoder`, `timers`, `tty`, `url`, `util`, `worker_threads` and `zlib`. Their `/promises`, `/strict`, `/posix`, `/win32`, `/types`, `/consumers` and `/web` subpaths also work. `node:sqlite` and `node:ffi` are available too.
 
-h2o follows the Node.js 24 API, so `process.version` is `v24.0.0`. Deprecated and experimental APIs are not included. These parts differ from Node.js:
+`@pierre/apps` follows the Node.js 24 API, so `process.version` is `v24.0.0`. Deprecated and experimental APIs are not included. These parts differ from Node.js:
 
 | Feature | Support |
 |---|---|
@@ -121,13 +122,13 @@ h2o follows the Node.js 24 API, so `process.version` is `v24.0.0`. Deprecated an
 | Timers | The main process runs until it quits, so `ref()` and `unref()` have no effect there. In `worker_threads` workers, `unref()` lets the worker end while the timer is pending |
 | `perf_hooks` | `performance` records marks, measures and `timerify()` entries only, with no resource timing. In the main process on Windows and Linux, `eventLoopUtilization()` counts time spent drawing windows as idle |
 | `worker_threads` | Workers get the environment of the app process, not the parent's `process.env`, so `SHARE_ENV` and the `env` option have no effect. A `BroadcastChannel` in a page only reaches channels of the same page |
-| `fs` | File descriptors are h2o handles, not OS descriptors. There are no `bigint` stats. `statfs()` doesn't work on Windows. `glob()` takes `*`, `?`, `[...]`, `{a,b}` and `**`, without extglobs or `{1..3}` ranges, and `fs.promises.glob()` yields its matches after the walk ends. `openAsBlob()` reads the whole file into memory. A FileHandle has no `readLines()` or `readableWebStream()` |
+| `fs` | File descriptors are `@pierre/apps` handles, not OS descriptors. There are no `bigint` stats. `statfs()` doesn't work on Windows. `glob()` takes `*`, `?`, `[...]`, `{a,b}` and `**`, without extglobs or `{1..3}` ranges, and `fs.promises.glob()` yields its matches after the walk ends. `openAsBlob()` reads the whole file into memory. A FileHandle has no `readLines()` or `readableWebStream()` |
 | `child_process` | No `fork()` and no IPC channel, so `'ipc'` in `stdio` throws. `stdio` takes the descriptors 0, 1 and 2 only. The `uid` and `gid` options throw on Windows. The child's `stdout` and `stderr` are readable streams, not sockets |
 | `crypto` | Hashes are `md5`, `sha1`, `sha224`, `sha256`, `sha384` and `sha512`. HMAC, `pbkdf2()` and `hkdf()` support all of them. Ciphers are `aes-128-gcm` and `aes-256-gcm` with a 12-byte IV, and a cipher keeps the message in memory until `final()`. Keys are RSA, EC P-256 and P-384, and Ed25519. Encrypted keys, compressed EC points and EC private keys without their public key can't be read, and keys are not exported encrypted. P-256 keys sign with SHA-256 and P-384 keys with SHA-384. RSA keys sign with 2048 to 4096 bits, and RSA-PSS salts are as long as the digest. `generateKeyPair()` makes `ec` and `ed25519` keys only. There is no Diffie-Hellman, ECDH, `X509Certificate`, `KeyObject.from()`, `publicEncrypt()` or `argon2()`. `crypto.subtle` does ECDSA P-256 only |
 | `zlib` | Gzip, deflate and raw deflate only, there is no Brotli or Zstd. `params()` keeps the old level when the new one needs a different strategy. Streams compress on the JavaScript thread |
 | `os` | `cpus()` times are 0. On Windows, `networkInterfaces()` returns `{}`, `loadavg()` returns zeros, `version()` returns `Windows`, and `getPriority()` and `setPriority()` throw |
 | `dns` | `resolve*()`, `reverse()` and `Resolver` use the system resolver library and don't work on Windows. `setServers()` takes IPv4 servers only, timeouts are rounded up to seconds, and `Resolver` has no `setLocalAddress()`. `lookupService()` is not supported |
-| `http`, `https` | `request()` uses `fetch`. It sends the body when `end()` is called, follows redirects, decodes gzip responses (without their `content-encoding` header) and reports the standard status text. `Agent` exists, but requests don't use its sockets. Servers listen on TCP ports only, by default on `0.0.0.0`. `https.createServer()` throws, because h2o has no TLS server. `https.request()` checks certificates against the system roots. `rejectUnauthorized`, `ca`, `cert` and `key` are ignored, so servers with self-signed certificates fail |
+| `http`, `https` | `request()` uses `fetch`. It sends the body when `end()` is called, follows redirects, decodes gzip responses (without their `content-encoding` header) and reports the standard status text. `Agent` exists, but requests don't use its sockets. Servers listen on TCP ports only, by default on `0.0.0.0`. `https.createServer()` throws, because `@pierre/apps` has no TLS server. `https.request()` checks certificates against the system roots. `rejectUnauthorized`, `ca`, `cert` and `key` are ignored, so servers with self-signed certificates fail |
 | `net` | The default host is IPv4. There is no `'lookup'` event or automatic family selection |
 | `node:sqlite` | No extensions, limits or `Session` |
 | `readline` | Reads lines from streams. There is no terminal line editing, history or completion |

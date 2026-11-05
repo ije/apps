@@ -559,7 +559,7 @@ impl State {
         let packed = path
             .to_str()
             .and_then(|key| host.borrow().scripts.get(key).cloned());
-        // WARNING: dlopen needs a file, so an addon packed in app.h2o is written to the user's cache folder, named by
+        // WARNING: dlopen needs a file, so an addon packed in app.bundle is written to the user's cache folder, named by
         // its name and content so copies at other paths stay separate modules, and rewritten only when the file differs.
         let path = match packed {
             Some(bytes) => {

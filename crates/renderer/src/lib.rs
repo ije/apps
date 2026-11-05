@@ -1,4 +1,4 @@
-//! h2o's windows and GPU renderer: Metal on macOS, Direct3D 11 on Windows, wgpu on Linux.
+//! The windows and GPU renderer of `@pierre/apps`: Metal on macOS, Direct3D 11 on Windows, wgpu on Linux.
 //!
 //! The view keeps a tree of boxes in each window. A frame commits the boxes that changed, lays
 //! out the ones whose inputs changed with taffy, paints them into a [`Scene`] in CSS paint order,

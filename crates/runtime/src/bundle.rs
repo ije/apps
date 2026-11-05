@@ -7,7 +7,7 @@ use bbtree::unsync::BBTreeMap;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
-const HEADER: &[u8; 8] = b"H2O\0\x01\0\0\0";
+const HEADER: &[u8; 8] = b"APP\0\x01\0\0\0";
 
 /// The attribute that carries the bundled CSS of a `<link rel="stylesheet">` in a bundled page.
 pub const LINK_SHEET: &str = "apps-sheet";
@@ -288,8 +288,8 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     );
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
-    // WARNING: running apps map app.h2o, so a new bundle replaces the file instead of rewriting it.
-    let temporary = path.with_extension("h2o.tmp");
+    // WARNING: running apps map app.bundle, so a new bundle replaces the file instead of rewriting it.
+    let temporary = path.with_extension("bin.tmp");
     fs::write(&temporary, &bytes)
         .and_then(|()| fs::rename(&temporary, path))
         .with_context(|| format!("Cannot write {}", path.display()))?;
@@ -299,7 +299,9 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
 pub fn read(directory: &Path) -> Result<Bundle> {
     let directory = if directory.join("Contents/Resources").is_dir() {
         directory.join("Contents/Resources")
-    } else if !directory.join("app.h2o").try_exists()? && !directory.join("app.js").try_exists()? {
+    } else if !directory.join("app.bundle").try_exists()?
+        && !directory.join("app.js").try_exists()?
+    {
         let mut resources = None;
         for entry in fs::read_dir(directory).context("Cannot read bundle directory")? {
             let path = entry?.path();
@@ -320,7 +322,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
     let directory = directory
         .canonicalize()
         .context("Cannot resolve bundle directory")?;
-    let path = directory.join("app.h2o");
+    let path = directory.join("app.bundle");
     let mut bundle = if path.try_exists()? {
         #[derive(Deserialize)]
         struct Mapped<'a> {
@@ -329,19 +331,19 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             #[serde(with = "map")]
             pages: BBTreeMap<String, Document>,
         }
-        let file = fs::File::open(&path).context("Cannot read app.h2o")?;
-        // WARNING: script chunks stay in the mapped file until they run, so app.h2o must not change
+        let file = fs::File::open(&path).context("Cannot read app.bundle")?;
+        // WARNING: script chunks stay in the mapped file until they run, so app.bundle must not change
         // while the app runs.
         let bytes = bytes::Bytes::from_owner(
-            unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.h2o")?,
+            unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.bundle")?,
         );
         ensure!(
             bytes.starts_with(HEADER),
-            "Invalid or unsupported app.h2o format"
+            "Invalid or unsupported app.bundle format"
         );
         let (mapped, rest): (Mapped, _) =
-            postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.h2o data")?;
-        ensure!(rest.is_empty(), "Trailing app.h2o data");
+            postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.bundle data")?;
+        ensure!(rest.is_empty(), "Trailing app.bundle data");
         let mut bundle = Bundle {
             pages: mapped.pages,
             ..Bundle::default()
@@ -354,7 +356,8 @@ pub fn read(directory: &Path) -> Result<Bundle> {
                     .insert(name, bytes.slice_ref(source))
                     .is_some()
             } else {
-                let source = String::from_utf8(source.to_vec()).context("Invalid app.h2o data")?;
+                let source =
+                    String::from_utf8(source.to_vec()).context("Invalid app.bundle data")?;
                 bundle.files.insert(name, source).is_some()
             };
             ensure!(!duplicate, "Duplicate bundle key");
@@ -775,7 +778,7 @@ mod tests {
             ("app.js".into(), "$appsDefine({id:0});".into()),
             ("page-0.html".into(), html.into()),
         ]);
-        write(&dir.path().join("app.h2o"), &files).unwrap();
+        write(&dir.path().join("app.bundle"), &files).unwrap();
         let mut bundle = read(dir.path()).unwrap();
         assert_eq!(bundle.files.len(), 1);
         let doc = bundle.pages.remove("page-0.html").unwrap();
@@ -845,7 +848,7 @@ mod tests {
             ("app.js".into(), String::new()),
             ("page-0.html".into(), html),
         ]);
-        let size = write(&dir.path().join("app.h2o"), &files).unwrap();
+        let size = write(&dir.path().join("app.bundle"), &files).unwrap();
         assert!(
             size < 10_000,
             "Nested parent selectors were duplicated: {size}"
@@ -862,7 +865,7 @@ mod tests {
     #[test]
     fn script_chunks_stay_in_the_mapped_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.h2o");
+        let path = dir.path().join("app.bundle");
         let files = BBTreeMap::from([
             ("app.js".into(), "$appsDefine({id:0});".into()),
             ("script-0.js".into(), "globalThis.chunk = '你好';".into()),
@@ -884,7 +887,7 @@ mod tests {
     #[test]
     fn rejects_corrupt_bundles_and_invalid_document_links() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.h2o");
+        let path = dir.path().join("app.bundle");
         let files = BBTreeMap::from([
             ("app.js".into(), "const x = '你好';".into()),
             ("page-0.html".into(), "<body>hello</body>".into()),
