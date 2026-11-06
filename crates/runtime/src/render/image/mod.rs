@@ -147,3 +147,36 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<renderer::RenderImage> {
         pixels,
     ))
 }
+
+/// A `data:` URL as a file in the temp folder, so CSS images read it like any other file.
+pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    let bytes = if header.ends_with(";base64") {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim()).ok()?
+    } else {
+        let input = payload.as_bytes();
+        let mut bytes = Vec::with_capacity(input.len());
+        let mut index = 0;
+        while index < input.len() {
+            let hex = (input[index] == b'%')
+                .then(|| input.get(index + 1..index + 3))
+                .flatten()
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            bytes.push(hex.unwrap_or(input[index]));
+            index += if hex.is_some() { 3 } else { 1 };
+        }
+        bytes
+    };
+    let mut hasher = std::hash::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let directory = std::env::temp_dir().join("apps-data-images");
+    let extension = if header.contains("svg") { "svg" } else { "bin" };
+    let path = directory.join(format!("{:016x}.{extension}", hasher.finish()));
+    if !path.exists() {
+        std::fs::create_dir_all(&directory).ok()?;
+        std::fs::write(&path, bytes).ok()?;
+    }
+    Some(path)
+}

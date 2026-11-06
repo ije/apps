@@ -418,6 +418,14 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     [kind]() { return this.mode & S.S_IFMT; }
   }
   for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) Object.defineProperty(Stats.prototype, name, { configurable: true, get() { return this[name] = new Date(this[name + 'Ms']); }, set(value) { Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true }); } });
+  class BigIntStats extends Stats {
+    constructor(value) {
+      super(value);
+      for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) { const ms = this[name + 'Ms']; this[name] = new Date(ms); this[name + 'Ms'] = BigInt(Math.floor(ms)); this[name + 'Ns'] = BigInt(Math.floor(ms)) * 1000000n; }
+      for (const name of ['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'rdev', 'size', 'blksize', 'blocks']) this[name] = BigInt(this[name]);
+    }
+    [kind]() { return Number(this.mode) & S.S_IFMT; }
+  }
   class Dirent {
     #type;
     constructor(name, type, parentPath) { this.name = name; this.parentPath = parentPath; this.#type = type; }
@@ -449,7 +457,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const seconds = value => value instanceof Date ? value.getTime() / 1000 : Number(value);
   const finish = (name, result, args) => {
     if (name === 'readFile') { const encoding = options(args[1]).encoding; return utf8.test(encoding) ? result : encoding && encoding !== 'buffer' ? bytes(result).toString(encoding) : bytes(result); }
-    if (name === 'stat' || name === 'lstat' || name === 'fstat') return new Stats(result);
+    if (name === 'stat' || name === 'lstat' || name === 'fstat') return args[1]?.bigint ? new BigIntStats(result) : new Stats(result);
     if (name === 'statfs') return new StatFs(result, args[1]?.bigint);
     if (name === 'readdir') {
       const o = options(args[1]), raw = o.encoding === 'buffer';
@@ -474,7 +482,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const b = await asyncCall('read', this.#fd, 1048576, null); if (!b.length) break; chunks.push(bytes(b)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
     async writeFile(data, o) { const { encoding, signal } = options(o), bytes = view(data, encoding); let at = 0; do { aborted(signal); at += await asyncCall('write', this.#fd, bytes.subarray(at, at + 1048576), null); } while (at < bytes.length); }
     async appendFile(data, o) { await this.writeFile(data, o); }
-    async stat() { return new Stats(await asyncCall('fstat', this.#fd)); }
+    async stat(options) { const result = await asyncCall('fstat', this.#fd); return options?.bigint ? new BigIntStats(result) : new Stats(result); }
     async sync() { await asyncCall('fsync', this.#fd); }
     async datasync() { await asyncCall('fdatasync', this.#fd); }
     async truncate(size = 0) { await asyncCall('ftruncate', this.#fd, size); }

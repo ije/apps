@@ -364,6 +364,12 @@ impl Window {
 
     pub fn state(&self) -> WindowState {
         let state = self.shared.state.borrow();
+        let display = self
+            .shared
+            .client
+            .upgrade()
+            .and_then(|client| client.primary_display_bounds())
+            .unwrap_or_default();
         WindowState {
             frame: state.bounds,
             content: state.bounds,
@@ -372,6 +378,8 @@ impl Window {
             fullscreen: state.fullscreen,
             visible: self.shared.mapped.get(),
             resizing: false,
+            display,
+            work_area: display,
         }
     }
 

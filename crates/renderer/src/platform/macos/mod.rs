@@ -16,7 +16,6 @@ use core_foundation::string::CFStringRef;
 use dispatch2::{
     DispatchObject as _, DispatchQueue, DispatchRetained, DispatchSource, DispatchTime,
 };
-use objc2_quartz_core::CATransaction;
 use objc2::{
     Encode, Encoding, MainThreadMarker, RefEncode, class, msg_send,
     rc::{Retained, autoreleasepool},
@@ -27,6 +26,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSPasteboard, NSPasteboardTypeString, NSScreen,
 };
 use objc2_foundation::{NSArray, NSNotFound, NSString, NSUInteger, NSURL};
+use objc2_quartz_core::CATransaction;
 use std::{
     cell::{Cell, RefCell},
     collections::{BinaryHeap, VecDeque},
@@ -201,18 +201,23 @@ fn wait_for_main(task: &mut (dyn FnMut() + Send)) {
 
 /// Stops the render threads for good, because the process is about to exit and its statics to go.
 pub(crate) fn park_render() {
-    let threads = RENDERS.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let threads = RENDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     for thread in threads {
-        post(thread, Box::new(move || {
-            leave_renders(thread);
-            loop {
-                std::thread::park();
-            }
-        }));
+        post(
+            thread,
+            Box::new(move || {
+                leave_renders(thread);
+                loop {
+                    std::thread::park();
+                }
+            }),
+        );
     }
     let guard = RENDERS.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = RENDER_LEFT
-        .wait_timeout_while(guard, 3 * ASK_LIMIT, |threads| !threads.is_empty());
+    let _ = RENDER_LEFT.wait_timeout_while(guard, 3 * ASK_LIMIT, |threads| !threads.is_empty());
 }
 
 fn leave_renders(thread: AppThread) {
@@ -251,20 +256,23 @@ pub(crate) fn ask_within<R: Send + 'static>(
     }
     let slot = Arc::new(Mutex::new(Asked::Waiting));
     let answer = slot.clone();
-    post(thread, Box::new(move || {
-        let value = f();
-        let mut answer = answer.lock().unwrap_or_else(PoisonError::into_inner);
-        if matches!(*answer, Asked::Abandoned) {
-            thread.late.fetch_sub(1, Ordering::AcqRel);
-        } else {
-            *answer = Asked::Answered(value);
-        }
-        drop(answer);
-        // WARNING: the waiter checks the slot while it holds this lock, so taking it here keeps the
-        // notification from falling between that check and its wait.
-        drop(MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner));
-        MAIN.ready.notify_all();
-    }));
+    post(
+        thread,
+        Box::new(move || {
+            let value = f();
+            let mut answer = answer.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*answer, Asked::Abandoned) {
+                thread.late.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                *answer = Asked::Answered(value);
+            }
+            drop(answer);
+            // WARNING: the waiter checks the slot while it holds this lock, so taking it here keeps the
+            // notification from falling between that check and its wait.
+            drop(MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner));
+            MAIN.ready.notify_all();
+        }),
+    );
     let deadline = Instant::now() + limit;
     let waits = thread.late.load(Ordering::Acquire) == 0;
     let mut tasks = MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner);
@@ -335,7 +343,10 @@ pub(crate) fn end_thread() {
 }
 
 /// Starts a render thread with `f` as its first work, and `done` as its last.
-pub(crate) fn spawn_render(f: impl FnOnce() + Send + 'static, done: impl FnOnce() + Send + 'static) {
+pub(crate) fn spawn_render(
+    f: impl FnOnce() + Send + 'static,
+    done: impl FnOnce() + Send + 'static,
+) {
     let thread: AppThread = Box::leak(Box::new(Inbox::new()));
     post(thread, Box::new(f));
     RENDERS
@@ -349,7 +360,10 @@ pub(crate) fn spawn_render(f: impl FnOnce() + Send + 'static, done: impl FnOnce(
         .spawn(move || {
             // SAFETY: sets the class of this thread, which draws for the user like the main thread.
             unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+                libc::pthread_set_qos_class_self_np(
+                    libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                    0,
+                );
             }
             THREAD.set(Some(thread));
             while !ENDED.get() {
@@ -387,7 +401,10 @@ pub(crate) fn spawn_render(f: impl FnOnce() + Send + 'static, done: impl FnOnce(
                     }
                     let now = Instant::now();
                     while let Some(due) = TIMERS.with_borrow_mut(|timers| {
-                        timers.peek().is_some_and(|due| due.0 <= now).then(|| timers.pop())?
+                        timers
+                            .peek()
+                            .is_some_and(|due| due.0 <= now)
+                            .then(|| timers.pop())?
                     }) {
                         (due.2)();
                     }
@@ -457,9 +474,8 @@ impl Platform {
     pub fn read_clipboard(&self) -> Option<String> {
         native_sync(|| {
             // SAFETY: the type is an AppKit constant.
-            let text = unsafe {
-                NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString)
-            }?;
+            let text =
+                unsafe { NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString) }?;
             Some(text.to_string())
         })
     }

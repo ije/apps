@@ -253,6 +253,7 @@ impl Window {
 
     /// Linux windows have no native buttons.
     pub fn set_button_visibility(&self, _visible: bool) {}
+    pub fn set_button_position(&self, _position: Option<Point<Pixels>>) {}
 
     pub fn state(&self) -> WindowState {
         each!(self, window => window.state())

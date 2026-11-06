@@ -184,7 +184,10 @@ impl Browser {
             let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else {
                 bail!("Expected an AppKit window");
             };
-            let (browser, parent) = (Native(self.handle.as_ptr()), Native(handle.ns_view.as_ptr()));
+            let (browser, parent) = (
+                Native(self.handle.as_ptr()),
+                Native(handle.ns_view.as_ptr()),
+            );
             sync_main(move || unsafe { apps_browser_attach(browser.get(), parent.get()) });
             Ok(())
         }
@@ -213,7 +216,10 @@ impl Browser {
             // WARNING: a page calls this while it paints, so it never waits for the main thread. Its
             // `Drop` waits for the main thread, so this runs first. On the main thread `Drop` runs at
             // once, so this must too.
-            match MAIN_THREAD.get().filter(|_| unsafe { pthread_main_np() } == 0) {
+            match MAIN_THREAD
+                .get()
+                .filter(|_| unsafe { pthread_main_np() } == 0)
+            {
                 Some((_, post)) => post(Box::new(set)),
                 None => set(),
             }
@@ -227,9 +233,7 @@ impl Browser {
         #[cfg(target_os = "macos")]
         {
             let browser = Native(self.handle.as_ptr());
-            sync_main(move || unsafe {
-                apps_browser_attach(browser.get(), std::ptr::null_mut())
-            });
+            sync_main(move || unsafe { apps_browser_attach(browser.get(), std::ptr::null_mut()) });
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.backend.detach()?;
@@ -321,6 +325,7 @@ impl Browser {
                 );
             }
             "visible" => ensure!(arguments.is_boolean(), "Expected visibility boolean"),
+            "appearance" => ensure!(arguments.is_string(), "Expected appearance string"),
             "decide" => ensure!(
                 arguments["id"].is_u64() && arguments["allow"].is_boolean(),
                 "Expected navigation decision"

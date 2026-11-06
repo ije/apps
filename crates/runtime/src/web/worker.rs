@@ -223,12 +223,12 @@ impl State {
                         host.borrow_mut().disabled=disabled;
                         host.borrow_mut().scripts=scripts;
                         let role = if native { Role::Main } else {
-                            host.borrow_mut().pages.insert(0, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
-                            Role::Renderer(0)
+                            host.borrow_mut().pages.insert(crate::host::WORKER_PAGE, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
+                            Role::Renderer(crate::host::WORKER_PAGE)
                         };
                         let api = JavaScriptCore::load()?;
                         let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
-                        engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
+                        engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.screen; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire();", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
@@ -243,7 +243,7 @@ impl State {
                             // is collected once, when it has been quiet for a second, like the main thread's.
                             let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
                             let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
-                            if wait != delay && matches!(message, Err(mpsc::RecvTimeoutError::Timeout)) {
+                            if api.shrink_due() {
                                 api.shrink();
                                 #[cfg(target_os = "macos")]
                                 crate::malloc::flush();

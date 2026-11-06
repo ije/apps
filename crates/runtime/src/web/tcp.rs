@@ -245,6 +245,29 @@ impl State {
                         .map_or(0, |ip| if ip.is_ipv4() { 4 } else { 6 }),
                 }
             }))),
+            #[cfg(unix)]
+            "open" => {
+                use std::os::fd::FromRawFd;
+                // WARNING: a copy, so destroying the socket leaves the inherited descriptor to its owner.
+                let fd = unsafe {
+                    libc::fcntl(
+                        args[0].as_i64().context("Expected descriptor")? as i32,
+                        libc::F_DUPFD_CLOEXEC,
+                        64,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                stream.set_nonblocking(true)?;
+                let id = self.start(async move {
+                    tokio::net::UnixStream::from_std(stream)
+                        .map(Accepted::Unix)
+                        .map_err(|error| (error, "connect", json!({})))
+                })?;
+                Ok(json!(id))
+            }
             "connect" => {
                 let options = args[0].clone();
                 let id = self.start(async move {

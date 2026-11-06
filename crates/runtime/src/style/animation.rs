@@ -663,6 +663,17 @@ impl Motion {
         self.previous.shrink_to_fit();
     }
 
+    /// Keeps the style a script read from a new node, as transitions start from it, like after a browser's
+    /// forced style.
+    pub fn read(&mut self, id: usize, style: &Rc<Style>) {
+        if self.previous.len() <= id {
+            self.previous.resize_with(id + 1, Default::default);
+        }
+        if self.previous[id].is_empty() {
+            self.previous[id] = style.clone();
+        }
+    }
+
     pub fn forget(&mut self, id: usize) {
         if let Some(previous) = self.previous.get_mut(id) {
             *previous = Rc::default();
@@ -1727,6 +1738,24 @@ pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Optio
     if t == 1. {
         return Some(to.to_owned());
     }
+    // WARNING: Tailwind writes `opacity: 0%` and `scale: 98% 98%`, and they mix as the numbers they stand for.
+    if matches!(property, "opacity" | "scale") && (from.contains('%') || to.contains('%')) {
+        let number = |value: &str| {
+            value
+                .split_ascii_whitespace()
+                .map(|part| {
+                    part.strip_suffix('%')
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .map_or(part.to_owned(), |value| (value / 100.).to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (from, to) = (number(from), number(to));
+        if !from.contains('%') && !to.contains('%') {
+            return interpolate(property, &from, &to, t);
+        }
+    }
     // WARNING: animations mix the same values every frame, so their parsed pairs are kept by a hash
     // of the property and values, checked against them.
     thread_local! {
@@ -2303,6 +2332,11 @@ mod tests {
         );
         assert_eq!(mix("width", "0", "10px", 0.5).unwrap(), "5px");
         assert_eq!(mix("opacity", "1", "0", 0.25).unwrap(), "0.75");
+        assert_eq!(mix("opacity", "0%", "1", 0.5).unwrap(), "0.5");
+        assert_eq!(
+            mix("scale", "50% 50%", "100% 100%", 0.5).unwrap(),
+            "0.75 0.75"
+        );
         assert_eq!(mix("z-index", "1", "4", 0.4).unwrap(), "2");
         assert_eq!(mix("width", "auto", "10px", 0.5), None);
         assert_eq!(

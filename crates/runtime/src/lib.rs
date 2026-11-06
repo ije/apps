@@ -25,7 +25,7 @@ pub mod desktop;
 pub mod dom;
 pub mod host;
 pub mod jsc;
-mod node;
+pub mod node;
 pub mod render;
 pub mod style;
 mod web;

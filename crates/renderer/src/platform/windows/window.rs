@@ -252,6 +252,7 @@ impl Window {
     }
 
     pub fn set_button_visibility(&self, _visible: bool) {}
+    pub fn set_button_position(&self, _position: Option<Point<Pixels>>) {}
 
     pub fn state(&self) -> WindowState {
         let hwnd = self.inner.hwnd;
@@ -264,7 +265,17 @@ impl Window {
             let _ = GetClientRect(hwnd, &mut client);
             let _ = ClientToScreen(hwnd, &mut origin);
             let fullscreen = self.inner.fullscreen.get().is_some();
+            let mut monitor = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            );
             WindowState {
+                display: logical_rect(monitor.rcMonitor, scale),
+                work_area: logical_rect(monitor.rcWork, scale),
                 frame: logical_rect(frame, scale),
                 content: logical_rect(
                     RECT {

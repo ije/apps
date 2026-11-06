@@ -167,6 +167,8 @@ impl TextSystem {
             line_gap: metrics.Base.lineGap as f32,
             cap_height: metrics.Base.capHeight as f32,
             x_height: metrics.Base.xHeight as f32,
+            em_ascent: metrics.Base.ascent as f32
+                / (metrics.Base.ascent as f32 + metrics.Base.descent as f32),
             bounding_box: Bounds::new(
                 point(metrics.glyphBoxLeft as f32, metrics.glyphBoxBottom as f32),
                 size(

@@ -65,19 +65,15 @@ pub(super) fn css_background(
             pick(&repeats, index),
         );
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-            if let Some(path) = base
-                .and_then(|base| {
-                    Some((
-                        base,
-                        base.join(source.trim().trim_matches(['"', '\''])).ok()?,
-                    ))
-                })
-                .and_then(|(base, url)| match url.scheme() {
-                    "file" if base.scheme() == "file" => url.to_file_path().ok(),
-                    "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
-                    _ => None,
-                })
-            {
+            let source = source.trim().trim_matches(['"', '\'']);
+            if let Some(path) = super::image::data_file(source).or_else(|| {
+                base.and_then(|base| Some((base, base.join(source).ok()?)))
+                    .and_then(|(base, url)| match url.scheme() {
+                        "file" if base.scheme() == "file" => url.to_file_path().ok(),
+                        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
+                        _ => None,
+                    })
+            }) {
                 let fit = match size.as_str() {
                     "cover" => renderer::ObjectFit::Cover,
                     "contain" => renderer::ObjectFit::Contain,
@@ -106,6 +102,18 @@ pub(super) fn css_background(
                             let mut host = view.host.borrow_mut();
                             let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
                             let scale = window.scale_factor();
+                            // WARNING: a layer with a set size is one tile, repeated when it paints.
+                            let [[tile_width, tile_height], [tile_x, tile_y]] =
+                                super::effects::tile(&size, &position, &units, width, height);
+                            let tiled = !matches!(
+                                size.as_str(),
+                                "" | "auto" | "auto auto" | "cover" | "contain"
+                            );
+                            let (width, height) = if tiled {
+                                (tile_width, tile_height)
+                            } else {
+                                (width, height)
+                            };
                             let raster = [width, height]
                                 .map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
                             let key = (id, slot * 64 + index);
@@ -258,6 +266,50 @@ pub(super) fn css_background(
                             };
                             let natural = image.size();
                             if u32::from(natural.width) == 0 || u32::from(natural.height) == 0 {
+                                return;
+                            }
+                            if tiled {
+                                let [left, top] =
+                                    [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
+                                let [right, bottom] = [
+                                    left + f32::from(bounds.size.width),
+                                    top + f32::from(bounds.size.height),
+                                ];
+                                let (across, down) = (
+                                    !matches!(repeat.trim(), "no-repeat" | "repeat-y"),
+                                    !matches!(repeat.trim(), "no-repeat" | "repeat-x"),
+                                );
+                                let start = |repeats: bool, origin: f32, at: f32, side: f32| {
+                                    if repeats {
+                                        origin + at.rem_euclid(side) - side
+                                    } else {
+                                        origin + at
+                                    }
+                                };
+                                let mut y = start(down, top, tile_y, tile_height);
+                                while y < bottom {
+                                    let mut x = start(across, left, tile_x, tile_width);
+                                    while x < right {
+                                        window.paint_image(
+                                            bounds,
+                                            renderer::Bounds::new(
+                                                renderer::point(px(x), px(y)),
+                                                renderer::size(px(tile_width), px(tile_height)),
+                                            ),
+                                            renderer::Corners::default(),
+                                            image.clone(),
+                                            false,
+                                        );
+                                        if !across {
+                                            break;
+                                        }
+                                        x += tile_width;
+                                    }
+                                    if !down {
+                                        break;
+                                    }
+                                    y += tile_height;
+                                }
                                 return;
                             }
                             let target = if fixed(backgrounds, image) {

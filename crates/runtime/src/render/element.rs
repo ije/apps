@@ -25,7 +25,8 @@ pub(super) struct Build<'a> {
     pub(super) ancestors: Rc<[usize]>,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
-    pub(super) inline_text: &'a RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>>,
+    pub(super) inline_text:
+        &'a RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>>,
     /// The parent's `perspective` distance and `perspective-origin`.
     pub(super) perspective: Option<(f32, String)>,
     /// The in-flow children (`false`) and list items (`true`) of a parent, with their indexes.
@@ -80,6 +81,10 @@ pub(super) fn own_inputs(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
+    // The text around an atomic inline box reserves the box's size from the last frame.
+    if let Some(size) = dom.atoms.get(&id) {
+        size.map(f32::to_bits).hash(&mut hasher);
+    }
     if doc.nodes[id].tag == "svg" {
         let mut pending = vec![id];
         let mut visited = rustc_hash::FxHashSet::default();
@@ -121,7 +126,11 @@ pub(super) fn own_inputs(
         if let (Some(axes), Some(sizes)) = (dom.flexed_grids.get(&id), dom.cull.widths.get(&id)) {
             for (axis, size) in axes.iter().zip(sizes) {
                 if let Some((used, _)) = axis {
-                    let size = if (size - used).abs() <= 0.5 { used } else { size };
+                    let size = if (size - used).abs() <= 0.5 {
+                        used
+                    } else {
+                        size
+                    };
                     size.to_bits().hash(&mut hasher);
                 }
             }
@@ -410,7 +419,10 @@ pub(super) type Margins = (
 );
 
 /// The collapsed margins of a parent's children, with the geometry revision, width and open sides they came from.
-pub(super) type Walked = ((u64, u32, [bool; 2]), Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>);
+pub(super) type Walked = (
+    (u64, u32, [bool; 2]),
+    Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>,
+);
 
 thread_local! {
     /// The lowest stack address that building boxes may reach: a quarter of the stack stays
@@ -860,6 +872,11 @@ fn create(
                 })
                 .is_none_or(|&child| doc.nodes[child].tag == "br")
         });
+        let painter = view.clone();
+        let ink = [Prop::CARET_COLOR, Prop::COLOR]
+            .into_iter()
+            .find_map(|prop| style::color(style.get(prop)?))
+            .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
         let view = view.clone();
         let above = above();
         let mut br = renderer::canvas(
@@ -881,7 +898,23 @@ fn create(
                         ],
                     );
             },
-            |_, _, _| {},
+            move |bounds, _, window| {
+                // An empty line has no text to hold the caret, so its line break draws it.
+                let caret = painter.host.try_borrow().is_ok_and(|host| {
+                    host.dom
+                        .get(&painter.id)
+                        .is_some_and(|dom| dom.selection_caret == Some(id))
+                });
+                if caret {
+                    super::input::paint_caret(
+                        &painter,
+                        [id, 0, 0],
+                        Bounds::new(bounds.origin, size(px(1.), px(line_height))),
+                        rgba(ink),
+                        window,
+                    );
+                }
+            },
         )
         .h(px(above))
         .mb(px(line_height - above))
@@ -991,19 +1024,20 @@ fn create(
                 .unwrap_or(default)
         };
         el = el.w(px(size("width", 300.))).h(px(size("height", 150.)));
-        if let Some(image) = view.images.borrow().get(&id) {
+        let host = view.host.borrow();
+        let state = host.dom.get(&view.id);
+        if let Some(image) = view
+            .images
+            .borrow()
+            .get(&id)
+            .or_else(|| state?.images.get(&id))
+        {
             el = el.child(img(image.clone()).size_full());
         }
-        if let Some(image) = view
-            .host
-            .borrow()
-            .dom
-            .get(&view.id)
-            .and_then(|state| state.canvases.get(&id))
-            .map(|canvas| canvas.image.clone())
-        {
-            el = el.child(img(image).absolute().size_full());
+        if let Some(canvas) = state.and_then(|state| state.canvases.get(&id)) {
+            el = el.child(img(canvas.image.clone()).absolute().size_full());
         }
+        drop(host);
     }
     let mut image_child = None;
     let mut cropped = None;
@@ -1041,6 +1075,7 @@ fn create(
                 }
             } else if natural[1] > 0. {
                 el.style().aspect_ratio = Some(natural[0] / natural[1]);
+                el = only_auto_ratio(el, style);
             }
             match (
                 auto(Prop::WIDTH),
@@ -1371,6 +1406,8 @@ fn create(
                     letter_spacing: px(0.),
                     word_spacing: px(0.),
                     font_size: None,
+                    inset: Default::default(),
+                    nowrap: false,
                 };
                 f32::from(text.shape_line(label, em, &[run], None).width)
             };
@@ -1457,6 +1494,8 @@ fn create(
             letter_spacing: style::spacing(style, &units, Prop::LETTER_SPACING),
             word_spacing: px(0.),
             font_size: None,
+            inset: Default::default(),
+            nowrap: false,
         };
         if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
             let mut sizer = renderer::text(shown.clone(), Some(vec![run.clone()]))
@@ -1543,6 +1582,18 @@ fn create(
             .and_then(style::color)
             .filter(|(_, alpha)| *alpha > 0)
     };
+    let inline_box = display == "inline"
+        && !node.tag.starts_with('#')
+        && !flex_parent
+        && slot.is_none()
+        && !matches!(
+            node.tag.as_str(),
+            "img" | "svg" | "canvas" | "input" | "button" | "select" | "textarea" | "iframe"
+        )
+        && !style
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed"));
+    let mut inline_fill = renderer::transparent_black();
     let mut cell_background = background(style);
     if cell_background.is_none() && matches!(node.tag.as_str(), "td" | "th") {
         // Rows and row groups have no box, so their color paints in each cell.
@@ -1570,50 +1621,8 @@ fn create(
                 .is_some_and(|value| value != "none");
         if blended {
             // The color is painted inside the blended background group.
-        } else if display == "inline"
-            && !node.tag.starts_with('#')
-            && !matches!(
-                node.tag.as_str(),
-                "img" | "svg" | "canvas" | "input" | "button" | "select" | "textarea" | "iframe"
-            )
-            && !style
-                .get(Prop::POSITION)
-                .is_some_and(|value| value == "absolute")
-        {
-            let font = text.resolve_font(&style::font(style));
-            let font_size = px(units.font.em);
-            let height = text.ascent(font, font_size) - text.descent(font, font_size);
-            let line_height = px(units.font.lh);
-            let radius = px(style
-                .get(Prop::BORDER_RADIUS)
-                .and_then(|value| units.resolve(value, containing[0]))
-                .unwrap_or(0.));
-            el = el.child(
-                renderer::canvas(
-                    |_, _| (),
-                    move |bounds, _, window| {
-                        let step = line_height.max(px(1.));
-                        let mask = window.content_mask().bounds;
-                        let mut top = bounds.top() + (line_height - height) / 2.;
-                        top += step * ((mask.top() - top - height) / step).floor().max(0.);
-                        while top < bounds.bottom().min(mask.bottom()) {
-                            window.paint_quad(
-                                renderer::fill(
-                                    Bounds::new(
-                                        point(bounds.left(), top),
-                                        size(bounds.size.width, height),
-                                    ),
-                                    color,
-                                )
-                                .corner_radii(radius),
-                            );
-                            top += step;
-                        }
-                    },
-                )
-                .absolute()
-                .size_full(),
-            );
+        } else if inline_box {
+            inline_fill = color;
         } else {
             el = el.bg(color);
         }
@@ -1683,12 +1692,22 @@ fn create(
         .map(|value| value.max(0.));
     padding[1] += reserved[1];
     padding[2] += reserved[0];
+    // `scrollbar-gutter: both-edges` keeps the content centered between two gutters.
+    let opposite = if style
+        .get(Prop::SCROLLBAR_GUTTER)
+        .is_some_and(|value| value.contains("both-edges"))
+    {
+        reserved[1]
+    } else {
+        0.
+    };
+    padding[3] += opposite;
     el = el
         .pt(px(padding[0]))
         .pr(px(padding[1]))
         .pb(px(padding[2]))
         .pl(px(padding[3]));
-    let margin = margins(
+    let mut margin = margins(
         build,
         id,
         &units,
@@ -1772,6 +1791,79 @@ fn create(
             .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
     });
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
+    if inline_box {
+        let [above, below] = [padding[0] + borders[0], padding[2] + borders[2]];
+        // WARNING: like browsers, padding and borders of an inline box hang outside its line.
+        margin[0] = -above;
+        margin[2] = -below;
+        el = el.mt(px(margin[0])).mb(px(margin[2]));
+        // The box of a line covers the font's height, not the line height.
+        let same = border_colors.iter().all(|color| *color == border_colors[0]);
+        let border = if same && borders.iter().any(|width| *width > 0.) {
+            border_colors[0]
+        } else {
+            renderer::transparent_black()
+        };
+        if border.a > 0. || inline_fill.a > 0. {
+            let font = text.resolve_font(&style::font(style));
+            let size_px = px(units.font.em);
+            let height = f32::from(text.ascent(font, size_px) - text.descent(font, size_px));
+            let line_height = units.font.lh;
+            let radii = super::effects::radii(style, &units, || containing);
+            let (sides, pad_y, fill) = (borders, padding[0] + padding[2], inline_fill);
+            let dashed = matches!(border_kinds[0], "dashed");
+            el = el.child(
+                renderer::canvas(
+                    |_, _| (),
+                    move |bounds, _, window| {
+                        let step = px(line_height.max(1.));
+                        let mask = window.content_mask().bounds;
+                        let quad = size(
+                            bounds.size.width + px(sides[1] + sides[3]),
+                            px(height + above + below),
+                        );
+                        let start = bounds.top() + px((line_height - height) / 2. - sides[0]);
+                        let lines =
+                            (((bounds.size.height - px(pad_y)) / step).round() as usize).max(1);
+                        for line in 0..lines {
+                            let top = start + step * line as f32;
+                            if top > mask.bottom() {
+                                break;
+                            }
+                            if top + quad.height < mask.top() {
+                                continue;
+                            }
+                            window.paint_quad(renderer::quad(
+                                Bounds::new(point(bounds.left() - px(sides[3]), top), quad),
+                                radii.resolve(quad),
+                                fill,
+                                renderer::Edges {
+                                    top: px(sides[0]),
+                                    right: px(sides[1]),
+                                    bottom: px(sides[2]),
+                                    left: px(sides[3]),
+                                },
+                                border,
+                                if dashed {
+                                    renderer::BorderStyle::Dashed
+                                } else {
+                                    renderer::BorderStyle::Solid
+                                },
+                            ));
+                        }
+                    },
+                )
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .size_full(),
+            );
+            // The canvas draws the border, at the height of the font.
+            if same {
+                border_colors = [renderer::transparent_black().into(); 4];
+            }
+        }
+    }
     // A select with `multiple` or more than one row is a list box of `size` rows, 4 by default.
     let list = (node.tag == "select")
         .then(|| {
@@ -1929,6 +2021,8 @@ fn create(
                                 letter_spacing: px(0.),
                                 word_spacing: px(0.),
                                 font_size: None,
+                                inset: Default::default(),
+                                nowrap: false,
                             };
                             widest = widest
                                 .max(f32::from(text.shape_line(&label, size, &[run], None).width));
@@ -2028,7 +2122,7 @@ fn create(
         [0.; 2]
     } else {
         [
-            padding[1] + padding[3] + borders[1] + borders[3] - reserved[1],
+            padding[1] + padding[3] + borders[1] + borders[3] - reserved[1] - opposite,
             padding[0] + padding[2] + borders[0] + borders[2] - reserved[0],
         ]
     };
@@ -2056,9 +2150,7 @@ fn create(
         } else if percent {
             el = el.child(super::input::natural_width(px(width)));
         }
-        if auto[1]
-            && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content"))
-        {
+        if auto[1] && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content")) {
             el = el.min_h(px(height + chrome[1]));
         }
     }
@@ -2116,6 +2208,10 @@ fn create(
                         Some(_) => px(percent.max(0.) / 100. * base + extra[axis]).into(),
                         None => renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis])),
                     }
+                } else if let Some((fraction, offset)) =
+                    percent_calc(&units, value).filter(|_| block_size.is_none())
+                {
+                    renderer::Length::Calc(fraction, px(offset + extra[axis]))
                 } else if let Some(length) = length() {
                     px(length.max(0.) + extra[axis]).into()
                 } else if matches!(prop, Prop::WIDTH | Prop::HEIGHT)
@@ -2154,6 +2250,10 @@ fn create(
                     };
                     let size = layout_ceil((size - margin[1] - margin[3]).max(0.), pixel_ratio);
                     intrinsic_width = Some(size);
+                    // WARNING: `containing` is only an estimate, so layout keeps a `fit-content` box inside its parent.
+                    if value == "fit-content" && style.get(Prop::MAX_WIDTH).is_none() {
+                        el = el.max_w(renderer::Length::Calc(1., px(-margin[1] - margin[3])));
+                    }
                     px(size).into()
                 } else {
                     continue;
@@ -2182,6 +2282,7 @@ fn create(
             Prop::ASPECT_RATIO => {
                 if let Some(ratio) = aspect_ratio(value) {
                     el.style().aspect_ratio = Some(ratio);
+                    el = only_auto_ratio(el, style);
                 }
             }
             Prop::DISPLAY if matches!(value, "grid" | "inline-grid") => el = el.grid(),
@@ -2312,6 +2413,10 @@ fn create(
                         Some(_) => px(percent / 100. * base).into(),
                         None => relative(percent / 100.),
                     }
+                } else if let Some((fraction, offset)) =
+                    percent_calc(&units, value).filter(|_| block_size.is_none())
+                {
+                    renderer::Length::Calc(fraction, px(offset))
                 } else if let Some(length) = length() {
                     px(length).into()
                 } else {
@@ -2451,7 +2556,8 @@ fn create(
         let middle = match el.style().size.height {
             _ if align != "middle" => None,
             _ if display == "inline" => Some(units.font.lh),
-            renderer::Length::Px(height) => Some(f32::from(height)),
+            // The middle of the margin box sits on that line, and the box's baseline is its bottom border edge.
+            renderer::Length::Px(height) => Some(f32::from(height) + margin[0] - margin[2]),
             _ => None,
         };
         let sized = matches!(el.style().size.height, renderer::Length::Px(_));
@@ -3237,9 +3343,14 @@ fn create(
                         .filter(|v| v.is_finite())
                     {
                         Some(percent) => Some(relative(percent / 100.)),
-                        None => pseudo_units
-                            .resolve(value, base)
-                            .map(|value| px(value).into()),
+                        None => match percent_calc(&pseudo_units, value) {
+                            Some((fraction, offset)) => {
+                                Some(renderer::Length::Calc(fraction, px(offset)))
+                            }
+                            None => pseudo_units
+                                .resolve(value, base)
+                                .map(|value| px(value).into()),
+                        },
                     }
                 };
                 match prop {
@@ -3438,21 +3549,86 @@ fn create(
                     - borders[3 - axis])
                     .max(0.)
             });
-            view.host
-                .borrow_mut()
-                .dom
-                .entry(view.id)
-                .or_default()
-                .containers
-                .insert(id, size);
+            let mut host = view.host.borrow_mut();
+            let dom = host.dom.entry(view.id).or_default();
+            let size = dom.cull.widths.get(&id).copied().unwrap_or(size);
+            dom.containers.insert(id, size);
+        }
+        let atom_slots: Rc<[super::text::AtomSlot]> = data
+            .atoms
+            .iter()
+            .map(|atom| {
+                let last = view
+                    .host
+                    .borrow()
+                    .dom
+                    .get(&view.id)
+                    .and_then(|dom| dom.atoms.get(&atom.node).copied());
+                let size = last.unwrap_or_else(|| {
+                    // A new box starts from its content width and one line, and the next frame has its real size.
+                    let [_, max, _, height] = super::grid::intrinsic(
+                        doc,
+                        atom.node,
+                        styles,
+                        Some(containing[0]),
+                        None,
+                        text,
+                        &mut measured.borrow_mut(),
+                    );
+                    let line = styles.lengths[atom.node].font.lh;
+                    [max, height.max(line), line * 0.8]
+                });
+                super::text::AtomSlot {
+                    size,
+                    at: std::cell::Cell::new(point(px(0.), px(0.))),
+                }
+            })
+            .collect();
+        // WARNING: `text-box` trims the block by moving its text with negative margins, so the glyphs stay where they would be.
+        let text_box = style.get(Prop::TEXT_BOX).unwrap_or("");
+        let trim = style.get(Prop::TEXT_BOX_TRIM).unwrap_or(text_box);
+        let edge = style.get(Prop::TEXT_BOX_EDGE).unwrap_or(text_box);
+        let (over, under) = (
+            trim.contains("trim-both") || trim.contains("trim-start"),
+            trim.contains("trim-both") || trim.contains("trim-end"),
+        );
+        let (mut trim_top, mut trim_bottom) = (0., 0.);
+        if over || under {
+            let system = build.text;
+            let font = system.resolve_font(&style::font(style));
+            let (size, height) = (px(units.font.em), px(units.font.lh));
+            let baseline = f32::from(system.baseline(font, size, height, build.pixel_ratio));
+            let [ascent, descent, _] = system.line_metrics(font, size).map(f32::from);
+            if over {
+                trim_top = baseline
+                    - if edge.contains("cap") {
+                        units.font.cap
+                    } else if edge.contains("ex") {
+                        units.font.ex
+                    } else {
+                        ascent
+                    };
+            }
+            if under {
+                trim_bottom = units.font.lh
+                    - baseline
+                    - if edge.contains("alphabetic") {
+                        0.
+                    } else {
+                        descent
+                    };
+            }
         }
         el = el.child(
             renderer::node()
                 .min_w(px(0.))
                 .max_w(relative(1.))
                 .flex_shrink(1.)
+                .mt(px(-trim_top))
+                .mb(px(-trim_bottom))
                 .child(InlineText {
-                    data,
+                    data: data.clone(),
+                    atoms: atom_slots.clone(),
                     view: view.clone(),
                     shaped: Default::default(),
                     prepainted: Default::default(),
@@ -3466,6 +3642,37 @@ fn create(
                         }),
                 }),
         );
+        let atom_containing = [
+            (containing[0]
+                - margin[1]
+                - margin[3]
+                - padding[1]
+                - padding[3]
+                - borders[1]
+                - borders[3])
+                .max(0.),
+            containing[1],
+        ];
+        for (index, atom) in data.atoms.iter().enumerate() {
+            let mut wrapper = renderer::node()
+                .absolute()
+                .left(px(padding[3]))
+                .top(px(padding[0]))
+                .flex()
+                .flex_row()
+                .max_w(relative(1.));
+            wrapper.style().align_items = Some(renderer::AlignItems::Baseline);
+            el = el.child(
+                wrapper
+                    .hooks(super::text::AtomBox {
+                        slots: atom_slots.clone(),
+                        index,
+                        node: atom.node,
+                        view: view.clone(),
+                    })
+                    .child(element(build, atom.node, atom_containing, container, None)),
+            );
+        }
     } else if !node.children.is_empty()
         && node.tag != "canvas"
         && node.tag != "iframe"
@@ -3531,14 +3738,12 @@ fn create(
             .get(Prop::CONTAINER_TYPE)
             .is_some_and(|v| matches!(v, "inline-size" | "size"))
         {
-            view.host
-                .borrow_mut()
-                .dom
-                .entry(view.id)
-                .or_default()
-                .containers
-                .insert(id, content);
-            content
+            // WARNING: `content` is an estimate, so the size from the last layout wins.
+            let mut host = view.host.borrow_mut();
+            let dom = host.dom.entry(view.id).or_default();
+            let size = dom.cull.widths.get(&id).copied().unwrap_or(content);
+            dom.containers.insert(id, size);
+            size
         } else {
             container
         };
@@ -3588,12 +3793,19 @@ fn create(
                     };
                     let parent = &styles.values[parent];
                     let display = parent.get(Prop::DISPLAY).unwrap_or("block");
-                    if display.ends_with("flex") {
-                        break parent
+                    if display.ends_with("flex")
+                        && parent
                             .get(Prop::FLEX_DIRECTION)
-                            .is_none_or(|v| v.starts_with("row"));
+                            .is_none_or(|v| v.starts_with("row"))
+                    {
+                        // A box that grows takes its width from the row, not from this grid.
+                        break child == id
+                            || own
+                                .get(Prop::FLEX_GROW)
+                                .is_none_or(|v| v.parse::<f32>().is_ok_and(|grow| grow == 0.));
                     }
-                    if !matches!(display, "block" | "inline-block")
+                    // WARNING: a column stretches to its own width, which can come from its content, as in a popup.
+                    if !matches!(display, "block" | "inline-block" | "flex" | "inline-flex")
                         || parent.get(Prop::WIDTH).is_some_and(|v| v != "auto")
                     {
                         break false;
@@ -3605,137 +3817,202 @@ fn create(
                 }
             };
         let mut widest = None;
-        let grid =
-            if let Some(display) = style
-                .get(Prop::DISPLAY)
-                .filter(|v| matches!(*v, "grid" | "inline-grid"))
+        let fills = style.get(Prop::DISPLAY).is_some_and(|v| v == "grid")
+            && !shrunk
+            && slot.is_none()
+            && !flexed
+            && style
+                .get(Prop::WIDTH)
+                .is_none_or(|v| matches!(v, "auto" | "100%"))
+            && !matches!(position, "absolute" | "fixed")
+            && node.parent.is_some_and(|parent| {
+                let parent = &styles.values[parent];
+                match parent.get(Prop::DISPLAY).unwrap_or("block") {
+                    "block" | "flow-root" | "list-item" => true,
+                    "flex" | "inline-flex" => {
+                        parent
+                            .get(Prop::FLEX_DIRECTION)
+                            .is_some_and(|v| v.starts_with("column"))
+                            && parent
+                                .get(Prop::ALIGN_ITEMS)
+                                .is_none_or(|v| matches!(v, "normal" | "stretch"))
+                            && style
+                                .get(Prop::ALIGN_SELF)
+                                .is_none_or(|v| matches!(v, "auto" | "stretch"))
+                    }
+                    _ => false,
+                }
+            });
+        let grid = if let Some(display) = style
+            .get(Prop::DISPLAY)
+            .filter(|v| matches!(*v, "grid" | "inline-grid"))
+        {
+            if display == "inline-grid"
+                && slot.is_none()
+                && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
             {
-                if display == "inline-grid"
-                    && slot.is_none()
-                    && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
-                {
-                    let extent =
-                        padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
-                    let [min, max, ..] = super::grid::intrinsic(
-                        doc,
-                        id,
-                        styles,
-                        None,
-                        None,
-                        text,
-                        &mut measured.borrow_mut(),
-                    );
-                    content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
-                }
-                let horizontal = padding[1] + padding[3] + borders[1] + borders[3];
-                let vertical = padding[0] + padding[2] + borders[0] + borders[2];
-                let mut tracked = [None; 2];
-                if shrunk {
-                    let [_, max, ..] = super::grid::intrinsic(
-                        doc,
-                        id,
-                        styles,
-                        None,
-                        None,
-                        text,
-                        &mut measured.borrow_mut(),
-                    );
-                    let max = (max - horizontal - margin[1] - margin[3]).max(0.);
-                    widest = Some(max);
-                    // WARNING: tracks size the untransformed box, so they read its laid-out size, not its window bounds.
-                    // New content makes the last size meaningless. Most content fits, so tracks take its full width,
-                    // and prepaint draws again when the layout disagrees.
-                    let last = {
-                        let mut host = view.host.borrow_mut();
-                        let dom = host.dom.entry(view.id).or_default();
-                        let same = dom.grid_widest.insert(id, max) == Some(max);
-                        same.then(|| dom.cull.widths.get(&id).map(|size| size[0].max(0.)))
-                            .flatten()
-                    };
-                    // Laid-out bounds are in layout units, so a fitting grid may look narrower.
-                    content[0] = last.map_or(content[0].min(max), |last| {
-                        if last + 0.5 >= max {
-                            last.max(max)
-                        } else {
-                            last
-                        }
-                    });
-                    tracked[0] = Some((last.unwrap_or(content[0]), horizontal));
-                }
-                let height =
-                    if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
-                        Some(content[1])
-                    } else if flexed {
-                        let height = view.host.borrow().dom.get(&view.id).and_then(|state| {
-                            state.cull.widths.get(&id).map(|size| size[1].max(0.))
-                        });
-                        tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
-                        height
+                let extent =
+                    padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
+                let [min, max, ..] = super::grid::intrinsic(
+                    doc,
+                    id,
+                    styles,
+                    None,
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                content[0] = (max.min(content[0] + extent).max(min) - extent).max(0.);
+            }
+            let horizontal = padding[1] + padding[3] + borders[1] + borders[3];
+            let vertical = padding[0] + padding[2] + borders[0] + borders[2];
+            let mut tracked = [None; 2];
+            if shrunk {
+                let [min, max, ..] = super::grid::intrinsic(
+                    doc,
+                    id,
+                    styles,
+                    None,
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                let [min, max] =
+                    [min, max].map(|value| (value - horizontal - margin[1] - margin[3]).max(0.));
+                widest = Some([min, max]);
+                // WARNING: tracks size the untransformed box, so they read its laid-out size, not its window bounds.
+                // New content makes the last size meaningless. Most content fits, so tracks take its full width,
+                // and prepaint draws again when the layout disagrees.
+                let last = {
+                    let mut host = view.host.borrow_mut();
+                    let dom = host.dom.entry(view.id).or_default();
+                    let same = dom.grid_widest.insert(id, max) == Some(max);
+                    same.then(|| dom.cull.widths.get(&id).map(|size| size[0].max(0.)))
+                        .flatten()
+                };
+                // Laid-out bounds are in layout units, so a fitting grid may look narrower.
+                content[0] = last.map_or(content[0].min(max), |last| {
+                    if last + 0.5 >= max {
+                        last.max(max)
                     } else {
-                        None
-                    };
-                // WARNING: entries stay while the grid is kept, so its size is checked in each frame.
-                let mut host = view.host.borrow_mut();
-                let flexed = &mut host.dom.entry(view.id).or_default().flexed_grids;
-                if tracked.iter().any(Option::is_some) {
-                    flexed.insert(id, tracked);
-                } else {
-                    flexed.remove(&id);
-                }
-                drop(host);
-                let cached = view
+                        last
+                    }
+                });
+                tracked[0] = Some((last.unwrap_or(content[0]), horizontal));
+            }
+            // WARNING: `containing` is an estimate that doesn't know flex siblings. A grid that fills its parent lets
+            // layout size it, and its tracks read that width from the last layout. Prepaint draws again when it changes.
+            if fills {
+                if let Some(last) = view
                     .host
                     .borrow()
                     .dom
                     .get(&view.id)
-                    .and_then(|state| state.grids.get(&id))
-                    .filter(|(width, cached, inherited, _)| {
-                        *width == content[0]
-                            && *cached == height
-                            && inherited.as_ref() == slot.as_ref().map(|(_, grid)| grid)
-                    })
-                    .map(|(_, _, _, grid)| grid.clone());
-                Some(cached.unwrap_or_else(|| {
-                    let grid = super::grid::layout(
-                        doc,
-                        id,
-                        styles,
-                        Some(content[0]),
-                        height,
-                        slot.as_ref().map(|(_, grid)| grid),
-                        view.host
-                            .borrow()
-                            .dom
-                            .get(&view.id)
-                            .map(|dom| &dom.baselines),
-                        text,
-                        &mut measured.borrow_mut(),
-                    );
-                    view.host
-                        .borrow_mut()
-                        .dom
-                        .entry(view.id)
-                        .or_default()
-                        .grids
-                        .insert(
-                            id,
-                            (
-                                content[0],
-                                height,
-                                slot.as_ref().map(|(_, grid)| grid.clone()),
-                                grid.clone(),
-                            ),
-                        );
-                    grid
-                }))
-            } else {
-                None
+                    .and_then(|dom| dom.cull.widths.get(&id))
+                {
+                    content[0] = last[0].max(0.);
+                }
+                tracked[0] = Some((content[0], horizontal));
+            }
+            // WARNING: a positioned box with both insets takes its height from its containing block, as with a set height.
+            let inset = |prop| {
+                style
+                    .get(prop)
+                    .and_then(|value| units.resolve(value, containing[1]))
             };
+            let stretched = matches!(position, "absolute" | "fixed")
+                .then(|| Some(inset(Prop::TOP)? + inset(Prop::BOTTOM)?))
+                .flatten();
+            let height =
+                if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
+                    Some(content[1])
+                } else if let Some(insets) = stretched {
+                    Some((containing[1] - insets - margin[0] - margin[2] - vertical).max(0.))
+                } else if flexed {
+                    let height =
+                        view.host.borrow().dom.get(&view.id).and_then(|state| {
+                            state.cull.widths.get(&id).map(|size| size[1].max(0.))
+                        });
+                    tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
+                    height
+                } else {
+                    None
+                };
+            // WARNING: entries stay while the grid is kept, so its size is checked in each frame.
+            let mut host = view.host.borrow_mut();
+            let flexed = &mut host.dom.entry(view.id).or_default().flexed_grids;
+            if tracked.iter().any(Option::is_some) {
+                flexed.insert(id, tracked);
+            } else {
+                flexed.remove(&id);
+            }
+            drop(host);
+            let cached = view
+                .host
+                .borrow()
+                .dom
+                .get(&view.id)
+                .and_then(|state| state.grids.get(&id))
+                .filter(|(width, cached, inherited, _)| {
+                    *width == content[0]
+                        && *cached == height
+                        && inherited.as_ref() == slot.as_ref().map(|(_, grid)| grid)
+                })
+                .map(|(_, _, _, grid)| grid.clone());
+            Some(cached.unwrap_or_else(|| {
+                let grid = super::grid::layout(
+                    doc,
+                    id,
+                    styles,
+                    Some(content[0]),
+                    height,
+                    slot.as_ref().map(|(_, grid)| grid),
+                    view.host
+                        .borrow()
+                        .dom
+                        .get(&view.id)
+                        .map(|dom| &dom.baselines),
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                view.host
+                    .borrow_mut()
+                    .dom
+                    .entry(view.id)
+                    .or_default()
+                    .grids
+                    .insert(
+                        id,
+                        (
+                            content[0],
+                            height,
+                            slot.as_ref().map(|(_, grid)| grid.clone()),
+                            grid.clone(),
+                        ),
+                    );
+                grid
+            }))
+        } else {
+            None
+        };
         if let Some(grid) = &grid {
             el = el.flex().flex_col();
-            // A shrunk grid stretches; a spacer gives it its max-content width.
+            // A shrunk grid stretches; a spacer gives it its intrinsic widths.
             el = match widest {
-                Some(widest) => el.child(renderer::node().w(px(widest)).h(px(0.)).flex_shrink_0()),
+                Some(widest) => el.child(renderer::node().measure(
+                    widest,
+                    |&[min, max], _, known, available, _| {
+                        let width = known.width.unwrap_or(match available.width {
+                            renderer::AvailableSpace::MinContent => px(min),
+                            renderer::AvailableSpace::MaxContent => px(max),
+                            renderer::AvailableSpace::Definite(width) => {
+                                width.min(px(max)).max(px(min))
+                            }
+                        });
+                        (renderer::size(width, px(0.)), None)
+                    },
+                )),
+                None if fills => el,
                 None => el.w(px(content[0]
                     + padding[1]
                     + padding[3]
@@ -4365,6 +4642,35 @@ fn create(
         el = el.window_drag_area().on_mouse_down(MouseButton::Left, {
             let view = view.clone();
             move |event: &renderer::MouseDownEvent, window, cx| {
+                // WARNING: a drag box gets the presses of all its children, so the box under the pointer
+                // decides: the nearest one that sets a region, as a `no-drag` button must get its click.
+                let dragged = view.host.try_borrow().is_ok_and(|host| {
+                    let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
+                    let (Some(page), Some(state)) =
+                        (host.pages.get(&view.id), host.dom.get(&view.id))
+                    else {
+                        return true;
+                    };
+                    let Some(computed) = &state.computed else {
+                        return true;
+                    };
+                    let at = [event.position.x, event.position.y].map(f32::from);
+                    crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false)
+                        .as_u64()
+                        .is_none_or(|target| {
+                            std::iter::successors(Some(target as usize), |&node| {
+                                page.doc.nodes[node].parent
+                            })
+                            .find_map(|node| {
+                                computed.values[node]
+                                    .get(Prop::APP_REGION)
+                                    .filter(|value| *value != "none")
+                            }) == Some("drag")
+                        })
+                });
+                if !dragged {
+                    return;
+                }
                 cx.stop_propagation();
                 if event.click_count != 2 {
                     view.moving.set(true);
@@ -4696,6 +5002,31 @@ pub(super) fn pseudo_content(
 }
 
 /// The ratio of an `aspect-ratio` value, like `5/4`, `1.25` or `auto 5 / 4`.
+/// WARNING: taffy passes min and max sizes through the aspect ratio even when the other side is set.
+/// CSS does that only for an auto size, so `max-width: 100%` must not limit the height of a sized image.
+/// A set limit replaces these in the style loop.
+fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::Node {
+    let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
+    let limited = |prop| style.get(prop).is_some_and(|value| value != "none");
+    if set(Prop::HEIGHT) {
+        if !limited(Prop::MAX_HEIGHT) {
+            el = el.max_h(px(1e7));
+        }
+        if !set(Prop::MIN_HEIGHT) {
+            el = el.min_h(px(0.));
+        }
+    }
+    if set(Prop::WIDTH) {
+        if !limited(Prop::MAX_WIDTH) {
+            el = el.max_w(px(1e7));
+        }
+        if !set(Prop::MIN_WIDTH) {
+            el = el.min_w(px(0.));
+        }
+    }
+    el
+}
+
 pub(crate) fn aspect_ratio(value: &str) -> Option<f32> {
     let value = value.replace('/', " / ");
     let parts = style::components(&value, ' ');
@@ -4977,7 +5308,11 @@ pub(super) fn margins(
         let used = Rc::new(used);
         build.margins.borrow_mut().0.insert(parent, used.clone());
         if !animated {
-            build.view.walked.borrow_mut().insert(parent, (key, used.clone()));
+            build
+                .view
+                .walked
+                .borrow_mut()
+                .insert(parent, (key, used.clone()));
         }
         used
     });
@@ -5064,6 +5399,22 @@ fn through(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
                 && style
                     .get(Prop::MIN_HEIGHT)
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
+}
+
+/// A `calc()` that mixes a percentage with lengths, as a fraction and an offset, for layout to resolve:
+/// `containing` is only an estimate.
+// WARNING: `None` when `min()` or `max()` inside make the value not linear in the base.
+fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
+    if !value.starts_with("calc(") || !value.contains('%') {
+        return None;
+    }
+    let low = units.resolve(value, 1000.)?;
+    let high = units.resolve(value, 2000.)?;
+    let check = units.resolve(value, 3000.)?;
+    ((check - high - (high - low)).abs() < 0.01).then(|| {
+        let fraction = (high - low) / 1000.;
+        (fraction, low - fraction * 1000.)
+    })
 }
 
 fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], bool) {
@@ -5627,7 +5978,10 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                     .filter(|_| inline)
                     .and_then(|(_, images)| {
                         images.iter().find(|image| {
-                            [u32::from(image.size().width), u32::from(image.size().height)] == raster
+                            [
+                                u32::from(image.size().width),
+                                u32::from(image.size().height),
+                            ] == raster
                         })
                     })
                     .cloned();
@@ -5644,7 +5998,8 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                                 images.push(image.clone());
                             }
                             if state.svg_cache.len() > 256 {
-                                for image in state.svg_cache.drain().flat_map(|(_, entry)| entry.1) {
+                                for image in state.svg_cache.drain().flat_map(|(_, entry)| entry.1)
+                                {
                                     if Arc::strong_count(&image) == 1 {
                                         window.drop_image(image);
                                     }

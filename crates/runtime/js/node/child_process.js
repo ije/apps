@@ -30,6 +30,20 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       this.stdout = output('stdout');
       this.stderr = output('stderr');
       this.stdio = [this.stdin, this.stdout, this.stderr];
+      // Extra pipes are sockets in the child, so like in Node they are duplex here.
+      for (let index = 3; index < options.stdio.length; index++) {
+        if (options.stdio[index] !== 'pipe') { this.stdio[index] = null; continue; }
+        const name = 'fd' + index, id = result.id;
+        if (id === undefined) { this.stdio[index] = null; continue; }
+        const pipe = this.stdio[index] = this[name] = new stream.Duplex({
+          read() { if (this._paused) { this._paused = false; call('child.pause', id, name, false); } },
+          write(data, _encoding, callback) { try { call('child.write', id, data, name); this._done = callback; } catch (error) { callback(error); } },
+          final(callback) { try { call('child.end', id, name); this._finished = callback; } catch (error) { callback(error); } },
+          destroy(error, callback) { if (!this._finished) try { call('child.end', id, name); } catch {} try { call('child.destroy', id, name); } catch {} callback(error); },
+        });
+        pipe._childWritten = () => { const callback = pipe._done; pipe._done = null; callback?.(); };
+        pipe._childEnded = () => { const callback = pipe._finished; pipe._finished = null; callback?.(); };
+      }
     }
     ref() { call('child.unref',this.#id,false);this._unreferenced=false;return this; }
     unref() { call('child.unref',this.#id,true);this._unreferenced=true;return this; }
@@ -44,7 +58,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
   }
   const stdioOf = (stdio, index) => {
     if (stdio == null || stdio === 'overlapped') return index < 3 ? 'pipe' : 'ignore';
-    if (stdio === 'pipe' || stdio === 'ignore' || stdio === 'inherit') return index < 3 || stdio === 'ignore' ? stdio : null;
+    if (stdio === 'pipe' || stdio === 'ignore' || stdio === 'inherit') return index < 3 || stdio !== 'inherit' ? stdio : null;
     const fd = typeof stdio === 'number' ? stdio : typeof stdio?.fd === 'number' && typeof stdio.on === 'function' ? stdio.fd : -1;
     return index < 3 && fd >= 0 && fd <= 2 ? fd : null;
   };
@@ -70,7 +84,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
     }
     const stdio = options.stdio ?? 'pipe', list = typeof stdio === 'string' ? [stdio, stdio, stdio] : Array.isArray(stdio) ? stdio : null;
     if (!list) throw Object.assign(new TypeError(`The argument 'stdio' is invalid. Received ${stdio}`), { code: 'ERR_INVALID_ARG_VALUE' });
-    result.stdio = [0, 1, 2].map(index => stdioOf(list[index], index));
+    result.stdio = Array.from({ length: Math.max(3, list.length) }, (_, index) => stdioOf(list[index], index));
     for (let index = 0; index < Math.max(3, list.length); index++) if (stdioOf(list[index], index) === null) throw Object.assign(new TypeError(list[index] === 'ipc' ? 'IPC channels are not supported' : `Unsupported stdio option at index ${index}: ${String(list[index])}`), { code: 'ERR_INVALID_ARG_VALUE' });
     if (sync) Object.assign(result, { input: options.input, timeout: options.timeout, killSignal: options.killSignal ?? 'SIGTERM', maxBuffer: options.maxBuffer === Infinity ? Number.MAX_SAFE_INTEGER : options.maxBuffer });
     return result;
@@ -117,8 +131,8 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       const child = children.get(event.id)?.child;
       if (!child) continue;
       if (event.event === 'data') { const output=child[event.stream]; if(!output.destroyed&&!output.push(view(event.data))&&!output._paused){output._paused=true;call('child.pause',event.id,event.stream,true);} }
-      else if (event.event === 'written') child.stdin?._childWritten();
-      else if (event.event === 'finish') child.stdin?._childEnded();
+      else if (event.event === 'written') (child[event.stream] ?? child.stdin)?._childWritten();
+      else if (event.event === 'finish') (child[event.stream] ?? child.stdin)?._childEnded();
       else if (event.event === 'end') { if (!child[event.stream].destroyed) child[event.stream].push(null); }
       else if (event.event === 'error') child[event.stream]?.destroy(Object.assign(new Error(`${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`), event.error, { message: `${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`, syscall: event.stream === 'stdin' ? 'write' : 'read' }));
       else if (event.event === 'exit' || event.event === 'close') {

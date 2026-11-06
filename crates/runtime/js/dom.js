@@ -34,7 +34,9 @@
     changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') changed = true; if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
+  // Parsed `<webview>` elements have no wrapper until something reads them.
+  let webviewScan = true, pickFiles;
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0; geometry[0] = 1;
@@ -162,7 +164,7 @@
     for (let rec = node._m, child = null; rec && rec.tag[0] !== '#'; child = rec, rec = rec.up) if (rec.attrs.has('disabled') && (rec === node._m || rec.tag === 'fieldset' && rec.kids.find(kid => kid.tag === 'legend') !== child || rec.tag === 'optgroup' && node.localName === 'option')) return true;
     return false;
   };
-  const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
+  const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button|file)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
   const group = radio => { const name = radio.name, form = radio.form; return name ? [...radio.getRootNode().querySelectorAll('input')].filter(other => other.type === 'radio' && other.name === name && other.form === form) : [radio]; };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
@@ -189,6 +191,10 @@
   const fireClick = (target, init = {}, native = false) => {
     const event = new PointerEvent('click', { bubbles: true, cancelable: true, composed: true, pointerId: native ? 1 : -1, pointerType: native ? 'mouse' : '', ...init });
     if (native) trusted(event);
+    return activateClick(target, event, init, native);
+  };
+  // WARNING: every `click` MouseEvent runs this, also from `dispatchEvent`, and Base UI's switches and checkboxes rely on that.
+  const activateClick = (target, event, init = {}, native = false) => {
     const activator = path(target).find(node => node.nodeType === 1 && activation(node)), kind = activator?.localName === 'input' ? activator.type : '';
     if (activator && disabled(activator)) return dispatch(target, event);
     const checked = node => node._checked ?? node.hasAttribute('checked');
@@ -203,6 +209,7 @@
       if (tag === 'label') { const control = labelControl(activator); if (control && !control.contains(target) && !disabled(control)) { if (focusable(control)) control.focus(); fireClick(control, { ...init, detail: 0 }, native); } }
       else if (tag === 'summary') activator.parentElement.open = !activator.parentElement.open;
       else if ((type === 'submit' || type === 'image') && activator.form) activator.form.requestSubmit(activator);
+      else if (type === 'file') pickFiles(activator);
       else if (tag === 'button' || tag === 'input') { if (type === 'reset' && activator.form) activator.form.reset(); invoke(activator, target); }
       else if ((tag === 'a' || tag === 'area') && !/^(_self|_top|_parent)?$/i.test(activator.getAttribute('target') ?? '')) openWindow(activator.href, activator.getAttribute('target'));
     }
@@ -429,7 +436,7 @@
     normalize() { for (const child of this.childNodes) { if (child.nodeType === 3) { while (child.nextSibling?.nodeType === 3) { child.data += child.nextSibling.data; child.nextSibling.remove(); } if (!child.length) child.remove(); } else child.normalize(); } }
     addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; const scroll = name === 'wheel' || name === 'mousewheel' || name === 'touchstart' || name === 'touchmove'; if (name === 'wheel' && !wheeling) { wheeling = true; call('dom.wheel'); } list.push({ fn, capture, once: !!options?.once, passive: !!(options?.passive ?? (scroll && (this === globalThis || this === document || this === document.documentElement || this === document.body))) }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
     removeEventListener(name, fn, options = false) { const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this); listeners?.set(String(name), (listeners.get(String(name)) ?? []).filter(item => item.fn !== fn || item.capture !== capture)); }
-    dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); return dispatch(this, event); }
+    dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); return event.type === 'click' && event instanceof MouseEvent ? activateClick(this, event) : dispatch(this, event); }
   }
   Object.setPrototypeOf(Node.prototype, EventTarget.prototype); Object.setPrototypeOf(Node, EventTarget);
   for (const [name, value] of Object.entries({ ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32 })) { Node[name] = value; Node.prototype[name] = value; }
@@ -647,6 +654,8 @@
     focus() {
       if (active === this || !focusable(this)) return;
       const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), focusVisible(this));
+      // A selection set before the focus drew no caret.
+      if (this.isContentEditable && selection.isCollapsed) selection._send();
       const mark = native ? trusted : event => event;
       if (previous) { commit(previous); dispatch(previous, mark(new FocusEvent('blur', { composed: true, relatedTarget: this }))); dispatch(previous, mark(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }))); }
       if (active === this) { dispatch(this, mark(new FocusEvent('focus', { composed: true, relatedTarget: previous }))); dispatch(this, mark(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous }))); }
@@ -754,7 +763,7 @@
   class HTMLInputElement extends HTMLElement {
     get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
     get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? this.getAttribute('value')?.replace(/[\r\n]/g, '') ?? ''; }
-    set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) setValue(this, value); }
+    set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) { if (!value) this._files = null; setValue(this, value); } }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
     get checked() { return this._checked ?? this.hasAttribute('checked'); }
     set checked(value) { setChecked(this, !!value); }
@@ -1117,7 +1126,10 @@
   const decode = (node, data) => new Promise(resolve => decodes.set(call(typeof data === 'string' ? 'dom.imageURL' : 'dom.image', node._id, data), resolve));
   // WARNING: decodes finish on workers that wake the loop, so the tick drains them only while one is pending.
   const decodes = new Map();
-  globalThis.__appsDecoded = () => { if (decodes.size) for (const [request, result] of host('dom.decoded')) { decodes.get(request)?.(result); decodes.delete(request); } };
+  globalThis.__appsDecoded = () => {
+    if (decodes.size) for (const [request, result] of host('dom.decoded')) { decodes.get(request)?.(result); decodes.delete(request); }
+    if (placeholders) for (const [node, width, height] of call('dom.frames')) { const canvas = wrap(node); if (canvas.width !== width) canvas.setAttribute('width', width); if (canvas.height !== height) canvas.setAttribute('height', height); }
+  };
   globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
   // WARNING: media elements play in the library of the video and audio features. Its threads wake the loop, and the tick polls their events while one is open. Playing elements stay alive, like in browsers.
   const players = new Map(), playing = new Set(), mediaFeatures = globalThis.__appsMedia ?? {};
@@ -1269,9 +1281,10 @@
     constructor(type, options = {}) { super(type, options); this.data = options.data ?? null; this.inputType = options.inputType ?? ''; this.isComposing = !!options.isComposing; this.dataTransfer = options.dataTransfer ?? null; this._targetRanges = Array.from(options.targetRanges ?? []); }
     getTargetRanges() { return this._targetRanges.slice(); }
   }
+  const droppedDirectories = new WeakSet();
   class DataTransfer {
-    constructor(){this.dropEffect='none';this.effectAllowed='all';this._data=new Map();this.files=[];this.items=[];this.items.add=(value,type)=>{if(value instanceof File){this.files.push(value);const item={kind:'file',type:value.type,getAsFile:()=>value,getAsString:()=>{}};this.items.push(item);return item;}this.setData(type,String(value));return this.items.at(-1);};this.items.remove=index=>{const item=this.items[index];if(item?.kind==='file')this.files.splice(this.files.indexOf(item.getAsFile()),1);this.items.splice(index,1);};this.items.clear=()=>{this.items.length=0;this.files.length=0;this._data.clear();};}
-    get types(){return [...this._data.keys(),...(this.files.length?['Files']:[])];}getData(type){return this._data.get(type==='text'?'text/plain':type)??'';}setData(type,data){type=type==='text'?'text/plain':type;this._data.set(type,String(data));const item={kind:'string',type,getAsFile:()=>null,getAsString:callback=>queueMicrotask(()=>callback(this.getData(type)))};const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index<0)this.items.push(item);else this.items[index]=item;}clearData(type){if(type===undefined){this._data.clear();this.items.splice(0,this.items.length,...this.items.filter(item=>item.kind==='file'));}else{this._data.delete(type);const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index>=0)this.items.splice(index,1);}}
+    constructor(){this.dropEffect='none';this.effectAllowed='all';this._data=new Map();this.files=[];this.items=[];this.items.add=(value,type)=>{if(value instanceof File){this.files.push(value);const directory=droppedDirectories.has(value),item={kind:'file',type:value.type,getAsFile:()=>value,getAsString:()=>{},webkitGetAsEntry:()=>({isFile:!directory,isDirectory:directory,name:value.name,fullPath:'/'+value.name})};this.items.push(item);return item;}this.setData(type,String(value));return this.items.at(-1);};this.items.remove=index=>{const item=this.items[index];if(item?.kind==='file')this.files.splice(this.files.indexOf(item.getAsFile()),1);this.items.splice(index,1);};this.items.clear=()=>{this.items.length=0;this.files.length=0;this._data.clear();};}
+    get types(){return [...this._data.keys(),...(this.items.some(item=>item.kind==='file')?['Files']:[])];}getData(type){return this._data.get(type==='text'?'text/plain':type)??'';}setData(type,data){type=type==='text'?'text/plain':type;this._data.set(type,String(data));const item={kind:'string',type,getAsFile:()=>null,getAsString:callback=>queueMicrotask(()=>callback(this.getData(type)))};const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index<0)this.items.push(item);else this.items[index]=item;}clearData(type){if(type===undefined){this._data.clear();this.items.splice(0,this.items.length,...this.items.filter(item=>item.kind==='file'));}else{this._data.delete(type);const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index>=0)this.items.splice(index,1);}}
   }
   class ClipboardEvent extends Event {constructor(type,options={}){super(type,options);this.clipboardData=options.clipboardData??null;}}
   class DragEvent extends MouseEvent {constructor(type,options={}){super(type,options);this.dataTransfer=options.dataTransfer??null;}}
@@ -1663,8 +1676,16 @@
       changed ||= !previous || direction !== this.direction || ['startContainer','startOffset','endContainer','endOffset'].some(key => previous[key] !== range[key]);
       this.ranges = [range]; this.direction = direction;
       if (!changed) return;
-      call('dom.selection', 0, rangeNodes(range).map(({node,start,end}) => [node._id,start,end]), range.collapsed && !!active?.isContentEditable && active.contains(range.startContainer));
+      this._send();
       selectionChanged();
+    }
+    _send() {
+      const range = this.ranges[0], caret = !!range?.collapsed && !!active?.isContentEditable && active.contains(range.startContainer);
+      if (!range) return;
+      const nodes = rangeNodes(range).map(({node,start,end}) => [node._id,start,end]);
+      // An empty line has no text to hold the caret, so its line break does.
+      if (caret && !nodes.length) { const { startContainer: parent, startOffset: offset } = range, child = parent.nodeType === 1 ? parent.childNodes[offset] ?? parent.lastChild : null; if (child?.localName === 'br') nodes.push([child._id, 0, 0]); }
+      call('dom.selection', 0, nodes, caret);
     }
     addRange(range) { if (!this.rangeCount && range.startContainer.isConnected) this._setRange(range); }
     removeRange(range) { if (this.ranges[0] !== range) throw new DOMException('Range is not selected', 'NotFoundError'); this.removeAllRanges(); }
@@ -1724,7 +1745,7 @@
     observe(target){watch(this,target,null,intersectionObservers);}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
-  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
+  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
     if (node || !rec) return node ?? null;
@@ -1766,8 +1787,8 @@
 
   // WARNING: drawing queues `code, ...args` floats that `Canvas::draw` in `render/canvas.rs` runs with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.
   class CanvasRenderingContext2D {
-    constructor(canvas) { this.canvas = canvas; this._ops = new Float32Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
-    _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1 }; this._stack = []; }
+    constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float32Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
+    _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDash: [], lineDashOffset: 0, globalCompositeOperation: 'source-over', letterSpacing: '0px', wordSpacing: '0px', imageSmoothingEnabled: true, imageSmoothingQuality: 'low', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto', direction: 'inherit', lang: 'inherit' }; this._stack = []; }
     _op(code, ...args) {
       const size = this._size;
       if (size + args.length >= this._ops.length) { const grown = new Float32Array(this._ops.length * 2 + args.length); grown.set(this._ops); this._ops = grown; }
@@ -1775,30 +1796,97 @@
       this._size = size + 1 + args.length;
       if (!size) queueMicrotask(() => this._flush()); else if (this._size > 1 << 18) this._flush();
     }
-    _flush() { if (!this._size) return; const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; call('dom.canvas', this.canvas._id, ops, text, ...data); }
+    _flush() { if (!this._size) return; const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; bitmapDraws.delete(this); if (this.canvas.width && this.canvas.height) call('dom.canvas', this.canvas._id, ops, text, ...data); this.canvas._commit?.(); }
     _resize() { this._size = 0; this._texts.length = 0; this._data = []; this._reset(); call('dom.canvas', this.canvas._id, null); }
     save() { this._stack.push({ ...this._state }); this._op(0); } restore() { if (this._stack.length) { this._state = this._stack.pop(); this._op(1); } }
     setTransform(a = {}, b, c, d, e, f) { if (typeof a === 'object') ({ a = 1, b = 0, c = 0, d = 1, e = 0, f = 0 } = a); this._op(3, a, b, c, d, e, f); }
     resetTransform() { this._op(3, 1, 0, 0, 1, 0, 0); } transform(a, b, c, d, e, f) { this._op(2, a, b, c, d, e, f); }
     scale(x, y) { this._op(2, x, 0, 0, y, 0, 0); } translate(x, y) { this._op(2, 1, 0, 0, 1, x, y); } rotate(a) { const cos = Math.cos(a), sin = Math.sin(a); this._op(2, cos, sin, -sin, cos, 0, 0); }
     fillRect(x, y, width, height) { this._op(21, x, y, width, height); } strokeRect(x, y, width, height) { this._op(22, x, y, width, height); } clearRect(x, y, width, height) { this._op(23, x, y, width, height); }
-    fillText(text, x, y) { text = String(text); this._texts.push(alone(text)); this._op(24, text.length, x, y); }
-    measureText(text) { return call('dom.measureText', this.canvas._id, String(text), this.font); }
+    fillText(text, x, y, maxWidth) { this._text(24, text, x, y, maxWidth); } strokeText(text, x, y, maxWidth) { this._text(27, text, x, y, maxWidth); }
+    _text(code, text, x, y, maxWidth = Infinity) { text = String(text); if (arguments.length > 4 && arguments[4] !== undefined && !(Number.isFinite(+maxWidth) && maxWidth > 0)) return; this._texts.push(alone(text)); this._op(code, text.length, x, y, maxWidth); }
+    measureText(text) { const s = this._state, [width, left, right, top, bottom, ascent, descent, emAscent, emDescent] = call('dom.measureText', this.canvas._id, String(text), this.font, parseFloat(s.letterSpacing), parseFloat(s.wordSpacing)); const base = { top: emAscent, hanging: ascent * 0.8, middle: (emAscent - emDescent) / 2, bottom: -emDescent, ideographic: -descent }[s.textBaseline] ?? 0, anchor = width * ({ center: 0.5, right: 1, end: 1 }[s.textAlign] ?? 0); return Object.assign(Object.create(TextMetrics.prototype), { width, actualBoundingBoxLeft: left === right ? anchor : anchor - left, actualBoundingBoxRight: left === right ? -anchor : right - anchor, actualBoundingBoxAscent: top - base, actualBoundingBoxDescent: bottom + base, fontBoundingBoxAscent: ascent - base, fontBoundingBoxDescent: descent + base, emHeightAscent: emAscent - base, emHeightDescent: emDescent + base, hangingBaseline: ascent * 0.8 - base, alphabeticBaseline: -base, ideographicBaseline: -descent - base }); }
+    getContextAttributes() { return { alpha: this._alpha, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; } isContextLost() { return false; } drawFocusIfNeeded() {} reset() { this._resize(); }
+    getTransform() { this._flush(); const [a, b, c, d, e, f] = call('dom.canvasQuery', this.canvas._id); return { a, b, c, d, e, f, is2D: true }; }
+    isPointInPath(x, y, rule = 'nonzero') { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, rule === 'evenodd', false); } isPointInStroke(x, y) { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, false, true); }
+    createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient([x0, y0, x1, y1]); } createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); return new CanvasGradient([x0, y0, r0, x1, y1, r1]); }
+    setLineDash(list) { list = Array.from(list, Number); if (!list.every(v => Number.isFinite(v) && v >= 0)) return; if (list.length % 2) list = [...list, ...list]; this._state.lineDash = list; const text = list.join(); this._texts.push(text); this._op(35, text.length); } getLineDash() { return [...this._state.lineDash]; }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
     getImageData(x,y,width,height) { this._flush(); if (!width || !height) throw new DOMException('Image dimensions must be nonzero','IndexSizeError'); return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels',this.canvas._id,x,y,Math.abs(width),Math.abs(height))),Math.abs(width),Math.abs(height)); }
     putImageData(data, x, y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._data.push(data.data.slice()); this._op(26, this._data.length - 1, x, y, data.width, data.height); }
-    drawImage(image,...args) { const video = image instanceof HTMLVideoElement; if (!(image instanceof HTMLImageElement) && !(image instanceof HTMLCanvasElement) && !video) throw new TypeError('Expected an image, canvas or video'); if (video && image.readyState < 2) return; image._context?._flush?.(); const iw=image.videoWidth ?? image.naturalWidth ?? image.width,ih=image.videoHeight ?? image.naturalHeight ?? image.height; if (!iw||!ih) throw new DOMException('Image is not loaded','InvalidStateError'); let sx=0,sy=0,sw=iw,sh=ih,dx,dy,dw=iw,dh=ih; if(args.length===2) [dx,dy]=args; else if(args.length===4) [dx,dy,dw,dh]=args; else if(args.length===8) [sx,sy,sw,sh,dx,dy,dw,dh]=args; else throw new TypeError('Invalid drawImage arguments'); this._op(25,image===this.canvas?-1:image._id,iw,ih,sx,sy,sw,sh,dx,dy,dw,dh); if (image._context && image!==this.canvas) this._flush(); }
+    drawImage(image,...args) {
+      if (!drawable(image)) throw new TypeError('Expected an image, canvas, video or bitmap');
+      if (image instanceof HTMLVideoElement && image.readyState < 2) return;
+      image._context?._flush?.();
+      const [iw, ih] = imageSize(image); if (!iw||!ih) throw new DOMException('Image is not loaded','InvalidStateError');
+      let sx=0,sy=0,sw=iw,sh=ih,dx,dy,dw=iw,dh=ih; if(args.length===2) [dx,dy]=args; else if(args.length===4) [dx,dy,dw,dh]=args; else if(args.length===8) [sx,sy,sw,sh,dx,dy,dw,dh]=args; else throw new TypeError('Invalid drawImage arguments');
+      // WARNING: negative sizes don't flip, and the part of the source rectangle outside the image draws nothing, as in browsers.
+      if (sw<0) { sx+=sw; sw=-sw; } if (sh<0) { sy+=sh; sh=-sh; } if (dw<0) { dx+=dw; dw=-dw; } if (dh<0) { dy+=dh; dh=-dh; }
+      const left=Math.max(sx,0),top=Math.max(sy,0),right=Math.min(sx+sw,iw),bottom=Math.min(sy+sh,ih),kx=dw/sw,ky=dh/sh;
+      if (right<=left||bottom<=top) return;
+      dx+=(left-sx)*kx; dy+=(top-sy)*ky; dw=(right-left)*kx; dh=(bottom-top)*ky;
+      this._op(25,image===this.canvas?-1:image._id,iw,ih,left,top,right-left,bottom-top,dx,dy,dw,dh);
+      if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image._context && image!==this.canvas) this._flush();
+    }
 
+    arc(x, y, radius, start, end, counter = false) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(28, x, y, radius, start, end, counter ? 1 : 0); }
+    ellipse(x, y, rx, ry, rotation, start, end, counter = false) { if (rx < 0 || ry < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(29, x, y, rx, ry, rotation, start, end, counter ? 1 : 0); }
+    arcTo(x1, y1, x2, y2, radius) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(30, x1, y1, x2, y2, radius); }
+    roundRect(x, y, width, height, radii = 0) { const list = (Array.isArray(radii) ? radii : [radii]).map(v => typeof v === 'object' ? [+v.x || 0, +v.y || 0] : [+v, +v]); if (!list.length || list.length > 4 || list.some(r => r[0] < 0 || r[1] < 0)) throw new RangeError('Invalid corner radii'); const [a, b, c, d] = list.length === 1 ? [list[0], list[0], list[0], list[0]] : list.length === 2 ? [list[0], list[1], list[0], list[1]] : list.length === 3 ? [list[0], list[1], list[2], list[1]] : list; const w = Math.abs(width), h = Math.abs(height), fit = (size, sum) => sum > size ? size / sum : 1, k = Math.min(fit(w, a[0] + b[0]), fit(w, d[0] + c[0]), fit(h, a[1] + d[1]), fit(h, b[1] + c[1])); this._op(31, x, y, width, height, ...[a, b, c, d].flat().map(v => v * k)); }
     beginPath() { this._op(11); } closePath() { this._op(12); } moveTo(x, y) { this._op(13, x, y); } lineTo(x, y) { this._op(14, x, y); } rect(x, y, width, height) { this._op(17, x, y, width, height); }
     quadraticCurveTo(x1, y1, x, y) { this._op(15, x1, y1, x, y); } bezierCurveTo(x1, y1, x2, y2, x, y) { this._op(16, x1, y1, x2, y2, x, y); }
     fill(rule = 'nonzero') { this._op(18, rule === 'evenodd' ? 1 : 0); } stroke() { this._op(19); }
     clip(rule = 'nonzero') { if (!['nonzero','evenodd'].includes(rule)) throw new TypeError('Invalid fill rule'); this._op(20, rule === 'evenodd' ? 1 : 0); }
   }
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
+    if (code < 6 && value instanceof CanvasGradient) { this._state[name] = value; const text = value._spec(); this._texts.push(text); this._op(code, text.length); return; }
     if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
     if (this._state[name] === value) return;
     this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);
   } });
+  for (const [name, code, list] of [['lineCap', 32, 'butt round square'], ['lineJoin', 33, 'miter round bevel'], ['globalCompositeOperation', 37, 'source-over source-in source-out source-atop destination-over destination-in destination-out destination-atop lighter copy xor multiply screen overlay darken lighten color-dodge color-burn hard-light soft-light difference exclusion hue saturation color luminosity']]) { const values = new Set(list.split(' ')); Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { value = String(value); if (!values.has(value) || this._state[name] === value) return; this._state[name] = value; this._texts.push(value); this._op(code, value.length); } }); }
+  for (const [name, code, valid] of [['miterLimit', 34, v => v > 0 && v < Infinity], ['lineDashOffset', 36, Number.isFinite]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { value = Number(value); if (valid(value)) { this._state[name] = value; this._op(code, value); } } });
+  for (const [name, code] of [['letterSpacing', 38], ['wordSpacing', 39]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { const px = /^(-?[\d.]+)px$/.exec(String(value).trim()); if (px) { this._state[name] = `${+px[1]}px`; this._op(code, +px[1]); } } });
+  Object.defineProperty(CanvasRenderingContext2D.prototype, 'imageSmoothingEnabled', { configurable: true, enumerable: true, get() { return this._state.imageSmoothingEnabled; }, set(value) { this._state.imageSmoothingEnabled = !!value; this._op(40, value ? 1 : 0); } });
+  // WARNING: these keep their values but draw nothing.
+  for (const name of ['imageSmoothingQuality', 'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
+  class CanvasGradient {
+    constructor(shape) { this._shape = shape.map(Number); this._stops = []; }
+    addColorStop(offset, color) { offset = Number(offset); if (!(offset >= 0 && offset <= 1)) throw new DOMException('The offset is out of range', 'IndexSizeError'); this._stops.push([offset, String(color)]); }
+    _spec() { return 'gradient:' + JSON.stringify([this._shape, [...this._stops].sort((a, b) => a[0] - b[0])]); }
+  }
+  class TextMetrics {}
+  // WARNING: Web Audio is a subset for playing whole sounds, through `<audio>`. Buffers keep the encoded file, so they have no samples and nodes other than gain don't exist.
+  class AudioNode { constructor(context) { this.context = context; this._target = null; } connect(target) { this._target = target; return target; } disconnect() { this._target = null; } }
+  class GainNode extends AudioNode { gain = { value: 1 }; }
+  class AudioDestinationNode extends AudioNode {}
+  class AudioBuffer { constructor(url, duration) { this._url = url; this.duration = duration; } }
+  class AudioBufferSourceNode extends AudioNode {
+    buffer = null; loop = false; onended = null; playbackRate = { value: 1 };
+    start(when = 0, offset = 0) {
+      if (!this.buffer) return;
+      let volume = 1, node = this._target;
+      while (node && !(node instanceof AudioDestinationNode)) { volume *= node.gain?.value ?? 1; node = node._target; }
+      const audio = this._audio = new Audio(this.buffer._url);
+      audio.volume = node ? Math.min(1, Math.max(0, volume)) : 0; audio.loop = this.loop; audio.playbackRate = this.playbackRate.value; audio.currentTime = offset;
+      audio.addEventListener('ended', () => this.onended?.(new Event('ended')));
+      setTimeout(() => audio.play().catch(() => {}), Math.max(0, when - this.context.currentTime) * 1000);
+    }
+    stop() { this._audio?.pause(); }
+  }
+  class AudioContext extends EventTarget {
+    state = 'running'; sampleRate = 48000; _start = performance.now(); destination = new AudioDestinationNode(this);
+    get currentTime() { return (performance.now() - this._start) / 1000; }
+    _set(state) { this.state = state; this.dispatchEvent(new Event('statechange')); return Promise.resolve(); }
+    resume() { return this.state === 'running' ? Promise.resolve() : this._set('running'); } suspend() { return this._set('suspended'); } close() { return this._set('closed'); }
+    createGain() { return new GainNode(this); } createBufferSource() { return new AudioBufferSourceNode(this); }
+    decodeAudioData(data, done, failed) {
+      const url = URL.createObjectURL(new Blob([data])), audio = new Audio(url);
+      const result = new Promise((resolve, reject) => { audio.addEventListener('loadedmetadata', () => resolve(new AudioBuffer(url, audio.duration))); audio.addEventListener('error', () => reject(new DOMException('The audio cannot be decoded', 'EncodingError'))); audio.load(); });
+      if (done || failed) result.then(done, failed);
+      return result;
+    }
+  }
   class ImageData {
     constructor(data,width,height) { if (typeof data==='number') {height=width;width=data;data=new Uint8ClampedArray(width*height*4);} else {if (!(data instanceof Uint8ClampedArray)) throw new TypeError('Expected Uint8ClampedArray');height??=data.length/(width*4);} if(!Number.isInteger(width)||!Number.isInteger(height)||width<=0||height<=0||data.length!==width*height*4) throw new DOMException('Invalid image dimensions','IndexSizeError');Object.assign(this,{data,width,height,colorSpace:'srgb'}); }
   }
@@ -1807,13 +1895,125 @@
   class HTMLCanvasElement extends HTMLElement {
     get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
     get clientHeight(){const height=this.getBoundingClientRect().height;if(height)return height;const value=getComputedStyle(this).height;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.height;}
-    get width() { return canvasSize(this.getAttribute('width'), 300); } set width(v) { this.setAttribute('width', Number(v) >>> 0); }
-    get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { this.setAttribute('height', Number(v) >>> 0); }
+    get width() { return canvasSize(this.getAttribute('width'), 300); } set width(v) { if (this._offscreen) throw transferred(); this.setAttribute('width', Number(v) >>> 0); }
+    get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { if (this._offscreen) throw transferred(); this.setAttribute('height', Number(v) >>> 0); }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
     toDataURL(type='image/png') { if (type!=='image/png') throw new DOMException('Only PNG encoding is supported','NotSupportedError');this._context?._flush?.();return call('dom.canvasURL',this._id); }
     toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.from(atob(data),c=>c.charCodeAt(0))],{type:'image/png'}))); }
-    getContext(type) { if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); if (this._contextType && this._contextType !== type) return null; if (!['webgpu','2d'].includes(type)) return null; this._contextType = type; return this._context ??= type === '2d' ? new CanvasRenderingContext2D(this) : new GPUCanvasContext(this, this._id); }
+    getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); return canvasContext(this, type, options, CanvasRenderingContext2D); }
+    transferControlToOffscreen() { if (this._contextType || this._offscreen) throw new DOMException('The canvas has a context or was already transferred', 'InvalidStateError'); this._offscreen = true; const offscreen = new OffscreenCanvas(0, 0); offscreen._node = this; return offscreen; }
   }
+  const transferred = () => new DOMException('The canvas was transferred', 'InvalidStateError');
+  const canvasContext = (canvas, type, options, Context2D) => { if (canvas._contextType && canvas._contextType !== type) return null; if (!['webgpu','2d','bitmaprenderer'].includes(type)) return null; canvas._contextType = type; return canvas._context ??= type === '2d' ? new Context2D(canvas, options) : type === 'bitmaprenderer' ? new ImageBitmapRenderingContext(canvas) : new GPUCanvasContext(canvas, canvas._id); };
+  // WARNING: bitmap draws wait in their context's queue, so closing a bitmap runs these first. Other canvases flush when they are drawn from, but sprites would redraw a whole canvas per draw that way.
+  const bitmapDraws = new Set();
+  const drawable = image => image instanceof HTMLImageElement || image instanceof HTMLCanvasElement || image instanceof HTMLVideoElement || image instanceof OffscreenCanvas || image instanceof ImageBitmap;
+  const imageSize = image => [image.videoWidth ?? image.naturalWidth ?? image.width, image.videoHeight ?? image.naturalHeight ?? image.height];
+  // WARNING: offscreen pixels live in a detached node like any canvas, which frees them when its wrapper dies. `apps-canvas` keeps no copy to show and needs no polling for GPU frames, unlike `canvas`.
+  const canvasNode = (width, height) => { const node = document.createElement('apps-canvas'); node.setAttribute('width', width); node.setAttribute('height', height); return node; };
+  const bitmapOf = node => Object.assign(Object.create(ImageBitmap.prototype), { _node: node });
+  class ImageBitmap {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get width() { return this._node ? canvasSize(this._node.getAttribute('width'), 0) : 0; }
+    get height() { return this._node ? canvasSize(this._node.getAttribute('height'), 0) : 0; }
+    get _id() { return this._node?._id; }
+    close() { if (!this._node) return; for (const context of bitmapDraws) context._flush(); call('dom.canvas', this._id, null); this._node = null; }
+    _detach() { this.close(); }
+    _wire() { if (!this._node) throw new DOMException('The ImageBitmap is closed', 'DataCloneError'); const { width, height } = this; return [width, height, call('dom.canvasPixels', this._id, 0, 0, width, height, true)]; }
+    static _revive(width, height, bytes) { const node = canvasNode(width, height); call('dom.canvasAdopt', node._id, bytes); return bitmapOf(node); }
+  }
+  class ImageBitmapRenderingContext {
+    constructor(canvas) { this.canvas = canvas; }
+    transferFromImageBitmap(bitmap) {
+      if (bitmap !== null && !(bitmap instanceof ImageBitmap)) throw new TypeError('Expected an ImageBitmap');
+      if (bitmap && !bitmap.width) throw new DOMException('The ImageBitmap is closed', 'InvalidStateError');
+      if (bitmap) { for (const context of bitmapDraws) context._flush(); call('dom.canvasTake', bitmap._id, this.canvas._id); bitmap.close(); }
+      else call('dom.canvas', this.canvas._id, null);
+      this.canvas._commit?.();
+    }
+    _resize() { call('dom.canvas', this.canvas._id, null); }
+  }
+  let placeholders = false;
+  class OffscreenCanvas extends EventTarget {
+    constructor(width, height) { super(); if (arguments.length < 2) throw new TypeError('OffscreenCanvas needs a width and a height'); this._node = canvasNode(0, 0); this.width = width; this.height = height; }
+    get _id() { return this._node?._id; }
+    get width() { return this._node ? canvasSize(this._node.getAttribute('width'), 300) : 0; }
+    get height() { return this._node ? canvasSize(this._node.getAttribute('height'), 150) : 0; }
+    set width(value) { this._node?.setAttribute('width', offscreenSize(value)); this._context?._resize(); }
+    set height(value) { this._node?.setAttribute('height', offscreenSize(value)); this._context?._resize(); }
+    getContext(type, options) { if (!this._node) throw transferred(); return canvasContext(this, type, options, OffscreenCanvasRenderingContext2D); }
+    transferToImageBitmap() {
+      const { width, height } = this;
+      if (!this._context || !width || !height) throw new DOMException('The canvas has no context or no pixels', 'InvalidStateError');
+      this._context._flush?.();
+      const node = canvasNode(width, height); call('dom.canvasTake', this._id, node._id);
+      return bitmapOf(node);
+    }
+    // WARNING: PNG is the only encoder. As the standard says for an unknown type, others give a PNG, and the blob's `type` tells.
+    async convertToBlob() {
+      if (!this._node) throw transferred();
+      if (!this.width || !this.height) throw new DOMException('The canvas has no pixels', 'IndexSizeError');
+      this._context?._flush?.();
+      return new Blob([call('dom.canvasURL', this._id, true)], { type: 'image/png' });
+    }
+    // WARNING: frames wait for the next task, so several draws in one task show as one frame.
+    _commit() { if (!this._linked || this._committing) return; this._committing = true; setTimeout(() => { this._committing = false; if (this._node) call('dom.canvasCommit', this._id); }, 0); }
+    // WARNING: a WebGPU frame reaches the CPU some time after its submit, so a worker asks for it until frames stop.
+    _pump() {
+      if (!this._linked) return;
+      this._frameAt = performance.now();
+      if (this._pumping) return;
+      this._pumping = true;
+      const pump = () => { if (this._node) call('dom.canvasCommit', this._id); if (this._node && performance.now() - this._frameAt < 100) setTimeout(pump, 4); else this._pumping = false; };
+      setTimeout(pump, 4);
+    }
+    _detach() { this._node = null; }
+    _wire() { if (!this._node || this._context) throw new DOMException('A canvas with a context or that was transferred cannot be transferred', 'InvalidStateError'); const linked = this._linked || this._node.localName === 'canvas'; placeholders ||= linked; return [linked ? call('dom.canvasLink', this._id) : null, this.width, this.height]; }
+    static _revive(token, width, height) { const canvas = new OffscreenCanvas(width, height); if (token !== null) { call('dom.canvasBind', canvas._id, token); canvas._linked = true; } return canvas; }
+  }
+  const offscreenSize = value => { value = Number(value); if (!(value >= 0 && value <= Number.MAX_SAFE_INTEGER)) throw new TypeError('Invalid canvas size'); return Math.trunc(value); };
+  class OffscreenCanvasRenderingContext2D extends CanvasRenderingContext2D {}
+  globalThis.createImageBitmap = async (source, ...rest) => {
+    const cropped = rest.length > 1;
+    if (cropped && rest.length < 4) throw new TypeError('createImageBitmap needs a whole crop rectangle');
+    const { imageOrientation, resizeWidth, resizeHeight, resizeQuality } = (cropped ? rest[4] : rest[0]) ?? {};
+    let [sx = 0, sy = 0, sw, sh] = cropped ? rest.slice(0, 4).map(Math.trunc) : [];
+    if (sw === 0 || sh === 0) throw new RangeError('The crop rectangle is empty');
+    if (resizeWidth === 0 || resizeHeight === 0) throw new DOMException('The resized image is empty', 'InvalidStateError');
+    let decoded;
+    if (source instanceof Blob) {
+      const image = document.createElement('img'), size = await decode(image, new Uint8Array(await source.arrayBuffer()));
+      if (typeof size === 'string') throw new DOMException('The source image could not be decoded', 'InvalidStateError');
+      image._dimensions = size; source = image; decoded = image;
+    } else if (source instanceof ImageData) {
+      const canvas = new OffscreenCanvas(source.width, source.height); canvas.getContext('2d').putImageData(source, 0, 0); source = canvas;
+    } else if (!drawable(source)) throw new TypeError('Expected an image, canvas, video, bitmap, blob or ImageData');
+    else if (source instanceof HTMLVideoElement && source.readyState < 2) throw new DOMException('The video has no frame', 'InvalidStateError');
+    const [iw, ih] = imageSize(source);
+    if (!iw || !ih) throw new DOMException('The image has no pixels', 'InvalidStateError');
+    sw ??= iw; sh ??= ih;
+    if (sw < 0) { sx += sw; sw = -sw; } if (sh < 0) { sy += sh; sh = -sh; }
+    const width = resizeWidth ?? (resizeHeight ? Math.ceil(sw * resizeHeight / sh) : sw), height = resizeHeight ?? (resizeWidth ? Math.ceil(sh * resizeWidth / sw) : sh);
+    const canvas = new OffscreenCanvas(width, height), context = canvas.getContext('2d');
+    // WARNING: smoothing would blur a flip at full size.
+    context.imageSmoothingEnabled = resizeQuality !== 'pixelated' && (width !== sw || height !== sh);
+    if (imageOrientation === 'flipY') { context.translate(0, height); context.scale(1, -1); }
+    context.drawImage(source, sx, sy, sw, sh, 0, 0, width, height); context._flush();
+    if (decoded) call('dom.canvas', decoded._id, null);
+    return bitmapOf(canvas._node);
+  };
+  class ScreenOrientation extends EventTarget {
+    get angle() { return 0; }
+    get type() { const [width, height] = host('dom.screen'); return width < height ? 'portrait-primary' : 'landscape-primary'; }
+    lock() { return Promise.reject(new DOMException('The screen orientation cannot be locked', 'NotSupportedError')); }
+    unlock() {}
+  }
+  class Screen extends EventTarget {
+    orientation = new ScreenOrientation();
+    get colorDepth() { return 24; } get pixelDepth() { return 24; }
+  }
+  for (const [index, name] of ['width', 'height', 'availLeft', 'availTop', 'availWidth', 'availHeight'].entries()) Object.defineProperty(Screen.prototype, name, { configurable: true, enumerable: true, get: () => host('dom.screen')[index] });
+  globalThis.screen = new Screen();
   const htmlTypes = new Map([['canvas', HTMLCanvasElement], ['img', HTMLImageElement], ['video', HTMLVideoElement], ['audio', HTMLAudioElement], ['slot', HTMLSlotElement], ['input', HTMLInputElement], ['textarea', HTMLTextAreaElement], ['template', HTMLTemplateElement], ['select', HTMLSelectElement], ['option', HTMLOptionElement], ['optgroup', HTMLOptGroupElement], ['button', HTMLButtonElement], ['fieldset', HTMLFieldSetElement], ['output', HTMLOutputElement], ['form', HTMLFormElement], ['dialog', HTMLDialogElement], ['details', HTMLDetailsElement], ['label', HTMLLabelElement]]);
   for (const [name, tags] of Object.entries({ Anchor: 'a', Area: 'area', Base: 'base', Body: 'body', BR: 'br', Data: 'data', DataList: 'datalist', Div: 'div', DList: 'dl', Embed: 'embed', Head: 'head', Heading: 'h1 h2 h3 h4 h5 h6', HR: 'hr', Html: 'html', IFrame: 'iframe', Legend: 'legend', LI: 'li', Link: 'link', Menu: 'menu', Meta: 'meta', Meter: 'meter', Mod: 'ins del', Object: 'object', OList: 'ol', Paragraph: 'p', Picture: 'picture', Pre: 'pre', Progress: 'progress', Quote: 'blockquote q', Script: 'script', Source: 'source', Span: 'span', Style: 'style', Table: 'table', TableCaption: 'caption', TableCell: 'td th', TableCol: 'col colgroup', TableRow: 'tr', TableSection: 'tbody tfoot thead', Time: 'time', Title: 'title', Track: 'track', UList: 'ul', Unknown: '' })) {
     const key = 'HTML' + name + 'Element', Type = globalThis[key] = { [key]: class extends HTMLElement {} }[key];
@@ -1863,7 +2063,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
+  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
   Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
   Object.assign(globalThis, { CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
@@ -1892,9 +2092,10 @@
   const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
   for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
   handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange');
+  handler(Screen.prototype, 'change'); handler(ScreenOrientation.prototype, 'change');
   for (const name of ['fullscreenchange', 'fullscreenerror']) for (const target of [Element.prototype, Document.prototype]) handler(target, name);
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
-  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
   // WARNING: bundled pages set the running classic `<script>` here, see `$appsClassic` in the bundler.
   globalThis.__appsScript = node => { currentScript = node ?? null; };
@@ -2427,7 +2628,74 @@
     removeListener(callback) { this.removeEventListener('change', callback); }
   }
   Object.assign(globalThis, { MediaQueryList, MediaQueryListEvent, matchMedia: query => new MediaQueryList(query) });
-  globalThis.__appsLayout = () => { for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
+  // A `<webview>` shows through a native view that main keeps over its box, so its bounds follow the layout of each frame.
+  const webviewRefs = new Set(), attachedWebviews = new Map(), webviewReplies = new Map();
+  let nextWebviewReply = 0;
+  const webviewCall = (guest, data) => call('dom.open', 'webview', 'call', guest, data);
+  class HTMLWebViewElement extends HTMLElement {
+    _guest = null; _bounds = ''; _src = null;
+    constructor(...args) { super(...args); webviewRefs.add(new WeakRef(this)); host('dom.requestFrame'); }
+    #call(method, ...args) { return this._guest === null ? null : webviewCall(this._guest, { method, args }); }
+    #promise(method, ...args) {
+      if (this._guest === null) return Promise.reject(new Error('The WebView must be attached to the DOM'));
+      return new Promise((resolve, reject) => { const reply = ++nextWebviewReply; webviewReplies.set(reply, [resolve, reject]); webviewCall(this._guest, { method, args, reply }); });
+    }
+    get src() { return this.getAttribute('src') ?? ''; }
+    set src(value) { this.setAttribute('src', value); }
+    get partition() { return this.getAttribute('partition') ?? ''; }
+    set partition(value) { this.setAttribute('partition', value); }
+    getWebContentsId() { if (this._guest === null) throw new Error('The WebView must be attached to the DOM'); return this._guest; }
+    loadURL(url) { return this.#promise('loadURL', String(url)); }
+    getURL() { return this.#call('getURL') ?? ''; }
+    getTitle() { return this.#call('getTitle') ?? ''; }
+    isLoading() { return !!this.#call('isLoading'); }
+    isLoadingMainFrame() { return !!this.#call('isLoading'); }
+    canGoBack() { return !!this.#call('canGoBack'); }
+    canGoForward() { return !!this.#call('canGoForward'); }
+    goBack() { this.#call('goBack'); }
+    goForward() { this.#call('goForward'); }
+    reload() { this.#call('reload'); }
+    reloadIgnoringCache() { this.#call('reload'); }
+    stop() { this.#call('stop'); }
+    focus() { this.#call('focus'); }
+    openDevTools() { this.#call('openDevTools'); }
+    closeDevTools() {}
+    isDevToolsOpened() { return false; }
+    setZoomFactor(value) { this.#call('setZoomFactor', value); }
+    getZoomFactor() { return this.#call('getZoomFactor') ?? 1; }
+    setZoomLevel(value) { this.#call('setZoomLevel', value); }
+    getZoomLevel() { return this.#call('getZoomLevel') ?? 0; }
+    executeJavaScript(code) { return this.#promise('executeJavaScript', String(code)); }
+    insertCSS(css) { return this.#promise('insertCSS', String(css)); }
+    getUserAgent() { return this.#call('getUserAgent') ?? navigator.userAgent; }
+  }
+  globalThis.HTMLWebViewElement = HTMLWebViewElement;
+  htmlTypes.set('webview', HTMLWebViewElement);
+  const syncWebviews = () => {
+    if (webviewScan) { webviewScan = false; document.querySelectorAll('webview'); }
+    for (const ref of webviewRefs) {
+      const view = ref.deref();
+      if (!view) { webviewRefs.delete(ref); continue; }
+      if (!view.isConnected) {
+        if (view._guest !== null) { attachedWebviews.delete(view._guest); call('dom.open', 'webview', 'detach', view._guest, null); view._guest = null; view._bounds = ''; }
+        continue;
+      }
+      const src = view.getAttribute('src');
+      if (view._guest === null) {
+        const guest = call('dom.open', 'webview', 'attach', null, { src: src ?? '', partition: view.partition });
+        if (guest === null) { webviewRefs.delete(ref); continue; }
+        view._guest = guest; view._src = src;
+        attachedWebviews.set(guest, view);
+        view.dispatchEvent(new Event('did-attach'));
+      } else if (src !== view._src) { view._src = src; if (src) view.loadURL(src).catch(() => {}); }
+      const rect = view.getBoundingClientRect(), bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
+      const visible = bounds.width > 0 && bounds.height > 0 && getComputedStyle(view).visibility !== 'hidden', key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${visible}`;
+      if (key !== view._bounds) { view._bounds = key; call('dom.open', 'webview', 'bounds', view._guest, { bounds, visible }); }
+    }
+  };
+  globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
+  globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
+  globalThis.__appsLayout = () => { syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -2635,7 +2903,45 @@
     }
     return data.getData('text/plain');
   };
-  globalThis.__appsDrop=(files,x,y)=>{const data=new DataTransfer();for(const value of files){const file=new File([new Uint8Array(value.bytes)],value.name,{lastModified:value.lastModified,type:({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf'})[value.name.split('.').at(-1).toLowerCase()]??'application/octet-stream'});droppedFiles.set(file,value.file);data.items.add(file);}const target=document.elementFromPoint(x,y)??document.body;dispatch(target,trusted(new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,dataTransfer:data})));};
+  const fileType=name=>({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf','html':'text/html','htm':'text/html','css':'text/css','js':'text/javascript','csv':'text/csv','xml':'text/xml','zip':'application/zip','mp3':'audio/mpeg','wav':'audio/wav','mp4':'video/mp4','webm':'video/webm'})[name.split('.').at(-1).toLowerCase()]??'application/octet-stream';
+  const picks=new Map();let nextPick=0;
+  // Like browsers, only user input opens the file panel, so a page can't open it by itself.
+  pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
+  globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.from(atob(data),char=>char.charCodeAt(0))],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
+  // WARNING: the clipboard answers only while a page script runs from the app's event loop, and it holds text only.
+  class ClipboardItem {
+    constructor(items) { this._items = { ...items }; this.types = Object.keys(this._items); this.presentationStyle = 'unspecified'; }
+    async getType(type) { if (!(type in this._items)) throw new DOMException('The type was not found', 'NotFoundError'); const value = await this._items[type]; return value instanceof Blob ? value : new Blob([value], { type }); }
+    static supports(type) { return type === 'text/plain'; }
+  }
+  const clipboardText = text => { const result = call('dom.clipboard', ...(text === undefined ? [] : [text])); if (result === null) throw new DOMException('The clipboard needs user input', 'NotAllowedError'); return result; };
+  class Clipboard extends EventTarget {
+    async writeText(text) { clipboardText(String(text)); }
+    async readText() { return clipboardText(); }
+    write(items) { const item = items[0]; if (!item?.types.includes('text/plain')) return Promise.reject(new DOMException('Only text can be written to the clipboard', 'NotAllowedError')); return item.getType('text/plain').then(value => value.text()).then(text => { clipboardText(text); }); }
+    async read() { const text = clipboardText(); return [new ClipboardItem({ 'text/plain': new Blob([text], { type: 'text/plain' }) })]; }
+  }
+  Object.defineProperty(navigator, 'clipboard', { value: new Clipboard(), configurable: true, enumerable: true });
+  globalThis.ClipboardItem = ClipboardItem; globalThis.Clipboard = Clipboard;
+  // Files dragged from other apps. As in browsers, they can be read only in `drop`, which fires only if the last `dragover` was canceled.
+  let dragTarget = null, dragData = null, dragAccepted = false;
+  const dragEvent = (type, target, x, y, relatedTarget = null, dataTransfer = dragData) => { const event = trusted(new DragEvent(type, { bubbles: true, cancelable: type !== 'dragleave', composed: true, clientX: x, clientY: y, relatedTarget, dataTransfer })); dispatch(target, event); return event; };
+  globalThis.__appsDrag = (kind, x, y, names) => {
+    if (kind === 'leave') { if (dragTarget) dragEvent('dragleave', dragTarget, x, y); dragTarget = dragData = null; return; }
+    if (kind === 'enter') { dragData = new DataTransfer(); for (const name of names) dragData.items.push({ kind: 'file', type: fileType(name), getAsFile: () => null, getAsString: () => {}, webkitGetAsEntry: () => null }); dragTarget = null; }
+    if (!dragData) return;
+    const target = document.elementFromPoint(x, y) ?? document.body;
+    if (target !== dragTarget) { const previous = dragTarget; dragEvent('dragenter', target, x, y, previous); if (previous) dragEvent('dragleave', previous, x, y, target); dragTarget = target; }
+    dragAccepted = dragEvent('dragover', dragTarget, x, y).defaultPrevented;
+  };
+  globalThis.__appsDrop = (files, x, y) => {
+    const target = document.elementFromPoint(x, y) ?? document.body, previous = dragTarget, accepted = dragAccepted;
+    dragTarget = dragData = null; dragAccepted = false;
+    if (!accepted) { if (previous) dragEvent('dragleave', previous, x, y, null, new DataTransfer()); return; }
+    const data = new DataTransfer();
+    for (const value of files) { const file = new File([new Uint8Array(value.bytes)], value.name, { lastModified: value.lastModified, type: value.directory ? '' : fileType(value.name) }); droppedFiles.set(file, value.file); if (value.directory) droppedDirectories.add(file); data.items.add(file); }
+    dragEvent('drop', target, x, y, null, data);
+  };
   const nativeKeys = { backspace:'Backspace', delete:'Delete', enter:'Enter', escape:'Escape', tab:'Tab', left:'ArrowLeft', right:'ArrowRight', up:'ArrowUp', down:'ArrowDown', home:'Home', end:'End', pageup:'PageUp', pagedown:'PageDown', insert:'Insert', space:' ', shift:'Shift', control:'Control', ctrl:'Control', alt:'Alt', command:'Meta', super:'Meta' };
   const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91 };
   let modifiers = {}, graphemes, words;
@@ -2848,7 +3154,11 @@
     }
     // WARNING: like browsers, a slider moves after the page's mouse listeners and sends `change` when the press ends.
     if (sliding && name !== 'pointerdown') { slide(sliding[0], data.clientX); if (ended) { if (sliding[0].value !== sliding[1]) dispatch(sliding[0], trusted(new Event('change', { bubbles: true }))); sliding = null; } }
-    if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac'))) dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })));
+    if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac')) && dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })))) {
+      // WARNING: like Chromium, the main side's `context-menu` comes only when the page didn't cancel the DOM event.
+      const element = target.nodeType === 1 ? target : target.parentElement, link = element?.closest?.('a[href]'), media = element?.closest?.('img,video,audio,canvas'), field = element?.closest?.('input,textarea,[contenteditable=""],[contenteditable="true"]'), selected = String(getSelection?.() ?? ''), kind = media?.localName;
+      host('dom.contextMenu', { x: data.clientX, y: data.clientY, linkURL: link?.href ?? '', linkText: link?.textContent ?? '', pageURL: location.href, frameURL: location.href, srcURL: media?.currentSrc ?? media?.src ?? '', mediaType: kind === 'img' ? 'image' : kind ?? 'none', hasImageContents: kind === 'img', isEditable: !!field, selectionText: selected, titleText: element?.title ?? '', altText: media?.alt ?? '', misspelledWord: '', dictionarySuggestions: [], selectionRect: { x: 0, y: 0, width: 0, height: 0 }, frameCharset: 'UTF-8', formControlType: field?.localName === 'input' ? field.type : 'none', spellcheckEnabled: false, menuSourceType: 'mouse', mediaFlags: {}, editFlags: { canUndo: !!field, canRedo: !!field, canCut: !!field && !!selected, canCopy: !!selected, canPaste: !!field, canDelete: !!field && !!selected, canSelectAll: true, canEditRichly: false } });
+    }
     if (name === 'pointermove' && result && selectionDrag && (selectionDrag.x !== data.clientX || selectionDrag.y !== data.clientY)) {
       const { host, node, offset, endNode, endOffset, granularity } = selectionDrag;
       selectionDrag.x = data.clientX; selectionDrag.y = data.clientY;

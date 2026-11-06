@@ -17,13 +17,16 @@ enum Event {
     Data(&'static str, Vec<u8>),
     End(&'static str),
     Error(&'static str, io::Error),
-    Written(usize),
+    Written(&'static str, usize),
+    Finish(&'static str),
     Exit,
 }
 
 struct Process {
     child: Child,
     input: Option<Sender<Option<Vec<u8>>>>,
+    /// Write queues of the extra stdio pipes, like `fd3`.
+    extra: Vec<(&'static str, Sender<Option<Vec<u8>>>)>,
     events: Receiver<Event>,
     /// Output readers with their state: flowing, `PAUSED` or `CLOSED`.
     readers: Vec<(&'static str, Arc<AtomicU8>, std::thread::Thread)>,
@@ -49,6 +52,7 @@ impl Process {
         }
         self.status = Some(status);
         self.input.take();
+        self.extra.clear();
     }
 
     fn code(&self) -> Option<i32> {
@@ -64,6 +68,7 @@ const CLOSED: u8 = 2;
 impl Drop for Process {
     fn drop(&mut self) {
         self.input.take();
+        self.extra.clear();
         for (_, state, reader) in &self.readers {
             state.store(CLOSED, Ordering::Release);
             reader.unpark();
@@ -198,6 +203,8 @@ impl State {
                 let arguments: Vec<String> = serde_json::from_value(args[1].clone())?;
                 let options = &args[2];
                 let mut builder = Command::new(command);
+                #[cfg(unix)]
+                let mut builder_ends = Vec::new();
                 builder.args(&arguments);
                 #[cfg(unix)]
                 if options["detached"] == true {
@@ -258,6 +265,57 @@ impl State {
                         _ => builder.stderr(stdio),
                     };
                 }
+                // WARNING: child ends are raised above the fds they become, so one `dup2` can't overwrite another end.
+                #[cfg(unix)]
+                let mut pipes = Vec::new();
+                #[cfg(unix)]
+                {
+                    use std::os::{
+                        fd::{AsRawFd, FromRawFd, OwnedFd},
+                        unix::{net::UnixStream, process::CommandExt},
+                    };
+                    let mut ends = Vec::new();
+                    for (index, kind) in options["stdio"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .skip(3)
+                    {
+                        if kind == "pipe" {
+                            let (parent, child) = UnixStream::pair()?;
+                            let raised = unsafe {
+                                libc::fcntl(
+                                    child.as_raw_fd(),
+                                    libc::F_DUPFD_CLOEXEC,
+                                    64 + index as i32,
+                                )
+                            };
+                            ensure!(raised >= 0, "Cannot create a stdio pipe");
+                            ends.push((index as i32, unsafe { OwnedFd::from_raw_fd(raised) }));
+                            pipes
+                                .push((&*Box::leak(format!("fd{index}").into_boxed_str()), parent));
+                        }
+                    }
+                    if !ends.is_empty() {
+                        let targets: Vec<_> = ends
+                            .iter()
+                            .map(|(index, end)| (*index, end.as_raw_fd()))
+                            .collect();
+                        unsafe {
+                            builder.pre_exec(move || {
+                                for &(target, end) in &targets {
+                                    if libc::dup2(end, target) < 0 {
+                                        return Err(io::Error::last_os_error());
+                                    }
+                                }
+                                Ok(())
+                            });
+                        }
+                        // The child ends stay open until `spawn` below, then close in this process.
+                        builder_ends = ends;
+                    }
+                }
                 let wake = Waker::current();
                 let child = match builder.spawn() {
                     Ok(child) => child,
@@ -266,11 +324,14 @@ impl State {
                         return Ok(json!({"error": error_value(&error)}));
                     }
                 };
+                #[cfg(unix)]
+                drop(std::mem::take(&mut builder_ends));
                 // WARNING: Small queues and batches keep paused output near the stream high water mark.
                 let (sender, receiver) = mpsc::sync_channel(8);
                 let mut process = Process {
                     child,
                     input: None,
+                    extra: Vec::new(),
                     events: receiver,
                     readers: Vec::new(),
                     status: None,
@@ -280,7 +341,8 @@ impl State {
                     detached: options["detached"] == true,
                     unreferenced: false,
                 };
-                let outputs: [(&str, Option<Box<dyn Read + Send>>); 2] = [
+                #[allow(unused_mut)]
+                let mut outputs: Vec<(&'static str, Option<Box<dyn Read + Send>>)> = vec![
                     (
                         "stdout",
                         process
@@ -298,6 +360,33 @@ impl State {
                             .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
                     ),
                 ];
+                #[cfg(unix)]
+                for (name, pipe) in pipes {
+                    let mut writer = pipe.try_clone()?;
+                    outputs.push((name, Some(Box::new(pipe))));
+                    let (input, writes) = mpsc::channel::<Option<Vec<u8>>>();
+                    process.extra.push((name, input));
+                    process.open_streams += 1;
+                    let (sender, wake) = (sender.clone(), wake.clone());
+                    std::thread::Builder::new()
+                        .name(format!("apps-{name}"))
+                        .spawn(move || {
+                            while let Ok(Some(bytes)) = writes.recv() {
+                                if let Err(error) = writer.write_all(&bytes) {
+                                    let _ = sender.send(Event::Error(name, error));
+                                    break;
+                                }
+                                if sender.send(Event::Written(name, bytes.len())).is_err() {
+                                    return;
+                                }
+                                wake.wake();
+                            }
+                            let _ = writer.shutdown(std::net::Shutdown::Write);
+                            if sender.send(Event::Finish(name)).is_ok() {
+                                wake.wake();
+                            }
+                        })?;
+                }
                 for (name, pipe) in outputs {
                     if let Some(mut pipe) = pipe {
                         process.open_streams += 1;
@@ -373,7 +462,7 @@ impl State {
                                     let _ = sender.send(Event::Error("stdin", error));
                                     break;
                                 }
-                                if sender.send(Event::Written(bytes.len())).is_err() {
+                                if sender.send(Event::Written("stdin", bytes.len())).is_err() {
                                     return;
                                 }
                                 wake.wake();
@@ -422,7 +511,11 @@ impl State {
                         events.push(match event {
                             Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
-                            Event::Written(bytes) => json!({"id": id, "event": "written", "bytes": bytes}),
+                            Event::Written(stream, bytes) => json!({"id": id, "event": "written", "stream": stream, "bytes": bytes}),
+                            Event::Finish(stream) => {
+                                process.open_streams -= 1;
+                                json!({"id": id, "event": "finish", "stream": stream})
+                            }
                             Event::End(stream) => {
                                 process.open_streams -= 1;
                                 json!({"id": id, "event": if stream == "stdin" { "finish" } else { "end" }, "stream": stream})
@@ -451,6 +544,21 @@ impl State {
                     .children
                     .get_mut(&args[0].as_u64().context("Expected child ID")?)
                     .context("Child process is closed")?;
+                let name = if op == "end" { &args[1] } else { &args[2] };
+                if let Some(name) = name.as_str() {
+                    let index = process
+                        .extra
+                        .iter()
+                        .position(|(stream, _)| *stream == name)
+                        .context("Child stream is closed")?;
+                    if op == "end" {
+                        process.extra.remove(index).1.send(None)?;
+                        return Ok(Value::Null);
+                    }
+                    let bytes = crate::node::bytes(&args[1])?;
+                    process.extra[index].1.send(Some(bytes.to_vec()))?;
+                    return Ok(json!(bytes.len()));
+                }
                 let input = process.input.as_ref().context("Child stdin is closed")?;
                 if op == "end" {
                     input.send(None)?;

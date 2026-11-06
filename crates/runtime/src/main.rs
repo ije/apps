@@ -17,6 +17,27 @@ fn main() {
         }
         // A built app passes all of its arguments to process.argv. Otherwise the arguments after `--` go there.
         let packaged = home.join("app.bundle").is_file() || home.join("app.js").is_file();
+        // WARNING: like Electron, these flags come before the script and are not arguments of it.
+        if std::env::var_os("ELECTRON_RUN_AS_NODE")
+            .is_some_and(|value| !value.is_empty() && value != "0")
+        {
+            let mut args = std::env::args().peekable();
+            let mut argv = vec![args.next().unwrap_or_default()];
+            while let Some(arg) = args.next_if(|arg| arg.starts_with('-')) {
+                if arg == "--require" || arg == "-r" {
+                    args.next();
+                }
+            }
+            argv.extend(args);
+            let bundle = match std::env::var_os("APPS_DEV_BUNDLE") {
+                Some(path) => serde_json::from_reader(std::io::BufReader::new(
+                    std::fs::File::open(path).context("Cannot read the app bundle")?,
+                ))
+                .context("Cannot read the app bundle")?,
+                None => apps_runtime::bundle::read(&home)?,
+            };
+            return apps_runtime::node::script::run(bundle, argv);
+        }
         for os in std::env::args_os().skip(1).filter(|_| !packaged) {
             let arg = os.to_string_lossy();
             if arg == "--" {

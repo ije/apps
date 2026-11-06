@@ -60,6 +60,10 @@ struct Shared {
     aliases: Option<(PathBuf, Vec<String>)>,
     preload: Option<PathBuf>,
     loaders: Option<Rc<Loaders>>,
+    /// `env` in package.json, which `import.meta.env` adds to its build values.
+    env: Value,
+    /// Modules that start a process, where `import.meta.main` is true.
+    process_entries: RefCell<BTreeSet<PathBuf>>,
 }
 
 /// The package.json `loaders`, as file name suffixes and module specifiers, running in one main engine.
@@ -126,6 +130,8 @@ struct Linker<'a, 'b> {
     imported: Vec<usize>,
     required: Vec<usize>,
     resolved: serde_json::Map<String, Value>,
+    /// Bindings of `createRequire(import.meta.url)`, whose calls with a string literal bundle like `require()`.
+    requires: Vec<oxc_semantic::SymbolId>,
     error: Option<anyhow::Error>,
 }
 
@@ -157,6 +163,12 @@ const ELECTRON: &[&str] = &[
     "systemPreferences",
     "webUtils",
     "net",
+    "nativeImage",
+    "protocol",
+    "webFrame",
+    "autoUpdater",
+    "desktopCapturer",
+    "ClipboardItem",
 ];
 
 /// `$appsN<module>.<name>`: how linked module code reads an import, so it needs no `with` scope.
@@ -363,6 +375,23 @@ impl<'a> Linker<'a, '_> {
 }
 
 impl<'a> VisitMut<'a> for Linker<'a, '_> {
+    fn visit_variable_declarator(&mut self, declarator: &mut VariableDeclarator<'a>) {
+        if let (BindingPattern::BindingIdentifier(name), Some(Expression::CallExpression(call))) =
+            (&declarator.id, declarator.init.as_ref())
+            && self.builder.realm != Realm::Renderer
+            && match call.callee.get_inner_expression() {
+                Expression::Identifier(callee) => callee.name == "createRequire",
+                Expression::StaticMemberExpression(callee) => {
+                    callee.property.name == "createRequire"
+                }
+                _ => false,
+            }
+        {
+            self.requires.push(name.symbol_id());
+        }
+        walk_mut::walk_variable_declarator(self, declarator);
+    }
+
     fn visit_expression(&mut self, expression: &mut Expression<'a>) {
         if self.error.is_some() {
             return;
@@ -388,34 +417,10 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     specifier.starts_with('.'),
                     "Worker URL must be a relative path"
                 );
-                let key = (
-                    resolve_file(&self.path.parent().unwrap_or(Path::new(".")).join(specifier))?,
-                    if self.builder.realm == Realm::Renderer {
-                        Realm::Renderer
-                    } else {
-                        Realm::Main
-                    },
-                );
+                let path =
+                    resolve_file(&self.path.parent().unwrap_or(Path::new(".")).join(specifier))?;
                 self.cacheable = false;
-                let shared = self.builder.shared.clone();
-                let existing = shared.workers.borrow().get(&key).copied();
-                let index = match existing {
-                    Some(index) => index,
-                    None => {
-                        let index = shared.scripts.borrow().len();
-                        shared.scripts.borrow_mut().push(String::new());
-                        shared.workers.borrow_mut().insert(key.clone(), index);
-                        let files = bundle(
-                            vec![(key.0, None)],
-                            key.1,
-                            self.builder.files.clone(),
-                            shared.clone(),
-                            self.builder.production,
-                        )?;
-                        shared.scripts.borrow_mut()[index] = script_source(&files, true);
-                        index
-                    }
-                };
+                let index = self.builder.script_chunk(path)?;
                 let value = self
                     .allocator
                     .alloc_str(&format!("apps:///script-{index}.js"));
@@ -447,6 +452,45 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 url.arguments[0] =
                     Expression::new_string_literal(specifier.span, value, None, &self.ast).into();
             }
+            // WARNING: apps often compile ESM to CommonJS, so ESM here also has these two as `import.meta` values.
+            if !self.commonjs
+                && let Expression::Identifier(name) = expression
+                && matches!(name.name.as_str(), "__dirname" | "__filename")
+                && self.builder.realm == Realm::Main
+                && self
+                    .scoping
+                    .get_reference(name.reference_id())
+                    .symbol_id()
+                    .is_none()
+            {
+                let code = if name.name == "__dirname" {
+                    "import.meta.dirname"
+                } else {
+                    "import.meta.filename"
+                };
+                *expression = Parser::new(self.allocator, code, SourceType::mjs())
+                    .parse_expression()
+                    .map_err(|_| anyhow::anyhow!("Cannot rewrite {code}"))?;
+                self.visit_expression(expression);
+                return Ok(());
+            }
+            if let Expression::StaticMemberExpression(member) = expression
+                && member.property.name == "main"
+                && matches!(
+                    member.object.get_inner_expression(),
+                    Expression::ImportMeta(_)
+                )
+            {
+                self.cacheable = false;
+                let main = self
+                    .builder
+                    .shared
+                    .process_entries
+                    .borrow()
+                    .contains(self.path);
+                *expression = Expression::new_boolean_literal(span, main, &self.ast);
+                return Ok(());
+            }
             if let Expression::StaticMemberExpression(member) = expression {
                 if member.property.name == "NODE_ENV"
                     && let Expression::StaticMemberExpression(env) =
@@ -470,6 +514,28 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                         None,
                         &self.ast,
                     );
+                    return Ok(());
+                }
+                if let Expression::StaticMemberExpression(env) =
+                    member.object.get_inner_expression()
+                    && env.property.name == "env"
+                    && matches!(env.object.get_inner_expression(), Expression::ImportMeta(_))
+                {
+                    let code = self.builder.meta_env()[member.property.name.as_str()].to_string();
+                    let code = if code == "null" {
+                        "void 0".to_owned()
+                    } else {
+                        code
+                    };
+                    *expression = Parser::new(
+                        self.allocator,
+                        self.allocator.alloc_str(&code),
+                        SourceType::mjs(),
+                    )
+                    .parse_expression()
+                    .map_err(|_| {
+                        anyhow::anyhow!("Cannot rewrite import.meta in {}", self.path.display())
+                    })?;
                     return Ok(());
                 }
                 if matches!(
@@ -573,18 +639,85 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     (specifier.starts_with('.') || Path::new(specifier).is_absolute())
                         && !specifier.contains("://")
                         && !specifier.starts_with("//"),
-                    "import.meta.resolve needs a local HTML path"
+                    "import.meta.resolve needs a local path"
                 );
                 let target = self.path.parent().unwrap_or(Path::new(".")).join(specifier);
-                ensure!(
-                    target.extension().is_some_and(|e| e == "html"),
-                    "import.meta.resolve only supports HTML files"
-                );
+                // WARNING: a script becomes a chunk that `ELECTRON_RUN_AS_NODE` can run in a child process.
+                if !target.extension().is_some_and(|e| e == "html") {
+                    let target = target
+                        .canonicalize()
+                        .with_context(|| format!("Cannot resolve {}", target.display()))?;
+                    self.cacheable = false;
+                    self.builder
+                        .shared
+                        .process_entries
+                        .borrow_mut()
+                        .insert(target.clone());
+                    let index = self.builder.script_chunk(target)?;
+                    let value = self
+                        .allocator
+                        .alloc_str(&format!("apps:///script-{index}.js"));
+                    *expression = Expression::new_string_literal(span, value, None, &self.ast);
+                    return Ok(());
+                }
                 let target = target
                     .canonicalize()
                     .with_context(|| format!("Cannot resolve {}", target.display()))?;
                 let value = self.page(target)?;
                 *expression = Expression::new_string_literal(span, value, None, &self.ast);
+                return Ok(());
+            }
+            // WARNING: only the eager `?url` form that Vite apps use for assets. It reads the folder of each pattern at build time.
+            if let Expression::CallExpression(call) = expression
+                && let Expression::StaticMemberExpression(member) =
+                    call.callee.get_inner_expression()
+                && matches!(
+                    member.object.get_inner_expression(),
+                    Expression::ImportMeta(_)
+                )
+                && member.property.name == "glob"
+            {
+                let Some(Argument::StringLiteral(pattern)) = call.arguments.first() else {
+                    bail!(
+                        "import.meta.glob needs one string literal in {}",
+                        self.path.display()
+                    );
+                };
+                let base = self.path.parent().unwrap_or(Path::new(".")).to_owned();
+                let mut urls = serde_json::Map::new();
+                let pattern = pattern
+                    .value
+                    .as_str()
+                    .context("Invalid import.meta.glob pattern")?;
+                for pattern in expand_braces(pattern) {
+                    let (folder, name) = pattern.rsplit_once('/').unwrap_or((".", &pattern));
+                    let Ok(entries) = fs::read_dir(base.join(folder)) else {
+                        continue;
+                    };
+                    let mut names: Vec<_> = entries
+                        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                        .filter(|file| glob(name.as_bytes(), file.as_bytes()))
+                        .collect();
+                    names.sort();
+                    for file in names {
+                        let key = format!("{folder}/{file}");
+                        let path = base.join(&key).canonicalize()?;
+                        if let Some(url) = self.builder.url_of(&path)? {
+                            urls.insert(key, url.into());
+                        }
+                    }
+                }
+                self.cacheable = false;
+                let code = format!("({})", Value::Object(urls));
+                *expression = Parser::new(
+                    self.allocator,
+                    self.allocator.alloc_str(&code),
+                    SourceType::mjs(),
+                )
+                .parse_expression()
+                .map_err(|_| {
+                    anyhow::anyhow!("Cannot rewrite import.meta.glob in {}", self.path.display())
+                })?;
                 return Ok(());
             }
             if self.commonjs
@@ -650,14 +783,54 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             } else {
                                 "jsExecute or httpImport"
                             };
+                            let enabled = shared.enabled("jsExecute")
+                                || (!data && shared.enabled("httpImport"));
+                            // WARNING: packages often keep such an import for a path that the app never takes, so there it fails when it runs.
+                            if !enabled
+                                && self
+                                    .path
+                                    .components()
+                                    .any(|part| part.as_os_str() == "node_modules")
+                            {
+                                let code = format!(
+                                    "Promise.reject(new Error({}))",
+                                    json!(format!(
+                                        "import() without a string literal needs the {feature} feature"
+                                    ))
+                                );
+                                *expression = Parser::new(
+                                    self.allocator,
+                                    self.allocator.alloc_str(&code),
+                                    SourceType::mjs(),
+                                )
+                                .parse_expression()
+                                .map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "Cannot rewrite import() in {}",
+                                        self.path.display()
+                                    )
+                                })?;
+                                return Ok(());
+                            }
                             ensure!(
-                                shared.enabled("jsExecute")
-                                    || (!data && shared.enabled("httpImport")),
+                                enabled,
                                 "import() of a data: URL or without a string literal needs the {feature} feature in {}",
                                 self.path.display()
                             );
                             None
                         }
+                    }
+                }
+                Expression::CallExpression(call)
+                    if matches!(call.callee.get_inner_expression(), Expression::Identifier(callee)
+                        if self.scoping.get_reference(callee.reference_id()).symbol_id().is_some_and(|symbol| self.requires.contains(&symbol))) =>
+                {
+                    match call.arguments.as_slice() {
+                        [Argument::StringLiteral(specifier)] => specifier
+                            .value
+                            .as_str()
+                            .map(|specifier| ("$appsRequire", specifier)),
+                        _ => None,
                     }
                 }
                 Expression::CallExpression(call) if call.callee.is_specific_id("require") => {
@@ -687,10 +860,20 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                         }
                     }
                 }
-                Expression::ImportMeta(_) => bail!(
-                    "Use import.meta.resolve with one string literal or import.meta.url in {}",
-                    self.path.display()
-                ),
+                // WARNING: `url`, `filename`, `dirname` and `resolve` are static above, so other reads see only `env`.
+                Expression::ImportMeta(_) => {
+                    let code = format!("({{env:{}}})", self.builder.meta_env());
+                    *expression = Parser::new(
+                        self.allocator,
+                        self.allocator.alloc_str(&code),
+                        SourceType::mjs(),
+                    )
+                    .parse_expression()
+                    .map_err(|_| {
+                        anyhow::anyhow!("Cannot rewrite import.meta in {}", self.path.display())
+                    })?;
+                    return Ok(());
+                }
                 _ => None,
             };
             if let Some((name, specifier)) = import {
@@ -748,6 +931,66 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
 }
 
 impl Builder {
+    /// Bundles a script for a worker or child process and returns its chunk number.
+    fn script_chunk(&mut self, path: PathBuf) -> Result<usize> {
+        let realm = if self.realm == Realm::Renderer {
+            Realm::Renderer
+        } else {
+            Realm::Main
+        };
+        let key = (path, realm);
+        let shared = self.shared.clone();
+        if let Some(index) = shared.workers.borrow().get(&key).copied() {
+            return Ok(index);
+        }
+        let index = shared.scripts.borrow().len();
+        shared.scripts.borrow_mut().push(String::new());
+        shared.workers.borrow_mut().insert(key.clone(), index);
+        let files = bundle(
+            vec![(key.0, None)],
+            key.1,
+            self.files.clone(),
+            shared.clone(),
+            self.production,
+        )?;
+        shared.scripts.borrow_mut()[index] = script_source(&files, true);
+        Ok(index)
+    }
+
+    /// The URL of a file that a `?url` import asks for: a chunk for scripts, or a bundled asset. Other files have none.
+    fn url_of(&mut self, path: &Path) -> Result<Option<String>> {
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("js" | "mjs" | "cjs" | "ts")
+        ) {
+            let index = self.script_chunk(path.to_owned())?;
+            return Ok(Some(format!("apps:///script-{index}.js")));
+        }
+        let Some(name) = asset_name(&self.shared.root, path) else {
+            return Ok(None);
+        };
+        self.files.borrow_mut().insert(path.to_owned());
+        Ok(Some(format!("apps:///{name}")))
+    }
+
+    fn meta_env(&self) -> Value {
+        let mut env = json!({
+            "MODE": if self.production { "production" } else { "development" },
+            "DEV": !self.production,
+            "PROD": self.production,
+            "SSR": false,
+            "BASE_URL": "/",
+        });
+        if let (Some(env), Some(values)) = (env.as_object_mut(), self.shared.env.as_object()) {
+            env.extend(
+                values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        env
+    }
+
     fn resolve(&mut self, base: &Path, specifier: &str, require: bool) -> Result<usize> {
         let (path, inline) = self.locate(base, specifier, require)?;
         self.visit(path, inline)
@@ -775,6 +1018,10 @@ impl Builder {
         let specifier = if matches!(
             specifier,
             "fs" | "fs/promises"
+                | "async_hooks"
+                | "diagnostics_channel"
+                | "tls"
+                | "v8"
                 | "path"
                 | "path/posix"
                 | "path/win32"
@@ -823,8 +1070,10 @@ impl Builder {
         } else {
             specifier
         };
-        if matches!(specifier, "@pierre/apps" | "electron" | "node-pty" | "ws")
-            || specifier.starts_with("node:")
+        if matches!(
+            specifier,
+            "@pierre/apps" | "electron" | "node-pty" | "ws" | "undici"
+        ) || specifier.starts_with("node:")
         {
             ensure!(
                 self.realm != Realm::Renderer,
@@ -842,6 +1091,24 @@ impl Builder {
             }
             let (object, names) = match specifier {
                 "@pierre/apps" | "electron" => ("globalThis.__apps", ELECTRON.to_vec()),
+                "undici" => (
+                    "globalThis.__apps.undici",
+                    vec![
+                        "Agent",
+                        "Dispatcher",
+                        "Pool",
+                        "Client",
+                        "request",
+                        "fetch",
+                        "getGlobalDispatcher",
+                        "setGlobalDispatcher",
+                        "Headers",
+                        "Request",
+                        "Response",
+                        "FormData",
+                        "WebSocket",
+                    ],
+                ),
                 "ws" => (
                     "globalThis.__apps.ws",
                     vec![
@@ -868,6 +1135,10 @@ impl Builder {
                         "isIP",
                         "isIPv4",
                         "isIPv6",
+                        "getDefaultAutoSelectFamily",
+                        "setDefaultAutoSelectFamily",
+                        "getDefaultAutoSelectFamilyAttemptTimeout",
+                        "setDefaultAutoSelectFamilyAttemptTimeout",
                     ],
                 ),
                 "node:https" => (
@@ -1146,6 +1417,23 @@ impl Builder {
                 "node:process" => (
                     "globalThis.__apps.process",
                     vec![
+                        "resourceUsage",
+                        "abort",
+                        "constrainedMemory",
+                        "availableMemory",
+                        "getActiveResourcesInfo",
+                        "features",
+                        "config",
+                        "allowedNodeEnvironmentFlags",
+                        "debugPort",
+                        "report",
+                        "sourceMapsEnabled",
+                        "setSourceMapsEnabled",
+                        "hasUncaughtExceptionCaptureCallback",
+                        "setUncaughtExceptionCaptureCallback",
+                        "loadEnvFile",
+                        "stdin",
+                        "getBuiltinModule",
                         "platform",
                         "arch",
                         "pid",
@@ -1673,6 +1961,69 @@ impl Builder {
                     ],
                 ),
                 "node:constants" => ("globalThis.__apps.constants", vec![]),
+                "node:async_hooks" => (
+                    "globalThis.__apps.async_hooks",
+                    vec![
+                        "AsyncLocalStorage",
+                        "AsyncResource",
+                        "createHook",
+                        "executionAsyncId",
+                        "triggerAsyncId",
+                        "executionAsyncResource",
+                    ],
+                ),
+                "node:diagnostics_channel" => (
+                    "globalThis.__apps.diagnostics_channel",
+                    vec![
+                        "Channel",
+                        "channel",
+                        "hasSubscribers",
+                        "subscribe",
+                        "unsubscribe",
+                        "tracingChannel",
+                    ],
+                ),
+                "node:v8" => (
+                    "globalThis.__apps.v8",
+                    vec![
+                        "getHeapStatistics",
+                        "getHeapSnapshot",
+                        "writeHeapSnapshot",
+                        "setFlagsFromString",
+                        "serialize",
+                        "deserialize",
+                    ],
+                ),
+                "node:sea" => (
+                    "globalThis.__apps.sea",
+                    vec![
+                        "isSea",
+                        "getAsset",
+                        "getAssetAsBlob",
+                        "getRawAsset",
+                        "getAssetKeys",
+                    ],
+                ),
+                "node:tls" => (
+                    "globalThis.__apps.tls",
+                    vec![
+                        "TLSSocket",
+                        "Server",
+                        "connect",
+                        "createServer",
+                        "createSecureContext",
+                        "rootCertificates",
+                        "getCACertificates",
+                        "setDefaultCACertificates",
+                        "getCiphers",
+                        "checkServerIdentity",
+                        "DEFAULT_MIN_VERSION",
+                        "DEFAULT_MAX_VERSION",
+                        "DEFAULT_ECDH_CURVE",
+                        "CLIENT_RENEG_LIMIT",
+                        "CLIENT_RENEG_WINDOW",
+                    ],
+                ),
                 _ => bail!("Unsupported built-in module: {specifier}"),
             };
             // WARNING: Node's require(esm) returns the 'module.exports' export, so CommonJS gets the module object itself.
@@ -1687,6 +2038,40 @@ impl Builder {
         }
         if let Some((path, source)) = remote(base, specifier, self.shared.enabled("httpImport"))? {
             return Ok((path, Some(source)));
+        }
+        // WARNING: `?url`, `?raw` and `?worker` work as in Vite. The query stays in the path, so the module is not the plain file.
+        if let Some((file, query)) = specifier.split_once('?') {
+            let kind = query.split('&').next().unwrap_or_default();
+            if matches!(kind, "url" | "raw" | "worker" | "sharedworker") {
+                let (path, _) = self.locate(base, file, require)?;
+                let source = match kind {
+                    "url" => {
+                        let url = self.url_of(&path)?.with_context(|| {
+                            format!("Cannot bundle {} as a URL", path.display())
+                        })?;
+                        format!("export default {};", json!(url))
+                    }
+                    "raw" => {
+                        self.files.borrow_mut().insert(path.clone());
+                        format!("export default {};", json!(fs::read_to_string(&path)?))
+                    }
+                    _ => format!(
+                        "export default function(options){{return new {}(new URL({},import.meta.url),options);}}",
+                        if kind == "worker" {
+                            "Worker"
+                        } else {
+                            "SharedWorker"
+                        },
+                        json!(format!(
+                            "./{}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ))
+                    ),
+                };
+                let mut name = path.into_os_string();
+                name.push(format!("?{kind}"));
+                return Ok((PathBuf::from(name), Some(source)));
+            }
         }
         let cache = self.shared.cache.clone();
         let resolution = (self.realm, base.to_owned(), specifier.to_owned(), require);
@@ -1734,10 +2119,21 @@ impl Builder {
             ensure!(components.len() >= count, "Invalid package name");
             let package = components[..count].join("/");
             let subpath = components[count..].join("/");
+            // WARNING: like Node, a package can import itself by name.
             (
                 base.ancestors()
                     .map(|p| p.join("node_modules").join(&package))
                     .find(|p| p.is_dir())
+                    .or_else(|| {
+                        let scope = base
+                            .ancestors()
+                            .find(|p| p.join("package.json").is_file())?;
+                        let manifest: Value = serde_json::from_str(
+                            &fs::read_to_string(scope.join("package.json")).ok()?,
+                        )
+                        .ok()?;
+                        (manifest["name"] == package.as_str()).then(|| scope.to_owned())
+                    })
                     .with_context(|| format!("Cannot resolve {specifier} from {}", base.display()))?
                     .canonicalize()?,
                 if subpath.is_empty() {
@@ -1857,15 +2253,22 @@ impl Builder {
                 (false, true) => &["main"],
                 (false, false) => &["main", "module"],
             };
+            // WARNING: like Vite, a field that names a missing file falls through to the next one.
             fields
                 .iter()
-                .find_map(|field| metadata.get(*field).and_then(Value::as_str))
+                .find_map(|field| {
+                    metadata
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .filter(|entry| resolve_file(&directory.join(entry)).is_ok())
+                })
                 .unwrap_or("index.js")
                 .to_owned()
         };
         let target = resolve_file(&directory.join(entry))?;
+        // WARNING: only package exports stay in their folder. An app's `imports` can name a symlinked package in node_modules.
         ensure!(
-            target.starts_with(&directory),
+            imports || target.starts_with(&directory),
             "Package export escapes its directory"
         );
         if let Some(cache) = cache {
@@ -2044,6 +2447,20 @@ impl Builder {
                         )?)?
                     )
                 }
+                // WARNING: like Vite, importing CSS applies it. Tailwind's `@import` stays for the runtime compiler.
+                "css" if self.realm == Realm::Renderer => {
+                    let text = json!(css(
+                        &path,
+                        None,
+                        &mut Vec::new(),
+                        &self.files,
+                        &self.shared
+                    )?);
+                    format!(
+                        "const sheet=document.createElement('style');sheet.textContent={text};document.head.append(sheet);export default {text};"
+                    )
+                }
+                "css" => "export default '';".to_owned(),
                 "json" => {
                     let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)
                         .with_context(|| format!("Invalid JSON in {}", path.display()))?;
@@ -2052,6 +2469,14 @@ impl Builder {
                         serde_json::to_string(&value.to_string())?
                     )
                 }
+                // WARNING: like Vite, importing an asset gives its URL.
+                _ if asset_name(&self.shared.root, &path).is_some() => format!(
+                    "export default {};",
+                    json!(format!(
+                        "apps:///{}",
+                        asset_name(&self.shared.root, &path).unwrap()
+                    ))
+                ),
                 "cjs" | "cts" if !dependency => bail!(
                     "CommonJS is only supported in npm packages: {}",
                     path.display()
@@ -2145,6 +2570,7 @@ impl Builder {
             cacheable: stamp.is_some() && !path.extension().is_some_and(|e| e == "html"),
             imported: Vec::new(),
             required: Vec::new(),
+            requires: Vec::new(),
             resolved: serde_json::Map::new(),
             error: None,
         };
@@ -2513,6 +2939,22 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
 }
 
 // WARNING: JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    match (pattern.find('{'), pattern.find('}')) {
+        (Some(open), Some(close)) if open < close => pattern[open + 1..close]
+            .split(',')
+            .flat_map(|part| {
+                expand_braces(&format!(
+                    "{}{part}{}",
+                    &pattern[..open],
+                    &pattern[close + 1..]
+                ))
+            })
+            .collect(),
+        _ => vec![pattern.to_owned()],
+    }
+}
+
 fn ascii_json(value: &Value) -> Result<String> {
     let json = serde_json::to_string(value)?;
     let mut result = String::with_capacity(json.len());
@@ -2667,10 +3109,15 @@ pub fn compile(
         aliases,
         preload,
         loaders,
+        env: metadata.get("env").cloned().unwrap_or_default(),
         root,
         cache,
         ..Shared::default()
     });
+    shared
+        .process_entries
+        .borrow_mut()
+        .extend(entry.canonicalize());
     let mut output = if rust {
         let mut output = BBTreeMap::new();
         let defaults = [json!("index.html")];
@@ -2915,7 +3362,7 @@ fn bundle(
                     .join(",");
                 let params = if module["linked"] == true {
                     let deps = module["deps"].as_array().into_iter().flatten();
-                    deps.fold(String::from(",$appsImport"), |params, dep| {
+                    deps.fold(String::from(",$appsImport,$appsRequire"), |params, dep| {
                         params + ",$appsN" + &dep.to_string()
                     })
                 } else {
@@ -3437,6 +3884,10 @@ fn asset_name(root: &Path, path: &Path) -> Option<String> {
             | "wav"
             | "flac"
             | "aac"
+            | "wasm"
+            | "glb"
+            | "bcmap"
+            | "pfb"
     ) {
         return None;
     }

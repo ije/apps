@@ -773,6 +773,11 @@ pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
     (value.abs() - 0.5).ceil().copysign(value)
 }
 
+/// Rounds midpoints up, like Chrome's `LayoutUnit::Round` that snaps boxes to device pixels.
+pub(crate) fn round_half_up(value: f32) -> f32 {
+    (value + 0.5).floor()
+}
+
 pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }

@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <pwd.h>
 
 uint32_t apps_theme_state(void);
 
@@ -152,7 +153,25 @@ static id AppsValue(const char *text) {
     return [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
 }
 
+static NSData *AppsSecretLookup(OSStatus *status);
+// WARNING: macOS asks to reset the keychain when it finds none, and a process with another HOME has none, so it gets no
+// secret store. The answer stays for the process, so availability checks never ask twice.
 static NSData *AppsSecret(OSStatus *status) {
+    static NSData *secret;
+    static OSStatus result;
+    static BOOL done;
+    if (!done) {
+        done = YES;
+        const char *home = getenv("HOME");
+        struct passwd *user = getpwuid(getuid());
+        if (home && user && strcmp(home, user->pw_dir) != 0) result = errSecNoDefaultKeychain;
+        else secret = AppsSecretLookup(&result);
+    }
+    *status = result;
+    return secret;
+}
+
+static NSData *AppsSecretLookup(OSStatus *status) {
     NSString *service = [NSBundle.mainBundle.bundleIdentifier ?: @"org.apps.runtime" stringByAppendingString:@".safe-storage"];
     NSDictionary *query = @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword, (__bridge id)kSecAttrService: service, (__bridge id)kSecAttrAccount: @"encryption-key", (__bridge id)kSecReturnData: @YES };
     CFTypeRef existing = NULL;
@@ -614,6 +633,10 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSPasteboard *board = [NSPasteboard generalPasteboard];
         [board clearContents];
         [board setString:args forType:[op hasSuffix:@"Text"] ? NSPasteboardTypeString : NSPasteboardTypeHTML];
+    } else if ([op isEqualToString:@"clipboard.writeImage"]) {
+        NSPasteboard *board = [NSPasteboard generalPasteboard];
+        [board clearContents];
+        [board setData:[[NSData alloc] initWithBase64EncodedString:args options:0] forType:NSPasteboardTypePNG];
     } else if ([op isEqualToString:@"clipboard.clear"]) [[NSPasteboard generalPasteboard] clearContents];
     else if ([op isEqualToString:@"shell.openExternal"]) {
         NSURL *url = [NSURL URLWithString:args];
@@ -696,7 +719,49 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         }];
         result = identifier;
     } else if ([op isEqualToString:@"notification.close"]) [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[args]];
-    else if ([op isEqualToString:@"screen.displays"]) {
+    else if ([op isEqualToString:@"image"]) {
+        NSString *kind = args[@"op"];
+        NSData *data = [kind isEqual:@"fileIcon"] ? [NSWorkspace.sharedWorkspace iconForFile:args[@"path"]].TIFFRepresentation : [[NSData alloc] initWithBase64EncodedString:args[@"data"] options:0];
+        size_t width = [args[@"width"] unsignedLongValue], height = [args[@"height"] unsignedLongValue];
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        CGImageRef image = NULL;
+        if ([kind isEqual:@"fromBitmap"]) {
+            CGContextRef context = data.length >= width * height * 4 ? CGBitmapContextCreate((void *)data.bytes, width, height, 8, width * 4, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+            if (context) { image = CGBitmapContextCreateImage(context); CGContextRelease(context); }
+        } else {
+            CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+            if (source) { image = CGImageSourceCreateImageAtIndex(source, 0, NULL); CFRelease(source); }
+        }
+        if (image && [kind isEqual:@"crop"]) {
+            CGImageRef cropped = CGImageCreateWithImageInRect(image, CGRectMake([args[@"x"] doubleValue], [args[@"y"] doubleValue], width, height));
+            CGImageRelease(image);
+            image = cropped;
+        } else if (image && ([kind isEqual:@"resize"] || [kind isEqual:@"bitmap"])) {
+            if ([kind isEqual:@"bitmap"]) { width = CGImageGetWidth(image); height = CGImageGetHeight(image); }
+            CGContextRef context = width && height ? CGBitmapContextCreate(NULL, width, height, 8, width * 4, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+            if (context) {
+                CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+                CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+                CGImageRelease(image);
+                image = CGBitmapContextCreateImage(context);
+                if ([kind isEqual:@"bitmap"]) result = @{ @"bytes": [[NSData dataWithBytes:CGBitmapContextGetData(context) length:width * height * 4] base64EncodedStringWithOptions:0] };
+                CGContextRelease(context);
+            }
+        }
+        CGColorSpaceRelease(space);
+        if (!image) return strdup("{\"error\":\"Cannot read the image\"}");
+        if (![kind isEqual:@"bitmap"]) {
+            NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:image];
+            NSData *encoded = [kind isEqual:@"jpeg"] ? [rep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{ NSImageCompressionFactor: @([args[@"quality"] doubleValue] / 100) }] : [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+            result = @{ @"png": [encoded base64EncodedStringWithOptions:0], @"width": @(CGImageGetWidth(image)), @"height": @(CGImageGetHeight(image)) };
+        }
+        CGImageRelease(image);
+    } else if ([op isEqualToString:@"app.protocolClient"]) {
+        NSURL *application = NSBundle.mainBundle.bundleURL;
+        if ([args[@"action"] isEqual:@"is"]) result = @([[NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:[NSURL URLWithString:[args[@"scheme"] stringByAppendingString:@"://x"]]] isEqual:application]);
+        else if ([application.pathExtension isEqual:@"app"]) { [NSWorkspace.sharedWorkspace setDefaultApplicationAtURL:application toOpenURLsWithScheme:args[@"scheme"] completionHandler:^(__unused NSError *error) {}]; result = @YES; }
+        else result = @NO;
+    } else if ([op isEqualToString:@"screen.displays"]) {
         NSMutableArray *displays = [NSMutableArray new];
         CGFloat top = NSMaxY(NSScreen.screens.firstObject.frame);
         NSDictionary *(^rect)(NSRect) = ^NSDictionary *(NSRect frame) { return @{ @"x": @(frame.origin.x), @"y": @(top - NSMaxY(frame)), @"width": @(frame.size.width), @"height": @(frame.size.height) }; };

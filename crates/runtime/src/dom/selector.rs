@@ -146,8 +146,7 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
 }
 
 /// Match results and their dependencies, by selector address, node, scope and combinator flag.
-type Matches =
-    rustc_hash::FxHashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[Dependency]>)>;
+type Matches = rustc_hash::FxHashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[Dependency]>)>;
 
 /// Element children positions of one parent: index, count, index among the same tag, count of that tag.
 type Positions = Rc<HashMap<usize, [usize; 4]>>;
@@ -267,8 +266,9 @@ impl SelectorCache {
                 u32::from(node.state),
                 hash.hash_one((node.attrs.get("style"), &node.inline)) as u32,
             ];
+            // WARNING: the attribute hash reads only attributes that selectors name, so a new stylesheet changes it.
             debug_assert!(
-                fresh || new == *values,
+                fresh || new[1..] == values[1..],
                 "node {id} changed without a new revision"
             );
             for (kind, (revision, (old, new))) in revisions
@@ -1414,10 +1414,8 @@ impl Selector {
                                 memo.depend(parent, 2);
                                 let siblings = &doc.nodes[parent].children;
                                 let (index, count) = if parsed.is_empty() {
-                                    let revision = memo
-                                        .nodes
-                                        .get(parent)
-                                        .map_or(0, |node| node.revisions[2]);
+                                    let revision =
+                                        memo.nodes.get(parent).map_or(0, |node| node.revisions[2]);
                                     let positions = match memo.positions.get(&parent) {
                                         Some((cached, positions)) if *cached == revision => {
                                             positions.clone()

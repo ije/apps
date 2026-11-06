@@ -18,7 +18,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     constructor(socket){super();Object.assign(this,{socket,httpVersionMajor:1,httpVersionMinor:1,httpVersion:'1.1',complete:false,headers:{},rawHeaders:[],trailers:{},rawTrailers:[],upgrade:false,url:'',method:null,statusCode:null,statusMessage:null,_body:null,_reader:null});}
     get connection(){return this.socket;}
     setTimeout(ms,callback){this.socket?.setTimeout(ms,callback);return this;}
-    _read(){if(!this._body){this.complete=true;this.push(null);return;}this._reader??=this._body.getReader();this._reader.read().then(({value,done})=>{if(done){this.complete=true;this.push(null);}else this.push(value);},error=>this.destroy(error));}
+    _read(){if(!this._body){this.complete=true;this.push(null);return;}this._reader??=this._body.getReader();this._reader.read().then(({value,done})=>{if(done){this.complete=true;this.push(null);}else this.push(value);},error=>this.destroy(error?.message==='Request ended'?undefined:error));}
     _destroy(error,callback){this._reader?.cancel(error).catch(()=>{});callback(error);}
   }
   class OutgoingMessage extends stream.Writable {
@@ -39,7 +39,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     constructor(req){super();Object.assign(this,{req,socket:req?.socket??null,statusCode:200,statusMessage:undefined,sendDate:true,_started:false,_body:undefined,_controller:null,_drain:null,_resolve:null});}
     writeHead(statusCode,statusMessage,headers){
       if(this.headersSent)throw fail(Error,'ERR_HTTP_HEADERS_SENT','Cannot write headers after they are sent to the client');
-      if(typeof statusMessage!=='string'){headers=statusMessage;statusMessage=undefined;}
+      if(typeof statusMessage!=='string'){headers??=statusMessage;statusMessage=undefined;}
       statusCode|=0;if(statusCode<100||statusCode>999)throw fail(RangeError,'ERR_HTTP_INVALID_STATUS_CODE',`Invalid status code: ${statusCode}`);
       this.statusCode=statusCode;if(statusMessage!==undefined)this.statusMessage=statusMessage;
       if(Array.isArray(headers)){if(Array.isArray(headers[0]))for(const[name,value]of headers)this.appendHeader(name,value);else for(let i=0;i+1<headers.length;i+=2)this.appendHeader(headers[i],headers[i+1]);}

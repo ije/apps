@@ -178,6 +178,10 @@ impl Desktop {
         let package = files.get("package.json").map(String::as_str);
         let (_, name, version, _) = crate::bundle::package_metadata(package)?;
         let disabled = crate::bundle::disabled_features(package)?;
+        crate::web::LOCAL_NETWORK.store(
+            disabled & crate::bundle::feature_bit("localNetwork") == 0,
+            Ordering::Relaxed,
+        );
         let path = if root.as_os_str().is_empty() {
             std::env::current_dir().unwrap_or_default()
         } else {
@@ -190,6 +194,7 @@ impl Desktop {
             .transpose()
             .context("Invalid assets.json")?
             .unwrap_or_default();
+        let _ = crate::web::ASSETS.set(assets.clone());
         let side = || {
             Rc::new(RefCell::new(Host {
                 link: Some(link.clone()),
@@ -256,8 +261,7 @@ impl Desktop {
                     self.titles(cx.as_deref_mut())?;
                 }
                 // Titles tell the main side.
-                if !self.queue.pending() && !(self.main.is_some() && self.link.main_pending())
-                {
+                if !self.queue.pending() && !(self.main.is_some() && self.link.main_pending()) {
                     return Ok(());
                 }
                 continue;
@@ -605,6 +609,7 @@ impl Desktop {
                                 let state = host.dom.entry(id).or_default();
                                 state.text_system = Some(window.text_system().clone());
                                 state.pixel_ratio = window.scale_factor();
+                                state.window = window.window_state();
                             });
                         }
                         view.preload = None;
@@ -1372,7 +1377,11 @@ impl Desktop {
             });
             let terminate = main.clone();
             renderer::native::on_should_quit(move || {
-                let quit = match terminate.engine.as_ref().filter(|_| !terminate.link().quitting()) {
+                let quit = match terminate
+                    .engine
+                    .as_ref()
+                    .filter(|_| !terminate.link().quitting())
+                {
                     None => true,
                     Some(engine) => match engine.eval("__appsEvent('before-quit')", "apps:quit") {
                         Err(error) => {
@@ -1427,7 +1436,9 @@ impl Desktop {
                     .stdin(std::process::Stdio::null())
                     .spawn();
                     #[cfg(not(unix))]
-                    let _ = std::process::Command::new(&command[0]).args(&command[1..]).spawn();
+                    let _ = std::process::Command::new(&command[0])
+                        .args(&command[1..])
+                        .spawn();
                 }
                 // AppKit exits with 0 after this hook, so a failure code must exit here.
                 if exit.exit_code() != 0 {
@@ -1552,9 +1563,22 @@ impl Desktop {
 
 fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
     let api = runtime.borrow().api.clone();
-    let busy = api.busy.get();
+    let frames = |runtime: &Rc<RefCell<Desktop>>, cx: &mut App| -> u64 {
+        let Ok(app) = runtime.try_borrow() else {
+            return 0;
+        };
+        app.views
+            .values()
+            .filter_map(|view| view.handle)
+            .filter_map(|handle| cx.update_window(handle, |window, _| window.frames_drawn()))
+            .sum()
+    };
+    let before = frames(&runtime, cx);
     cx.timer(Duration::from_secs(1), move |cx| {
-        if api.busy.get() != busy {
+        // WARNING: this GC blocks the thread that draws, so it waits for a window that animates. A blinking
+        // caret draws about twice a second and doesn't count, or a focused text field would stop all GCs.
+        let drawing = frames(&runtime, cx).saturating_sub(before) > 4;
+        if drawing || !api.shrink_due() {
             return shrink_when_quiet(runtime, cx);
         }
         api.idle.set(false);

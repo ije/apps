@@ -153,6 +153,7 @@ impl TextSystem {
             cap_height: metrics.cap_height,
             x_height: metrics.x_height,
             tall_ascent: false,
+            em_ascent: metrics.ascent / (metrics.ascent + metrics.descent),
             bounding_box: Bounds {
                 origin: point(0., 0.),
                 size: size(metrics.max_width, metrics.ascent + metrics.descent),

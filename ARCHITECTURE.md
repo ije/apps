@@ -42,6 +42,8 @@ By default macOS malloc keeps freed memory in the process footprint: about 40% o
 
 That mode makes malloc slower, so on macOS the runtime has a global allocator that keeps freed blocks of up to 512 bytes per thread, at most 64 KB per size, and gives them back when the thread is quiet. A Rust app can't define its own `#[global_allocator]`.
 
+JSC's GC timers don't fire on the generic event loop, so each VM collects itself. A thread that ran JS asks about once a second whether to collect: yes after a second that ran at least 100 ms of JS followed by 5 quiet seconds, or every 5 minutes when only a little ran. Apps have timers that never stop, so collecting more often uses more CPU at idle than the app itself. A collection also drops all compiled code, about 70% of a typical live heap, and functions compile again when they next run. A window thread waits while it draws more than a few frames a second, because the collection blocks drawing. On machines with 16 GB of RAM or more, JSC lets a heap grow to about 4x its live size before a full collection, so the runtime sets `heapGrowthMaxIncrease` to make that about 2x.
+
 ## Node Integration
 
 - Can import nodejs internal modules from `node:child_process`, `node:fs`, etc
@@ -50,6 +52,12 @@ That mode makes malloc slower, so on macOS the runtime has a global allocator th
 - Support FFI via `node:ffi`
 
 > Unlike Electron, which bundles Node.js, `@pierre/apps` provides limited node integration via rust code.
+
+With `ELECTRON_RUN_AS_NODE=1` the executable runs one script without AppKit or windows, so an app can keep a server in a child process. `import.meta.resolve('./server.ts')` bundles the script as a chunk and returns an `apps:///script-*.js` URL for it, and `child_process` can pass it extra `stdio` pipes.
+
+## Web Views
+
+`WebContentsView`, `<webview>` and `<iframe>` show pages in a system web view (WKWebView, WebView2 or WebKitGTK) above the GPU frame, so CSS can't clip or blend them. A `<webview>` is a `WebContentsView` that main keeps over the element: its page reads the box each frame and sends main the bounds when they change, and main sends the view's events back to the element. These views have no Chrome DevTools Protocol, so `webContents.debugger` answers only the commands that have a web view equivalent.
 
 ## App File
 
@@ -74,14 +82,20 @@ Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` be
 
 | Platform | Window | Renderer | Text |
 |---|---|---|---|
-| macOS | AppKit | Metal. Shaders are compiled at build time when the Metal toolchain is installed | CoreText |
+| macOS | AppKit | Metal, with layers tagged sRGB so wide-gamut displays show CSS colors like browsers. Shaders are compiled at build time when the Metal toolchain is installed | CoreText |
 | Windows | Win32 | Direct3D 11 with DirectComposition | DirectWrite |
 | Linux | X11 and Wayland | wgpu on Vulkan or OpenGL | cosmic-text |
 
 
+## Offscreen Canvases
+
+An `OffscreenCanvas` and an `ImageBitmap` keep their pixels in a detached `apps-canvas` node, the same way a `<canvas>` keeps them, so a dead wrapper frees them. Unlike `<canvas>`, the node keeps no second copy to show, and drawing on it costs the page no frames. A page worker has its own hidden page for these nodes, and its own text system for canvas text.
+
+`transferControlToOffscreen()` links the worker's node to the `<canvas>` of the page. Each commit puts the newest frame in a slot of that page and wakes its thread, so a page that is behind skips frames and a fast worker can't queue them. WebGPU frames reach the CPU by readback, so a worker that draws with WebGPU polls for them until its frames stop.
+
 ## Media
 
-`crates/media` (`apps-media`) plays `<video>` and `<audio>` for the `video` and `audio` features. The runtime loads it like the WebGPU library, and it links the FFmpeg shared libraries that `scripts/build-ffmpeg.sh` builds into `target/ffmpeg`. FFmpeg must stay LGPL: no GPL or nonfree options, dynamic linking only, and `FFmpeg.LICENSE` ships next to it.
+`crates/media` (`apps-media`) plays `<video>` and `<audio>` for the `video` and `audio` features. The runtime loads it like the WebGPU library, and it links `libffmpeg`, one shared library that `scripts/build-ffmpeg.sh` builds into `target/ffmpeg`. The library exports only the functions that `crates/media/native/ffmpeg.c` calls, so run the script again when that file calls a new one. FFmpeg must stay LGPL: no GPL or nonfree options, dynamic linking only, and `FFmpeg.LICENSE` ships next to it.
 
 ```sh
 bash scripts/build-ffmpeg.sh

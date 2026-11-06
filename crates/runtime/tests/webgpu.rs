@@ -101,6 +101,102 @@ fn present(host: &RefCell<Host>, node: usize) -> Arc<renderer::RenderImage> {
 
 #[test]
 #[ignore = "Requires a native GPU adapter"]
+fn bitmaps_upload_and_offscreen_canvases_draw() {
+    let (wake, woken) = std::sync::mpsc::channel();
+    apps_runtime::host::Waker::install(move || {
+        let _ = wake.send(());
+    });
+    let (host, engine) =
+        page("<html><body><canvas id='shown' width='4' height='4'></canvas></body></html>");
+    engine.eval(r#"
+        globalThis.result = 'pending';
+        const same = (actual, expected, name) => { actual = JSON.stringify(actual); expected = JSON.stringify(expected); if (actual !== expected) throw Error(name + ': ' + actual + ' is not ' + expected); };
+        const clear = (context, device, color) => {
+          const encoder = device.createCommandEncoder();
+          encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: color }] }).end();
+          device.queue.submit([encoder.finish()]);
+        };
+        (async () => {
+          const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+          const data = new ImageData(new Uint8ClampedArray([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,128]), 2, 2);
+          const read = async (texture, bytesPerRow) => {
+            const buffer = device.createBuffer({ size: 256 * 2, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [2, 2]);
+            device.queue.submit([encoder.finish()]);
+            await buffer.mapAsync(GPUMapMode.READ);
+            const bytes = new Uint8Array(buffer.getMappedRange());
+            return [...bytes.subarray(0, 8), ...bytes.subarray(256, 264)];
+          };
+          for (const [format, expected] of [
+            ['rgba8unorm', [255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,128]],
+            ['bgra8unorm', [0,0,255,255, 0,255,0,255, 255,0,0,255, 255,255,255,128]],
+          ]) {
+            const texture = device.createTexture({ size: [2, 2], format, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT });
+            device.queue.copyExternalImageToTexture({ source: await createImageBitmap(data) }, { texture }, [2, 2]);
+            same(await read(texture), expected, format);
+          }
+          const flipped = device.createTexture({ size: [2, 2], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT });
+          device.queue.copyExternalImageToTexture({ source: data, flipY: true }, { texture: flipped, premultipliedAlpha: true }, { width: 2, height: 2 });
+          same(await read(flipped), [0,0,255,255, 128,128,128,128, 255,0,0,255, 0,255,0,255], 'flip and premultiply');
+          let rejected = false;
+          try { device.queue.copyExternalImageToTexture({ source: data }, { texture: device.createTexture({ size: [2, 2], format: 'r8unorm', usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT }) }, [2, 2]); } catch (error) { rejected = error instanceof TypeError; }
+          same(rejected, true, 'other formats');
+
+          const canvas = new OffscreenCanvas(2, 2), context = canvas.getContext('webgpu');
+          same(context instanceof GPUCanvasContext && context.canvas === canvas, true, 'context');
+          context.configure({ device, format: 'bgra8unorm', alphaMode: 'premultiplied' });
+          clear(context, device, [1, 0, 0, 1]);
+          const bitmap = canvas.transferToImageBitmap();
+          const pixel = source => { const reader = new OffscreenCanvas(2, 2), reading = reader.getContext('2d'); reading.drawImage(source, 0, 0); return [...reading.getImageData(1, 1, 1, 1).data]; };
+          same(pixel(bitmap), [255, 0, 0, 255], 'WebGPU bitmap');
+          clear(context, device, [0, 1, 0, 1]);
+          same(pixel(canvas), [0, 255, 0, 255], 'drawImage of a WebGPU canvas');
+          same((await canvas.convertToBlob()).type, 'image/png', 'WebGPU blob');
+          const element = document.createElement('canvas'); element.width = element.height = 2;
+          const own = element.getContext('webgpu'); own.configure({ device, format: 'rgba8unorm', alphaMode: 'premultiplied' });
+          clear(own, device, [0, 0, 1, 1]);
+          same(pixel(element), [0, 0, 255, 255], 'drawImage of a WebGPU element');
+
+          const shown = document.getElementById('shown'), offscreen = shown.transferControlToOffscreen();
+          const worker = new Worker('data:text/javascript,' + encodeURIComponent(`onmessage = async ({ data }) => {
+            const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+            const context = data.getContext('webgpu'); context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'premultiplied' });
+            const encoder = device.createCommandEncoder();
+            encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [1, 1, 0, 1] }] }).end();
+            device.queue.submit([encoder.finish()]);
+          };`));
+          worker.onerror = event => { result = 'worker: ' + event.message; };
+          worker.postMessage(offscreen, [offscreen]);
+          const reader = new OffscreenCanvas(4, 4), reading = reader.getContext('2d');
+          for (let i = 0; i < 5000; i++) {
+            reading.clearRect(0, 0, 4, 4); reading.drawImage(shown, 0, 0);
+            if (reading.getImageData(3, 3, 1, 1).data[3]) break;
+            await new Promise(resolve => setTimeout(resolve, 2));
+          }
+          same([...reading.getImageData(3, 3, 1, 1).data], [255, 255, 0, 255], 'WebGPU in a worker');
+          await worker.terminate();
+        })().then(() => { if (result === 'pending') result = 'ok'; }, error => { result = error + '\n' + error.stack; });
+    "#, "gpu-test").unwrap();
+    let started = Instant::now();
+    loop {
+        let value = engine.eval("result", "gpu-test").unwrap();
+        if value != "pending" {
+            assert_eq!(value, "ok");
+            break;
+        }
+        let _ = woken.recv_timeout(Duration::from_millis(2));
+        engine.tick().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "GPU work did not finish"
+        );
+    }
+    drop(host);
+}
+
+#[test]
+#[ignore = "Requires a native GPU adapter"]
 fn renders_pixels_and_runs_compute() {
     let (host, engine) =
         page("<html><body><canvas id='canvas' width='64' height='64'></canvas></body></html>");

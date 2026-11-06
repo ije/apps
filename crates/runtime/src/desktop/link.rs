@@ -5,7 +5,9 @@
 use crate::{host::Host, jsc::JavaScriptCore, jsc::JsContext, jsc::payload::Payload};
 use anyhow::{Context, Result};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
-use renderer::{Bounds, WindowChange, WindowControl, WindowId, native::WindowEvent, point, px, size};
+use renderer::{
+    Bounds, WindowChange, WindowControl, WindowId, native::WindowEvent, point, px, size,
+};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
@@ -43,6 +45,8 @@ pub(crate) enum ToMain {
     /// `ipcRenderer.sendSync()`, while the preload waits.
     Sync(Payload, Answer),
     /// `window.open()`, or a read of the window it opened, while the page waits.
+    /// A key for `before-input-event`, which answers whether the page and menus get it.
+    Input(u64, Value, Answer),
     Open(u64, Value, Answer),
     /// A new window needs its page side.
     Spawn(u64),
@@ -330,6 +334,10 @@ impl Link {
     }
 }
 
+/// Whether the app listens for `before-input-event`, so keys of other apps skip the round trip to main.
+pub(crate) static INPUT_LISTENERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 thread_local! { static MAIN: RefCell<Weak<Main>> = RefCell::default(); }
 
 /// Runs a turn of the main side of this thread.
@@ -368,6 +376,7 @@ pub(crate) fn native_command(command: &Value) -> bool {
                         | "movable"
                         | "alwaysOnTop"
                         | "buttons"
+                        | "buttonPosition"
                         | "opacity"
                         | "shadow"
                         | "ignoreMouse"
@@ -463,8 +472,14 @@ impl Main {
 
     /// Runs what the page side sent, and returns whether there was anything.
     pub(crate) fn receive(&self) -> bool {
-        let messages =
-            std::mem::take(&mut *self.link.0.main.lock().unwrap_or_else(PoisonError::into_inner));
+        let messages = std::mem::take(
+            &mut *self
+                .link
+                .0
+                .main
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let busy = !messages.is_empty();
         for message in messages {
             match (message, &self.engine) {
@@ -481,6 +496,12 @@ impl Main {
                 (ToMain::Bridge(message), None) => self.invoke(message.value),
                 (ToMain::Sync(message, answer), Some(engine)) => {
                     let _ = answer.send(engine.receive(message));
+                }
+                (ToMain::Input(id, input, answer), Some(engine)) => {
+                    let result = engine
+                        .call("__appsBeforeInput", &[&id.to_string(), &input.to_string()])
+                        .map(|text| Value::Bool(text == "true").into());
+                    let _ = answer.send(result);
                 }
                 (ToMain::Open(id, args, answer), Some(engine)) => {
                     let result = engine
@@ -516,7 +537,10 @@ impl Main {
                 },
                 (ToMain::OpenTools, None) => {}
                 // A dropped answer tells the page that there is no main script.
-                (ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..), None) => {}
+                (
+                    ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..) | ToMain::Input(..),
+                    None,
+                ) => {}
             }
         }
         // Web views attach to native windows, which can still be on their way.
@@ -649,6 +673,10 @@ impl Main {
                 ));
             }
             "buttons" => return window.set_button_visibility(on),
+            "buttonPosition" => {
+                return window
+                    .set_button_position(args[2].as_f64().map(|_| point(number(2), number(3))));
+            }
             "minimize" => return window.minimize(),
             "maximize" | "unmaximize" => {
                 if state().maximized != (action == "maximize") {
@@ -670,9 +698,7 @@ impl Main {
             "workspaces" => WindowChange::AllWorkspaces(on, args[3] == true),
             "contentProtection" => WindowChange::ContentProtection(on),
             "focusable" => WindowChange::Focusable(on),
-            "aspectRatio" => {
-                WindowChange::AspectRatio(number(2).0, size(number(3), number(4)))
-            }
+            "aspectRatio" => WindowChange::AspectRatio(number(2).0, size(number(3), number(4))),
             "parent" => {
                 // WARNING: windows start on their own threads, so the parent can arrive after its child.
                 if args[2].as_u64().is_some_and(|parent| {
@@ -696,10 +722,9 @@ impl Main {
             "blur" => WindowChange::Blur,
             "hide" => WindowChange::Hide,
             "showInactive" => WindowChange::Show(false),
-            "limits" => WindowChange::SizeLimits(
-                size(number(2), number(3)),
-                size(number(4), number(5)),
-            ),
+            "limits" => {
+                WindowChange::SizeLimits(size(number(2), number(3)), size(number(4), number(5)))
+            }
             "resizable" => WindowChange::Resizable(on),
             "minimizable" => WindowChange::Minimizable(on),
             "maximizable" => WindowChange::Maximizable(on),

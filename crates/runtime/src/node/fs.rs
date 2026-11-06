@@ -63,20 +63,30 @@ fn stat(meta: &fs::Metadata) -> Value {
     }
 }
 
+// WARNING: handles start here, so smaller descriptors are the ones that this process inherited, like fd 3 from a parent.
+const FIRST_HANDLE: u64 = 1 << 20;
+
 #[derive(Default)]
 pub(super) struct Files(Mutex<(u64, HashMap<u64, Arc<File>>)>);
 
 impl Files {
     fn file(&self, id: &Value) -> Result<Arc<File>> {
         let id = id.as_u64().context("Expected descriptor")?;
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .1
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?)
+        let mut files = self.0.lock().unwrap();
+        if let Some(file) = files.1.get(&id) {
+            return Ok(file.clone());
+        }
+        #[cfg(unix)]
+        if id < FIRST_HANDLE {
+            use std::os::fd::FromRawFd;
+            let copy = unsafe { libc::fcntl(id as libc::c_int, libc::F_DUPFD_CLOEXEC, 64) };
+            if copy >= 0 {
+                let file = Arc::new(unsafe { File::from_raw_fd(copy) });
+                files.1.insert(id, file.clone());
+                return Ok(file);
+            }
+        }
+        Err(std::io::Error::from_raw_os_error(libc::EBADF).into())
     }
 
     pub(super) fn call(&self, op: &str, args: &Value) -> Result<Value> {
@@ -471,14 +481,19 @@ impl Files {
                 }
                 let file = Arc::new(options.open(path()?)?);
                 let mut files = self.0.lock().unwrap();
-                files.0 += 1;
+                files.0 = files.0.max(FIRST_HANDLE) + 1;
                 let id = files.0;
                 files.1.insert(id, file);
                 Ok(json!(id))
             }
             "close" => {
                 let id = args[0].as_u64().context("Expected descriptor")?;
-                if self.0.lock().unwrap().1.remove(&id).is_none() {
+                let removed = self.0.lock().unwrap().1.remove(&id).is_some();
+                #[cfg(unix)]
+                let closed = id < FIRST_HANDLE && unsafe { libc::close(id as libc::c_int) } == 0;
+                #[cfg(not(unix))]
+                let closed = false;
+                if !removed && !closed {
                     return Err(std::io::Error::from_raw_os_error(libc::EBADF).into());
                 }
                 Ok(Value::Null)

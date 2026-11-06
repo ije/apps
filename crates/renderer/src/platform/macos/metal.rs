@@ -231,9 +231,14 @@ impl Renderer {
             .min_by_key(|device| (device.isRemovable(), !device.isLowPower()))
             .or_else(|| MTLCreateSystemDefaultDevice())
             .context("accessing a Metal device")?;
+        let srgb = objc2_core_graphics::CGColorSpace::with_name(Some(unsafe {
+            objc2_core_graphics::kCGColorSpaceSRGB
+        }));
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(&device));
         layer.setPixelFormat(FORMAT);
+        // WARNING: without a color space the display shows CSS colors in its own wider gamut, more saturated than browsers.
+        layer.setColorspace(srgb.as_deref());
         // An opaque layer can be shown directly by the display.
         layer.setOpaque(!transparent);
         layer.setMaximumDrawableCount(3);
@@ -312,6 +317,7 @@ impl Renderer {
                 let sublayer = CAMetalLayer::new();
                 sublayer.setDevice(Some(&self.device));
                 sublayer.setPixelFormat(FORMAT);
+                sublayer.setColorspace(self.layer.colorspace().as_deref());
                 sublayer.setFramebufferOnly(false);
                 sublayer.setOpaque(false);
                 sublayer.setPresentsWithTransaction(true);
@@ -693,14 +699,17 @@ impl Renderer {
         let thread = super::app_thread();
         let block = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             if let Some(buffer) = done.take() {
-                super::post(thread, Box::new(move || {
-                    let buffer = buffer.into_inner();
-                    let pool = POOL.with(Rc::clone);
-                    let mut pool = pool.borrow_mut();
-                    if buffer.1 == pool.size {
-                        pool.buffers.push(buffer);
-                    }
-                }));
+                super::post(
+                    thread,
+                    Box::new(move || {
+                        let buffer = buffer.into_inner();
+                        let pool = POOL.with(Rc::clone);
+                        let mut pool = pool.borrow_mut();
+                        if buffer.1 == pool.size {
+                            pool.buffers.push(buffer);
+                        }
+                    }),
+                );
             }
         });
         drop(pool);

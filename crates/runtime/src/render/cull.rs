@@ -623,6 +623,16 @@ pub(super) fn spacer(
                     .is_none_or(|placed| (placed.1[0] - width).abs() > 0.01)
             });
             if resized || reflowed || y < high && y + height > low {
+                // WARNING: a kept subtree keeps this spacer and its old width, so asking for a frame alone would
+                // repeat this in every frame, forever. The next frame builds the path down to it again.
+                if let Some(page) = host.pages.get(&view.id) {
+                    let mut kept = view.kept.borrow_mut();
+                    let mut node = Some(parent);
+                    while let Some(id) = node {
+                        kept.remove(&id);
+                        node = page.doc.nodes[id].parent;
+                    }
+                }
                 dom.cull.off |= resized || reflowed;
                 window.redraw();
             }

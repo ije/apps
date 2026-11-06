@@ -372,7 +372,8 @@ impl Client {
     }
 
     pub fn primary_display_bounds(&self) -> Option<Bounds<Pixels>> {
-        let state = self.state.borrow();
+        // WARNING: `Window::state()` calls this every frame, and a panic ends the app.
+        let state = self.state.try_borrow().ok()?;
         let output = state
             .outputs
             .values()

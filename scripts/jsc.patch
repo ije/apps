@@ -244,7 +244,7 @@ index b8e3b2619..b835675b3 100644
 +{
 +    VM& vm = *toJS(group);
 +    JSLockHolder locker(&vm);
-+    vm.shrinkFootprintNow(VM::ShrinkFootprint::KeepCodeInUse);
++    vm.shrinkFootprintNow({});
 +}
 +
 +void JSGlobalContextSetModuleLoader(JSGlobalContextRef ctx, JSObjectRef loader)

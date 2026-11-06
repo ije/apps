@@ -1,11 +1,12 @@
-globalThis.__appsWorkers = (call, nativeAccess) => {
+globalThis.__appsWorkers = (call, nativeAccess, task) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   const encodeBytes = value => { if(value.toBase64)return value.toBase64();let text='';for(let i=0;i<value.length;i+=8192)text+=String.fromCharCode(...value.subarray(i,i+8192));return btoa(text); };
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
-  // With `buffers`, ArrayBuffers go there instead of into base64 text.
-  const encode = (value, buffers) => {
+  const fresh = new WeakSet();
+  // With `buffers`, ArrayBuffers go there instead of into base64 text. `transfer` lists the objects that move.
+  const encode = (value, buffers, transfer) => {
     const seen = new Map(), nodes = [];
     const visit = value => {
       if (value === undefined) return { u: true };
@@ -17,6 +18,8 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       const id = nodes.length; seen.set(value, id); nodes.push(null);
       let node;
       if (globalThis.CryptoKey && value instanceof CryptoKey) node = ['crypto', cryptoCodec.encode(value)];
+      else if (globalThis.ImageBitmap && value instanceof ImageBitmap) { const [width, height, bytes] = value._wire(); fresh.add(bytes.buffer); node = ['bitmap', width, height, visit(bytes.buffer)]; }
+      else if (globalThis.OffscreenCanvas && value instanceof OffscreenCanvas) { if (!transfer?.includes(value)) throw new DOMException('An OffscreenCanvas must be transferred', 'DataCloneError'); node = ['offscreen', ...value._wire()]; }
       else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : encodeBytes(new Uint8Array(value))];
       else if (ArrayBuffer.isView(value)) node = ['view', value.constructor.name, visit(value.buffer), value.byteOffset, value.byteLength];
       else if (value instanceof Date) node = ['date', value.getTime()];
@@ -45,6 +48,8 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       const node = wire.nodes[id]; let result;
       switch (node[0]) {
         case 'crypto': result = cryptoCodec.decode(node[1]); break;
+        case 'bitmap': result = ImageBitmap._revive(node[1], node[2], new Uint8Array(visit(node[3]))); break;
+        case 'offscreen': result = OffscreenCanvas._revive(node[1], node[2], node[3]); break;
         case 'buffer': result = typeof node[1] === 'number' ? (received ??= buffers())[node[1]].buffer : (typeof node[1] === 'string' ? decodeBytes(node[1]) : new Uint8Array(node[1])).buffer; break;
         case 'view': { const buffer = visit(node[2]), Type = globalThis[node[1]]; result = node[1] === 'DataView' ? new DataView(buffer, node[3], node[4]) : new Type(buffer, node[3], node[4] / Type.BYTES_PER_ELEMENT); break; }
         case 'date': result = new Date(node[1]); break;
@@ -68,17 +73,19 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
   };
   const transfers = options => {
     const values = Array.from(Array.isArray(options) ? options : options?.transfer ?? []);
-    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer) || typeof v.transfer !== 'function')) throw new DOMException('Only transferable ArrayBuffers are supported', 'DataCloneError');
+    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas))) throw new DOMException('Only ArrayBuffer, ImageBitmap and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
   // WARNING: native calls pin the bytes they read, so messages send moved or copied buffers and never the caller's own.
   const message = (value, options) => {
-    const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers));
-    return [text, ...buffers.map(buffer => new Uint8Array(transfer.includes(buffer) ? buffer.transfer() : buffer.slice(0)))];
+    const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers, transfer));
+    const wire = [text, ...buffers.map(buffer => new Uint8Array(fresh.has(buffer) ? buffer : transfer.includes(buffer) ? buffer.transfer() : buffer.slice(0)))];
+    for (const item of transfer) item._detach?.();
+    return wire;
   };
   if (!globalThis.structuredClone) globalThis.structuredClone = (value, options) => {
-    const transfer = transfers(options), result = decode(encode(value));
-    for (const buffer of transfer) buffer.transfer(0);
+    const transfer = transfers(options), result = decode(encode(value, undefined, transfer));
+    for (const item of transfer) if (item._detach) item._detach(); else item.transfer(0);
     return result;
   };
   globalThis.__appsStorageClone = { encode, decode };
@@ -157,7 +164,8 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
       target._pending.push(structuredClone(value, Array.isArray(options) ? { transfer: options } : options));
       if (target._started || target.onmessage || target._listeners.has('message')) target._deliver();
     }
-    _deliver() { queueMicrotask(() => { if (!this._closed && this._pending.length) this._emit('message', this._pending.shift()); }); }
+    // WARNING: a message is a task, like in browsers. React schedules its work with these, so as a microtask its work would run before the frame's style pass and never yield to painting.
+    _deliver() { task(() => { if (!this._closed && this._pending.length) this._emit('message', this._pending.shift()); }); }
     start() { this._started = true; for (let i = 0; i < this._pending.length; i++) this._deliver(); }
     close() { this._closed = true; this._pending.length = 0; }
     on(type, listener) { super.on(type, listener); if (type === 'message') this.start(); return this; }
@@ -166,7 +174,7 @@ globalThis.__appsWorkers = (call, nativeAccess) => {
   // WARNING: node engines share channels across threads through native subscribers; pages only reach channels of their own engine.
   const channels = new Map();
   let subscriber = null;
-  const dispatch = (name, data, except) => { for (const channel of channels.get(name) ?? []) if (channel !== except) { const copy = structuredClone(data); queueMicrotask(() => { if (channels.get(name)?.has(channel)) channel.dispatchEvent(new MessageEvent('message', { data: copy })); }); } };
+  const dispatch = (name, data, except) => { for (const channel of channels.get(name) ?? []) if (channel !== except) { const copy = structuredClone(data); task(() => { if (channels.get(name)?.has(channel)) channel.dispatchEvent(new MessageEvent('message', { data: copy })); }); } };
   class BroadcastChannel extends EventTarget {
     #name; #closed = false;
     _referenced = true;

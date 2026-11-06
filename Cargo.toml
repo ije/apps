@@ -61,6 +61,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
     "std",
 ] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColorSpace", "objc2"] }
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
 pathfinder_geometry = "0.5"
 pollster = "0.4.0"

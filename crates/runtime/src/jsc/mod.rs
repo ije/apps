@@ -23,6 +23,12 @@ pub struct JavaScriptCore {
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: Option<unsafe extern "C" fn(Ptr)>,
     pub(crate) busy: std::cell::Cell<std::time::Duration>,
+    /// When `shrink_due` last looked, and `busy` then.
+    busy_mark: std::cell::Cell<(std::time::Instant, std::time::Duration)>,
+    /// Whether a second since the last collection ran a lot of JS, the quiet seconds in a row, and that collection.
+    burst: std::cell::Cell<bool>,
+    quiet: std::cell::Cell<u32>,
+    shrunk: std::cell::Cell<std::time::Instant>,
     pub(crate) idle: std::cell::Cell<bool>,
     inspectable: Option<unsafe extern "C" fn(Ptr, bool)>,
     extra_memory: Option<unsafe extern "C" fn(Ptr, usize)>,
@@ -166,9 +172,20 @@ impl JavaScriptCore {
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;
+            // WARNING: JSC reads its options once, from the environment, when the first group is created. The first load runs before other threads start.
+            static OPTIONS: std::sync::Once = std::sync::Once::new();
+            let mut group = None;
+            OPTIONS.call_once(|| {
+                std::env::set_var("JSC_useSharedArrayBuffer", "1");
+                // WARNING: with 16 GB of RAM or more, a heap may grow to about 4x its live size before a full GC. This makes it about 2x.
+                std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
+                group = Some(group_create());
+                std::env::remove_var("JSC_useSharedArrayBuffer");
+                std::env::remove_var("JSC_heapGrowthMaxIncrease");
+            });
             Ok(Rc::new(Self {
                 // WARNING: engines of one thread share a VM, so JSC reuses compiled runtime code across windows.
-                group: group_create(),
+                group: group.unwrap_or_else(|| group_create()),
                 inspectable: library
                     .get(b"JSGlobalContextSetInspectable\0")
                     .ok()
@@ -187,6 +204,10 @@ impl JavaScriptCore {
                     .ok()
                     .map(|s| *s),
                 busy: Default::default(),
+                busy_mark: std::cell::Cell::new((std::time::Instant::now(), Default::default())),
+                burst: Default::default(),
+                quiet: Default::default(),
+                shrunk: std::cell::Cell::new(std::time::Instant::now()),
                 idle: Default::default(),
                 create: *library.get(b"JSGlobalContextCreateInGroup\0")?,
                 release: *library.get(b"JSGlobalContextRelease\0")?,
@@ -318,9 +339,37 @@ impl JavaScriptCore {
         self.shrink.is_some() && self.busy.get() >= std::time::Duration::from_millis(20)
     }
 
+    /// Whether the VM should collect now, asked about once a second: after a burst of work and 5 quiet
+    /// seconds, or every 5 minutes when only a little ran.
+    // WARNING: JSC's GC timers don't fire on the generic event loop, so garbage stays until the heap has grown
+    // about 2x. A collection costs about 300 ms of CPU over all GC threads and drops the compiled code, so it must
+    // not run for the timers and polls that apps always have, or it uses more CPU at idle than the app itself.
+    pub(crate) fn shrink_due(&self) -> bool {
+        use std::time::Duration;
+        let (now, busy) = (std::time::Instant::now(), self.busy.get());
+        let (at, before) = self.busy_mark.get();
+        if !self.shrink_pending() || now.duration_since(at) < Duration::from_millis(900) {
+            return false;
+        }
+        self.busy_mark.set((now, busy));
+        let ran = busy.saturating_sub(before);
+        self.burst
+            .set(self.burst.get() || ran >= Duration::from_millis(100));
+        if ran >= Duration::from_millis(20) {
+            self.quiet.set(0);
+            return false;
+        }
+        self.quiet.set(self.quiet.get() + 1);
+        self.burst.get() && self.quiet.get() >= 5
+            || now.duration_since(self.shrunk.get()) >= Duration::from_secs(300)
+    }
+
     pub(crate) fn shrink(&self) {
         if let Some(shrink) = self.shrink {
             self.busy.set(Default::default());
+            self.burst.set(false);
+            self.quiet.set(0);
+            self.shrunk.set(std::time::Instant::now());
             unsafe { shrink(self.group) };
         }
     }
@@ -389,7 +438,8 @@ fn bridge(
     unsafe {
         (api.protect)(context, argument);
     }
-    let result = unsafe { (api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
+    let result =
+        unsafe { (api.invoke)(context, receiver, ptr::null_mut(), 1, &argument, &mut error) };
     unsafe {
         (api.unprotect)(context, argument);
     }
@@ -1069,6 +1119,25 @@ fn dispatch(
         host.try_borrow_mut()
             .context("Host is busy")?
             .media(id, op, &args)
+    } else if op == "dom.listenInput" {
+        crate::desktop::link::INPUT_LISTENERS.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(serde_json::Value::Null)
+    } else if let (Role::Renderer(id), "dom.contextMenu") = (role, op) {
+        if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
+            link.event(
+                format!("__appsEvent('context-menu',{id},{})", values[0]),
+                "apps:context-menu",
+            );
+        }
+        Ok(serde_json::Value::Null)
+    } else if let (Role::Renderer(id), "dom.filePicker") = (role, op) {
+        if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
+            link.event(
+                format!("__appsEvent('file-picker',{id},{})", values[0]),
+                "apps:file-picker",
+            );
+        }
+        Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.open") = (role, op) {
         let link = host.try_borrow().context("Host is busy")?.link.clone();
         Ok(link
@@ -1368,10 +1437,11 @@ fn call_json<T>(
 /// page scripts past the limit. Returning false lets the script run for another tick.
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     let binding = HOSTS.with(|hosts| {
-        hosts
-            .try_borrow()
-            .ok()
-            .and_then(|hosts| hosts.get(&(ctx as usize)).map(|binding| (binding.0.clone(), binding.2)))
+        hosts.try_borrow().ok().and_then(|hosts| {
+            hosts
+                .get(&(ctx as usize))
+                .map(|binding| (binding.0.clone(), binding.2))
+        })
     });
     let Some((api, role)) = binding else {
         return false;
@@ -1675,6 +1745,7 @@ impl JsContext {
             engine.eval(&js!("node/http.js"), "apps:node-http")?;
             engine.eval(&js!("node/net.js"), "apps:net")?;
             engine.eval(&js!("node/pty.js"), "apps:pty")?;
+            engine.eval(&js!("node/compat.js"), "apps:node-compat")?;
         }
         engine.eval(&js!("web/streams.js"), "apps:streams")?;
         engine.eval(&js!("web/crypto.js"), "apps:crypto")?;
@@ -1682,6 +1753,7 @@ impl JsContext {
         engine.eval(&js!("web/platform.js"), "apps:platform")?;
         engine.eval(&js!("bridge.js"), "apps:bridge")?;
         engine.eval(&js!("browser.js"), "apps:browser")?;
+        engine.eval(&js!("electron.js"), "apps:electron")?;
         engine.eval(&js!("web/worker.js"), "apps:worker")?;
         engine.eval(&js!("web/environment.js"), "apps:browser-environment")?;
         engine.eval(&js!("inspect.js"), "apps:inspect")?;
@@ -1734,6 +1806,11 @@ impl JsContext {
         }
         let _armed = Armed(ARMED.replace(self.ctx as usize));
         self.evaluate(source, url, self.scope)
+    }
+
+    /// Whether native addons still have work that keeps the event loop alive.
+    pub fn addons_pending(&self) -> bool {
+        self.napi.as_ref().is_some_and(|napi| napi.pending())
     }
 
     /// Calls a global function with JSON arguments, without compiling a new script.
@@ -1871,6 +1948,7 @@ impl JsContext {
     pub fn tick(&self) -> Result<i64> {
         if let Some(napi) = &self.napi {
             napi.sweep();
+            napi.drain();
         }
         // WARNING: -2 means one macrotask ran. Each call returns to the VM, which drains the microtasks before the next one.
         loop {
@@ -1977,6 +2055,59 @@ impl Drop for JsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_clicks_run_activation_behavior() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+        let script = "const box = document.createElement('input'); box.type = 'checkbox'; \
+            document.body.append(box); const seen = []; box.addEventListener('change', () => seen.push('change')); \
+            box.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); \
+            const plain = document.createElement('input'); plain.type = 'checkbox'; \
+            plain.dispatchEvent(new Event('click')); [box.checked, seen[0], plain.checked].join()";
+        assert_eq!(page.eval(script, "test").unwrap(), "true,change,false");
+    }
+
+    #[test]
+    fn channel_messages_are_tasks_and_file_readers_finish() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+        let script = "globalThis.seen = []; const { port1, port2 } = new MessageChannel(); \
+            port1.onmessage = () => seen.push('message'); port2.postMessage(0); \
+            Promise.resolve().then(() => seen.push('microtask')); \
+            const reader = new FileReader(); reader.onload = () => seen.push(reader.result); \
+            reader.readAsDataURL(new Blob(['hi'], { type: 'text/plain' })); ''";
+        page.eval(script, "test").unwrap();
+        assert_eq!(page.eval("seen.join()", "test").unwrap(), "microtask");
+        for _ in 0..200 {
+            page.tick().unwrap();
+            if page.eval("String(seen.length)", "test").unwrap() == "3" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            page.eval("seen.join()", "test").unwrap(),
+            "microtask,message,data:text/plain;base64,aGk="
+        );
+    }
+
     #[test]
     fn contexts_isolate_privileges_and_share_dom_only() {
         let api = JavaScriptCore::load().unwrap();

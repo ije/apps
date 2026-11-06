@@ -1,4 +1,4 @@
-globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}) => {
+globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = () => {}, nativeImage) => {
   const contents = new Map(), pending = new Map(), partitions = new Map(), layouts = new WeakMap(), owners = new WeakMap();
   const safe = { nodeIntegration: false, nodeIntegrationInWorker: false, nodeIntegrationInSubFrames: false, contextIsolation: true, sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false, experimentalFeatures: false };
   const eventOf = (fields = {}) => ({ ...fields, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
@@ -19,7 +19,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       Object.defineProperty(this, 'id', { value: call('browser.create', { partition: options.partition || 'persist:default', javascript: options.javascript ?? true, inspectable: options.devTools ?? true, navigation: true, ...(options.show ? { show: true } : {}) }) });
       this.#devTools = options.devTools !== false;
       this.#partition = options.partition;
-      this.session = Object.freeze({
+      this._storage = Object.freeze({
         cookies: Object.freeze({
           get: (filter = {}) => this.#request('cookies.get', { filter }),
           set: details => this.#request('cookies.set', { details }),
@@ -31,13 +31,14 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     }
     loadURL(url) {
       if (this.#destroyed) return Promise.reject(new Error('Browser is destroyed'));
+      this.#loading = true;
       return new Promise((resolve, reject) => {
         const success = () => { clean(); resolve(); };
         const failure = (_event, _code, description) => { clean(); reject(new Error(description ?? 'WebContents was destroyed')); };
         const clean = () => { this.off('did-finish-load', success); this.off('did-fail-load', failure); this.off('destroyed', failure); };
         this.once('did-finish-load', success); this.once('did-fail-load', failure); this.once('destroyed', failure);
         try { call('browser.command', this.id, 'loadURL', String(url)); }
-        catch (error) { clean(); reject(error); }
+        catch (error) { this.#loading = false; clean(); reject(error); }
       });
     }
     loadFile(file, options = {}) {
@@ -61,11 +62,45 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     }
     executeJavaScript(script) { return this.#request('evaluate', { script: String(script) }); }
     capturePage(rect) {
-      return this.#request('capture', rect ? { rect } : {}).then(image => {
-        const bytes = Uint8Array.from(atob(image.png), char => char.charCodeAt(0));
-        return Object.freeze({ toPNG: () => bytes.slice(), toDataURL: () => 'data:image/png;base64,' + image.png, getSize: () => ({ width: image.width, height: image.height }), isEmpty: () => !bytes.length });
-      });
+      return this.#request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.from(atob(image.png), char => char.charCodeAt(0))));
     }
+    get session() { return session.fromPartition(this.#partition ?? 'persist:default'); }
+    get mainFrame() { const contents = this; return { get url() { return contents.getURL(); }, get top() { return this; }, parent: null, frames: [], framesInSubtree: [], processId: 0, routingId: 1, frameTreeNodeId: this.id, visibilityState: 'visible', detached: false, executeJavaScript: code => contents.executeJavaScript(code), send() {}, isDestroyed: () => contents.isDestroyed() }; }
+    get focusedFrame() { return this.mainFrame; }
+    get navigationHistory() { const contents = this; return { canGoBack: () => contents.canGoBack(), canGoForward: () => contents.canGoForward(), goBack: () => contents.goBack(), goForward: () => contents.goForward(), canGoToOffset: () => false, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] }; }
+    get debugger() { return this.#debugger ??= new Debugger(this); }
+    #debugger;
+    ipc = Object.assign(new EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
+    hostWebContents = null;
+    devToolsWebContents = null;
+    getType() { return this.hostWebContents ? 'webview' : 'browserView'; }
+    reloadIgnoringCache() { this.reload(); }
+    isFocused() { return false; }
+    isLoadingMainFrame() { return this.isLoading(); }
+    isCrashed() { return false; }
+    isDevToolsOpened() { return false; }
+    closeDevTools() {}
+    getOSProcessId() { return process.pid; }
+    getProcessId() { return process.pid; }
+    getUserAgent() { return this.session.getUserAgent(); }
+    setUserAgent() {}
+    setBackgroundThrottling() {}
+    getBackgroundThrottling() { return false; }
+    setIgnoreMenuShortcuts() {}
+    setAudioMuted() {}
+    isAudioMuted() { return false; }
+    isCurrentlyAudible() { return false; }
+    getZoomLevel() { return Math.log(this.#zoom) / Math.log(1.2); }
+    setZoomLevel(level) { this.setZoomFactor(1.2 ** level); }
+    setVisualZoomLevelLimits() { return Promise.resolve(); }
+    executeJavaScriptInIsolatedWorld(_world, scripts) { return Promise.all(scripts.map(({ code }) => this.executeJavaScript(code))).then(results => results.at(-1)); }
+    insertCSS(css) { return this.executeJavaScript(`document.head.append(Object.assign(document.createElement('style'),{textContent:${JSON.stringify(String(css))}}))`).then(() => ''); }
+    insertText(text) { return this.executeJavaScript(`document.execCommand('insertText',false,${JSON.stringify(String(text))})`).then(() => {}); }
+    sendInputEvent() {}
+    send() {}
+    startDrag() {}
+    replaceMisspelling() {}
+    copyImageAt() {}
     getURL() { return this.#url; }
     getTitle() { return this.#title; }
     isLoading() { return this.#loading; }
@@ -117,7 +152,16 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       else if (event.type === 'did-fail-load') this.emit(event.type, eventOf(), event.code ?? -2, event.error ?? 'Navigation failed', event.url ?? this.#url, true, -1, -1);
       else if (event.type === 'page-title-updated') this.emit(event.type, eventOf(), this.#title, true);
       else if (event.type === 'did-navigate') this.emit(event.type, eventOf(), this.#url, -1, '');
-      else if (event.type === 'did-start-loading' || event.type === 'did-finish-load' || event.type === 'dom-ready') this.emit(event.type, eventOf());
+      else if (event.type === 'did-navigate-in-page' || (event.type === 'history' && !this.#loading)) this.emit('did-navigate-in-page', eventOf({ url: this.#url, isMainFrame: true }), this.#url, true, -1, -1);
+      else if (event.type === 'did-start-loading') {
+        this.emit('did-start-navigation', eventOf({ url: event.url ?? this.#url, isMainFrame: true, isSameDocument: false }), event.url ?? this.#url, false, true, -1, -1);
+        this.emit(event.type, eventOf());
+      }
+      else if (event.type === 'dom-ready') {
+        this.emit(event.type, eventOf());
+        this.executeJavaScript(`[...document.querySelectorAll('link[rel~="icon"]')].map(link => link.href)`).then(icons => { if (!this.#destroyed && icons?.length) this.emit('page-favicon-updated', eventOf(), icons); }, () => {});
+      }
+      else if (event.type === 'did-finish-load') this.emit(event.type, eventOf());
       else if (event.type === 'render-process-gone') this.emit(event.type, eventOf(), { reason: 'crashed', exitCode: 0 });
       else if (event.type === 'message' && (event.data?.kind === 'console' || event.data?.kind === 'error')) {
         const level = event.data.kind === 'error' ? 'error' : { log: 'info', info: 'info', warn: 'warning', error: 'error', debug: 'debug' }[event.data.level] ?? 'info';
@@ -126,6 +170,35 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       }
       else if (event.type === 'message') this.emit('ipc-message', eventOf(), 'message', event.data?.data);
       if (event.type === 'did-finish-load' || event.type === 'did-fail-load') this.emit('did-stop-loading');
+    }
+  }
+  // WARNING: guests are system web views with no Chrome DevTools Protocol, so this answers only the commands that have a web view equivalent, and tools like Playwright can't connect.
+  class Debugger extends EventEmitter {
+    #contents; #attached = false;
+    constructor(contents) { super(); this.#contents = contents; }
+    attach() { if (this.#attached) throw new Error('Debugger is already attached to the target'); this.#attached = true; }
+    detach() { if (!this.#attached) throw new Error('Debugger is not attached to the target'); this.#attached = false; this.emit('detach', eventOf(), 'target closed'); }
+    isAttached() { return this.#attached; }
+    async sendCommand(method, params = {}) {
+      if (!this.#attached) throw new Error('Debugger is not attached to the target');
+      const contents = this.#contents;
+      switch (method) {
+        case 'Page.enable': case 'Runtime.enable': case 'Network.enable': case 'Log.enable': case 'Runtime.releaseObjectGroup': case 'Emulation.setDefaultBackgroundColorOverride': case 'Emulation.setFocusEmulationEnabled': return {};
+        case 'Emulation.setEmulatedMedia': {
+          const scheme = params.features?.find(feature => feature.name === 'prefers-color-scheme')?.value ?? '';
+          call('browser.command', contents.id, 'appearance', scheme);
+          return {};
+        }
+        case 'Page.reload': contents.reload(); return {};
+        case 'Page.captureScreenshot': return { data: (await contents.capturePage()).toDataURL().split(',')[1] };
+        case 'Target.getTargetInfo': return { targetInfo: { targetId: String(contents.id), type: 'page', title: contents.getTitle(), url: contents.getURL(), attached: true, canAccessOpener: false } };
+        case 'Runtime.evaluate':
+          try {
+            const value = await contents.executeJavaScript(String(params.expression));
+            return { result: { type: value === null ? 'object' : typeof value, value } };
+          } catch (error) { return { result: { type: 'undefined' }, exceptionDetails: { text: String(error?.message ?? error) } }; }
+        default: throw new Error(`'${method}' wasn't found`);
+      }
     }
   }
   const sync = (view, reorder = false) => {
@@ -219,11 +292,57 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       } else contents.get(view)?._event(event);
     }
   };
+  // WARNING: a session needs a system web view only for its cookies and storage, so that one starts on first use.
+  const sessions = new Map();
+  class Session extends EventEmitter {
+    #partition; #holder; #agent = null;
+    constructor(partition) {
+      super();
+      this.#partition = partition;
+      this.cookies = Object.assign(new EventEmitter(), {
+        get: filter => this.#contents()._storage.cookies.get(filter),
+        set: details => this.#contents()._storage.cookies.set(details),
+        remove: (url, name) => this.#contents()._storage.cookies.remove(url, name),
+        flushStore: async () => {},
+      });
+      const noop = () => {};
+      this.webRequest = { onBeforeRequest: noop, onBeforeSendHeaders: noop, onSendHeaders: noop, onHeadersReceived: noop, onResponseStarted: noop, onBeforeRedirect: noop, onCompleted: noop, onErrorOccurred: noop };
+      this.serviceWorkers = new EventEmitter();
+      this.protocol = globalThis.__apps?.protocol;
+    }
+    #contents() { if (!partitions.has(this.#partition)) partitions.set(this.#partition, new WebContents({ partition: this.#partition })); return partitions.get(this.#partition); }
+    get storagePath() { return null; }
+    get availableSpellCheckerLanguages() { return []; }
+    clearStorageData() { return partitions.has(this.#partition) ? this.#contents()._storage.clearStorageData() : Promise.resolve(); }
+    clearCache() { return this.clearStorageData(); }
+    clearAuthCache() { return Promise.resolve(); }
+    clearHostResolverCache() { return Promise.resolve(); }
+    flushStorageData() {}
+    setPermissionRequestHandler(handler) { this.permissionRequestHandler = handler; }
+    setPermissionCheckHandler(handler) { this.permissionCheckHandler = handler; }
+    setDisplayMediaRequestHandler() {}
+    setDevicePermissionHandler() {}
+    setCertificateVerifyProc() {}
+    setUserAgent(agent) { this.#agent = String(agent); }
+    getUserAgent() { return this.#agent ?? `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15`; }
+    setDownloadPath() {}
+    setSpellCheckerEnabled() {}
+    isSpellCheckerEnabled() { return false; }
+    setSpellCheckerLanguages() {}
+    getSpellCheckerLanguages() { return []; }
+    setProxy() { return Promise.resolve(); }
+    resolveProxy() { return Promise.resolve('DIRECT'); }
+    closeAllConnections() { return Promise.resolve(); }
+    fetch(input, init) { return globalThis.__apps.net.fetch(input, init); }
+    getStoragePath() { return null; }
+    isPersistent() { return this.#partition.startsWith('persist:'); }
+  }
   const session = Object.freeze({
     fromPartition(partition) {
       if (typeof partition !== 'string') throw new TypeError('Expected partition name');
-      if (!partitions.has(partition)) partitions.set(partition, new WebContents({ partition }));
-      return partitions.get(partition).session;
+      partition ||= 'persist:default';
+      if (!sessions.has(partition)) sessions.set(partition, new Session(partition));
+      return sessions.get(partition);
     },
     get defaultSession() { return this.fromPartition('persist:default'); },
   });
@@ -254,6 +373,11 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     };
     app.hasSingleInstanceLock = () => ownsInstance;
     app.releaseSingleInstanceLock = () => { native('app.releaseInstance'); ownsInstance = false; };
+    // WARNING: macOS only accepts schemes that the Info.plist lists, and `apps build` doesn't add them.
+    app.setAsDefaultProtocolClient = scheme => process.platform === 'darwin' && native('app.protocolClient', { action: 'set', scheme: String(scheme) });
+    app.isDefaultProtocolClient = scheme => process.platform === 'darwin' && native('app.protocolClient', { action: 'is', scheme: String(scheme) });
+    app.removeAsDefaultProtocolClient = () => false;
+    app.userAgentFallback = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) ${identifier}`;
     app.showAboutPanel = () => native('app.about');
     app.setAboutPanelOptions = options => native('app.about', { ...options });
     app.getLoginItemSettings = () => native('app.loginItem');
@@ -288,9 +412,18 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     Object.defineProperty(app, 'badgeCount', { enumerable: true, get: app.getBadgeCount, set: app.setBadgeCount });
   };
   const clipboard = Object.freeze({
-    readText: () => native('clipboard.readText'), writeText: text => native('clipboard.writeText', String(text)),
-    readHTML: () => native('clipboard.readHTML'), writeHTML: text => native('clipboard.writeHTML', String(text)),
+    readText: () => native('clipboard.readText'), writeText: async text => { native('clipboard.writeText', String(text)); },
+    readHTML: () => native('clipboard.readHTML'), writeHTML: async text => { native('clipboard.writeHTML', String(text)); },
     clear: () => native('clipboard.clear'),
+    async write(items) {
+      for (const item of items) for (const type of item.types) {
+        const blob = await item.getType(type);
+        if (type === 'text/plain') native('clipboard.writeText', await blob.text());
+        else if (type === 'text/html') native('clipboard.writeHTML', await blob.text());
+        else if (type === 'image/png') native('clipboard.writeImage', Buffer.from(await blob.arrayBuffer()).toString('base64'));
+        else throw new DOMException(`Type ${type} not supported on write.`, 'NotAllowedError');
+      }
+    },
   });
   const shell = Object.freeze({
     async openExternal(url) { if (!native('shell.openExternal', String(url))) throw new Error('Could not open URL'); },
@@ -302,7 +435,8 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
   let nextReply = 0;
   // WARNING: native code sends the reply through the main queue, so it can't arrive before `replies` holds it.
   const later = (op, value) => new Promise(resolve => { const id = ++nextReply; native(op, { ...value, async: id }); replies.set(id, resolve); });
-  const dialog = Object.freeze({
+  // Not frozen, as in Electron, where tests replace its functions.
+  const dialog = {
     showOpenDialog: async (...args) => later('dialog.open', options(args)),
     showOpenDialogSync: (...args) => { const result = native('dialog.open', options(args)); return result.canceled ? undefined : result.filePaths; },
     showSaveDialog: async (...args) => later('dialog.save', options(args)),
@@ -310,7 +444,7 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     showMessageBox: async (...args) => later('dialog.message', options(args)),
     showMessageBoxSync: (...args) => native('dialog.message', options(args)).response,
     showErrorBox: (title, content) => native('dialog.message', { message: String(title), detail: String(content), type: 'error' }),
-  });
+  };
   const nativeTheme = new EventEmitter();
   let themeSource = 'system';
   // WARNING: only macOS reports the system theme, so other platforms read light defaults instead of throwing.
@@ -327,6 +461,7 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
   });
   const safeStorage = Object.freeze({
     isEncryptionAvailable: () => native('safeStorage.available'),
+    getSelectedStorageBackend: () => 'unknown',
     encryptString: value => Buffer.from(native('safeStorage.encrypt', String(value)), 'base64'),
     decryptString: bytes => {
       if (!ArrayBuffer.isView(bytes)) throw new TypeError('Expected encrypted bytes');
@@ -506,7 +641,7 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     getEffectiveAppearance: () => native('prefs.appearance'),
     getMediaAccessStatus: type => native('prefs.media', String(type)),
     askForMediaAccess: async type => later('prefs.askMedia', { type: String(type) }),
-    isTrustedAccessibilityClient: prompt => native('prefs.trusted', !!prompt),
+    isTrustedAccessibilityClient: prompt => !!native('prefs.trusted', !!prompt),
     getUserDefault: (key, type) => native('prefs.getDefault', { key: String(key), type: defaultType(type) }),
     setUserDefault(key, type, value) { if (!defaults[defaultType(type)](value)) throw new TypeError(`Unable to convert value to: ${type}`); native('prefs.setDefault', { key: String(key), type, value }); },
     removeUserDefault: key => native('prefs.removeDefault', String(key)),
@@ -537,6 +672,11 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     getPrimaryDisplay: () => native('screen.displays')[0],
     getCursorScreenPoint: () => native('screen.cursor'),
     getDisplayNearestPoint: point => nearest(point.x, point.y),
+    // On macOS, screen coordinates are already DIP.
+    screenToDipPoint: point => ({ ...point }),
+    dipToScreenPoint: point => ({ ...point }),
+    screenToDipRect: (_window, rect) => ({ ...rect }),
+    dipToScreenRect: (_window, rect) => ({ ...rect }),
     getDisplayMatching(rect) {
       const area = display => { const b = display.bounds; return Math.max(0, Math.min(b.x + b.width, rect.x + rect.width) - Math.max(b.x, rect.x)) * Math.max(0, Math.min(b.y + b.height, rect.y + rect.height) - Math.max(b.y, rect.y)); };
       const best = native('screen.displays').reduce((best, display) => area(display) > area(best) ? display : best);

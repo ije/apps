@@ -18,7 +18,7 @@ To teach an agent the HTTP API, install the skill, for example `mkdir -p ~/.clau
 `apps build` writes to `dist/` by default and does not generate source maps.
 On macOS, `identifier` in `package.json` sets the bundle ID (`CFBundleIdentifier`). It defaults to `com.apps.<name>`, with `_` changed to `-`.
 It packs imported `.node` addons into the app bundle and writes each one to the user's cache folder the first time it loads.
-It copies the contents of `public/` into the app folder, and the files and folders in `files` of `package.json` at their path in the app, so `join(import.meta.dirname, './lib/math.dylib')` finds the same file in `apps run` and built apps:
+It copies only the files and folders in `files` of `package.json`, at their path in the app, so `join(import.meta.dirname, './lib/math.dylib')` finds the same file in `apps run` and built apps:
 
 ```json
 {
@@ -64,6 +64,21 @@ Named exports, default exports, callbacks, promises, and literal dynamic imports
 The page has no direct access to Node APIs or private preload variables. Export only the API that the page needs.
 `<script type="preload">` scripts and `contextBridge.exposeInMainWorld()` also work.
 
+Bundled code also takes these:
+
+```ts
+import './theme.css';                             // adds a <style> to the page
+import icon from './icon.png';                    // the URL of the file
+import text from './notes.md?raw';                // the text of the file
+import url from './data.bin?url';                 // the URL of the file
+import MyWorker from './work.ts?worker';          // a Worker class
+const pages = import.meta.glob('./pages/*.html', { eager: true, query: '?url', import: 'default' });
+const version = import.meta.env.APP_VERSION;      // from `env` in package.json
+const server = import.meta.resolve('./server.ts'); // a script that `ELECTRON_RUN_AS_NODE` can run
+```
+
+`productName` names the app, `executableName` names its executable, and `env` gives the values of `import.meta.env`.
+
 Set `loaders` in `package.json` to import other file types. Each key is a file extension, and each value is a module path relative to `package.json` or a package name:
 
 ```json
@@ -96,11 +111,12 @@ WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by de
 ```
 
 `"name"` enables a feature, `"-name"` disables it, and `"*"` means all features. Entries apply in order.
+The `localNetwork` feature lets pages reach loopback and LAN addresses, for apps with a server in a child process.
 A disabled feature is not loaded, and its API throws an error when called. On macOS and Windows, WebGPU is a separate library (3.2 MB) that `apps build` copies only for apps that enable it. Linux always includes it, because the renderer uses wgpu.
 
 `jsExecute` lets pages use `eval()`, `new Function()` and `import()` of `data:` and `blob:` URLs. `httpImport` lets apps import `http` and `https` URLs: `apps build` and `apps run` download the imports, `<script src>`, `<link rel="stylesheet">` and CSS `@import` with a string literal URL, and bundle them. Remote files can import other files only by relative or absolute URLs. An `import()` without a string literal stays in the code and loads its URL when it runs. It needs `jsExecute` or `httpImport`.
 
-`video` and `audio` play media with the FFmpeg shared libraries, under the LGPL 2.1. Build them once with `bash scripts/build-ffmpeg.sh` before `cargo build --workspace`. `apps build` copies the media library and FFmpeg (about 7 MB) with `FFmpeg.LICENSE` only for apps that enable one of them, so users can replace FFmpeg. Hardware decoding uses VideoToolbox on macOS and Direct3D 11 on Windows.
+`video` and `audio` play media with an FFmpeg shared library, under the LGPL 2.1. Build it once with `bash scripts/build-ffmpeg.sh` before `cargo build --workspace`. `apps build` copies the media library and FFmpeg (about 4 MB) with `FFmpeg.LICENSE` only for apps that enable one of them, so users can replace FFmpeg. Hardware decoding uses VideoToolbox on macOS and Direct3D 11 on Windows.
 
 The main module can export an object with lifecycle handlers and an HTTP server:
 

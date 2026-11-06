@@ -368,6 +368,18 @@ impl Hooks for DomBox {
             offset += translation;
             bounds.origin += translation;
             matrix = None;
+            // WARNING: boxes positioned in this block include the translation through the offset, so the block must too.
+            let view = &*self.view;
+            if self.block.is_some()
+                && let Some(block) = view
+                    .host
+                    .borrow_mut()
+                    .dom
+                    .get_mut(&view.id)
+                    .and_then(|dom| dom.blocks.get_mut(&self.id))
+            {
+                block.origin += translation;
+            }
         }
         let mut prepaint = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
@@ -422,13 +434,20 @@ impl Hooks for DomBox {
                     ]),
                     self.margin,
                 );
-                cull.widths.insert(
-                    self.id,
-                    [
-                        width - self.sides[0],
-                        f32::from(bounds.size.height) - self.sides[1],
-                    ],
-                );
+                let inner = [
+                    width - self.sides[0],
+                    f32::from(bounds.size.height) - self.sides[1],
+                ];
+                cull.widths.insert(self.id, inner);
+                // WARNING: a container's size starts from an estimate, so queries read the size that layout gave it.
+                if dom
+                    .containers
+                    .get(&self.id)
+                    .is_some_and(|size| (size[0] - inner[0]).abs() > 0.5)
+                {
+                    dom.containers.insert(self.id, inner);
+                    window.redraw();
+                }
                 if let Some((grid, aligned)) = self.grid {
                     let baselines = baselines.map(|value| value.map(f32::from));
                     // WARNING: the grid's own baseline comes from its first item in the same layout, so only aligned
@@ -616,9 +635,33 @@ impl DomBox {
             let masks = &mut host.dom.entry(view.id).or_default().masks;
             if masks.get(&self.id).is_none_or(|(old, image)| {
                 *old != inputs
-                    || u32::from(image.size().width) != raster[0]
-                    || u32::from(image.size().height) != raster[1]
+                    || image.as_ref().is_some_and(|image| {
+                        u32::from(image.size().width) != raster[0]
+                            || u32::from(image.size().height) != raster[1]
+                    })
             }) {
+                // WARNING: scroll areas keep gradient masks that are usually fully opaque, and a resize changes them in every frame, so these skip the SVG.
+                if shapes.is_none()
+                    && let Some([across, down]) =
+                        super::effects::axis_mask(style, &units, size, raster)
+                {
+                    let opaque = |alpha: &f32| *alpha >= 0.999;
+                    let image = (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
+                        let mut bytes = vec![0; across.len() * down.len() * 4];
+                        for (row, y) in bytes.chunks_exact_mut(across.len() * 4).zip(&down) {
+                            for (pixel, x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&across) {
+                                pixel[3] = (x * y * 255. + 0.5) as u8;
+                            }
+                        }
+                        std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
+                    });
+                    if let Some((_, Some(old))) = masks.insert(self.id, (inputs, image)) {
+                        window.drop_image(old);
+                    }
+                    return masks
+                        .get(&self.id)
+                        .and_then(|(_, image)| image.clone().map(|image| (image, bounds)));
+                }
                 let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
                     (Some(shape), Some(layers)) => format!(
                         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"h2o-clip\">{shape}</clipPath></defs><g clip-path=\"url(#h2o-clip)\">{layers}</g></svg>"
@@ -633,14 +676,16 @@ impl DomBox {
                 };
                 match super::canvas::svg(&source, raster[0], raster[1], None) {
                     Ok(image) => {
-                        if let Some((_, old)) = masks.insert(self.id, (inputs, image)) {
+                        if let Some((_, Some(old))) = masks.insert(self.id, (inputs, Some(image))) {
                             window.drop_image(old);
                         }
                     }
                     Err(error) => eprintln!("apps: mask: {error}"),
                 }
             }
-            masks.get(&self.id).map(|(_, image)| (image.clone(), bounds))
+            masks
+                .get(&self.id)
+                .and_then(|(_, image)| image.clone().map(|image| (image, bounds)))
         });
         // A hidden or transparent box filters nothing, so it skips the copy and blur of what is behind it.
         let shown = self.effects.unwrap_or(1.) > 0.
@@ -668,9 +713,16 @@ impl DomBox {
             key: self.composited.then_some(self.id as u64),
             ..Default::default()
         };
+        // WARNING: isolation only contains `mix-blend-mode`. It is no backdrop root, so without blending a group
+        // would hide what is behind from a `backdrop-filter` inside.
         let isolate = style
             .get(Prop::ISOLATION)
-            .is_some_and(|value| value == "isolate");
+            .is_some_and(|value| value == "isolate")
+            && host
+                .dom
+                .get(&view.id)
+                .and_then(|dom| dom.computed.as_ref())
+                .is_none_or(|styles| styles.blended());
         let needed = outer.transform.is_some()
             || outer.opacity < 1.
             || outer.blend_mode != renderer::BlendMode::Normal
@@ -743,14 +795,15 @@ fn mask_svg(
     for (index, image) in style::components(images, ',').into_iter().enumerate().rev() {
         let image = image.trim();
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-            let Some(path) = base
-                .and_then(|base| base.join(source.trim().trim_matches(['"', '\''])).ok())
-                .and_then(|url| match url.scheme() {
-                    "file" => url.to_file_path().ok(),
-                    "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
-                    _ => None,
-                })
-            else {
+            let source = source.trim().trim_matches(['"', '\'']);
+            let Some(path) = super::image::data_file(source).or_else(|| {
+                base.and_then(|base| base.join(source).ok())
+                    .and_then(|url| match url.scheme() {
+                        "file" => url.to_file_path().ok(),
+                        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
+                        _ => None,
+                    })
+            }) else {
                 continue;
             };
             let aspect = match pick(&sizes, index).as_str() {

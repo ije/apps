@@ -161,10 +161,19 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
 
 fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
     let hex = |color: u32| format!("#{color:06x}");
-    let edge = box_colors(look)
-        .0
-        .unwrap_or(if look.dark { 0x858585 } else { 0x767676 });
-    let accent = if look.hover && !look.disabled {
+    // Chromium's dark controls have solid disabled colors, and its light ones are 30% opaque.
+    let solid =
+        look.disabled && look.dark && matches!(look.control, Control::Check | Control::Radio);
+    let edge = if solid {
+        0x626262
+    } else {
+        box_colors(look)
+            .0
+            .unwrap_or(if look.dark { 0x858585 } else { 0x767676 })
+    };
+    let accent = if solid {
+        0x757575
+    } else if look.hover && !look.disabled {
         darken(look.accent)
     } else {
         look.accent
@@ -347,7 +356,7 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
         }
         Control::Button | Control::Field => return None,
     }
-    let opacity = if look.disabled {
+    let opacity = if look.disabled && !solid {
         r#" opacity=".3""#
     } else {
         ""

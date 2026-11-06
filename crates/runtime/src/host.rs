@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
 
+/// The page of a page worker's thread. It has no window, and windows don't use this id.
+pub(crate) const WORKER_PAGE: u64 = 0;
+
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -97,6 +100,8 @@ pub struct Host {
     pub app_path: PathBuf,
     pub paths: HashMap<String, PathBuf>,
     pub relaunch: Option<Vec<String>>,
+    /// `process.argv` of a script that `ELECTRON_RUN_AS_NODE` runs.
+    pub argv: Option<Vec<String>>,
     pub packaged: bool,
     /// Features that package.json disables, as bits by `bundle::FEATURES` index.
     pub disabled: u32,
@@ -535,7 +540,14 @@ impl Host {
                 })
             })();
             match result {
-                Ok(changed) => page.dirty |= changed,
+                // WARNING: the node of an offscreen canvas is never on the page, so making many must not cost frames.
+                Ok(changed) => {
+                    page.dirty |= changed
+                        && usize::try_from(a)
+                            .ok()
+                            .and_then(|id| doc.nodes.get(id))
+                            .is_none_or(|node| node.tag != "apps-canvas");
+                }
                 Err(error) => errors.push(error.to_string()),
             }
         }
@@ -557,6 +569,13 @@ impl Host {
         ensure!(self.enabled("webgpu"), "The webgpu feature is disabled");
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let result = self.graphics.entry(id).or_default().call(op, args)?;
+        // WARNING: a read of a WebGPU canvas keeps its frame in the page images, see `dom.canvasCommit`.
+        if op == "resetCanvas"
+            && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
+            && let Some(state) = self.dom.get_mut(&id)
+        {
+            state.images.remove(&node);
+        }
         if matches!(op, "submit" | "writeTexture" | "resetCanvas") {
             page.dirty = true;
         }
@@ -690,6 +709,74 @@ impl Host {
                 ]));
             }
             let state = self.dom.entry(id).or_default();
+            // WARNING: a worker has no window to share a text system with, so its first canvas makes one.
+            if id == WORKER_PAGE
+                && matches!(op, "dom.canvas" | "dom.measureText")
+                && state.text_system.is_none()
+            {
+                state.text_system = Some(std::rc::Rc::new(renderer::TextSystem::new()));
+            }
+            // WARNING: `dom.requestFrame` takes a text system to mean a window, so a worker's animation frames stay on their timer.
+            if id == WORKER_PAGE && op == "dom.requestFrame" {
+                return Ok(json!(false));
+            }
+            // WARNING: a WebGPU frame reaches the CPU some time after its submit, so with `args[1]` this waits for it, for reads.
+            if op == "dom.canvasCommit" {
+                let node = args[0].as_u64().context("Expected node id")? as usize;
+                let image = if let Some(canvas) = state.canvases.get(&node) {
+                    state
+                        .placeholders
+                        .contains_key(&node)
+                        .then(|| crate::render::canvas::render_image(&canvas.pixels))
+                } else if let Some(gpu) = self.graphics.get_mut(&id) {
+                    let start = std::time::Instant::now();
+                    loop {
+                        match gpu.image(node)? {
+                            Some(image)
+                                if state
+                                    .images
+                                    .get(&node)
+                                    .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &image)) =>
+                            {
+                                state.images.insert(node, image.clone());
+                                break Some(image);
+                            }
+                            _ if args[1] != true
+                                || start.elapsed() >= std::time::Duration::from_millis(100) =>
+                            {
+                                break None;
+                            }
+                            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let (Some(image), Some(placeholder)) = (image, state.placeholders.get(&node)) {
+                    placeholder.show(image);
+                }
+                return Ok(Value::Null);
+            }
+            if op == "dom.screen" {
+                let (display, work) = (state.window.display, state.window.work_area);
+                let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
+                // WARNING: a page without a window yet sees its viewport as the screen.
+                return Ok(if f32::from(display.size.width) > 0. {
+                    json!(
+                        [
+                            display.size.width,
+                            display.size.height,
+                            work.origin.x,
+                            work.origin.y,
+                            work.size.width,
+                            work.size.height
+                        ]
+                        .map(|value| f32::from(value).round())
+                    )
+                } else {
+                    json!([viewport[0], viewport[1], 0, 0, viewport[0], viewport[1]])
+                });
+            }
             if op == "dom.fonts" {
                 let system = state.text_system.clone();
                 crate::dom::styles(
@@ -737,6 +824,10 @@ impl Host {
             )
             .unwrap_or_else(|| Err(anyhow::anyhow!("Unknown DOM operation: {op}")));
             page.dirty |= std::mem::take(&mut state.dirty);
+            // WARNING: a worker has no renderer to drop images on the GPU, so nothing drains these.
+            if id == WORKER_PAGE {
+                state.retired.clear();
+            }
             if op == "dom.release"
                 && let Ok(ids) = &result
             {
@@ -854,8 +945,13 @@ impl Host {
                     .collect();
                 let locale = json!({"system":system,"languages":if languages.is_empty() {vec![system.clone()]} else {languages}});
                 let lossy = |value: std::ffi::OsString| value.to_string_lossy().into_owned();
-                let mut argv: Vec<_> = std::env::args_os().map(lossy).collect();
+                let node = self.argv.is_some();
+                let mut argv: Vec<_> = self
+                    .argv
+                    .clone()
+                    .unwrap_or_else(|| std::env::args_os().map(lossy).collect());
                 if !self.packaged
+                    && !node
                     && let Some(end) = argv.iter().position(|arg| arg == "--")
                 {
                     argv.drain(1..=end);
@@ -864,7 +960,7 @@ impl Host {
                     .map(|(name, value)| (lossy(name), lossy(value)))
                     .collect();
                 Ok(
-                    json!({"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
+                    json!({"node":node,"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
             "cwd" => Ok(json!(std::env::current_dir()?)),

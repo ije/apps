@@ -20,12 +20,13 @@ use core_graphics::{
     base::{CGFloat, CGGlyph, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
-    geometry::CGPoint,
+    geometry::{CGPoint, CGRect, CGSize},
 };
 use core_text::{
     font::CTFont,
     font_descriptor::{
-        kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
+        kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
+        kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -88,6 +89,10 @@ fn variation_weight(font: &CTFont) -> Option<f32> {
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
+#[allow(non_upper_case_globals)]
+const kCGImageAlphaNoneSkipFirst: u32 = 6;
+#[allow(non_upper_case_globals)]
+const kCGBitmapByteOrder32Little: u32 = 2 << 12;
 
 /// Fonts through font-kit, shaping through CoreText and glyphs through CoreGraphics.
 pub(crate) struct TextSystem(RefCell<AppleTextSystemState>);
@@ -121,7 +126,12 @@ static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
     // SAFETY: the function follows the Create Rule and returns an array of strings.
     let families: CFArray<CFString> =
         unsafe { CFArray::wrap_under_create_rule(CTFontManagerCopyAvailableFontFamilyNames()) };
-    families.iter().map(|name| name.to_string()).collect()
+    // WARNING: macOS leaves these out of the list, though it has them and browsers find them.
+    families
+        .iter()
+        .map(|name| name.to_string())
+        .chain(["Times".into(), "Courier".into()])
+        .collect()
 });
 
 impl TextSystem {
@@ -238,13 +248,43 @@ impl TextSystem {
     pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         let state = self.0.borrow();
         let font = &state.fonts[font_id.0];
+        let metrics = font_kit_metrics_to_metrics(font.metrics());
+        // Like Chromium, the em box comes from the typographic metrics in the OS/2 table.
+        let typo = font
+            .load_font_table(u32::from_be_bytes(*b"OS/2"))
+            .filter(|table| table.len() >= 72)
+            .map(|table| {
+                [68, 70].map(|at| f32::from(i16::from_be_bytes([table[at], table[at + 1]])))
+            })
+            .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.);
         FontMetrics {
             tall_ascent: matches!(
                 font.family_name().as_str(),
                 "Times" | "Helvetica" | "Courier"
             ),
-            ..font_kit_metrics_to_metrics(font.metrics())
+            em_ascent: typo.map_or(metrics.em_ascent, |[ascent, descent]| {
+                ascent / (ascent - descent)
+            }),
+            ..metrics
         }
+    }
+
+    pub fn glyph_bounds(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: f32,
+    ) -> Option<[f32; 4]> {
+        let state = self.0.borrow();
+        let font = &state.fonts[font_id.0];
+        let bounds = font.typographic_bounds(glyph_id.0).ok()?;
+        let scale = font_size / font.metrics().units_per_em as f32;
+        Some([
+            bounds.min_x() * scale,
+            bounds.max_x() * scale,
+            bounds.max_y() * scale,
+            bounds.min_y() * scale,
+        ])
     }
 
     pub fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -525,6 +565,9 @@ impl AppleTextSystemState {
 
             let mut bytes;
 
+            // WARNING: an alpha-only context makes glyphs about 17% heavier than an opaque one. Like Skia, antialiased
+            // text draws black on white in an opaque context, whose inverse is the mask.
+            let opaque_mask = !params.is_emoji && params.dilation == 0;
             let cx = if params.is_emoji {
                 bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
                 CGContext::create_bitmap_context(
@@ -535,6 +578,17 @@ impl AppleTextSystemState {
                     bitmap_size.width.0 as usize * 4,
                     &CGColorSpace::create_device_rgb(),
                     kCGImageAlphaPremultipliedLast,
+                )
+            } else if opaque_mask {
+                bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
+                CGContext::create_bitmap_context(
+                    Some(bytes.as_mut_ptr() as *mut _),
+                    bitmap_size.width.0 as usize,
+                    bitmap_size.height.0 as usize,
+                    8,
+                    bitmap_size.width.0 as usize * 4,
+                    &CGColorSpace::create_device_rgb(),
+                    kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
                 )
             } else {
                 bytes = vec![0; bitmap_size.width.0 as usize * bitmap_size.height.0 as usize];
@@ -549,15 +603,33 @@ impl AppleTextSystemState {
                 )
             };
 
+            if opaque_mask {
+                cx.set_gray_fill_color(1.0, 1.0);
+                cx.fill_rect(CGRect::new(
+                    &CGPoint::new(0., 0.),
+                    &CGSize::new(
+                        bitmap_size.width.0 as CGFloat,
+                        bitmap_size.height.0 as CGFloat,
+                    ),
+                ));
+                cx.set_allows_font_smoothing(false);
+                cx.set_should_smooth_fonts(false);
+            }
+
             // Bottom-left origin and scale, to match font-kit's `raster_bounds`.
             cx.translate(
                 -glyph_bounds.origin.x.0 as CGFloat,
                 (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
             );
-            cx.scale(
-                params.scale_factor as CGFloat,
-                params.scale_factor as CGFloat,
-            );
+            // WARNING: CoreText draws emoji larger under about 24 points, while Chromium draws them at device size.
+            // So they draw at twice the size or more, and they stay in proportion to the text at any scale.
+            let oversize = if params.is_emoji {
+                params.scale_factor.max(2.)
+            } else {
+                1.
+            };
+            let drawn = (params.scale_factor / oversize) as CGFloat;
+            cx.scale(drawn, drawn);
 
             let subpixel_shift = params
                 .subpixel_variant
@@ -577,7 +649,7 @@ impl AppleTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            self.sized(params.font_id, f32::from(params.font_size))
+            self.sized(params.font_id, f32::from(params.font_size) * oversize)
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
                     &[CGPoint::new(
@@ -587,6 +659,14 @@ impl AppleTextSystemState {
                     cx,
                 );
 
+            if opaque_mask {
+                bytes = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| 255 - pixel[1])
+                    .collect();
+            }
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
                 for pixel in bytes.as_chunks_mut::<4>().0 {
@@ -651,6 +731,8 @@ impl AppleTextSystemState {
         let glyph_runs = line.glyph_runs();
         let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
         let mut ix_converter = StringIndexConverter::new(text);
+        let mut shift = 0f32;
+        let mut emoji_end = None;
         for run in glyph_runs.into_iter() {
             let attributes = run.attributes().unwrap();
             let font = unsafe {
@@ -678,11 +760,22 @@ impl AppleTextSystemState {
                 Some((_, font_id)) => *font_id,
                 None => {
                     let font_id = self.id_for_native_font(font.clone());
-                    self.natives.insert(key, (font, font_id));
+                    self.natives.insert(key, (font.clone(), font_id));
                     font_id
                 }
             };
             let is_emoji = self.is_emoji(font_id);
+            // Emoji take the advance of the size they draw at, see `rasterize_glyph`.
+            // WARNING: the emoji font that system fonts fall back to has wider advances than Chromium's.
+            let doubled = is_emoji
+                .then(|| {
+                    core_text::font::new_from_name(
+                        "AppleColorEmoji",
+                        f64::from(f32::from(run_size)) * 2.,
+                    )
+                    .ok()
+                })
+                .flatten();
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id && run.font_size == run_size => &mut run.glyphs,
@@ -702,19 +795,41 @@ impl AppleTextSystemState {
                 .zip(run.string_indices().iter())
             {
                 ix_converter.seek_to_utf16_ix(usize::try_from(glyph_utf16_ix).unwrap());
+                if let Some(end) = emoji_end.take() {
+                    shift = end - position.x as f32;
+                }
+                let x = position.x as f32 + shift;
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
-                    position: point(position.x as f32, position.y as f32).map(px),
+                    position: point(x, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
                     is_emoji,
                 });
+                if let Some(doubled) = &doubled {
+                    // SAFETY: the pointer is to one glyph, and the advances can be null.
+                    let drawn = unsafe {
+                        doubled.get_advances_for_glyphs(
+                            kCTFontOrientationDefault,
+                            &glyph_id,
+                            std::ptr::null_mut(),
+                            1,
+                        )
+                    } as f32;
+                    // WARNING: where CoreText enlarges emoji, Chromium's advance is one device pixel less.
+                    let drawn = if drawn > f32::from(run_size) * 2. {
+                        drawn - 1.
+                    } else {
+                        drawn
+                    };
+                    emoji_end = Some(x + drawn / 2.);
+                }
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
         LineLayout {
             runs,
             font_size,
-            width: typographic_bounds.width.into(),
+            width: px(emoji_end.unwrap_or(typographic_bounds.width as f32 + shift)),
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
@@ -766,6 +881,7 @@ fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
         cap_height: metrics.cap_height,
         x_height: metrics.x_height,
         tall_ascent: false,
+        em_ascent: metrics.ascent / (metrics.ascent - metrics.descent),
         bounding_box: bounds_from_rect(metrics.bounding_box),
     }
 }

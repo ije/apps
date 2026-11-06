@@ -266,7 +266,9 @@ mod tests {
         // The face that covers more of the page text loads first, so the other one loads last.
         assert_eq!(state.font_aliases["Ranked"], "H2O Test CFF");
         let width = |state: &State, font: &str, text: &str| {
-            crate::render::canvas::line(&system, &state.font_aliases, font, text).width
+            crate::render::canvas::line(&system, &state.font_aliases, font, text, [0.; 2])
+                .0
+                .width
         };
         for family in ["Fallback", "Brand", "Ranked"] {
             assert_eq!(

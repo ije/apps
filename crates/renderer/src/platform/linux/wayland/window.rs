@@ -262,6 +262,12 @@ impl Window {
         let state = self.shared.state.borrow();
         // Wayland windows don't know where they are.
         let bounds = Bounds::new(point(px(0.), px(0.)), state.size);
+        let display = self
+            .shared
+            .client
+            .upgrade()
+            .and_then(|client| client.primary_display_bounds())
+            .unwrap_or_default();
         WindowState {
             frame: bounds,
             content: bounds,
@@ -270,6 +276,8 @@ impl Window {
             fullscreen: state.fullscreen,
             visible: self.shared.shown.get() && !state.suspended,
             resizing: state.resizing,
+            display,
+            work_area: display,
         }
     }
 

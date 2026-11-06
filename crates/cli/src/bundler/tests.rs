@@ -1559,12 +1559,12 @@ fn unsupported_electron_exports_fail_at_build_time() {
     let entry = dir.path().join("main.js");
     for (source, error) in [
         (
-            "import {app, autoUpdater} from 'electron'; app.quit();",
-            "electron.autoUpdater is not supported",
+            "import {app, crashReporter} from 'electron'; app.quit();",
+            "electron.crashReporter is not supported",
         ),
         (
-            "import {protocol} from '@pierre/apps';",
-            "@pierre/apps.protocol is not supported",
+            "import {utilityProcess} from '@pierre/apps';",
+            "@pierre/apps.utilityProcess is not supported",
         ),
     ] {
         fs::write(&entry, source).unwrap();
@@ -1714,6 +1714,24 @@ fn nearest_package_version_reaches_dev_and_production_apps() {
 }
 
 #[test]
+fn import_meta_resolve_makes_a_script_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.js");
+    fs::write(dir.path().join("server.ts"), "console.log(1 as number);").unwrap();
+    let files = compile(
+        &entry,
+        Realm::Main,
+        Some("globalThis.url = import.meta.resolve('./server.ts');".into()),
+        Rc::default(),
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(files["app.js"].contains("apps:///script-0.js"));
+    assert!(files.contains_key("script-0.js"));
+}
+
+#[test]
 fn rejects_unsupported_import_meta_resolve() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("app.js");
@@ -1725,14 +1743,14 @@ fn rejects_unsupported_import_meta_resolve() {
             "one string literal",
         ),
         (
-            "import.meta.resolve('./app.js')",
+            "import.meta.resolve('./missing.js')",
             Realm::Main,
-            "only supports HTML",
+            "Cannot resolve",
         ),
         (
             "import.meta.resolve('https://example.com/index.html')",
             Realm::Main,
-            "local HTML path",
+            "local path",
         ),
         (
             "import.meta.resolve('./missing.html')",

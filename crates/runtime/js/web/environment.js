@@ -213,9 +213,11 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
   const navigate = (url, replace = false, reload = false) => {
     const target = new URL(String(url), current), oldURL = current.href;
     if (!reload && target.href.split('#')[0] === current.href.split('#')[0]) {
-      current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); } changed(oldURL);
+      current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); } dispatchEvent(Object.assign(new Event('popstate'), { state: null })); changed(oldURL); entryChanged();
     } else call('dom.navigate', target.href, replace, reload);
   };
+  // WARNING: URL origins of non-special schemes are opaque, but code uses `location.origin` as a base URL, as with a privileged Electron scheme.
+  const originOf = url => url.protocol === 'apps:' ? 'apps://app' : url.protocol === 'file:' ? 'file://' : url.origin;
   class Location {
     assign(url) { navigate(url); }
     replace(url) { navigate(url, true); }
@@ -223,18 +225,44 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
     toString() { return current.href; }
     valueOf() { return this.toString(); }
   }
-  for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(Location.prototype, name, { enumerable: true, get: () => current[name], ...(name === 'origin' ? {} : { set: value => { const url = new URL(current); url[name] = value; navigate(url); } }) });
+  for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(Location.prototype, name, { enumerable: true, get: () => name === 'origin' ? originOf(current) : current[name], ...(name === 'origin' ? {} : { set: value => { const url = new URL(current); url[name] = value; if (name !== 'hash' || url.hash !== current.hash) navigate(url); } }) });
   class History {
     get length() { return entries.length; }
     get state() { return clone(entries[position].state); }
     scrollRestoration = 'auto';
     pushState(state, _, url) { this._set(state, url, false); }
     replaceState(state, _, url) { this._set(state, url, true); }
-    _set(state, url, replace) { const target = url === undefined || url === null ? new URL(current) : new URL(String(url), current); if (target.origin !== current.origin || target.protocol !== current.protocol || target.host !== current.host) throw fail('SecurityError'); const entry = { url: target.href, state: clone(state) }; current = target; if (replace) entries[position] = entry; else { entries.splice(++position); entries.push(entry); } }
-    go(delta = 0) { delta = Math.trunc(Number(delta) || 0); if (!delta) { navigate(current.href, true, true); return; } const next = position + delta; if (next < 0 || next >= entries.length) return; setTimeout(() => { const oldURL = current.href; position = next; current = new URL(entries[position].url); dispatchEvent(Object.assign(new Event('popstate'), { state: this.state })); changed(oldURL); }, 0); }
+    _set(state, url, replace) { const target = url === undefined || url === null ? new URL(current) : new URL(String(url), current); if (target.origin !== current.origin || target.protocol !== current.protocol || target.host !== current.host) throw fail('SecurityError'); const entry = { url: target.href, state: clone(state) }; current = target; if (replace) entries[position] = entry; else { entries.splice(++position); entries.push(entry); } entryChanged(); }
+    go(delta = 0) { delta = Math.trunc(Number(delta) || 0); if (!delta) { navigate(current.href, true, true); return; } const next = position + delta; if (next < 0 || next >= entries.length) return; setTimeout(() => { const oldURL = current.href; position = next; current = new URL(entries[position].url); dispatchEvent(Object.assign(new Event('popstate'), { state: this.state })); changed(oldURL); entryChanged(); }, 0); }
     back() { this.go(-1); }
     forward() { this.go(1); }
   }
-  Object.assign(globalThis, { Location, History, location: new Location(), history: new History() });
+  class NavigationHistoryEntry extends EventTarget {
+    #index; #entry;
+    constructor(index, entry) { super(); this.#index = index; this.#entry = entry; entry.key ??= crypto.randomUUID(); }
+    get key() { return this.#entry.key; }
+    get id() { return this.#entry.key; }
+    get url() { return this.#entry.url; }
+    get index() { return this.#index; }
+    get sameDocument() { return true; }
+    getState() { return clone(this.#entry.state); }
+  }
+  class Navigation extends EventTarget {
+    get canGoBack() { return position > 0; }
+    get canGoForward() { return position < entries.length - 1; }
+    get currentEntry() { return new NavigationHistoryEntry(position, entries[position]); }
+    get transition() { return null; }
+    entries() { return entries.map((entry, index) => new NavigationHistoryEntry(index, entry)); }
+    #result() { const done = Promise.resolve(this.currentEntry); return { committed: done, finished: done }; }
+    navigate(url, options = {}) { navigate(url, options.history === 'replace'); return this.#result(); }
+    reload() { navigate(current.href, true, true); return this.#result(); }
+    back() { history.back(); return this.#result(); }
+    forward() { history.forward(); return this.#result(); }
+    traverseTo(key) { const index = entries.findIndex(entry => entry.key === key); if (index >= 0) history.go(index - position); return this.#result(); }
+    updateCurrentEntry({ state }) { entries[position].state = clone(state); entryChanged(); }
+  }
+  const navigation = new Navigation();
+  function entryChanged() { navigation.dispatchEvent(new Event('currententrychange')); }
+  Object.assign(globalThis, { Location, History, Navigation, NavigationHistoryEntry, location: new Location(), history: new History(), navigation });
   globalThis.__appsSetLocation = url => { current = new URL(String(url)); entries = [{ url: current.href, state: null }]; position = 0; };
 };

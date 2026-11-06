@@ -178,9 +178,20 @@ impl Drop for Listening {
     }
 }
 
+/// The bundled assets of the app, which pages and workers of any thread can fetch.
+pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+/// The `localNetwork` feature: pages may reach private networks, for apps with servers in child processes or on a LAN.
+pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // WARNING: pages can't reach private networks, but they may reach loopback ports that this app listens on, so a page
 // can call the app's own server.
 pub(crate) fn own_server(url: &Url) -> bool {
+    if LOCAL_NETWORK.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let loopback = match url.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -255,6 +266,7 @@ impl tower_service::Service<Name> for Dns {
         Box::pin(async move {
             let addresses: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
             if public
+                && !LOCAL_NETWORK.load(std::sync::atomic::Ordering::Relaxed)
                 && (addresses.is_empty()
                     || addresses
                         .iter()
@@ -401,6 +413,15 @@ impl State {
                     String::from_utf8_lossy(&bytes[..end]),
                     bytes.len() - end
                 ]))
+            }
+            "asset" => {
+                let url = Url::parse(args[0].as_str().context("Expected URL")?)?;
+                let name = url.path().trim_start_matches('/');
+                let path = ASSETS.get().and_then(|assets| assets.get(name));
+                Ok(match path.map(std::fs::read) {
+                    Some(Ok(data)) => base64(&data),
+                    _ => Value::Null,
+                })
             }
             "fetch.start" => {
                 ensure!(self.fetches.len() < 256, "Too many active fetch requests");
@@ -620,6 +641,9 @@ impl State {
             _ if op.starts_with("worker.") => self.workers.call(&op[7..], args),
             _ if op.starts_with("tcp.") => self.tcp.call(&op[4..], args),
             _ if op.starts_with("storage.") => self.storage.call(&op[8..], args),
+            "cpus" => Ok(std::thread::available_parallelism()
+                .map_or(1, |count| count.get())
+                .into()),
             _ => bail!("Unknown web operation: {op}"),
         }
     }

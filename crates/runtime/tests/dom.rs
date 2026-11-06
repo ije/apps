@@ -1012,6 +1012,294 @@ fn shadow_cycles_child_access_release_and_retired_images() {
     assert_eq!(host.borrow().dom[&1].retired.len(), 3);
 }
 
+fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
+    let (wake, woken) = std::sync::mpsc::channel();
+    apps_runtime::host::Waker::install(move || {
+        let _ = wake.send(());
+    });
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body><canvas id=shown width=8 height=8></canvas></body>"),
+            dirty: false,
+        },
+    );
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine
+        .eval(
+            &format!(
+                r#"globalThis.testResult = 'pending';
+                const worker = code => new Worker('data:text/javascript,' + encodeURIComponent(code));
+                const reply = target => new Promise((resolve, reject) => {{ target.onmessage = event => resolve(event.data); target.onerror = event => reject(event.error ?? Error(event.message)); target.addEventListener('error', event => reject(event.error ?? Error('worker failed'))); }});
+                const rgba = (bitmap, x = 0, y = 0) => {{ const canvas = new OffscreenCanvas(bitmap.width, bitmap.height), context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0); return [...context.getImageData(x, y, 1, 1).data].join(); }};
+                const same = (actual, expected, name) => {{ actual = JSON.stringify(actual); expected = JSON.stringify(expected); if (actual !== expected) throw Error(name + ': ' + actual + ' is not ' + expected); }};
+                const rejected = async (run, name) => {{ try {{ await run(); }} catch (error) {{ if (error.name !== name) throw Error('Expected ' + name + ', got ' + error); return; }} throw Error('Expected ' + name); }};
+                (async () => {{ {source} }})().then(() => {{ testResult = 'ok'; }}, error => {{ testResult = error + '\n' + error?.stack; }});"#
+            ),
+            "test",
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result = loop {
+        let result = engine.eval("testResult", "test").unwrap();
+        if result != "pending" {
+            break result;
+        }
+        let _ = woken.recv_timeout(std::time::Duration::from_millis(2));
+        engine.tick().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "Test timed out"
+        );
+    };
+    (host, engine, result)
+}
+
+#[test]
+fn screen_describes_the_viewport_without_a_window() {
+    let (.., result) = offscreen_page(
+        r#"
+        same([screen.width, screen.height, screen.availWidth, screen.availHeight, screen.availLeft, screen.availTop], [800, 600, 800, 600, 0, 0], 'size');
+        same([screen.colorDepth, screen.pixelDepth, screen.orientation.type, screen.orientation.angle], [24, 24, 'landscape-primary', 0], 'depth');
+        if (!(screen instanceof Screen) || !(screen.orientation instanceof ScreenOrientation) || window.screen !== screen) throw Error('types');
+        if (String(screen) !== '[object Screen]' || screen.onchange !== null || !(screen instanceof EventTarget)) throw Error('events');
+        await rejected(() => screen.orientation.lock('portrait'), 'NotSupportedError');
+        const inner = await reply(worker(`postMessage([typeof screen, typeof OffscreenCanvas, typeof createImageBitmap, typeof ImageBitmap])`));
+        same(inner, ['undefined', 'function', 'function', 'function'], 'worker globals');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn offscreen_canvas_draws_reads_and_resizes() {
+    let (.., result) = offscreen_page(
+        r#"
+        same(typeof OffscreenCanvas, 'function', 'global');
+        const canvas = new OffscreenCanvas(4.7, 2), context = canvas.getContext('2d');
+        same([canvas.width, canvas.height, String(canvas), context.canvas === canvas, context instanceof OffscreenCanvasRenderingContext2D, canvas.getContext('2d') === context, canvas.getContext('webgpu'), new OffscreenCanvas(1, 1).getContext('webgl2')], [4, 2, '[object OffscreenCanvas]', true, true, true, null, null], 'object');
+        for (const size of [-1, NaN, Infinity]) { try { new OffscreenCanvas(size, 1); } catch (error) { if (error instanceof TypeError) continue; } throw Error('size ' + size); }
+        try { new OffscreenCanvas(1); throw Error('one size'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+        context.fillStyle = '#ff0000'; context.fillRect(0, 0, 2, 2);
+        same([...context.getImageData(1, 1, 1, 1).data], [255, 0, 0, 255], 'pixels');
+        const element = document.createElement('canvas'); element.width = element.height = 4; const other = element.getContext('2d'); other.drawImage(canvas, 2, 2);
+        same([...other.getImageData(3, 3, 1, 1).data], [255, 0, 0, 255], 'drawn on a canvas');
+        const blob = await canvas.convertToBlob({ type: 'image/jpeg' });
+        same(blob.type, 'image/png', 'blob type');
+        same([...new Uint8Array(await blob.arrayBuffer()).subarray(0, 4)], [137, 80, 78, 71], 'png');
+        context.fillStyle = '#00ff00'; canvas.width = 6;
+        same([canvas.width, [...context.getImageData(0, 0, 1, 1).data]], [6, [0, 0, 0, 0]], 'resize clears');
+        same(context.fillStyle, '#000000', 'resize resets the state');
+
+        const empty = new OffscreenCanvas(0, 0), blank = empty.getContext('2d'); blank.fillRect(0, 0, 1, 1); blank._flush();
+        await rejected(() => empty.convertToBlob(), 'IndexSizeError');
+        await rejected(async () => empty.transferToImageBitmap(), 'InvalidStateError');
+        await rejected(async () => new OffscreenCanvas(1, 1).transferToImageBitmap(), 'InvalidStateError');
+
+        const moved = new OffscreenCanvas(2, 2), drawing = moved.getContext('2d');
+        drawing.fillStyle = '#0000ff'; drawing.translate(1, 0); drawing.fillRect(0, 0, 1, 1);
+        const taken = moved.transferToImageBitmap();
+        same([taken.width, taken.height, rgba(taken, 1, 0), rgba(taken, 0, 0)], [2, 2, '0,0,255,255', '0,0,0,0'], 'bitmap');
+        same([...drawing.getImageData(1, 0, 1, 1).data], [0, 0, 0, 0], 'the canvas is blank after the transfer');
+        drawing.fillRect(0, 1, 1, 1);
+        same([...drawing.getImageData(1, 1, 1, 1).data], [0, 0, 255, 255], 'the drawing state survives the transfer');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn create_image_bitmap_takes_all_sources() {
+    let (.., result) = offscreen_page(
+        r#"
+        const sample = new OffscreenCanvas(2, 1); sample.getContext('2d').fillRect(0, 0, 1, 1);
+        const png = new Uint8Array(await (await sample.convertToBlob()).arrayBuffer());
+        const fromBlob = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+        same([fromBlob.width, fromBlob.height, fromBlob instanceof ImageBitmap, String(fromBlob)], [2, 1, true, '[object ImageBitmap]'], 'blob');
+        await rejected(() => createImageBitmap(new Blob([new Uint8Array(4)])), 'InvalidStateError');
+        const svg = await createImageBitmap(new Blob(['<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><rect width="3" height="2" fill="blue"/></svg>'], { type: 'image/svg+xml' }));
+        same([svg.width, svg.height, rgba(svg, 1, 1)], [3, 2, '0,0,255,255'], 'svg');
+
+        const data = new ImageData(new Uint8ClampedArray([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255]), 2, 2);
+        const bitmap = await createImageBitmap(data);
+        same([bitmap.width, bitmap.height, rgba(bitmap, 0, 0), rgba(bitmap, 1, 0), rgba(bitmap, 0, 1), rgba(bitmap, 1, 1)], [2, 2, '255,0,0,255', '0,255,0,255', '0,0,255,255', '255,255,255,255'], 'ImageData is exact');
+        const crop = await createImageBitmap(data, 1, 0, 1, 2);
+        same([crop.width, crop.height, rgba(crop, 0, 0), rgba(crop, 0, 1)], [1, 2, '0,255,0,255', '255,255,255,255'], 'crop');
+        const negative = await createImageBitmap(data, 2, 2, -1, -1);
+        same([negative.width, negative.height, rgba(negative)], [1, 1, '255,255,255,255'], 'negative crop');
+        const outside = await createImageBitmap(data, -1, 0, 2, 1);
+        same([outside.width, rgba(outside, 0, 0), rgba(outside, 1, 0)], [2, '0,0,0,0', '255,0,0,255'], 'a crop outside the image is transparent');
+        const flipped = await createImageBitmap(data, { imageOrientation: 'flipY' });
+        same(rgba(flipped, 0, 0), '0,0,255,255', 'flipY');
+        const large = await createImageBitmap(data, { resizeWidth: 4, resizeQuality: 'pixelated' });
+        same([large.width, large.height, rgba(large, 3, 3)], [4, 4, '255,255,255,255'], 'resize');
+        const small = await createImageBitmap(data, { resizeHeight: 1 });
+        same([small.width, small.height], [1, 1], 'resize keeps the ratio');
+        const copy = await createImageBitmap(bitmap);
+        const canvas = new OffscreenCanvas(1, 1), context = canvas.getContext('2d'); context.fillStyle = '#123456'; context.fillRect(0, 0, 1, 1);
+        const fromCanvas = await createImageBitmap(canvas); context.fillStyle = '#ffffff'; context.fillRect(0, 0, 1, 1);
+        same([rgba(copy), rgba(fromCanvas)], ['255,0,0,255', '18,52,86,255'], 'bitmaps copy their source');
+        const element = document.createElement('canvas'); element.width = element.height = 1; element.getContext('2d').fillRect(0, 0, 1, 1);
+        same(rgba(await createImageBitmap(element)), '0,0,0,255', 'canvas element');
+        const image = new Image(); image.src = 'data:image/png;base64,' + btoa(String.fromCharCode(...png));
+        await rejected(() => createImageBitmap(new Image()), 'InvalidStateError');
+        await image.decode();
+        same((await createImageBitmap(image)).width, 2, 'image element');
+        await rejected(() => createImageBitmap(document.createElement('video')), 'InvalidStateError');
+
+        await rejected(() => createImageBitmap({}), 'TypeError');
+        await rejected(() => createImageBitmap(data, 0, 0), 'TypeError');
+        await rejected(() => createImageBitmap(data, 0, 0, 0, 1), 'RangeError');
+        await rejected(() => createImageBitmap(data, { resizeWidth: 0 }), 'InvalidStateError');
+        await rejected(() => createImageBitmap(new OffscreenCanvas(0, 1)), 'InvalidStateError');
+        try { new ImageBitmap(); throw Error('constructor'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+
+        const target = new OffscreenCanvas(2, 2), drawing = target.getContext('2d');
+        drawing.drawImage(bitmap, 0, 0); bitmap.close();
+        same([...drawing.getImageData(1, 1, 1, 1).data], [255, 255, 255, 255], 'a draw before close() keeps its pixels');
+        same([bitmap.width, bitmap.height], [0, 0], 'close');
+        bitmap.close();
+        try { drawing.drawImage(bitmap, 0, 0); throw Error('drew a closed bitmap'); } catch (error) { if (error.name !== 'InvalidStateError') throw error; }
+        await rejected(() => createImageBitmap(bitmap), 'InvalidStateError');
+
+        const shown = document.createElement('canvas'); shown.width = shown.height = 2;
+        const renderer = shown.getContext('bitmaprenderer');
+        const source = await createImageBitmap(data);
+        renderer.transferFromImageBitmap(source);
+        same(source.width, 0, 'the bitmap moves');
+        same(shown.toDataURL().startsWith('data:image/png'), true, 'bitmaprenderer shows');
+        const read = shown.ownerDocument.createElement('canvas'); read.width = read.height = 2; const reader = read.getContext('2d'); reader.drawImage(shown, 0, 0);
+        same([...reader.getImageData(1, 0, 1, 1).data], [0, 255, 0, 255], 'bitmaprenderer pixels');
+        renderer.transferFromImageBitmap(null);
+        reader.clearRect(0, 0, 2, 2); reader.drawImage(shown, 0, 0);
+        same([...reader.getImageData(1, 0, 1, 1).data], [0, 0, 0, 0], 'bitmaprenderer clears');
+        try { renderer.transferFromImageBitmap({}); throw Error('object'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn bitmaps_and_canvases_move_between_threads() {
+    let (host, engine, result) = offscreen_page(
+        r#"
+        const data = new ImageData(new Uint8ClampedArray([255,0,0,128, 0,255,0,255]), 2, 1);
+        const original = await createImageBitmap(data);
+        const before = rgba(original);
+        const cloned = structuredClone(original);
+        same([cloned.width, rgba(cloned)], [2, before], 'structured clone');
+        const moved = structuredClone(original, { transfer: [original] });
+        same([original.width, moved.width, rgba(moved)], [0, 2, before], 'structured clone transfer');
+        try { structuredClone(moved, { transfer: [moved, moved] }); throw Error('twice'); } catch (error) { if (error.name !== 'DataCloneError') throw error; }
+
+        const echo = worker(`onmessage = async ({ data }) => {
+          const canvas = new OffscreenCanvas(data.width, data.height), context = canvas.getContext('2d');
+          context.drawImage(data, 0, 0);
+          const pixel = [...context.getImageData(0, 0, 1, 1).data];
+          context.fillStyle = '#0000ff'; context.fillRect(1, 0, 1, 1);
+          const bitmap = canvas.transferToImageBitmap(), blob = await createImageBitmap(await new OffscreenCanvas(2, 1).convertToBlob());
+          const text = new OffscreenCanvas(32, 16), writer = text.getContext('2d'); writer.fillText('Hi', 2, 12);
+          const ink = writer.getImageData(0, 0, 32, 16).data.some(value => value), width = writer.measureText('Hi').width;
+          await new Promise(requestAnimationFrame);
+          postMessage({ pixel, bitmap, sizes: [blob.width, blob.height], ink, width }, [bitmap]);
+        };`);
+        const answer = reply(echo);
+        echo.postMessage(moved, [moved]);
+        same(moved.width, 0, 'transfer detaches');
+        const { pixel, bitmap, sizes, ink, width } = await answer;
+        same([pixel, rgba(bitmap, 1, 0), sizes], [[...before.split(',').map(Number)].map((v, i) => i < 3 ? pixel[i] : v), '0,0,255,255', [2, 1]], 'worker bitmap');
+        if (!ink || !(width > 0)) throw Error('worker text: ' + ink + ' ' + width);
+        await echo.terminate();
+
+        const shown = document.getElementById('shown');
+        const offscreen = shown.transferControlToOffscreen();
+        same([offscreen.width, offscreen.height], [8, 8], 'placeholder size');
+        for (const run of [() => shown.getContext('2d'), () => { shown.width = 1; }, () => shown.transferControlToOffscreen()]) { try { run(); throw Error('placeholder was usable'); } catch (error) { if (error.name !== 'InvalidStateError') throw error; } }
+        try { worker('').postMessage(offscreen); throw Error('copied'); } catch (error) { if (error.name !== 'DataCloneError') throw error; }
+        const drawer = worker(`onmessage = ({ data }) => {
+          const context = data.getContext('2d'); context.fillStyle = '#00ff00'; context.fillRect(0, 0, 16, 4);
+          data.width = 16; data.height = 4;
+          context.fillStyle = '#00ff00'; context.fillRect(0, 0, 16, 4);
+          postMessage([data.width, data.height]);
+        };`);
+        const drawn = reply(drawer);
+        drawer.postMessage(offscreen, [offscreen]);
+        same([offscreen.width, await drawn], [0, [16, 4]], 'transfer to a worker');
+        for (let i = 0; i < 2000 && shown.width !== 16; i++) await new Promise(resolve => setTimeout(resolve, 1));
+        same([shown.width, shown.height], [16, 4], 'the placeholder follows the frame');
+        const read = new OffscreenCanvas(16, 4), reader = read.getContext('2d'); reader.drawImage(shown, 0, 0);
+        same([...reader.getImageData(15, 3, 1, 1).data], [0, 255, 0, 255], 'the placeholder shows the frame');
+        same(shown.toDataURL().startsWith('data:image/png'), true, 'placeholder png');
+        globalThis.placeholder = shown._id;
+        await drawer.terminate();
+
+        const local = document.createElement('canvas'); local.width = local.height = 2; document.body.append(local);
+        const same_thread = local.transferControlToOffscreen(), ownContext = same_thread.getContext('2d');
+        ownContext.fillStyle = '#ff00ff'; ownContext.fillRect(0, 0, 2, 2); ownContext._flush();
+        globalThis.local = local._id;
+    "#,
+    );
+    assert_eq!(result, "ok");
+    let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
+    let host = host.borrow();
+    let dom = &host.dom[&1];
+    assert_eq!(u32::from(dom.images[&node("placeholder")].size().width), 16);
+    assert!(host.pages[&1].dirty);
+    let local = &dom.canvases[&node("local")];
+    assert_eq!(local.image.bytes()[..4], [255, 0, 255, 255]);
+}
+
+#[test]
+fn bitmaps_free_their_pixels() {
+    let (host, engine, result) = offscreen_page(
+        r#"
+        globalThis.closed = await createImageBitmap(new ImageData(1, 1));
+        globalThis.closedId = closed._id;
+        closed.close();
+    "#,
+    );
+    assert_eq!(result, "ok");
+    let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
+    assert!(!host.borrow().dom[&1].canvases.contains_key(&id));
+    // An offscreen canvas keeps no copy to show and costs the page no frames.
+    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
+    let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
+    {
+        let host = host.borrow();
+        assert!(!host.pages[&1].dirty);
+        assert!(!host.dom[&1].canvases[&kept].present);
+        assert_eq!(host.dom[&1].canvases[&kept].pixels.pixels()[0].alpha(), 255);
+    }
+    // Bitmaps that nobody closes go with a GC, which their pixels bring on.
+    engine
+        .eval(
+            r#"globalThis.source = new OffscreenCanvas(1024, 1024); source.getContext('2d').fillRect(0, 0, 1024, 1024);
+            globalThis.drop = () => { createImageBitmap(source).catch(error => console.error(error)); };"#,
+            "test",
+        )
+        .unwrap();
+    let (mut most, mut made) = (0, 0);
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(3) {
+        engine.eval("drop()", "test").unwrap();
+        made += 1;
+        engine.tick().unwrap();
+        most = most.max(host.borrow().dom[&1].canvases.len());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        most * 2 < made,
+        "{most} of {made} unclosed bitmaps stayed alive"
+    );
+}
+
 #[test]
 fn images_decode_on_workers_and_load_after_a_wake() {
     let (wake, woken) = std::sync::mpsc::channel();

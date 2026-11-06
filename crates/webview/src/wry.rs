@@ -307,6 +307,8 @@ impl Browser {
             }
             "focus" => self.view.focus()?,
             "zoom" => self.view.zoom(arguments.as_f64().unwrap())?,
+            // WARNING: wry has no per-view color scheme, so guests follow the system.
+            "appearance" => {}
             _ => {
                 return self
                     .window

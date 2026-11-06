@@ -4,14 +4,11 @@
 //! Tool calls run on the main thread in `Desktop::drive`, or in `paused` while the debugger holds the thread.
 
 use super::{Desktop, link::Link, png, window_state};
-use crate::{
-    host::Role,
-    jsc,
-};
+use crate::{host::Role, jsc};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use renderer::{
-    App, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, ScrollDelta, ScrollPhase, ScrollWheelEvent, point, px,
+    App, FileDropEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PlatformInput, ScrollDelta, ScrollPhase, ScrollWheelEvent, point, px,
 };
 use serde_json::{Value, json};
 use std::{
@@ -89,7 +86,9 @@ impl Handle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(key, sender);
-        CHANNEL.with(|channel| channel.set((calls, self.1.clone(), key))).ok();
+        CHANNEL
+            .with(|channel| channel.set((calls, self.1.clone(), key)))
+            .ok();
     }
 }
 
@@ -98,7 +97,10 @@ pub(crate) fn uninstall() {
     if let Some(pages) = PAGES.get()
         && let Some(key) = CHANNEL.with(|channel| channel.get().map(|(_, _, key)| *key))
     {
-        pages.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
+        pages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
     }
 }
 
@@ -252,11 +254,7 @@ fn serve(mut stream: TcpStream, route: &Route, shared: &Shared) -> Result<()> {
     }
 }
 
-fn rpc(
-    request: &Value,
-    route: &Route,
-    shared: &Shared,
-) -> Option<Value> {
+fn rpc(request: &Value, route: &Route, shared: &Shared) -> Option<Value> {
     let id = request.get("id")?.clone();
     let params = &request["params"];
     let result = match request["method"].as_str().unwrap_or("") {
@@ -302,7 +300,9 @@ fn call(tool: &str, args: Value, route: &Route, shared: &Shared) -> Result<Value
         let mut list = Vec::new();
         for key in keys {
             // A stuck window must not hide the others.
-            if let Ok(Value::Array(windows)) = dispatch(tool, args.clone(), Some(key), route, shared) {
+            if let Ok(Value::Array(windows)) =
+                dispatch(tool, args.clone(), Some(key), route, shared)
+            {
                 list.extend(windows);
             }
         }
@@ -421,14 +421,18 @@ fn tools() -> Value {
             "styles": {"description": "true for all computed styles, or a list of property names.", "anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]},
             "max_length": {"type": "integer", "description": "Maximum HTML length. Default 20000."},
         }}},
-        {"name": "input", "description": "Sends real mouse and keyboard input to a window: click, move, scroll, key (for example `enter`, `cmd-a`, `shift-tab`) or type (text into the focused element).", "inputSchema": {"type": "object", "properties": {
+        {"name": "input", "description": "Sends real mouse and keyboard input to a window: click, move, press, pressed_move and release for a paced drag, drag (from x, y to to_x, to_y), drop (paths dragged from another app, from x, y to to_x, to_y, canceled with leave), scroll, key (for example `enter`, `cmd-a`, `shift-tab`) or type (text into the focused element).", "inputSchema": {"type": "object", "properties": {
             "window": page,
-            "action": {"type": "string", "enum": ["click", "move", "scroll", "key", "type"]},
+            "action": {"type": "string", "enum": ["click", "move", "press", "pressed_move", "release", "drag", "drop", "scroll", "key", "type"]},
             "selector": {"type": "string", "description": "Element to point at. Its center is used."},
             "x": {"type": "number"}, "y": {"type": "number"},
             "button": {"type": "string", "enum": ["left", "right", "middle"]},
             "count": {"type": "integer", "description": "Click count. 2 is a double click."},
             "key": {"type": "string"}, "text": {"type": "string"},
+            "to_x": {"type": "number"}, "to_y": {"type": "number"},
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "Files that a drop action carries."},
+            "leave": {"type": "boolean", "description": "A drop action leaves the window instead of dropping."},
+            "hold": {"type": "boolean", "description": "A drop action stays over the window, to look at the page during the drag."},
             "delta_x": {"type": "number"}, "delta_y": {"type": "number"},
             "lines": {"type": "boolean", "description": "Scroll deltas are mouse wheel lines instead of trackpad pixels."},
             "phase": {"type": "string", "enum": ["began", "changed", "ended", "momentum", "momentum_ended"], "description": "Where a trackpad scroll is in its gesture. Without it, the box bounces back 100 ms after the last scroll."},
@@ -590,9 +594,11 @@ pub(crate) fn frame(window: u64, started: Instant) {
 pub(crate) fn paused(ctx: usize, done: *mut bool) {
     pump();
     let page = CHANNEL.with(|channel| channel.get().map(|(_, shared, key)| (shared.clone(), *key)));
-    let Some(shared) = page.as_ref().map(|(shared, _)| shared.clone()).or_else(|| {
-        MAIN_CHANNEL.with(|channel| channel.get().map(|(_, shared)| shared.clone()))
-    }) else {
+    let Some(shared) = page
+        .as_ref()
+        .map(|(shared, _)| shared.clone())
+        .or_else(|| MAIN_CHANNEL.with(|channel| channel.get().map(|(_, shared)| shared.clone())))
+    else {
         let _ = send(ctx, "Debugger.resume", json!({}));
         return;
     };
@@ -1034,6 +1040,83 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
             pressed_button: None,
             modifiers,
         })),
+        "drop" => {
+            let paths = args["paths"]
+                .as_array()
+                .context("Expected paths")?
+                .iter()
+                .filter_map(|path| path.as_str().map(std::path::PathBuf::from))
+                .collect();
+            events.push(PlatformInput::FileDrop(FileDropEvent::Entered {
+                position,
+                paths,
+            }));
+            let end = point(
+                px(args["to_x"].as_f64().map_or(position.x.0, |x| x as f32)),
+                px(args["to_y"].as_f64().map_or(position.y.0, |y| y as f32)),
+            );
+            events.push(PlatformInput::FileDrop(FileDropEvent::Pending {
+                position: end,
+            }));
+            if args["hold"].as_bool() != Some(true) {
+                events.push(PlatformInput::FileDrop(
+                    if args["leave"].as_bool() == Some(true) {
+                        FileDropEvent::Exited
+                    } else {
+                        FileDropEvent::Submit { position: end }
+                    },
+                ));
+            }
+        }
+        "press" => events.push(PlatformInput::MouseDown(MouseDownEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        })),
+        "pressed_move" => events.push(PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: Some(button),
+            modifiers,
+        })),
+        "release" => events.push(PlatformInput::MouseUp(MouseUpEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 1,
+        })),
+        "drag" => {
+            let end = point(
+                px(args["to_x"].as_f64().context("Expected to_x")? as f32),
+                px(args["to_y"].as_f64().context("Expected to_y")? as f32),
+            );
+            events.push(PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }));
+            events.push(PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }));
+            for step in 1..=8 {
+                events.push(PlatformInput::MouseMove(MouseMoveEvent {
+                    position: position + (end - position) * (step as f32 / 8.),
+                    pressed_button: Some(button),
+                    modifiers,
+                }));
+            }
+            events.push(PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: end,
+                modifiers,
+                click_count: 1,
+            }));
+        }
         "scroll" => {
             let delta = point(
                 -args["delta_x"].as_f64().unwrap_or(0.) as f32,

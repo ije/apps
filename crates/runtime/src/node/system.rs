@@ -991,6 +991,7 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 Ok(Value::Object(result))
             }
         }
+        "process.abort" => std::process::abort(),
         "process.memory" => {
             #[cfg(target_os = "macos")]
             unsafe {
@@ -1028,6 +1029,22 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 );
                 Ok(json!(counters.working_set))
             }
+        }
+        "process.resourceUsage" => {
+            #[cfg(unix)]
+            {
+                let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+                let micros =
+                    |time: libc::timeval| time.tv_sec as i64 * 1_000_000 + i64::from(time.tv_usec);
+                Ok(
+                    json!({"userCPUTime":micros(usage.ru_utime),"systemCPUTime":micros(usage.ru_stime),"maxRSS":usage.ru_maxrss / 1024,"sharedMemorySize":usage.ru_ixrss,"unsharedDataSize":usage.ru_idrss,"unsharedStackSize":usage.ru_isrss,"minorPageFault":usage.ru_minflt,"majorPageFault":usage.ru_majflt,"swappedOut":usage.ru_nswap,"fsRead":usage.ru_inblock,"fsWrite":usage.ru_oublock,"ipcSent":usage.ru_msgsnd,"ipcReceived":usage.ru_msgrcv,"signalsCount":usage.ru_nsignals,"voluntaryContextSwitches":usage.ru_nvcsw,"involuntaryContextSwitches":usage.ru_nivcsw}),
+                )
+            }
+            #[cfg(not(unix))]
+            Ok(
+                json!({"userCPUTime":0,"systemCPUTime":0,"maxRSS":0,"sharedMemorySize":0,"unsharedDataSize":0,"unsharedStackSize":0,"minorPageFault":0,"majorPageFault":0,"swappedOut":0,"fsRead":0,"fsWrite":0,"ipcSent":0,"ipcReceived":0,"signalsCount":0,"voluntaryContextSwitches":0,"involuntaryContextSwitches":0}),
+            )
         }
         "process.cpu" => {
             #[cfg(unix)]

@@ -495,7 +495,9 @@ impl State {
             };
         }
         if self.database.is_none() {
-            let _setup = SETUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _setup = SETUP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             ensure!(
                 !self.path.as_os_str().is_empty(),
                 "Browser storage namespace is not configured"
@@ -537,7 +539,9 @@ impl State {
         let db = self.database.as_ref().unwrap();
         if let Some(op) = op.strip_prefix("local.") {
             if self.local_database.is_none() {
-                let _setup = SETUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _setup = SETUP
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let database = Database::open(&self.path.with_file_name("local.sqlite"))?;
                 unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
                 database.query("PRAGMA journal_mode=WAL", &[])?;

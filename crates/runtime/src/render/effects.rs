@@ -835,6 +835,148 @@ pub(crate) fn tile(
 /// The SVG of a CSS gradient layer covering a `width` by `height` box, sized, placed and
 /// repeated like a background or mask layer.
 #[allow(clippy::too_many_arguments)]
+/// The color stops of a gradient line `extent` long, in order and with all their offsets.
+fn gradient_stops<S: AsRef<str>>(
+    parts: &[S],
+    prelude: bool,
+    units: &Lengths,
+    extent: f32,
+) -> Option<Vec<(f32, (u32, u8))>> {
+    let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
+    for stop in parts.iter().map(AsRef::as_ref).skip(usize::from(prelude)) {
+        let tokens = style::components(stop.trim(), ' ');
+        let Some(ink) = tokens.iter().find_map(|token| style::color(token)) else {
+            continue;
+        };
+        let offsets: Vec<f32> = tokens
+            .iter()
+            .filter(|token| style::color(token).is_none())
+            .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token)))
+            .take(2)
+            .collect();
+        if offsets.is_empty() {
+            stops.push((None, ink));
+        }
+        stops.extend(offsets.into_iter().map(|offset| (Some(offset), ink)));
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    let last = stops.len() - 1;
+    stops[0].0.get_or_insert(0.);
+    stops[last].0.get_or_insert(extent);
+    let mut floor = f32::MIN;
+    for stop in &mut stops {
+        if let Some(offset) = &mut stop.0 {
+            *offset = offset.max(floor);
+            floor = *offset;
+        }
+    }
+    let mut index = 1;
+    while index < last {
+        if stops[index].0.is_none() {
+            let end = (index..=last)
+                .find(|&end| stops[end].0.is_some())
+                .unwrap_or(last);
+            let (a, b) = (
+                stops[index - 1].0.unwrap_or(0.),
+                stops[end].0.unwrap_or(extent),
+            );
+            for (step, stop) in stops[index..end].iter_mut().enumerate() {
+                stop.0 = Some(a + (b - a) * (step + 1) as f32 / (end - index + 1) as f32);
+            }
+            index = end;
+        }
+        index += 1;
+    }
+    Some(
+        stops
+            .into_iter()
+            .map(|(offset, ink)| (offset.unwrap_or(0.), ink))
+            .collect(),
+    )
+}
+
+/// `mask-image` layers that are all axis-aligned linear gradients and intersect, as the alpha of each
+/// device pixel along x and along y. Their product is the mask, so it takes no rendering.
+pub(super) fn axis_mask(
+    style: &style::Style,
+    units: &Lengths,
+    [width, height]: [f32; 2],
+    raster: [u32; 2],
+) -> Option<[Vec<f32>; 2]> {
+    let get =
+        |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
+    let plain = |value: &str, defaults: &[&str]| {
+        style::components(value, ',').iter().all(|part| {
+            let part = part.trim();
+            part.is_empty() || defaults.contains(&part)
+        })
+    };
+    if !plain(
+        get([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
+        &["auto", "auto auto"],
+    ) || !plain(
+        get([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
+        &["0% 0%", "0 0", "left top"],
+    ) {
+        return None;
+    }
+    let images = style::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
+    if images.len() > 1
+        && !style::components(style.get(Prop::MASK_COMPOSITE)?, ',')
+            .iter()
+            .all(|part| part.trim() == "intersect")
+    {
+        return None;
+    }
+    let mut axes = [
+        vec![1f32; raster[0] as usize],
+        vec![1f32; raster[1] as usize],
+    ];
+    for image in &images {
+        let body = image
+            .trim()
+            .strip_prefix("linear-gradient(")?
+            .strip_suffix(')')?;
+        let parts = style::components(body, ',');
+        let (first, space) = first_argument(body);
+        if space.is_some() {
+            return None;
+        }
+        let (axis, reversed, prelude) = match first.as_str() {
+            "to bottom" | "180deg" => (1, false, true),
+            "to top" | "0deg" => (1, true, true),
+            "to right" | "90deg" => (0, false, true),
+            "to left" | "270deg" => (0, true, true),
+            other if style::color(other).is_some() || other.is_empty() => (1, false, false),
+            _ => return None,
+        };
+        let extent = [width, height][axis];
+        let stops = gradient_stops(&parts, prelude, units, extent)?;
+        let count = raster[axis] as usize;
+        for (index, alpha) in axes[axis].iter_mut().enumerate() {
+            let at = (index as f32 + 0.5) * extent / count as f32;
+            let at = if reversed { extent - at } else { at };
+            let end = stops.partition_point(|(offset, _)| *offset <= at);
+            *alpha *= match (
+                end.checked_sub(1).map(|start| stops[start]),
+                stops.get(end).copied(),
+            ) {
+                (Some((a, (_, from))), Some((b, (_, to)))) if b > a => {
+                    let t = (at - a) / (b - a);
+                    (f32::from(from) * (1. - t) + f32::from(to) * t) / 255.
+                }
+                (Some((_, (_, alpha))), _) | (None, Some((_, (_, alpha)))) => {
+                    f32::from(alpha) / 255.
+                }
+                (None, None) => 1.,
+            };
+        }
+    }
+    Some(axes)
+}
+
 pub(crate) fn gradient_svg(
     kind: &str,
     body: &str,
@@ -987,57 +1129,7 @@ pub(crate) fn gradient_svg(
         }
         _ => return None,
     };
-    let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
-    for stop in parts.iter().skip(usize::from(prelude)) {
-        let tokens = style::components(stop.trim(), ' ');
-        let Some(ink) = tokens.iter().find_map(|token| style::color(token)) else {
-            continue;
-        };
-        let offsets: Vec<f32> = tokens
-            .iter()
-            .filter(|token| style::color(token).is_none())
-            .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token)))
-            .take(2)
-            .collect();
-        if offsets.is_empty() {
-            stops.push((None, ink));
-        }
-        stops.extend(offsets.into_iter().map(|offset| (Some(offset), ink)));
-    }
-    if stops.len() < 2 {
-        return None;
-    }
-    let last = stops.len() - 1;
-    stops[0].0.get_or_insert(0.);
-    stops[last].0.get_or_insert(extent);
-    let mut floor = f32::MIN;
-    for stop in &mut stops {
-        if let Some(offset) = &mut stop.0 {
-            *offset = offset.max(floor);
-            floor = *offset;
-        }
-    }
-    let mut index = 1;
-    while index < last {
-        if stops[index].0.is_none() {
-            let end = (index..=last)
-                .find(|&end| stops[end].0.is_some())
-                .unwrap_or(last);
-            let (a, b) = (
-                stops[index - 1].0.unwrap_or(0.),
-                stops[end].0.unwrap_or(extent),
-            );
-            for (step, stop) in stops[index..end].iter_mut().enumerate() {
-                stop.0 = Some(a + (b - a) * (step + 1) as f32 / (end - index + 1) as f32);
-            }
-            index = end;
-        }
-        index += 1;
-    }
-    let mut offsets: Vec<(f32, (u32, u8))> = stops
-        .into_iter()
-        .map(|(offset, ink)| (offset.unwrap_or(0.), ink))
-        .collect();
+    let mut offsets = gradient_stops(&parts, prelude, &units, extent)?;
     // SVG gradients mix in sRGB, so other spaces get extra stops. Without `in`, colors other
     // than the legacy ones mix in Oklab.
     let space = space
@@ -1228,6 +1320,33 @@ mod tests {
 
     fn close(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
+    }
+
+    #[test]
+    fn gradient_masks_that_intersect_multiply_along_their_axes() {
+        let units = Lengths::new(16., 800., 600.);
+        let mask = |image: &str, composite: Option<&str>, raster: [u32; 2]| {
+            let mut props = vec![("mask-image", image)];
+            props.extend(composite.map(|value| ("mask-composite", value)));
+            axis_mask(&style(&props), &units, [100., 50.], raster)
+        };
+        let opaque = "linear-gradient(to left, black calc(100% - min(12px, 0px)), transparent 100%), linear-gradient(#fff, #fff)";
+        let [x, y] = mask(opaque, Some("intersect"), [100, 50]).unwrap();
+        assert!(x.iter().chain(&y).all(|alpha| *alpha >= 0.999));
+        let fades = "linear-gradient(to right, transparent, black 10px), linear-gradient(to top, transparent, black 10px)";
+        let [x, y] = mask(fades, Some("intersect"), [100, 50]).unwrap();
+        assert!(x[0] < 0.1 && x[50] >= 0.999);
+        assert!(y[0] >= 0.999 && y[49] < 0.1);
+        // Layers that add can't be multiplied, and other shapes go through the SVG.
+        assert!(mask(fades, None, [100, 50]).is_none());
+        assert!(
+            mask(
+                "linear-gradient(45deg, black, transparent)",
+                None,
+                [100, 50]
+            )
+            .is_none()
+        );
     }
 
     #[test]

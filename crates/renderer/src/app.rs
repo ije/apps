@@ -692,7 +692,9 @@ pub mod native {
     pub(crate) fn reopen(visible: bool) {
         if let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.reopen.take()) {
             callback(visible);
-            HANDLERS.with_borrow_mut(|handlers| { handlers.reopen.get_or_insert(callback); });
+            HANDLERS.with_borrow_mut(|handlers| {
+                handlers.reopen.get_or_insert(callback);
+            });
         }
     }
 
@@ -701,7 +703,9 @@ pub mod native {
         match HANDLERS.with_borrow_mut(|handlers| handlers.should_quit.take()) {
             Some(mut callback) => {
                 let quit = callback();
-                HANDLERS.with_borrow_mut(|handlers| { handlers.should_quit.get_or_insert(callback); });
+                HANDLERS.with_borrow_mut(|handlers| {
+                    handlers.should_quit.get_or_insert(callback);
+                });
                 quit
             }
             None => true,
@@ -719,7 +723,9 @@ pub mod native {
         match HANDLERS.with_borrow_mut(|handlers| handlers.open_urls.take()) {
             Some(mut callback) => {
                 callback(urls);
-                HANDLERS.with_borrow_mut(|handlers| { handlers.open_urls.get_or_insert(callback); });
+                HANDLERS.with_borrow_mut(|handlers| {
+                    handlers.open_urls.get_or_insert(callback);
+                });
             }
             None => HANDLERS.with_borrow_mut(|handlers| handlers.pending_urls.extend(urls)),
         }
@@ -727,7 +733,7 @@ pub mod native {
 }
 
 pub(crate) mod events {
-    pub(crate) use super::native::{should_quit};
+    pub(crate) use super::native::should_quit;
     #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
     pub(crate) use super::native::{open_urls, reopen};
     pub fn quit() {

@@ -14,6 +14,8 @@ use std::{
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
 struct TextLayoutInner {
+    /// The width the lines were shaped for, 0 for the min-content size and `None` when unconstrained.
+    shaped_width: Option<Pixels>,
     lines: Vec<WrappedLine>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
@@ -104,6 +106,7 @@ impl TextState {
             }
         } else if let Some(inner) = layout.0.borrow().as_ref()
             && wrap_width == inner.wrap_width
+            && inner.shaped_width != Some(px(0.))
             && truncate.is_none()
             // A truncated layout answers an unconstrained probe with the truncated size,
             // so it is never reused.
@@ -196,6 +199,7 @@ impl TextState {
         // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
         if probe.is_none() || layout.0.borrow().is_none() {
             *layout.0.borrow_mut() = Some(TextLayoutInner {
+                shaped_width: if min_content { Some(px(0.)) } else { width },
                 lines,
                 line_height,
                 wrap_width,
@@ -206,6 +210,31 @@ impl TextState {
             });
         }
         (size, Some(baselines))
+    }
+}
+
+impl TextState {
+    /// WARNING: taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
+    pub(crate) fn fit(&self, width: Pixels, window: &mut Window) {
+        if self.style.white_space != WhiteSpace::Normal && self.style.text_overflow.is_none() {
+            return;
+        }
+        let stale = self
+            .layout
+            .0
+            .borrow()
+            .as_ref()
+            .is_some_and(|inner| match inner.shaped_width {
+                Some(shaped) => (shaped - width).abs() > px(0.01),
+                None => inner.size.width > width + px(0.01),
+            });
+        if stale {
+            self.measure(
+                Size::new(Some(width), None),
+                Size::new(AvailableSpace::Definite(width), AvailableSpace::MinContent),
+                window,
+            );
+        }
     }
 }
 
@@ -396,6 +425,8 @@ fn truncate_text(
         .cloned()
         .map(|run| TextRun {
             len: affix.len(),
+            inset: Default::default(),
+            nowrap: false,
             ..run
         })
         .unwrap_or_else(|| style.to_run(affix.len()));

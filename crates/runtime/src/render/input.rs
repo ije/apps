@@ -116,6 +116,7 @@ impl renderer::Hooks for FieldText {
                     self.text.clone(),
                     0..self.text.len(),
                     Rc::default(),
+                    [px(0.), layout.line_height()],
                 ),
             );
         }
@@ -272,16 +273,48 @@ impl PageState {
         cx.defer(move |cx| Desktop::drive(runtime, cx));
     }
 
+    /// `dragenter`, `dragover` and `dragleave` of files dragged from other apps.
+    fn drag_files(&self, kind: &str, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        let names: Vec<_> = self
+            .dropped
+            .borrow()
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let script = format!(
+            "__appsDrag({},{},{},{})",
+            serde_json::json!(kind),
+            f32::from(position.x),
+            f32::from(position.y),
+            serde_json::json!(names),
+        );
+        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
+            eprintln!("apps: {error}");
+        }
+        self.drive(cx);
+        window.refresh();
+    }
+
     fn drop_files(&self, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
         let mut files = Vec::new();
         for path in self.dropped.take() {
             let result = (|| -> Result<serde_json::Value> {
                 let metadata = std::fs::metadata(&path)?;
+                let directory = metadata.is_dir();
                 ensure!(
-                    metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
+                    directory || metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
                     "Dropped file exceeds 64 MB or is not a file"
                 );
-                let bytes = std::fs::read(&path)?;
+                let bytes = if directory {
+                    Vec::new()
+                } else {
+                    std::fs::read(&path)?
+                };
                 let modified = metadata
                     .modified()
                     .ok()
@@ -291,7 +324,7 @@ impl PageState {
                 let paths = host.dropped.entry(self.id).or_default();
                 paths.push(path.to_string_lossy().into_owned());
                 Ok(
-                    serde_json::json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"file":paths.len() - 1,"bytes":bytes,"lastModified":modified}),
+                    serde_json::json!({"directory":directory,"name":path.file_name().unwrap_or_default().to_string_lossy(),"file":paths.len() - 1,"bytes":bytes,"lastModified":modified}),
                 )
             })();
             match result {
@@ -327,6 +360,36 @@ fn password<'a>(
         .get(id)?
         .password()
         .then(|| state["text"].as_str())?
+}
+
+impl PageView {
+    /// Asks the main side's `before-input-event`, and answers whether it prevented the key.
+    fn before_input(&self, kind: &str, event: &renderer::KeyDownEvent, _cx: &mut App) -> bool {
+        if !crate::desktop::link::INPUT_LISTENERS.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let Some(link) = self.host.borrow().link.clone() else {
+            return false;
+        };
+        let keystroke = &event.keystroke;
+        let modifiers = &keystroke.modifiers;
+        let input = serde_json::json!({
+            "type": kind,
+            "key": keystroke.key_char.clone().unwrap_or_else(|| keystroke.key.clone()),
+            "code": keystroke.key,
+            "isAutoRepeat": event.is_held,
+            "isComposing": false,
+            "shift": modifiers.shift,
+            "control": modifiers.control,
+            "alt": modifiers.alt,
+            "meta": modifiers.platform,
+            "location": 0,
+            "modifiers": [],
+        });
+        let id = self.id;
+        link.ask(|answer| crate::desktop::link::ToMain::Input(id, input, answer))
+            .is_ok_and(|answer| answer.value == true)
+    }
 }
 
 impl renderer::View for PageView {
@@ -386,6 +449,10 @@ impl renderer::View for PageView {
                     cx.stop_propagation();
                     return;
                 }
+                if self.before_input("keyDown", event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let allowed = Desktop::dispatch(
                     self.runtime.clone(),
                     id,
@@ -436,6 +503,13 @@ impl renderer::View for PageView {
             }
             PlatformInput::KeyUp(event) => {
                 let modifiers = &event.keystroke.modifiers;
+                let held = renderer::KeyDownEvent {
+                    keystroke: event.keystroke.clone(),
+                    is_held: false,
+                };
+                if self.before_input("keyUp", &held, cx) {
+                    return;
+                }
                 Desktop::dispatch(
                     self.runtime.clone(),
                     id,
@@ -458,8 +532,15 @@ impl renderer::View for PageView {
                     cx,
                 );
             }
-            PlatformInput::FileDrop(FileDropEvent::Entered { paths, .. }) => {
-                *self.dropped.borrow_mut() = paths.clone()
+            PlatformInput::FileDrop(FileDropEvent::Entered { paths, position }) => {
+                *self.dropped.borrow_mut() = paths.clone();
+                self.drag_files("enter", *position, window, cx);
+            }
+            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
+                self.drag_files("over", *position, window, cx)
+            }
+            PlatformInput::FileDrop(FileDropEvent::Exited) => {
+                self.drag_files("leave", Point::default(), window, cx)
             }
             PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
                 self.drop_files(*position, window, cx)
@@ -590,7 +671,7 @@ impl renderer::View for PageView {
             found.unwrap_or((id, range))
         };
         // A field's text has a layout, so the range gets its own rectangle, where the IME shows its candidates.
-        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&node) {
+        if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&node) {
             let content = &text[span.clone()];
             let [start, end] = [range.start, range.end].map(|index| {
                 let index = password.map_or(index, |value| crate::dom::bullets(value, index));
@@ -619,7 +700,7 @@ impl renderer::View for PageView {
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
-        if let Some((layout, text, span, rows)) = dom.text_layouts.get(&id) {
+        if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&id) {
             let index = super::text::text_index(layout, text, rows, point)
                 .unwrap_or_else(|index| index)
                 .clamp(span.start, span.end);

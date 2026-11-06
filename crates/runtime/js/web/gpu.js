@@ -179,7 +179,17 @@
     }
     writeTexture(destination, data, dataLayout, size) { this._device._call('writeTexture', [destination, binary(bytes(data)), dataLayout, size]); }
     async onSubmittedWorkDone() { await settle(this._device, this._device._call('workDone', null)); }
-    copyExternalImageToTexture() { throw new Error('External image uploads are not supported; use writeTexture with pixel data'); }
+    copyExternalImageToTexture({ source, origin = [], flipY = false }, { colorSpace, premultipliedAlpha = false, ...destination }, copySize) {
+      const format = destination.texture.format, width = copySize.width ?? copySize[0], height = copySize.height ?? copySize[1] ?? 1, row = width * 4;
+      if (!/^(rgba|bgra)8unorm(-srgb)?$/.test(format)) throw new TypeError('copyExternalImageToTexture needs an 8-bit RGBA or BGRA texture');
+      if (source instanceof ImageData) { const canvas = new OffscreenCanvas(source.width, source.height), context = canvas.getContext('2d'); context.putImageData(source, 0, 0); source = canvas; }
+      source._context?._flush?.();
+      if (source._id === undefined) throw new DOMException('The source is closed or was transferred', 'InvalidStateError');
+      const pixels = call('dom.canvasPixels', source._id, origin.x ?? origin[0] ?? 0, origin.y ?? origin[1] ?? 0, width, height, premultipliedAlpha);
+      if (flipY) { const line = new Uint8Array(row); for (let top = 0, bottom = height - 1; top < bottom; top++, bottom--) { const a = top * row, b = bottom * row; line.set(pixels.subarray(a, a + row)); pixels.copyWithin(a, b, b + row); pixels.set(line, b); } }
+      if (format.startsWith('bgra')) for (let i = 0; i < pixels.length; i += 4) { const red = pixels[i]; pixels[i] = pixels[i + 2]; pixels[i + 2] = red; }
+      this.writeTexture(destination, pixels, { bytesPerRow: row, rowsPerImage: height }, [width, height]);
+    }
   }
   class GPUDevice {
     constructor(info, adapterInfo) {
@@ -230,7 +240,7 @@
     async requestAdapterInfo() { return this.info; }
   }
   class GPUCanvasContext {
-    constructor(canvas, node) { this.canvas = canvas; this._node = node; this._configuration = null; this._texture = null; }
+    constructor(canvas, node) { this.canvas = canvas; this._node = node; this._configuration = null; this._texture = null; this._drawn = false; }
     configure(config) {
       if (!(config.device instanceof GPUDevice)) throw new TypeError('Expected a GPUDevice');
       if (!['bgra8unorm', 'rgba8unorm'].includes(config.format)) throw new TypeError('Canvas format must be bgra8unorm or rgba8unorm');
@@ -249,8 +259,11 @@
         const id = config.device._call('canvasTexture', { canvas: this._node, width, height, format: config.format, usage: config.usage, alphaMode: config.alphaMode });
         this._texture = new GPUTexture(config.device, id, { size: [width, height], format: config.format, usage: config.usage });
       }
+      this._drawn = true; this.canvas._pump?.();
       return this._texture;
     }
+    // WARNING: reads like `drawImage()` block here for up to 100 ms, because the last frame is still on its way to the CPU.
+    _flush() { if (this._drawn) { this._drawn = false; call('dom.canvasCommit', this._node, true); } }
     _resize() { if (this._texture) garbage.unregister(this._texture); this._texture = null; call('gpu.resetCanvas', this._node); }
   }
   globalThis.navigator ??= {};

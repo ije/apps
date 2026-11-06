@@ -151,6 +151,11 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                 ),
             "Invalid activation policy"
         ),
+        "app.protocolClient" => ensure!(arguments["scheme"].is_string(), "Expected a scheme"),
+        "image" => ensure!(
+            arguments["data"].is_string() && arguments["op"].is_string(),
+            "Expected image data"
+        ),
         "app.about" => {
             if !arguments.is_null() {
                 let options = arguments
@@ -248,6 +253,7 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "theme.get"
         | "safeStorage.available" => {}
         "clipboard.writeText"
+        | "clipboard.writeImage"
         | "clipboard.writeHTML"
         | "shell.openExternal"
         | "shell.openPath"

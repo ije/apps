@@ -525,14 +525,16 @@ impl Style {
             min.y += self.border_widths.top;
             max.y -= self.border_widths.bottom;
         }
+        // WARNING: the other axis stays visible, so `overflow-x: clip` keeps descenders that leave a trimmed text box.
+        const FAR: Pixels = px(1e7);
         let clip = Bounds::from_corners(
             point(
-                if clip_x { min.x } else { bounds.origin.x },
-                if clip_y { min.y } else { bounds.origin.y },
+                if clip_x { min.x } else { -FAR },
+                if clip_y { min.y } else { -FAR },
             ),
             point(
-                if clip_x { max.x } else { bounds.right() },
-                if clip_y { max.y } else { bounds.bottom() },
+                if clip_x { max.x } else { FAR },
+                if clip_y { max.y } else { FAR },
             ),
         );
         let radii = self.corner_radii.resolve(bounds.size);
@@ -635,6 +637,8 @@ impl TextStyle {
             letter_spacing: self.letter_spacing,
             word_spacing: self.word_spacing,
             font_size: None,
+            inset: Default::default(),
+            nowrap: false,
         }
     }
 
@@ -718,8 +722,19 @@ impl TextStyleRefinement {
 
 #[cfg(test)]
 mod tests {
-    use super::{Length, resolve_calc, to_layout_unit};
-    use crate::px;
+    use super::{Bounds, Length, Overflow, Style, resolve_calc, to_layout_unit};
+    use crate::{point, px, size};
+
+    #[test]
+    fn overflow_clip_on_one_axis_leaves_the_other_visible() {
+        let mut style = Style::default();
+        style.overflow.x = Overflow::Clip;
+        let bounds = Bounds::new(point(px(10.), px(10.)), size(px(20.), px(5.)));
+        let mask = style.overflow_mask(bounds).unwrap();
+        assert_eq!(mask.bounds.origin.x, px(10.));
+        assert_eq!(mask.bounds.right(), px(30.));
+        assert!(mask.bounds.origin.y < px(0.) && mask.bounds.bottom() > px(1000.));
+    }
 
     #[test]
     fn calc_handles_keep_the_fraction_and_offset() {

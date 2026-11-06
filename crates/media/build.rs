@@ -8,7 +8,13 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(ffmpeg)");
     println!("cargo:rerun-if-changed=native/ffmpeg.c");
     println!("cargo:rerun-if-changed={}", ffmpeg.display());
-    if !ffmpeg.join("include/libavcodec/avcodec.h").is_file() {
+    let lib = ffmpeg.join("lib");
+    let name = match os.as_str() {
+        "macos" => "libffmpeg.dylib",
+        "windows" => "ffmpeg.dll",
+        _ => "libffmpeg.so",
+    };
+    if !lib.join(name).is_file() {
         println!(
             "cargo:warning=FFmpeg is missing, so video and audio will not play. Run bash scripts/build-ffmpeg.sh"
         );
@@ -26,46 +32,26 @@ fn main() {
     let link = |arg: String| println!("cargo:rustc-cdylib-link-arg={arg}");
     if msvc {
         link(out.join("apps_ffmpeg.lib").display().to_string());
-        link(format!("/LIBPATH:{}", ffmpeg.join("lib").display()));
-        link(format!("/LIBPATH:{}", ffmpeg.join("bin").display()));
+        link(format!("/LIBPATH:{}", lib.display()));
+        link("ffmpeg.lib".to_owned());
     } else {
         link(out.join("libapps_ffmpeg.a").display().to_string());
-        link(format!("-L{}", ffmpeg.join("lib").display()));
+        link(format!("-L{}", lib.display()));
+        link("-lffmpeg".to_owned());
     }
-    for name in ["avformat", "avcodec", "swscale", "swresample", "avutil"] {
-        link(if msvc {
-            format!("{name}.lib")
-        } else {
-            format!("-l{name}")
-        });
+    if os == "linux" {
+        link("-Wl,-rpath,$ORIGIN".to_owned());
     }
-    let lib = ffmpeg.join(if os == "windows" { "bin" } else { "lib" });
-    match os.as_str() {
-        "macos" => println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path"),
-        "linux" => println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,$ORIGIN"),
-        _ => {}
-    }
-    // The libraries go next to the media library in target/<profile> and in deps for tests.
+    // The library goes next to the media library in target/<profile> and in deps for tests.
     let profile = out.ancestors().nth(3).unwrap();
+    let path = lib.join(name);
     for folder in [profile.to_owned(), profile.join("deps")] {
-        for entry in fs::read_dir(&lib).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let shared = match os.as_str() {
-                "macos" => name.matches('.').count() == 2 && name.ends_with(".dylib"),
-                "windows" => name.ends_with(".dll"),
-                _ => {
-                    name.matches(".so.").count() == 1
-                        && !name[name.find(".so.").unwrap() + 4..].contains('.')
-                }
-            };
-            let target = folder.join(&name);
-            // WARNING: macOS kills processes that load a library rewritten in place, so copy to a new file.
-            if shared && fs::read(&target).ok() != Some(fs::read(&path).unwrap()) {
-                let temporary = folder.join(format!(".{name}"));
-                fs::copy(&path, &temporary).unwrap();
-                fs::rename(&temporary, &target).unwrap();
-            }
+        let target = folder.join(name);
+        // WARNING: macOS kills processes that load a library rewritten in place, so copy to a new file.
+        if fs::read(&target).ok() != Some(fs::read(&path).unwrap()) {
+            let temporary = folder.join(format!(".{name}"));
+            fs::copy(&path, &temporary).unwrap();
+            fs::rename(&temporary, &target).unwrap();
         }
         fs::copy(ffmpeg.join("FFmpeg.LICENSE"), folder.join("FFmpeg.LICENSE")).unwrap();
     }

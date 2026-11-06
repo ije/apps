@@ -31,6 +31,7 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
         try { call('web.tcp.write', this._socket, encode(chunk)); } catch (error) { this._written = null; callback(error); }
       };
       this._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
+      if (options.fd !== undefined) { this._socket = call('web.tcp.open', options.fd); sockets.set(this._socket, this); this.pending = false; }
     }
     connect(...args) {
       if (this._socket !== undefined) throw fail('ERR_SOCKET_CONNECTION', 'Socket is already connected', Error);
@@ -152,7 +153,10 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
     [Symbol.for('nodejs.util.inspect.custom')](depth, options, inspect) { return `BlockList ${inspect({ rules: this.rules }, options)}`; }
     static isBlockList(value) { return typeof value === 'object' && value !== null && #rules in value; }
   }
+  let autoSelect = false, autoSelectTimeout = 250;
   const api = { Socket, Server, BlockList, SocketAddress, createServer: (...args) => new Server(...args), connect, createConnection: connect,
+    getDefaultAutoSelectFamily: () => autoSelect, setDefaultAutoSelectFamily: value => { autoSelect = !!value; },
+    getDefaultAutoSelectFamilyAttemptTimeout: () => autoSelectTimeout, setDefaultAutoSelectFamilyAttemptTimeout: value => { autoSelectTimeout = Math.max(10, Number(value)); },
     isIP: value => call('web.tcp.ip', String(value)), isIPv4: value => call('web.tcp.ip', String(value)) === 4, isIPv6: value => call('web.tcp.ip', String(value)) === 6 };
   return { api, normalize, port, failure,
     poll() {

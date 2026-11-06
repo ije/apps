@@ -159,6 +159,8 @@ extern "C" fn paint(window: *mut c_void, item: &Item) {
         letter_spacing: px(0.),
         word_spacing: px(0.),
         font_size: None,
+        inset: Default::default(),
+        nowrap: false,
     };
     let line = window
         .text_system()

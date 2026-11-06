@@ -1,7 +1,7 @@
 use crate::{
     AvailableSpace, Baseline, Bounds, ContentMask, Display, ElementId, Hitbox, HitboxBehavior,
     Hooks, Pixels, Point, Size, Style, TextStyle, Visibility, Window,
-    geometry::round_half_toward_zero,
+    geometry::round_half_up,
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx},
     point, px, quad, size,
     text::TextState,
@@ -486,10 +486,7 @@ impl Tree {
         let scale = window.scale_factor();
         let layout = &self.slots[index as usize].layout;
         let far = point(origin.x + layout.size.width, origin.y + layout.size.height);
-        let snapped = Bounds::from_corners(
-            origin.map(round_half_toward_zero),
-            far.map(round_half_toward_zero),
-        );
+        let snapped = Bounds::from_corners(origin.map(round_half_up), far.map(round_half_up));
         let offset = window.element_offset();
         let exact = Bounds::new(
             origin.map(|value| Pixels(value / scale)),
@@ -548,7 +545,7 @@ impl Tree {
 
     fn prepaint_box(&mut self, index: u32, style: &Style, window: &mut Window) {
         let origin = self.slots[index as usize].origin;
-        let [bounds, _] = self.bounds(index, origin, window);
+        let [bounds, exact] = self.bounds(index, origin, window);
         let scale = window.scale_factor();
         self.slots[index as usize].bounds[1] = bounds;
         let slot = &self.slots[index as usize];
@@ -557,7 +554,9 @@ impl Tree {
             .as_ref()
             .and_then(|state| state.downcast_ref::<TextState>())
         {
-            state.layout.place(bounds);
+            state.fit(px(slot.layout.size.width / scale), window);
+            // WARNING: like Chromium, text starts at its exact place, and only each row's baseline snaps to a device pixel.
+            state.layout.place(Bounds::new(exact.origin, bounds.size));
         }
         let scroll = slot
             .events
@@ -573,8 +572,8 @@ impl Tree {
                     let layout = &self.slots[index_of(child) as usize].layout;
                     let at = point(origin.x + layout.location.x, origin.y + layout.location.y);
                     let far = point(at.x + layout.size.width, at.y + layout.size.height);
-                    min = min.min(at.map(round_half_toward_zero));
-                    max = max.max(far.map(round_half_toward_zero));
+                    min = min.min(at.map(round_half_up));
+                    max = max.max(far.map(round_half_up));
                 }
                 Size::from(max - min).map(|value| Pixels(value / scale))
             }
@@ -892,11 +891,21 @@ impl LayoutTree<'_> {
     fn compute(
         &mut self,
         node: NodeId,
-        inputs: LayoutInput,
+        mut inputs: LayoutInput,
         block: Option<&mut BlockContext<'_>>,
     ) -> LayoutOutput {
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return taffy::compute_hidden_layout(self, node);
+        }
+        let style = &self.slots[usize::from(node)].taffy;
+        // WARNING: taffy calls the measured height of an absolute box definite. With `height: auto` and without
+        // both insets it comes from the content, so percentage heights inside must act as `auto`.
+        if style.position == taffy::Position::Absolute
+            && inputs.run_mode == RunMode::PerformLayout
+            && style.size.height.is_auto()
+            && (style.inset.top.is_auto() || style.inset.bottom.is_auto())
+        {
+            inputs.known_dimensions_are_definite.height = false;
         }
         let output = taffy::compute_cached_layout(self, node, inputs, |tree, node, inputs| {
             let slot = &tree.slots[usize::from(node)];

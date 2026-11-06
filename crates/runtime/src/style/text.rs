@@ -49,12 +49,38 @@ pub(crate) struct InlineText {
     pub text: Rc<str>,
     pub runs: Box<[renderer::TextRun]>,
     pub ranges: Box<[(usize, std::ops::Range<usize>)]>,
-    pub backgrounds: Box<[(usize, u32)]>,
+    pub boxes: Box<[InlineBox]>,
+    pub atoms: Box<[Atom]>,
     pub cursors: Box<[(usize, renderer::CursorStyle)]>,
     pub shadows: Box<[(f32, f32, f32, u32)]>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     /// The line height of the text up to each end offset, which sizes its inline boxes in a row.
     pub line_heights: Box<[(usize, LineHeight)]>,
+}
+
+/// An inline box with its own layout, like an `inline-block` or an image, that a placeholder holds a place for.
+#[derive(Clone, Copy)]
+pub(crate) struct Atom {
+    pub node: usize,
+    /// The placeholder in the text.
+    pub at: usize,
+    pub run: usize,
+}
+
+/// An inline box in the text with something to paint or room around its text.
+#[derive(Clone, Copy)]
+pub(crate) struct InlineBox {
+    /// The node in `ranges`.
+    pub index: usize,
+    pub fill: u32,
+    /// Padding and border width: top, right, bottom and left.
+    pub edges: [f32; 4],
+    pub borders: [f32; 4],
+    pub border: u32,
+    /// From its first character to its left border edge.
+    pub lead: f32,
+    /// From the position after its last character to its right border edge.
+    pub trail: f32,
 }
 
 /// A computed `line-height`. A number scales with the font size of the text that inherits it.
@@ -227,6 +253,8 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
         letter_spacing: spacing(style, units, Prop::LETTER_SPACING),
         word_spacing: spacing(style, units, Prop::WORD_SPACING),
         font_size: None,
+        inset: Default::default(),
+        nowrap: false,
     }
 }
 
@@ -411,7 +439,17 @@ pub(crate) fn inline_text(
     let mut runs: Vec<renderer::TextRun> = Vec::new();
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
-    let mut backgrounds = Vec::new();
+    let mut boxes: Vec<InlineBox> = Vec::new();
+    let mut atoms: Vec<Atom> = Vec::new();
+    // Flex and grid containers make their children items, not boxes in a line.
+    let atomic_allowed = !own
+        && !parent
+            .get(Prop::DISPLAY)
+            .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"));
+    // Room for the boxes that open before the next text.
+    let mut opening = 0f32;
+    // Per box: `opening` at its left border edge, and the run and its end inset at its right border edge.
+    let mut marks: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
     let mut cursors = Vec::new();
     // Inline `::before` and `::after` boxes are content of the line, so spaces next to them stay.
     let [before, after] = [0, 1].map(|index| {
@@ -449,6 +487,20 @@ pub(crate) fn inline_text(
         if let Some(index) = end {
             let (_, range): &mut (usize, std::ops::Range<usize>) = &mut ranges[index];
             range.end = text.len();
+            let empty = range.start == range.end;
+            if let Some(at) = boxes.iter().position(|inline| inline.index == index) {
+                let inline = &boxes[at];
+                let right = inline.edges[1];
+                let margin =
+                    styles.lengths[child].edges(&styles.values[child], super::MARGIN, 0.)[1];
+                if empty {
+                    opening += right + margin;
+                } else if let Some(last) = runs.len().checked_sub(1) {
+                    runs[last].inset[1] += renderer::px(right);
+                    marks[at].1 = Some((last, f32::from(runs[last].inset[1])));
+                    runs[last].inset[1] += renderer::px(margin);
+                }
+            }
             continue;
         }
         let node = &doc.nodes[child];
@@ -476,6 +528,58 @@ pub(crate) fn inline_text(
             space = true;
             continue;
         }
+        let display = style.get(Prop::DISPLAY);
+        if atomic_allowed
+            && (display.is_some_and(|value| value.starts_with("inline-"))
+                || display.is_none_or(|value| value == "inline")
+                    && matches!(
+                        node.tag.as_str(),
+                        "img"
+                            | "svg"
+                            | "canvas"
+                            | "video"
+                            | "audio"
+                            | "iframe"
+                            | "object"
+                            | "embed"
+                            | "input"
+                            | "button"
+                            | "select"
+                            | "textarea"
+                            | "progress"
+                            | "meter"
+                    ))
+            && style
+                .get(Prop::POSITION)
+                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+            && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
+        {
+            let at = text.len();
+            text.push('\u{fffc}');
+            let mut run = text_run(parent, &styles.lengths[id], '\u{fffc}'.len_utf8());
+            run.underline = None;
+            run.strikethrough = None;
+            run.color = renderer::transparent_black();
+            run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
+            // WARNING: the character only holds the place, and the box's width is its end inset.
+            run.font_size = Some(renderer::px(0.01));
+            run.inset[0] = renderer::px(opening);
+            for (inline, (mark, _)) in boxes.iter_mut().zip(&marks) {
+                if inline.lead.is_nan() {
+                    inline.lead = opening - mark;
+                }
+            }
+            opening = 0.;
+            atoms.push(Atom {
+                node: child,
+                at,
+                run: runs.len(),
+            });
+            runs.push(run);
+            line_heights.push((text.len(), LineHeight::Fixed(0.)));
+            space = false;
+            continue;
+        }
         if node.tag != "#text"
             && (style
                 .get(Prop::DISPLAY)
@@ -499,14 +603,11 @@ pub(crate) fn inline_text(
                 ))
             || styles.pseudos.contains_key(&child)
             || styles.animations.contains_key(&child)
-            || [
-                Prop::WHITE_SPACE,
-                Prop::VISIBILITY,
-                Prop::POINTER_EVENTS,
-                Prop::TEXT_SHADOW,
-            ]
-            .into_iter()
-            .any(|prop| style.get(prop) != parent.get(prop))
+            || style.get(Prop::WHITE_SPACE) != parent.get(Prop::WHITE_SPACE)
+                && style.get(Prop::WHITE_SPACE) != Some("nowrap")
+            || [Prop::VISIBILITY, Prop::POINTER_EVENTS, Prop::TEXT_SHADOW]
+                .into_iter()
+                .any(|prop| style.get(prop) != parent.get(prop))
             || style.iter().any(|(key, value)| {
                 key.is_known()
                     && parent.value(key) != Some(value)
@@ -536,10 +637,34 @@ pub(crate) fn inline_text(
                             | "transparent"
                             | "currentcolor"
                             | "solid"
+                            // What the `background` shorthand sets by default.
+                            | "0% 0%"
+                            | "repeat"
+                            | "scroll"
+                            | "padding-box"
+                            | "auto auto"
                     )
                     && !matches!(
                         key,
-                        Prop::COLOR
+                        // Checked above: `nowrap` is a flag of its runs.
+                        Prop::WHITE_SPACE
+                            // Inline boxes reserve their padding, border and margin in the text.
+                            | Prop::PADDING
+                            | Prop::PADDING_TOP
+                            | Prop::PADDING_RIGHT
+                            | Prop::PADDING_BOTTOM
+                            | Prop::PADDING_LEFT
+                            | Prop::MARGIN_LEFT
+                            | Prop::MARGIN_RIGHT
+                            | Prop::BORDER_TOP_WIDTH
+                            | Prop::BORDER_RIGHT_WIDTH
+                            | Prop::BORDER_BOTTOM_WIDTH
+                            | Prop::BORDER_LEFT_WIDTH
+                            | Prop::BORDER_TOP_STYLE
+                            | Prop::BORDER_RIGHT_STYLE
+                            | Prop::BORDER_BOTTOM_STYLE
+                            | Prop::BORDER_LEFT_STYLE
+                            | Prop::COLOR
                             | Prop::FONT_FAMILY
                             | Prop::FONT_WEIGHT
                             | Prop::FONT_STYLE
@@ -634,10 +759,48 @@ pub(crate) fn inline_text(
             .and_then(color::color)
             .filter(|(_, alpha)| *alpha != 0)
             .or(background);
-        if background != inherited_background
-            && let Some((color, alpha)) = background
-        {
-            backgrounds.push((index, color << 8 | alpha as u32));
+        if node.tag != "#text" {
+            let units = &styles.lengths[child];
+            let padding = units.edges(style, super::PADDING, 0.);
+            let margin = units.edges(style, super::MARGIN, 0.);
+            let borders: [f32; 4] = std::array::from_fn(|side| {
+                let [width, kind, _] = super::BORDERS[side];
+                if style
+                    .get(kind)
+                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                {
+                    return 0.;
+                }
+                style
+                    .get(width)
+                    .map_or(Some(3.), |width| units.resolve(width, 0.))
+                    .unwrap_or(0.)
+                    .max(0.)
+            });
+            let fill = (background != inherited_background)
+                .then_some(background)
+                .flatten()
+                .map_or(0, |(color, alpha)| color << 8 | alpha as u32);
+            let edges: [f32; 4] = std::array::from_fn(|side| padding[side] + borders[side]);
+            if fill != 0 || edges != [0.; 4] || margin[1] != 0. || margin[3] != 0. {
+                opening += margin[3];
+                marks.push((opening, None));
+                opening += edges[3];
+                boxes.push(InlineBox {
+                    index,
+                    fill,
+                    edges,
+                    borders,
+                    border: super::BORDERS
+                        .iter()
+                        .enumerate()
+                        .filter(|(side, _)| borders[*side] > 0.)
+                        .find_map(|(_, [_, _, color])| style.get(*color).and_then(self::color))
+                        .map_or(0, |(color, alpha)| color << 8 | alpha as u32),
+                    lead: f32::NAN,
+                    trail: f32::NAN,
+                });
+            }
         }
         pending.push((child, Some(index), background));
         pending.extend(
@@ -687,6 +850,14 @@ pub(crate) fn inline_text(
                 if (size - styles.lengths[id].font.em).abs() > 0.01 {
                     run.font_size = Some(renderer::px(size));
                 }
+                run.nowrap = mode == "nowrap";
+                run.inset[0] = renderer::px(opening);
+                for (inline, (mark, _)) in boxes.iter_mut().zip(&marks) {
+                    if inline.lead.is_nan() {
+                        inline.lead = opening - mark;
+                    }
+                }
+                opening = 0.;
                 runs.push(run);
                 line_heights.push((text.len(), line_height(style)));
             }
@@ -705,6 +876,10 @@ pub(crate) fn inline_text(
         pop(&mut text, &mut runs, &mut ranges);
     }
     if text.is_empty() {
+        return None;
+    }
+    // Boxes alone need no text layout: their line is a row of boxes.
+    if !atoms.is_empty() && text.chars().all(|c| c == '\u{fffc}' || c.is_whitespace()) {
         return None;
     }
     let pseudo_run = |style: &Style| {
@@ -781,11 +956,23 @@ pub(crate) fn inline_text(
                 })
                 .collect()
         });
+    for (inline, (mark, closed)) in boxes.iter_mut().zip(&marks) {
+        if inline.lead.is_nan() {
+            inline.lead = opening - mark;
+        }
+        if let Some((run, at)) = closed {
+            inline.trail = runs
+                .get(*run)
+                .map_or(0., |run| f32::from(run.inset[1]) - at)
+                + runs.get(run + 1).map_or(0., |run| f32::from(run.inset[0]));
+        }
+    }
     Some(InlineText {
         text: text.into(),
         runs: runs.into(),
         ranges: ranges.into(),
-        backgrounds: backgrounds.into(),
+        boxes: boxes.into(),
+        atoms: atoms.into(),
         cursors: cursors.into(),
         shadows: shadows.into(),
         line_heights: line_heights.into(),
@@ -826,9 +1013,14 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
                 let generic: &[&str] = match lower.as_str() {
                     // Like Chrome, the `ui-*` families are not supported, so lists fall through to the next family.
                     "ui-monospace" | "ui-serif" | "ui-sans-serif" | "ui-rounded" => return None,
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" | "sans-serif" => {
-                        &[".SystemUIFont"]
-                    }
+                    "system-ui" | "-apple-system" | "blinkmacsystemfont" => &[".SystemUIFont"],
+                    "sans-serif" => &[
+                        "Helvetica",
+                        "Arial",
+                        "DejaVu Sans",
+                        "Liberation Sans",
+                        ".SystemUIFont",
+                    ],
                     "monospace" => &[
                         "Menlo",
                         "SF Mono",

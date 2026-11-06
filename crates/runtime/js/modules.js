@@ -19,7 +19,7 @@ const define = definition => {
   if (definition.commonjs) source = `(function(exports,require,module,__filename,__dirname,$appsRequire,$appsImport){\n${definition.code}\n})${debug}`;
   else {
     const exports = definition.exports.map(item => `[${JSON.stringify(item.name)}]:{enumerable:true,get:()=>(${item.value})}`).join(',');
-    const params = definition.linked === false ? '' : ',$appsImport' + definition.deps.map(id => ',$appsN' + id).join('');
+    const params = definition.linked === false ? '' : ',$appsImport,$appsRequire' + definition.deps.map(id => ',$appsN' + id).join('');
     const body = `(${definition.async === 2 ? 'async ' : ''}function*($out,$appsBind${params}){'use strict';$appsBind($out,{${exports}});yield;\n${definition.code}\n})`;
     source = definition.linked === false ? `(function($scope){with($scope){return${body}}})${debug}` : body + debug;
   }
@@ -114,7 +114,7 @@ const setup = root => {
         if (item.local) Object.defineProperty(scope, item.local, { get: () => item.name === '*' ? target.namespace : target.namespace[item.name] });
       }
       module.iterator = factory(scope)(namespace, bind);
-    } else module.iterator = factory(namespace, bind, $appsImport, ...definition.deps.map(id => modules.get(id)?.namespace));
+    } else module.iterator = factory(namespace, bind, $appsImport, $appsRequire, ...definition.deps.map(id => modules.get(id)?.namespace));
     module.iterator.next();
     for (const id of definition.stars) {
       if (!starredBy.has(id)) starredBy.set(id, []);

@@ -22,29 +22,18 @@ pub fn package_app(
     let disabled = apps_runtime::bundle::disabled_features(package)?;
     let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
     let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
-    // WARNING: FFmpeg is LGPL, so it ships as its own libraries with its license, which users can replace.
+    // WARNING: FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
     let media = if enabled("video") || enabled("audio") {
-        let folder = runtime.canonicalize()?;
-        let folder = folder.parent().context("Missing runtime directory")?;
-        let library = apps_runtime::media::library_name(target.platform);
-        // WARNING: older builds can leave other FFmpeg versions next to the runtime, so each file must be the name
-        // that the media library links, which it keeps as a NUL-terminated string.
-        let linked = fs::read(folder.join(library)).unwrap_or_default();
-        let mut names = vec![library.to_owned(), "FFmpeg.LICENSE".to_owned()];
-        for stem in apps_runtime::media::FFMPEG {
-            names.push(
-                fs::read_dir(folder)?
-                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-                    .find(|name| {
-                        apps_runtime::media::is_ffmpeg(target.platform, stem, name) && {
-                            let needle = [name.as_bytes(), b"\0"].concat();
-                            linked.windows(needle.len()).any(|window| window == needle)
-                        }
-                    })
-                    .context("The video and audio features need the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release.")?,
-            );
-        }
-        names
+        let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
+        ensure!(
+            runtime.canonicalize()?.with_file_name(ffmpeg).is_file(),
+            "The video and audio features need the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release."
+        );
+        vec![
+            apps_runtime::media::library_name(target.platform),
+            ffmpeg,
+            "FFmpeg.LICENSE",
+        ]
     } else {
         Vec::new()
     };
@@ -83,13 +72,6 @@ pub fn package_app(
     fs::create_dir_all(out.parent().context("Missing output parent")?)?;
     let root = root.canonicalize()?;
     let mut copies = Vec::new();
-    if root.join("public").try_exists()? {
-        copies.push((
-            "public".to_owned(),
-            root.join("public").canonicalize()?,
-            PathBuf::new(),
-        ));
-    }
     if let Some(manifest) = root
         .ancestors()
         .map(|directory| directory.join("package.json"))
@@ -237,7 +219,7 @@ pub fn package_app(
     let folder = runtime.canonicalize()?;
     for name in &media {
         let source = folder.with_file_name(name);
-        if name != "FFmpeg.LICENSE" {
+        if *name != "FFmpeg.LICENSE" {
             target.validate_binary(&source).context(
                 "The video and audio features need the media library next to the runtime. Build the workspace first with cargo build --workspace --release.",
             )?;
@@ -259,7 +241,8 @@ pub fn package_app(
             ensure!(
                 relative
                     .file_name()
-                    .is_none_or(|name| name.to_str().is_some_and(|name| !name.contains('\\'))),
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.contains('\\')),
                 "App file names must be UTF-8 without backslashes: {}",
                 source.display()
             );
@@ -612,20 +595,11 @@ mod tests {
         };
         let error = build(r#"["video"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
-        let mut names = vec![
-            apps_runtime::media::library_name(target.platform).to_owned(),
-            "FFmpeg.LICENSE".to_owned(),
+        let names = [
+            apps_runtime::media::library_name(target.platform),
+            apps_runtime::media::ffmpeg_name(target.platform),
+            "FFmpeg.LICENSE",
         ];
-        for entry in fs::read_dir(std::env::current_exe().unwrap().parent().unwrap()).unwrap() {
-            let name = entry.unwrap().file_name().into_string().unwrap();
-            if apps_runtime::media::FFMPEG
-                .iter()
-                .any(|stem| apps_runtime::media::is_ffmpeg(target.platform, stem, &name))
-            {
-                names.push(name);
-            }
-        }
-        assert_eq!(names.len(), 7, "{names:?}");
         for name in &names {
             fs::copy(
                 std::env::current_exe().unwrap().with_file_name(name),
@@ -633,12 +607,6 @@ mod tests {
             )
             .unwrap();
         }
-        let stale = match target.platform {
-            "macos" => "libavcodec.1.dylib",
-            "windows" => "avcodec-1.dll",
-            _ => "libavcodec.so.1",
-        };
-        fs::write(dir.path().join(stale), b"stale").unwrap();
         for (features, shipped) in [
             ("[]", false),
             (r#"["audio"]"#, true),
@@ -649,7 +617,6 @@ mod tests {
             for name in &names {
                 assert_eq!(libraries.join(name).is_file(), shipped, "{features} {name}");
             }
-            assert!(!libraries.join(stale).exists(), "{features}");
         }
     }
 
@@ -758,23 +725,23 @@ mod tests {
     }
 
     #[test]
-    fn public_and_package_files_copy_unchanged_and_refresh_on_rebuild() {
+    fn package_files_copy_unchanged_and_refresh_on_rebuild() {
         let dir = tempfile::tempdir().unwrap();
-        let public = dir.path().join("public");
-        fs::create_dir_all(public.join("nested/empty")).unwrap();
-        fs::write(public.join("nested/data.bin"), [0, 255, 128]).unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("nested/empty")).unwrap();
+        fs::write(data.join("nested/data.bin"), [0, 255, 128]).unwrap();
         fs::create_dir_all(dir.path().join("lib")).unwrap();
-        fs::create_dir_all(dir.path().join("data/deep")).unwrap();
+        fs::create_dir_all(dir.path().join("public")).unwrap();
         fs::write(dir.path().join("lib/math.bin"), [1, 2]).unwrap();
         fs::write(dir.path().join("lib/skipped.bin"), [3]).unwrap();
-        fs::write(dir.path().join("data/deep/x.txt"), "x").unwrap();
+        fs::write(dir.path().join("public/skipped.txt"), "x").unwrap();
         fs::write(
             dir.path().join("package.json"),
             r#"{"files":["./lib/math.bin","data"]}"#,
         )
         .unwrap();
         fs::write(
-            public.join("static.js"),
+            data.join("static.js"),
             "throw new Error('static file executed')",
         )
         .unwrap();
@@ -788,7 +755,7 @@ mod tests {
             out.clone()
         };
         for production in [false, true] {
-            fs::write(public.join("message.txt"), "first").unwrap();
+            fs::write(data.join("message.txt"), "first").unwrap();
             package_app(
                 &out,
                 &files,
@@ -800,27 +767,28 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                fs::read(assets.join("nested/data.bin")).unwrap(),
+                fs::read(assets.join("data/nested/data.bin")).unwrap(),
                 [0, 255, 128]
             );
-            assert!(assets.join("nested/empty").is_dir());
+            assert!(assets.join("data/nested/empty").is_dir());
             assert_eq!(fs::read(assets.join("lib/math.bin")).unwrap(), [1, 2]);
             assert!(!assets.join("lib/skipped.bin").exists());
-            assert_eq!(fs::read(assets.join("data/deep/x.txt")).unwrap(), b"x");
-            assert_eq!(fs::read(assets.join("message.txt")).unwrap(), b"first");
+            assert!(!assets.join("public").exists());
+            assert!(!assets.join("skipped.txt").exists());
+            assert_eq!(fs::read(assets.join("data/message.txt")).unwrap(), b"first");
             assert_eq!(
-                fs::read(assets.join("static.js")).unwrap(),
-                fs::read(public.join("static.js")).unwrap()
+                fs::read(assets.join("data/static.js")).unwrap(),
+                fs::read(data.join("static.js")).unwrap()
             );
             assert!(
                 !apps_runtime::bundle::read(&out)
                     .unwrap()
                     .files
-                    .contains_key("static.js")
+                    .contains_key("data/static.js")
             );
 
-            fs::remove_file(public.join("message.txt")).unwrap();
-            fs::write(public.join("new.txt"), "second").unwrap();
+            fs::remove_file(data.join("message.txt")).unwrap();
+            fs::write(data.join("new.txt"), "second").unwrap();
             package_app(
                 &out,
                 &files,
@@ -831,21 +799,23 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(!assets.join("message.txt").exists());
-            assert_eq!(fs::read(assets.join("new.txt")).unwrap(), b"second");
+            assert!(!assets.join("data/message.txt").exists());
+            assert_eq!(fs::read(assets.join("data/new.txt")).unwrap(), b"second");
         }
     }
 
     #[test]
-    fn public_assets_cannot_replace_build_files_or_contain_output() {
+    fn package_files_cannot_replace_build_files_or_contain_output() {
         let dir = tempfile::tempdir().unwrap();
-        let public = dir.path().join("public");
-        fs::create_dir(&public).unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let manifest = dir.path().join("package.json");
         let runtime = dir.path().join("runtime");
         fs::write(&runtime, b"runtime").unwrap();
         let out = dir.path().join("dist");
         let files = BBTreeMap::from([("app.js".into(), String::new())]);
         for production in [false, true] {
+            fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
             let (_, executable) = package_app(
                 &out,
                 &files,
@@ -864,8 +834,9 @@ mod tests {
                 ".apps-build",
                 if cfg!(windows) { "App.exe" } else { "App" },
             ] {
-                let source = public.join(name);
+                let source = dir.path().join(name);
                 fs::write(&source, "conflict").unwrap();
+                fs::write(&manifest, format!(r#"{{"files":["{name}"]}}"#)).unwrap();
                 let error = package_app(
                     &out,
                     &files,
@@ -884,12 +855,13 @@ mod tests {
                 assert!(apps_runtime::bundle::read(&out).is_ok());
                 fs::remove_file(source).unwrap();
             }
+            fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
             #[cfg(unix)]
             for name in [
                 std::ffi::OsStr::new("..\\..\\escape.txt"),
                 std::os::unix::ffi::OsStrExt::from_bytes(b"invalid-\xff.txt"),
             ] {
-                let source = public.join(name);
+                let source = data.join(name);
                 if fs::write(&source, "escape").is_err() {
                     continue;
                 }
@@ -908,7 +880,7 @@ mod tests {
             }
         }
         let error = package_app(
-            &public.join("dist"),
+            &data.join("dist"),
             &files,
             &runtime,
             dir.path(),
@@ -917,7 +889,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("outside public"), "{error}");
-        assert!(!public.join("dist").exists());
+        assert!(error.to_string().contains("outside data"), "{error}");
+        assert!(!data.join("dist").exists());
     }
 }

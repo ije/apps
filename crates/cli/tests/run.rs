@@ -203,8 +203,6 @@ mod process {
             format!("console.log({value:?});"),
         )
         .unwrap();
-        fs::create_dir(app.root.join("public")).unwrap();
-        fs::write(app.root.join("public/asset.txt"), "asset").unwrap();
         fs::set_permissions(&app.root, fs::Permissions::from_mode(0o555)).unwrap();
         let output = app.command().env("APPS_RUNTIME", "../runtime").output();
         fs::set_permissions(&app.root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -233,7 +231,7 @@ mod process {
                 .unwrap()
                 .contains(&value)
         );
-        assert_eq!(fs::read_dir(&app.root).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&app.root).unwrap().count(), 1);
     }
 
     #[test]
@@ -327,27 +325,6 @@ mod process {
         app.wait(2);
         let line = format!("--bundle-stdin -- {}\n", entry.display());
         assert_eq!(app.launches(), line.repeat(2));
-    }
-
-    #[test]
-    fn watches_public_assets_without_copying_them() {
-        let mut app = App::new();
-        fs::write(app.root.join("index.js"), "console.log(1);").unwrap();
-        fs::create_dir(app.root.join("public")).unwrap();
-        let asset = app.root.join("public/asset.txt");
-        fs::write(&asset, "before").unwrap();
-        app.child = Some(
-            app.command()
-                .arg("--watch")
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        app.wait(1);
-        fs::write(&asset, "after").unwrap();
-        app.wait(2);
-        assert!(!app.root.join(".apps").exists());
-        assert_eq!(fs::read_to_string(asset).unwrap(), "after");
     }
 
     #[test]

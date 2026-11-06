@@ -31,7 +31,6 @@ pub fn run(
     let root = rust
         .or_else(|| entry.parent())
         .context("Missing project directory")?;
-    let public = root.join("public");
     let runtime = runtime.canonicalize().context(
         "Cannot find the runtime. Build the workspace or set APPS_RUNTIME to an executable",
     )?;
@@ -94,6 +93,9 @@ pub fn run(
     let mut watched = BTreeSet::<PathBuf>::new();
     let mut child = None;
     let mut writer = None;
+    let dev_bundle = rust
+        .is_none()
+        .then(|| std::env::temp_dir().join(format!("apps-bundle-{}.json", std::process::id())));
     let result = (|| -> Result<i32> {
         let mut fresh = true;
         let mut launch = bundle.is_some();
@@ -111,12 +113,8 @@ pub fn run(
                         .iter()
                         .filter_map(|path| path.parent())
                         .filter_map(|path| path.ancestors().find(|path| path.is_dir()))
-                        .filter(|path| !path.starts_with(&public))
                         .map(Path::to_owned)
                         .collect();
-                    if public.is_dir() {
-                        directories.insert(public.clone());
-                    }
                     let src = root.join("src");
                     if rust.is_some() && src.is_dir() {
                         directories.insert(src.clone());
@@ -129,7 +127,7 @@ pub fn run(
                         for path in directories.difference(&watched) {
                             paths.add(
                                 path,
-                                if path == &public || rust.is_some() && path == &src {
+                                if rust.is_some() && path == &src {
                                     notify::RecursiveMode::Recursive
                                 } else {
                                     notify::RecursiveMode::NonRecursive
@@ -166,6 +164,9 @@ pub fn run(
                 // WARNING: without it the runtime starts itself again, see `malloc.rs`.
                 #[cfg(target_os = "macos")]
                 cmd.env("MallocSpaceEfficient", "1");
+                if let Some(path) = &dev_bundle {
+                    cmd.env("APPS_DEV_BUNDLE", path);
+                }
                 child = Some(
                     cmd.args(args)
                         .env("APPS_JSC_LIBRARY", &library)
@@ -174,6 +175,7 @@ pub fn run(
                         .spawn()?,
                 );
                 let input = child.as_mut().unwrap().stdin.take().unwrap();
+                let dev_bundle = dev_bundle.clone();
                 writer = Some(
                     std::thread::Builder::new()
                         .name("apps-bundle".into())
@@ -182,6 +184,15 @@ pub fn run(
                                 files,
                                 ..Default::default()
                             };
+                            // WARNING: a script that `ELECTRON_RUN_AS_NODE` runs reads its chunk from this file, so it must be there before the app starts.
+                            if let Some(path) = &dev_bundle
+                                && bundle.files.keys().any(|name| name.starts_with("script-"))
+                            {
+                                serde_json::to_writer(
+                                    BufWriter::new(std::fs::File::create(path)?),
+                                    &bundle,
+                                )?;
+                            }
                             let mut input = BufWriter::new(input);
                             serde_json::to_writer(&mut input, &bundle)?;
                             input.flush()?;
@@ -240,8 +251,7 @@ pub fn run(
                     }
                     let files = files.borrow();
                     if event.paths.iter().any(|path| {
-                        path.starts_with(&public)
-                            || rust.is_some() && path.extension().is_some_and(|e| e == "rs")
+                        rust.is_some() && path.extension().is_some_and(|e| e == "rs")
                             || files
                                 .range(path.clone()..)
                                 .next()
@@ -301,6 +311,9 @@ pub fn run(
             }
         }
     })();
+    if let Some(path) = &dev_bundle {
+        let _ = std::fs::remove_file(path);
+    }
     if let Some(mut process) = child {
         let _ = process.kill();
         let _ = process.wait();

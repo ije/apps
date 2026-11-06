@@ -7,9 +7,6 @@ use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLoc
 
 const ABI: u32 = 2;
 
-/// The FFmpeg libraries that the media library links, by name stem.
-pub const FFMPEG: [&str; 5] = ["avformat", "avcodec", "swscale", "swresample", "avutil"];
-
 #[repr(C)]
 struct Host {
     waker: extern "C" fn() -> *mut c_void,
@@ -74,22 +71,12 @@ pub fn library_name(platform: &str) -> &'static str {
     }
 }
 
-/// Whether `name` is the file that the media library loads for FFmpeg library `stem`, like
-/// `libavcodec.63.dylib`, `libavcodec.so.63` or `avcodec-63.dll`.
-pub fn is_ffmpeg(platform: &str, stem: &str, name: &str) -> bool {
-    let version = |rest: Option<&str>| {
-        rest.is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
-    };
+/// The FFmpeg library that the media library links.
+pub fn ffmpeg_name(platform: &str) -> &'static str {
     match platform {
-        "macos" => version(
-            name.strip_prefix(&format!("lib{stem}."))
-                .and_then(|rest| rest.strip_suffix(".dylib")),
-        ),
-        "windows" => version(
-            name.strip_prefix(&format!("{stem}-"))
-                .and_then(|rest| rest.strip_suffix(".dll")),
-        ),
-        _ => version(name.strip_prefix(&format!("lib{stem}.so."))),
+        "macos" => "libffmpeg.dylib",
+        "windows" => "ffmpeg.dll",
+        _ => "libffmpeg.so",
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::dom::{Document, Selector, SelectorCache, SelectorList};
-use rustc_hash::FxHashMap;
 use bbtree::unsync::BBTreeMap;
+use rustc_hash::FxHashMap;
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 mod animation;
@@ -803,7 +803,10 @@ type CollapsedTable = (
 
 impl StyleCache {
     fn walk(&mut self, doc: &Document, root: usize) -> Rc<TreeWalk> {
-        let walk = self.walks.remove(&root).and_then(|walk| Rc::try_unwrap(walk).ok());
+        let walk = self
+            .walks
+            .remove(&root)
+            .and_then(|walk| Rc::try_unwrap(walk).ok());
         let mut walk = walk.unwrap_or_else(|| TreeWalk {
             walk: Default::default(),
             used: Default::default(),
@@ -858,7 +861,11 @@ impl StyleCache {
         }
     }
 
-    pub(crate) fn set_containers(&mut self, sizes: &HashMap<usize, [f32; 2]>, doc: &Document) -> bool {
+    pub(crate) fn set_containers(
+        &mut self,
+        sizes: &HashMap<usize, [f32; 2]>,
+        doc: &Document,
+    ) -> bool {
         self.units = false;
         if *sizes == self.containers {
             return false;
@@ -1613,6 +1620,9 @@ const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
         "text-align-last",
         "auto|start|end|left|right|center|justify|match-parent",
     ),
+    ("text-box", "*"),
+    ("text-box-edge", "*"),
+    ("text-box-trim", "none|trim-start|trim-end|trim-both"),
     ("text-decoration", "*"),
     ("text-decoration-color", "<color>"),
     (
@@ -1714,6 +1724,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("animation-name", "none"),
     ("animation-play-state", "running"),
     ("animation-timing-function", "ease"),
+    ("app-region", "none"),
     ("appearance", "none"),
     ("aspect-ratio", "auto"),
     ("backdrop-filter", "none"),
@@ -1850,6 +1861,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("tab-size", "8"),
     ("table-layout", "auto"),
     ("text-align", "start"),
+    ("text-box", "normal"),
+    ("text-box-edge", "auto"),
+    ("text-box-trim", "none"),
     ("text-decoration-color", "currentcolor"),
     ("text-decoration-line", "none"),
     ("text-decoration-style", "solid"),
@@ -2409,6 +2423,9 @@ pub(crate) fn resolved(
         }
         .or_else(|| match name.split_once('-') {
             Some(("animation", key)) => shorthand(Prop::ANIMATION, key),
+            Some(("transition", "property")) if style.get(Prop::TRANSITION) == Some("none") => {
+                Some("none".to_owned())
+            }
             Some(("transition", key)) => shorthand(Prop::TRANSITION, key),
             _ => None,
         })
@@ -2764,6 +2781,20 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
         );
     }
     result
+}
+
+impl ComputedStyles {
+    pub(crate) fn blended(&self) -> bool {
+        self.blended.get().unwrap_or_else(|| {
+            let blended = self.values.iter().any(|style| {
+                style
+                    .get(Prop::MIX_BLEND_MODE)
+                    .is_some_and(|value| value != "normal")
+            });
+            self.blended.set(Some(blended));
+            blended
+        })
+    }
 }
 
 pub(crate) fn computed_names() -> impl Iterator<Item = &'static str> {
@@ -3413,6 +3444,8 @@ impl From<ComputedStyles> for SpareStyles {
 
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
+    /// Whether a box uses `mix-blend-mode`, found on first use.
+    blended: std::cell::Cell<Option<bool>>,
     /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
     /// that don't read it. Only nodes with animations or transitions keep theirs, for the keyframes.
     pub values: Vec<Rc<Style>>,
@@ -4303,7 +4336,11 @@ pub(crate) fn cascade(
                     scoped.nodes[id].as_ref()
                     && matches.valid_since(&cached.dependencies, &cached.checked)
                 {
-                    (cached.rules.to_vec(), cached.pseudos.to_vec(), cached.columns)
+                    (
+                        cached.rules.to_vec(),
+                        cached.pseudos.to_vec(),
+                        cached.columns,
+                    )
                 } else {
                     matches.dependencies.clear();
                     matches.depend(id, 0);
@@ -4746,6 +4783,41 @@ pub(crate) fn cascade(
                     )
                 })
                 .collect();
+        }
+        // WARNING: `transition` and `animation` stay shorthands here, and a longhand always wins over them
+        // later, so a stronger shorthand must remove the longhands it resets.
+        for (shorthand, longhands) in [
+            (
+                Prop::TRANSITION,
+                &[
+                    Prop::TRANSITION_PROPERTY,
+                    Prop::TRANSITION_DURATION,
+                    Prop::TRANSITION_TIMING_FUNCTION,
+                    Prop::TRANSITION_DELAY,
+                    Prop::TRANSITION_BEHAVIOR,
+                ][..],
+            ),
+            (
+                Prop::ANIMATION,
+                &[
+                    Prop::ANIMATION_NAME,
+                    Prop::ANIMATION_DURATION,
+                    Prop::ANIMATION_TIMING_FUNCTION,
+                    Prop::ANIMATION_DELAY,
+                    Prop::ANIMATION_ITERATION_COUNT,
+                    Prop::ANIMATION_DIRECTION,
+                    Prop::ANIMATION_FILL_MODE,
+                    Prop::ANIMATION_PLAY_STATE,
+                ][..],
+            ),
+        ] {
+            if let Some(&(rank, _)) = cascade.get(&shorthand) {
+                for longhand in longhands {
+                    if cascade.get(longhand).is_some_and(|(old, _)| *old < rank) {
+                        cascade.remove(longhand);
+                    }
+                }
+            }
         }
         if let Some((rank, value)) = cascade.remove(&Prop::ALL) {
             for (prop, _) in style.own() {

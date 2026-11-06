@@ -6,14 +6,22 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 #[derive(Clone)]
 struct State {
     transform: skia::Transform,
-    fill: skia::Color,
-    stroke: skia::Color,
+    fill: skia::Shader<'static>,
+    stroke: skia::Shader<'static>,
     alpha: f32,
     width: f32,
+    cap: skia::LineCap,
+    join: skia::LineJoin,
+    miter: f32,
+    dash: Vec<f32>,
+    dash_offset: f32,
+    blend: skia::BlendMode,
+    smoothing: bool,
+    spacing: [f32; 2],
     font: Rc<str>,
     /// The part of the text width that is left of the anchor: 0, 0.5 or 1.
     align: f32,
-    /// 0 alphabetic, 1 top, 2 middle, 3 bottom.
+    /// 0 alphabetic, 1 top, 2 middle, 3 bottom, 4 hanging, 5 ideographic.
     baseline: u8,
     clip: Option<Rc<skia::Mask>>,
 }
@@ -22,6 +30,8 @@ struct State {
 pub struct Canvas {
     pub pixels: skia::Pixmap,
     pub image: Arc<renderer::RenderImage>,
+    /// Keep `image` current. Only a `<canvas>` on a page needs it, so an offscreen canvas has one pixel copy.
+    pub present: bool,
     state: State,
     stack: Vec<State>,
     path: skia::PathBuilder,
@@ -44,7 +54,8 @@ pub fn line(
     aliases: &std::collections::HashMap<String, String>,
     font: &str,
     text: &str,
-) -> Rc<renderer::LineLayout> {
+    [letter, word]: [f32; 2],
+) -> (Rc<renderer::LineLayout>, [f32; 4]) {
     let text = text.replace(['\n', '\r', '\t'], " ");
     let (size, family) = font.split_once("px").unwrap_or(("10", "sans-serif"));
     let mut face = crate::style::font(&crate::style::Style::from_iter([
@@ -78,9 +89,11 @@ pub fn line(
         background_color: None,
         underline: None,
         strikethrough: None,
-        letter_spacing: renderer::px(0.),
-        word_spacing: renderer::px(0.),
+        letter_spacing: renderer::px(letter),
+        word_spacing: renderer::px(word),
         font_size: None,
+        inset: Default::default(),
+        nowrap: false,
     };
     let font_size = size
         .split_whitespace()
@@ -88,7 +101,117 @@ pub fn line(
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|size| size.is_finite() && *size > 0.)
         .unwrap_or(10.);
-    system.layout_line(&text, renderer::px(font_size), &[run], None)
+    let id = system.resolve_font(&run.font);
+    let [ascent, descent, _] = system.line_metrics(id, renderer::px(font_size));
+    let em = f32::from(system.em_ascent(id, renderer::px(font_size)));
+    (
+        system.layout_line(&text, renderer::px(font_size), &[run], None),
+        [f32::from(ascent), f32::from(descent), em, font_size - em],
+    )
+}
+
+/// The ink of a line from its origin: left, right, above and below the baseline. All are 0 without ink.
+pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 4] {
+    let mut ink: Option<[f32; 4]> = None;
+    for run in &line.runs {
+        for glyph in &run.glyphs {
+            let Some([left, right, top, bottom]) =
+                system.glyph_bounds(run.font_id, glyph.id, run.font_size)
+            else {
+                continue;
+            };
+            let x = f32::from(glyph.position.x);
+            let [l, r, t, b] = ink.get_or_insert([x + left, x + right, top, bottom]);
+            *l = l.min(x + left);
+            *r = r.max(x + right);
+            *t = t.max(top);
+            *b = b.min(bottom);
+        }
+    }
+    ink.map_or([0.; 4], |[left, right, top, bottom]| {
+        [left, right, top, -bottom]
+    })
+}
+
+fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
+    let (shape, stops): (Vec<f32>, Vec<(f32, String)>) = serde_json::from_str(spec).ok()?;
+    // WARNING: tiny-skia has no start radius, so the stops move out by it. Inside it the first color fills.
+    let start = (shape.len() == 6)
+        .then(|| shape[2] / shape[5])
+        .unwrap_or(0.);
+    let stops = stops
+        .iter()
+        .filter_map(|(offset, color)| {
+            let (rgb, alpha) = crate::style::color(color)?;
+            let [_, r, g, b] = rgb.to_be_bytes();
+            Some(skia::GradientStop::new(
+                start + offset * (1. - start),
+                skia::Color::from_rgba8(r, g, b, alpha),
+            ))
+        })
+        .collect();
+    let identity = skia::Transform::identity();
+    match shape[..] {
+        [x0, y0, x1, y1] => skia::LinearGradient::new(
+            (x0, y0).into(),
+            (x1, y1).into(),
+            stops,
+            skia::SpreadMode::Pad,
+            identity,
+        ),
+        [x0, y0, _, x1, y1, r1] => skia::RadialGradient::new(
+            (x0, y0).into(),
+            (x1, y1).into(),
+            r1,
+            stops,
+            skia::SpreadMode::Pad,
+            identity,
+        ),
+        _ => None,
+    }
+}
+
+/// Adds an elliptical arc in canvas pixels, joined to the current point with a line.
+fn arc(
+    path: &mut skia::PathBuilder,
+    t: skia::Transform,
+    [cx, cy, rx, ry, rotation, start, end, counter]: [f32; 8],
+) {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let sweep = end - start;
+    let sweep = if counter == 0. && sweep >= TAU {
+        TAU
+    } else if counter != 0. && sweep <= -TAU {
+        -TAU
+    } else if counter != 0. {
+        sweep.rem_euclid(TAU) - TAU * f32::from(sweep.rem_euclid(TAU) > 0.)
+    } else {
+        sweep.rem_euclid(TAU)
+    };
+    let (sin, cos) = rotation.sin_cos();
+    let at = |x: f32, y: f32| {
+        let (x, y) = (x * rx, y * ry);
+        let (x, y) = (cx + x * cos - y * sin, cy + x * sin + y * cos);
+        (t.sx * x + t.kx * y + t.tx, t.ky * x + t.sy * y + t.ty)
+    };
+    let (mut s0, mut c0) = start.sin_cos();
+    let (x, y) = at(c0, s0);
+    if path.is_empty() {
+        path.move_to(x, y);
+    } else {
+        path.line_to(x, y);
+    }
+    let parts = (sweep.abs() / FRAC_PI_2).ceil().max(1.);
+    let step = sweep / parts;
+    let k = 4. / 3. * (step / 4.).tan();
+    for part in 1..=parts as u32 {
+        let (s1, c1) = (start + step * part as f32).sin_cos();
+        let (x1, y1) = at(c0 - k * s0, s0 + k * c0);
+        let (x2, y2) = at(c1 + k * s1, s1 - k * c1);
+        let (x, y) = at(c1, s1);
+        path.cubic_to(x1, y1, x2, y2, x, y);
+        (s0, c0) = (s1, c1);
+    }
 }
 
 /// Web fonts, and the system fonts once `system` asks for them, since loading those takes tens of milliseconds.
@@ -103,7 +226,7 @@ pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, 
     fonts
 }
 
-fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> {
+pub(crate) fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> {
     let mut bytes = vec![0; pixels.data().len()];
     for (out, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(pixels.pixels()) {
         if pixel.alpha() != 0 {
@@ -137,12 +260,21 @@ impl Canvas {
         Ok(Self {
             pixels,
             image,
+            present: true,
             state: State {
                 transform: skia::Transform::identity(),
-                fill: skia::Color::BLACK,
-                stroke: skia::Color::BLACK,
+                fill: skia::Shader::SolidColor(skia::Color::BLACK),
+                stroke: skia::Shader::SolidColor(skia::Color::BLACK),
                 alpha: 1.,
                 width: 1.,
+                cap: skia::LineCap::Butt,
+                join: skia::LineJoin::Miter,
+                miter: 10.,
+                dash: Vec::new(),
+                dash_offset: 0.,
+                blend: skia::BlendMode::SourceOver,
+                smoothing: true,
+                spacing: [0.; 2],
                 font: "10px sans-serif".into(),
                 align: 0.,
                 baseline: 0,
@@ -158,42 +290,94 @@ impl Canvas {
     /// Runs the `CanvasRenderingContext2D` operations from `dom.js`: a code and its arguments. Strings are
     /// UTF-16 lengths of consecutive parts of `strings`, and `putImageData` bytes are in `data`. `image`
     /// returns the pixels of another canvas or image node.
-    pub fn draw(
+    pub fn draw<'a>(
         &mut self,
         ops: &[f32],
         mut strings: &str,
         data: &[&[u8]],
-        image: &dyn Fn(usize) -> Option<skia::Pixmap>,
+        image: &dyn Fn(usize) -> Option<std::borrow::Cow<'a, skia::Pixmap>>,
         fonts: Option<(
             &renderer::TextSystem,
             &std::collections::HashMap<String, String>,
         )>,
     ) -> Result<()> {
         // WARNING: the codes and argument counts must match `CanvasRenderingContext2D` in `dom.js`.
-        const ARGS: [usize; 27] = [
-            0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 3, 11, 5,
+        const ARGS: [usize; 41] = [
+            0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 4, 11, 5, 4, 6,
+            8, 5, 12, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ];
-        let paint = |mut color: skia::Color, alpha: f32| {
-            color.apply_opacity(alpha);
-            let mut paint = skia::Paint::default();
-            paint.set_color(color);
-            paint
+        let paint = |source: &skia::Shader<'static>,
+                     alpha: f32,
+                     blend_mode: skia::BlendMode,
+                     transform: skia::Transform| {
+            let mut shader = source.clone();
+            shader.apply_opacity(alpha);
+            shader.transform(transform);
+            skia::Paint {
+                shader,
+                blend_mode,
+                ..Default::default()
+            }
+        };
+        let stroke = |state: &State| skia::Stroke {
+            width: state.width,
+            miter_limit: state.miter,
+            line_cap: state.cap,
+            line_join: state.join,
+            dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
+        };
+        // WARNING: these modes also change pixels outside the shape, so the shape draws into a layer that covers the canvas.
+        let mut covered: Option<skia::Pixmap> = None;
+        let finish = |pixels: &mut skia::Pixmap, saved: skia::Pixmap, state: &State| {
+            let layer = std::mem::replace(pixels, saved);
+            pixels.draw_pixmap(
+                0,
+                0,
+                layer.as_ref(),
+                &skia::PixmapPaint {
+                    blend_mode: state.blend,
+                    ..Default::default()
+                },
+                skia::Transform::identity(),
+                state.clip.as_deref(),
+            );
         };
         let mut string = |units: f32| {
             let (part, rest) = strings.split_at(crate::dom::utf16_index(strings, units as usize));
             strings = rest;
             part
         };
+        let identity = skia::Transform::identity();
         let mut sources = rustc_hash::FxHashMap::default();
         let [width, height] = [self.pixels.width(), self.pixels.height()];
         let mut rest = ops;
         while let [code, tail @ ..] = rest {
+            if let Some(saved) = covered.take() {
+                finish(&mut self.pixels, saved, &self.state);
+            }
             let count = *ARGS
                 .get(*code as usize)
                 .context("Invalid canvas operation")?;
             ensure!(tail.len() >= count, "Invalid canvas operation");
             let (a, tail) = tail.split_at(count);
             rest = tail;
+            let blend = if matches!(*code as u8, 18 | 19 | 21 | 22 | 24 | 25 | 27)
+                && matches!(
+                    self.state.blend,
+                    skia::BlendMode::SourceIn
+                        | skia::BlendMode::SourceOut
+                        | skia::BlendMode::DestinationIn
+                        | skia::BlendMode::DestinationAtop
+                        | skia::BlendMode::Source
+                ) {
+                covered = Some(std::mem::replace(
+                    &mut self.pixels,
+                    skia::Pixmap::new(width, height).context("Cannot allocate canvas layer")?,
+                ));
+                skia::BlendMode::SourceOver
+            } else {
+                self.state.blend
+            };
             let state = &mut self.state;
             let point = |x: f32, y: f32| {
                 let t = state.transform;
@@ -216,13 +400,23 @@ impl Canvas {
                 }
                 2 | 3 => {}
                 4 | 5 => {
-                    if let Some((rgb, alpha)) = crate::style::color(string(a[0])) {
-                        let [_, r, g, b] = rgb.to_be_bytes();
-                        let color = skia::Color::from_rgba8(r, g, b, alpha);
+                    let value = string(a[0]);
+                    let source = if let Some(spec) = value.strip_prefix("gradient:") {
+                        Some(
+                            gradient(spec)
+                                .unwrap_or(skia::Shader::SolidColor(skia::Color::TRANSPARENT)),
+                        )
+                    } else {
+                        crate::style::color(value).map(|(rgb, alpha)| {
+                            let [_, r, g, b] = rgb.to_be_bytes();
+                            skia::Shader::SolidColor(skia::Color::from_rgba8(r, g, b, alpha))
+                        })
+                    };
+                    if let Some(source) = source {
                         if *code == 4. {
-                            state.fill = color;
+                            state.fill = source;
                         } else {
-                            state.stroke = color;
+                            state.stroke = source;
                         }
                     }
                 }
@@ -236,9 +430,11 @@ impl Canvas {
                 }
                 8 => {
                     state.baseline = match string(a[0]) {
-                        "top" | "hanging" => 1,
+                        "top" => 1,
                         "middle" => 2,
-                        "bottom" | "ideographic" => 3,
+                        "bottom" => 3,
+                        "hanging" => 4,
+                        "ideographic" => 5,
                         _ => 0,
                     }
                 }
@@ -306,7 +502,7 @@ impl Canvas {
                         if *code == 18. {
                             self.pixels.fill_path(
                                 &path,
-                                &paint(state.fill, state.alpha),
+                                &paint(&state.fill, state.alpha, blend, state.transform),
                                 rule,
                                 skia::Transform::identity(),
                                 mask,
@@ -317,12 +513,8 @@ impl Canvas {
                             // The path is in canvas pixels, while the line width follows the transform.
                             self.pixels.stroke_path(
                                 &path,
-                                &paint(state.stroke, state.alpha),
-                                &skia::Stroke {
-                                    width: state.width,
-                                    miter_limit: 10.,
-                                    ..Default::default()
-                                },
+                                &paint(&state.stroke, state.alpha, blend, identity),
+                                &stroke(state),
                                 state.transform,
                                 mask,
                             );
@@ -343,18 +535,14 @@ impl Canvas {
                     match *code as u8 {
                         21 => self.pixels.fill_rect(
                             rect,
-                            &paint(state.fill, state.alpha),
+                            &paint(&state.fill, state.alpha, blend, identity),
                             state.transform,
                             mask,
                         ),
                         22 => self.pixels.stroke_path(
                             &skia::PathBuilder::from_rect(rect),
-                            &paint(state.stroke, state.alpha),
-                            &skia::Stroke {
-                                width: state.width,
-                                miter_limit: 10.,
-                                ..Default::default()
-                            },
+                            &paint(&state.stroke, state.alpha, blend, identity),
+                            &stroke(state),
                             state.transform,
                             mask,
                         ),
@@ -369,19 +557,35 @@ impl Canvas {
                         ),
                     }
                 }
-                24 => {
+                24 | 27 => {
                     let value = string(a[0]);
                     let Some((system, aliases)) = fonts else {
                         continue;
                     };
-                    let line = line(system, aliases, &state.font, value);
-                    let [advance, ascent, descent] =
-                        [line.width, line.ascent, line.descent].map(f32::from);
-                    let t = state.transform.pre_translate(
-                        a[1] - advance * state.align,
-                        a[2] + [0., ascent, (ascent - descent) / 2., -descent]
-                            [state.baseline as usize],
-                    );
+                    let (line, [ascent, descent, em_ascent, em_descent]) =
+                        line(system, aliases, &state.font, value, state.spacing);
+                    let advance = f32::from(line.width);
+                    // Text wider than `maxWidth` is squeezed horizontally. Rounding errors in the widths are not worth a blurry layer.
+                    let squeeze = if advance > a[3] + 1e-3 {
+                        a[3] / advance
+                    } else {
+                        1.
+                    };
+                    let t = state
+                        .transform
+                        .pre_translate(a[1], a[2])
+                        .pre_scale(squeeze, 1.)
+                        .pre_translate(
+                            -advance * state.align,
+                            [
+                                0.,
+                                em_ascent,
+                                (em_ascent - em_descent) / 2.,
+                                -em_descent,
+                                ascent * 0.8,
+                                -descent,
+                            ][state.baseline as usize],
+                        );
                     let scale = (t.sx * t.sy - t.kx * t.ky).abs().sqrt();
                     if !scale.is_finite() || scale <= 1e-3 {
                         continue;
@@ -467,7 +671,15 @@ impl Canvas {
                         .context("Cannot allocate text layer")?;
                     let stride = layer.width() as usize;
                     let out = layer.pixels_mut();
-                    let fill = state.fill.to_color_u8();
+                    let source = if *code == 24. {
+                        &state.fill
+                    } else {
+                        &state.stroke
+                    };
+                    let fill = match source {
+                        skia::Shader::SolidColor(color) => color.to_color_u8(),
+                        _ => skia::ColorU8::from_rgba(255, 255, 255, 255),
+                    };
                     for (key, x, y) in placed {
                         let Some((_, size, bytes)) = &self.glyphs[&key] else {
                             continue;
@@ -512,14 +724,36 @@ impl Canvas {
                             }
                         }
                     }
+                    if let Some(to_layer) =
+                        skia::Rect::from_xywh(0., 0., layer.width() as f32, layer.height() as f32)
+                            .filter(|_| !matches!(source, skia::Shader::SolidColor(_)))
+                            .zip(
+                                skia::Transform::from_translate(left as f32, top as f32)
+                                    .post_concat(to_canvas)
+                                    .invert(),
+                            )
+                    {
+                        let (rect, to_layer) = to_layer;
+                        layer.fill_rect(
+                            rect,
+                            &paint(
+                                source,
+                                1.,
+                                skia::BlendMode::SourceIn,
+                                state.transform.post_concat(to_layer),
+                            ),
+                            identity,
+                            None,
+                        );
+                    }
                     let paint = skia::PixmapPaint {
                         opacity: state.alpha,
+                        blend_mode: blend,
                         quality: if upright {
                             skia::FilterQuality::Nearest
                         } else {
                             skia::FilterQuality::Bilinear
                         },
-                        ..Default::default()
                     };
                     self.pixels.draw_pixmap(
                         left,
@@ -534,13 +768,13 @@ impl Canvas {
                     // WARNING: a negative node draws the canvas onto itself, so it is copied for each call.
                     let own;
                     let source = if a[0] < 0. {
-                        own = self.pixels.clone();
+                        own = covered.as_ref().unwrap_or(&self.pixels).clone();
                         Some(&own)
                     } else {
                         sources
                             .entry(a[0] as usize)
                             .or_insert_with(|| image(a[0] as usize))
-                            .as_ref()
+                            .as_deref()
                     };
                     let Some(source) = source else {
                         continue;
@@ -558,7 +792,11 @@ impl Canvas {
                         shader: skia::Pattern::new(
                             source.as_ref(),
                             skia::SpreadMode::Pad,
-                            skia::FilterQuality::Bicubic,
+                            if state.smoothing {
+                                skia::FilterQuality::Bicubic
+                            } else {
+                                skia::FilterQuality::Nearest
+                            },
                             state.alpha,
                             skia::Transform::from_row(
                                 x * iw / source.width() as f32,
@@ -569,11 +807,157 @@ impl Canvas {
                                 dy - sy * y,
                             ),
                         ),
+                        blend_mode: blend,
                         ..Default::default()
                     };
                     self.pixels
                         .fill_rect(rect, &paint, state.transform, state.clip.as_deref());
                 }
+                28 | 29 => {
+                    let args = if *code == 28. {
+                        [a[0], a[1], a[2], a[2], 0., a[3], a[4], a[5]]
+                    } else {
+                        [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]
+                    };
+                    if args.iter().all(|v| v.is_finite()) {
+                        arc(&mut self.path, state.transform, args);
+                    }
+                }
+                30 => {
+                    let [x1, y1, x2, y2, r] = [a[0], a[1], a[2], a[3], a[4]];
+                    let (cx, cy) = point(x1, y1);
+                    let Some(last) = self.path.last_point().filter(|_| !self.path.is_empty())
+                    else {
+                        self.path.move_to(cx, cy);
+                        continue;
+                    };
+                    let mut from = [skia::Point::from_xy(last.x, last.y)];
+                    if let Some(inverse) = state.transform.invert() {
+                        inverse.map_points(&mut from);
+                    }
+                    let (dx0, dy0, dx1, dy1) = (x1 - from[0].x, y1 - from[0].y, x2 - x1, y2 - y1);
+                    let (len0, len1) = (dx0.hypot(dy0), dx1.hypot(dy1));
+                    let cross = dx0 * dy1 - dy0 * dx1;
+                    if len0 == 0. || len1 == 0. || r == 0. || cross.abs() < 1e-6 {
+                        self.path.line_to(cx, cy);
+                        continue;
+                    }
+                    let (ux0, uy0, ux1, uy1) = (dx0 / len0, dy0 / len0, dx1 / len1, dy1 / len1);
+                    let turn = (ux0 * uy1 - uy0 * ux1).atan2(ux0 * ux1 + uy0 * uy1).abs();
+                    let (reach, k) = (r * (turn / 2.).tan(), r * 4. / 3. * (turn / 4.).tan());
+                    let (sx, sy) = (x1 - ux0 * reach, y1 - uy0 * reach);
+                    let (ex, ey) = (x1 + ux1 * reach, y1 + uy1 * reach);
+                    let start = point(sx, sy);
+                    let (c1, c2, end) = (
+                        point(sx + ux0 * k, sy + uy0 * k),
+                        point(ex - ux1 * k, ey - uy1 * k),
+                        point(ex, ey),
+                    );
+                    self.path.line_to(start.0, start.1);
+                    self.path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
+                }
+                31 => {
+                    let [x, y, w, h] = [a[0], a[1], a[2], a[3]];
+                    let (right, bottom) = (x + w, y + h);
+                    let (sx, sy) = (w.signum(), h.signum());
+                    let r: [f32; 8] =
+                        std::array::from_fn(|i| a[4 + i] * if i % 2 == 0 { sx } else { sy });
+                    // How far a Bézier handle stops from the corner of a quarter circle.
+                    const K: f32 = 0.447_715_25;
+                    let start = point(x + r[0], y);
+                    self.path.move_to(start.0, start.1);
+                    for (line, c1, c2, end) in [
+                        (
+                            (right - r[2], y),
+                            (right - r[2] * K, y),
+                            (right, y + r[3] * K),
+                            (right, y + r[3]),
+                        ),
+                        (
+                            (right, bottom - r[5]),
+                            (right, bottom - r[5] * K),
+                            (right - r[4] * K, bottom),
+                            (right - r[4], bottom),
+                        ),
+                        (
+                            (x + r[6], bottom),
+                            (x + r[6] * K, bottom),
+                            (x, bottom - r[7] * K),
+                            (x, bottom - r[7]),
+                        ),
+                        (
+                            (x, y + r[1]),
+                            (x, y + r[1] * K),
+                            (x + r[0] * K, y),
+                            (x + r[0], y),
+                        ),
+                    ] {
+                        let line = point(line.0, line.1);
+                        let (c1, c2, end) =
+                            (point(c1.0, c1.1), point(c2.0, c2.1), point(end.0, end.1));
+                        self.path.line_to(line.0, line.1);
+                        self.path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
+                    }
+                    self.path.close();
+                    let start = point(x, y);
+                    self.path.move_to(start.0, start.1);
+                }
+                32 => {
+                    state.cap = match string(a[0]) {
+                        "round" => skia::LineCap::Round,
+                        "square" => skia::LineCap::Square,
+                        _ => skia::LineCap::Butt,
+                    }
+                }
+                33 => {
+                    state.join = match string(a[0]) {
+                        "round" => skia::LineJoin::Round,
+                        "bevel" => skia::LineJoin::Bevel,
+                        _ => skia::LineJoin::Miter,
+                    }
+                }
+                34 => state.miter = a[0],
+                35 => {
+                    state.dash = string(a[0])
+                        .split(',')
+                        .filter_map(|v| v.parse().ok())
+                        .collect()
+                }
+                36 => state.dash_offset = a[0],
+                37 => {
+                    use skia::BlendMode::*;
+                    state.blend = match string(a[0]) {
+                        "source-in" => SourceIn,
+                        "source-out" => SourceOut,
+                        "source-atop" => SourceAtop,
+                        "destination-over" => DestinationOver,
+                        "destination-in" => DestinationIn,
+                        "destination-out" => DestinationOut,
+                        "destination-atop" => DestinationAtop,
+                        "lighter" => Plus,
+                        "copy" => Source,
+                        "xor" => Xor,
+                        "multiply" => Multiply,
+                        "screen" => Screen,
+                        "overlay" => Overlay,
+                        "darken" => Darken,
+                        "lighten" => Lighten,
+                        "color-dodge" => ColorDodge,
+                        "color-burn" => ColorBurn,
+                        "hard-light" => HardLight,
+                        "soft-light" => SoftLight,
+                        "difference" => Difference,
+                        "exclusion" => Exclusion,
+                        "hue" => Hue,
+                        "saturation" => Saturation,
+                        "color" => Color,
+                        "luminosity" => Luminosity,
+                        _ => SourceOver,
+                    }
+                }
+                38 => state.spacing[0] = a[0],
+                39 => state.spacing[1] = a[0],
+                40 => state.smoothing = a[0] != 0.,
                 _ => {
                     let bytes = data.get(a[0] as usize).context("Expected image data")?;
                     let (x, y, w, h) = (a[1] as i64, a[2] as i64, a[3] as usize, a[4] as usize);
@@ -599,8 +983,65 @@ impl Canvas {
                 }
             }
         }
-        self.image = render_image(&self.pixels);
+        if let Some(saved) = covered.take() {
+            finish(&mut self.pixels, saved, &self.state);
+        }
+        if self.present {
+            self.image = render_image(&self.pixels);
+        }
         Ok(())
+    }
+
+    /// Whether the point in canvas pixels is in the current path, or in its stroke.
+    pub fn hit(&self, x: f32, y: f32, even_odd: bool, stroke: bool) -> bool {
+        let Some(path) = self.path.clone().finish() else {
+            return false;
+        };
+        let state = &self.state;
+        let path = if stroke {
+            let Some(path) = state
+                .transform
+                .invert()
+                .and_then(|t| path.transform(t))
+                .and_then(|path| {
+                    path.stroke(
+                        &skia::Stroke {
+                            width: state.width,
+                            miter_limit: state.miter,
+                            line_cap: state.cap,
+                            line_join: state.join,
+                            dash: None,
+                        },
+                        1.,
+                    )
+                })
+                .and_then(|path| path.transform(state.transform))
+            else {
+                return false;
+            };
+            path
+        } else {
+            path
+        };
+        let Some(mut mask) = skia::Mask::new(1, 1) else {
+            return false;
+        };
+        mask.fill_path(
+            &path,
+            if even_odd {
+                skia::FillRule::EvenOdd
+            } else {
+                skia::FillRule::Winding
+            },
+            false,
+            skia::Transform::from_translate(-x.floor(), -y.floor()),
+        );
+        mask.data()[0] != 0
+    }
+
+    pub fn transform(&self) -> [f32; 6] {
+        let t = self.state.transform;
+        [t.sx, t.ky, t.kx, t.sy, t.tx, t.ty]
     }
 }
 
@@ -773,6 +1214,135 @@ pub fn svg_shape(source: &str) -> Option<([f32; 4], f32)> {
 mod tests {
     use super::*;
 
+    fn draw(canvas: &mut Canvas, ops: &[f32], strings: &str) {
+        canvas.draw(ops, strings, &[], &|_| None, None).unwrap();
+    }
+
+    fn pixel(canvas: &Canvas, x: u32, y: u32) -> [u8; 4] {
+        let pixel = canvas.pixels.pixel(x, y).unwrap().demultiply();
+        [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
+    }
+
+    #[test]
+    fn arcs_gradients_and_rounded_rects_draw_like_paths() {
+        let mut canvas = Canvas::new(100, 40).unwrap();
+        // A full circle, then a rounded rect whose corner is outside the fill.
+        draw(
+            &mut canvas,
+            &[
+                11., 28., 20., 20., 15., 0., 6.3, 0., 18., 0., 11., 31., 50., 0., 40., 40., 20.,
+                20., 0., 0., 0., 0., 0., 0., 18., 0.,
+            ],
+            "",
+        );
+        assert_eq!(pixel(&canvas, 20, 20), [0, 0, 0, 255]);
+        assert_eq!(pixel(&canvas, 1, 1)[3], 0);
+        assert_eq!(pixel(&canvas, 51, 1)[3], 0);
+        assert_eq!(pixel(&canvas, 85, 30), [0, 0, 0, 255]);
+
+        let spec = r##"gradient:[[0,0,100,0],[[0,"#ff0000"],[1,"#0000ff"]]]"##;
+        let mut canvas = Canvas::new(100, 10).unwrap();
+        draw(
+            &mut canvas,
+            &[
+                4.,
+                spec.encode_utf16().count() as f32,
+                21.,
+                0.,
+                0.,
+                100.,
+                10.,
+            ],
+            spec,
+        );
+        let [left, right] = [pixel(&canvas, 2, 5), pixel(&canvas, 97, 5)];
+        assert!(left[0] > 240 && left[2] < 15 && right[2] > 240 && right[0] < 15);
+    }
+
+    #[test]
+    fn composite_modes_that_cover_the_canvas_change_pixels_outside_the_shape() {
+        let mut canvas = Canvas::new(20, 10).unwrap();
+        let mode = "destination-in";
+        draw(
+            &mut canvas,
+            &[
+                21.,
+                0.,
+                0.,
+                20.,
+                10.,
+                37.,
+                mode.len() as f32,
+                21.,
+                0.,
+                0.,
+                10.,
+                10.,
+            ],
+            mode,
+        );
+        assert_eq!(pixel(&canvas, 5, 5)[3], 255);
+        assert_eq!(pixel(&canvas, 15, 5)[3], 0);
+    }
+
+    #[test]
+    fn text_squeezes_to_its_max_width() {
+        let system = renderer::TextSystem::new();
+        let aliases = std::collections::HashMap::new();
+        let strings = "20px sans-serifWWWWWWWW";
+        let ink = |max: f32| {
+            let mut canvas = Canvas::new(400, 30).unwrap();
+            canvas
+                .draw(
+                    &[6., 15., 24., 8., 0., 24., max],
+                    strings,
+                    &[],
+                    &|_| None,
+                    Some((&system, &aliases)),
+                )
+                .unwrap();
+            (0..400)
+                .rev()
+                .find(|x| (0..30).any(|y| canvas.pixels.pixel(*x, y).unwrap().alpha() > 32))
+        };
+        let full = ink(f32::INFINITY).unwrap();
+        let squeezed = ink(50.).unwrap();
+        assert!(full > 100, "{full}");
+        assert!((45..=52).contains(&squeezed), "{squeezed}");
+    }
+
+    #[test]
+    fn dashes_leave_gaps_and_hits_follow_the_path() {
+        let mut canvas = Canvas::new(40, 10).unwrap();
+        let dash = "10,10";
+        draw(
+            &mut canvas,
+            &[
+                35.,
+                dash.len() as f32,
+                10.,
+                4.,
+                13.,
+                0.,
+                5.,
+                14.,
+                40.,
+                5.,
+                19.,
+            ],
+            dash,
+        );
+        assert_eq!(pixel(&canvas, 5, 5)[3], 255);
+        assert_eq!(pixel(&canvas, 15, 5)[3], 0);
+        assert!(canvas.hit(20., 5.5, false, true));
+        assert!(!canvas.hit(20., 0.5, false, true));
+        draw(&mut canvas, &[11., 17., 2., 2., 6., 6.], "");
+        assert!(canvas.hit(4., 4., false, false));
+        assert!(!canvas.hit(20., 4., false, false));
+        draw(&mut canvas, &[2., 2., 0., 0., 2., 3., 4.], "");
+        assert_eq!(canvas.transform(), [2., 0., 0., 2., 3., 4.]);
+    }
+
     #[test]
     fn svg_boxes_map_elements_to_canvas_and_own_coordinates() {
         let (size, content, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="h2o-7" width="10" height="10"/></g></svg>"##).unwrap());
@@ -845,7 +1415,10 @@ mod tests {
         let mut canvas = Canvas::new(200, 24).unwrap();
         let text = "Hi".repeat(5000);
         #[rustfmt::skip]
-        let ops = [6., 15., 7., 6., 24., 2., 150., 18., 24., 10000., -1e6, 18.];
+        let inf = f32::INFINITY;
+        let ops = [
+            6., 15., 7., 6., 24., 2., 150., 18., inf, 24., 10000., -1e6, 18., inf,
+        ];
         let strings = format!("20px sans-serifcenterHi{text}");
         canvas
             .draw(&ops, &strings, &[], &|_| None, Some((&system, &aliases)))
@@ -869,9 +1442,9 @@ mod tests {
         let mut canvas = Canvas::new(64, 64).unwrap();
         #[rustfmt::skip]
         let ops = [
-            6., 11., 24., 1., 0., 100.,
-            6., 11., 24., 1., 0., 10.,
-            6., 10., 2., 1e5, 0., 0., 1e5, 0., 0., 24., 1., 0., 0.,
+            6., 11., 24., 1., 0., 100., f32::INFINITY,
+            6., 11., 24., 1., 0., 10., f32::INFINITY,
+            6., 10., 2., 1e5, 0., 0., 1e5, 0., 0., 24., 1., 0., 0., f32::INFINITY,
         ];
         let strings = "1e7px serifWNaNpx serifW10px serifW";
         canvas

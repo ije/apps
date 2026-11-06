@@ -235,8 +235,8 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
     );
     let inline = inline_text(&doc, &computed, id).unwrap();
     assert_eq!(&*inline.text, "A😀BC");
-    assert_eq!(inline.backgrounds.len(), 1);
-    assert_eq!(inline.backgrounds[0].1, 0xffee00ff);
+    assert_eq!(inline.boxes.len(), 1);
+    assert_eq!(inline.boxes[0].fill, 0xffee00ff);
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
@@ -251,7 +251,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
     doc.nodes[span].inline = None;
     doc.nodes[span]
         .attrs
-        .insert("style".into(), "padding:4px".into());
+        .insert("style".into(), "opacity:0.5".into());
     let computed = compute_styles(
         &doc,
         800.,
@@ -304,9 +304,9 @@ fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
         let actual = (
             inline.text.clone(),
             inline
-                .backgrounds
+                .boxes
                 .iter()
-                .map(|&(index, color)| (inline.ranges[index].1.clone(), color))
+                .map(|inline_box| (inline.ranges[inline_box.index].1.clone(), inline_box.fill))
                 .collect::<Vec<_>>(),
         );
         if let Some(expected) = &expected {
@@ -631,6 +631,81 @@ fn app_region_is_inherited_and_accepts_the_webkit_name() {
     assert_eq!(region("#title").as_deref(), Some("drag"));
     assert_eq!(region("#icon").as_deref(), Some("no-drag"));
     assert_eq!(region("#main"), None);
+}
+
+#[test]
+fn inline_boxes_and_atoms_stay_in_one_text_layout() {
+    let doc = Document::parse(
+        r#"<style>code { padding: 1px 4px; border: 1px solid red; background: #111 }
+            .b { display: inline-block; width: 10px } .n { white-space: nowrap } img { display: inline }
+            .flex { display: flex }</style>
+        <p id="p">a <code id="c">b</code> <span class="b"></span> <span class="n"><img>d</span> e</p>
+        <p id="alone"><span class="b"></span></p><div id="flex" class="flex"><img>text</div>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let inline = inline_text(&doc, &computed, element(&doc, "#p")).unwrap();
+    assert_eq!(&*inline.text, "a b \u{fffc} \u{fffc}d e");
+    assert_eq!(inline.atoms.len(), 2);
+    assert_eq!(inline.boxes.len(), 1);
+    assert_eq!(inline.boxes[0].edges, [2., 5., 2., 5.]);
+    assert_eq!(inline.boxes[0].lead, 5.);
+    assert_eq!(inline.boxes[0].trail, 0.);
+    let run_of = |text: &str| {
+        let at = inline.text.find(text).unwrap();
+        let mut end = 0;
+        inline
+            .runs
+            .iter()
+            .find(|run| {
+                end += run.len;
+                end > at
+            })
+            .unwrap()
+    };
+    assert_eq!(run_of("b").inset[0], renderer::px(5.));
+    assert_eq!(run_of("b").inset[1], renderer::px(5.));
+    assert!(run_of("d").nowrap);
+    assert!(!run_of("e").nowrap);
+    // Boxes alone are a row of boxes, and flex children are items.
+    assert!(inline_text(&doc, &computed, element(&doc, "#alone")).is_none());
+    assert!(inline_text(&doc, &computed, element(&doc, "#flex")).is_none());
+}
+
+#[test]
+fn a_stronger_transition_shorthand_resets_the_longhands() {
+    let doc = Document::parse(
+        r#"<style>
+            div { transition-property: transform; transition-duration: 1s; }
+            #c { transition: opacity 2s; transition-duration: 3s; }
+        </style><div id="a" style="transition: none"></div><div id="b"></div><div id="c"></div>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let style = |selector| &computed.values[element(&doc, selector)];
+    assert_eq!(style("#a").get(Prop::TRANSITION), Some("none"));
+    assert_eq!(style("#a").get(Prop::TRANSITION_PROPERTY), None);
+    assert_eq!(
+        style("#b").get(Prop::TRANSITION_PROPERTY),
+        Some("transform")
+    );
+    assert_eq!(style("#c").get(Prop::TRANSITION), Some("opacity 2s"));
+    assert_eq!(style("#c").get(Prop::TRANSITION_DURATION), Some("3s"));
+    assert_eq!(style("#c").get(Prop::TRANSITION_PROPERTY), None);
 }
 
 #[test]
@@ -2524,12 +2599,19 @@ fn children_keep_their_styles_when_a_parent_changes_what_it_does_not_pass_on() {
         computed
     };
     let first = compute(&doc, &mut cache);
-    doc.nodes[a].attrs.insert("style".into(), "height:2px;color:red".into());
+    doc.nodes[a]
+        .attrs
+        .insert("style".into(), "height:2px;color:red".into());
     let second = compute(&doc, &mut cache);
     assert!(Rc::ptr_eq(&first.values[b], &second.values[b]));
     assert_eq!(second.values[c].get(Prop::HEIGHT), Some("2px"));
-    doc.nodes[a].attrs.insert("style".into(), "height:2px;color:blue".into());
-    assert_eq!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("blue"));
+    doc.nodes[a]
+        .attrs
+        .insert("style".into(), "height:2px;color:blue".into());
+    assert_eq!(
+        compute(&doc, &mut cache).values[b].get(Prop::COLOR),
+        Some("blue")
+    );
 }
 
 #[test]
@@ -2547,11 +2629,20 @@ fn attributes_that_no_selector_reads_keep_matches() {
     };
     compute(&doc, &mut cache);
     doc.nodes[a].attrs.insert("data-off".into(), "1".into());
-    assert_ne!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("red"));
+    assert_ne!(
+        compute(&doc, &mut cache).values[b].get(Prop::COLOR),
+        Some("red")
+    );
     doc.nodes[a].attrs.insert("data-on".into(), "1".into());
-    assert_eq!(compute(&doc, &mut cache).values[b].get(Prop::COLOR), Some("red"));
+    assert_eq!(
+        compute(&doc, &mut cache).values[b].get(Prop::COLOR),
+        Some("red")
+    );
     doc.nodes[c].attrs.insert("aria-x".into(), "y".into());
-    assert_eq!(compute(&doc, &mut cache).values[c].get(Prop::COLOR), Some("blue"));
+    assert_eq!(
+        compute(&doc, &mut cache).values[c].get(Prop::COLOR),
+        Some("blue")
+    );
 }
 
 #[test]

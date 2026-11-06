@@ -159,11 +159,10 @@ fn packages_every_platform_and_arch_with_matching_jsc() {
     fs::write(&entry, "const answer: number = 42; console.log(answer);").unwrap();
     fs::write(
         dir.path().join("package.json"),
-        r#"{"name":"Tea","productName":"Tea App"}"#,
+        r#"{"name":"Tea","productName":"Tea App","files":["asset.txt"]}"#,
     )
     .unwrap();
-    fs::create_dir(dir.path().join("public")).unwrap();
-    fs::write(dir.path().join("public/asset.txt"), "asset").unwrap();
+    fs::write(dir.path().join("asset.txt"), "asset").unwrap();
     fs::write(dir.path().join("JavaScriptCore.LICENSE"), "engine license").unwrap();
     for platform in ["macos", "linux", "windows"] {
         for arch in ["x64", "arm64"] {

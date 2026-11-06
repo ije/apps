@@ -15,6 +15,8 @@ typedef void (*AppsCallback)(void *, const char *);
 @property(nonatomic) BOOL visible;
 @property(nonatomic) BOOL gated;
 @property(nonatomic) BOOL programmatic;
+@property(nonatomic) BOOL provisional;
+@property(nonatomic, copy) NSString *committedURL;
 @property(nonatomic) NSInteger nextDecision;
 @property(nonatomic, strong) NSMutableDictionary *decisions;
 @end
@@ -73,19 +75,38 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
     AppsEmit(self, @{ @"type": @"will-navigate", @"id": decision, @"url": action.request.URL.absoluteString ?: @"" });
 }
 - (void)webView:(WKWebView *)view didStartProvisionalNavigation:(WKNavigation *)navigation {
+    self.provisional = YES;
     AppsEmit(self, @{ @"type": @"did-start-loading", @"url": view.URL.absoluteString ?: @"" });
 }
 - (void)webView:(WKWebView *)view didCommitNavigation:(WKNavigation *)navigation {
     self.programmatic = NO;
+    self.provisional = NO;
+    self.committedURL = view.URL.absoluteString;
+    AppsEmit(self, @{ @"type": @"did-navigate", @"url": view.URL.absoluteString ?: @"", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
+}
+- (void)observeValueForKeyPath:(NSString *)path ofObject:(WKWebView *)view change:(NSDictionary *)change context:(void *)context {
+    if ([path isEqual:@"title"]) { if (view.title.length) AppsEmit(self, @{ @"type": @"page-title-updated", @"title": view.title }); }
+    else if ([path hasPrefix:@"can"]) AppsEmit(self, @{ @"type": @"history", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
+    // WARNING: a load changes the URL just before it starts, and the history updates just after the URL, so check once they are settled. `loading` can't tell, because it is also set while going back within a document.
+    else dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *url = view.URL.absoluteString;
+        if (self.provisional || !url || [url isEqual:self.committedURL]) return;
+        self.committedURL = url;
+        AppsEmit(self, @{ @"type": @"did-navigate-in-page", @"url": url, @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
+    });
 }
 - (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
-    AppsEmit(self, @{ @"type": @"did-finish-load", @"url": view.URL.absoluteString ?: @"", @"title": view.title ?: @"", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
+    // WARNING: WebKit updates `title` just after this call, and code reads the title when the load ends.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AppsEmit(self, @{ @"type": @"did-finish-load", @"url": view.URL.absoluteString ?: @"", @"title": view.title ?: @"", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
+    });
 }
 - (void)webView:(WKWebView *)view didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     AppsEmit(self, @{ @"type": @"did-fail-load", @"error": error.localizedDescription, @"code": @(error.code) });
 }
 - (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     self.programmatic = NO;
+    self.provisional = NO;
     [self webView:view didFailNavigation:navigation withError:error];
 }
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)view {
@@ -118,6 +139,8 @@ void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback ca
     [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:source injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
     owner.view = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600) configuration:configuration];
     owner.view.navigationDelegate = owner;
+    [owner.view addObserver:owner forKeyPath:@"title" options:0 context:NULL];
+    for (NSString *path in @[ @"URL", @"canGoBack", @"canGoForward" ]) [owner.view addObserver:owner forKeyPath:path options:0 context:NULL];
     owner.view.UIDelegate = owner;
     if (@available(macOS 13.3, *)) owner.view.inspectable = [options[@"inspectable"] boolValue];
     if (parent) {
@@ -142,6 +165,8 @@ void apps_browser_destroy(void *handle) {
     for (void (^decide)(WKNavigationActionPolicy) in owner.decisions.allValues) decide(WKNavigationActionPolicyCancel);
     [owner.decisions removeAllObjects];
     [owner.view stopLoading];
+    [owner.view removeObserver:owner forKeyPath:@"title"];
+    for (NSString *path in @[ @"URL", @"canGoBack", @"canGoForward" ]) [owner.view removeObserver:owner forKeyPath:path];
     owner.view.navigationDelegate = nil;
     owner.view.UIDelegate = nil;
     [owner.view.configuration.userContentController removeScriptMessageHandlerForName:@"apps"];
@@ -198,6 +223,9 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
     else if ([op isEqualToString:@"visible"]) {
         owner.visible = [args boolValue];
         view.hidden = !owner.visible || view.frame.size.width <= 0 || view.frame.size.height <= 0;
+    }
+    else if ([op isEqualToString:@"appearance"]) {
+        view.appearance = [args isEqual:@"dark"] ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : [args isEqual:@"light"] ? [NSAppearance appearanceNamed:NSAppearanceNameAqua] : nil;
     }
     else if ([op isEqualToString:@"zoom"]) {
         double zoom = [args doubleValue];

@@ -13,10 +13,11 @@ use crate::style::Prop;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, LazyLock, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -378,8 +379,17 @@ pub struct State {
     pub(crate) detached: Vec<usize>,
     live: HashSet<usize>,
     pub bounds: LayoutMirror,
-    pub(crate) text_layouts:
-        HashMap<usize, (renderer::TextLayout, Rc<str>, std::ops::Range<usize>, Rows)>,
+    /// The layout of a node's text, its range in it, the rows, and the top and height of its font in a row.
+    pub(crate) text_layouts: HashMap<
+        usize,
+        (
+            renderer::TextLayout,
+            Rc<str>,
+            std::ops::Range<usize>,
+            Rows,
+            [renderer::Pixels; 2],
+        ),
+    >,
     pub scroll: HashMap<usize, renderer::ScrollHandle>,
     scroll_offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
@@ -450,6 +460,10 @@ pub struct State {
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
     /// Images that workers decoded, by node and request.
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
+    /// The latest frames of offscreen canvases, by the `<canvas>` of this page that shows them.
+    frames: Frames,
+    /// Where the offscreen canvases of this page send their frames, by node.
+    pub(crate) placeholders: HashMap<usize, Placeholder>,
     /// The latest decode request by node.
     decoding: HashMap<usize, u64>,
     /// Empty nodes that the page reserved for `dom.batch` creates.
@@ -463,11 +477,18 @@ pub struct State {
     pub(crate) svg_trees: HashMap<usize, resvg::usvg::Tree>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
     /// Rasterized `clip-path` and `mask-image` shapes, by node.
-    pub(crate) masks: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    /// `None` for a mask that is fully opaque, so nothing draws it.
+    pub(crate) masks: HashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
     /// The geometry and small rasters of inline SVGs by source, so the icons of a list that recycles its rows are
     /// parsed and drawn once.
-    pub(crate) svg_cache: HashMap<String, (crate::render::canvas::SvgGeometry, Vec<Arc<renderer::RenderImage>>)>,
+    pub(crate) svg_cache: HashMap<
+        String,
+        (
+            crate::render::canvas::SvgGeometry,
+            Vec<Arc<renderer::RenderImage>>,
+        ),
+    >,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     /// Gradient bitmaps by their inputs, oldest first, that boxes built again reuse, like the rows of a
     /// scrolling list.
@@ -480,6 +501,8 @@ pub struct State {
     /// The node revision whose text no waiting `unicode-range` face uses.
     pub(crate) font_text: Option<u64>,
     pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
+    /// The native window's state at the last frame.
+    pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
@@ -493,6 +516,8 @@ pub struct State {
     /// Nodes with an animated color in the last frame, whose paragraphs draw it from their inline text.
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
+    /// The width, height and baseline of the atomic inline boxes in text, from the last layout.
+    pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
     /// The padding boxes of containing blocks. They stay between frames, so absolute boxes size in last frame's.
@@ -668,6 +693,57 @@ fn slots(
     slots
 }
 
+/// Where an `OffscreenCanvas` sends its frames: a `<canvas>` of a page, maybe on another thread.
+#[derive(Clone)]
+pub(crate) struct Placeholder {
+    frames: Frames,
+    node: usize,
+    wake: crate::host::Waker,
+}
+
+type Frames = Arc<Mutex<HashMap<usize, Arc<renderer::RenderImage>>>>;
+
+impl Placeholder {
+    pub(crate) fn show(&self, image: Arc<renderer::RenderImage>) {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.node, image);
+        self.wake.wake();
+    }
+}
+
+static PLACEHOLDERS: LazyLock<Mutex<HashMap<u64, Placeholder>>> = LazyLock::new(Default::default);
+
+fn canvas_size(node: &Node) -> (u32, u32) {
+    let size = |name, default| {
+        node.attrs
+            .get(name)
+            .and_then(|value| crate::render::dimension(value, true))
+            .map_or(default, |value| value as u32)
+    };
+    (size("width", 300), size("height", 150))
+}
+
+fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
+    let (width, height) = canvas_size(node);
+    let mut canvas = crate::render::canvas::Canvas::new(width, height)?;
+    canvas.present = node.tag == "canvas";
+    Ok(canvas)
+}
+
+fn source_pixels(state: &State, id: usize) -> Option<Cow<'_, resvg::tiny_skia::Pixmap>> {
+    if let Some(canvas) = state.canvases.get(&id) {
+        return Some(Cow::Borrowed(&canvas.pixels));
+    }
+    if let Some(image) = state.images.get(&id) {
+        return pixmap(image).map(Cow::Owned);
+    }
+    let (source, [width, height]) = state.svg_images.get(&id)?;
+    let image = crate::render::canvas::svg(source, width.ceil() as u32, height.ceil() as u32, None);
+    pixmap(&*image.ok()?).map(Cow::Owned)
+}
+
 fn pixmap(image: &renderer::RenderImage) -> Option<resvg::tiny_skia::Pixmap> {
     let size = image.size();
     let mut pixels = resvg::tiny_skia::Pixmap::new(size.width.into(), size.height.into())?;
@@ -805,9 +881,15 @@ pub fn call(
             | "dom.canvas"
             | "dom.canvasPixels"
             | "dom.canvasURL"
+            | "dom.canvasTake"
+            | "dom.canvasAdopt"
+            | "dom.canvasLink"
+            | "dom.canvasBind"
+            | "dom.frames"
             | "dom.image"
             | "dom.decoded"
             | "dom.measureText"
+            | "dom.canvasQuery"
             | "dom.textRect"
             | "dom.textIndex"
             | "dom.svgBox"
@@ -893,6 +975,25 @@ pub fn call(
                         Err(error) => json!(error.to_string()),
                     }
                 ]));
+            }
+            return Ok(json!(results));
+        }
+        if op == "dom.frames" {
+            let frames =
+                std::mem::take(&mut *state.frames.lock().unwrap_or_else(PoisonError::into_inner));
+            let mut results = Vec::with_capacity(frames.len());
+            if state.retired.is_empty() {
+                state.retired_canvases.clear();
+            }
+            for (node, image) in frames {
+                let size = image.size();
+                results.push(json!([node, u32::from(size.width), u32::from(size.height)]));
+                if let Some(old) = state.images.insert(node, image)
+                    && state.retired_canvases.insert(node)
+                {
+                    state.retired.push(old);
+                }
+                state.dirty = true;
             }
             return Ok(json!(results));
         }
@@ -1146,7 +1247,10 @@ pub fn call(
                     continue;
                 }
                 for id in subtree {
-                    if matches!(doc.nodes[id].tag.as_str(), "canvas" | "video" | "audio") {
+                    if matches!(
+                        doc.nodes[id].tag.as_str(),
+                        "canvas" | "apps-canvas" | "video" | "audio"
+                    ) {
                         canvases.push(id);
                     }
                     doc.nodes[id] = Node::default();
@@ -1163,21 +1267,24 @@ pub fn call(
                     }
                     state.inline_text.remove(&id);
                     state.retired.extend(state.images.remove(&id));
+                    state.retired.extend(
+                        state
+                            .canvases
+                            .remove(&id)
+                            .filter(|canvas| canvas.present)
+                            .map(|canvas| canvas.image),
+                    );
+                    state.placeholders.remove(&id);
+                    state.retired.extend(
+                        state
+                            .svgs
+                            .remove(&id)
+                            .map(|(_, image)| image)
+                            .filter(|image| Arc::strong_count(image) == 1),
+                    );
                     state
                         .retired
-                        .extend(state.canvases.remove(&id).map(|canvas| canvas.image));
-                    state
-                        .retired
-                        .extend(
-                            state
-                                .svgs
-                                .remove(&id)
-                                .map(|(_, image)| image)
-                                .filter(|image| Arc::strong_count(image) == 1),
-                        );
-                    state
-                        .retired
-                        .extend(state.masks.remove(&id).map(|(_, image)| image));
+                        .extend(state.masks.remove(&id).and_then(|(_, image)| image));
                     state.svg_sources.remove(&id);
                     state.svg_boxes.remove(&id);
                     state.svg_trees.remove(&id);
@@ -1193,6 +1300,7 @@ pub fn call(
                         state.focus = None;
                     }
                     state.selection.remove(&id);
+                    state.atoms.remove(&id);
                     if state.selection_caret == Some(id) {
                         state.selection_caret = None;
                     }
@@ -1561,6 +1669,9 @@ pub fn call(
                     system.as_deref().map(|system| (system, state.pixel_ratio)),
                 );
                 let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
+                if let Some(style) = styles.values.get(id) {
+                    state.motion.read(id, style);
+                }
                 // Script animations show their values at once, not from the last frame.
                 let slot = match pseudo {
                     "" => Some(0),
@@ -1851,28 +1962,18 @@ pub fn call(
                         .collect::<Result<Vec<_>>>()?;
                     let mut canvas = match state.canvases.remove(&id) {
                         Some(canvas) => canvas,
-                        None => crate::render::canvas::Canvas::new(
-                            doc.nodes[id]
-                                .attrs
-                                .get("width")
-                                .and_then(|v| crate::render::dimension(v, true))
-                                .map_or(300, |v| v as u32),
-                            doc.nodes[id]
-                                .attrs
-                                .get("height")
-                                .and_then(|v| crate::render::dimension(v, true))
-                                .map_or(150, |v| v as u32),
-                        )?,
+                        None => {
+                            let canvas = new_canvas(&doc.nodes[id])?;
+                            state.created += canvas.pixels.data().len() >> 16;
+                            canvas
+                        }
                     };
                     let old = canvas.image.clone();
                     let result = canvas.draw(
                         &ops,
                         args[2].as_str().unwrap_or(""),
                         &data,
-                        &|source| match state.canvases.get(&source) {
-                            Some(canvas) => Some(canvas.pixels.clone()),
-                            None => pixmap(state.images.get(&source)?),
-                        },
+                        &|source| source_pixels(state, source),
                         state
                             .text_system
                             .as_deref()
@@ -1888,56 +1989,39 @@ pub fn call(
                         state.retired.push(old);
                     }
                 } else {
-                    state
-                        .retired
-                        .extend(state.canvases.remove(&id).map(|canvas| canvas.image));
+                    state.retired.extend(
+                        state
+                            .canvases
+                            .remove(&id)
+                            .filter(|canvas| canvas.present)
+                            .map(|canvas| canvas.image),
+                    );
+                    state.retired.extend(state.images.remove(&id));
                 }
-                state.dirty = true;
+                // WARNING: offscreen drawing changes nothing on the page, so it must not cost page frames.
+                state.dirty |= doc.nodes[id].tag == "canvas";
                 Ok(Value::Null)
             }
             "dom.canvasURL" => {
                 use base64::Engine as _;
-                let bytes = if let Some(canvas) = state.canvases.get(&id) {
-                    canvas.pixels.encode_png()?
-                } else if let Some(image) = state.images.get(&id) {
-                    pixmap(image)
-                        .context("Invalid image pixels")?
-                        .encode_png()?
-                } else {
-                    let width = doc.nodes[id]
-                        .attrs
-                        .get("width")
-                        .and_then(|v| crate::render::dimension(v, true))
-                        .map_or(300, |v| v as u32);
-                    let height = doc.nodes[id]
-                        .attrs
-                        .get("height")
-                        .and_then(|v| crate::render::dimension(v, true))
-                        .map_or(150, |v| v as u32);
-                    crate::render::canvas::Canvas::new(width, height)?
-                        .pixels
-                        .encode_png()?
+                let bytes = match source_pixels(state, id) {
+                    Some(pixels) => pixels.encode_png()?,
+                    None => new_canvas(&doc.nodes[id])?.pixels.encode_png()?,
                 };
-                Ok(json!(format!(
-                    "data:image/png;base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(bytes)
-                )))
+                Ok(if args[1] == true {
+                    crate::jsc::payload::write(bytes)
+                } else {
+                    json!(format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ))
+                })
             }
             "dom.canvasPixels" => {
-                if let std::collections::hash_map::Entry::Vacant(entry) = state.canvases.entry(id) {
-                    let width = doc.nodes[id]
-                        .attrs
-                        .get("width")
-                        .and_then(|v| crate::render::dimension(v, true))
-                        .map_or(300, |v| v as u32);
-                    let height = doc.nodes[id]
-                        .attrs
-                        .get("height")
-                        .and_then(|v| crate::render::dimension(v, true))
-                        .map_or(150, |v| v as u32);
-                    entry.insert(crate::render::canvas::Canvas::new(width, height)?);
-                }
-                let canvas = state.canvases.get(&id).unwrap();
+                let pixels = match source_pixels(state, id) {
+                    Some(pixels) => pixels,
+                    None => Cow::Owned(new_canvas(&doc.nodes[id])?.pixels),
+                };
                 let x = args[1].as_i64().unwrap_or(0);
                 let y = args[2].as_i64().unwrap_or(0);
                 let width = args[3].as_u64().context("Expected width")? as usize;
@@ -1951,30 +2035,111 @@ pub fn call(
                     "Invalid pixel region"
                 );
                 let mut bytes = vec![0u8; width * height * 4];
+                // WARNING: with `true` the bytes stay premultiplied, as they are stored.
+                let premultiplied = args[5] == true;
                 for row in 0..height {
                     for col in 0..width {
                         let sx = x + col as i64;
                         let sy = y + row as i64;
                         if sx < 0
                             || sy < 0
-                            || sx >= i64::from(canvas.pixels.width())
-                            || sy >= i64::from(canvas.pixels.height())
+                            || sx >= i64::from(pixels.width())
+                            || sy >= i64::from(pixels.height())
                         {
                             continue;
                         }
-                        let color = canvas.pixels.pixels()
-                            [sy as usize * canvas.pixels.width() as usize + sx as usize]
-                            .demultiply();
+                        let pixel =
+                            pixels.pixels()[sy as usize * pixels.width() as usize + sx as usize];
+                        let color = pixel.demultiply();
                         let at = (row * width + col) * 4;
-                        bytes[at..at + 4].copy_from_slice(&[
-                            color.red(),
-                            color.green(),
-                            color.blue(),
-                            color.alpha(),
-                        ]);
+                        bytes[at..at + 4].copy_from_slice(&if premultiplied {
+                            [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
+                        } else {
+                            [color.red(), color.green(), color.blue(), color.alpha()]
+                        });
                     }
                 }
                 Ok(crate::web::base64(&bytes))
+            }
+            // WARNING: `id` stays blank with its drawing state, as `transferToImageBitmap()` needs.
+            "dom.canvasTake" => {
+                let to = args[1].as_u64().context("Expected node id")? as usize;
+                ensure!(to < doc.nodes.len(), "Invalid node id");
+                let mut taken = match state.canvases.get_mut(&id) {
+                    Some(canvas) => {
+                        let mut taken = crate::render::canvas::Canvas::new(
+                            canvas.pixels.width(),
+                            canvas.pixels.height(),
+                        )?;
+                        std::mem::swap(&mut canvas.pixels, &mut taken.pixels);
+                        taken
+                    }
+                    None => {
+                        let mut taken = new_canvas(&doc.nodes[id])?;
+                        if let Some(pixels) = source_pixels(state, id) {
+                            taken.pixels = pixels.into_owned();
+                        }
+                        taken
+                    }
+                };
+                taken.present = doc.nodes[to].tag == "canvas";
+                if taken.present {
+                    taken.image = crate::render::canvas::render_image(&taken.pixels);
+                }
+                state.created += taken.pixels.data().len() >> 16;
+                state.dirty |= taken.present;
+                if state.retired.is_empty() {
+                    state.retired_canvases.clear();
+                }
+                if let Some(old) = state.canvases.insert(to, taken)
+                    && old.present
+                    && state.retired_canvases.insert(to)
+                {
+                    state.retired.push(old.image);
+                }
+                Ok(Value::Null)
+            }
+            "dom.canvasAdopt" => {
+                let mut canvas = new_canvas(&doc.nodes[id])?;
+                canvas.pixels = resvg::tiny_skia::Pixmap::from_vec(
+                    crate::web::bytes(&args[1])?,
+                    resvg::tiny_skia::IntSize::from_wh(
+                        canvas.pixels.width(),
+                        canvas.pixels.height(),
+                    )
+                    .context("Invalid canvas size")?,
+                )
+                .context("Invalid canvas pixels")?;
+                state.created += canvas.pixels.data().len() >> 16;
+                state.canvases.insert(id, canvas);
+                Ok(Value::Null)
+            }
+            "dom.canvasLink" => {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let token = NEXT.fetch_add(1, Ordering::Relaxed);
+                let placeholder = state
+                    .placeholders
+                    .remove(&id)
+                    .unwrap_or_else(|| Placeholder {
+                        frames: state.frames.clone(),
+                        node: id,
+                        wake: crate::host::Waker::current(),
+                    });
+                PLACEHOLDERS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(token, placeholder);
+                Ok(json!(token))
+            }
+            "dom.canvasBind" => {
+                let token = args[1].as_u64().context("Expected a token")?;
+                let placeholder = PLACEHOLDERS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&token)
+                    .context("The canvas was already transferred")?;
+                state.placeholders.insert(id, placeholder);
+                Ok(Value::Null)
             }
             "dom.image" => {
                 let bytes = crate::web::bytes(&args[1])?;
@@ -2086,8 +2251,9 @@ pub fn call(
                 };
                 let start = shown(args[1].as_u64().unwrap_or(0) as usize);
                 let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
-                if let Some((layout, text, range, rows)) = state.text_layouts.get(&id) {
+                if let Some((layout, text, range, rows, font)) = state.text_layouts.get(&id) {
                     let content = &text[range.clone()];
+                    let source = doc.nodes[id].text.as_str();
                     if op == "dom.textIndex" {
                         let position = renderer::point(
                             renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
@@ -2096,30 +2262,19 @@ pub fn call(
                         let index = crate::render::text::text_index(layout, text, rows, position)
                             .unwrap_or_else(|index| index)
                             .clamp(range.start, range.end);
-                        return Ok(json!(real(text[range.start..index].encode_utf16().count())));
+                        return Ok(json!(real(source_offset(
+                            source,
+                            content,
+                            index - range.start
+                        ))));
                     }
-                    let a = crate::render::text::text_position(
+                    return Ok(json!(crate::render::text::text_rects(
                         layout,
                         text,
                         rows,
-                        range.start + utf16_index(content, start),
-                    );
-                    let b = crate::render::text::text_position(
-                        layout,
-                        text,
-                        rows,
-                        range.start + utf16_index(content, end),
-                    );
-                    return Ok(json!(
-                        a.zip(b)
-                            .map(|(a, b)| vec![[
-                                f32::from(a.x),
-                                f32::from(a.y),
-                                f32::from(b.x - a.x),
-                                f32::from(layout.line_height())
-                            ]])
-                            .unwrap_or_default()
-                    ));
+                        [start, end].map(|index| range.start + shown_index(source, content, index)),
+                        *font,
+                    )));
                 }
                 let system = state
                     .text_system
@@ -2174,6 +2329,8 @@ pub fn call(
                     letter_spacing: renderer::px(0.),
                     word_spacing: renderer::px(0.),
                     font_size: None,
+                    inset: Default::default(),
+                    nowrap: false,
                 };
                 let wrap = (!single
                     && !style
@@ -2249,15 +2406,46 @@ pub fn call(
                     .text_system
                     .as_ref()
                     .context("Text measurement requires a displayed window")?;
-                let line = crate::render::canvas::line(
+                let (line, [ascent, descent, em_ascent, em_descent]) = crate::render::canvas::line(
                     system,
                     &state.font_aliases,
                     args[2].as_str().unwrap_or("10px sans-serif"),
                     args[1].as_str().context("Expected text")?,
+                    [
+                        args[3].as_f64().unwrap_or(0.) as f32,
+                        args[4].as_f64().unwrap_or(0.) as f32,
+                    ],
                 );
-                Ok(
-                    json!({"width":f32::from(line.width),"actualBoundingBoxLeft":0,"actualBoundingBoxRight":f32::from(line.width),"actualBoundingBoxAscent":f32::from(line.ascent),"actualBoundingBoxDescent":f32::from(line.descent),"fontBoundingBoxAscent":f32::from(line.ascent),"fontBoundingBoxDescent":f32::from(line.descent)}),
-                )
+                let [left, right, top, bottom] = crate::render::canvas::ink(system, &line);
+                Ok(json!([
+                    f32::from(line.width),
+                    left,
+                    right,
+                    top,
+                    bottom,
+                    ascent,
+                    descent,
+                    em_ascent,
+                    em_descent
+                ]))
+            }
+            "dom.canvasQuery" => {
+                let Some(canvas) = state.canvases.get(&id) else {
+                    return Ok(json!(if args[1].is_number() {
+                        json!(false)
+                    } else {
+                        json!([1, 0, 0, 1, 0, 0])
+                    }));
+                };
+                Ok(match args[1].as_f64() {
+                    Some(x) => json!(canvas.hit(
+                        x as f32,
+                        args[2].as_f64().unwrap_or(0.) as f32,
+                        args[3].as_bool().unwrap_or(false),
+                        args[4].as_bool().unwrap_or(false),
+                    )),
+                    None => json!(canvas.transform()),
+                })
             }
             "dom.client" => {
                 let rect = state.bounds.get(&id).copied().unwrap_or_default();
@@ -2332,10 +2520,19 @@ pub fn call(
                         Some(look.space(look.shown(scrolls, handle.max_offset())))
                     })
                     .unwrap_or_default();
+                // `both-edges` reserves the gutter on both sides.
+                let gutters = if style
+                    .get(Prop::SCROLLBAR_GUTTER)
+                    .is_some_and(|value| value.contains("both-edges"))
+                {
+                    2.
+                } else {
+                    1.
+                };
                 Ok(json!([
                     borders[3],
                     borders[0],
-                    (rect[2] - borders[1] - borders[3] - bars[1]).max(0.),
+                    (rect[2] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
                     (rect[3] - borders[0] - borders[2] - bars[0]).max(0.),
                     padding[0],
                     padding[1],
@@ -2871,14 +3068,21 @@ pub(crate) fn styles(
         return computed.clone();
     }
     state.drop_removed(doc);
-    if let Some(styles) = state.old_styles.take().and_then(|styles| Rc::try_unwrap(styles).ok()) {
+    if let Some(styles) = state
+        .old_styles
+        .take()
+        .and_then(|styles| Rc::try_unwrap(styles).ok())
+    {
         state.style_cache.spare = Some(styles.into());
     }
-    if state.shadow_walk.tree != doc.nodes.tree()
-        || state.shadow_walk.count != state.shadows.len()
+    if state.shadow_walk.tree != doc.nodes.tree() || state.shadow_walk.count != state.shadows.len()
     {
         let mut hosts = Vec::new();
-        let mut pending = if state.shadows.is_empty() { vec![] } else { vec![0] };
+        let mut pending = if state.shadows.is_empty() {
+            vec![]
+        } else {
+            vec![0]
+        };
         while let Some(id) = pending.pop() {
             if let Some(&root) = state.shadows.get(&id) {
                 hosts.push(id);
@@ -3184,7 +3388,11 @@ pub(crate) fn styles(
         };
         result.user_select[id] = (mode, if mode == inherited.0 { inherited.1 } else { id });
     }
-    if result.flags.iter().any(|flags| flags & style::DISPLAY_CONTENTS != 0) {
+    if result
+        .flags
+        .iter()
+        .any(|flags| flags & style::DISPLAY_CONTENTS != 0)
+    {
         for &(id, _) in state.style_walk.nodes.iter().rev() {
             let id = id as usize;
             let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
@@ -3257,6 +3465,48 @@ pub(crate) fn unbullet(value: &str, bullets: usize) -> usize {
     value.chars().take(bullets).map(char::len_utf16).sum()
 }
 
+/// The byte in `shown` for a UTF-16 offset in `source`, the node's text before its white space collapsed.
+pub(crate) fn shown_index(source: &str, shown: &str, offset: usize) -> usize {
+    if source.is_empty() || source == shown {
+        return utf16_index(shown, offset);
+    }
+    let mut rest = shown.char_indices().peekable();
+    let mut units = 0;
+    for c in source.chars() {
+        if units >= offset {
+            break;
+        }
+        units += c.len_utf16();
+        if rest
+            .peek()
+            .is_some_and(|&(_, next)| !c.is_ascii_whitespace() || next == ' ' || next == c)
+        {
+            rest.next();
+        }
+    }
+    rest.peek().map_or(shown.len(), |&(byte, _)| byte)
+}
+
+/// The UTF-16 offset in `source` for a byte in `shown`, see [`shown_index`].
+pub(crate) fn source_offset(source: &str, shown: &str, byte: usize) -> usize {
+    if source.is_empty() || source == shown {
+        return shown[..byte].encode_utf16().count();
+    }
+    let (mut at, mut units) = (0, 0);
+    for c in source.chars() {
+        if at >= byte {
+            break;
+        }
+        units += c.len_utf16();
+        if let Some(next) = shown[at..].chars().next()
+            && (!c.is_ascii_whitespace() || next == ' ' || next == c)
+        {
+            at += next.len_utf8();
+        }
+    }
+    units
+}
+
 pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
     let mut offset = 0;
     for (byte, c) in text.char_indices() {
@@ -3270,6 +3520,29 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn offsets_map_through_collapsed_white_space() {
+        let (source, shown) = ("  a  b\n c ", "a b c");
+        for (offset, byte) in [
+            (0, 0),
+            (2, 0),
+            (3, 1),
+            (5, 2),
+            (6, 3),
+            (8, 4),
+            (9, 5),
+            (10, 5),
+        ] {
+            assert_eq!(super::shown_index(source, shown, offset), byte, "{offset}");
+        }
+        assert_eq!(super::source_offset(source, shown, 0), 0);
+        assert_eq!(super::source_offset(source, shown, 1), 3);
+        assert_eq!(super::source_offset(source, shown, 2), 4);
+        assert_eq!(super::source_offset(source, shown, 3), 6);
+        assert_eq!(super::shown_index("héllo", "héllo", 2), 3);
+        assert_eq!(super::shown_index("", "abc", 2), 2);
+    }
+
     #[test]
     fn kept_containers_keep_their_sizes_between_frames() {
         let mut state = super::State::default();

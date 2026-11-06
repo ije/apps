@@ -121,6 +121,8 @@ pub struct FontMetrics {
     pub bounding_box: Bounds<f32>,
     /// Browsers on macOS add 15% of the height to the ascent of Times, Helvetica and Courier.
     pub tall_ascent: bool,
+    /// The part of the em box above the baseline.
+    pub em_ascent: f32,
 }
 
 impl FontMetrics {
@@ -213,6 +215,10 @@ pub struct TextRun {
     pub word_spacing: Pixels,
     /// A font size for this run instead of the line's.
     pub font_size: Option<Pixels>,
+    /// Space before the first and after the last character, like the padding of an inline box.
+    pub inset: [Pixels; 2],
+    /// The text can't wrap between its characters, like CSS `white-space: nowrap` in a line that can.
+    pub nowrap: bool,
 }
 
 /// A run of text in one font, as the shaper sees it.
@@ -223,6 +229,8 @@ pub struct FontRun {
     pub letter_spacing: Pixels,
     pub word_spacing: Pixels,
     pub font_size: Pixels,
+    pub inset: [Pixels; 2],
+    pub nowrap: bool,
 }
 
 /// A glyph raster: the cache key of its atlas tile.
@@ -421,6 +429,11 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.ascent, font_size))
     }
 
+    /// The part of the em box above the baseline, in pixels.
+    pub fn em_ascent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| px(metrics.em_ascent * font_size.0))
+    }
+
     /// The ascent, descent and line gap rounded like browsers do for `line-height: normal`.
     pub fn line_metrics(&self, font_id: FontId, font_size: Pixels) -> [Pixels; 3] {
         self.read_metrics(font_id, |metrics| {
@@ -463,6 +476,43 @@ impl TextSystem {
         }
         let (size, bytes) = self.platform.rasterize_glyph(params, bounds)?;
         Ok(Some((bounds.origin, size, bytes)))
+    }
+
+    /// The ink of a glyph from its origin, in logical pixels with y up: left, right, top and bottom. Glyphs without ink have none.
+    pub fn glyph_bounds(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+    ) -> Option<[f32; 4]> {
+        #[cfg(target_os = "macos")]
+        let bounds = self.platform.glyph_bounds(font_id, glyph_id, font_size.0);
+        // WARNING: other platforms measure raster bounds at this scale, so the values are off by up to its inverse.
+        #[cfg(not(target_os = "macos"))]
+        let bounds = {
+            const SCALE: f32 = 8.;
+            let bounds = self
+                .platform
+                .glyph_raster_bounds(&RenderGlyphParams {
+                    font_id,
+                    glyph_id,
+                    font_size,
+                    subpixel_variant: crate::point(0, 0),
+                    scale_factor: SCALE,
+                    is_emoji: false,
+                    dilation: 0,
+                })
+                .ok()?;
+            let [x, y, w, h] = [
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+            ]
+            .map(|v| v as f32 / SCALE);
+            Some([x, x + w, -y, -(y + h)])
+        };
+        bounds.filter(|[left, right, top, bottom]| right > left && top > bottom)
     }
 
     /// Rasterizes a glyph on the CPU, for drawing outside the scene: the offset of its pixels from the glyph origin, their size, and alpha bytes, or straight-alpha BGRA for emoji.
@@ -526,9 +576,13 @@ impl TextSystem {
                         && font_run.letter_spacing == run.letter_spacing
                         && font_run.word_spacing == run.word_spacing
                         && font_run.font_size == size
+                        && font_run.inset[1] == Pixels::ZERO
+                        && run.inset[0] == Pixels::ZERO
+                        && font_run.nowrap == run.nowrap
                         && !decoration_changed =>
                 {
-                    font_run.len += len
+                    font_run.len += len;
+                    font_run.inset[1] = run.inset[1];
                 }
                 _ => font_runs.push(FontRun {
                     len,
@@ -536,6 +590,8 @@ impl TextSystem {
                     letter_spacing: run.letter_spacing,
                     word_spacing: run.word_spacing,
                     font_size: size,
+                    inset: run.inset,
+                    nowrap: run.nowrap,
                 }),
             }
         }

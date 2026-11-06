@@ -50,6 +50,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLTexture",
     "MTLTypes",
 ] }
+objc2-core-graphics.workspace = true
 objc2-quartz-core = { workspace = true, features = [
     "objc2-core-foundation",
     "objc2-core-graphics",

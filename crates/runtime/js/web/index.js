@@ -166,18 +166,33 @@ globalThis.__appsWeb = call => {
       return utf8(String(input), 0, output, 0);
     }
   }
+  const decoderLabels = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be', latin1: 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252', ascii: 'windows-1252', 'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', cp1252: 'windows-1252', 'x-cp1252': 'windows-1252' };
+  const cp1252 = '€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8DŽ\x8F\x90‘’“”•–—˜™š›œ\x9DžŸ';
   class TextDecoder {
-    #pending = []; #started = false; #fatal; #ignoreBOM;
+    #pending = []; #started = false; #fatal; #ignoreBOM; #encoding;
     constructor(label = 'utf-8', options = {}) {
-      if (!['utf-8', 'utf8', 'unicode-1-1-utf-8'].includes(String(label).trim().toLowerCase())) throw new RangeError('Only UTF-8 decoding is supported');
+      this.#encoding = Object.hasOwn(decoderLabels, String(label).trim().toLowerCase()) ? decoderLabels[String(label).trim().toLowerCase()] : null;
+      if (!this.#encoding) throw new RangeError(`The encoding label provided ('${label}') is invalid.`);
       this.#fatal = !!options.fatal; this.#ignoreBOM = !!options.ignoreBOM;
     }
-    get encoding() { return 'utf-8'; }
+    get encoding() { return this.#encoding; }
     get fatal() { return this.#fatal; }
     get ignoreBOM() { return this.#ignoreBOM; }
     decode(input = new Uint8Array(), options = {}) {
       let data = bytes(input);
       if (this.#pending.length) { const combined = new Uint8Array(this.#pending.length + data.length); combined.set(this.#pending); combined.set(data, this.#pending.length); data = combined; }
+      if (this.#encoding === 'windows-1252') { let text = ''; for (const byte of data) text += byte >= 0x80 && byte < 0xA0 ? cp1252[byte - 0x80] : String.fromCharCode(byte); return text; }
+      if (this.#encoding !== 'utf-8') {
+        const end = data.length & ~1, big = this.#encoding === 'utf-16be', parts = [];
+        let units = [];
+        for (let index = 0; index < end; index += 2) { units.push(big ? data[index] << 8 | data[index + 1] : data[index] | data[index + 1] << 8); if (units.length === 8192) { parts.push(String.fromCharCode(...units)); units = []; } }
+        parts.push(String.fromCharCode(...units));
+        let text = parts.join('');
+        if (options.stream) this.#pending = data.slice(end); else { this.#pending = []; if (end !== data.length) { if (this.#fatal) throw new TypeError('The encoded data was not valid'); text += '�'; } }
+        if (text && !this.#started) { this.#started = true; if (!this.#ignoreBOM && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); }
+        if (!options.stream) this.#started = false;
+        return this.#fatal && !text.isWellFormed() ? (() => { throw new TypeError('The encoded data was not valid'); })() : text.toWellFormed();
+      }
       try {
         let [text, pending] = call('web.decode', encodeBytes(data), !!options.stream, this.#fatal);
         this.#pending = pending ? data.slice(data.length - pending) : [];
@@ -546,6 +561,13 @@ globalThis.__appsWeb = call => {
     let request;
     try {
       request = new Request(input, init); request.signal.throwIfAborted();
+      if (new URL(request.url).protocol === 'apps:') {
+        if (!['GET', 'HEAD'].includes(request.method)) throw new TypeError('Bundled assets require GET');
+        const data = call('web.asset', request.url);
+        if (data === null) throw new TypeError('Failed to fetch');
+        const type = { wasm: 'application/wasm', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf', otf: 'font/otf', mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', glb: 'model/gltf-binary' }[request.url.split('.').pop()] ?? 'application/octet-stream';
+        resolve(new Response(request.method === 'HEAD' ? null : decodeBytes(data), { headers: { 'content-type': type } })); return;
+      }
       if (new URL(request.url).protocol === 'data:') {
         if (request.method !== 'GET') throw new TypeError('Data URLs require GET');
         const url=new URL(request.url), source=url.href.slice(5,url.hash?-url.hash.length:undefined), comma=source.indexOf(',');
@@ -589,6 +611,7 @@ globalThis.__appsWeb = call => {
   });
   let beaconBytes = 0;
   globalThis.navigator ??= {};
+  for (const [name, get] of Object.entries({ language: () => new Intl.DateTimeFormat().resolvedOptions().locale, languages: () => [navigator.language], onLine: () => true, cookieEnabled: () => true, maxTouchPoints: () => 0, hardwareConcurrency: () => call('web.cpus') })) if (!(name in navigator)) Object.defineProperty(navigator, name, { get, configurable: true, enumerable: true });
   navigator.sendBeacon = (url, data = null) => {
     const request = new Request(url, { method: 'POST', body: data, credentials: 'include' });
     if (!['http:', 'https:'].includes(new URL(request.url).protocol)) throw new TypeError('Beacon requires HTTP or HTTPS');
@@ -655,7 +678,123 @@ globalThis.__appsWeb = call => {
   poll.eventState = event => eventStates.get(event);
   poll.blob = blob => blobs.get(blob);
   poll.listeners = (target, type) => (eventTargets.get(target)?.get(String(type)) ?? []).map(item => item.callback);
-  Object.assign(globalThis, { DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
+  class ProgressEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.lengthComputable = !!init.lengthComputable; this.loaded = Number(init.loaded) || 0; this.total = Number(init.total) || 0; }
+  }
+  const fireXhr = (target, type, init = {}) => { const event = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, init); target.dispatchEvent(event); target['on' + type]?.call(target, event); };
+  class XMLHttpRequestEventTarget extends EventTarget {
+    onloadstart = null; onprogress = null; onabort = null; onerror = null; onload = null; ontimeout = null; onloadend = null;
+  }
+  class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {}
+  // WARNING: this runs on `fetch`, so upload progress reports only the start and the end, and synchronous requests are not possible.
+  class XMLHttpRequest extends XMLHttpRequestEventTarget {
+    static UNSENT = 0; static OPENED = 1; static HEADERS_RECEIVED = 2; static LOADING = 3; static DONE = 4;
+    UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
+    onreadystatechange = null; upload = new XMLHttpRequestUpload(); readyState = 0; status = 0; statusText = ''; responseURL = ''; responseType = ''; timeout = 0; withCredentials = false;
+    #method; #url; #headers; #sent = false; #run = 0; #controller = null; #timer; #response = null; #chunks = []; #size = 0; #mime = null; #uploading = false;
+    #state(value) { this.readyState = value; fireXhr(this, 'readystatechange'); }
+    #reset() { this.#run++; clearTimeout(this.#timer); this.#controller = null; this.#sent = false; this.#uploading = false; this.#response = null; this.#chunks = []; this.#size = 0; this.status = 0; this.statusText = ''; this.responseURL = ''; }
+    #fail(type) {
+      this.#run++; clearTimeout(this.#timer); this.#sent = false; this.#response = null; this.#chunks = []; this.status = 0; this.statusText = ''; this.responseURL = '';
+      this.#state(4);
+      if (this.#uploading) { this.#uploading = false; fireXhr(this.upload, type); fireXhr(this.upload, 'loadend'); }
+      fireXhr(this, type); fireXhr(this, 'loadend');
+    }
+    open(method, url, async = true) {
+      if (async === false) throw new DOMException('Synchronous requests are not supported', 'InvalidAccessError');
+      this.#controller?.abort(); this.#reset();
+      this.#method = String(method).toUpperCase(); this.#url = String(url); this.#headers = new Headers();
+      this.#state(1);
+    }
+    setRequestHeader(name, value) { if (this.readyState !== 1 || this.#sent) throw new DOMException('The request is not open', 'InvalidStateError'); this.#headers.append(name, value); }
+    overrideMimeType(mime) { this.#mime = String(mime); }
+    getResponseHeader(name) { return this.#response?.headers.get(name) ?? null; }
+    getAllResponseHeaders() { return this.#response ? [...this.#response.headers].map(([name, value]) => `${name}: ${value}\r\n`).join('') : ''; }
+    send(body = null) {
+      if (this.readyState !== 1 || this.#sent) throw new DOMException('The request is not open', 'InvalidStateError');
+      const bodied = body !== null && !['GET', 'HEAD'].includes(this.#method);
+      const total = !bodied ? 0 : body.size ?? body.byteLength ?? (typeof body === 'string' ? new TextEncoder().encode(body).length : 0);
+      const run = ++this.#run, controller = this.#controller = new AbortController();
+      this.#sent = true; this.#uploading = bodied;
+      fireXhr(this, 'loadstart');
+      if (bodied) fireXhr(this.upload, 'loadstart', { lengthComputable: true, loaded: 0, total });
+      let timedOut = false;
+      if (this.timeout > 0) this.#timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeout);
+      (async () => {
+        const response = await fetch(this.#url, { method: this.#method, headers: this.#headers, body: bodied ? body : undefined, signal: controller.signal, credentials: this.withCredentials ? 'include' : 'same-origin' });
+        if (run !== this.#run) return;
+        if (bodied) { this.#uploading = false; for (const type of ['progress', 'load', 'loadend']) fireXhr(this.upload, type, { lengthComputable: true, loaded: total, total }); }
+        this.#response = response; this.status = response.status; this.statusText = response.statusText; this.responseURL = response.url;
+        this.#state(2);
+        const length = Number(response.headers.get('content-length')) || 0, reader = response.body?.getReader();
+        while (reader) {
+          const { value, done } = await reader.read();
+          if (run !== this.#run) { reader.cancel().catch(() => {}); return; }
+          if (done) break;
+          this.#chunks.push(value); this.#size += value.length;
+          this.#state(3);
+          fireXhr(this, 'progress', { lengthComputable: length > 0, loaded: this.#size, total: length });
+        }
+        if (run !== this.#run) return;
+        clearTimeout(this.#timer); this.#sent = false;
+        this.#state(4);
+        fireXhr(this, 'load', { lengthComputable: length > 0, loaded: this.#size, total: length });
+        fireXhr(this, 'loadend', { lengthComputable: length > 0, loaded: this.#size, total: length });
+      })().catch(() => { if (run === this.#run) this.#fail(timedOut ? 'timeout' : 'error'); });
+    }
+    abort() {
+      const controller = this.#controller, active = this.#sent;
+      this.#controller = null;
+      if (active) { this.#fail('abort'); controller?.abort(); }
+      else this.#reset();
+      this.readyState = 0;
+    }
+    get #bytes() { const bytes = new Uint8Array(this.#size); let at = 0; for (const chunk of this.#chunks) { bytes.set(chunk, at); at += chunk.length; } return bytes; }
+    get responseText() { if (this.responseType !== '' && this.responseType !== 'text') throw new DOMException('The response is not text', 'InvalidStateError'); return this.readyState < 3 ? '' : new TextDecoder().decode(this.#bytes); }
+    get responseXML() { return this.responseType === 'document' && this.readyState === 4 && globalThis.DOMParser && this.#size ? new DOMParser().parseFromString(new TextDecoder().decode(this.#bytes), 'text/html') : null; }
+    get response() {
+      if (this.responseType === '' || this.responseType === 'text') return this.responseText;
+      if (this.readyState !== 4 || !this.#response) return null;
+      if (this.responseType === 'json') { try { return JSON.parse(new TextDecoder().decode(this.#bytes)); } catch { return null; } }
+      if (this.responseType === 'arraybuffer') return this.#bytes.buffer;
+      if (this.responseType === 'blob') return new Blob([this.#bytes], { type: this.#mime ?? this.#response.headers.get('content-type') ?? '' });
+      return this.responseXML;
+    }
+  }
+  const base64Bytes = bytes => { if (bytes.toBase64) return bytes.toBase64(); let text = ''; for (let i = 0; i < bytes.length; i += 8192) text += String.fromCharCode(...bytes.subarray(i, i + 8192)); return btoa(text); };
+  class FileReader extends EventTarget {
+    static EMPTY = 0; static LOADING = 1; static DONE = 2;
+    EMPTY = 0; LOADING = 1; DONE = 2;
+    readyState = 0; result = null; error = null;
+    onloadstart = null; onprogress = null; onload = null; onabort = null; onerror = null; onloadend = null;
+    #run = 0;
+    #fire(type, blob) { const event = new ProgressEvent(type, { lengthComputable: true, loaded: this.result === null ? 0 : blob.size, total: blob.size }); this.dispatchEvent(event); }
+    #read(blob, convert) {
+      if (!(blob instanceof Blob)) throw new TypeError('Expected a Blob');
+      if (this.readyState === 1) throw new DOMException('The reader is already busy', 'InvalidStateError');
+      this.readyState = 1; this.result = this.error = null;
+      const run = ++this.#run;
+      setTimeout(() => {
+        if (run !== this.#run) return;
+        this.#fire('loadstart', blob);
+        blob.arrayBuffer().then(buffer => {
+          if (run !== this.#run) return;
+          this.result = convert(buffer); this.readyState = 2;
+          this.#fire('progress', blob); this.#fire('load', blob); if (run === this.#run && this.readyState === 2) this.#fire('loadend', blob);
+        }, error => {
+          if (run !== this.#run) return;
+          this.error = error; this.readyState = 2;
+          this.#fire('error', blob); this.#fire('loadend', blob);
+        });
+      }, 0);
+    }
+    readAsArrayBuffer(blob) { this.#read(blob, buffer => buffer); }
+    readAsBinaryString(blob) { this.#read(blob, buffer => { let text = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.length; i += 8192) text += String.fromCharCode(...bytes.subarray(i, i + 8192)); return text; }); }
+    readAsText(blob, encoding = 'utf-8') { this.#read(blob, buffer => new TextDecoder(encoding).decode(buffer)); }
+    readAsDataURL(blob) { this.#read(blob, buffer => `data:${blob.type || 'application/octet-stream'};base64,${base64Bytes(new Uint8Array(buffer))}`); }
+    abort() { if (this.readyState !== 1) { return; } this.#run++; this.readyState = 2; this.result = null; const blob = new Blob(); this.#fire('abort', blob); this.#fire('loadend', blob); }
+  }
+  Object.assign(globalThis, { FileReader, ProgressEvent, XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload, DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
     TextDecoderStream, URL, URLSearchParams, crypto, Headers, Request, Response, Blob, File, FormData, fetch, WebSocket, MessageEvent, CloseEvent });
   return poll;
 };

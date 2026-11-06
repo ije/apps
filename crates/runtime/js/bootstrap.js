@@ -162,7 +162,7 @@
     promise.then(() => { modulesPending--; }, error => { modulesPending--; moduleErrors.push(error); });
   };
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
-  const workers = globalThis.__appsWorkers(call, !(typeof role === "object" && "renderer" in role));
+  const workers = globalThis.__appsWorkers(call, !(typeof role === "object" && "renderer" in role), task);
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
@@ -306,10 +306,14 @@
     getUploadProgress() { const total = this._chunks.reduce((size, chunk) => size + chunk.length, 0); return { active: this.headersSent && !this.res, started: this.headersSent, current: this.res ? total : 0, total }; }
   }
   const isOnline = () => info.platform === 'win32' || Object.values(node.os.networkInterfaces()).flat().some(item => !item.internal && !/^(169\.254\.|fe80:)/i.test(item.address));
-  const electronNet = Object.freeze({ fetch: (input, init) => fetch(input, init), request: options => new ClientRequest(options), isOnline, get online() { return isOnline(); } });
+  const electron = globalThis.__appsElectron(call, events.EventEmitter, () => ready);
+  delete globalThis.__appsElectron;
+  const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new ClientRequest(options), isOnline, get online() { return isOnline(); } });
   pty = globalThis.__appsPty(call);
   delete globalThis.__appsPty;
-  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents));
+  // Like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
+  for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
+  browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
   delete globalThis.__appsBrowser;
   nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter);
   delete globalThis.__appsNativeShell;
@@ -335,7 +339,7 @@
   const memoryUsage = () => ({ rss: memoryUsage.rss(), heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 });
   memoryUsage.rss = () => call('node.process.memory');
   const process = globalThis.process = Object.assign(new events.EventEmitter(), {
-    platform: info.platform, arch: info.arch, pid: info.pid, title: info.appName, type: role === 'main' ? 'browser' : 'renderer',
+    platform: info.platform, arch: info.arch, pid: info.pid, title: info.appName, type: info.node ? undefined : role === 'main' ? 'browser' : 'renderer',
     version: 'v' + nodeVersion, versions: Object.freeze({ node: nodeVersion, electron: electronVersion, apps: info.version, javascriptcore: info.javascriptcore, napi: '8' }), release: Object.freeze({ name: 'node' }),
     argv: [info.execPath ?? info.argv[0], ...info.argv.slice(1)], argv0: info.argv[0], execArgv: [], env, execPath: info.execPath, exitCode: undefined,
     cwd: () => call('cwd'), chdir: path => call('chdir', path),
@@ -353,6 +357,23 @@
       if (warning.name === 'DeprecationWarning' && process.noDeprecation) return;
       queueMicrotask(() => { process.emit('warning', warning); if (!process.noProcessWarnings) console.error(`(node:${info.pid}) ${warning.code ? `[${warning.code}] ` : ''}${warning.name}: ${warning.message}`); });
     },
+  });
+  Object.assign(process, {
+    resourceUsage: () => call('node.process.resourceUsage'),
+    abort() { call('node.process.abort'); },
+    constrainedMemory: () => 0,
+    availableMemory: () => node.os.freemem(),
+    getActiveResourcesInfo: () => [],
+    features: Object.freeze({ inspector: false, debug: false, uv: true, ipv6: true, tls_alpn: true, tls_sni: true, tls_ocsp: true, tls: true, cached_builtins: true, require_module: true, typescript: false }),
+    config: Object.freeze({ target_defaults: Object.freeze({}), variables: Object.freeze({}) }),
+    allowedNodeEnvironmentFlags: new Set(),
+    debugPort: 9229,
+    report: Object.freeze({ compact: false, directory: '', filename: '', getReport: () => ({}), reportOnFatalError: false, reportOnSignal: false, reportOnUncaughtException: false, signal: 'SIGUSR2', writeReport: () => '' }),
+    sourceMapsEnabled: false,
+    setSourceMapsEnabled() {},
+    hasUncaughtExceptionCaptureCallback: () => false,
+    setUncaughtExceptionCaptureCallback() {},
+    loadEnvFile() {},
   });
   process.hrtime.bigint = () => BigInt(Math.floor(performance.now() * 1e6));
   Object.defineProperty(process, 'ppid', { get: () => node.details().ppid ?? 0, enumerable: true });
@@ -375,6 +396,13 @@
   process.stdout = output(1);
   process.stderr = output(2);
   const fs = node.fs;
+  // WARNING: reading it holds a thread of the file pool until input comes, so it opens on first use.
+  let stdin;
+  Object.defineProperty(process, 'stdin', { enumerable: true, configurable: true, get() {
+    if (stdin) return stdin;
+    stdin = fs.createReadStream('', { fd: 0, autoClose: false });
+    return Object.assign(stdin, { isTTY: node.tty.isatty(0) || undefined, setRawMode() { return this; }, ref() { return this; }, unref() { return this; } });
+  } });
   const fileStream = (self, file, o, flags) => {
     const handle = typeof o.fd === 'object' && o.fd !== null ? o.fd : null;
     if (o.start !== undefined && o.end !== undefined && o.start > o.end) throw Object.assign(new RangeError(`The value of "start" is out of range. It must be <= "end" (here: ${o.end}). Received ${o.start}`), { code: 'ERR_OUT_OF_RANGE' });
@@ -478,7 +506,51 @@
       }
       return this._load('loadFile', target, url.href);
     }
-    loadURL() { throw Error('loadURL is not allowed, use WebContentsView to load webpage'); }
+    // WARNING: pages that ship with the app are bundled, so only these URLs load here. Use WebContentsView or `shell.openExternal()` for websites.
+    loadURL(url) {
+      url = String(url);
+      if (/^(apps|file):/i.test(url)) return this.loadFile(url);
+      const data = /^data:text\/html(;[^,]*)?,(.*)$/is.exec(url);
+      if (data) return this._load('load', /;base64/i.test(data[1] ?? '') ? node.Buffer.from(data[2], 'base64').toString() : decodeURIComponent(data[2]), url);
+      const handler = electron.handled(url);
+      if (handler) return Promise.resolve(handler(new Request(url))).then(response => response.text()).then(html => this._load('load', html, url));
+      const failure = loadError(-301, 'ERR_DISALLOWED_URL_SCHEME', url);
+      this.emit('did-fail-load', event(), failure.errno, failure.code, url, true, info.pid, 1);
+      return Promise.reject(failure);
+    }
+    on(name, listener) { if (name === 'before-input-event') call('dom.listenInput'); return super.on(name, listener); }
+    getType() { return 'window'; }
+    get session() { return browsers.session.defaultSession; }
+    get mainFrame() { return frameOf(this); }
+    get focusedFrame() { return frameOf(this); }
+    get navigationHistory() { return navigationHistory(this); }
+    get hostWebContents() { return null; }
+    get devToolsWebContents() { return null; }
+    get debugger() { return debuggerOf(this); }
+    ipc = Object.assign(new events.EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
+    isFocused() { return !this.isDestroyed() && states.get(windows.get(pages.get(this).win)).focused; }
+    isLoadingMainFrame() { return this.isLoading(); }
+    getUserAgent() { return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) ${info.appName}/${info.appVersion}`; }
+    setUserAgent() {}
+    setBackgroundThrottling() {}
+    getBackgroundThrottling() { return false; }
+    setIgnoreMenuShortcuts() {}
+    setVisualZoomLevelLimits() { return Promise.resolve(); }
+    setAudioMuted() {}
+    isAudioMuted() { return false; }
+    isCurrentlyAudible() { return false; }
+    isDevToolsOpened() { return false; }
+    closeDevTools() {}
+    isCrashed() { return false; }
+    stop() {}
+    startDrag() {}
+    sendInputEvent() {}
+    replaceMisspelling(text) { this.replace(text); }
+    copyImageAt() {}
+    executeJavaScriptInIsolatedWorld(_world, scripts) { return Promise.all(scripts.map(({ code }) => this.executeJavaScript(code))).then(results => results.at(-1)); }
+    getFrameRate() { return 120; }
+    setFrameRate() {}
+    getProcessMemoryInfo() { return Promise.resolve({ residentSet: process.memoryUsage.rss() >> 10, private: 0, shared: 0 }); }
     reload() { const page = this.#page(), html = page.url === 'apps://app/'; if (page.url) this._load(html ? 'load' : 'loadFile', html ? page.html : page.url, page.url).catch(() => {}); }
     reloadIgnoringCache() { this.reload(); }
     send(channel, ...args) { bridge.send(this.#page().win, channel, ...args); }
@@ -511,6 +583,27 @@
     getOSProcessId() { return info.pid; }
     getProcessId() { return info.pid; }
   }
+  // WARNING: a page has one frame here, and `<iframe>` contents are system web views that main can't reach.
+  const frames = new WeakMap();
+  const frameOf = contents => {
+    let frame = frames.get(contents);
+    if (!frame) frames.set(contents, frame = { get url() { return contents.getURL(); }, get name() { return ''; }, get top() { return frame; }, get parent() { return null; }, frames: [], framesInSubtree: [], get origin() { try { return new URL(contents.getURL()).origin; } catch { return ''; } }, processId: info.pid, routingId: 1, frameTreeNodeId: 1, visibilityState: 'visible', detached: false, ipc: contents.ipc,
+      executeJavaScript: code => contents.executeJavaScript(code), send: (channel, ...args) => contents.send(channel, ...args), postMessage: (channel, message) => contents.send(channel, message), isDestroyed: () => contents.isDestroyed(), reload: () => { contents.reload(); return true; }, collectJavaScriptCallStack: async () => '' });
+    return frame;
+  };
+  const histories = new WeakMap();
+  const navigationHistory = contents => {
+    let history = histories.get(contents);
+    if (!history) histories.set(contents, history = { canGoBack: () => false, canGoForward: () => false, canGoToOffset: () => false, goBack() { contents.executeJavaScript('history.back()'); }, goForward() { contents.executeJavaScript('history.forward()'); }, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] });
+    return history;
+  };
+  // WARNING: the renderer is not Chromium, so there is no Chrome DevTools Protocol to attach to.
+  const debuggers = new WeakMap();
+  const debuggerOf = contents => {
+    let item = debuggers.get(contents);
+    if (!item) debuggers.set(contents, item = Object.assign(new events.EventEmitter(), { attach() { throw new Error('Chrome DevTools Protocol is not supported'); }, detach() {}, isAttached: () => false, sendCommand: () => Promise.reject(new Error('Chrome DevTools Protocol is not supported')) }));
+    return item;
+  };
   const webContents = Object.freeze({
     getAllWebContents: () => [...[...windows.values()].map(win => win.webContents), ...browsers.all()],
     fromId: id => webContents.getAllWebContents().find(contents => contents.id === id),
@@ -534,9 +627,53 @@
   };
   hooks.contents = id => windows.get(id)?.webContents ?? null;
   // Pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
+  // A `<webview>` is a WebContentsView that main keeps over the element, and its events go to the element.
+  const webviews = new Map();
+  const webview = (win, op, guestId, data) => {
+    const entry = webviews.get(guestId), contents = win.webContents;
+    if (op === 'attach') {
+      const preferences = { partition: data.partition || undefined }, attach = event();
+      contents.emit('will-attach-webview', attach, preferences, { ...data });
+      if (attach.defaultPrevented) return null;
+      const view = new browsers.WebContentsView({ webPreferences: { partition: data.partition || undefined } }), guest = view.webContents;
+      guest.hostWebContents = contents;
+      win.contentView.addChildView(view);
+      const emit = guest.emit;
+      guest.emit = (name, ...args) => {
+        if (webviewEvents[name] && !contents.isDestroyed()) contents.executeJavaScript(`__appsWebviewEvent(${guest.id},${JSON.stringify(name)},${JSON.stringify(webviewEvents[name](...args))})`).catch(() => {});
+        return emit.call(guest, name, ...args);
+      };
+      const drop = () => { if (webviews.delete(guest.id) && !guest.isDestroyed()) guest.close(); };
+      webviews.set(guest.id, { view, guest, drop });
+      // A page that goes away can't detach its guests.
+      contents.once('did-start-loading', drop);
+      win.once('closed', drop);
+      contents.emit('did-attach-webview', event(), guest);
+      if (data.src) guest.loadURL(data.src).catch(() => {});
+      return guest.id;
+    }
+    if (!entry) return null;
+    const { view, guest, drop } = entry;
+    if (op === 'bounds') { view.setBounds(data.bounds); view.setVisible(data.visible); return null; }
+    if (op === 'detach') { contents.off('did-start-loading', drop); win.off('closed', drop); win.contentView.removeChildView(view); drop(); return null; }
+    if (op === 'call') {
+      const result = guest[data.method](...data.args);
+      if (typeof result?.then !== 'function') return result ?? null;
+      const reply = (value, error) => { if (!contents.isDestroyed()) contents.executeJavaScript(`__appsWebviewReply(${data.reply},${JSON.stringify(value ?? null)},${JSON.stringify(error ?? null)})`).catch(() => {}); };
+      result.then(value => reply(value), error => reply(null, String(error?.message ?? error)));
+    }
+    return null;
+  };
+  const webviewEvents = {
+    'did-start-loading': () => ({}), 'did-stop-loading': () => ({}), 'dom-ready': () => ({}), 'did-finish-load': () => ({}),
+    'did-navigate': (_event, url) => ({ url }), 'did-navigate-in-page': (_event, url, isMainFrame) => ({ url, isMainFrame }), 'page-title-updated': (_event, title) => ({ title }), 'page-favicon-updated': (_event, favicons) => ({ favicons }),
+    'did-fail-load': (_event, errorCode, errorDescription, validatedURL) => ({ errorCode, errorDescription, validatedURL, isMainFrame: true }),
+    'console-message': (_event, level, message, line, sourceId) => ({ level, message, line, sourceId }), 'render-process-gone': (_event, details) => ({ details }), 'destroyed': () => ({}),
+  };
   globalThis.__appsWindowOpen = (id, [kind, url, frameName, features, disposition]) => {
     const opener = windows.get(id);
     if (!opener) return 'null';
+    if (kind === 'webview') { try { return JSON.stringify(webview(opener, url, frameName, features) ?? null); } catch (error) { hooks.report(error); return 'null'; } }
     if (kind !== 'open') { const child = opened.get(url) === id ? windows.get(url) : null; if (kind === 'close') child?.close(); return JSON.stringify(!child); }
     const page = pages.get(opener.webContents), details = { url, frameName, features, disposition, referrer: { url: page.url, policy: 'strict-origin-when-cross-origin' }, postBody: undefined };
     try {
@@ -552,6 +689,24 @@
       opener.webContents.emit('did-create-window', win, { ...details, options });
       return String(win.id);
     } catch (error) { hooks.report(error); return 'null'; }
+  };
+  // `<input type=file>`: main opens the panel and reads the files, as a page can't read files by path.
+  const pickFiles = async (win, { id, multiple, directory, accept }) => {
+    let files = null;
+    try {
+      const images = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'heic', 'bmp', 'tiff'];
+      const extensions = accept.split(',').map(item => item.trim().toLowerCase()).flatMap(item => item === 'image/*' ? images : item.startsWith('.') ? [item.slice(1)] : [null]);
+      const { canceled, filePaths } = await globalThis.__apps.dialog.showOpenDialog(win, {
+        properties: [directory ? 'openDirectory' : 'openFile', ...(multiple ? ['multiSelections'] : [])],
+        ...(accept && !extensions.includes(null) ? { filters: [{ name: 'Files', extensions }] } : {}),
+      });
+      // WARNING: as with dropped files, more than 64 MB is left out, because the bytes cross to the page as a string.
+      if (!canceled) files = filePaths.flatMap(path => {
+        const stat = __apps.fs.statSync(path);
+        return stat.isFile() && stat.size <= 64 * 1024 * 1024 ? [{ name: path.split('/').at(-1), lastModified: stat.mtimeMs, data: __apps.fs.readFileSync(path).toString('base64') }] : [];
+      });
+    } catch (error) { hooks.report(error); }
+    if (!win.isDestroyed()) win.webContents.executeJavaScript(`__appsFilesPicked(${id},${JSON.stringify(files)})`).catch(() => {});
   };
   const num = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return value; };
   const int = (value, name) => Math.round(num(value, name));
@@ -581,6 +736,8 @@
       super();
       if (!ready) throw Error('Call app.whenReady() before creating a window');
       options = { ...options, title: String(options.title ?? name) };
+      // WARNING: pages use the `preload` of package.json, and these have no effect here.
+      for (const key of ['webPreferences', 'autoHideMenuBar', 'disableAutoHideCursor', 'titleBarOverlay', 'enableLargerThanScreen', 'tabbingIdentifier', 'acceptFirstMouse', 'thickFrame', 'paintWhenInitiallyHidden', 'roundedCorners']) delete options[key];
       if (typeof options.backgroundColor === 'string') options.backgroundColor = argb(options.backgroundColor);
       if (options.parent != null && !(options.parent instanceof BrowserWindow)) throw new TypeError('Expected a BrowserWindow for parent');
       if (options.parent) { state(options.parent); options.parent = options.parent.id; } else delete options.parent;
@@ -605,7 +762,26 @@
     }
     load(html) { return this.webContents._load('load', String(html), 'apps://app/'); }
     loadFile(file, options) { return this.webContents.loadFile(file, options); }
-    loadURL() { throw Error('loadURL is not allowed, use WebContentsView to load webpage'); }
+    loadURL(url) { return this.webContents.loadURL(url); }
+    setWindowButtonPosition(position) { const s = state(this); s.buttonPosition = position ?? null; call('window', 'buttonPosition', this.id, position ? int(position.x, 'x') : null, position ? int(position.y, 'y') : null); }
+    getWindowButtonPosition() { return state(this).buttonPosition ?? null; }
+    setAutoHideCursor() { state(this); }
+    setTitleBarOverlay() { state(this); }
+    setOverlayIcon() { state(this); }
+    setIcon() { state(this); }
+    setAutoHideMenuBar() { state(this); }
+    isMenuBarAutoHide() { state(this); return false; }
+    setMenuBarVisibility() { state(this); }
+    isMenuBarVisible() { state(this); return false; }
+    setDocumentEdited(edited) { state(this).edited = !!edited; }
+    isDocumentEdited() { return !!state(this).edited; }
+    setRepresentedFilename(file) { state(this).represented = String(file); }
+    getRepresentedFilename() { return state(this).represented ?? ''; }
+    setSheetOffset() { state(this); }
+    invalidateShadow() { state(this); }
+    getNativeWindowHandle() { state(this); const handle = node.Buffer.alloc(8); handle.writeBigUInt64LE(BigInt(this.id)); return handle; }
+    moveTop() { state(this); if (this.isVisible()) this.showInactive(); }
+    moveAbove() { state(this); }
     reload() { this.webContents.reload(); }
     close() {
       if (state(this).closing) return;
@@ -755,7 +931,7 @@
     focus: ({ steal = false } = {}) => call('focus', !!steal),
     getAppPath: () => info.appPath,
     getPath: name => call('app.path', name),
-    setPath: (name, path) => call('app.setPath', name, path),
+    setPath: (name, path) => { call('app.setPath', name, path); if (name === 'userData') fs.mkdirSync(path, { recursive: true }); },
     getVersion: () => info.appVersion,
     getName: () => name,
     setName: value => { name = String(value); },
@@ -772,6 +948,12 @@
     }),
     disableHardwareAcceleration: () => {},
     isHardwareAccelerationEnabled: () => true,
+    getFileIcon: electron.fileIcon,
+    setAppUserModelId() {},
+    setDesktopName() {},
+    getAppMetrics: () => [{ pid: info.pid, type: 'Browser', creationTime: 0, cpu: { percentCPUUsage: 0, cumulativeCPUUsage: 0, idleWakeupsPerSecond: 0 }, memory: { workingSetSize: process.memoryUsage.rss() >> 10, peakWorkingSetSize: 0 } }],
+    runningUnderARM64Translation: false,
+    runningUnderRosettaTranslation: false,
     isPackaged: info.isPackaged, platform: info.platform,
   });
   Object.defineProperty(app, 'name', { get: () => name, set: app.setName, enumerable: true });
@@ -798,6 +980,11 @@
       } else app.on(event, listener);
     }
     onReady?.();
+  };
+  globalThis.__appsBeforeInput = (id, input) => {
+    const prevented = event();
+    try { windows.get(id)?.webContents.emit('before-input-event', prevented, input); } catch (error) { hooks.report(error); }
+    return prevented.defaultPrevented;
   };
   globalThis.__appsEvent = (name, id, data) => {
     const win = windows.get(id);
@@ -832,6 +1019,9 @@
       if (!updated.defaultPrevented) { states.get(win).title = data; call('window', 'title', id, data); }
     }
     else if (name === 'loaded' || name === 'failed') { win?.webContents._event(name, data); if (name === 'loaded') win?.emit('ready-to-show'); }
+    else if (name === 'context-menu') win?.webContents.emit('context-menu', event(), { ...data, frame: frameOf(win.webContents) });
+    else if (name === 'input-event') win?.webContents.emit('input-event', event(), data);
+    else if (name === 'file-picker') pickFiles(win, data);
     else if (name === 'activate') app.emit('activate', event(), !!data);
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
@@ -848,7 +1038,7 @@
       captures.delete(data.id);
       if (data.error) return request?.reject(new Error(data.error));
       const bytes = Uint8Array.from(atob(data.png), char => char.charCodeAt(0));
-      request?.resolve(Object.freeze({ toPNG: () => bytes.slice(), toDataURL: () => 'data:image/png;base64,' + data.png, getSize: () => ({ width: data.width, height: data.height }), isEmpty: () => !data.width || !data.height }));
+      request?.resolve(electron.nativeImage.createFromBuffer(bytes));
     }
   };
   const abortError = signal => Object.assign(new Error('The operation was aborted', { cause: signal.reason }), { name: 'AbortError', code: 'ABORT_ERR' });
@@ -928,17 +1118,23 @@
     });
   };
   const perf_hooks = { performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList, createHistogram: () => new RecordableHistogram(), monitorEventLoopDelay };
-  const modules = { fs, path, os, process, events, stream, util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring, dns: node.dns, tty: node.tty, zlib: io.zlib, readline: io.readline, crypto: { ...globalThis.__appsNodeCrypto, ...io.crypto }, child_process: children.api, net: net.api, http: http.http, https: http.https, worker_threads: workers.api, perf_hooks, timers: timerModule, sqlite, ffi };
+  const compat = globalThis.__appsNodeCompat(events.EventEmitter, stream, net.api);
+  delete globalThis.__appsNodeCompat;
+  const modules = { ...compat, fs, path, os, process, events, stream, util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring, dns: node.dns, tty: node.tty, zlib: io.zlib, readline: io.readline, crypto: { ...globalThis.__appsNodeCrypto, ...io.crypto }, child_process: children.api, net: net.api, http: http.http, https: http.https, worker_threads: workers.api, perf_hooks, timers: timerModule, sqlite, ffi };
   modules.constants = Object.assign({}, os.constants.errno, os.constants.priority, os.constants.signals, fs.constants, modules.crypto.constants);
   const builtins = { ...modules, module: null, sys: node.util, 'fs/promises': fs.promises, 'stream/promises': stream.promises, 'stream/consumers': stream.consumers, 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest, ReadableStreamDefaultController, ReadableByteStreamController, WritableStreamDefaultWriter, WritableStreamDefaultController, TransformStreamDefaultController }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict, 'readline/promises': io.readline.promises, 'dns/promises': node.dns.promises };
   // WARNING: like Node, prefixed modules are built in only with `node:`.
-  const prefixed = new Set(['sqlite', 'ffi']), isBuiltin = name => { name = String(name); const key = name.replace(/^node:/, ''); return Object.hasOwn(builtins, key) && (key !== name || !prefixed.has(key)); };
+  const prefixed = new Set(['sqlite', 'ffi', 'sea']), isBuiltin = name => { name = String(name); const key = name.replace(/^node:/, ''); return Object.hasOwn(builtins, key) && (key !== name || !prefixed.has(key)); };
   const missingModule = name => Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
   builtins.module = { builtinModules: Object.keys(builtins).map(name => prefixed.has(name) ? 'node:' + name : name), isBuiltin, createRequire: () => Object.assign(name => {
     const key = String(name).replace(/^node:/, '');
     const value = key === 'electron' || key === '@pierre/apps' ? globalThis.__apps : key === 'node-pty' ? pty.api : key === 'ws' ? http.ws : isBuiltin(name) ? builtins[key] : undefined;
     if (value === undefined) throw missingModule(name);
     return value;
-  }, { resolve: name => { if (isBuiltin(name)) return String(name); throw missingModule(name); } }) };
-  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, ...nativeShell, ...bridge, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
+  }, { resolve: name => { if (isBuiltin(name) || /^(node-pty|ws|undici|electron)(\/|$)/.test(String(name))) return String(name); throw missingModule(name); } }) };
+  // WARNING: zoom is per window and lives on main, so a preload reads what main last told it.
+  const webFrame = Object.freeze({ getZoomFactor: () => 1, getZoomLevel: () => 0, setZoomFactor() {}, setZoomLevel() {}, setVisualZoomLevelLimits() {}, insertCSS: () => '', removeInsertedCSS() {} });
+  process.getBuiltinModule = name => isBuiltin(name) ? builtins[String(name).replace(/^node:/, '')] : undefined;
+  if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
+  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, nativeImage: electron.nativeImage, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
 })();

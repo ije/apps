@@ -105,7 +105,10 @@ impl LineLayout {
         indent: Pixels,
         wrap: TextWrap,
         word_break: WordBreak,
+        nowrap: &[std::ops::Range<usize>],
     ) -> Vec<WrapBoundary> {
+        let inside = |index: usize| nowrap.iter().any(|range| range.contains(&index));
+        let mut prev_index = 0;
         let mut boundaries = Vec::new();
         // Break opportunities for `wrap`: the boundary, its x, and the x where the words before it end.
         let constrain = wrap != TextWrap::Wrap && max_lines.is_none();
@@ -131,19 +134,25 @@ impl LineLayout {
                         WrapBoundary { run_ix, glyph_ix },
                         character,
                         glyph.position.x,
+                        glyph.index,
                     )
                 })
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((boundary, ch, x, index)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
+            let joined = !nowrap.is_empty() && inside(index) && inside(prev_index);
+            prev_index = index;
 
             if first_non_whitespace_ix.is_some()
                 && ch != ' '
+                && !joined
                 && (prev_ch == ' '
+                    // An object in the text, like an inline box, can break on both sides.
+                    || prev_ch == '\u{fffc}'
                     || !is_word_char(ch)
                     || word_break == WordBreak::BreakAll
                     // UAX #14: a hyphen inside a word breaks after it, but not before a digit.
@@ -160,7 +169,7 @@ impl LineLayout {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
+            let next_x = glyphs.peek().map_or(self.width, |(_, _, x, _)| *x);
             if ch != ' ' {
                 words_end = next_x.0;
             }
@@ -176,7 +185,7 @@ impl LineLayout {
             if ch != ' '
                 && width > available + px(0.01)
                 && boundary > last_boundary
-                && (last_candidate_ix.is_some() || word_break != WordBreak::Normal)
+                && (last_candidate_ix.is_some() || word_break != WordBreak::Normal && !joined)
             {
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -432,7 +441,12 @@ impl WrappedLineLayout {
                 line_start_ix = line_end_ix;
                 continue;
             } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
+                // The first row starts at zero, so the space before its first character counts.
+                let line_start_x = if ix == 0 {
+                    px(0.)
+                } else {
+                    self.unwrapped_layout.x_for_index(line_start_ix)
+                };
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
                 return Some(point(x, line_y));
             }
@@ -535,8 +549,20 @@ impl LineLayoutCache {
         }
         let unwrapped_layout = self.layout_line(platform, text, font_size, runs, None);
         let wrap_boundaries = match wrap_width {
-            Some(width) => unwrapped_layout
-                .compute_wrap_boundaries(text, width, max_lines, indent, wrap, word_break),
+            Some(width) => {
+                let mut end = 0;
+                let nowrap: Vec<_> = runs
+                    .iter()
+                    .filter_map(|run| {
+                        let start = end;
+                        end += run.len;
+                        run.nowrap.then_some(start..end)
+                    })
+                    .collect();
+                unwrapped_layout.compute_wrap_boundaries(
+                    text, width, max_lines, indent, wrap, word_break, &nowrap,
+                )
+            }
             None => Vec::new(),
         };
         let size = size_of_line(text, &unwrapped_layout)
@@ -593,10 +619,9 @@ impl LineLayoutCache {
             }
         }
         let mut layout = platform.layout_line(text, font_size, runs);
-        if runs
-            .iter()
-            .any(|run| run.letter_spacing != px(0.) || run.word_spacing != px(0.))
-        {
+        if runs.iter().any(|run| {
+            run.letter_spacing != px(0.) || run.word_spacing != px(0.) || run.inset != [px(0.); 2]
+        }) {
             apply_spacing(&mut layout, text, runs);
         }
         if let Some(force_width) = force_width {
@@ -665,18 +690,35 @@ fn apply_spacing(layout: &mut LineLayout, text: &str, runs: &[FontRun]) {
         let space = matches!(text[index..].chars().next(), Some(' ' | '\u{a0}'));
         run.letter_spacing + if space { run.word_spacing } else { px(0.) }
     };
+    let run_of = |index: usize| {
+        ends.partition_point(|&end| end <= index)
+            .min(runs.len() - 1)
+    };
     let mut shift = px(0.);
-    let mut previous = None;
+    let mut previous: Option<usize> = None;
     for run in &mut layout.runs {
         for glyph in &mut run.glyphs {
-            if let Some(previous) = previous.filter(|&previous| previous != glyph.index) {
-                shift += spacing(previous);
+            match previous.filter(|&previous| previous != glyph.index) {
+                Some(previous) => {
+                    shift += spacing(previous);
+                    let (from, to) = (run_of(previous), run_of(glyph.index));
+                    if from != to {
+                        shift += runs[from].inset[1];
+                        shift += runs[from + 1..=to]
+                            .iter()
+                            .map(|run| run.inset[0])
+                            .fold(px(0.), |sum, inset| sum + inset);
+                    }
+                }
+                None if previous.is_none() => shift += runs[run_of(glyph.index)].inset[0],
+                None => {}
             }
             previous = Some(glyph.index);
             glyph.position.x += shift;
         }
     }
     if let Some(previous) = previous {
+        shift += runs[run_of(previous)].inset[1];
         shift += spacing(previous);
     }
     layout.width += shift;
@@ -809,6 +851,36 @@ mod tests {
     }
 
     #[test]
+    fn objects_break_on_both_sides_and_nowrap_runs_hold_together() {
+        let breaks = |text: &str, nowrap: &[std::ops::Range<usize>]| -> Vec<usize> {
+            let mut shaped = layout(text);
+            for glyph in shaped.runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+                glyph.index = text
+                    .char_indices()
+                    .nth(glyph.position.x.0 as usize / 10)
+                    .map_or(text.len(), |(byte, _)| byte);
+            }
+            shaped.runs[0].glyphs.truncate(text.chars().count());
+            shaped
+                .compute_wrap_boundaries(
+                    text,
+                    px(0.),
+                    None,
+                    px(0.),
+                    TextWrap::Wrap,
+                    WordBreak::Normal,
+                    nowrap,
+                )
+                .iter()
+                .map(|boundary| boundary.glyph_ix)
+                .collect()
+        };
+        assert_eq!(breaks("ab\u{fffc}cd", &[]), [2, 3]);
+        assert_eq!(breaks("ab cd ef", &[]), [3, 6]);
+        assert_eq!(breaks("ab cd ef", &[0..5]), [6]);
+    }
+
+    #[test]
     fn hyphens_break_after_inside_words() {
         let text = "ab-cd x-12 -ef";
         let boundaries = layout(text).compute_wrap_boundaries(
@@ -818,6 +890,7 @@ mod tests {
             px(0.),
             TextWrap::Wrap,
             WordBreak::Normal,
+            &[],
         );
         let found: Vec<_> = boundaries
             .iter()
@@ -843,6 +916,7 @@ mod tests {
                 px(0.),
                 wrap,
                 WordBreak::Normal,
+                &[],
             );
             let found: Vec<_> = boundaries
                 .iter()

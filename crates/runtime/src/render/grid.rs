@@ -599,14 +599,43 @@ pub(crate) fn intrinsic(
                 .and_then(|v| super::element::dimension(v, node.tag == "canvas"))
                 .unwrap_or(default[axis])
         });
+        // WARNING: like browsers, an svg with a set height and auto width takes its width from the viewBox ratio.
+        let ratio = (node.tag == "svg" && !node.attrs.contains_key("width"))
+            .then(|| node.attrs.get("viewBox"))
+            .flatten()
+            .and_then(|view| {
+                let mut parts = view
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|part| !part.is_empty())
+                    .filter_map(|part| part.parse::<f32>().ok())
+                    .skip(2);
+                Some(parts.next()? / parts.next().filter(|height| *height > 0.)?)
+            });
+        let width = match (ratio, vertical[0]) {
+            (Some(ratio), Some(height)) => height * ratio,
+            _ => width,
+        };
         content = [width, width, height];
     } else if super::element::text_field(node) {
         // A percentage width is `auto` for the max-content size, like in Chrome.
         let [width, height] = super::element::field_size(
-            doc, id, style, units, text, measured.pixel_ratio, true, available,
+            doc,
+            id,
+            style,
+            units,
+            text,
+            measured.pixel_ratio,
+            true,
+            available,
         );
         content = [width, width, height];
     } else if let Some(inline) = style::inline_text(doc, styles, id) {
+        // An atomic box takes its own content width in the line.
+        let mut runs = inline.runs.to_vec();
+        for atom in &inline.atoms {
+            let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
+            runs[atom.run].inset[1] = renderer::px(max);
+        }
         let wrap = !style
             .get(Prop::WHITE_SPACE)
             .is_some_and(|space| matches!(space, "pre" | "nowrap"));
@@ -619,7 +648,7 @@ pub(crate) fn intrinsic(
             .shape_text(
                 inline.text.to_string().into(),
                 renderer::px(units.font.em),
-                &inline.runs,
+                &runs,
                 available.filter(|_| wrap).map(renderer::px),
                 style
                     .get(Prop::WEBKIT_LINE_CLAMP)
@@ -629,6 +658,16 @@ pub(crate) fn intrinsic(
                 word_break,
             )
             .unwrap_or_default();
+        // Where an inline box's padding starts a word, it is part of the word.
+        let mut opening = Vec::new();
+        let mut at = 0;
+        for run in &*runs {
+            if run.inset[0] > renderer::px(0.) {
+                opening.push((at, f32::from(run.inset[0])));
+            }
+            at += run.len;
+        }
+        let mut line_start = 0;
         for line in &lines {
             let layout = &line.unwrapped_layout;
             let width = f32::from(layout.width);
@@ -645,7 +684,10 @@ pub(crate) fn intrinsic(
                 if !character.is_whitespace() {
                     let x = f32::from(glyph.position.x);
                     if anywhere || previous.is_whitespace() || character > '\u{2e7f}' {
-                        start = x;
+                        start = x - opening
+                            .iter()
+                            .find(|(at, _)| *at == line_start + glyph.index)
+                            .map_or(0., |(_, inset)| *inset);
                     }
                     let end = glyphs
                         .peek()
@@ -654,6 +696,7 @@ pub(crate) fn intrinsic(
                 }
                 previous = character;
             }
+            line_start += line.text.len() + 1;
         }
         if !wrap {
             content[0] = content[1];

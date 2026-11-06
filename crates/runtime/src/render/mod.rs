@@ -120,9 +120,9 @@ fn clipboard(text: Option<String>) -> Option<String> {
     match text {
         Some(text) => {
             cx.write_to_clipboard(text);
-            None
+            Some(String::new())
         }
-        None => cx.read_from_clipboard(),
+        None => Some(cx.read_from_clipboard().unwrap_or_default()),
     }
 }
 
@@ -351,6 +351,7 @@ impl PageView {
             let state = host.dom.entry(self.id).or_default();
             state.text_system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
+            state.window = window.window_state();
             state.sync_scroll();
             state.bounds.touch();
         }
@@ -411,6 +412,20 @@ impl PageView {
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if !phase.capture() {
                     return;
+                }
+                if let (renderer::ScrollPhase::Began | renderer::ScrollPhase::Ended, Ok(host)) =
+                    (event.phase, view.host.try_borrow())
+                    && let Some(link) = &host.link
+                {
+                    let kind = if event.phase == renderer::ScrollPhase::Began {
+                        "gestureScrollBegin"
+                    } else {
+                        "gestureScrollEnd"
+                    };
+                    link.event(
+                        format!("__appsEvent('input-event',{},{{type:'{kind}'}})", view.id),
+                        "apps:input",
+                    );
                 }
                 // WARNING: like browsers, listeners run before the frame that shows the new offset, so what they
                 // place by the scroll position never lags it, also on the first event after an idle frame.
@@ -811,7 +826,10 @@ impl PageView {
         // A transparent window keeps its own, or the page could never become see-through again.
         #[cfg(target_os = "macos")]
         if background.1 == 255
-            && state.backgrounds.get(&self.id).is_none_or(|color| color.1 != 0)
+            && state
+                .backgrounds
+                .get(&self.id)
+                .is_none_or(|color| color.1 != 0)
             && self.canvas.replace(background) != background
         {
             window.change_window(renderer::WindowChange::Background(renderer::rgba(
@@ -975,7 +993,27 @@ impl PageView {
                                 style.get(Prop::POSITION),
                                 Some("absolute" | "fixed" | "sticky")
                             )
-                            || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid"));
+                            || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid"))
+                            // The text around an atomic inline box reserves its size.
+                            || style
+                                .get(Prop::DISPLAY)
+                                .is_some_and(|value| value.starts_with("inline-"))
+                            || matches!(
+                                node.tag.as_str(),
+                                "img"
+                                    | "canvas"
+                                    | "video"
+                                    | "audio"
+                                    | "iframe"
+                                    | "object"
+                                    | "embed"
+                                    | "input"
+                                    | "button"
+                                    | "select"
+                                    | "textarea"
+                                    | "progress"
+                                    | "meter"
+                            );
                         (
                             flags,
                             u16::from(volatile) * cull::VOLATILE
@@ -987,8 +1025,10 @@ impl PageView {
                 };
                 // WARNING: boxes out of the flow don't move this box, but it links them, so they renew its revision
                 // and not its geometry. A kept box would hide them.
-                let (mut list, mut kids) =
-                    (rustc_hash::FxHasher::default(), rustc_hash::FxHasher::default());
+                let (mut list, mut kids) = (
+                    rustc_hash::FxHasher::default(),
+                    rustc_hash::FxHasher::default(),
+                );
                 let (mut out, mut moved, mut below) = (0u64, 0u64, 0u16);
                 for &child in &node.children {
                     let child_info = &info[child];
@@ -1002,8 +1042,10 @@ impl PageView {
                         moved = moved.max(child_info.revision);
                     }
                 }
-                let (list, kids) =
-                    (std::hash::Hasher::finish(&list), std::hash::Hasher::finish(&kids));
+                let (list, kids) = (
+                    std::hash::Hasher::finish(&list),
+                    std::hash::Hasher::finish(&kids),
+                );
                 let mut relisted = false;
                 if own || old.is_some_and(|old| old.out != out || old.kids != kids) {
                     relisted = old.is_none_or(|old| old.list != list);
@@ -1372,8 +1414,12 @@ impl PageView {
                     if visible.get(id) != Some(&true) {
                         continue;
                     }
-                    let own = element::own_inputs(&doc, &styles, dom, &ids, id)
-                        ^ (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    // WARNING: ancestors XOR these, so each must mix its id. With a plain XOR, an even number of equal
+                    // grids that change the same way cancel out and their ancestors stay kept.
+                    let own = (element::own_inputs(&doc, &styles, dom, &ids, id)
+                        ^ (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                    .wrapping_mul(0xff51_afd7_ed55_8ccd)
+                    .rotate_left(31);
                     let mut node = Some(id);
                     while let Some(at) = node {
                         *inputs.entry(at).or_default() ^= own;
@@ -1993,12 +2039,14 @@ fn retire(
     });
     dom.masks.retain(|id, (_, image)| {
         visible.get(*id) == Some(&true) || {
-            release(image.clone());
+            if let Some(image) = image {
+                release(image.clone());
+            }
             false
         }
     });
     for (id, canvas) in &dom.canvases {
-        if visible.get(*id) != Some(&true) {
+        if canvas.present && visible.get(*id) != Some(&true) {
             release(canvas.image.clone());
         }
     }

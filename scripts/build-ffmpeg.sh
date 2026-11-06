@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds the FFmpeg shared libraries for the video and audio features into target/ffmpeg/<system>-<arch>.
-# WARNING: FFmpeg is LGPL only while GPL and nonfree parts stay off. Apps load these libraries
-# dynamically and ship FFmpeg.LICENSE next to them, so users can replace them.
+# Builds FFmpeg as one shared library for the video and audio features into target/ffmpeg/<system>-<arch>.
+# WARNING: FFmpeg is LGPL only while GPL and nonfree parts stay off. Apps load this library
+# dynamically and ship FFmpeg.LICENSE next to it, so users can replace it.
 set -euo pipefail
 
 version=9.0.2
@@ -42,8 +42,9 @@ fi
 
 options=(
   --prefix=/
-  --enable-shared
-  --disable-static
+  --enable-static
+  --disable-shared
+  --enable-small
   --disable-programs
   --disable-doc
   --disable-debug
@@ -61,15 +62,18 @@ options=(
 case "$system" in
   macos)
     options+=(
-      --install-name-dir=@rpath
-      --extra-cflags=-mmacosx-version-min=13.0
+      "--extra-cflags=-mmacosx-version-min=13.0 -fno-unwind-tables -fno-asynchronous-unwind-tables"
       --extra-ldflags=-mmacosx-version-min=13.0
+      --enable-lto
       --enable-videotoolbox
       --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,vp9_videotoolbox,av1_videotoolbox
     )
     ;;
   windows)
     options+=(--enable-d3d11va --enable-hwaccel=h264_d3d11va2,hevc_d3d11va2,vp9_d3d11va2,av1_d3d11va2)
+    ;;
+  linux)
+    options+=("--extra-cflags=-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables")
     ;;
 esac
 if [[ $arch == x86_64 ]] && ! command -v nasm >/dev/null; then
@@ -85,16 +89,46 @@ if ! grep -q '^License: LGPL version 2.1 or later' "$build/configure.log"; then
   exit 1
 fi
 make -C "$build" -j"$jobs"
-# WARNING: the prefix is /, so the libraries do not carry a build path.
-make -C "$build" install DESTDIR="$build/install"
+# WARNING: the prefix is /, so the library does not carry a build path. Only the headers install: the
+# static libraries stay in the build folder, so nothing can link FFmpeg statically.
+make -C "$build" install-headers DESTDIR="$build/install"
 rm -rf "$build/install/share" "$build/install/lib/pkgconfig"
+
+# The library exports only what the media library calls, so the linker drops the rest of FFmpeg.
+lib=$build/install/lib
+mkdir -p "$lib"
+config=$build/ffbuild/config.mak
+cc=$(sed -n 's/^CC=//p' "$config")
+"$cc" -c "$root/crates/media/native/ffmpeg.c" -I"$build/install/include" -o "$build/ffmpeg.o"
+symbols=($(nm -u "$build/ffmpeg.o" | awk '{print $NF}' | grep -E '^_?(av|sws|swr)'))
+case "$system" in
+  macos)
+    printf '%s\n' "${symbols[@]}" > "$build/exports"
+    link=(-dynamiclib -install_name @loader_path/libffmpeg.dylib -Wl,-dead_strip,-dead_strip_dylibs,-x
+      -Wl,-exported_symbols_list,"$build/exports" -o "$lib/libffmpeg.dylib")
+    ;;
+  windows)
+    { printf 'EXPORTS\n'; printf '%s\n' "${symbols[@]}"; } > "$build/exports.def"
+    link=("$build/exports.def" -shared -static-libgcc -s -Wl,--out-implib,"$lib/ffmpeg.lib" -o "$lib/ffmpeg.dll")
+    ;;
+  linux)
+    { printf '{ global:\n'; printf '%s;\n' "${symbols[@]}"; printf 'local: *; };\n'; } > "$build/exports"
+    link=(-shared -s -Wl,-soname,libffmpeg.so -Wl,-Bsymbolic -Wl,--gc-sections
+      -Wl,--version-script="$build/exports" -o "$lib/libffmpeg.so")
+    ;;
+esac
+"$cc" $(sed -n 's/^LDFLAGS=//p' "$config") "${link[@]}" "${symbols[@]/#/-Wl,-u,}" \
+  "$build/libavformat/libavformat.a" "$build/libavcodec/libavcodec.a" "$build/libswscale/libswscale.a" \
+  "$build/libswresample/libswresample.a" "$build/libavutil/libavutil.a" \
+  $(sed -n 's/^EXTRALIBS[^=]*=//p' "$config")
 
 {
   printf 'FFmpeg %s from https://ffmpeg.org/releases/ffmpeg-%s.tar.xz\n' "$version" "$version"
   printf 'is licensed under the GNU Lesser General Public License version 2.1 or later.\n'
   printf 'It was built unmodified by scripts/build-ffmpeg.sh with:\n\n  configure %s\n\n' "${options[*]}"
-  printf 'The app loads the FFmpeg shared libraries next to this file. You may replace them\n'
-  printf 'with your own build of the same FFmpeg version.\n\n'
+  printf 'Its static libraries were linked into one shared library that exports:\n\n  %s\n\n' "${symbols[*]}"
+  printf 'The app loads that library next to this file. You may replace it with your own\n'
+  printf 'build of the same FFmpeg version that exports the same functions.\n\n'
   cat "$source_dir/COPYING.LGPLv2.1"
 } > "$build/install/FFmpeg.LICENSE"
 

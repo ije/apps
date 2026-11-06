@@ -36,15 +36,15 @@ use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSDragOperation, NSScreen,
     NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsPlacement,
-    NSViewLayerContentsRedrawPolicy, NSWindow,
-    NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowSharingType, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowSharingType, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
+use objc2_core_foundation::CGSize;
 use objc2_foundation::{
     NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
     NSSize, NSString, NSUInteger,
 };
-use objc2_core_foundation::CGSize;
 use objc2_quartz_core::CAMetalLayer;
 use raw_window_handle as rwh;
 use std::{
@@ -371,10 +371,13 @@ extern "C" fn tick(context: *mut c_void) {
         Arc::from_raw(context as *const Tick)
     };
     if !tick.pending.swap(true, Ordering::AcqRel) {
-        post(tick.callbacks.thread, Box::new(move || {
-            tick.pending.store(false, Ordering::Release);
-            step(tick.callbacks);
-        }));
+        post(
+            tick.callbacks.thread,
+            Box::new(move || {
+                tick.pending.store(false, Ordering::Release);
+                step(tick.callbacks);
+            }),
+        );
     }
 }
 
@@ -487,6 +490,12 @@ impl State {
                 .map_or_else(Default::default, |screen| screen.visibleFrame());
             frame.size.width == visible.size.width && frame.size.height == visible.size.height
         };
+        // WARNING: a window outside all displays has no screen.
+        let screen = window.screen().or_else(|| {
+            NSScreen::screens(MainThreadMarker::new().unwrap())
+                .iter()
+                .next()
+        });
         WindowState {
             frame: flip(frame),
             content: flip(window.contentRectForFrameRect(frame)),
@@ -495,6 +504,12 @@ impl State {
             fullscreen,
             visible: window.isVisible(),
             resizing: window.inLiveResize(),
+            display: screen
+                .as_ref()
+                .map_or_else(Default::default, |screen| flip(screen.frame())),
+            work_area: screen
+                .as_ref()
+                .map_or_else(Default::default, |screen| flip(screen.visibleFrame())),
         }
     }
 
@@ -743,8 +758,7 @@ fn open_native(
         let () = msg_send![native_window, setMovable: Bool::new(options.movable)];
         if options.titlebar_hidden || options.frameless {
             let () = msg_send![native_window, setTitlebarAppearsTransparent: Bool::YES];
-            let () =
-                msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
+            let () = msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
         }
         let () = msg_send![native_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
         // Views become layer backed on their own after joining a window, which breaks the
@@ -762,8 +776,7 @@ fn open_native(
         let () = msg_send![native_window, setAcceptsMouseMovedEvents: Bool::NO];
         add_mouse_tracking_area(&*native_view.cast::<NSView>());
         if options.show {
-            let () =
-                msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
+            let () = msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
         }
         // The origin from `initWithContentRect` can be off when the key screen is not the primary one.
         let () = msg_send![native_window, setFrameTopLeftPoint: rect.origin];
@@ -998,6 +1011,18 @@ impl WindowControl {
 
     pub fn set_button_visibility(&self, visible: bool) {
         self.later(move |_, state| set_button_visibility(state, visible));
+    }
+
+    pub fn set_button_position(&self, position: Option<Point<Pixels>>) {
+        self.later(move |_, state| {
+            let mut state = state.borrow_mut();
+            state.traffic_light_position = position;
+            if position.is_some() {
+                state.move_traffic_light();
+            } else {
+                state.restore_traffic_light();
+            }
+        });
     }
 
     pub fn state(&self) -> Option<WindowState> {
@@ -1238,7 +1263,10 @@ impl WindowControl {
 
     pub fn start_window_move(&self) {
         self.later(|window, state| {
-            let Some(event) = state.try_borrow().ok().and_then(|state| state.last_press.clone())
+            let Some(event) = state
+                .try_borrow()
+                .ok()
+                .and_then(|state| state.last_press.clone())
             else {
                 return;
             };

@@ -72,8 +72,10 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
     ensure!(package.is_object(), "Expected an object in package.json");
+    // WARNING: like electron-builder, `executableName` wins, because npm names like `@scope/app` can't name a file.
     let name = package
-        .get("name")
+        .get("executableName")
+        .or_else(|| package.get("name"))
         .map(|value| value.as_str().context("package.json name must be a string"))
         .transpose()?
         .unwrap_or("App");
@@ -151,12 +153,13 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
 }
 
 /// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
-pub const FEATURES: [(&str, bool); 5] = [
+pub const FEATURES: [(&str, bool); 6] = [
     ("webgpu", false),
     ("video", false),
     ("audio", false),
     ("jsExecute", false),
     ("httpImport", false),
+    ("localNetwork", false),
 ];
 
 /// The bit of `feature` in a set returned by `disabled_features`.
@@ -670,17 +673,18 @@ mod tests {
     #[test]
     fn package_features_enable_and_disable_in_order() {
         for (features, disabled) in [
-            (None, 31),
-            (Some(json!([])), 31),
-            (Some(json!(["webgpu"])), 30),
+            (None, 63),
+            (Some(json!([])), 63),
+            (Some(json!(["webgpu"])), 62),
             (Some(json!(["*"])), 0),
-            (Some(json!(["-*"])), 31),
+            (Some(json!(["-*"])), 63),
             (Some(json!(["*", "-webgpu"])), 1),
-            (Some(json!(["-*", "webgpu"])), 30),
-            (Some(json!(["webgpu", "-webgpu"])), 31),
-            (Some(json!(["video", "audio"])), 25),
+            (Some(json!(["-*", "webgpu"])), 62),
+            (Some(json!(["webgpu", "-webgpu"])), 63),
+            (Some(json!(["video", "audio"])), 57),
             (Some(json!(["*", "-audio"])), 4),
-            (Some(json!(["jsExecute", "httpImport"])), 7),
+            (Some(json!(["jsExecute", "httpImport"])), 39),
+            (Some(json!(["localNetwork"])), 31),
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(

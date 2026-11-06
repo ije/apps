@@ -154,6 +154,9 @@ pub struct WindowState {
     /// Shown. A minimized window is not.
     pub visible: bool,
     pub resizing: bool,
+    /// The display the window is on, and the part of it that windows can use.
+    pub display: Bounds<Pixels>,
+    pub work_area: Bounds<Pixels>,
 }
 
 /// What any thread can ask of a native window, without the thread that draws it.
@@ -182,6 +185,9 @@ impl WindowControl {
     }
     pub fn set_button_visibility(&self, visible: bool) {
         self.run(move |window| window.set_button_visibility(visible));
+    }
+    pub fn set_button_position(&self, position: Option<Point<Pixels>>) {
+        self.run(move |window| window.set_button_position(position));
     }
     pub fn minimize(&self) {
         self.run(|window| window.minimize());
@@ -576,6 +582,7 @@ pub struct Window {
     pub(crate) removed: bool,
     cursor: Option<CursorStyle>,
     drawn_at: std::time::Instant,
+    frames_drawn: u64,
     /// The transforms the compositor plays for promoted layers: key, start, step and transforms,
     /// so hit testing follows them.
     tracks: Vec<(u64, std::time::Instant, f32, Vec<[f32; 16]>)>,
@@ -620,6 +627,7 @@ impl Window {
             next_states: FxHashMap::default(),
             next_frame_callbacks: Vec::new(),
             drawn_at: std::time::Instant::now(),
+            frames_drawn: 0,
             tracks: Vec::new(),
             rails: ([0.; 2], std::time::Instant::now()),
             scroll_chain: None,
@@ -847,6 +855,11 @@ impl Window {
         self.platform.request_frame();
     }
 
+    /// How many frames this window has drawn.
+    pub fn frames_drawn(&self) -> u64 {
+        self.frames_drawn
+    }
+
     pub fn request_animation_frame(&mut self) {
         self.on_next_frame(|window, _| window.refresh());
     }
@@ -962,6 +975,7 @@ impl Window {
         self.platform.demote();
         self.tracks.clear();
         self.drawn_at = std::time::Instant::now();
+        self.frames_drawn += 1;
         loop {
             self.dirty = false;
             self.drawing = true;
@@ -977,7 +991,9 @@ impl Window {
             }
             if let Some(mut view) = self.view.take() {
                 let mut tree = self.tree.take().unwrap_or_default();
-                let root = self.build(&mut tree, cx, |tree, window, cx| view.render(tree, window, cx));
+                let root = self.build(&mut tree, cx, |tree, window, cx| {
+                    view.render(tree, window, cx)
+                });
                 self.view = Some(view);
                 if let Some(root) = root {
                     tree.layout(root, self.viewport_size, self);
@@ -1007,7 +1023,8 @@ impl Window {
         self.scene.finish();
         let captures = mem::take(&mut self.captures);
         #[cfg(target_os = "macos")]
-        self.platform.set_drawable_size(self.native.0, self.native.1);
+        self.platform
+            .set_drawable_size(self.native.0, self.native.1);
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
         self.text_system.finish_frame();
         self.platform.atlas().finish_frame();
@@ -1807,9 +1824,10 @@ impl Window {
         let scale = self.scale_factor;
         let origin = origin.scale(scale);
         let variants = SUBPIXEL_VARIANTS_X as f32;
+        // WARNING: like Skia, halves round up, so a baseline at y.5 draws on the same row as in Chromium.
         let quantized = point(
-            round_half_toward_zero(origin.x.0 * variants) / variants,
-            round_half_toward_zero(origin.y.0),
+            (origin.x.0 * variants + 0.5).floor() / variants,
+            (origin.y.0 + 0.5).floor(),
         );
         let subpixel_variant = point((quantized.x.fract() * variants) as u8, 0);
         let params = RenderGlyphParams {

@@ -3,6 +3,7 @@ pub(crate) mod ffi;
 mod fs;
 pub(crate) mod napi;
 pub(crate) mod pty;
+pub mod script;
 pub(crate) mod sqlite;
 pub(crate) mod system;
 

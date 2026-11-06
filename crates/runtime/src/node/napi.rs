@@ -108,6 +108,10 @@ pub(crate) struct State {
     pending: Cell<Ptr>,
     error: Cell<ErrorInfo>,
     modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
+    ready: std::sync::Arc<std::sync::Mutex<Vec<Ready>>>,
+    active: Cell<usize>,
+    threadsafe: Cell<usize>,
+    threadsafe_live: RefCell<HashSet<usize>>,
 }
 thread_local! { static FUNCTIONS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
 thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
@@ -194,6 +198,10 @@ impl State {
                 code: 0,
             }),
             modules: RefCell::default(),
+            ready: Default::default(),
+            active: Cell::new(0),
+            threadsafe: Cell::new(0),
+            threadsafe_live: RefCell::default(),
         });
         CONTEXTS.with(|contexts| {
             contexts
@@ -620,12 +628,15 @@ impl State {
         .into();
         #[cfg(not(unix))]
         let library = unsafe { Library::new(&path)? };
-        let register = unsafe {
-            *library
+        // WARNING: older addons register from a static constructor, which ran when the library opened.
+        let register = match unsafe {
+            library
                 .get::<unsafe extern "C" fn(*const State, Ptr) -> Ptr>(b"napi_register_module_v1\0")
-                .context(
-                    "Addon must use Node-API (napi_register_module_v1); V8 addons are unsupported",
-                )?
+        } {
+            Ok(register) => *register,
+            Err(_) => LEGACY_MODULE.take().context(
+                "Addon must use Node-API (napi_register_module_v1); V8 addons are unsupported",
+            )?,
         };
         if let Ok(version) = unsafe {
             library.get::<unsafe extern "C" fn() -> i32>(b"node_api_module_get_api_version_v1\0")
@@ -2134,6 +2145,381 @@ pub(crate) unsafe extern "C" fn load(
             }
             env.undefined()
         }
+    }
+}
+
+// Node-API calls that addon threads make, so these take no environment and skip the thread check.
+macro_rules! raw_api {
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn $name($($arg: $ty),*) -> i32 $body
+    };
+}
+
+api!(napi_adjust_external_memory(env, change: i64, result: *mut i64) {
+    let _ = env;
+    if !result.is_null() {
+        *result = change.max(0);
+    }
+    Ok(())
+});
+api!(napi_coerce_to_bool(env, value: Ptr, result: *mut Ptr) {
+    env.value(result, env.boolean((env.api.to_boolean)(env.ctx, value)))
+});
+api!(napi_get_value_bigint_words(
+    env,
+    value: Ptr,
+    sign: *mut i32,
+    count: *mut usize,
+    words: *mut u64,
+) {
+    check(!count.is_null(), 1)?;
+    check(env.kind(value)? == 9, 17)?;
+    let text = env.api.text(env.ctx, env.js("bigint_words", &[value])?);
+    let mut parts = text.split(',');
+    let negative = parts.next() == Some("1");
+    let list: Vec<u64> = parts.filter_map(|word| word.parse().ok()).collect();
+    if !sign.is_null() {
+        *sign = i32::from(negative);
+    }
+    if !words.is_null() {
+        for (index, word) in list.iter().take(*count).enumerate() {
+            *words.add(index) = *word;
+        }
+        *count = list.len().min(*count);
+    } else {
+        *count = list.len();
+    }
+    Ok(())
+});
+api!(napi_type_tag_object(env, object: Ptr, tag: *const [u64; 2]) {
+    check(!tag.is_null(), 1)?;
+    env.object(object)?;
+    let existing = env.js("type_tag", &[object])?;
+    check((env.api.value_type)(env.ctx, existing) == 0, 1)?;
+    env.js("type_tag", &[object, env.text(&format!("{:?}", *tag))])?;
+    Ok(())
+});
+api!(napi_check_object_type_tag(env, object: Ptr, tag: *const [u64; 2], result: *mut bool) {
+    check(!tag.is_null() && !result.is_null(), 1)?;
+    env.object(object)?;
+    let existing = env.js("type_tag", &[object])?;
+    *result = (env.api.value_type)(env.ctx, existing) != 0
+        && env.api.text(env.ctx, existing) == format!("{:?}", *tag);
+    Ok(())
+});
+api!(napi_fatal_exception(env, error: Ptr) {
+    env.js("report", &[error])?;
+    Ok(())
+});
+raw_api!(napi_fatal_error(
+    location: *const c_char,
+    location_length: usize,
+    message: *const c_char,
+    message_length: usize,
+) {
+    let text = |pointer: *const c_char, length: usize| unsafe {
+        if pointer.is_null() {
+            String::new()
+        } else if length == usize::MAX {
+            CStr::from_ptr(pointer).to_string_lossy().into_owned()
+        } else {
+            String::from_utf8_lossy(std::slice::from_raw_parts(pointer.cast(), length)).into_owned()
+        }
+    };
+    eprintln!(
+        "FATAL ERROR: {} {}",
+        text(location, location_length),
+        text(message, message_length)
+    );
+    std::process::abort()
+});
+
+#[repr(C)]
+struct LegacyModule {
+    version: i32,
+    flags: u32,
+    filename: *const c_char,
+    register: Option<unsafe extern "C" fn(*const State, Ptr) -> Ptr>,
+}
+thread_local! { static LEGACY_MODULE: Cell<Option<unsafe extern "C" fn(*const State, Ptr) -> Ptr>> = const { Cell::new(None) }; }
+raw_api!(napi_module_register(module: *const LegacyModule) {
+    if !module.is_null() {
+        LEGACY_MODULE.set(unsafe { (*module).register });
+    }
+    0
+});
+
+type AsyncExecute = unsafe extern "C" fn(*const State, Ptr);
+type AsyncComplete = unsafe extern "C" fn(*const State, i32, Ptr);
+type CallJs = unsafe extern "C" fn(*const State, Ptr, Ptr, Ptr);
+
+struct AsyncWork {
+    execute: AsyncExecute,
+    complete: Option<AsyncComplete>,
+    data: Ptr,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+api!(napi_create_async_work(
+    env,
+    _resource: Ptr,
+    _name: Ptr,
+    execute: Option<AsyncExecute>,
+    complete: Option<AsyncComplete>,
+    data: Ptr,
+    result: *mut Ptr,
+) {
+    let _ = env;
+    check(!result.is_null(), 1)?;
+    *result = Box::into_raw(Box::new(AsyncWork {
+        execute: execute.ok_or(1)?,
+        complete,
+        data,
+        cancelled: Default::default(),
+    }))
+    .cast();
+    Ok(())
+});
+api!(napi_delete_async_work(env, work: Ptr) {
+    let _ = env;
+    check(!work.is_null(), 1)?;
+    drop(Box::from_raw(work.cast::<AsyncWork>()));
+    Ok(())
+});
+api!(napi_queue_async_work(env, work: Ptr) {
+    check(!work.is_null(), 1)?;
+    let item = &*work.cast::<AsyncWork>();
+    env.active.set(env.active.get() + 1);
+    let (execute, data, cancelled) = (item.execute, item.data as usize, item.cancelled.clone());
+    let (ready, wake, raw, work) = (env.ready.clone(), crate::host::Waker::current(), std::ptr::from_ref(env) as usize, work as usize);
+    std::thread::Builder::new()
+        .name("apps-napi".into())
+        .spawn(move || {
+            let stopped = cancelled.load(std::sync::atomic::Ordering::Acquire);
+            if !stopped {
+                // WARNING: `execute` runs off the JS thread and may not call JavaScript, as Node-API documents.
+                unsafe { execute(raw as *const State, data as Ptr) };
+            }
+            ready.lock().unwrap().push(Ready::Work(work, if stopped { 11 } else { 0 }));
+            wake.wake();
+        })
+        .map_err(|_| 9)?;
+    Ok(())
+});
+api!(napi_cancel_async_work(env, work: Ptr) {
+    let _ = env;
+    check(!work.is_null(), 1)?;
+    (*work.cast::<AsyncWork>()).cancelled.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+});
+
+struct Threadsafe {
+    env: usize,
+    function: usize,
+    call: Option<CallJs>,
+    context: usize,
+    finalize: Option<Finalize>,
+    finalize_data: usize,
+    queue: std::sync::Mutex<std::collections::VecDeque<usize>>,
+    threads: std::sync::atomic::AtomicUsize,
+    closing: std::sync::atomic::AtomicBool,
+    referenced: std::sync::atomic::AtomicBool,
+    ready: std::sync::Arc<std::sync::Mutex<Vec<Ready>>>,
+    wake: crate::host::Waker,
+}
+pub(crate) enum Ready {
+    Work(usize, i32),
+    Threadsafe(usize),
+}
+api!(napi_create_threadsafe_function(
+    env,
+    function: Ptr,
+    _resource: Ptr,
+    _name: Ptr,
+    _max_queue: usize,
+    threads: usize,
+    finalize_data: Ptr,
+    finalize: Option<Finalize>,
+    context: Ptr,
+    call: Option<CallJs>,
+    result: *mut Ptr,
+) {
+    check(!result.is_null() && threads > 0, 1)?;
+    check(!function.is_null() || call.is_some(), 1)?;
+    if !function.is_null() {
+        (env.api.protect)(env.ctx, function);
+    }
+    env.threadsafe.set(env.threadsafe.get() + 1);
+    *result = Box::into_raw(Box::new(Threadsafe {
+        env: std::ptr::from_ref(env) as usize,
+        function: function as usize,
+        call,
+        context: context as usize,
+        finalize,
+        finalize_data: finalize_data as usize,
+        queue: Default::default(),
+        threads: threads.into(),
+        closing: false.into(),
+        referenced: true.into(),
+        ready: env.ready.clone(),
+        wake: crate::host::Waker::current(),
+    }))
+    .cast();
+    env.threadsafe_live.borrow_mut().insert(*result as usize);
+    Ok(())
+});
+raw_api!(napi_get_threadsafe_function_context(function: *const Threadsafe, result: *mut Ptr) {
+    if function.is_null() || result.is_null() {
+        return 1;
+    }
+    unsafe { *result = (*function).context as Ptr };
+    0
+});
+raw_api!(napi_call_threadsafe_function(function: *const Threadsafe, data: Ptr, _mode: i32) {
+    if function.is_null() {
+        return 1;
+    }
+    let function = unsafe { &*function };
+    if function.closing.load(std::sync::atomic::Ordering::Acquire) {
+        return 16;
+    }
+    function.queue.lock().unwrap().push_back(data as usize);
+    function.ready.lock().unwrap().push(Ready::Threadsafe(std::ptr::from_ref(function) as usize));
+    function.wake.wake();
+    0
+});
+raw_api!(napi_acquire_threadsafe_function(function: *const Threadsafe) {
+    if function.is_null() {
+        return 1;
+    }
+    let function = unsafe { &*function };
+    if function.closing.load(std::sync::atomic::Ordering::Acquire) {
+        return 16;
+    }
+    function.threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    0
+});
+raw_api!(napi_release_threadsafe_function(function: *const Threadsafe, mode: i32) {
+    if function.is_null() {
+        return 1;
+    }
+    let function = unsafe { &*function };
+    let left = function.threads.fetch_sub(1, std::sync::atomic::Ordering::AcqRel).saturating_sub(1);
+    if mode == 1 {
+        function.closing.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if left == 0 || mode == 1 {
+        function.ready.lock().unwrap().push(Ready::Threadsafe(std::ptr::from_ref(function) as usize));
+        function.wake.wake();
+    }
+    0
+});
+api!(napi_unref_threadsafe_function(env, function: Ptr) {
+    check(!function.is_null(), 1)?;
+    if (*function.cast::<Threadsafe>()).referenced.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        env.threadsafe.set(env.threadsafe.get().saturating_sub(1));
+    }
+    Ok(())
+});
+api!(napi_ref_threadsafe_function(env, function: Ptr) {
+    check(!function.is_null(), 1)?;
+    if !(*function.cast::<Threadsafe>()).referenced.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        env.threadsafe.set(env.threadsafe.get() + 1);
+    }
+    Ok(())
+});
+
+impl State {
+    /// Finishes async work and threadsafe calls of this thread's addons, on the event loop.
+    pub(crate) fn drain(self: &Rc<Self>) {
+        for environment in self.environments.borrow().clone() {
+            environment.drain();
+        }
+        let items = std::mem::take(&mut *self.ready.lock().unwrap());
+        for item in items {
+            let depth = self.scopes.borrow().len();
+            self.scopes.borrow_mut().push(Box::new(Scope {
+                kept: HashSet::new(),
+                values: Vec::new(),
+                escaped: false,
+                escapable: false,
+            }));
+            match item {
+                Ready::Work(work, status) => {
+                    self.active.set(self.active.get().saturating_sub(1));
+                    let (complete, data) = unsafe {
+                        let work = &*(work as *const AsyncWork);
+                        (work.complete, work.data)
+                    };
+                    if let Some(complete) = complete {
+                        unsafe { complete(Rc::as_ptr(self), status, data) };
+                    }
+                }
+                Ready::Threadsafe(pointer) => self.run_threadsafe(pointer),
+            }
+            let exception = self.take_exception();
+            if !exception.is_null() {
+                let _ = self.js("report", &[exception]);
+            }
+            while self.scopes.borrow().len() > depth {
+                self.pop();
+            }
+        }
+    }
+
+    fn run_threadsafe(self: &Rc<Self>, pointer: usize) {
+        use std::sync::atomic::Ordering;
+        // WARNING: one function can have several entries here, so a later one may name a function that already ended.
+        if !self.threadsafe_live.borrow().contains(&pointer) {
+            return;
+        }
+        let function = unsafe { &*(pointer as *const Threadsafe) };
+        loop {
+            let Some(data) = function.queue.lock().unwrap().pop_front() else {
+                break;
+            };
+            let env = function.env as *const State;
+            let target = function.function as Ptr;
+            unsafe {
+                match function.call {
+                    Some(call) => call(env, target, function.context as Ptr, data as Ptr),
+                    None => {
+                        let _ = self.js("call", &[target, self.undefined()]);
+                    }
+                }
+            }
+        }
+        if function.threads.load(Ordering::Acquire) == 0 || function.closing.load(Ordering::Acquire)
+        {
+            self.threadsafe_live.borrow_mut().remove(&pointer);
+            if function.referenced.load(Ordering::Acquire) {
+                self.threadsafe.set(self.threadsafe.get().saturating_sub(1));
+            }
+            if let Some(finalize) = function.finalize {
+                unsafe {
+                    finalize(
+                        function.env as *const State,
+                        function.finalize_data as Ptr,
+                        function.context as Ptr,
+                    )
+                };
+            }
+            if function.function != 0 {
+                unsafe { (self.api.unprotect)(self.ctx, function.function as Ptr) };
+            }
+            drop(unsafe { Box::from_raw(pointer as *mut Threadsafe) });
+        }
+    }
+
+    /// Whether addon work keeps the event loop alive.
+    pub(crate) fn pending(&self) -> bool {
+        self.active.get() > 0
+            || self.threadsafe.get() > 0
+            || self
+                .environments
+                .borrow()
+                .iter()
+                .any(|environment| environment.pending())
     }
 }
 
