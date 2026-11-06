@@ -2112,7 +2112,14 @@ pub fn call(
                 Ok(if op == "dom.textOffset" {
                     json!(offset)
                 } else {
-                    json!([id, doc.nodes[id].children.len()])
+                    // WARNING: with no text the point is inside the first empty block, as text after `<p><br></p>` would make a new line.
+                    let mut node = id;
+                    while let Some(&child) = doc.nodes[node].children.first()
+                        && !doc.nodes[child].children.is_empty()
+                    {
+                        node = child;
+                    }
+                    json!([node, 0])
                 })
             }
             "dom.svgBox" => {

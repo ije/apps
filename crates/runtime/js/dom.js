@@ -2757,11 +2757,14 @@
       dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
     if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
-    const targetRanges = [];
-    if (!control) {
-      const [startContainer,startOffset] = textPoint(target,start), [endContainer,endOffset] = textPoint(target,end);
-      targetRanges.push(new StaticRange({startContainer,startOffset,endContainer,endOffset}));
-    }
+    // WARNING: a text offset at a block boundary also fits the end of the block before it, and an empty block has no text. So use the selection when it is the replaced text, else look up the first replaced character.
+    const replaced = () => {
+      if (selection.rangeCount && start === Math.min(state.start,state.end) && end === Math.max(state.start,state.end) && target.contains(selection.getRangeAt(0).startContainer)) return selection.getRangeAt(0).cloneRange();
+      const range = document.createRange(), [node,at] = textPoint(target,start + (start < end));
+      range.setStart(node,at - (start < end)); range.setEnd(...textPoint(target,end));
+      return range;
+    };
+    const targetRanges = control ? [] : [new StaticRange(replaced())];
     const data = inputType.startsWith('delete') || ['insertParagraph','insertLineBreak','historyUndo','historyRedo'].includes(inputType) || (inputType === 'insertFromPaste' && !control) ? null : text;
     const options = { bubbles: true, composed: true, data, inputType, isComposing, dataTransfer: control ? null : dataTransfer };
     if (!dispatch(target, trusted(new InputEvent('beforeinput', { ...options, cancelable: !isComposing, targetRanges })))) return;
@@ -2771,9 +2774,7 @@
       target._edited = true;
       target.setSelectionRange(start + (selected?.[0] ?? text.length), start + (selected?.[1] ?? text.length));
     } else {
-      const current = !composing && selection.rangeCount && start === Math.min(state.start,state.end) && end === Math.max(state.start,state.end) && target.contains(selection.getRangeAt(0).startContainer);
-      const range = current ? selection.getRangeAt(0).cloneRange() : document.createRange();
-      if (!current) { range.setStart(...textPoint(target,start)); range.setEnd(...textPoint(target,end)); }
+      const range = replaced();
       if (!range.collapsed) range.deleteContents();
       const plain = target.getAttribute('contenteditable')?.toLowerCase() === 'plaintext-only';
       if (inputType === 'insertParagraph' && !plain) { const line = paragraph(target, range), first = line.firstChild; selection.collapse(first?.nodeType === 3 ? first : line, 0); }

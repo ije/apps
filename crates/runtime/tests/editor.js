@@ -53,7 +53,7 @@ globalThis.editorResult = 'pending';
   assert(editor.textContent === 'hello orld', 'Forward deletion');
   assert(inputs[0].inputType === 'deleteContentForward' && inputs[0].data === null && inputs[0].composed && inputs[0].cancelable, 'Forward deletion beforeinput');
   const targets = inputs[0].getTargetRanges();
-  assert(targets.length === 1 && targets[0] instanceof StaticRange && targets[0].startContainer === first && targets[0].startOffset === 6 && targets[0].endContainer === last && targets[0].endOffset === 1, 'Deletion target ranges');
+  assert(targets.length === 1 && targets[0] instanceof StaticRange && targets[0].startContainer === last && targets[0].startOffset === 0 && targets[0].endContainer === last && targets[0].endOffset === 1, 'Deletion target ranges');
   targets.length = 0;
   assert(inputs[0].getTargetRanges().length === 1 && inputs[1].getTargetRanges().length === 0, 'Target range array isolation');
   inputs.length = 0;
@@ -112,6 +112,23 @@ globalThis.editorResult = 'pending';
   compositionController.abort();
   assert(__appsDispatch('keydown', [], { nativeKey: 'z', ...primary }) === false && editor.textContent === 'AB', 'Undo removes the committed composition');
   assert(__appsDispatch('keydown', [], { nativeKey: 'z', shiftKey: true, ...primary }) === false && editor.textContent === 'A文B', 'Redo commits it again');
+  for (const [name,html,caret,result] of [
+    ['an empty block','<p><br></p>',() => [editor.firstChild,0],'<p>中</p>'],
+    ['an empty block after text','<p>ab</p><p><br></p>',() => [editor.lastChild,0],'<p>ab</p><p>中</p>'],
+    ['the start of a later block','<p>ab</p><p>cd</p>',() => [editor.lastChild.firstChild,0],'<p>ab</p><p>中cd</p>'],
+    ['the end of a block','<p>ab</p><p>cd</p>',() => [editor.firstChild.firstChild,2],'<p>ab中</p><p>cd</p>'],
+    ['an empty list item','<ul><li>a</li><li><br></li></ul>',() => [editor.firstChild.lastChild,0],'<ul><li>a</li><li>中</li></ul>'],
+  ]) {
+    editor.innerHTML = html; selection.collapse(...caret());
+    __appsInput('z', null, null, true, [1,1]); __appsInput('zh', null, null, true, [2,2]); __appsInput('中');
+    assert(editor.innerHTML === result, 'Composition in ' + name + ': ' + editor.innerHTML);
+  }
+  editor.innerHTML = '<p>ab</p><p>cd</p>'; selection.collapse(editor.lastChild.firstChild, 0);
+  __appsInput('zh', null, null, true, [2,2]); __appsInput('', null, null, true, [0,0]); __appsInput('中');
+  assert(editor.innerHTML === '<p>ab</p><p>中cd</p>', 'Composition that was emptied stays in its block: ' + editor.innerHTML);
+  editor.innerHTML = '<p><br></p>'; selection.removeAllRanges();
+  __appsInput('中');
+  assert(editor.innerHTML === '<p>中</p>', 'Input without a selection uses the first empty block: ' + editor.innerHTML);
 
   const input = document.querySelector('textarea'); input.focus();
   input.value = 'A😀e\u0301B'; input.setSelectionRange(5,5);
