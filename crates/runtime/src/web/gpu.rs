@@ -1,6 +1,3 @@
-//! WebGPU lives in `apps-webgpu`. macOS and Windows load it as a library that `apps build` copies only
-//! for apps with the `webgpu` feature. Linux links it, because the render crate draws with wgpu there.
-
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::{
@@ -57,8 +54,6 @@ pub(crate) extern "C" fn drop_waker(waker: *mut c_void) {
     drop(unsafe { Box::from_raw(waker.cast::<crate::host::Waker>()) });
 }
 
-/// Bytes that the library writes. `alloc` leaves them uninitialized, and `finish` trusts that the
-/// library wrote all of them.
 #[derive(Default)]
 pub(crate) struct Output {
     bytes: Vec<u8>,
@@ -97,7 +92,6 @@ struct Library {
     allocated: unsafe extern "C" fn(*mut c_void) -> u64,
 }
 
-/// The file name of the WebGPU library, or `None` where the runtime links WebGPU.
 pub fn library_name(platform: &str) -> Option<&'static str> {
     match platform {
         "macos" => Some("libapps_webgpu.dylib"),
@@ -157,7 +151,6 @@ fn load() -> Result<Library> {
     }
 }
 
-/// The WebGPU state of one page. The library loads on the first call.
 #[derive(Default)]
 pub struct Gpu {
     raw: Option<(NonNull<c_void>, &'static Library)>,
@@ -165,7 +158,6 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Runs `op` with arguments as JSON text, which the library parses.
     pub fn call(&mut self, op: &str, args: &[u8]) -> Result<Value> {
         let (raw, library) = match self.raw {
             Some(raw) => raw,
@@ -238,7 +230,6 @@ impl Gpu {
         }
     }
 
-    /// Returns and resets the GPU bytes allocated since the last call.
     pub fn take_allocated(&mut self) -> u64 {
         self.raw.map_or(0, |(raw, library)| unsafe {
             (library.allocated)(raw.as_ptr())

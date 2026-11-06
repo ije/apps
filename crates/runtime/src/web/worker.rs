@@ -23,7 +23,6 @@ struct Parent {
     data: Value,
     id: u64,
     stop: Arc<AtomicBool>,
-    /// The bytes of the message that `__appsWorkerReceive` is reading.
     received: Vec<bytes::Bytes>,
     code: Option<i32>,
 }

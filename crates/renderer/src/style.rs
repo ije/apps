@@ -8,7 +8,6 @@ use crate::{
     },
 };
 
-/// A length: `auto`, logical pixels, a fraction of the parent's size, or a fraction plus pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Length {
     #[default]
@@ -24,7 +23,6 @@ impl From<Pixels> for Length {
     }
 }
 
-/// A fraction of the parent's size, like a CSS percentage divided by 100.
 pub fn relative(fraction: f32) -> Length {
     Length::Fraction(fraction)
 }
@@ -48,8 +46,8 @@ impl Radii<Length> {
 }
 
 impl Length {
-    /// The taffy calc handle of `Calc`, or `None` when it is a plain fraction. Taffy treats the handle as
-    /// opaque, so it holds the fraction's bits and the offset in 1/64 device pixels instead of a pointer.
+    // WARNING: the taffy calc handle of `Calc`, or `None` when it is a plain fraction. Taffy treats the handle as
+    // opaque, so it holds the fraction's bits and the offset in 1/64 device pixels instead of a pointer.
     fn calc(fraction: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
         let offset = (to_layout_unit(offset.0, scale) * 64.) as i32;
         (offset != 0).then(|| {
@@ -91,7 +89,6 @@ impl Length {
     }
 }
 
-/// Resolves a handle from `Length::calc` against `basis`, in device pixels.
 pub(crate) fn resolve_calc(handle: *const (), basis: f32) -> f32 {
     let bits = handle.addr() as u64;
     f32::from_bits((bits >> 32) as u32) * basis + ((bits as u32 as i32) >> 3) as f32 / 64.
@@ -106,21 +103,14 @@ pub enum Display {
     None,
 }
 
-/// Where a box finds the baseline its line aligns, and the last baseline an inline-block around it uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Baseline {
-    /// Block flow: the first and the last child with a baseline, or a line's items.
     #[default]
     Auto,
-    /// An inline-block: its line aligns its last baseline.
     Last,
-    /// Flex and grid boxes: the first baseline is also the last.
     First,
-    /// Tables have no last baseline.
     FirstOnly,
-    /// A piece of a line, like a strut: its bottom border edge is its baseline.
     Bottom,
-    /// No baseline: the line aligns the bottom border edge.
     None,
 }
 
@@ -135,21 +125,16 @@ pub enum Position {
 pub enum Overflow {
     #[default]
     Visible,
-    /// Clipped without making a scroll container.
     Clip,
     Hidden,
     Scroll,
 }
 
-/// What a scroll box does at its edges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Overscroll {
-    /// Scrolling goes on in the boxes around it, and it bounces when none of them moves.
     #[default]
     Auto,
-    /// Scrolling stops here, and it bounces.
     Contain,
-    /// Scrolling stops here. It never bounces.
     None,
 }
 
@@ -203,7 +188,6 @@ pub enum AlignContent {
 
 pub type JustifyContent = AlignContent;
 
-/// How an image fits its box, like CSS `object-fit`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ObjectFit {
     #[default]
@@ -300,7 +284,6 @@ pub struct BoxShadow {
     pub offset: Point<Pixels>,
     pub blur_radius: Pixels,
     pub spread_radius: Pixels,
-    /// Drawn inside the element's bounds.
     pub inset: bool,
 }
 
@@ -309,7 +292,6 @@ pub struct Style {
     pub display: Display,
     pub visibility: Visibility,
     pub overflow: Point<Overflow>,
-    /// Wheel input scrolls only the axis it moves along.
     pub restrict_scroll_to_axis: bool,
     pub overscroll: Point<Overscroll>,
     pub position: Position,
@@ -317,7 +299,6 @@ pub struct Style {
     pub size: Size<Length>,
     pub min_size: Size<Length>,
     pub max_size: Size<Length>,
-    /// Width divided by height.
     pub aspect_ratio: Option<f32>,
     pub margin: Edges<Length>,
     pub padding: Edges<Length>,
@@ -333,8 +314,6 @@ pub struct Style {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub baseline: Baseline,
-    /// Its parent takes its first baseline from this box, even out of flow, like a grid from its
-    /// first item.
     pub baseline_source: bool,
     pub background: Option<Rgba>,
     pub border_color: Option<Rgba>,
@@ -344,9 +323,7 @@ pub struct Style {
     pub text: TextStyleRefinement,
     pub mouse_cursor: Option<CursorStyle>,
     pub opacity: Option<f32>,
-    /// The box paints in the list of its nearest stacking context, by this order.
     pub z_index: Option<i32>,
-    /// The box is a stacking context, which lists the boxes with a z-index below it.
     pub stacking: bool,
 }
 
@@ -394,7 +371,6 @@ impl Default for Style {
 }
 
 impl Style {
-    /// The taffy style in device pixels. Lengths are rounded to device pixels before layout.
     pub(crate) fn to_taffy(&self, scale: f32) -> taffy::Style {
         use taffy::style as t;
         let align_items = |value: AlignItems| match value {
@@ -504,8 +480,6 @@ impl Style {
         }
     }
 
-    /// The mask that clips children, or `None` when both axes are visible. Children are clipped
-    /// to the padding box, whose corners are the inner border radii.
     pub fn overflow_mask(&self, bounds: Bounds<Pixels>) -> Option<ContentMask<Pixels>> {
         let (clip_x, clip_y) = (
             self.overflow.x != Overflow::Visible,
@@ -555,7 +529,6 @@ impl Style {
     }
 }
 
-/// How the text of an element and its children looks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub color: Rgba,
@@ -570,7 +543,6 @@ pub struct TextStyle {
     pub underline: Option<UnderlineStyle>,
     pub strikethrough: Option<StrikethroughStyle>,
     pub white_space: WhiteSpace,
-    /// Text that does not fit is cut and ends with this string, like CSS `text-overflow`.
     pub text_overflow: Option<SharedString>,
     pub text_align: TextAlign,
     pub line_clamp: Option<usize>,
@@ -579,7 +551,6 @@ pub struct TextStyle {
     pub text_indent: Pixels,
     pub text_wrap: TextWrap,
     pub word_break: WordBreak,
-    /// Light text gets thicker strokes, like the platform's font smoothing.
     pub font_smoothing: bool,
 }
 
@@ -688,7 +659,6 @@ impl TextStyle {
     }
 }
 
-/// The text style fields an element sets for itself and its children.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextStyleRefinement {
     pub color: Option<Rgba>,

@@ -18,6 +18,7 @@ enum Event {
     End(&'static str),
     Error(&'static str, io::Error),
     Written(&'static str, usize),
+    #[cfg(unix)]
     Finish(&'static str),
     Exit,
 }
@@ -25,10 +26,8 @@ enum Event {
 struct Process {
     child: Child,
     input: Option<Sender<Option<Vec<u8>>>>,
-    /// Write queues of the extra stdio pipes, like `fd3`.
     extra: Vec<(&'static str, Sender<Option<Vec<u8>>>)>,
     events: Receiver<Event>,
-    /// Output readers with their state: flowing, `PAUSED` or `CLOSED`.
     readers: Vec<(&'static str, Arc<AtomicU8>, std::thread::Thread)>,
     status: Option<ExitStatus>,
     open_streams: usize,
@@ -312,7 +311,7 @@ impl State {
                                 Ok(())
                             });
                         }
-                        // The child ends stay open until `spawn` below, then close in this process.
+                        // WARNING: the child ends stay open until `spawn` below, then close in this process.
                         builder_ends = ends;
                     }
                 }
@@ -512,6 +511,7 @@ impl State {
                             Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
                             Event::Written(stream, bytes) => json!({"id": id, "event": "written", "stream": stream, "bytes": bytes}),
+                            #[cfg(unix)]
                             Event::Finish(stream) => {
                                 process.open_streams -= 1;
                                 json!({"id": id, "event": "finish", "stream": stream})

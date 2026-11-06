@@ -1,7 +1,5 @@
-//! macOS: AppKit windows, Metal rendering and CoreText.
-//!
-//! macOS screens have a y axis that goes up from the bottom, with the origin at the bottom left
-//! of the main display.
+// WARNING: macOS screens have a y axis that goes up from the bottom, with the origin at the
+// bottom left of the main display.
 
 mod display_link;
 mod events;
@@ -84,15 +82,12 @@ fn delegate_class() -> &'static AnyClass {
     unsafe { &*(class as *const AnyClass) }
 }
 
-/// A unit of work for another thread.
 type Task = Box<dyn FnOnce() + Send>;
 
 pub(crate) struct Inbox {
     tasks: Mutex<VecDeque<Task>>,
     ready: Condvar,
-    /// The `ask`s that gave up and whose work has not run yet.
     late: AtomicUsize,
-    /// The thread ended, so work for it, like late Metal callbacks, is dropped.
     closed: AtomicBool,
 }
 
@@ -123,23 +118,21 @@ impl Inbox {
     }
 }
 
-/// A render thread, which owns one `App`: a window and its page scripts. It is leaked, because
-/// `Callbacks` of native views can name it after it ends, and it is small.
+// WARNING: A render thread, which owns one `App`: a window and its page scripts. It is leaked, because
+// `Callbacks` of native views can name it after it ends, and it is small.
 pub(crate) type AppThread = &'static Inbox;
 
-/// The work of the main thread, which owns AppKit. `ask` runs it too, so a page that waits for the
-/// main thread never waits for an `ask` of that thread to time out.
+// WARNING: the work of the main thread, which owns AppKit. `ask` runs it too, so a page that waits for the
+// main thread never waits for an `ask` of that thread to time out.
 static MAIN: Inbox = Inbox::new();
 static MAIN_QUEUED: AtomicBool = AtomicBool::new(false);
-/// The render threads that run. A thread leaves when it parks or has torn down its page.
 static RENDERS: Mutex<Vec<AppThread>> = Mutex::new(Vec::new());
 static RENDER_LEFT: Condvar = Condvar::new();
 
-/// How long the main thread waits for the render thread to answer AppKit. A busy page must not
-/// freeze the menus and the window, so AppKit then gets the answer for a page that ignores it.
+// WARNING: how long the main thread waits for the render thread to answer AppKit. A busy page must not
+// freeze the menus and the window, so AppKit then gets the answer for a page that ignores it.
 const ASK_LIMIT: Duration = Duration::from_millis(100);
 
-/// Lets a value cross threads.
 pub(crate) struct Sendable<T>(T);
 // SAFETY: each use hands the value over whole, or runs it on the thread that may touch it.
 unsafe impl<T> Send for Sendable<T> {}
@@ -152,7 +145,6 @@ impl<T> Sendable<T> {
     }
 }
 
-/// Runs `f` on the main thread, from any thread.
 pub(crate) fn native_post(f: Task) {
     MAIN.push(f);
     if !MAIN_QUEUED.swap(true, Ordering::AcqRel) {
@@ -168,7 +160,6 @@ extern "C" fn run_main(_: *mut c_void) {
     }
 }
 
-/// Runs `f` on the main thread and waits for it.
 pub(crate) fn native_sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if MainThreadMarker::new().is_some() {
         return f();
@@ -199,7 +190,6 @@ fn wait_for_main(task: &mut (dyn FnMut() + Send)) {
     }
 }
 
-/// Stops the render threads for good, because the process is about to exit and its statics to go.
 pub(crate) fn park_render() {
     let threads = RENDERS
         .lock()
@@ -228,7 +218,6 @@ fn leave_renders(thread: AppThread) {
     RENDER_LEFT.notify_all();
 }
 
-/// The answer to an `ask`, and whether the main thread stopped waiting for it.
 enum Asked<R> {
     Waiting,
     Answered(R),
@@ -245,7 +234,6 @@ pub(crate) fn ask<R: Send + 'static>(
     ask_within(thread, ASK_LIMIT, f)
 }
 
-/// Like [`ask`], with a limit of its own.
 pub(crate) fn ask_within<R: Send + 'static>(
     thread: AppThread,
     limit: Duration,
@@ -305,7 +293,6 @@ pub(crate) fn ask_within<R: Send + 'static>(
     }
 }
 
-/// A timer of the render thread.
 struct Due(Instant, u64, Box<dyn FnOnce()>);
 
 impl PartialEq for Due {
@@ -332,17 +319,14 @@ thread_local! {
     static ENDED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The render thread that this code runs on.
 pub(crate) fn app_thread() -> AppThread {
     THREAD.get().expect("Not a render thread")
 }
 
-/// Ends this render thread after its current work.
 pub(crate) fn end_thread() {
     ENDED.set(true);
 }
 
-/// Starts a render thread with `f` as its first work, and `done` as its last.
 pub(crate) fn spawn_render(
     f: impl FnOnce() + Send + 'static,
     done: impl FnOnce() + Send + 'static,
@@ -417,7 +401,6 @@ pub(crate) fn spawn_render(
                 thread.closed.store(true, Ordering::Relaxed);
                 std::mem::take(&mut *tasks)
             };
-            // An `ask` that is late has nothing left to wait for.
             thread.late.store(0, Ordering::Release);
             drop(left);
             // WARNING: timers can hold the page side, whose drop needs the other thread locals.
@@ -525,18 +508,15 @@ extern "C" fn local(context: *mut c_void) {
     f();
 }
 
-/// Runs `f` on a render thread, from any thread.
 pub(crate) fn post(thread: AppThread, f: Task) {
     thread.push(f);
 }
 
-/// Runs `f` on the app's thread after `delay`.
 pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
     let order = NEXT_TIMER.replace(NEXT_TIMER.get().wrapping_add(1));
     TIMERS.with_borrow_mut(|timers| timers.push(Due(Instant::now() + delay, order, Box::new(f))));
 }
 
-/// Runs `f` on the main thread after `delay`.
 pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
     // WARNING: `dispatch_after` lets a timer fire a tenth of its delay late (300 ms for a 3 s
     // `setTimeout`), so a timer source with a 1 ms leeway runs it.
@@ -568,7 +548,6 @@ extern "C" fn fire(context: *mut c_void) {
     f();
 }
 
-/// Runs `f` on the main thread after the current event.
 pub(crate) fn post_local(f: impl FnOnce() + 'static) {
     let f: Box<dyn FnOnce()> = Box::new(f);
     let context = Box::into_raw(Box::new(f)) as *mut c_void;
@@ -579,7 +558,6 @@ pub(crate) fn post_local(f: impl FnOnce() + 'static) {
 extern "C-unwind" fn will_finish_launching(_: &AnyObject, _: Sel, _: *mut AnyObject) {
     // SAFETY: plain NSUserDefaults calls.
     unsafe {
-        // The autofill heuristic controller costs CPU on every key press.
         let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let name = ns_string("NSAutoFillHeuristicControllerEnabled");
         let existing: *mut AnyObject = msg_send![defaults, objectForKey: name];
@@ -610,7 +588,6 @@ extern "C-unwind" fn should_handle_reopen(
     Bool::YES
 }
 
-/// Returns `NSTerminateNow` (1) or `NSTerminateCancel` (0).
 extern "C-unwind" fn should_terminate(_: &AnyObject, _: Sel, _: *mut AnyObject) -> usize {
     crate::app::events::should_quit() as usize
 }

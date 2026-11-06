@@ -18,8 +18,6 @@ use std::{
 type Callback = Box<dyn FnOnce(&mut App)>;
 type WakeCallback = Rc<RefCell<dyn FnMut(&mut App)>>;
 
-/// The app state, owned by the thread that draws: its own thread on macOS, the main thread on
-/// other platforms.
 pub struct App {
     pub(crate) platform: Rc<platform::Platform>,
     text_system: Rc<TextSystem>,
@@ -32,7 +30,6 @@ pub struct App {
 
 struct AppCell {
     app: RefCell<App>,
-    /// Work that arrived while the app was busy, like events of a nested native loop.
     queue: RefCell<VecDeque<Callback>>,
 }
 
@@ -44,7 +41,6 @@ fn cell() -> Option<Rc<AppCell>> {
     APP.with_borrow(Clone::clone)
 }
 
-/// Runs `f` with the app, or queues it while the app is busy.
 pub(crate) fn update(f: impl FnOnce(&mut App) + 'static) {
     let Some(cell) = cell() else {
         return;
@@ -62,7 +58,6 @@ pub(crate) fn update(f: impl FnOnce(&mut App) + 'static) {
     drain(&cell);
 }
 
-/// Runs `f` with the app, or returns `None` while the app is busy.
 pub(crate) fn try_update<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     let cell = cell()?;
     let result = {
@@ -107,11 +102,8 @@ fn install(platform: Rc<platform::Platform>) {
     });
 }
 
-/// Whether each [`spawn`] gets its own thread, so its windows don't share a thread with others.
 pub const THREAD_PER_APP: bool = cfg!(target_os = "macos");
 
-/// Starts an `App` with `init`: on its own thread on macOS, with one thread and event loop until
-/// [`App::end_thread`]. Other platforms have one `App`, on the main thread.
 pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
     #[cfg(target_os = "macos")]
     platform::spawn_render(
@@ -128,8 +120,6 @@ pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
     update(init);
 }
 
-/// Starts the platform loop, and calls `native` on the main thread once the app has launched.
-/// Returns after quitting.
 pub fn run(native: impl FnOnce() + 'static) {
     let platform = Rc::new(platform::Platform::new());
     #[cfg(target_os = "macos")]
@@ -145,7 +135,6 @@ pub fn run(native: impl FnOnce() + 'static) {
     }
 }
 
-/// Wakes the app's thread from any thread, to run the app's [`App::on_wake`] callback.
 #[derive(Clone)]
 pub struct Waker {
     pending: Arc<AtomicBool>,
@@ -187,7 +176,6 @@ pub(crate) fn timer(delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Time
     }
 }
 
-/// A pending [`App::timer`]. Dropping it cancels the timer unless it was detached.
 pub struct Timer {
     cancelled: Rc<Cell<bool>>,
     detached: bool,
@@ -208,17 +196,14 @@ impl Drop for Timer {
 }
 
 impl App {
-    /// Keeps the current mouse or key event from the listeners after this one.
     pub fn stop_propagation(&mut self) {
         self.propagate_event = false;
     }
 
-    /// Runs `f` after the current event, with the app.
     pub fn defer(&mut self, f: impl FnOnce(&mut App) + 'static) {
         self.deferred.push(Box::new(f));
     }
 
-    /// Runs `f` after `delay`, on the app's thread.
     pub fn timer(&mut self, delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Timer {
         timer(delay, f)
     }
@@ -231,13 +216,11 @@ impl App {
         }
     }
 
-    /// Ends this app's thread after the current work, once its window has closed.
     pub fn end_thread(&self) {
         #[cfg(target_os = "macos")]
         platform::end_thread();
     }
 
-    /// Runs on the app's thread after any [`Waker::wake`].
     pub fn on_wake(&mut self, f: impl FnMut(&mut App) + 'static) {
         self.on_wake = Some(Rc::new(RefCell::new(f)));
     }
@@ -250,20 +233,18 @@ impl App {
         self.platform.activate(ignoring_other_apps);
     }
 
-    pub fn read_from_clipboard(&self) -> Option<String> {
+    pub fn read_clipboard(&self) -> Option<String> {
         self.platform.read_clipboard()
     }
 
-    pub fn write_to_clipboard(&self, text: String) {
+    pub fn write_clipboard(&self, text: String) {
         self.platform.write_clipboard(&text);
     }
 
-    /// The visible area of the main display, in screen points.
     pub fn primary_display_bounds(&self) -> Option<Bounds<Pixels>> {
         self.platform.primary_display_bounds()
     }
 
-    /// The bounds of `size` centered on the main display.
     pub fn centered(&self, size: Size<Pixels>) -> Bounds<Pixels> {
         let display = self.primary_display_bounds().unwrap_or_default();
         Bounds::new(
@@ -306,7 +287,6 @@ impl App {
         self.windows.keys().copied().collect()
     }
 
-    /// Runs `f` with the window, or returns `None` when it is closed or busy.
     pub fn update_window<R>(
         &mut self,
         id: WindowId,
@@ -320,7 +300,6 @@ impl App {
         Some(result)
     }
 
-    /// Redraws the window on the next frame.
     pub fn refresh_window(&mut self, id: WindowId) {
         self.update_window(id, |window, _| window.refresh());
     }
@@ -340,16 +319,13 @@ impl App {
     }
 }
 
-/// The platform's way into one window.
 #[derive(Clone, Copy)]
 pub(crate) struct Callbacks {
     pub id: WindowId,
-    /// The thread of the app that owns the window.
     #[cfg(target_os = "macos")]
     pub thread: platform::AppThread,
 }
 
-/// Sends platform input, whose positions are in window points, so the page zoom maps them.
 pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformInput) -> bool {
     let zoom = window.zoom;
     if zoom != 1. {
@@ -376,8 +352,6 @@ pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformIn
 }
 
 impl Callbacks {
-    /// Runs `f` with the window and returns its result. On macOS the main thread asks the render
-    /// thread and gets `None` when that takes too long.
     pub(crate) fn with<R: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
@@ -405,13 +379,11 @@ impl Callbacks {
         run();
     }
 
-    /// Sends input and returns whether the view handled it.
     pub fn input(&self, input: PlatformInput) -> bool {
         self.with(move |window, app| dispatch(window, app, input))
             .unwrap_or(false)
     }
 
-    /// Sends input whose result nothing needs, so a busy view holds up nothing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn input_later(&self, input: PlatformInput) {
         self.queue(move |window, app| {
@@ -419,8 +391,6 @@ impl Callbacks {
         });
     }
 
-    /// The display is ready for a frame. Returns whether more frames are wanted, or `None` while
-    /// the app is busy.
     pub fn frame(&self) -> Option<bool> {
         self.with(|window, app| {
             for callback in window.take_next_frame_callbacks() {
@@ -449,7 +419,6 @@ impl Callbacks {
         });
     }
 
-    /// The window moved, was activated, minimized, or changed in another way the view may track.
     pub fn changed(&self) {
         native::window_event(self.id, native::WindowEvent::Changed);
         self.queue(|window, app| {
@@ -458,7 +427,6 @@ impl Callbacks {
         });
     }
 
-    /// The user asked to close the window. The main side decides, so the native window stays for now.
     pub fn should_close(&self) -> bool {
         native::window_event(self.id, native::WindowEvent::CloseRequested);
         false
@@ -468,7 +436,6 @@ impl Callbacks {
         self.queue(|window, _| window.refresh());
     }
 
-    /// The window stopped drawing, so its renderer can free what the last frame didn't use.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn trim(&self) {
         #[cfg(target_os = "macos")]
@@ -482,13 +449,9 @@ impl Callbacks {
     }
 
     pub fn accepts_text_input(&self) -> bool {
-        self.with(|window, app| {
-            window.with_view(app, |view, window, app| {
-                view.accepts_text_input(window, app)
-            })
-        })
-        .flatten()
-        .unwrap_or(false)
+        self.with(|window, app| window.with_view(app, |_, _, _| true))
+            .flatten()
+            .unwrap_or(false)
     }
 
     pub fn selected_text_range(&self) -> Option<Utf16Selection> {
@@ -510,7 +473,6 @@ impl Callbacks {
         .flatten()
     }
 
-    /// The text of `range`, and the range it really covers when that differs.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn text_for_range(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
         self.with(move |window, app| {
@@ -581,16 +543,12 @@ impl Callbacks {
     }
 }
 
-/// The app as the OS sees it. These run on the main thread, unless they say otherwise.
 pub mod native {
     use super::*;
 
-    /// What a native window tells the main side, without the thread that draws it.
     #[derive(Clone, Copy)]
     pub enum WindowEvent {
-        /// It moved, resized, was activated, minimized or otherwise changed.
         Changed,
-        /// The user asked to close it.
         CloseRequested,
     }
 
@@ -619,17 +577,14 @@ pub mod native {
         }
     }
 
-    /// The Dock icon was clicked; `true` when windows are visible.
     pub fn on_reopen(f: impl FnMut(bool) + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.reopen = Some(Box::new(f)));
     }
 
-    /// Asked before quitting; `false` cancels.
     pub fn on_should_quit(f: impl FnMut() -> bool + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.should_quit = Some(Box::new(f)));
     }
 
-    /// URLs or files the app was asked to open.
     pub fn on_open_urls(mut f: impl FnMut(Vec<String>) + 'static) {
         let urls = HANDLERS.with_borrow_mut(|handlers| std::mem::take(&mut handlers.pending_urls));
         if !urls.is_empty() {
@@ -642,7 +597,6 @@ pub mod native {
         HANDLERS.with_borrow_mut(|handlers| handlers.quit = Some(Box::new(f)));
     }
 
-    /// Runs `f` on the main thread, from any thread.
     pub fn post(f: Box<dyn FnOnce() + Send>) {
         #[cfg(target_os = "macos")]
         platform::native_post(f);
@@ -650,7 +604,6 @@ pub mod native {
         platform::post(f);
     }
 
-    /// Runs `f` on the main thread after `delay`.
     pub fn after(delay: Duration, f: impl FnOnce() + 'static) {
         #[cfg(target_os = "macos")]
         platform::native_after(delay, f);
@@ -658,7 +611,6 @@ pub mod native {
         platform::run_after(delay, f);
     }
 
-    /// Runs `f` on the main thread and waits for it, from any thread.
     pub fn sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         #[cfg(target_os = "macos")]
         return platform::native_sync(f);
@@ -666,13 +618,11 @@ pub mod native {
         f()
     }
 
-    /// Stops the thread that draws, before the process exits without AppKit.
     pub fn before_exit() {
         #[cfg(target_os = "macos")]
         platform::park_render();
     }
 
-    /// Brings the app to the front, from any thread.
     pub fn activate(ignoring_other_apps: bool) {
         #[cfg(target_os = "macos")]
         platform::Platform::new().activate(ignoring_other_apps);
@@ -680,7 +630,6 @@ pub mod native {
         update(move |app| app.activate(ignoring_other_apps));
     }
 
-    /// Ends the app, from any thread.
     pub fn quit() {
         #[cfg(target_os = "macos")]
         platform::Platform::new().quit();
@@ -698,7 +647,6 @@ pub mod native {
         }
     }
 
-    /// Returns `false` to cancel quitting.
     pub(crate) fn should_quit() -> bool {
         match HANDLERS.with_borrow_mut(|handlers| handlers.should_quit.take()) {
             Some(mut callback) => {

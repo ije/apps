@@ -148,7 +148,6 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<renderer::RenderImage> {
     ))
 }
 
-/// A `data:` URL as a file in the temp folder, so CSS images read it like any other file.
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;

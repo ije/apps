@@ -23,9 +23,7 @@ pub struct JavaScriptCore {
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: Option<unsafe extern "C" fn(Ptr)>,
     pub(crate) busy: std::cell::Cell<std::time::Duration>,
-    /// When `shrink_due` last looked, and `busy` then.
     busy_mark: std::cell::Cell<(std::time::Instant, std::time::Duration)>,
-    /// Whether a second since the last collection ran a lot of JS, the quiet seconds in a row, and that collection.
     burst: std::cell::Cell<bool>,
     quiet: std::cell::Cell<u32>,
     shrunk: std::cell::Cell<std::time::Instant>,
@@ -339,8 +337,6 @@ impl JavaScriptCore {
         self.shrink.is_some() && self.busy.get() >= std::time::Duration::from_millis(20)
     }
 
-    /// Whether the VM should collect now, asked about once a second: after a burst of work and 5 quiet
-    /// seconds, or every 5 minutes when only a little ran.
     // WARNING: JSC's GC timers don't fire on the generic event loop, so garbage stays until the heap has grown
     // about 2x. A collection costs about 300 ms of CPU over all GC threads and drops the compiled code, so it must
     // not run for the timers and polls that apps always have, or it uses more CPU at idle than the app itself.
@@ -404,17 +400,12 @@ thread_local! {
     pub(crate) static NATIVE: std::cell::Cell<Option<NativeCall>> = const { std::cell::Cell::new(None) };
     // WARNING: the render thread must stop before statics go, so the main thread sets this.
     pub(crate) static BEFORE_EXIT: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
-    /// When the script that runs long started, and its last tick.
-    /// The `busy` value of the run that the last tick belongs to, and the ticks of that run.
     static RUN_TICKS: std::cell::Cell<(std::time::Duration, u32)> = const { std::cell::Cell::new((std::time::Duration::ZERO, 0)) };
 }
 
-/// Writes text to the clipboard, or reads it without text.
 type Clipboard = fn(Option<String>) -> Option<String>;
-/// Makes a native call on the main thread.
 type NativeCall = fn(&str, &serde_json::Value) -> Result<serde_json::Value>;
 
-/// Calls bridge function `function` of a context with message `payload`.
 fn bridge(
     api: &JavaScriptCore,
     context: Ptr,
@@ -449,7 +440,6 @@ fn bridge(
     Ok(result)
 }
 
-/// Runs bridge message `payload` in a context, and returns what it answers.
 fn receive(
     api: &JavaScriptCore,
     context: Ptr,
@@ -491,7 +481,6 @@ fn receive(
     decoded
 }
 
-/// Returns the context of this thread with `role`.
 pub(crate) fn context(role: Role) -> Option<usize> {
     HOSTS.with_borrow(|hosts| {
         hosts
@@ -501,7 +490,6 @@ pub(crate) fn context(role: Role) -> Option<usize> {
     })
 }
 
-/// Returns every context of this thread.
 pub(crate) fn contexts() -> Vec<(usize, Role)> {
     HOSTS.with_borrow(|hosts| {
         hosts
@@ -511,7 +499,6 @@ pub(crate) fn contexts() -> Vec<(usize, Role)> {
     })
 }
 
-/// Connects the Web Inspector to a context once. Returns true for a new connection.
 pub(crate) fn connect_inspector(ctx: usize) -> Result<bool> {
     if INSPECTED.with_borrow(|inspected| inspected.contains_key(&ctx)) {
         return Ok(false);
@@ -529,7 +516,6 @@ pub(crate) fn connect_inspector(ctx: usize) -> Result<bool> {
     Ok(true)
 }
 
-/// Sends a Web Inspector protocol message. Replies and events arrive in `inspector_messages`.
 pub(crate) fn inspect(ctx: usize, message: &str) -> Result<()> {
     connect_inspector(ctx)?;
     let api = HOSTS
@@ -659,8 +645,8 @@ unsafe extern "C" fn chunk(
     result
 }
 
-/// Turns the `\udXXX` escapes that `JSON.stringify` writes for lone surrogates into `\ufffd`
-/// in place, because serde_json rejects them.
+// WARNING: turns the `\udXXX` escapes that `JSON.stringify` writes for lone surrogates into `\ufffd`
+// in place, because serde_json rejects them.
 fn well_formed(json: &mut str) {
     let mut from = 0;
     while let Some(at) = json.get(from..).and_then(|rest| rest.find('\\')) {
@@ -676,9 +662,9 @@ fn well_formed(json: &mut str) {
     }
 }
 
-/// Host calls: `native(op, ...args)` takes primitive and binary arguments directly, and
-/// `native(0, op, json, buffers?)` takes the rest as JSON. Results come back as JavaScript values,
-/// and failures throw an `Error` with the I/O `code`.
+// WARNING: host calls: `native(op, ...args)` takes primitive and binary arguments directly, and
+// `native(0, op, json, buffers?)` takes the rest as JSON. Results come back as JavaScript values,
+// and failures throw an `Error` with the I/O `code`.
 unsafe extern "C" fn call(
     ctx: Ptr,
     _function: Ptr,
@@ -1157,7 +1143,6 @@ fn dispatch(
     }
 }
 
-/// Reports new DOM nodes to JSC as memory.
 // WARNING: JSC cannot see the native DOM, so the wrappers that keep removed nodes and their styles alive
 // would wait for an unrelated GC, and a page that rebuilds rows as it scrolls would grow without bound.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
@@ -1190,7 +1175,6 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
     result
 }
 
-/// Makes an `ArrayBuffer` that owns `bytes`, or a `Uint8Array` over one.
 fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
     let bytes = Box::new(Vec::from(bytes));
     unsafe {
@@ -1210,7 +1194,6 @@ fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> P
     }
 }
 
-/// Converts a host result to a JavaScript value. Small arrays of primitives skip JSON.
 fn output(api: &JavaScriptCore, ctx: Ptr, payload: crate::jsc::payload::Payload) -> Ptr {
     use serde_json::Value;
     let crate::jsc::payload::Payload { value, mut buffers } = payload;
@@ -1433,8 +1416,6 @@ fn call_json<T>(
     result
 }
 
-/// Runs while a script of a page thread takes long: it stops the scripts of closing windows and
-/// page scripts past the limit. Returning false lets the script run for another tick.
 unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     let binding = HOSTS.with(|hosts| {
         hosts.try_borrow().ok().and_then(|hosts| {
@@ -1478,7 +1459,6 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
 }
 
 const PAGE_LIMIT: u64 = 10;
-/// How often a long script is checked, in seconds of its CPU time.
 const PAGE_TICK: f64 = 0.1;
 
 static STOPPING: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -1492,7 +1472,6 @@ pub(crate) fn stopping(id: u64) -> bool {
             .contains(&id)
 }
 
-/// Stops the long scripts of a closing window at their next tick, from any thread.
 pub(crate) fn stop_page(id: u64) {
     STOPPING
         .lock()
@@ -1500,7 +1479,6 @@ pub(crate) fn stop_page(id: u64) {
         .push(id);
 }
 
-/// The closing window's page is gone.
 pub(crate) fn page_stopped(id: u64) {
     STOPPING
         .lock()
@@ -1508,7 +1486,6 @@ pub(crate) fn page_stopped(id: u64) {
         .retain(|&other| other != id);
 }
 
-/// Stops the long scripts of all pages for good, because the app is quitting.
 pub(crate) fn stop_pages() {
     STOP_ALL.store(true, std::sync::atomic::Ordering::Release);
 }
@@ -1796,7 +1773,6 @@ impl JsContext {
         self.evaluate(source, url, ptr::null_mut())
     }
 
-    /// Runs a page script. Bundled scripts compile their modules through `this.__appsCompile`.
     pub fn eval_page(&self, source: &str, url: &str) -> Result<String> {
         struct Armed(usize);
         impl Drop for Armed {
@@ -1808,12 +1784,10 @@ impl JsContext {
         self.evaluate(source, url, self.scope)
     }
 
-    /// Whether native addons still have work that keeps the event loop alive.
     pub fn addons_pending(&self) -> bool {
         self.napi.as_ref().is_some_and(|napi| napi.pending())
     }
 
-    /// Calls a global function with JSON arguments, without compiling a new script.
     pub fn call(&self, name: &str, arguments: &[&str]) -> Result<String> {
         call_json(&self.api, self.ctx, name, arguments, |value| {
             self.api.text(self.ctx, value)
@@ -1862,12 +1836,10 @@ impl JsContext {
         });
     }
 
-    /// Runs bridge message `payload` here, and returns what this context answers.
     pub(crate) fn receive(&self, payload: payload::Payload) -> Result<payload::Payload> {
         receive(&self.api, self.ctx, payload)
     }
 
-    /// Runs a bridge message from the other side of the app, and its listeners.
     pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
         bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
     }
@@ -1922,7 +1894,6 @@ impl JsContext {
         Ok(())
     }
 
-    /// Returns JSC heap statistics. The VM is shared, so they cover every context of this thread.
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {
         let memory = self
             .api

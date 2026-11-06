@@ -1,6 +1,3 @@
-//! Tailwind CSS v4 without a build step. Like the Tailwind compiler, every class found in the
-//! document becomes a CSS rule in `@layer utilities`, and `@apply` expands into the author rules.
-
 use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
 use crate::dom::Document;
 use rustc_hash::FxHashMap;
@@ -19,7 +16,6 @@ thread_local! {
         .lines()
         .filter_map(|line| line.strip_suffix(';')?.split_once(':'))
         .collect();
-    /// Parsed once and added after the generated sheets; its layer order puts it in `base`.
     static BASE: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("@layer base{{{PREFLIGHT}}}")));
 }
 
@@ -33,7 +29,6 @@ const KEYFRAMES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Default variables that Tailwind inlines instead of emitting.
 const INLINE: &[&str] = &[
     "--blur",
     "--shadow",
@@ -43,7 +38,6 @@ const INLINE: &[&str] = &[
     "--max-width-prose",
 ];
 
-/// Variables that `--name-*: initial` keeps, because they belong to another namespace.
 const KEPT: &[(&str, &[&str])] = &[
     ("--font", &["--font-weight", "--font-size"]),
     ("--inset", &["--inset-shadow", "--inset-ring"]),
@@ -65,8 +59,6 @@ const KEPT: &[(&str, &[&str])] = &[
     ("--grid-row", &["--grid-row-start", "--grid-row-end"]),
 ];
 
-/// Initial values of the `--tw-*` properties. Tailwind registers them with `@property`; like its
-/// fallback for older browsers, they are set on every element so they don't inherit.
 const PROPERTIES: &[(&str, &str)] = &[
     ("--tw-border-spacing-x", "0"),
     ("--tw-border-spacing-y", "0"),
@@ -197,7 +189,6 @@ const PROPERTIES: &[(&str, &str)] = &[
     ("--tw-content", "\"\""),
 ];
 
-/// Tailwind's property order, used to sort utilities that set the same property.
 const ORDER: &[&str] = &[
     "container-type",
     "pointer-events",
@@ -560,7 +551,6 @@ const ORDER: &[&str] = &[
     "forced-color-adjust",
 ];
 
-/// Variants in Tailwind's order. Templates use `&` for the utility selector; `@` starts an at-rule.
 const VARIANTS: &[(&str, &str)] = &[
     ("*", ":is(& > *)"),
     ("**", ":is(& *)"),
@@ -652,7 +642,6 @@ const VARIANTS: &[(&str, &str)] = &[
     ("noscript", "@media (scripting: none)"),
 ];
 
-/// Tailwind's keyword utilities, sorted by name.
 const STATIC: &[(&str, &str)] = &[
     ("absolute", "position:absolute"),
     ("accent-auto", "accent-color:auto"),
@@ -1373,7 +1362,6 @@ const STATIC: &[(&str, &str)] = &[
     ("wrap-normal", "overflow-wrap:normal"),
 ];
 
-/// Roots whose values may be negated with a leading `-`.
 const NEGATIVE: &[&str] = &[
     "inset",
     "inset-x",
@@ -1447,7 +1435,6 @@ const NEGATIVE: &[&str] = &[
     "mask-conic",
 ];
 
-/// Positions of `origin-*` and `perspective-origin-*`.
 const ORIGINS: &[(&str, &str)] = &[
     ("center", "center"),
     ("top", "top"),
@@ -1472,13 +1459,11 @@ const EDGES: &str =
     "var(--tw-mask-left), var(--tw-mask-right), var(--tw-mask-bottom), var(--tw-mask-top)";
 
 type Pairs = Vec<(String, String)>;
-/// A rule: at-rules from the outside in, a selector and its declarations.
 type Nested = (Vec<String>, String, Pairs);
 
 #[derive(Default)]
 struct Body {
     declarations: Pairs,
-    /// Rules after the declarations; their selectors use `&` for the utility's.
     nested: Vec<Nested>,
     sort: Option<&'static str>,
 }
@@ -1516,14 +1501,11 @@ impl Body {
     }
 }
 
-/// The ways a variant applies: at-rules from the outside in, then a selector with `&`.
 #[derive(Default)]
 struct Variant {
     branches: Vec<(Vec<String>, Option<String>)>,
     content: bool,
-    /// No compound variant may wrap it, like pseudo-elements.
     never: bool,
-    /// A relative arbitrary selector like `[>svg]`, valid only in `has-` and `in-`.
     relative: bool,
 }
 
@@ -1542,45 +1524,29 @@ struct Compiled {
     rules: Vec<Nested>,
 }
 
-/// Generated sheets of one pass and how scopes using the previous ones can follow.
 pub(crate) struct Update<'a> {
-    /// The theme variables, also set on the document node for pages without `<html>`.
     pub(crate) root: Rc<Style>,
-    /// Generated sheets that were replaced; scopes holding them are rebuilt.
     pub(crate) replaced: Vec<Rc<Stylesheet>>,
-    /// Utility sheets that only gained utilities, with the sheets that replace them.
     pub(crate) added: Vec<(Rc<Stylesheet>, Vec<Rc<Stylesheet>>)>,
-    /// The rules of the new utilities.
     pub(crate) rules: Vec<&'a Rule>,
-    /// The cascade key of every generated rule, by the address of its selector list.
     pub(crate) keys: &'a FxHashMap<usize, u64>,
 }
 
-/// The utilities of one Tailwind config (theme, variants and utilities), kept across passes.
 #[derive(Default)]
 struct Config {
-    /// The source of the Tailwind directives the config comes from.
     key: String,
-    /// Sheet lists known to use this config.
     lists: Vec<Vec<Rc<Stylesheet>>>,
     theme: BTreeMap<String, String>,
-    /// Variables of `@theme inline`, which utilities use as values instead of `var()`.
     inline: BTreeSet<String>,
-    /// Variables and `--name-*` namespaces that `initial` removed.
     cleared: Vec<String>,
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
-    /// The `@utility` rules being expanded, by index.
     expanding: std::cell::RefCell<Vec<usize>>,
-    /// `Some(preflight)` when a sheet imports Tailwind, `None` with only `@reference`.
     import: Option<bool>,
     classes: FxHashMap<String, bool>,
-    /// The revision of each node when its attributes were read.
     scanned: Vec<u64>,
     applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>)>,
-    /// Compiled utilities in Tailwind's order, with their key and rules.
     sorted: Vec<(Sort, u32, Vec<Rule>)>,
-    /// Sheets of the utilities, with the first key after each.
     chunks: Vec<(u64, Rc<Stylesheet>)>,
     keys: FxHashMap<usize, u64>,
     header: Option<Rc<Stylesheet>>,
@@ -1590,13 +1556,10 @@ struct Config {
     root: Rc<Style>,
 }
 
-/// Tailwind compilers by config, so a shadow root with its own theme keeps the document's utilities.
 #[derive(Default)]
 pub(crate) struct Compiler(Vec<Config>);
 
 impl Compiler {
-    /// Adds the generated sheets before the first sheet that imports Tailwind and expands `@apply`.
-    /// Returns `None` when no sheet uses Tailwind.
     pub(crate) fn update(
         &mut self,
         sheets: &mut Vec<Rc<Stylesheet>>,
@@ -1976,8 +1939,6 @@ impl Config {
         }
     }
 
-    /// Adds the theme variables, `--tw-*` properties and keyframes that `css` uses; true when
-    /// the header changes.
     fn vars(&mut self, css: &str) -> bool {
         let mut changed = false;
         let mut pending: Vec<String> = names(css, "var(--")
@@ -1996,7 +1957,6 @@ impl Config {
                     else {
                         continue;
                     };
-                    // `--theme(--name, initial)` points at another variable and is dropped without it.
                     match value
                         .strip_prefix("--theme(")
                         .and_then(|value| value.strip_suffix(", initial)"))
@@ -2028,8 +1988,6 @@ impl Config {
         changed
     }
 
-    /// Expands `@apply`, `@variant` and Tailwind's functions in `rules`; `None` when nothing
-    /// changed. Generated CSS is added to `used`.
     fn apply<R: std::borrow::Borrow<Rule>>(
         &self,
         rules: &[R],
@@ -2559,7 +2517,6 @@ impl Config {
         self.cleared.iter().any(|cleared| removes(cleared, name))
     }
 
-    /// The value of a theme variable, from the author theme or Tailwind's defaults.
     fn raw(&self, name: &str) -> Option<String> {
         if let Some(value) = self.theme.get(name) {
             return Some(value.clone());
@@ -2570,7 +2527,6 @@ impl Config {
         DEFAULTS.with(|defaults| defaults.get(name).map(|value| (*value).to_owned()))
     }
 
-    /// A theme value as `var(--name)`, or the value itself for inline variables.
     fn theme(&self, namespace: &str, key: &str) -> Option<String> {
         let name = format!("{namespace}-{key}");
         let name = if self.raw(&name).is_none() && key.contains('.') {
@@ -2587,7 +2543,6 @@ impl Config {
         self.raw(&name).map(|_| format!("var({name})"))
     }
 
-    /// An `@utility` from the author CSS, with `--value()` and `--modifier()` resolved.
     fn custom(&self, class: &str) -> Option<Body> {
         let (candidate, modifier) = modifier(class);
         self.utilities
@@ -2702,7 +2657,6 @@ impl Config {
         Some(body)
     }
 
-    /// Resolves one `--value(...)`: theme namespaces, `"literals"`, bare types and `[types]`.
     fn resolve(&self, arguments: &str, value: &str) -> Option<String> {
         split(arguments, ',')
             .into_iter()
@@ -2736,7 +2690,6 @@ impl Config {
             })
     }
 
-    /// The value of `[...]` or `(--name)`, decoded and checked like Tailwind does.
     fn arbitrary(&self, value: &str) -> Option<String> {
         let raw = match value
             .strip_prefix('[')
@@ -2762,7 +2715,6 @@ impl Config {
         (valid(&raw) && !raw.trim().is_empty()).then_some(raw)
     }
 
-    /// An arbitrary value with its type hint, like `length` in `[length:var(--x)]`.
     fn typed(&self, value: &str) -> Option<(Option<String>, String)> {
         let raw = self.arbitrary(value)?;
         let end = raw
@@ -2778,7 +2730,6 @@ impl Config {
         Some((None, raw))
     }
 
-    /// Resolves `--spacing()`, `--alpha()`, `--theme()` and the legacy `theme()`.
     fn functions(&self, value: &str) -> String {
         if !calls(value) {
             return value.to_owned();
@@ -3020,7 +2971,6 @@ impl Config {
         (color != "inherit").then(|| with_alpha(&color, &alpha))
     }
 
-    /// An opacity modifier like `50`, `[0.5]` or `(--alpha)` as a percentage.
     fn opacity(&self, modifier: &str) -> Option<String> {
         if modifier.starts_with(['[', '(']) {
             return self.arbitrary(modifier);
@@ -3030,7 +2980,6 @@ impl Config {
             .then(|| format!("{modifier}%"))
     }
 
-    /// A shadow color: Tailwind mixes it with the shadow's alpha variable.
     fn shadow(&self, value: &str, modifier: Option<&str>, alpha: &str) -> Option<String> {
         if matches!(value, "initial" | "inherit") && modifier.is_none() {
             return Some(value.into());
@@ -4540,7 +4489,6 @@ impl Config {
     }
 }
 
-/// Parses a variant template: a selector, an at-rule, or a block with `@slot`.
 fn template(source: &str) -> Variant {
     let mut variant = Variant::default();
     if source.contains("@slot") {
@@ -4563,7 +4511,6 @@ fn template(source: &str) -> Variant {
     variant
 }
 
-/// Collects the at-rules and selector leading to each `@slot` of a block variant.
 fn slots(
     source: &str,
     at: &[String],
@@ -4596,7 +4543,6 @@ fn slots(
     }
 }
 
-/// Splits a block body into statements: `prelude;` or `prelude { block }`.
 fn statements(source: &str) -> Vec<(&str, Option<&str>)> {
     let mut items = Vec::new();
     let (mut start, mut open, mut depth, mut parens) = (0, 0, 0usize, 0usize);
@@ -4650,8 +4596,6 @@ fn statements(source: &str) -> Vec<(&str, Option<&str>)> {
     items
 }
 
-/// Finds `name(` outside strings: its start, the start of its arguments and its closing
-/// parenthesis, which is the text's length when it isn't closed.
 fn call(text: &str, name: &str) -> Option<(usize, usize, usize)> {
     let (mut found, mut quote, mut escaped, mut depth) = (None, None, false, 0);
     for (index, character) in text.char_indices() {
@@ -4691,12 +4635,10 @@ fn call(text: &str, name: &str) -> Option<(usize, usize, usize)> {
     found.map(|(start, open)| (start, open, text.len()))
 }
 
-/// Whether a value uses one of Tailwind's CSS functions.
 fn calls(value: &str) -> bool {
     value.contains("theme(") || value.contains("--spacing(") || value.contains("--alpha(")
 }
 
-/// Splits on `separator` outside brackets, parentheses and strings, like Tailwind's `segment()`.
 fn split(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut stack = Vec::new();
@@ -4744,8 +4686,6 @@ fn modifier(value: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Whether an arbitrary value stays inside its declaration: balanced brackets and strings, and no
-/// top-level `;` or comments.
 fn valid(value: &str) -> bool {
     let mut stack = Vec::new();
     let mut chars = value.chars().peekable();
@@ -4772,7 +4712,6 @@ fn valid(value: &str) -> bool {
     stack.is_empty()
 }
 
-/// Tailwind's named values, like `red-500`, `1.5` or `50%`.
 fn named_value(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -4784,8 +4723,6 @@ fn integer(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Tailwind's decoding of arbitrary values: `_` is a space, except in `url()` and `var()` names, and
-/// math operators get the spaces CSS needs.
 fn decode(raw: &str) -> String {
     let mut value = String::with_capacity(raw.len());
     let mut stack: Vec<bool> = Vec::new();
@@ -4860,7 +4797,6 @@ fn decode(raw: &str) -> String {
     math(&value)
 }
 
-/// Tailwind's spacing around math operators inside `calc()` and the other math functions.
 fn math(value: &str) -> String {
     const MATH: &[&str] = &[
         "calc", "min", "max", "clamp", "mod", "rem", "sin", "cos", "tan", "asin", "acos", "atan",
@@ -4930,7 +4866,6 @@ fn math(value: &str) -> String {
     result
 }
 
-/// Tailwind's `--alpha()`: numbers become percentages and `100%` keeps the color.
 fn with_alpha(color: &str, alpha: &str) -> String {
     let alpha = match alpha.parse::<f64>() {
         Ok(number) => format!("{}%", number * 100.),
@@ -4942,7 +4877,6 @@ fn with_alpha(color: &str, alpha: &str) -> String {
     format!("color-mix(in oklab, {color} {alpha}, transparent)")
 }
 
-/// Replaces `&` with `*`, which is dropped before other simple selectors: `&:hover` is `:hover`.
 fn universal(selector: &str, all: bool) -> String {
     let mut result = String::with_capacity(selector.len() + 2);
     let mut chars = selector.chars().peekable();
@@ -4960,7 +4894,6 @@ fn universal(selector: &str, all: bool) -> String {
     result
 }
 
-/// The negation of a conditional at-rule for `not-*`.
 fn negate(rule: &str) -> Option<String> {
     let (name, params) = rule.split_once(' ')?;
     let params = params.trim();
@@ -4983,7 +4916,6 @@ fn negate(rule: &str) -> Option<String> {
     })
 }
 
-/// Whether `initial` on `cleared`, a variable or a `--name-*` namespace, removes `name`.
 fn removes(cleared: &str, name: &str) -> bool {
     match cleared.strip_suffix("-*") {
         Some(namespace) => name.starts_with(namespace) && !kept(name, namespace),
@@ -4991,7 +4923,6 @@ fn removes(cleared: &str, name: &str) -> bool {
     }
 }
 
-/// Whether `name` belongs to another namespace than `namespace`, like `--font-weight-bold`.
 fn kept(name: &str, namespace: &str) -> bool {
     KEPT.iter().any(|(other, names)| {
         *other == namespace
@@ -5065,7 +4996,6 @@ fn is_length(value: &str) -> bool {
             .any(|prefix| value.starts_with(prefix))
 }
 
-/// Puts each shadow layer's color in `var(name, color)`, so shadow color utilities apply.
 fn shadow_color(shadow: &str, name: &str, alpha: Option<&str>) -> String {
     let replacement = |color: &str| match alpha {
         Some(alpha) => format!("var({name}, oklab(from {color} l a b / {alpha}))"),
@@ -5102,7 +5032,6 @@ fn shadow_color(shadow: &str, name: &str, alpha: Option<&str>) -> String {
         .join(", ")
 }
 
-/// Tailwind's attribute selector quoting: `state=open` becomes `state="open"`.
 fn quote(value: &str) -> String {
     let Some((name, rest)) = value.split_once('=') else {
         return value.to_owned();
@@ -5148,7 +5077,6 @@ fn css(rules: &[Nested]) -> String {
     css
 }
 
-/// A sheet with utilities in `@layer utilities`.
 fn chunk(utilities: &[(Sort, u32, Vec<Rule>)]) -> Rc<Stylesheet> {
     let rules = utilities
         .iter()
@@ -5160,7 +5088,6 @@ fn chunk(utilities: &[(Sort, u32, Vec<Rule>)]) -> Rc<Stylesheet> {
     ))]))
 }
 
-/// Calls `visit` with the selector list of every style rule in `rule`, in order.
 fn selectors(rule: &Rule, visit: &mut impl FnMut(&super::SelectorList)) {
     match rule {
         Rule::Style(list, children) => {
@@ -5181,7 +5108,6 @@ fn selectors(rule: &Rule, visit: &mut impl FnMut(&super::SelectorList)) {
     }
 }
 
-/// Identifiers that follow `prefix` in `text`.
 fn names<'a>(text: &'a str, prefix: &'a str) -> impl Iterator<Item = &'a str> {
     text.match_indices(prefix).filter_map(move |(index, _)| {
         let rest = &text[index + prefix.len()..];

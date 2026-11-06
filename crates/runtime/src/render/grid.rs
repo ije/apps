@@ -8,7 +8,6 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub(crate) struct Measurements {
     pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
-    /// Fields measure their text in device pixels, like Chrome.
     pub(crate) pixel_ratio: f32,
 }
 
@@ -16,20 +15,13 @@ pub(crate) struct Measurements {
 pub(crate) struct Grid {
     pub columns: Vec<f32>,
     pub rows: Vec<f32>,
-    /// Each item, its cell, its margin box, and whether it aligns baselines.
     pub cells: Vec<(usize, [usize; 4], [f32; 4], bool)>,
     pub gap: [f32; 2],
-    /// In an item's slot: the item aligns baselines, which the grid reads from its last layout.
     pub baseline: bool,
-    /// The item that gives the grid its first baseline, which layout reads from that item. In an item's slot:
-    /// that item.
     pub first_item: Option<usize>,
-    /// The grid's first baseline from its content box top, from the first item's last layout. Only a culled
-    /// first item, which did not change, uses it.
     pub first_baseline: Option<f32>,
 }
 
-/// The first and last baselines of grid items from their last layout, by node.
 pub(crate) type Baselines = rustc_hash::FxHashMap<usize, [Option<f32>; 2]>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -425,7 +417,6 @@ fn size(
     if let Some(space) = available
         && table
     {
-        // Table columns grow from their min-content toward their max-content width in proportion to the gap.
         let free = space - base.iter().sum::<f32>() - gaps(count);
         let room: f32 = (0..count).map(|i| limit[i] - base[i]).sum();
         if free > 0. && room > 0. {
@@ -496,7 +487,6 @@ fn size(
     if stretch && let Some(space) = available {
         let free = space - base.iter().sum::<f32>() - gaps(count);
         let automatic: Vec<_> = (0..count).filter(|&i| max(i) == Auto).collect();
-        // Tables give the extra width to columns in proportion to their width, like Chrome.
         let total: f32 = automatic.iter().map(|&i| base[i]).sum();
         if free > 0. {
             for &i in &automatic {
@@ -617,7 +607,6 @@ pub(crate) fn intrinsic(
         };
         content = [width, width, height];
     } else if super::element::text_field(node) {
-        // A percentage width is `auto` for the max-content size, like in Chrome.
         let [width, height] = super::element::field_size(
             doc,
             id,
@@ -630,7 +619,6 @@ pub(crate) fn intrinsic(
         );
         content = [width, width, height];
     } else if let Some(inline) = style::inline_text(doc, styles, id) {
-        // An atomic box takes its own content width in the line.
         let mut runs = inline.runs.to_vec();
         for atom in &inline.atoms {
             let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
@@ -658,7 +646,6 @@ pub(crate) fn intrinsic(
                 word_break,
             )
             .unwrap_or_default();
-        // Where an inline box's padding starts a word, it is part of the word.
         let mut opening = Vec::new();
         let mut at = 0;
         for run in &*runs {
@@ -782,7 +769,6 @@ pub(crate) fn intrinsic(
             }
             let gap = if first { [0.; 2] } else { gaps };
             first = false;
-            // Inline-level children of a block share lines between its block children.
             let inline_level = !flex
                 && (doc.nodes[child].tag.starts_with('#')
                     || doc.nodes[child].tag == "br"
@@ -836,7 +822,6 @@ pub(crate) fn intrinsic(
         content[1] = content[1].max(run);
         content[2] += line[1];
     }
-    // `::before` and `::after` boxes take room in the first and last line, or stack as blocks.
     if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| {
         !matches!(
             node.tag.as_str(),
@@ -931,7 +916,6 @@ pub(crate) fn intrinsic(
         }
     }
     let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
-    // Like Chrome, replaced boxes sized against their container add nothing to the min-content width.
     let min = if matches!(
         node.tag.as_str(),
         "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object" | "input" | "textarea"
@@ -943,8 +927,6 @@ pub(crate) fn intrinsic(
     } else {
         min
     };
-    // An `aspect-ratio` sizes the `box-sizing` box from the width, but a box that doesn't clip still grows
-    // to fit its content, like in Chrome.
     let ratio = vertical[0]
         .is_none()
         .then(|| style.get(Prop::ASPECT_RATIO))
@@ -1110,7 +1092,6 @@ pub(crate) fn layout(
                 .max(0.),
         }
     });
-    // Each string is a row; strings need no space between them, like `'a a''b c'`.
     let area_rows: Vec<Vec<&str>> = areas
         .as_deref()
         .unwrap_or_default()
@@ -1208,7 +1189,6 @@ pub(crate) fn layout(
                 break;
             }
         }
-        // Baseline alignment falls back to the start, or to the end for the last baseline.
         let last = value.starts_with("last");
         match (margins, value.split_whitespace().last().unwrap_or(value)) {
             ([true, true], _) => (Some(0.5), None),
@@ -1229,16 +1209,13 @@ pub(crate) fn layout(
             _ => (Some(0.), None),
         }
     };
-    /// What an item's style says, read once per style.
     #[derive(Clone, Copy)]
     struct Item<'a> {
         flowed: bool,
         order: i32,
         placed: ([Option<usize>; 2], [usize; 2]),
         alignment: [Option<f32>; 2],
-        /// Aligns its first baseline with its row, or its last one when `true`.
         baseline: Option<bool>,
-        /// Whether the minimum size is zero, per axis.
         shrink: [bool; 2],
         auto_width: bool,
         height: Option<&'a str>,
@@ -1246,7 +1223,6 @@ pub(crate) fn layout(
     }
     // WARNING: large grids repeat a few styles over thousands of items, so each style is read once.
     let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
-    // A fieldset's rendered legend sits in its top border, outside its grid.
     let legend = (doc.nodes[id].tag == "fieldset")
         .then(|| super::element::legend(doc, styles, id))
         .flatten()
@@ -1564,7 +1540,6 @@ pub(crate) fn layout(
     };
     let mut offsets = [0.; 2];
     let mut boxes = vec![[0f32; 4]; cells.len()];
-    // How far baseline alignment moves each item down, or up for the last baseline.
     let mut shims = Vec::new();
     for axis in 0..2 {
         if axis == 1 {
@@ -1593,8 +1568,6 @@ pub(crate) fn layout(
                     intrinsic(doc, child, styles, Some(size), None, text, measured)[3]
                 };
                 boxes[index] = [x + (area - size) * fraction.unwrap_or(0.), 0., size, height];
-                // Items in a row align their margin box's distance to the first baseline, or from the last
-                // baseline to the bottom. Without a baseline, the bottom border edge is used.
                 if let (Some(last), Some(&[first, end])) = (
                     derived[index].baseline,
                     baselines.and_then(|baselines| baselines.get(&child)),
@@ -1754,8 +1727,6 @@ pub(crate) fn layout(
             derived[index].baseline.is_some(),
         ));
     }
-    // Like Chrome, the grid's first baseline is the shared one of the first row's items that align their first
-    // baselines, else the first item's in that row. An item without one gives its bottom border edge.
     let top = cells.iter().map(|cell| cell[1]).min();
     if let Some((index, cell)) = cells
         .iter()
@@ -1957,7 +1928,6 @@ mod tests {
             &text,
             &mut Default::default(),
         );
-        // The inputs are 24px of text and 2px of border tall, and `.r a.` is four cells.
         assert_eq!(grid.rows, [26., 26.]);
         let cells: Vec<_> = grid.cells.iter().map(|(_, cell, ..)| *cell).collect();
         assert_eq!(cells[2..], [[1, 1, 1, 1], [2, 1, 1, 1]]);
@@ -1988,7 +1958,6 @@ mod tests {
                 .rows
             })
             .collect();
-        // 300px / 1.25, and a 200px border box gives 160px; a clipping box keeps 30px, others fit their content.
         assert_eq!(rows, [vec![240.], vec![90.]]);
     }
 

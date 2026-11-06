@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The runtime loads the cdylib on macOS and Windows, and links the rlib on Linux, where the render crate already uses wgpu.
+# WARNING: Linux links the rlib, because the renderer already uses wgpu there.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

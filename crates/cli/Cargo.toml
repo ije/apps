@@ -30,7 +30,7 @@ tempfile = "3"
 url.workspace = true
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
-# Puts the WebGPU and media libraries next to test executables.
+# WARNING: these put the WebGPU and media libraries next to test executables.
 [dev-dependencies]
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }

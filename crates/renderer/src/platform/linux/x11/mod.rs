@@ -1,5 +1,3 @@
-//! X11 through xcb, with XInput 2 for the pointer, XKB for keys and XIM for input methods.
-
 mod clipboard;
 mod window;
 
@@ -81,9 +79,7 @@ x11rb::atom_manager! {
     }
 }
 
-/// Selects every pointer device.
 const ALL_DEVICES: xinput::DeviceId = 0;
-/// Selects every device group, which reports the events of its devices.
 const ALL_DEVICE_GROUPS: xinput::DeviceId = 1;
 
 pub(crate) fn check<C: x11rb::connection::RequestConnection>(
@@ -99,7 +95,6 @@ pub(crate) fn reply<C: x11rb::connection::RequestConnection, O: x11rb::x11_utils
     Ok(result?.reply()?)
 }
 
-/// The smooth scrolling axes of a pointer device.
 #[derive(Default)]
 struct Pointer {
     horizontal: Axis,
@@ -109,13 +104,10 @@ struct Pointer {
 #[derive(Default)]
 struct Axis {
     valuator: Option<u16>,
-    /// Lines per scroll unit.
     multiplier: f32,
-    /// The last value, `None` when it may be stale, like after the pointer left.
     value: Option<f32>,
 }
 
-/// An XDND drag of files onto one of our windows.
 #[derive(Default)]
 struct Drag {
     source: xproto::Window,
@@ -124,7 +116,6 @@ struct Drag {
     position: Point<Pixels>,
 }
 
-/// Input method state, from the XIM callbacks.
 #[derive(Default)]
 struct XimHandler {
     im_id: u16,
@@ -237,7 +228,6 @@ struct State {
     cursors: FxHashMap<CursorStyle, Option<xproto::Cursor>>,
     cursor: CursorStyle,
     pointers: BTreeMap<xinput::DeviceId, Pointer>,
-    /// Keys held down, so X11 key repeats are seen as held.
     pressed: Vec<u8>,
     clicks: Clicks,
     drag: Drag,
@@ -249,7 +239,6 @@ pub(crate) struct Client {
     screen: usize,
     root: xproto::Window,
     scale_factor: f32,
-    /// How long one frame of the display takes.
     refresh: Duration,
     state: RefCell<State>,
     clipboard: clipboard::Clipboard,
@@ -399,13 +388,11 @@ impl Client {
         }
     }
 
-    /// Handles the events in the connection's queue.
     pub fn process_events(&self) {
         loop {
             let mut events = Vec::new();
             let mut exposed = Vec::new();
             let mut last_release = None;
-            // Keymap changes refresh the whole state, so one of them is enough.
             let mut keymap_change = None;
             loop {
                 let event = match self.xcb.poll_for_event() {
@@ -434,7 +421,7 @@ impl Client {
                             events.extend(last_release.take());
                             events.push(change);
                         }
-                        // A release right before a press of the same key is X11 key repeat.
+                        // WARNING: A release right before a press of the same key is X11 key repeat.
                         if let Some(Event::KeyRelease(release)) = last_release.take()
                             && (release.detail != press.detail
                                 || press.time.saturating_sub(release.time) > 20)
@@ -470,7 +457,6 @@ impl Client {
         }
     }
 
-    /// Passes an event through the input method first.
     fn filter_event(&self, event: Event) {
         let Some((mut xim, mut handler)) = self.state.borrow_mut().xim.take() else {
             self.handle_event(event);
@@ -505,7 +491,6 @@ impl Client {
             Ok(false) => {
                 self.handle_event(event);
             }
-            // The input method crashed: its events are lost, and keys go straight to the windows.
             Err(error) => {
                 eprintln!("apps: XIM: {error}");
                 self.state.borrow_mut().xim = None;
@@ -534,7 +519,6 @@ impl Client {
         self.state.borrow_mut().xim = Some((xim, handler));
     }
 
-    /// Moves the input method's candidates to the selection.
     fn update_ime_position(&self, callbacks: Callbacks) {
         let Some(area) = ime_area(callbacks) else {
             return;
@@ -647,7 +631,7 @@ impl Client {
                 let window = self.window(event.event)?;
                 {
                     let mut state = self.state.borrow_mut();
-                    // The scroll valuators are global, so a scroll elsewhere must not become one big delta.
+                    // WARNING: the scroll valuators are global, so a scroll elsewhere must not become one big delta.
                     for pointer in state.pointers.values_mut() {
                         pointer.horizontal.value = None;
                         pointer.vertical.value = None;
@@ -762,7 +746,6 @@ impl Client {
                     }
                     (state.composing && state.xim.is_some(), pre_edit)
                 };
-                // A click ends a composition.
                 if composing {
                     self.reset_ime();
                     Ime::Unmark.apply(window.callbacks);
@@ -789,7 +772,7 @@ impl Client {
                         return Some(());
                     }
                 };
-                // Emulated wheel presses come with the smooth scroll motion events, which scroll instead.
+                // WARNING: emulated wheel presses come with the smooth scroll motion events, which scroll instead.
                 if !event
                     .flags
                     .contains(xinput::PointerEventFlags::POINTER_EMULATED)
@@ -866,7 +849,6 @@ impl Client {
             }
             Event::XinputHierarchy(event) => {
                 let mut state = self.state.borrow_mut();
-                // A changed device's scroll values are stale.
                 for info in event.infos {
                     if info.type_ == xinput::DeviceType::SLAVE_POINTER {
                         state.pointers.remove(&info.deviceid);
@@ -1007,7 +989,6 @@ impl Client {
         let _ = self.xcb.flush();
     }
 
-    /// Sends a `_NET_WM_STATE` or other root window message for `window`.
     fn send_wm_message(&self, window: xproto::Window, kind: xproto::Atom, data: [u32; 5]) {
         let message = xproto::ClientMessageEvent::new(32, window, kind, data);
         let _ = self.xcb.send_event(
@@ -1057,7 +1038,6 @@ fn invisible_cursor(xcb: &XCBConnection) -> Result<xproto::Cursor> {
 }
 
 fn scroll_event(position: Point<Pixels>, delta: Point<f32>, modifiers: Modifiers) -> PlatformInput {
-    // Shift turns vertical scrolling horizontal.
     let delta = if modifiers.shift {
         point(delta.y, 0.)
     } else {
@@ -1113,7 +1093,6 @@ fn modifiers_from_xinput(info: xinput::ModifierInfo) -> Modifiers {
     }
 }
 
-/// The XKB state of a key event, whose modifiers can differ from the tracked state.
 fn key_event_state(xkb: &xkbc::State, event: xproto::KeyButMask) -> xkbc::State {
     let mut state = xkbc::State::new(&xkb.get_keymap());
     let latched = xkb.serialize_mods(xkbc::STATE_MODS_LATCHED);
@@ -1145,7 +1124,6 @@ fn fp3232(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
 }
 
-/// The pointer devices and their scroll axes, keeping the scroll values of `previous`.
 fn pointers(
     xcb: &XCBConnection,
     previous: &BTreeMap<xinput::DeviceId, Pointer>,
@@ -1189,11 +1167,9 @@ fn pointers(
     )
 }
 
-/// The smooth scroll delta of a motion event, in lines.
 fn scroll_delta(pointer: &mut Pointer, event: &xinput::MotionEvent) -> Option<Point<f32>> {
     let axis = |axis: &mut Axis| {
         let number = axis.valuator?;
-        // The axis values hold one value for each set bit of the valuator mask, in order.
         let word = event.valuator_mask.get(number as usize / 32)?;
         if word & (1 << (number % 32)) == 0 {
             return None;
@@ -1213,7 +1189,6 @@ fn scroll_delta(pointer: &mut Pointer, event: &xinput::MotionEvent) -> Option<Po
     (x.is_some() || y.is_some()).then(|| point(x.unwrap_or(0.), y.unwrap_or(0.)))
 }
 
-/// The display's refresh interval, from the first active RandR mode.
 fn refresh_interval(xcb: &XCBConnection, root: xproto::Window) -> Duration {
     let mode = reply(xcb.randr_get_screen_resources_current(root))
         .ok()
@@ -1237,7 +1212,6 @@ fn refresh_interval(xcb: &XCBConnection, root: xproto::Window) -> Duration {
     }
 }
 
-/// `Xft.dpi`, or the DPI of the primary monitor, in steps of 1/12.
 fn scale_factor(xcb: &XCBConnection, database: &Database, root: xproto::Window) -> f32 {
     if let Ok(Some(dpi)) = database.get_value::<f32>("Xft.dpi", "Xft.dpi") {
         return dpi / 96.;

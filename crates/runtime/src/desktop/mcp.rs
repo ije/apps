@@ -1,8 +1,3 @@
-//! Devtools MCP server for `apps run --enable-devtools-mcp`.
-//!
-//! It speaks streamable HTTP without sessions, so clients stay connected across `--watch` restarts.
-//! Tool calls run on the main thread in `Desktop::drive`, or in `paused` while the debugger holds the thread.
-
 use super::{Desktop, link::Link, png, window_state};
 use crate::{host::Role, jsc};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -38,7 +33,6 @@ struct Call {
 struct Shared {
     paused: Mutex<Option<String>>,
     pauses: AtomicU64,
-    /// The page side that a debugger paused, plus one.
     page_paused: AtomicU64,
 }
 
@@ -72,10 +66,8 @@ struct State {
     samples: Option<Value>,
 }
 
-/// The calls of the page sides, by their window.
 type Pages = Arc<Mutex<std::collections::BTreeMap<u64, mpsc::Sender<Call>>>>;
 
-/// Lets a page side take its calls on its thread.
 #[derive(Clone)]
 pub(crate) struct Handle(Pages, Arc<Shared>);
 
@@ -92,7 +84,6 @@ impl Handle {
     }
 }
 
-/// Stops the calls of a page side whose window closed.
 pub(crate) fn uninstall() {
     if let Some(pages) = PAGES.get()
         && let Some(key) = CHANNEL.with(|channel| channel.get().map(|(_, _, key)| *key))
@@ -119,7 +110,6 @@ const PAUSED: &str = "The app is paused in the debugger. Resume it with the debu
 // WARNING: pages can redefine globals, so this formatter uses only syntax and builtins it checks itself.
 const SHOW: &str = r#"function(){const seen=new WeakSet(),plain=(v,d)=>{if(typeof v==='bigint')return v+'n';if(typeof v==='symbol'||v===undefined)return String(v);if(typeof v==='function')return`[Function ${v.name||'(anonymous)'}]`;if(v===null||typeof v!=='object')return v;if(typeof Node==='function'&&v instanceof Node)return String(v.outerHTML??v.textContent??'').slice(0,4000);if(v instanceof Error)return`${v.name}: ${v.message}`+(v.stack?'\n'+v.stack:'');if(v instanceof Date)return v.toISOString();if(seen.has(v))return'[Circular]';if(d>4)return Array.isArray(v)?`[Array(${v.length})]`:`[${v.constructor?.name??'Object'}]`;seen.add(v);if(v instanceof Map||v instanceof Set||Array.isArray(v)||ArrayBuffer.isView(v))return Array.from(v).slice(0,100).map(e=>plain(e,d+1));const o={};for(const k of Object.keys(v).slice(0,100)){try{o[k]=plain(v[k],d+1)}catch{o[k]='[Thrown]'}}return o},show=v=>{const p=plain(v,0),s=typeof p==='string'?p:JSON.stringify(p)??String(p);return s.length>120&&typeof p==='object'?JSON.stringify(p,null,1):s};return this instanceof Promise?this.then(show,e=>{throw show(e)}):show(this)}"#;
 
-/// Starts the server on this thread, which runs the main side. Returns what page sides need.
 pub(crate) fn start(port: u16, link: Link) -> Result<Handle> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("Cannot start the devtools MCP server on port {port}"))?;
@@ -150,8 +140,6 @@ pub(crate) fn start(port: u16, link: Link) -> Result<Handle> {
     Ok(handle)
 }
 
-/// Where a call goes. Tools that name no window run on the main side's thread or on the first
-/// window's, and the rest on the thread of their window.
 struct Route {
     pages: Pages,
     main: mpsc::Sender<Call>,
@@ -228,7 +216,6 @@ fn serve(mut stream: TcpStream, route: &Route, shared: &Shared) -> Result<()> {
                 },
                 Err(error) => ("400 Bad Request", "application/json", json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}).to_string().into_bytes()),
             },
-            // Plain HTTP for agents without an MCP client: JSON arguments in, text or PNG out.
             (_, "POST", _, Some(tool)) => match serde_json::from_slice::<Value>(&body).map_err(anyhow::Error::from).and_then(|args| call(tool, args, route, shared)) {
                 Ok(Value::Object(image)) if image.contains_key("image") => (
                     "200 OK",
@@ -293,13 +280,11 @@ fn rpc(request: &Value, route: &Route, shared: &Shared) -> Option<Value> {
 
 fn call(tool: &str, args: Value, route: &Route, shared: &Shared) -> Result<Value> {
     let pages = route.pages.lock().unwrap_or_else(PoisonError::into_inner);
-    // `windows` lists what each page side knows of its windows.
     if tool == "windows" {
         let keys: Vec<_> = pages.keys().copied().collect();
         drop(pages);
         let mut list = Vec::new();
         for key in keys {
-            // A stuck window must not hide the others.
             if let Ok(Value::Array(windows)) =
                 dispatch(tool, args.clone(), Some(key), route, shared)
             {
@@ -460,7 +445,6 @@ fn tools() -> Value {
     ])
 }
 
-/// The tool list as plain text, for agents that call tools with plain HTTP.
 fn help() -> String {
     let mut text = String::from(
         "apps devtools. POST /<tool> with JSON arguments; the answer is text, JSON or PNG.\nMCP clients use POST /mcp.\n",
@@ -510,7 +494,6 @@ fn next(wait: bool) -> Option<Call> {
         .or_else(|| MAIN_CHANNEL.with(|channel| channel.get().and_then(|(calls, _)| take(calls))))
 }
 
-/// Answers a debugger step that ended without pausing again.
 fn settle_step() {
     if STATE.with_borrow(|state| state.paused.is_none())
         && let Some(reply) = STATE.with_borrow_mut(|state| state.stepping.take())
@@ -521,7 +504,6 @@ fn settle_step() {
     }
 }
 
-/// Runs the calls for the main side that arrived. Returns true when it ran one.
 pub(crate) fn poll_main() -> bool {
     if !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
         return false;
@@ -536,7 +518,6 @@ pub(crate) fn poll_main() -> bool {
     ran
 }
 
-/// Runs the calls that arrived. Returns true when it ran one.
 pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
     pump();
     settle_step();
@@ -581,7 +562,6 @@ pub(crate) fn profiling() -> bool {
     FRAMES.with_borrow(Option::is_some)
 }
 
-/// Records the CPU time of one window frame, from render through paint.
 pub(crate) fn frame(window: u64, started: Instant) {
     FRAMES.with_borrow_mut(|frames| {
         if let Some(frames) = frames {
@@ -590,7 +570,7 @@ pub(crate) fn frame(window: u64, started: Instant) {
     });
 }
 
-/// Runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
+// WARNING: runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
 pub(crate) fn paused(ctx: usize, done: *mut bool) {
     pump();
     let page = CHANNEL.with(|channel| channel.get().map(|(_, shared, key)| (shared.clone(), *key)));
@@ -729,7 +709,6 @@ fn request(ctx: usize, method: &str, params: Value) -> Result<Value> {
         .map_err(anyhow::Error::msg)
 }
 
-/// Sends a request whose answer may come later, after promises settle.
 fn request_later(ctx: usize, method: &str, params: Value, done: Waiter) -> Result<()> {
     let id = send(ctx, method, params)?;
     STATE.with_borrow_mut(|state| state.waiting.insert(id, done));
@@ -737,7 +716,6 @@ fn request_later(ctx: usize, method: &str, params: Value, done: Waiter) -> Resul
     Ok(())
 }
 
-/// Enables the debugger of a context once, so its scripts and source maps are known.
 fn attach(ctx: usize) -> Result<()> {
     if !jsc::connect_inspector(ctx)? && STATE.with_borrow(|state| state.sessions.contains_key(&ctx))
     {
@@ -753,7 +731,6 @@ fn attach(ctx: usize) -> Result<()> {
     Ok(())
 }
 
-/// Attaches the debugger for the debugger tool, which also pauses on `debugger` statements.
 fn debug(ctx: usize) -> Result<()> {
     attach(ctx)?;
     request(
@@ -785,7 +762,6 @@ fn page(args: &Value, desktop: &Desktop) -> Result<u64> {
     }
 }
 
-/// Evaluates a page expression that returns JSON-compatible data.
 fn page_value(window: u64, expression: &str) -> Result<Value> {
     let ctx = jsc::context(Role::Renderer(window))
         .with_context(|| format!("Window {window} has no page"))?;
@@ -1223,7 +1199,7 @@ fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
     }
     let host = desktop.host.borrow();
     let mut report = json!({
-        "rss": crate::node::system::system("process.memory", &Value::Null)?,
+        "rss": crate::node::system::call("process.memory", &Value::Null)?,
         "heap": heap,
         "domNodes": host.pages.iter().map(|(id, page)| {
             let (mut attached, mut pending) = (0, vec![0]);
@@ -1282,7 +1258,7 @@ fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
 }
 
 fn cpu_time() -> f64 {
-    let usage = crate::node::system::system("process.cpu", &Value::Null).unwrap_or_default();
+    let usage = crate::node::system::call("process.cpu", &Value::Null).unwrap_or_default();
     (usage["user"].as_f64().unwrap_or(0.) + usage["system"].as_f64().unwrap_or(0.)) / 1000.
 }
 
@@ -1321,7 +1297,6 @@ fn profile_start() -> Result<()> {
                 .find_map(|(ctx, role)| matches!(role, Role::Renderer(_)).then_some(ctx))
         })
         .context("No JavaScript context")?;
-    // Debugger sessions report the scripts and source maps that name the sampled functions.
     for (ctx, _) in jsc::contexts() {
         attach(ctx)?;
     }
@@ -1640,7 +1615,6 @@ fn state(args: &Value) -> Result<Value> {
             "Runtime.getProperties",
             json!({"objectId": id, "ownProperties": true, "generatePreview": true}),
         )?;
-        // The module wrapper's own parameters start with `$`.
         let variables: String = properties["properties"]
             .as_array()
             .into_iter()
@@ -1679,7 +1653,6 @@ fn name(frame: &Value) -> &str {
         .unwrap_or("(anonymous)")
 }
 
-/// A one-line value from a RemoteObject preview.
 fn short(object: &Value) -> String {
     let text = match (object["type"].as_str(), object.get("value")) {
         (Some("undefined"), _) => "undefined".into(),
@@ -1730,7 +1703,6 @@ fn short(object: &Value) -> String {
     }
 }
 
-/// Formats a protocol location as a source file position when a source map covers it.
 fn location(state: &State, location: &Value) -> String {
     let id = location["scriptId"].as_str().unwrap_or("");
     let line = location["lineNumber"].as_i64().unwrap_or(0).max(0) as u32;
@@ -1770,7 +1742,6 @@ fn source_map(script: &Script) -> Option<Rc<SourceMap>> {
 
 struct SourceMap {
     sources: Vec<String>,
-    /// Generated line and column, then source, line and column, sorted by generated position.
     mappings: Vec<[u32; 5]>,
 }
 
@@ -1856,7 +1827,6 @@ impl SourceMap {
         Some((mapping[2], mapping[3], mapping[4]))
     }
 
-    /// The first generated position of an original line, or of the next mapped line.
     fn generated(&self, source: u32, line: u32, column: u32) -> Option<(u32, u32)> {
         self.mappings
             .iter()
@@ -1893,7 +1863,6 @@ mod tests {
                 .values()
                 .any(|script| script.url == "apps:bootstrap")
         }));
-        // Without an MCP client a pause resumes at once.
         assert_eq!(engine.eval("debugger; 'after'", "test").unwrap(), "after");
         drop(engine);
         assert!(jsc::context(Role::Main).is_none());

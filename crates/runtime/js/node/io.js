@@ -16,8 +16,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     #write(chunk, flush) {
       if (this.#id === null) {
         if (!chunk.length && this.#format === 'unzip' && flush !== zlib.constants.Z_FINISH) return null;
-        const kind = this.#format === 'unzip' ? (chunk[0] === 0x1f && chunk[1] === 0x8b ? 'gzip' : 'deflate') : this.#format, o = this.#options;
-        this.#id = sync('zlib.new', kind, this.#inflate, o.level ?? -1, o.windowBits ?? 15, o.dictionary ? input(o.dictionary) : null);
+        const kind = this.#format === 'unzip' ? (chunk[0] === 0x1f && chunk[1] === 0x8b ? 'gzip' : 'deflate') : this.#format, opts = this.#options;
+        this.#id = sync('zlib.new', kind, this.#inflate, opts.level ?? -1, opts.windowBits ?? 15, opts.dictionary ? input(opts.dictionary) : null);
         codecs.register(this, this.#id, this);
       }
       try {
@@ -214,7 +214,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   }
   const fail = (code, message, Type = Error) => { throw Object.assign(new Type(message), { code }); };
   const unsupported = () => fail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
-  // DER readers return [tag, value, next]. Key fields are views of a private copy of the input.
+  // WARNING: DER readers return [tag, value, next]. Key fields are views of a private copy of the input.
   const der = (bytes, at = 0) => {
     let length = bytes[at + 1], start = at + 2;
     if (length > 127) { const count = length & 127; length = 0; for (let i = 0; i < count; i++) length = length * 256 + bytes[start++]; }
@@ -308,19 +308,18 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   class SecretKeyObject extends KeyObject {}
   class PublicKeyObject extends KeyObject {}
   class PrivateKeyObject extends KeyObject {}
-  // Reads a key argument as Node's createPublicKey() or createPrivateKey() would. Private keys are accepted where a public key is wanted.
   const load = (value, want) => {
     if (value instanceof KeyObject || value?.key instanceof KeyObject) {
       const data = keys.get(value.key ?? value);
       if (data.type === want || (want === 'public' && data.type === 'private')) return want === 'public' ? publicOf(data) : data;
       fail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${data.type}, expected ${want}.`, TypeError);
     }
-    const o = typeof value === 'string' || ArrayBuffer.isView(value) || value instanceof ArrayBuffer ? { key: value } : value ?? {}, format = o.format ?? 'pem';
+    const opts = typeof value === 'string' || ArrayBuffer.isView(value) || value instanceof ArrayBuffer ? { key: value } : value ?? {}, format = opts.format ?? 'pem';
     let data;
-    if (format === 'jwk') data = fromJwk(o.key);
+    if (format === 'jwk') data = fromJwk(opts.key);
     else {
-      if (typeof o.key !== 'string' && !ArrayBuffer.isView(o.key) && !(o.key instanceof ArrayBuffer)) fail('ERR_INVALID_ARG_TYPE', 'The "key.key" property must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.', TypeError);
-      let bytes = Buffer.from(input(o.key, o.encoding)), type = o.type;
+      if (typeof opts.key !== 'string' && !ArrayBuffer.isView(opts.key) && !(opts.key instanceof ArrayBuffer)) fail('ERR_INVALID_ARG_TYPE', 'The "key.key" property must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView.', TypeError);
+      let bytes = Buffer.from(input(opts.key, opts.encoding)), type = opts.type;
       if (format === 'pem') {
         const text = bytes.toString('latin1'), match = /-----BEGIN ([A-Z0-9 ]+)-----([^-]*)-----END \1-----/.exec(text);
         if (/-----BEGIN ENCRYPTED|Proc-Type: 4,ENCRYPTED/.test(text)) fail('ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'Encrypted private keys are not supported');
@@ -340,12 +339,12 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const signing = { sha1: ['SHA-1', 20], sha256: ['SHA-256', 32], sha384: ['SHA-384', 48], sha512: ['SHA-512', 64] };
   // WARNING: ring pads RSA-PSS with a salt as long as the digest, so other salt lengths are rejected.
   const signature = (algorithm, data, key, signed) => {
-    const verify = signed !== undefined, o = key !== null && typeof key === 'object' && !ArrayBuffer.isView(key) ? key : {}, value = load(key, verify ? 'public' : 'private');
+    const verify = signed !== undefined, opts = key !== null && typeof key === 'object' && !ArrayBuffer.isView(key) ? key : {}, value = load(key, verify ? 'public' : 'private');
     const name = algorithm == null ? 'sha256' : String(algorithm).toLowerCase().replace(/^(?:rsa-|ecdsa-with-)/, '').replace('-', ''), [hash, size] = signing[name] ?? fail('ERR_CRYPTO_INVALID_DIGEST', `Invalid digest: ${algorithm}`, TypeError);
     let kind = value.kind;
-    if (kind === 'ec') kind = o.dsaEncoding === 'ieee-p1363' ? 'ECDSA' : 'ec';
-    else if (kind === 'rsa' && o.padding === 6) { kind = 'rsa-pss'; if (o.saltLength !== undefined && o.saltLength !== -1 && o.saltLength !== size && !(verify && o.saltLength === -2)) fail('ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'RSA-PSS salts must be as long as the digest'); }
-    else if (kind === 'rsa' && o.padding !== undefined && o.padding !== 1) fail('ERR_INVALID_ARG_VALUE', `The property 'options.padding' is invalid. Received ${inspect(o.padding)}`, TypeError);
+    if (kind === 'ec') kind = opts.dsaEncoding === 'ieee-p1363' ? 'ECDSA' : 'ec';
+    else if (kind === 'rsa' && opts.padding === 6) { kind = 'rsa-pss'; if (opts.saltLength !== undefined && opts.saltLength !== -1 && opts.saltLength !== size && !(verify && opts.saltLength === -2)) fail('ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'RSA-PSS salts must be as long as the digest'); }
+    else if (kind === 'rsa' && opts.padding !== undefined && opts.padding !== 1) fail('ERR_INVALID_ARG_VALUE', `The property 'options.padding' is invalid. Received ${inspect(opts.padding)}`, TypeError);
     const empty = new Uint8Array(0), bytes = input(data, 'utf8');
     const args = [kind, verify ? empty : kind.startsWith('rsa') ? rsaDer(value, 'private') : value.d, kind.startsWith('rsa') ? (verify ? rsaDer(value, 'public') : empty) : value.x, bytes, verify ? input(signed) : empty, hash];
     return verify ? call('web.crypto.verify', ...args) : output(call('web.crypto.sign', ...args));

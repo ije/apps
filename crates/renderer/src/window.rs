@@ -32,88 +32,59 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
 
-/// The root of a window's content.
 pub trait View: 'static {
-    /// Describes the content. Subtrees that did not change can be linked with [`Child::Kept`]
-    /// when `tree` still holds them.
     fn render(&mut self, tree: &Tree, window: &mut Window, cx: &mut App) -> Child;
 
-    /// The window was resized, moved, activated, minimized or otherwise changed.
-    fn window_changed(&mut self, _window: &mut Window, _cx: &mut App) {}
+    fn window_changed(&mut self, window: &mut Window, cx: &mut App);
 
-    /// Key, modifier and file drop events. Call [`App::stop_propagation`] to keep the event from
-    /// the input method.
-    fn event(&mut self, _event: &PlatformInput, _window: &mut Window, _cx: &mut App) {}
+    fn event(&mut self, event: &PlatformInput, window: &mut Window, cx: &mut App);
 
-    // The text input of the focused field, for input methods. Ranges are UTF-16 code units.
-    fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
-        true
-    }
-    fn selected_text_range(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Option<Utf16Selection> {
-        None
-    }
-    fn marked_text_range(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Range<usize>> {
-        None
-    }
+    fn selected_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Utf16Selection>;
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>>;
     fn text_for_range(
         &mut self,
-        _range: Range<usize>,
-        _adjusted: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Option<String> {
-        None
-    }
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String>;
     fn replace_text_in_range(
         &mut self,
-        _range: Option<Range<usize>>,
-        _text: &str,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) {
-    }
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    );
     fn replace_and_mark_text_in_range(
         &mut self,
-        _range: Option<Range<usize>>,
-        _text: &str,
-        _selected: Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) {
-    }
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut App) {}
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    );
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App);
     fn bounds_for_range(
         &mut self,
-        _range: Range<usize>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Option<Bounds<Pixels>> {
-        None
-    }
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>>;
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Option<usize> {
-        None
-    }
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize>;
 }
 
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
-    /// The content bounds, or the outer frame with `outer_size`, in screen points.
     pub bounds: Bounds<Pixels>,
     pub outer_size: bool,
     pub title: String,
-    /// The content extends under a transparent title bar.
     pub titlebar_hidden: bool,
     pub traffic_light_position: Option<Point<Pixels>>,
-    /// No title bar or border at all.
     pub frameless: bool,
     pub transparent: bool,
     pub show: bool,
@@ -140,30 +111,22 @@ impl Default for WindowOptions {
     }
 }
 
-/// The state of a native window. Rectangles are in screen points with the origin at the
-/// top-left of the primary display.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WindowState {
-    /// The outer frame, including the title bar.
     pub frame: Bounds<Pixels>,
     pub content: Bounds<Pixels>,
     pub minimized: bool,
-    /// Maximized, or zoomed on macOS.
     pub maximized: bool,
     pub fullscreen: bool,
-    /// Shown. A minimized window is not.
     pub visible: bool,
     pub resizing: bool,
-    /// The display the window is on, and the part of it that windows can use.
     pub display: Bounds<Pixels>,
     pub work_area: Bounds<Pixels>,
 }
 
-/// What any thread can ask of a native window, without the thread that draws it.
 #[cfg(target_os = "macos")]
 pub use crate::platform::WindowControl;
 
-/// What the main side can ask of a native window. Everything runs on one thread on this platform.
 #[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy)]
 pub struct WindowControl(WindowId);
@@ -225,20 +188,14 @@ impl WindowControl {
     }
 }
 
-/// A change to a native window. Platforms ignore the changes they don't support.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowChange {
-    /// Moves and resizes the outer frame, in the coordinates of [`WindowState::frame`].
     Frame(Bounds<Pixels>),
     Center,
-    /// Shows the window, and focuses it when `true`.
     Show(bool),
     Hide,
-    /// Moves the window behind the other windows.
     Blur,
-    /// Restores a minimized window.
     Restore,
-    /// Limits the outer size to a minimum and a maximum. A zero maximum has no limit.
     SizeLimits(Size<Pixels>, Size<Pixels>),
     AlwaysOnTop(bool),
     Resizable(bool),
@@ -246,27 +203,15 @@ pub enum WindowChange {
     Maximizable(bool),
     Closable(bool),
     Movable(bool),
-    /// The color shown behind the content.
     Background(Rgba),
-    /// The alpha of the whole window, from 0 to 1.
     Opacity(f32),
     Shadow(bool),
-    /// Lets mouse events pass through to the windows below. With the second flag, mouse moves
-    /// still reach the window while it is the key window.
     IgnoreMouse(bool, bool),
-    /// Shows the window on every workspace, and over fullscreen windows with the second flag.
     AllWorkspaces(bool, bool),
-    /// Keeps the content out of screenshots and screen sharing.
     ContentProtection(bool),
-    /// Whether the window can become the key window. It keeps its focus when turned off.
     Focusable(bool),
-    /// Keeps the content width / height at a ratio, after taking an extra size away, while the
-    /// user resizes. A ratio of 0 turns it off.
     AspectRatio(f32, Size<Pixels>),
-    /// Makes the window a child of another window, or its sheet with the second flag. `None`
-    /// detaches it. A child shows above its parent and moves with it.
     Parent(Option<raw_window_handle::RawWindowHandle>, bool),
-    /// An `NSVisualEffectMaterial` behind the content, or `None`, with an `NSVisualEffectState`.
     Vibrancy(Option<isize>, isize),
 }
 
@@ -284,18 +229,14 @@ impl HitboxId {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum HitboxBehavior {
-    /// Doesn't change how other hitboxes are hit.
     #[default]
     Normal,
-    /// Hitboxes behind this one are not hovered, but still scroll.
     BlockMouseExceptScroll,
 }
 
-/// A region that receives the mouse.
 #[derive(Clone, Debug)]
 pub struct Hitbox {
     pub id: HitboxId,
-    /// In the coordinates of `transform`.
     pub bounds: Bounds<Pixels>,
     pub content_mask: ContentMask<Pixels>,
     pub behavior: HitboxBehavior,
@@ -318,9 +259,6 @@ impl Hitbox {
     }
 }
 
-/// A projective map of the plane z = 0 from content coordinates to the window: its own map,
-/// composed with the outer ones. The map of a keyed effect changes between frames, see
-/// [`Window::patch_effect`].
 #[derive(Debug, PartialEq)]
 struct HitTransform {
     local: Cell<[f32; 9]>,
@@ -332,8 +270,6 @@ struct HitTransform {
 }
 
 impl HitTransform {
-    /// Composes the maps again after the local map of `key` became `local`; `done` holds the
-    /// transforms composed already.
     fn refresh(&self, key: u64, local: [f32; 9], done: &mut Vec<*const Self>) {
         if done.contains(&(self as *const Self)) {
             return;
@@ -367,13 +303,10 @@ impl HitTransform {
     }
 }
 
-/// The 3x3 homography of a 4x4 column-major transform on the plane z = 0: columns 0, 1 and 3 of
-/// rows 0, 1 and 3.
 fn plane(m: &[f32; 16]) -> [f32; 9] {
     [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
 }
 
-/// Conjugates a 4x4 column-major transform in logical pixels with the scale factor: device = S * M * S^-1.
 fn device_matrix(mut matrix: [f32; 16], scale: f32) -> [f32; 16] {
     for row in [3, 7, 11] {
         matrix[row] /= scale;
@@ -417,8 +350,6 @@ pub struct PaintQuad {
     pub border_widths: Edges<Pixels>,
     pub border_color: Rgba,
     pub border_style: BorderStyle,
-    /// The sides of the border it paints (top 1, right 2, bottom 4, left 8), or 0 for all. A side ends where
-    /// the line from the outer corner to the inner one meets it, so sides of other colors join like in CSS.
     pub border_sides: u8,
 }
 
@@ -489,7 +420,6 @@ impl Frame {
         self.drag_areas.clear();
     }
 
-    /// Maps hitboxes under the transform keyed `key` with the new transform `matrix`.
     fn turn(&self, key: u64, matrix: &[f32; 16]) {
         let local = plane(matrix);
         let mut done = Vec::new();
@@ -503,7 +433,6 @@ impl Frame {
         }
     }
 
-    /// Fills `ids` with the hit hitboxes, front first, and returns how many of them are hovered.
     fn hit_test(&self, position: Point<Pixels>, ids: &mut Vec<HitboxId>) -> usize {
         ids.clear();
         let mut hovered = None;
@@ -530,17 +459,11 @@ impl Frame {
     }
 }
 
-/// A native window and the state of the frame it draws.
-/// The trackpad gesture going on in a window.
 #[derive(Default)]
 pub(crate) struct ScrollGesture {
-    /// The box that takes the whole gesture, as in browsers.
     pub(crate) latch: Option<ScrollHandle>,
-    /// The box's bounce started, so the rest of the momentum does nothing.
     pub(crate) spent: bool,
-    /// Pixels per second, in the direction of the deltas.
     pub(crate) speed: Point<f32>,
-    /// The outermost box seen at its edge, with the rest of the delta. It stretches when no box moves.
     pub(crate) edge: Option<(ScrollHandle, Point<Pixels>)>,
 }
 
@@ -549,11 +472,8 @@ pub struct Window {
     pub(crate) platform: platform::Window,
     pub(crate) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
-    /// Device pixels per pixel, with the page zoom.
     pub(crate) scale_factor: f32,
-    /// The content size in pixels, with the page zoom.
     pub(crate) viewport_size: Size<Pixels>,
-    /// The page zoom, and the content size and scale factor the platform reported.
     pub(crate) zoom: f32,
     native: (Size<Pixels>, f32),
     tree: Option<Tree>,
@@ -565,7 +485,6 @@ pub struct Window {
     next_hitbox: u64,
     content_masks: Vec<(ContentMask<Pixels>, ContentMask<ScaledPixels>)>,
     offsets: Vec<Point<Pixels>>,
-    /// Light text of the box being painted gets thicker strokes.
     pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     opacity: f32,
@@ -583,13 +502,8 @@ pub struct Window {
     cursor: Option<CursorStyle>,
     drawn_at: std::time::Instant,
     frames_drawn: u64,
-    /// The transforms the compositor plays for promoted layers: key, start, step and transforms,
-    /// so hit testing follows them.
     tracks: Vec<(u64, std::time::Instant, f32, Vec<[f32; 16]>)>,
-    /// Decayed trackpad movement on x and y, and when it last moved. The larger one is the axis
-    /// the gesture scrolls.
     pub(crate) rails: ([f32; 2], std::time::Instant),
-    /// The boxes that may scroll for the wheel event being dispatched, innermost first.
     pub(crate) scroll_chain: Option<Vec<ScrollHandle>>,
     pub(crate) gesture: ScrollGesture,
 }
@@ -664,8 +578,6 @@ impl Window {
         self.zoom
     }
 
-    /// Zooms the page like a browser: pixels grow by `zoom`, so the viewport shrinks by it and
-    /// everything draws again at the new scale. Input from the platform is mapped back.
     pub fn set_zoom(&mut self, zoom: f32) {
         if self.zoom != zoom {
             self.mouse_position = self.mouse_position * (self.zoom / zoom);
@@ -674,7 +586,6 @@ impl Window {
         }
     }
 
-    /// Draws the window on the next frame. Does nothing while drawing; see [`Self::redraw`].
     pub fn refresh(&mut self) {
         if !self.drawing && !self.dirty {
             self.dirty = true;
@@ -682,8 +593,6 @@ impl Window {
         }
     }
 
-    /// Draws the window again before the frame is shown, when called during a draw. A frame
-    /// draws again at most once; later calls wait for the next frame.
     pub fn redraw(&mut self) {
         if self.drawing {
             self.redraw[0] = true;
@@ -692,13 +601,10 @@ impl Window {
         }
     }
 
-    /// Builds the view again before layout, when called while it builds. The boxes of this build stay in
-    /// the tree, so the next one links what did not change.
     pub fn rebuild(&mut self) {
         self.rebuild = true;
     }
 
-    /// Whether this draw replaces one that called [`Self::redraw`].
     pub fn redrawing(&self) -> bool {
         self.redraw[1]
     }
@@ -707,9 +613,6 @@ impl Window {
         self.drawing || self.dirty || !self.captures.is_empty()
     }
 
-    /// Sets the opacity of the effect layer that the last frame painted with `key`, and its transform
-    /// unless `None`, for [`Self::present`]. Hit testing follows the transform. Returns `false` when
-    /// the last frame has no such layer or the transform needs a new frame.
     pub fn patch_effect(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
         let device = transform.map(|matrix| device_matrix(matrix, self.scale_factor));
         if !self.scene.patch(key, opacity.clamp(0., 1.), device) {
@@ -721,19 +624,12 @@ impl Window {
         true
     }
 
-    /// Takes the promoted layers back into the frames that [`Self::present`] shows.
     pub fn demote(&mut self) {
         #[cfg(target_os = "macos")]
         self.platform.demote();
         self.tracks.clear();
     }
 
-    /// Hands the effect layer that the last frame painted with `key` to the compositor, which plays
-    /// `opacities` and, unless `None`, `transforms` (in logical pixels, like [`PaintEffect`]) every
-    /// `step` seconds from now and holds the last ones, so the view draws no frames for it. Returns
-    /// `false` where the platform can't, or right after a drawn frame, or when the layer has other
-    /// effects, is clipped or painted over in its reach; [`Self::patch_effect`] animates it then. A
-    /// new promoted layer shows with the next [`Self::present`], and the next drawn frame takes it back.
     pub fn promote(
         &mut self,
         key: u64,
@@ -838,8 +734,6 @@ impl Window {
         }
     }
 
-    /// Shows the last frame again with its patched layers, without laying out or painting the
-    /// view. Returns `false` when the window draws anyway.
     pub fn present(&mut self) -> bool {
         if self.will_draw() {
             return false;
@@ -849,13 +743,11 @@ impl Window {
         true
     }
 
-    /// Runs `callback` at the start of the next frame, whether or not the window draws.
     pub fn on_next_frame(&mut self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         self.next_frame_callbacks.push(Box::new(callback));
         self.platform.request_frame();
     }
 
-    /// How many frames this window has drawn.
     pub fn frames_drawn(&self) -> u64 {
         self.frames_drawn
     }
@@ -864,7 +756,6 @@ impl Window {
         self.on_next_frame(|window, _| window.refresh());
     }
 
-    /// Draws the window again and passes that frame to `done`: its size in device pixels and RGBA rows.
     pub fn capture(&mut self, done: impl FnOnce(Result<([u32; 2], Vec<u8>)>, &mut App) + 'static) {
         self.captures.push(Box::new(done));
         self.dirty = true;
@@ -882,7 +773,6 @@ impl Window {
         })
     }
 
-    /// Closes the window after the current event.
     pub fn remove_window(&mut self) {
         self.removed = true;
     }
@@ -899,7 +789,6 @@ impl Window {
         self.platform.change(change);
     }
 
-    /// A handle to the native window for the main side.
     pub fn control(&self) -> WindowControl {
         #[cfg(target_os = "macos")]
         return self.platform.control().clone();
@@ -915,25 +804,12 @@ impl Window {
         self.platform.toggle_fullscreen();
     }
 
-    pub fn minimize_window(&self) {
-        self.platform.minimize();
-    }
-
     pub fn zoom_window(&self) {
         self.platform.zoom();
     }
 
-    pub fn activate_window(&self) {
-        self.platform.activate();
-    }
-
     pub fn set_window_title(&mut self, title: &str) {
         self.platform.set_title(title);
-    }
-
-    /// Resizes the content area.
-    pub fn resize(&mut self, size: Size<Pixels>) {
-        self.platform.resize(size);
     }
 
     pub fn start_window_move(&self) {
@@ -942,15 +818,6 @@ impl Window {
 
     pub fn titlebar_double_click(&self) {
         self.platform.titlebar_double_click();
-    }
-
-    /// Shows or hides the traffic lights of a macOS window.
-    pub fn set_window_button_visibility(&self, visible: bool) {
-        self.platform.set_button_visibility(visible);
-    }
-
-    pub fn raw_window_handle(&self) -> Result<raw_window_handle::RawWindowHandle> {
-        self.platform.raw_window_handle()
     }
 
     pub(crate) fn mark_resized(&mut self, size: Size<Pixels>, scale_factor: f32) {
@@ -969,7 +836,6 @@ impl Window {
         self.dirty || !self.next_frame_callbacks.is_empty()
     }
 
-    /// Lays out and paints the view, then shows the frame.
     pub(crate) fn draw(&mut self, cx: &mut App) {
         #[cfg(target_os = "macos")]
         self.platform.demote();
@@ -1059,9 +925,6 @@ impl Window {
         }
     }
 
-    /// Commits, lays out and prepaints `render`'s content without painting or showing it, so a
-    /// view can read current bounds between frames. Like a draw, a pass that calls
-    /// [`Self::redraw`] runs once more. Returns `false` while the window draws.
     pub fn layout(
         &mut self,
         cx: &mut App,
@@ -1110,7 +973,6 @@ impl Window {
         }
     }
 
-    /// Whether the mouse is over a drag area, from the last frame.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn in_drag_area(&self) -> bool {
         self.hit_test
@@ -1118,7 +980,6 @@ impl Window {
             .is_some_and(|top| self.rendered.drag_areas.contains(top))
     }
 
-    /// Sends an input event to the mouse listeners or the view. Returns whether it was handled.
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> bool {
         if let Some(position) = event.mouse_position() {
             self.mouse_position = position;
@@ -1131,8 +992,6 @@ impl Window {
                 self.modifiers = event.modifiers;
                 self.scroll_chain = None;
                 self.gesture.edge = None;
-                // Like Chrome on macOS, a trackpad gesture scrolls on the axis that leads its recent
-                // movement, so a vertical swipe doesn't drift sideways. A pause starts a new gesture.
                 if let ScrollDelta::Pixels(delta) = event.delta {
                     let now = std::time::Instant::now();
                     let elapsed = now - self.rails.1;
@@ -1219,7 +1078,6 @@ impl Window {
                     }
                 }
             }
-            // Listeners added while dispatching belong to a newer frame.
             if self.rendered.mouse_listeners.is_empty() {
                 self.rendered.mouse_listeners = listeners;
             }
@@ -1237,7 +1095,6 @@ impl Window {
         !cx.propagate_event
     }
 
-    /// Stretches a box past its edges by the rest of a trackpad delta. Momentum bounces at once.
     pub(crate) fn overscroll(
         &mut self,
         handle: ScrollHandle,
@@ -1258,12 +1115,10 @@ impl Window {
         self.refresh();
     }
 
-    /// Lets only these boxes scroll for the wheel event being dispatched, innermost first.
     pub fn scroll_only(&mut self, chain: Vec<ScrollHandle>) {
         self.scroll_chain = Some(chain);
     }
 
-    /// Sends a key press like a keyboard would, typing its text when nothing handles it.
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
         let handled = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
@@ -1281,7 +1136,6 @@ impl Window {
         handled
     }
 
-    /// Runs `f` with the view taken out of the window.
     pub(crate) fn with_view<R>(
         &mut self,
         cx: &mut App,
@@ -1317,7 +1171,6 @@ impl Window {
         self.next.cursors.push((hitbox.id, style));
     }
 
-    /// Listens to mouse events of this frame.
     pub fn on_mouse_event<E: MouseEvent>(
         &mut self,
         mut listener: impl FnMut(&E, DispatchPhase, &mut Window, &mut App) + 'static,
@@ -1331,7 +1184,6 @@ impl Window {
             })));
     }
 
-    /// Keeps state for `id` from one frame to the next.
     pub fn with_element_state<S: 'static, R>(
         &mut self,
         id: ElementId,
@@ -1350,7 +1202,6 @@ impl Window {
         result
     }
 
-    /// Whether light text of the box being painted gets thicker strokes.
     pub fn font_smoothing(&self) -> bool {
         self.font_smoothing
     }
@@ -1362,7 +1213,6 @@ impl Window {
         )
     }
 
-    /// Pushes a content mask with its device pixel form, which primitives copy.
     fn push_content_mask(&mut self, mask: ContentMask<Pixels>) {
         let snapped = self.snap_mask(mask);
         self.content_masks.push((mask, snapped));
@@ -1424,7 +1274,6 @@ impl Window {
         result
     }
 
-    /// Maps bounds from the current hit transform's coordinates to the window, as a bounding box.
     pub fn transformed_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         let Some(transform) = &self.hit_transform else {
             return bounds;
@@ -1445,15 +1294,10 @@ impl Window {
         Bounds::from_corners(min, max)
     }
 
-    /// Runs `f` with hit testing mapped through a 4x4 column-major transform from the content's
-    /// coordinates to the window, in logical pixels. Use it in prepaint around content painted
-    /// with a transformed [`PaintEffect`].
     pub fn with_hit_transform<R>(&mut self, m: [f32; 16], f: impl FnOnce(&mut Self) -> R) -> R {
         self.with_keyed_hit_transform(m, None, f)
     }
 
-    /// Like [`Self::with_hit_transform`], for content painted with an effect keyed by `key`, whose
-    /// transform [`Self::patch_effect`] can change.
     pub fn with_keyed_hit_transform<R>(
         &mut self,
         m: [f32; 16],
@@ -1499,12 +1343,10 @@ impl Window {
         )
     }
 
-    /// Rounds half toward zero, but a non-zero stroke keeps at least one device pixel.
     fn snap_stroke(&self, value: Pixels) -> ScaledPixels {
         ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor))
     }
 
-    /// Floors the near edges and ceils the far ones, so the result covers `bounds`.
     fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale = self.scale_factor;
         let left = (bounds.left().0 * scale).floor();
@@ -1532,7 +1374,6 @@ impl Window {
         }
     }
 
-    /// Paints the primitives inside `f` at one draw order, so they keep their paint order.
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         let clipped = bounds.intersect(&self.content_mask().bounds);
         if !clipped.is_empty() {
@@ -1562,7 +1403,6 @@ impl Window {
             self.scene.insert(Primitive::Quad(quad));
             return;
         }
-        // A border-only quad is split around its empty interior, so the inside is not shaded.
         let outer = quad.bounds;
         let inner = largest_border_interior(&quad);
         if inner.is_empty() {
@@ -1588,7 +1428,6 @@ impl Window {
         }
     }
 
-    /// Paints the drop shadows; inset ones are skipped.
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1598,7 +1437,6 @@ impl Window {
         self.paint_shadows(bounds, corner_radii, shadows, false);
     }
 
-    /// Paints the inset shadows, after the background.
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1661,7 +1499,6 @@ impl Window {
         }
     }
 
-    /// Paints everything inside `f` into an offscreen layer, then composites it with the effect.
     pub fn paint_effect<R>(&mut self, effect: PaintEffect, f: impl FnOnce(&mut Self) -> R) -> R {
         let scale = self.scale_factor;
         let content_mask = self.content_mask().scale(scale);
@@ -1765,7 +1602,6 @@ impl Window {
         }
     }
 
-    /// Splits double lines and cuts dots and dashes out of a solid line, with WebKit's lengths.
     fn paint_decoration(&mut self, line: Underline, style: DecorationStyle) {
         let thickness = line.thickness.0;
         let mut second = None;
@@ -1811,7 +1647,6 @@ impl Window {
         }
     }
 
-    /// Paints a glyph with its baseline at `origin.y`.
     pub fn paint_glyph(
         &mut self,
         origin: Point<Pixels>,
@@ -1861,7 +1696,6 @@ impl Window {
         }));
     }
 
-    /// Paints an emoji glyph with its baseline at `origin.y`.
     pub fn paint_emoji(
         &mut self,
         origin: Point<Pixels>,
@@ -1900,7 +1734,6 @@ impl Window {
         }));
     }
 
-    /// The glyph's tile and the offset of its pixels from the glyph origin.
     fn glyph_tile(
         &self,
         params: RenderGlyphParams,
@@ -1932,8 +1765,6 @@ impl Window {
             .map(|(tile, _)| tile)
     }
 
-    /// Paints the part of an image placed at `image_bounds` that `bounds` shows, with `corner_radii`
-    /// applied to that part.
     pub fn paint_image(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -2001,7 +1832,6 @@ impl Window {
         }));
     }
 
-    /// Frees the GPU copy of an image.
     pub fn drop_image(&mut self, image: Arc<RenderImage>) {
         self.platform.atlas().remove(&AtlasKey::Image(image.id));
     }
@@ -2027,7 +1857,6 @@ fn unbounded_mask() -> ContentMask<Pixels> {
     ))
 }
 
-/// The largest rectangle inside a border-only quad that holds no border pixels.
 fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
     let radii = &quad.corner_radii;
     let widths = &quad.border_widths;
@@ -2044,7 +1873,6 @@ fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
             quad.bounds.bottom_right() - far - antialias,
         )
     };
-    // Rounded corners need only be excluded on one axis, so the larger band wins.
     let horizontal = inset(
         point(widths.left, widths.top.max(edge.top)),
         point(widths.right, widths.bottom.max(edge.bottom)),

@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The space a measured node can take along one axis.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum AvailableSpace {
     Definite(Pixels),
@@ -38,7 +37,6 @@ impl From<Pixels> for AvailableSpace {
     }
 }
 
-/// An identifier that keeps a box, and state, from one frame to the next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ElementId(pub u64);
 
@@ -66,7 +64,6 @@ impl From<(&'static str, usize)> for ElementId {
 
 type Listener<E> = Box<dyn FnMut(&E, &mut Window, &mut App)>;
 
-/// What a box measures with, from its text style and its kept state.
 pub type MeasureFn = dyn FnMut(
     &TextStyle,
     Size<Option<Pixels>>,
@@ -74,9 +71,6 @@ pub type MeasureFn = dyn FnMut(
     &mut Window,
 ) -> (Size<Pixels>, Option<[Pixels; 2]>);
 
-/// A box of the tree as the view describes it. The window keeps it in its tree: a node with the
-/// same id, or at the same place in its nearest parent with an id, updates the kept box, so layout
-/// caches survive.
 #[derive(Default)]
 pub struct Node {
     pub(crate) id: Option<ElementId>,
@@ -87,7 +81,6 @@ pub struct Node {
     pub(crate) content: Content,
 }
 
-/// A child of a node: a new description, or the kept subtree of the node with that id.
 // WARNING: boxing the description would allocate for every box built, so children move it instead.
 #[allow(clippy::large_enum_variant)]
 pub enum Child {
@@ -129,7 +122,6 @@ pub(crate) enum Content {
     Layers(bool),
 }
 
-/// The measured state of a leaf, kept while it compares equal.
 pub(crate) trait Measurement {
     fn same(&self, old: Option<&Rc<dyn Any>>) -> bool;
     fn build(self: Box<Self>) -> (Rc<dyn Any>, Box<MeasureFn>);
@@ -167,8 +159,6 @@ where
     }
 }
 
-/// Code a node runs around its own box each frame. `inner` prepaints or paints the box, its
-/// content and its children; hooks keep per-frame state in cells.
 pub trait Hooks: 'static {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window)
@@ -178,7 +168,6 @@ pub trait Hooks: 'static {
     }
 }
 
-/// Hooks around other hooks.
 struct Chain(Rc<dyn Hooks>, Rc<dyn Hooks>);
 
 impl Hooks for Chain {
@@ -229,14 +218,10 @@ impl Hooks for Chain {
     }
 }
 
-/// A node's frame for its hooks.
 pub struct NodeCx<'a> {
     pub window: &'a mut Window,
-    /// The border box in window coordinates, snapped to device pixels.
     pub bounds: Bounds<Pixels>,
-    /// The border box in layout units.
     pub exact: Bounds<Pixels>,
-    /// The first and last baselines from the top of the border box.
     pub baselines: [Option<Pixels>; 2],
     pub text: &'a TextStyle,
     pub style: &'a Style,
@@ -244,12 +229,10 @@ pub struct NodeCx<'a> {
 }
 
 impl NodeCx<'_> {
-    /// The kept state of a measured node.
     pub fn state<S: 'static>(&self) -> Option<&S> {
         self.state?.downcast_ref()
     }
 
-    /// The shaped lines of a text node.
     pub fn text_layout(&self) -> Option<&crate::TextLayout> {
         Some(&self.state?.downcast_ref::<crate::text::TextState>()?.layout)
     }
@@ -279,7 +262,6 @@ impl Node {
         self
     }
 
-    /// Runs `hooks` around the box, outside the hooks it has.
     pub fn hooks(mut self, hooks: impl Hooks) -> Self {
         let outer: Rc<dyn Hooks> = Rc::new(hooks);
         self.hooks = Some(match self.hooks.take() {
@@ -289,20 +271,16 @@ impl Node {
         self
     }
 
-    /// Paints this box in the list of its nearest stacking context, ordered by `order`.
     pub fn z_index(mut self, order: i32) -> Self {
         self.style.z_index = Some(order);
         self
     }
 
-    /// Makes this box a stacking context: its descendants with a z-index paint in its own list.
     pub fn stacking(mut self) -> Self {
         self.style.stacking = true;
         self
     }
 
-    /// A leaf sized by `measure`, from its text style and `state`. While both compare equal, the
-    /// kept state and layout stay; hooks read the kept state with [`NodeCx::state`].
     pub fn measure<S: PartialEq + 'static>(
         mut self,
         state: S,
@@ -344,13 +322,11 @@ impl Node {
         self
     }
 
-    /// Scrolls the overflow with the wheel and keeps the offset in `handle`.
     pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
         self.events().scroll = Some(handle.clone());
         self
     }
 
-    /// Moves the window when dragged, like `app-region: drag`.
     pub fn window_drag_area(mut self) -> Self {
         self.events().drag = true;
         self
@@ -645,15 +621,12 @@ impl Node {
     }
 }
 
-/// Paints the boxes with a z-index of the parent stacking context here: the negative ones, or the
-/// others.
 pub fn layers(negative: bool) -> Node {
     let mut node = node().absolute().w(px(0.)).h(px(0.));
     node.content = Content::Layers(negative);
     node
 }
 
-/// An image that fills its box.
 pub fn img(image: Arc<RenderImage>) -> Node {
     let size = image.size();
     let mut node = node();
@@ -664,7 +637,6 @@ pub fn img(image: Arc<RenderImage>) -> Node {
     node
 }
 
-/// Text in the inherited text style, or with its own runs that cover it.
 pub fn text(text: impl Into<SharedString>, runs: Option<Vec<TextRun>>) -> Node {
     let text = text.into();
     debug_assert!(
@@ -677,9 +649,6 @@ pub fn text(text: impl Into<SharedString>, runs: Option<Vec<TextRun>>) -> Node {
     node
 }
 
-/// A box that paints with closures each frame. Prepaint gets the bounds in layout units, so
-/// positions it records match the boxes around it, and paint gets them snapped to device pixels
-/// with what prepaint returned.
 pub fn canvas<T: 'static>(
     prepaint: impl Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
     paint: impl Fn(Bounds<Pixels>, T, &mut Window) + 'static,
@@ -881,33 +850,25 @@ impl Events {
 
 #[derive(Default)]
 struct ScrollState {
-    /// Zero or negative: how far the content moved up and left.
     offset: Point<Pixels>,
     max_offset: Point<Pixels>,
     bounds: Bounds<Pixels>,
     animation: Option<Animation>,
-    /// A frame callback advances `animation` and `spring`.
     driven: bool,
-    /// How far the content draws past the edges. `offset` stays in range, so scripts don't see it.
     stretch: Point<Pixels>,
     spring: Option<Spring>,
-    /// Stretched by a device that reports no gesture end, so it springs back after a pause.
     loose: bool,
 }
 
-/// Trackpad pixels past an edge for each pixel of stretch, from AppKit's `_NSElasticDeltaForReboundDelta`.
 const STIFFNESS: f32 = 20.;
 
-/// A stretched box going back to its edge, from AppKit's `_NSElasticDeltaForTimeDelta`.
 struct Spring {
     from: Point<Pixels>,
-    /// Pixels per second as it starts, which carries it further out first.
     speed: Point<f32>,
     start: Instant,
 }
 
 impl Spring {
-    /// The stretch at `now`, or `None` once it is back.
     fn at(&self, now: Instant) -> Option<Point<Pixels>> {
         let t = now.saturating_duration_since(self.start).as_secs_f32();
         let damping = (-12.5 * t).exp();
@@ -916,17 +877,12 @@ impl Spring {
             axis(self.from.x, self.speed.x),
             axis(self.from.y, self.speed.y),
         );
-        // It only falls after the peak, at 1 / 12.5 seconds at the latest.
         (t < 0.08 || at.x.abs() >= px(0.25) || at.y.abs() >= px(0.25)).then_some(at)
     }
 }
 
-/// How long a wheel tick scrolls when the box is still.
 const WHEEL: Duration = Duration::from_millis(150);
 
-/// A smooth scroll. Each axis moves by `f(u) = s·u + (3 - 2s)·u² + (s - 2)·u³` of the distance as
-/// `u` goes from 0 to 1, so it starts at `s` times the average speed and stops softly. `s` stays
-/// in 0..=3, where 0 eases in and out and 3 is a cubic ease-out.
 struct Animation {
     from: Point<Pixels>,
     to: Point<Pixels>,
@@ -936,7 +892,6 @@ struct Animation {
 }
 
 impl Animation {
-    /// The offset and the speed in pixels per second at `now`.
     fn at(&self, now: Instant) -> (Point<Pixels>, Point<f32>) {
         let duration = self.duration.as_secs_f32();
         let u = (now.saturating_duration_since(self.start).as_secs_f32() / duration).min(1.);
@@ -953,7 +908,6 @@ impl Animation {
     }
 }
 
-/// The scroll position of a box, shared between frames.
 #[derive(Clone, Default)]
 pub struct ScrollHandle(Rc<RefCell<ScrollState>>);
 
@@ -968,12 +922,10 @@ impl ScrollHandle {
         self.0.borrow().offset
     }
 
-    /// How far the content draws past the edges, on top of `offset`.
     pub fn stretch(&self) -> Point<Pixels> {
         self.0.borrow().stretch
     }
 
-    /// Moves at once and stops a smooth scroll and a bounce.
     pub fn set_offset(&self, offset: Point<Pixels>) {
         let mut state = self.0.borrow_mut();
         state.offset = offset;
@@ -983,8 +935,6 @@ impl ScrollHandle {
         state.loose = false;
     }
 
-    /// Moves by a trackpad delta, taking back the stretch first. Returns whether the box moved and
-    /// what is left past its edges.
     fn pan(&self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
         let state = &mut *self.0.borrow_mut();
         let axis = |offset: &mut Pixels, stretch: &mut Pixels, max: Pixels, mut delta: Pixels| {
@@ -1021,7 +971,6 @@ impl ScrollHandle {
         state.spring = None;
     }
 
-    /// Springs back after a pause in the scroll events, for devices that report no gesture end.
     pub(crate) fn loosen(&self, window: &mut Window) {
         {
             let mut state = self.0.borrow_mut();
@@ -1030,15 +979,12 @@ impl ScrollHandle {
         self.drive(window);
     }
 
-    /// Stops a bounce under new fingers. Returns whether the box is stretched.
     fn hold(&self) -> bool {
         let mut state = self.0.borrow_mut();
         state.spring = None;
         state.stretch != Point::default()
     }
 
-    /// Springs back, going on at `speed` first when that is further out. Returns whether the box is
-    /// stretched.
     pub(crate) fn release(&self, speed: Point<f32>, window: &mut Window) -> bool {
         {
             let mut state = self.0.borrow_mut();
@@ -1067,7 +1013,6 @@ impl ScrollHandle {
         true
     }
 
-    /// Where the box stops: the end of a smooth scroll, or the offset.
     pub fn target(&self) -> Point<Pixels> {
         let state = self.0.borrow();
         state
@@ -1076,13 +1021,6 @@ impl ScrollHandle {
             .map_or(state.offset, |animation| animation.to)
     }
 
-    /// Scrolls smoothly to `offset` from the current position and speed. The box's next frame
-    /// starts it.
-    ///
-    /// A `wheel` tick starts at full speed. It lasts 150 ms, or twice the time since the last
-    /// tick but at least 50 ms, like Firefox. It never starts slower than 1.5 times its average
-    /// speed, so each tick is felt. Other scrolls ease in from rest and take the square root of
-    /// the distance in 60 Hz frames, up to 0.7 seconds, like Chromium.
     pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
         let now = Instant::now();
         let mut state = self.0.borrow_mut();
@@ -1121,8 +1059,6 @@ impl ScrollHandle {
         state.animation = animation;
     }
 
-    /// Advances the smooth scroll and the bounce at the start of each frame, before the view
-    /// renders, so the frame lays out at the new offset.
     pub(crate) fn drive(&self, window: &mut Window) {
         {
             let mut state = self.0.borrow_mut();
@@ -1177,7 +1113,6 @@ impl ScrollHandle {
         self.0.borrow().max_offset
     }
 
-    /// The box's bounds in the last frame.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().bounds
     }
@@ -1189,7 +1124,7 @@ impl ScrollHandle {
         content: crate::Size<Pixels>,
         scale: f32,
     ) -> Point<Pixels> {
-        // Padding was truncated to layout units, so it is truncated the same way here.
+        // WARNING: padding was truncated to layout units, so it is truncated the same way here.
         let snap = |length: crate::Length| match length {
             crate::Length::Px(value) => px(crate::geometry::to_layout_unit(value.0, scale) / scale),
             crate::Length::Fraction(fraction) => bounds.size.width * fraction,
@@ -1203,7 +1138,7 @@ impl ScrollHandle {
             snap(style.padding.left) + snap(style.padding.right),
             snap(style.padding.top) + snap(style.padding.bottom),
         );
-        // Taffy and these sums differ after a few decimals, so the range rounds to two places.
+        // WARNING: Taffy and these sums differ after a few decimals, so the range rounds to two places.
         let round = |value: Pixels| (value * 100.).round() / 100.;
         let max = Point::from(content + padding - bounds.size)
             .map(round)
@@ -1238,7 +1173,6 @@ mod tests {
         assert_eq!(handle.stretch().y, px(2.));
         assert_eq!(handle.pan(delta(20.)), (true, delta(0.)));
         assert_eq!(handle.stretch().y, px(3.));
-        // Going back takes the stretch away first, and the rest scrolls.
         assert_eq!(handle.pan(delta(-80.)), (true, delta(0.)));
         assert_eq!(handle.stretch().y, px(0.));
         assert_eq!(handle.offset().y, px(-20.));
@@ -1263,7 +1197,6 @@ mod tests {
                 .at(start + Duration::from_millis(ms))
                 .map(|at| f32::from(at.y))
         };
-        // The values of `_NSElasticDeltaForTimeDelta`.
         assert!((at(&spring(100., 0.), 50).unwrap() - 53.53).abs() < 0.01);
         assert!((at(&spring(0., 4000.), 100).unwrap() - 35.53).abs() < 0.01);
         assert_eq!(at(&spring(0., 4000.), 0), Some(0.));

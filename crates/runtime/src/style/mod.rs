@@ -19,8 +19,8 @@ pub use color::color;
 pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::expand;
 pub(crate) use text::{
-    InlineText, LineHeight, cursor, font, inline_text, line_height, phantom, restyle,
-    selection_colors, spacing, splits, text_run, text_transform, word_break,
+    InlineText, LineHeight, cursor, font, holds_block_box, inline_text, line_height, makes_no_line,
+    restyle, selection_colors, spacing, text_run, text_transform, word_break,
 };
 pub use value::length;
 pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components};
@@ -34,7 +34,6 @@ pub(crate) const INVISIBLE: u8 = 4;
 pub(crate) const SELECT_NONE: u8 = 8;
 pub(crate) const SELECT_ALL: u8 = 16;
 pub(crate) const SELECT_TEXT: u8 = 32;
-/// The style sets a CSS counter.
 const COUNTED: u8 = 64;
 
 fn flags(style: &Style) -> u8 {
@@ -169,14 +168,12 @@ dialog:popover-open{display:block}
 [popover]:popover-open::backdrop{pointer-events:none!important;background-color:transparent}
 ";
 
-/// Rules for a fullscreen element, which apply only while one is fullscreen, like in Chromium.
 const FULLSCREEN_UA: &str = "
 :not(:root):fullscreen{position:fixed!important;inset:0!important;margin:0!important;box-sizing:border-box!important;min-width:0!important;max-width:none!important;min-height:0!important;max-height:none!important;width:100%!important;height:100%!important;transform:none!important;object-fit:contain}
 iframe:fullscreen{border:none!important;padding:0!important}
 :not(:root):fullscreen::backdrop{background:black}
 ";
 
-/// The `format()` and `tech()` keywords of `@font-face` sources that load. Color fonts draw in one color.
 pub(crate) const FONT_FORMATS: [&str; 5] = ["collection", "opentype", "truetype", "woff", "woff2"];
 pub(crate) const FONT_TECHS: [&str; 2] = ["features-opentype", "variations"];
 
@@ -201,7 +198,6 @@ impl std::hash::Hash for StyleRef {
     }
 }
 
-/// The properties that SVG elements take as presentation attributes and that resvg draws.
 pub(crate) const SVG: [Prop; 43] = [
     Prop::CLIP_PATH,
     Prop::CLIP_RULE,
@@ -248,15 +244,12 @@ pub(crate) const SVG: [Prop; 43] = [
     Prop::FONT_STRETCH,
 ];
 
-/// The property that an SVG presentation attribute sets. `transform` is not one, because its syntax differs
-/// from CSS.
 pub(crate) fn presentation(name: &str) -> Option<Prop> {
     Prop::find(name).filter(|prop| {
         SVG.contains(prop) && !matches!(*prop, Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN)
     })
 }
 
-/// An SVG `transform` attribute as a CSS `transform`, or `None` when it doesn't parse.
 pub(crate) fn svg_transform(value: &str) -> Option<String> {
     let mut result = Vec::new();
     for part in value.split_inclusive(')') {
@@ -295,14 +288,12 @@ pub(crate) fn svg_transform(value: &str) -> Option<String> {
     })
 }
 
-/// The value of a custom property in a sorted list.
 fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {
     vars.binary_search_by_key(&prop, |entry| entry.0)
         .ok()
         .map(|index| &vars[index].1)
 }
 
-/// `vars` with `own` set over them.
 fn merged(vars: Vars, own: &[(Prop, Option<Rc<str>>)]) -> Vars {
     if own
         .iter()
@@ -324,8 +315,6 @@ fn merged(vars: Vars, own: &[(Prop, Option<Rc<str>>)]) -> Vars {
     Rc::new(list)
 }
 
-/// Adds the custom properties that `var()` calls in `value` read. Names that no style has yet are left out and
-/// set `unknown`.
 fn references(value: &str, names: &mut Option<Vec<Prop>>, unknown: &mut bool) {
     let mut rest = value;
     while let Some(list) = names.as_mut()
@@ -345,7 +334,6 @@ struct StyleKey {
     scope: usize,
     tag: String,
     inline: Option<String>,
-    /// The presentation attributes of an SVG element.
     hints: Vec<(Prop, Rc<str>)>,
     parent: Option<StyleRef>,
     font: [u32; 6],
@@ -355,11 +343,9 @@ struct StyleKey {
     columns: usize,
     host: Option<Style>,
     selection: Option<Style>,
-    /// `::slotted()` and `::part()` declarations from the outer tree.
     shadowed: [Option<Vec<Declared>>; 2],
 }
 
-/// The rare inputs of a node's style: `:host` declarations, `::selection`, and `::slotted()` and `::part()`.
 #[derive(PartialEq)]
 struct RareInputs {
     host: Option<Style>,
@@ -367,7 +353,6 @@ struct RareInputs {
     shadowed: [Option<Vec<Declared>>; 2],
 }
 
-/// Hashes font units as a `StyleKey` holds them.
 fn units_hash(bits: &[u32; 6]) -> u64 {
     bits.iter().fold(0, |hash: u64, &bits| {
         (hash.rotate_left(5) ^ u64::from(bits)).wrapping_mul(0x517c_c1b7_2722_0a95)
@@ -376,10 +361,8 @@ fn units_hash(bits: &[u32; 6]) -> u64 {
 
 struct CachedNode {
     parent: Option<StyleRef>,
-    /// The parent's custom properties, and the node's.
     inherited: Option<Vars>,
     vars: Vars,
-    /// Hashes of the font units of the parent and the root.
     font: u64,
     root: u64,
     rare: Option<Box<RareInputs>>,
@@ -429,15 +412,10 @@ impl CachedNode {
 struct CachedStyle {
     used: std::cell::Cell<u64>,
     style: Rc<Style>,
-    /// The parent's custom properties and the node's, from the latest node that used the styles. Later nodes
-    /// with the same parent list then get the same list.
     vars: std::cell::RefCell<(Option<Vars>, Vars)>,
-    /// The inherited custom properties that the styles read, with their values, when the styles hold none,
-    /// so other inherited changes keep the styles.
+    #[allow(clippy::type_complexity)]
     reads: Option<Box<[(Prop, Option<Rc<str>>)]>>,
-    /// The node's own custom properties as they resolved, `None` for invalid ones, which go away.
     own: Box<[(Prop, Option<Rc<str>>)]>,
-    /// `Prop::interned()` when the styles read names that no style had, else 0. A new name may be one of them.
     interned: usize,
     flags: u8,
     lengths: Lengths,
@@ -450,51 +428,37 @@ struct CachedStyle {
     host: Style,
     shadowed: Option<(bool, Shadowed)>,
     starting: Option<Rc<Style>>,
-    /// The font size or line height uses viewport units, so a resize changes the values.
     viewport: bool,
-    /// A keyword took the value of a property that the parent doesn't pass on by itself.
     keyword: bool,
 }
 
-/// A bucket key: id, class, tag or attribute name.
 type Key = Option<(u8, String)>;
-/// Marks pseudo-element selectors in the buckets, by index in `StyleScope.pseudos`.
 const PSEUDO: usize = 1 << (usize::BITS - 1);
 struct StyleScope {
     id: usize,
     used: u64,
     restricted: bool,
-    /// The UA rules include the fullscreen ones.
     fullscreen: bool,
     sheets: Vec<Rc<Stylesheet>>,
-    /// Selectors, declarations with their `!important` flag, and layer.
     rules: Vec<(SelectorList, Vec<Declared>, i32)>,
     layers: Vec<(String, i32)>,
-    /// Pseudo-element kind, selector without it, rule and key.
     pseudos: Vec<(usize, Selector, usize, Key)>,
     arguments: FxHashMap<usize, Rc<str>>,
-    /// Element selectors of each rule, by index in the rule's list.
     elements: Vec<Vec<(usize, Key)>>,
-    /// Rules, and pseudo-element selectors with `PSEUDO`, by the key they require, per key kind.
     buckets: [FxHashMap<String, Vec<usize>>; 4],
     universal: Vec<usize>,
     containers: Vec<Option<ContainerQuery>>,
-    /// The `@media` rules of the sheets, and the ones around each rule.
     blocks: Vec<Rc<MediaBlock>>,
     medias: Vec<Option<MediaStack>>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     properties: Registry,
-    /// Interaction states the selectors use.
     states: u16,
     matches: SelectorCache,
-    /// By node id. Boxed, since the list is as long as the document's node arena in every scope.
+    // WARNING: by node id. Boxed, since the list is as long as the document's node arena in every scope.
     nodes: Vec<Option<MatchedRules>>,
-    /// The matched rule lists of the nodes, shared when equal.
+    #[allow(clippy::type_complexity)]
     lists: rustc_hash::FxHashSet<Rc<[(usize, [usize; 3])]>>,
-    /// The cascade order of each rule. Tailwind's generated rules share one block of keys in
-    /// Tailwind's order, so new utilities join the scope without rebuilding it.
     keys: Vec<u64>,
-    /// The key prefix of Tailwind's block, and of the latest other rule.
     block: Option<u64>,
     sequence: u64,
 }
@@ -508,7 +472,6 @@ type Collected<'a> = (
 );
 
 impl StyleScope {
-    /// Adds collected rules; `tailwind` has the keys of generated rules by selector list.
     fn push(&mut self, rules: Vec<Collected>, tailwind: Option<&FxHashMap<usize, u64>>) {
         let mut lists = Vec::new();
         for (selectors, body, layer, container, media) in rules {
@@ -580,8 +543,6 @@ impl StyleScope {
         }
     }
 
-    /// Adds the new rules of a Tailwind update and restyles only nodes they may match; false when
-    /// the scope must be rebuilt.
     fn insert(
         &mut self,
         update: &tailwind::Update,
@@ -646,7 +607,6 @@ impl StyleScope {
     }
 }
 
-/// Whether a node has the id, class, tag or attribute that a selector requires.
 fn has_key(node: &crate::dom::Node, key: &Key) -> bool {
     match key {
         Some((0, value)) => node.attrs.get("id") == Some(value),
@@ -665,7 +625,6 @@ struct MatchedRules {
     cached: Option<CachedNode>,
     // WARNING: matching collects many duplicates before the dedup, so the list is boxed to its length.
     dependencies: Box<[crate::dom::Dependency]>,
-    /// The list is shared by the nodes of a scope that match the same rules.
     rules: Rc<[(usize, [usize; 3])]>,
     pseudos: Box<[usize]>,
     columns: usize,
@@ -745,16 +704,13 @@ fn derive<R, E>(
 #[derive(Default)]
 pub(crate) struct StyleCache {
     viewport: [f32; 2],
-    /// The scale when font metrics are used.
     pub(crate) metrics: Option<f32>,
     reduced_motion: bool,
     native_theme: u32,
     scopes: Vec<StyleScope>,
     next: usize,
     pass: u64,
-    /// Interaction states used by the scopes of the latest pass.
     pub(crate) states: u16,
-    /// Parsed `<style>` text by node, with the pass that last used it.
     sheets: HashMap<usize, (u64, Rc<str>, Rc<Stylesheet>)>,
     pub(crate) cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: HashMap<u32, Rc<Stylesheet>>,
@@ -764,36 +720,28 @@ pub(crate) struct StyleCache {
     containers: HashMap<usize, [f32; 2]>,
     sized: std::collections::HashSet<usize>,
     queries: QueryCache,
-    /// The last `set_containers` changed the size of a container that container units use.
     pub(crate) units: bool,
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
-    /// Lists of custom properties without the registered ones that don't inherit, by the list they come
-    /// from, which they keep alive. Kept across passes, so children keep the same list.
+    #[allow(clippy::type_complexity)]
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Vars)>,
     pub(crate) scripted: Registry,
     scheme: Option<Rc<str>>,
     pub(crate) spare: Option<SpareStyles>,
-    /// The walks of the document and each shadow tree, by root.
     walks: FxHashMap<usize, Rc<TreeWalk>>,
 }
 
 type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
-/// The `@media` rules around a style rule.
 type MediaStack = Rc<[Rc<MediaBlock>]>;
 
-/// An `@media` rule of the sheets, with its result at the last viewport.
 struct MediaBlock {
     queries: Vec<MediaQuery>,
     matched: std::cell::Cell<bool>,
-    /// It holds more than style rules, like layers or keyframes, so a new result rebuilds the scope.
     fixed: bool,
 }
 type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, FontUnits)>;
-/// A collapsed table: the pass that used it, the styles and columns of its parts, the viewport,
-/// and the styles its borders adjusted.
 type CollapsedTable = (
     u64,
     Vec<(usize, StyleRef, usize)>,
@@ -831,12 +779,10 @@ impl StyleCache {
         walk
     }
 
-    /// The walk of the document, which has no shadow trees or slots in it.
     pub(crate) fn document_walk(&self) -> Option<&crate::dom::Walk> {
         self.walks.get(&0).map(|walk| &walk.walk)
     }
 
-    /// Drops what the scopes keep for nodes that left the document.
     pub(crate) fn forget(&mut self, gone: &[usize]) {
         for scope in &mut self.scopes {
             for &id in gone {
@@ -848,7 +794,6 @@ impl StyleCache {
         }
     }
 
-    /// Drops what the next style pass can compute again, and the room for node ids past `len`.
     pub(crate) fn trim(&mut self, len: usize) {
         self.values = Default::default();
         self.spare = None;
@@ -934,7 +879,6 @@ impl StyleCache {
         true
     }
 
-    /// The `@font-face` rules of the sheets that the latest pass used, in order.
     pub(crate) fn font_faces(&self) -> Vec<(String, String, Option<String>)> {
         let mut seen = std::collections::HashSet::new();
         self.scopes
@@ -1100,7 +1044,6 @@ impl StyleCache {
         result
     }
 
-    /// Ends a style pass: drops the scopes and `<style>` parses it did not use.
     pub(crate) fn finish(&mut self) {
         let pass = self.pass;
         let count = self.scopes.len();
@@ -1139,7 +1082,6 @@ enum Declaration {
     Apply(Vec<String>),
 }
 
-/// Top-level rules are shared, so a sheet that changes or grows copies only the rules it edits.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Stylesheet(Vec<Rc<Rule>>);
 
@@ -1150,15 +1092,10 @@ enum Rule {
     Layer(Vec<String>, Vec<Rule>),
     Supports(String, bool, Vec<Rule>),
     Declarations(Declarations),
-    /// `@theme [inline]`: variables and keyframes.
     Theme(bool, Vec<Rule>),
-    /// `@custom-variant name (template)` or `{ block with @slot }`; in a rule, `@variant name`
-    /// with its `{body}`.
     Variant(String, String),
     Utility(String, String),
     FontFace(Declarations),
-    /// `@import "tailwindcss"` or one of its parts, `Some(true)` when it includes preflight;
-    /// `None` for `@reference`.
     Tailwind(Option<bool>),
     Keyframes(String, Vec<(f32, Declarations)>),
     Container(Option<String>, bool, MediaQuery, Vec<Rule>),
@@ -2569,12 +2506,10 @@ pub(crate) fn resolved(
                     )
                 }
                 Some(m) => format!("matrix3d({})", m.map(number).join(", ")),
-                // Functions that cancel out, like `translateX(0px)`, are still a matrix in browsers.
                 None if value.contains('(') => "matrix(1, 0, 0, 1, 0, 0)".into(),
                 None => value,
             }
         }
-        // Like Chrome: the color first, then every length in px, then `inset`.
         "box-shadow" | "text-shadow" if value != "none" => components(&value, ',')
             .into_iter()
             .map(|shadow| {
@@ -2598,7 +2533,6 @@ pub(crate) fn resolved(
             .collect::<Vec<_>>()
             .join(", "),
         "flex-basis" if value.ends_with('%') => value,
-        // A box that clips or scrolls in one axis can't overflow visibly in the other.
         "overflow-x" | "overflow-y" if matches!(value.as_str(), "visible" | "clip") => {
             let other = if name == "overflow-x" {
                 Prop::OVERFLOW_Y
@@ -2641,7 +2575,6 @@ pub(crate) fn resolved(
             })
             .collect::<Vec<_>>()
             .join(", "),
-        // Browsers give `inset()` the fewest sides, like the `margin` shorthand.
         "clip-path" | "shape-outside" if value.starts_with("inset(") && value.ends_with(')') => {
             let body = &value[6..value.len() - 1];
             let (sides, round) = body
@@ -2733,7 +2666,6 @@ pub(crate) fn resolved(
                     | "column-rule-width"
             ) =>
         {
-            // Only the used-value properties resolve percentages; the others keep them, like `border-radius: 20%`.
             let used = name.starts_with("margin-")
                 || name.starts_with("padding-")
                 || matches!(
@@ -2884,8 +2816,6 @@ pub(crate) fn reduced_motion() -> bool {
 }
 
 impl MediaQuery {
-    /// Kleene logic: `None` is unknown and only `Some(true)` matches.
-    /// Font-relative lengths use `font`: the container's font in container queries.
     fn matches(
         &self,
         width: f32,
@@ -3025,7 +2955,6 @@ impl MediaQuery {
         };
         let boundary = match name {
             _ if op.is_empty() => return Some(actual != 0.),
-            // NaN base rejects percentages.
             "width" | "height" => f64::from(
                 Lengths {
                     font,
@@ -3107,10 +3036,8 @@ struct Collect<'a> {
     native_theme: u32,
     rules: Vec<Collected<'a>>,
     container: Option<ContainerQuery>,
-    /// The `@media` rules around the next rules, and every `@media` rule collected.
     media: Option<MediaStack>,
     blocks: Vec<Rc<MediaBlock>>,
-    /// Full layer names with their path rank: 10 bits per level, siblings in first-seen order.
     layers: Vec<(String, i32)>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     properties: Registry,
@@ -3295,7 +3222,6 @@ impl Rule {
         }
     }
 
-    /// Whether the rule only adds style rules, so it can join a scope under a condition.
     fn plain(&self) -> bool {
         match self {
             Self::Layer(..) | Self::Keyframes(..) | Self::Property(..) | Self::Theme(..) => false,
@@ -3396,23 +3322,16 @@ pub(crate) struct StyleContext {
     pub inherited: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
     pub roots: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
     pub required: Option<rustc_hash::FxHashSet<usize>>,
-    /// The page has a top layer, which fullscreen boxes are in.
     pub top_layer: bool,
     pub animated: HashMap<usize, Style>,
     pub reduced_motion: bool,
     pub theme: u32,
-    /// The device pixel ratio. Font metrics round to device pixels, like Chrome.
     pub scale: f32,
-    /// Loaded font names by the family names pages use.
     pub aliases: HashMap<String, String>,
-    /// `insertCSS()` sheets, which follow the page's sheets, and whether each has the user origin.
     pub inserted: Vec<(Rc<Stylesheet>, bool)>,
-    /// The last styles. A restyle that computes the same values for a node keeps its old style.
     pub previous: Option<Rc<ComputedStyles>>,
 }
 
-/// The nodes of a tree in document order, and those that give style sheets or the color scheme, kept until the
-/// tree changes.
 struct TreeWalk {
     walk: crate::dom::Walk,
     used: std::cell::Cell<u64>,
@@ -3420,7 +3339,6 @@ struct TreeWalk {
     tables: Vec<usize>,
 }
 
-/// The per-node lists of old styles, which the next style pass fills again without allocating them.
 #[derive(Default)]
 pub(crate) struct SpareStyles {
     values: Vec<Rc<Style>>,
@@ -3444,20 +3362,16 @@ impl From<ComputedStyles> for SpareStyles {
 
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
-    /// Whether a box uses `mix-blend-mode`, found on first use.
     blended: std::cell::Cell<Option<bool>>,
     /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
     /// that don't read it. Only nodes with animations or transitions keep theirs, for the keyframes.
     pub values: Vec<Rc<Style>>,
-    /// The custom properties of each node.
     pub vars: Vec<Vars>,
     pub flags: Vec<u8>,
     pub lengths: NodeLengths,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
     pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
-    /// `::backdrop` of the elements in the top layer.
     pub backdrops: FxHashMap<usize, Rc<Style>>,
-    /// `::-webkit-scrollbar`, `-track`, `-thumb`, `-corner` and `-thumb:hover`.
     pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
     pub selections: FxHashMap<usize, Style>,
     pub user_select: Vec<(UserSelect, usize)>,
@@ -3469,7 +3383,6 @@ pub(crate) struct ComputedStyles {
     pub starting: FxHashMap<usize, Rc<Style>>,
     pub list_items: FxHashMap<usize, i64>,
     pub registry: Rc<Registry>,
-    /// The styles of nodes that layout adjusted, like cells of collapsed tables, before the adjustment.
     pub authored: FxHashMap<usize, Rc<Style>>,
 }
 
@@ -3484,7 +3397,6 @@ pub(crate) enum UserSelect {
     All,
 }
 
-/// The computed styles of all nodes by property name.
 pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, String>> {
     let out = compute_styles(
         doc,
@@ -3548,8 +3460,6 @@ pub(crate) fn compute_styles(
     out
 }
 
-/// Lists the font families in `FONT_NAMES` by lowercase name once after fonts change: the installed
-/// and loaded ones, and the `@font-face` families that draw with another one.
 pub(crate) fn font_names(system: &renderer::TextSystem, aliases: &HashMap<String, String>) {
     FONT_NAMES.with(|names| {
         let mut names = names.borrow_mut();
@@ -3569,8 +3479,6 @@ pub(crate) fn font_names(system: &renderer::TextSystem, aliases: &HashMap<String
     });
 }
 
-/// Computes the styles of the nodes reachable from node 0 into `out`, leaving other nodes as they are.
-/// `cache` shares parsed `<style>` text between nodes.
 pub(crate) fn cascade(
     doc: &Document,
     [width, height]: [f32; 2],
@@ -3693,8 +3601,6 @@ pub(crate) fn cascade(
         || style_cache.reduced_motion != reduced_motion
         || style_cache.native_theme != native_theme
     {
-        // A resize keeps the values that resolve no viewport unit, and they get the new viewport
-        // when they are used.
         let resized = style_cache.metrics == metrics
             && style_cache.reduced_motion == reduced_motion
             && style_cache.native_theme == native_theme;
@@ -4176,7 +4082,6 @@ pub(crate) fn cascade(
     out.registry = registry.clone();
     let mut inheritable = std::mem::take(&mut style_cache.inheritable);
     let filtered = registry.values().any(|(_, inherits, _)| !inherits);
-    // Registered properties that don't inherit leave the parent's list.
     let mut inherit = |vars: &Vars| -> Vars {
         if !filtered {
             return vars.clone();
@@ -4275,8 +4180,6 @@ pub(crate) fn cascade(
         let animated = context.and_then(|context| context.animated.get(&id));
         let mut key = None;
         let mut moved = false;
-        // Styles stay with the parent's same list of custom properties, or with the same values of the names
-        // they read, which then gives the node a new list.
         let mut reuse =
             |value: &CachedStyle, old: Option<&Vars>, vars: &Vars| match (old, parent_vars) {
                 (None, None) => Some((vars.clone(), false)),
@@ -4510,7 +4413,6 @@ pub(crate) fn cascade(
                     {
                         hints.push((Prop::TRANSFORM, value.into()));
                     } else if let Some(prop) = presentation(name) {
-                        // Unitless lengths in presentation attributes are pixels.
                         let value = value.trim();
                         let pixels = matches!(
                             prop,
@@ -4668,7 +4570,6 @@ pub(crate) fn cascade(
                 }
             }
         }
-        // Presentation attributes come before all author rules, in a layer of their own.
         for (prop, value) in &key.hints {
             let rank = (false, 0, [0; 4], 0);
             if cascade.get(prop).is_none_or(|(old, _)| rank >= *old) {
@@ -4963,7 +4864,6 @@ pub(crate) fn cascade(
         {
             style.insert(Prop::TEXT_DECORATION_COLOR, ink);
         }
-        // Like Chrome, `th` is centered unless it inherits another alignment.
         if style.get(Prop::TEXT_ALIGN) == Some("-internal-center") {
             let inherited = parent_style
                 .and_then(|parent| parent.get(Prop::TEXT_ALIGN))
@@ -4972,7 +4872,6 @@ pub(crate) fn cascade(
                 .to_owned();
             style.insert(Prop::TEXT_ALIGN, inherited);
         }
-        // Like Chrome, a vertical `-webkit-box` that clamps lines is a block container.
         if style
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
@@ -4990,7 +4889,6 @@ pub(crate) fn cascade(
             };
             style.insert(Prop::DISPLAY, display);
         }
-        // Flex and grid items, floats and absolutely positioned boxes are blockified.
         if !node.tag.starts_with('#')
             && let Some(display) = match style.get(Prop::DISPLAY).unwrap_or("inline") {
                 "inline" | "inline-block" => Some("block"),
@@ -5048,7 +4946,6 @@ pub(crate) fn cascade(
                 let row = parts.get(1).copied().unwrap_or(column);
                 style.insert(Prop::COLUMN_GAP, column);
                 style.insert(Prop::ROW_GAP, row);
-                // Separated borders also keep the spacing between the table's edges and its cells.
                 if spacing != "0" {
                     for (prop, gap) in [
                         (Prop::PADDING_TOP, row),
@@ -5155,7 +5052,6 @@ pub(crate) fn cascade(
                 .and_then(|style| style.get(Prop::FONT_FAMILY))
                 .is_some_and(|family| family.trim().eq_ignore_ascii_case("monospace"))
         };
-        // Font-relative sizes keep the parent's kind, keywords are not absolute, and other lengths are.
         let absolute = match style.get(Prop::FONT_SIZE).filter(|_| explicit_size) {
             None => parent.absolute,
             Some(value)
@@ -5359,7 +5255,6 @@ pub(crate) fn cascade(
                 values
             })
         };
-        // Only boxes in the top layer have a `::backdrop`, and the root never shows one.
         if node.state & crate::dom::TOP_LAYER != 0
             && node.tag != "html"
             && let Some(values) = derive(backdrop)
@@ -5375,7 +5270,6 @@ pub(crate) fn cascade(
                 Rc::new([marker, letter, line, placeholder].map(&derive)),
             );
         }
-        // Scrollbar parts only matter on scroll containers, and on the root and body, which style the page's bar.
         if [&bar, &track, &thumb, &corner, &hovered]
             .iter()
             .any(|cascade| !cascade.is_empty())
@@ -5513,7 +5407,6 @@ pub(crate) fn cascade(
         } else {
             Vec::new()
         };
-        // Pseudo-element animations go with the element's, named apart.
         for (slot, pseudo) in pseudos
             .get(&id)
             .into_iter()
@@ -5544,7 +5437,6 @@ pub(crate) fn cascade(
                     .map(|bits| (bits, font.absolute))
             })
         };
-        // A list made again with the same values keeps last frame's, so the children keep theirs.
         let vars = match context
             .and_then(|context| context.previous.as_deref())
             .and_then(|previous| previous.vars.get(id))
@@ -5945,7 +5837,6 @@ pub(crate) fn cascade(
             }
             continue;
         }
-        // Each shared edge takes the widest border of its cells, rows and row groups, then the strongest style.
         let edge = |id: usize, side: usize| {
             let rank = match styles[id].get(SIDES[side][0]).unwrap_or("none") {
                 "double" => 8,
@@ -6009,7 +5900,6 @@ pub(crate) fn cascade(
                 }
             }
         }
-        // The table's border is one more contender for each outer cell edge, which the cell then draws.
         let mut edges = [0f32; 4];
         let mut cells: Vec<(usize, [Edge; 4])> = Vec::with_capacity(inputs.len());
         for (index, ((_, _, row), sides)) in lines.iter().zip(resolved).enumerate() {
@@ -6029,11 +5919,9 @@ pub(crate) fn cascade(
                 cells.push((cell, sides));
             }
         }
-        // The table and its cells were styled again in this pass, so their old authored styles are stale.
         for (id, ..) in &inputs {
             authored.remove(id);
         }
-        // A cell takes the winning border of each side, from wherever it came.
         let taken: Vec<_> = cells
             .iter()
             .flat_map(|&(cell, sides)| {
@@ -6071,7 +5959,6 @@ pub(crate) fn cascade(
             .entry(table)
             .or_insert_with(|| styles[table].clone());
         let style = Rc::make_mut(&mut styles[table]);
-        // The table keeps half of its outer edges as space, like Chrome.
         for ([_, width, _, padding], widest) in SIDES.into_iter().zip(edges) {
             style.insert(width, "0");
             style.insert(padding, format!("{}px", widest / 2.));
@@ -6093,7 +5980,6 @@ pub(crate) fn cascade(
 
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
 
-/// Moves logical sides in a cascade to the physical sides of its direction, or of the parent's.
 fn physical<V: AsRef<str>>(cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>, parent: &Style) {
     if !LOGICAL
         .iter()
@@ -6446,7 +6332,6 @@ impl Substitution<'_> {
     }
 }
 
-/// `parent_vars` holds the parent's custom properties when `parent` has none.
 fn resolve_style(
     style: &mut Style,
     parent: Option<&Style>,
@@ -6661,7 +6546,6 @@ fn resolve_style(
     });
 }
 
-/// Whether `color-scheme` picks dark colors. `light dark` follows the system appearance, like browsers.
 pub(crate) fn dark(style: &Style) -> bool {
     style.get(Prop::COLOR_SCHEME).is_some_and(|v| {
         v.contains("dark")
@@ -6910,7 +6794,6 @@ impl Stylesheet {
         edit_rules(rules, last, edit, parent, |rule| rule)
     }
 
-    /// The `font-family`, `src` and `unicode-range` of each `@font-face` rule.
     pub(crate) fn font_faces(&self) -> impl Iterator<Item = (String, String, Option<String>)> + '_ {
         self.0.iter().filter_map(|rule| {
             let Rule::FontFace(values) = &**rule else {
@@ -6951,7 +6834,6 @@ impl Stylesheet {
     }
 }
 
-/// The index of the `n`th rule that is not a block of declarations, as CSSOM counts them.
 fn position<R: std::borrow::Borrow<Rule>>(rules: &[R], n: usize) -> Option<usize> {
     rules
         .iter()
@@ -6961,7 +6843,6 @@ fn position<R: std::borrow::Borrow<Rule>>(rules: &[R], n: usize) -> Option<usize
         .map(|(index, _)| index)
 }
 
-/// The rules in a grouping rule. A style rule's selector becomes their parent.
 fn children<'a>(
     rule: &'a mut Rule,
     parent: &mut Option<SelectorList>,
@@ -6979,7 +6860,6 @@ fn children<'a>(
     }
 }
 
-/// Applies a CSSOM edit to the `last`th rule of a top-level or nested rule list.
 fn edit_rules<R: std::borrow::Borrow<Rule> + From<Rule>>(
     rules: &mut Vec<R>,
     last: usize,

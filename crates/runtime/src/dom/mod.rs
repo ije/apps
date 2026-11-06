@@ -2,7 +2,7 @@ mod document;
 mod entities;
 mod selector;
 
-pub use document::{Attrs, Document, Node, escape};
+pub use document::{Document, Node, escape};
 pub(crate) use selector::{
     ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache,
     SelectorList,
@@ -22,17 +22,13 @@ use std::{
     },
 };
 
-/// One visual row of wrapped text: its shift for alignment and indent, its right edge, the extra
-/// space after each space when justified, its first byte, and how far it moves down.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Row {
     pub shift: renderer::Pixels,
     pub right: renderer::Pixels,
     pub gap: renderer::Pixels,
     pub start: usize,
-    /// How far the row moves down: the extra height of the rows above, and its own extra space above.
     pub drop: renderer::Pixels,
-    /// The extra space above the row, when its fonts or line heights need more than the paragraph's.
     pub above: renderer::Pixels,
 }
 
@@ -46,36 +42,26 @@ pub(crate) type SvgBoxes = (
     [f32; 4],
 );
 
-/// A decoded raster, or SVG text and its size.
 type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
 
 pub(crate) struct LayoutNode {
-    /// The hashes of `cull::content`.
     pub shape: u64,
     pub attrs: u64,
-    /// The document revision that the hashes are from.
     pub seen: u64,
     pub style: Rc<style::Style>,
-    /// A hash of the units the style's lengths resolve with.
     pub units: u64,
-    /// A hash of the children in the flow.
     pub list: u64,
-    /// A hash of the children in the flow with their revisions.
     pub kids: u64,
-    /// The summed revisions of the children out of the flow.
     pub(crate) out: u64,
     pub revision: u64,
-    /// The revision of the last change that could move or resize a box in the subtree.
     pub geometry: u64,
-    /// The culling flags of the box's own style.
     pub flags: u16,
-    /// The culling flags that its tag and pseudo-elements give, with `cull::INPUT`.
     pub marks: u16,
 }
 
-/// Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
-/// floats (stale, capacity, layout count, moved), 8 floats per node (x, y, width, height, scroll left, scroll top,
-/// scroll range x, scroll range y), then one byte of `MIRROR_*` flags per node.
+// WARNING: Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
+// floats (stale, capacity, layout count, moved), 8 floats per node (x, y, width, height, scroll left, scroll top,
+// scroll range x, scroll range y), then one byte of `MIRROR_*` flags per node.
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
@@ -94,8 +80,6 @@ impl Drop for MirrorMemory {
     }
 }
 
-/// All nodes of a composed tree in document order, each with its parent's id or `u32::MAX`, kept until the tree
-/// changes. Pages that only change styles, text or attributes then don't chase the children of every node.
 #[derive(Default)]
 pub(crate) struct Walk {
     tree: u64,
@@ -104,8 +88,6 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
-    /// Walks the tree again if it changed, or takes the nodes of `shared` if that is the same walk, and returns
-    /// whether the nodes changed.
     pub(crate) fn update(
         &mut self,
         doc: &Document,
@@ -143,7 +125,6 @@ impl Walk {
     }
 }
 
-/// The shadow hosts in tree order and the nodes assigned to each slot, kept until the tree changes.
 #[derive(Default)]
 struct ShadowWalk {
     tree: u64,
@@ -152,9 +133,6 @@ struct ShadowWalk {
     slots: HashMap<usize, Vec<usize>>,
 }
 
-/// Node states that scripts set: a checked checkbox, radio or option, whether that replaces the
-/// attribute, an open modal dialog, a shown popover and the fullscreen element. The last three are
-/// in the top layer.
 pub(crate) const CHECKED: u16 = 16;
 pub(crate) const DIRTY: u16 = 32;
 pub(crate) const MODAL: u16 = 64;
@@ -163,7 +141,6 @@ pub(crate) const FULLSCREEN: u16 = 512;
 pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
 
 impl Node {
-    /// Whether a checkbox, radio or option is checked, by script state or else by its attribute.
     pub(crate) fn checked(&self) -> bool {
         if self.state & DIRTY != 0 {
             self.state & CHECKED != 0
@@ -176,7 +153,6 @@ impl Node {
         }
     }
 
-    /// Whether the node is a password field, which shows a bullet for each code point like Chrome.
     pub(crate) fn password(&self) -> bool {
         self.tag == "input"
             && self
@@ -185,7 +161,6 @@ impl Node {
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
     }
 
-    /// The text a field shows, see [`bullets`] for the offsets of a password.
     pub(crate) fn shown_text(&self, text: String) -> String {
         if self.password() {
             "\u{2022}".repeat(text.chars().count())
@@ -194,7 +169,6 @@ impl Node {
         }
     }
 
-    /// The current value of an `input`, or `None` for a `textarea` that shows its text.
     pub(crate) fn current_value(&self) -> Option<&str> {
         self.value.as_deref().or_else(|| {
             (self.tag == "input").then(|| self.attrs.get("value").map_or("", String::as_str))
@@ -281,21 +255,18 @@ impl LayoutMirror {
         }
     }
 
-    /// Whether frames turned boxes since the last layout, so their bounds are stale.
     pub(crate) fn moved(&self) -> bool {
         self.memory
             .as_ref()
             .is_some_and(|memory| unsafe { *memory.0.as_ptr().add(3) } != 0.)
     }
 
-    /// Marks the bounds stale until the next layout, so the page lays out before it reads them.
     pub(crate) fn set_moved(&mut self) {
         if let Some(memory) = &self.memory {
             unsafe { *memory.0.as_ptr().add(3) = 1. };
         }
     }
 
-    /// Counts a layout in the third header float, so pages know when cached box sizes are old.
     pub(crate) fn touch(&mut self) {
         self.reserve(0);
         if let Some(memory) = &self.memory {
@@ -308,7 +279,6 @@ impl LayoutMirror {
         }
     }
 
-    /// Marks the nodes that have no box, where `visible` differs from last time's `old`.
     pub(crate) fn hide(&mut self, visible: &[bool], old: &[bool]) {
         if let Some(last) = visible.len().checked_sub(1) {
             self.reserve(last);
@@ -331,7 +301,6 @@ impl LayoutMirror {
         }
     }
 
-    /// The memory for a page `ArrayBuffer`, its size and an owner for `release`.
     pub(crate) fn share(&mut self) -> (*mut std::ffi::c_void, usize, *mut std::ffi::c_void) {
         self.reserve(0);
         let memory = self.memory.clone().expect("Layout memory");
@@ -342,7 +311,6 @@ impl LayoutMirror {
         )
     }
 
-    /// Drops the owner from `share` when JSC collects the buffer, maybe on another thread.
     pub(crate) unsafe extern "C" fn release(
         _: *mut std::ffi::c_void,
         owner: *mut std::ffi::c_void,
@@ -369,17 +337,13 @@ impl std::ops::Index<&usize> for LayoutMirror {
 #[derive(Default)]
 pub struct State {
     pub base: Option<url::Url>,
-    /// Free node ids, the lowest first, so the end of the arena empties and `trim` can cut it.
     pub(crate) free: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
-    /// Nodes taken out of the document since the last style pass.
     pub(crate) removed: Vec<usize>,
-    /// Nodes allocated since the page last reported them to JSC as memory.
     pub(crate) created: usize,
-    /// Nodes that lost their parent since the last release, as candidate roots of garbage subtrees.
     pub(crate) detached: Vec<usize>,
     live: HashSet<usize>,
     pub bounds: LayoutMirror,
-    /// The layout of a node's text, its range in it, the rows, and the top and height of its font in a row.
+    #[allow(clippy::type_complexity)]
     pub(crate) text_layouts: HashMap<
         usize,
         (
@@ -393,14 +357,9 @@ pub struct State {
     pub scroll: HashMap<usize, renderer::ScrollHandle>,
     scroll_offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
-    /// The last styles while `computed` is out of date, so a restyle keeps the old style of nodes whose values
-    /// stay the same.
     previous: Option<Rc<style::ComputedStyles>>,
-    /// The styles before those. Once frames dropped them, the next style pass reuses their lists.
     // WARNING: a list per node is megabytes on big pages, and a new one costs a page fault per 16 KB.
     old_styles: Option<Rc<style::ComputedStyles>>,
-    /// A walk of the composed tree before `display: contents`, with the boxes that are always selectable and
-    /// room for the marks of a pass.
     pub(crate) style_walk: Walk,
     editable: Vec<usize>,
     select_marks: Vec<u8>,
@@ -414,25 +373,18 @@ pub struct State {
             crate::render::grid::Grid,
         ),
     >,
-    /// Grids sized by a flex layout: per axis, the content size their tracks used and the
-    /// padding and borders. Prepaint renders again when the laid-out size differs.
     pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
-    /// The max-content width of grids that shrink to fit, when their tracks were last sized.
     pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
     pub(crate) baselines: crate::render::grid::Baselines,
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
-    /// When each box last painted, counted across frames. Hit tests take the box painted last.
     pub painted: Vec<u64>,
     pub(crate) paint_count: u64,
     pub(crate) inline_text: rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>,
     pub(crate) layout_revision: u64,
-    /// Counts style recomputes, so `layout_flags` knows when the mirror's style bits are old.
     style_epoch: u64,
     layout_epoch: u64,
-    /// Parsed `<style>` and media query text.
     pub(crate) sheets: HashMap<Rc<str>, Rc<style::Stylesheet>>,
-    /// `insertCSS()` sheets by key, with whether each has the user origin.
     pub(crate) inserted: Vec<(String, Rc<style::Stylesheet>, bool)>,
     pub(crate) style_cache: style::StyleCache,
     style_viewport: [f32; 2],
@@ -445,43 +397,25 @@ pub struct State {
     pub selection_caret: Option<usize>,
     pub dirty: bool,
     pub frame_requested: bool,
-    /// The page listens to wheel events, so native wheel events go to it first.
     pub(crate) wheel: bool,
     pub canvases: HashMap<usize, crate::render::canvas::Canvas>,
     pub images: HashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
-    /// Shadow hosts by shadow root.
     pub(crate) hosts: HashMap<usize, usize>,
-    /// Replaced or removed images whose GPU atlas tiles the renderer must drop.
     pub retired: Vec<Arc<renderer::RenderImage>>,
-    /// Canvases and videos with a replaced image in `retired` or `recycled`.
     pub(crate) retired_canvases: HashSet<usize>,
-    /// Replaced video frames by node, whose pixels go back to the media library once the renderer dropped them.
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
-    /// Images that workers decoded, by node and request.
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
-    /// The latest frames of offscreen canvases, by the `<canvas>` of this page that shows them.
     frames: Frames,
-    /// Where the offscreen canvases of this page send their frames, by node.
     pub(crate) placeholders: HashMap<usize, Placeholder>,
-    /// The latest decode request by node.
     decoding: HashMap<usize, u64>,
-    /// Empty nodes that the page reserved for `dom.batch` creates.
     pub(crate) reserved: HashSet<usize>,
-    /// Inline SVG sources by `<svg>` node.
     pub(crate) svg_sources: HashMap<usize, String>,
-    /// Inline SVG geometry by `<svg>` node: the source it came from, the nodes of elements with their own
-    /// ids, the SVG's size, and each element's node with its canvas box and object box.
     pub(crate) svg_boxes: HashMap<usize, SvgBoxes>,
-    /// Inline SVG trees that prepaint parsed for their boxes and paint draws next.
     pub(crate) svg_trees: HashMap<usize, resvg::usvg::Tree>,
     pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
-    /// Rasterized `clip-path` and `mask-image` shapes, by node.
-    /// `None` for a mask that is fully opaque, so nothing draws it.
     pub(crate) masks: HashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
     pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
-    /// The geometry and small rasters of inline SVGs by source, so the icons of a list that recycles its rows are
-    /// parsed and drawn once.
     pub(crate) svg_cache: HashMap<
         String,
         (
@@ -490,45 +424,32 @@ pub struct State {
         ),
     >,
     pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
-    /// Gradient bitmaps by their inputs, oldest first, that boxes built again reuse, like the rows of a
-    /// scrolling list.
     pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
     pub font_aliases: HashMap<String, String>,
-    /// The `@font-face` URLs tried, with the font family of the ones that loaded.
     pub(crate) fonts: HashMap<String, Option<String>>,
-    /// How many fonts were added, from `@font-face` or `FontFace`.
     pub(crate) font_loads: u32,
-    /// The node revision whose text no waiting `unicode-range` face uses.
     pub(crate) font_text: Option<u64>,
     pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
-    /// The native window's state at the last frame.
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
-    /// The declarations the lint checked, by pseudo-element index.
     pub(crate) checked: rustc_hash::FxHashSet<(u8, style::Prop, Rc<str>)>,
     pub(crate) motion: style::Motion,
     pub(crate) animated: HashMap<usize, style::Style>,
     pub(crate) animating: HashMap<usize, Rc<style::Style>>,
-    /// The animated `::before` and `::after` styles of the last frame.
     pub(crate) animating_pseudos: HashMap<usize, Rc<[style::Style; 2]>>,
-    /// Nodes with an animated color in the last frame, whose paragraphs draw it from their inline text.
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: HashMap<usize, [f32; 2]>,
-    /// The width, height and baseline of the atomic inline boxes in text, from the last layout.
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
-    /// The padding boxes of containing blocks. They stay between frames, so absolute boxes size in last frame's.
     pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
-    /// The top layer: modal dialogs, shown popovers and fullscreen elements, in the order they went in.
     pub top_layer: Vec<usize>,
 }
 
 impl State {
-    /// Copies scroll offsets and ranges into the layout mirror.
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
             let (offset, max) = (scroll_offset(handle, handle.offset()), handle.max_offset());
@@ -544,7 +465,6 @@ impl State {
         }
     }
 
-    /// Drops the caches of nodes that left the document.
     // WARNING: such nodes wait for a GC to be freed, and a scrolling list makes them much faster than GCs run,
     // so they would outnumber the nodes in the document. A node that comes back computes them again.
     fn drop_removed(&mut self, doc: &Document) {
@@ -573,8 +493,6 @@ impl State {
         }
     }
 
-    /// Gives back memory while the page is quiet: cuts the free end of the node arena, and drops caches that
-    /// the next style pass fills again. Returns whether the arena shrank, so arrays by node need a new frame.
     pub(crate) fn trim(&mut self, doc: &mut Document) -> bool {
         self.drop_removed(doc);
         let before = doc.nodes.len();
@@ -611,7 +529,6 @@ impl State {
         len < before
     }
 
-    /// Marks the styles out of date.
     pub(crate) fn invalidate(&mut self) {
         if let Some(computed) = self.computed.take() {
             self.previous = Some(computed);
@@ -693,7 +610,6 @@ fn slots(
     slots
 }
 
-/// Where an `OffscreenCanvas` sends its frames: a `<canvas>` of a page, maybe on another thread.
 #[derive(Clone)]
 pub(crate) struct Placeholder {
     frames: Frames,
@@ -758,7 +674,6 @@ fn pixmap(image: &renderer::RenderImage) -> Option<resvg::tiny_skia::Pixmap> {
     Some(pixels)
 }
 
-/// Shows a new frame of video `id`, or none. Returns the replaced frame when no window drew it.
 pub(crate) fn show_frame(
     state: &mut State,
     id: usize,
@@ -1022,7 +937,6 @@ pub fn call(
             return Ok(json!(style::easing(easing, args[1].as_f64().unwrap_or(0.))));
         }
         if op == "dom.animation" {
-            // Arguments: the animation id, its target node, and its state, or none to remove it. Times are in ms.
             let id = args[0].as_u64().context("Expected an animation")? as u32;
             state.dirty = true;
             // WARNING: the last frame's animated style of the node is stale now, so getComputedStyle samples again.
@@ -1435,7 +1349,6 @@ pub fn call(
             };
             let focus = if op == "dom.focus" { FOCUS } else { 0 };
             let used = state.style_cache.states & (flag | focus) != 0;
-            // Form controls draw their own hover and pressed looks.
             let control = |id: &usize| {
                 doc.nodes.get(*id).is_some_and(|node| {
                     matches!(
@@ -1617,7 +1530,6 @@ pub fn call(
                 Ok(tree(doc, id, false))
             }
             "dom.cssAnimations" => {
-                // The CSS animations and transitions of the node, or with `subtree` of its tree in tree order.
                 let system = state.text_system.clone();
                 let styles = styles(
                     doc,
@@ -1641,7 +1553,6 @@ pub fn call(
                 )))
             }
             "dom.animated" => {
-                // The values that script animations give the node now, for `commitStyles()`.
                 let system = state.text_system.clone();
                 let styles = styles(
                     doc,
@@ -1672,7 +1583,6 @@ pub fn call(
                 if let Some(style) = styles.values.get(id) {
                     state.motion.read(id, style);
                 }
-                // Script animations show their values at once, not from the last frame.
                 let slot = match pseudo {
                     "" => Some(0),
                     "before" => Some(1),
@@ -1714,7 +1624,6 @@ pub fn call(
                     }
                     (style, _) => style,
                 };
-                // Styles hold no custom properties, unless they animate or declare their own.
                 let mut full = None;
                 let style = match style {
                     Some(style)
@@ -1758,7 +1667,6 @@ pub fn call(
                         let value =
                             style::resolved(style, &units, name, size, container, &registry);
                         let tag = doc.nodes[id].tag.as_str();
-                        // Tables lay out as grids, but report their table display like browsers.
                         json!(match (name, value.as_str()) {
                             ("display", "grid") if tag == "table" => "table".to_owned(),
                             ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
@@ -1777,7 +1685,6 @@ pub fn call(
                             ("display", "block") if matches!(tag, "td" | "th") =>
                                 "table-cell".to_owned(),
                             ("display", "block") if tag == "caption" => "table-caption".to_owned(),
-                            // `auto` minimum sizes are 0 outside flex and grid containers.
                             ("min-width" | "min-height", "auto")
                                 if parent.is_none_or(|parent| {
                                     parent.get(Prop::DISPLAY).is_none_or(|display| {
@@ -1787,7 +1694,6 @@ pub fn call(
                             {
                                 "0px".to_owned()
                             }
-                            // A relatively positioned box with `auto` offsets doesn't move.
                             ("top" | "right" | "bottom" | "left", "auto")
                                 if style.get(Prop::POSITION) == Some("relative") =>
                             {
@@ -1902,7 +1808,6 @@ pub fn call(
                     .or_default()
                     .clone();
                 let previous = handle.offset();
-                // Like Chrome, scripts scroll in whole device pixels.
                 let ratio = state.pixel_ratio.max(1.);
                 let axis = |value: &Value, current: renderer::Pixels| {
                     renderer::px(
@@ -2211,7 +2116,6 @@ pub fn call(
                 })
             }
             "dom.svgBox" => {
-                // An SVG element's box in its own coordinates; the root's covers its content.
                 let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
                     .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
                 Ok(json!(
@@ -2458,7 +2362,6 @@ pub fn call(
                 );
                 let (style, units) = (&computed.values[id], &computed.lengths[id]);
                 let tag = doc.nodes[id].tag.as_str();
-                // Table rows and row groups have the box of their cells, without borders or padding.
                 if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
                     && style.get(Prop::DISPLAY) == Some("contents")
                 {
@@ -2471,7 +2374,6 @@ pub fn call(
                 {
                     return Ok(json!([0.; 8].as_slice()));
                 }
-                // A cell of a collapsed table owns half of each border it shares.
                 let shared = matches!(tag, "td" | "th")
                     && std::iter::successors(doc.nodes[id].parent, |&parent| {
                         doc.nodes[parent].parent
@@ -2520,7 +2422,6 @@ pub fn call(
                         Some(look.space(look.shown(scrolls, handle.max_offset())))
                     })
                     .unwrap_or_default();
-                // `both-edges` reserves the gutter on both sides.
                 let gutters = if style
                     .get(Prop::SCROLLBAR_GUTTER)
                     .is_some_and(|value| value.contains("both-edges"))
@@ -2648,7 +2549,6 @@ pub fn call(
     })())
 }
 
-/// The nodes of a subtree in document order, each as `id, parent, tag, text, attribute count, names and values`.
 fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     let mut list = Vec::new();
     let mut pending: Vec<_> = if inclusive {
@@ -2683,7 +2583,6 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     Value::Array(list)
 }
 
-/// `offset` clamped to the scroll range of `handle`, once its box was laid out.
 fn scroll_offset(
     handle: &renderer::ScrollHandle,
     mut offset: renderer::Point<renderer::Pixels>,
@@ -2697,7 +2596,6 @@ fn scroll_offset(
     offset
 }
 
-/// Adds font data for the CSS `family`, from `FontFace` or `@font-face`, and returns its font family.
 pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<String> {
     const LIMIT: usize = 32 * 1024 * 1024;
     let system = state
@@ -2755,7 +2653,6 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
         .first()
         .and_then(|id| database.face(*id))
         .context("Unsupported or invalid font data")?;
-    // A face of the same family, like one weight of several, keeps the family itself.
     let name = face
         .families
         .iter()
@@ -2769,8 +2666,6 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
     Ok(name)
 }
 
-/// Uses the installed font family `name` for the CSS `family`, like `local()` in `@font-face`.
-/// Returns false when no such family is installed.
 pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
     let Some(system) = state.text_system.clone() else {
         return false;
@@ -2785,8 +2680,6 @@ pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
     true
 }
 
-/// Restyles the page for changed fonts, where the CSS `family` draws with the font family `name`.
-/// Without `added` font data, a family that draws with a font already keeps it.
 pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool) {
     let same = name.eq_ignore_ascii_case(family);
     if !added && (same || state.font_aliases.contains_key(family)) {
@@ -2805,7 +2698,6 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     state.dirty = true;
 }
 
-/// Writes the overflow clip and positioned flags of current styles into the layout mirror.
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
     let system = state.text_system.clone();
     let computed = styles(
@@ -2846,7 +2738,6 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
     }
 }
 
-/// The parent of a node in the flat tree: slotted nodes go up to their slot, shadow roots to their host.
 pub(crate) fn flat_parent(
     doc: &Document,
     state: &State,
@@ -2863,8 +2754,6 @@ pub(crate) fn flat_parent(
     }
 }
 
-/// The nodes at `x`, `y`, topmost first, or with `first` only the topmost element. With `caret`, the
-/// text node nearest to the point within the topmost element.
 pub(crate) fn hit_test(
     doc: &Document,
     state: &State,
@@ -2881,7 +2770,6 @@ pub(crate) fn hit_test(
             .parent
             .or_else(|| state.hosts.get(&id).copied())
     };
-    // Boxes of the top layer escape the clips of their ancestors.
     let top: Vec<usize> = state
         .top_layer
         .iter()
@@ -2976,9 +2864,6 @@ pub(crate) fn hit_test(
             );
         }
     }
-    // Hits come deepest and last in the tree first. The box painted last is on top, so z-index
-    // and positioned boxes win over later siblings. Text and boxes that don't paint use their
-    // nearest painted ancestor.
     hits.sort_by_key(|&id| {
         std::cmp::Reverse(
             std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
@@ -2986,7 +2871,6 @@ pub(crate) fn hit_test(
                 .unwrap_or(0),
         )
     });
-    // A `::backdrop` covers what paints before its box and hits as that box.
     for &id in top.iter().rev() {
         if hits.first().is_some_and(|&hit| {
             std::iter::successors(Some(hit), |&hit| up(hit)).any(|hit| hit == id)
@@ -3455,17 +3339,14 @@ fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
     }
 }
 
-/// The bullets that a password field shows before UTF-16 offset `offset` of its `value`.
 pub(crate) fn bullets(value: &str, offset: usize) -> usize {
     value[..utf16_index(value, offset)].chars().count()
 }
 
-/// The UTF-16 offset in a password `value` after `bullets` of its bullets.
 pub(crate) fn unbullet(value: &str, bullets: usize) -> usize {
     value.chars().take(bullets).map(char::len_utf16).sum()
 }
 
-/// The byte in `shown` for a UTF-16 offset in `source`, the node's text before its white space collapsed.
 pub(crate) fn shown_index(source: &str, shown: &str, offset: usize) -> usize {
     if source.is_empty() || source == shown {
         return utf16_index(shown, offset);
@@ -3487,7 +3368,6 @@ pub(crate) fn shown_index(source: &str, shown: &str, offset: usize) -> usize {
     rest.peek().map_or(shown.len(), |&(byte, _)| byte)
 }
 
-/// The UTF-16 offset in `source` for a byte in `shown`, see [`shown_index`].
 pub(crate) fn source_offset(source: &str, shown: &str, byte: usize) -> usize {
     if source.is_empty() || source == shown {
         return shown[..byte].encode_utf16().count();

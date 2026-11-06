@@ -1,6 +1,3 @@
-//! Wayland through wayland-client: xdg-shell toplevels, server decorations where the compositor
-//! has them, and text-input for input methods.
-
 mod window;
 
 pub(crate) use window::Window;
@@ -64,14 +61,11 @@ use wayland_protocols::{
 };
 use xkbcommon::xkb;
 
-/// Linux key codes are XKB key codes minus 8.
 const MIN_KEYCODE: u32 = 8;
-/// The text formats offered, then the ones read.
 const TEXT_MIME_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 const READ_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
 const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 
-/// The dispatch target of the event queue.
 #[derive(Clone)]
 pub(crate) struct Handle(Weak<Client>);
 
@@ -94,19 +88,16 @@ pub(super) struct Output {
     scale: i32,
 }
 
-/// An offer of data from another app, with its formats.
 struct Offer {
     offer: wl_data_offer::WlDataOffer,
     mime_types: Vec<String>,
 }
 
-/// Files dragged onto a window.
 #[derive(Default)]
 struct Drag {
     offer: Option<wl_data_offer::WlDataOffer>,
     window: Option<ObjectId>,
     position: Point<Pixels>,
-    /// Tells an old read of the file list from the current one.
     generation: u64,
 }
 
@@ -117,9 +108,7 @@ struct Repeat {
     key: Option<xkb::Keycode>,
 }
 
-/// The cursor drawn from the cursor theme, when the compositor has no cursor shapes.
 struct ThemeCursor {
-    /// The theme, loaded for a scale.
     theme: Option<(CursorTheme, i32)>,
     size: u32,
     shm: wl_shm::WlShm,
@@ -128,7 +117,6 @@ struct ThemeCursor {
 
 struct State {
     windows: FxHashMap<ObjectId, Weak<window::Shared>>,
-    /// By protocol id.
     outputs: FxHashMap<u32, Output>,
     output_globals: FxHashMap<u32, wl_output::WlOutput>,
     seat: wl_seat::WlSeat,
@@ -140,7 +128,6 @@ struct State {
     data_device: Option<wl_data_device::WlDataDevice>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     enter_serial: u32,
-    /// The latest key or button press, which focus and selection requests must name.
     press: Option<(u32, wl_surface::WlSurface)>,
     keymap: Option<xkb::State>,
     compose: Option<xkb::compose::State>,
@@ -160,7 +147,6 @@ struct State {
     discrete: Option<Point<f32>>,
     offers: Vec<Offer>,
     selection: Option<usize>,
-    /// Our clipboard text, and the last text read from another app.
     clipboard: Option<String>,
     cached: Option<String>,
     drag: Drag,
@@ -172,13 +158,10 @@ pub(crate) struct Client {
     qh: QueueHandle<Handle>,
     globals: Globals,
     state: RefCell<State>,
-    /// Marks our own clipboard offers.
     self_mime: String,
 }
 
 impl Client {
-    /// Connects to the compositor. With `need_decorations`, a compositor without server
-    /// decorations is an error, so the caller can use XWayland instead.
     pub fn new(handle: &LoopHandle<'static, ()>, need_decorations: bool) -> Result<Rc<Self>> {
         let conn = Connection::connect_to_env().context("connecting to the Wayland compositor")?;
         let (globals, mut queue) =
@@ -189,7 +172,6 @@ impl Client {
         globals.contents().with_list(|list| {
             for global in list {
                 match &global.interface[..] {
-                    // The frame event of wl_pointer needs version 5.
                     "wl_seat" if global.version >= 5 => {
                         seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
                             global.name,
@@ -294,7 +276,7 @@ impl Client {
                 clipboard: None,
                 cached: None,
                 drag: Drag::default(),
-                // Removed from the environment below, so child processes don't take it.
+                // WARNING: removed from the environment below, so child processes don't take it.
                 startup_token: std::env::var("XDG_ACTIVATION_TOKEN")
                     .ok()
                     .filter(|token| !token.is_empty()),
@@ -310,7 +292,6 @@ impl Client {
             "the Wayland compositor has no server decorations"
         );
         let mut dispatch = Handle(Rc::downgrade(&client));
-        // The seat and outputs are known before the first window opens.
         queue
             .roundtrip(&mut dispatch)
             .context("reading the Wayland state")?;
@@ -354,7 +335,6 @@ impl Client {
         }
     }
 
-    /// Asks for focus. Compositors give it only when the latest press was in one of our windows.
     fn activate(&self, surface: &wl_surface::WlSurface) {
         let Some(activation) = &self.globals.activation else {
             return;
@@ -418,7 +398,6 @@ impl Client {
             .map_err(|error| eprintln!("apps: clipboard: {error:#}"))
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())?
-            // Other apps can send Windows line endings.
             .replace("\r\n", "\n");
         state.cached = Some(text.clone());
         Some(text)
@@ -533,7 +512,6 @@ fn shape(style: CursorStyle) -> Shape {
     }
 }
 
-/// Writes `bytes` to another app's pipe from the event loop, without blocking it.
 fn send_bytes(fd: OwnedFd, bytes: Vec<u8>) {
     // SAFETY: fcntl on a pipe this process owns.
     unsafe {
@@ -575,7 +553,6 @@ impl Handle {
         self.0.upgrade()
     }
 
-    /// Reads the dragged file list from the event loop, then reports the drag to the window.
     fn read_drag(
         &self,
         offer: wl_data_offer::WlDataOffer,
@@ -616,7 +593,6 @@ impl Handle {
                         };
                         let paths = file_paths(&String::from_utf8_lossy(&list));
                         let mut state = client.state.borrow_mut();
-                        // Text from other apps can't be dropped.
                         if state.drag.generation != generation || paths.is_empty() {
                             offer.destroy();
                             return Ok(PostAction::Remove);
@@ -636,7 +612,6 @@ impl Handle {
         });
     }
 
-    /// Enables the input method, at the selection of the focused window.
     fn enable_ime(&self, client: &Client) {
         let (text_input, window) = {
             let state = client.state.borrow();
@@ -758,7 +733,6 @@ impl Dispatch<wl_output::WlOutput, ()> for Handle {
         match event {
             wl_output::Event::Geometry { x, y, .. } => entry.position = Some(point(x, y)),
             wl_output::Event::Scale { factor } => entry.scale = factor,
-            // Older outputs also list the modes they don't use.
             wl_output::Event::Mode {
                 flags: WEnum::Value(flags),
                 width,
@@ -984,7 +958,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 state.keyboard_focus = None;
-                // A key held while focus leaves must not repeat.
                 state.repeat.id += 1;
                 if let Some(compose) = &mut state.compose {
                     compose.reset();
@@ -1085,7 +1058,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
     }
 }
 
-/// Repeats a held key on the client, as Wayland asks.
 fn start_repeat(
     handle: Handle,
     keystroke: Keystroke,
@@ -1140,7 +1112,6 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for Handle {
                 let Some(window) = window else {
                     return;
                 };
-                // Input methods like IBus take plain keys too, which still go out as key presses.
                 if text.len() == 1 {
                     key_down(
                         window.callbacks,
@@ -1217,7 +1188,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                     state.mouse,
                 );
                 drop(state);
-                // No motion follows an enter until the pointer moves, so the hover starts here.
                 if let Some(window) = window {
                     window
                         .callbacks
@@ -1266,11 +1236,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let Some(window) = state.focused(&state.mouse_focus) else {
                     return;
                 };
-                // Only presses count: requests that name a release serial are declined.
+                // WARNING: only presses count: requests that name a release serial are declined.
                 if button_state == wl_pointer::ButtonState::Pressed {
                     state.press = Some((serial, window.surface.clone()));
                 }
-                // From <linux/input-event-codes.h>.
                 let button = match button {
                     0x110 => MouseButton::Left,
                     0x111 => MouseButton::Right,
@@ -1295,7 +1264,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 }
                 state.button = Some(button);
                 let click_count = state.clicks.press(button, position);
-                // A click ends a composition.
                 let composing = state.composing && state.text_input.is_some();
                 let pre_edit = state.pre_edit.take();
                 if pre_edit.is_some()
@@ -1306,7 +1274,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let text_input = state.text_input.clone();
                 drop(state);
                 if composing && let Some(text_input) = text_input {
-                    // text-input-v3 has no reset, so the input method is turned off and on.
+                    // WARNING: text-input-v3 has no reset, so the input method is turned off and on.
                     text_input.disable();
                     text_input.commit();
                     this.enable_ime(&client);
@@ -1327,7 +1295,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(source),
             } => state.axis_source = source,
-            // Wheels send discrete steps, so only fingers and knobs scroll by pixels.
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
                 value,
@@ -1379,9 +1346,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
 }
 
 impl State {
-    /// Adds wheel steps, in steps of `SCROLL_LINES` lines. Shift scrolls horizontally.
     fn add_discrete(&mut self, axis: wl_pointer::Axis, steps: f32) {
-        // Compositors send both kinds of steps; seats from version 8 only use value120.
+        // WARNING: compositors send both kinds of steps; seats from version 8 only use value120.
         let horizontal = axis == wl_pointer::Axis::HorizontalScroll || self.modifiers.shift;
         let delta = self.discrete.get_or_insert_default();
         if horizontal {
@@ -1407,7 +1373,6 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for Handle {
         let mut state = client.state.borrow_mut();
         match event {
             wl_data_device::Event::DataOffer { id } => {
-                // A clipboard offer and a drag offer at most.
                 if state.offers.len() >= 2 {
                     let old = state.offers.remove(0);
                     if state.selection == Some(0) {

@@ -33,27 +33,21 @@ pub(crate) struct View {
     pub(crate) title: Option<String>,
     pub(crate) preload: Option<Rc<JsContext>>,
     pub(crate) renderer: Option<Rc<JsContext>>,
-    /// The page made the window fullscreen: whether it was fullscreen before, and whether it got there.
     fullscreen: Option<[bool; 2]>,
 }
 
-/// The page side of an app: its windows and pages. The main side is reached through `link`.
 pub struct Desktop {
     api: Rc<JavaScriptCore>,
     host: Rc<RefCell<Host>>,
-    /// The main side, while no thread drives it: at startup, in checks and in tests.
     pub(crate) main: Option<Rc<Main>>,
     pub(crate) link: Link,
     queue: Arc<PageQueue>,
     pub(crate) views: HashMap<u64, View>,
     devtools: HashMap<u64, devtools::DevTools>,
-    /// The logs of the main side, for developer tools.
     main_logs: Vec<serde_json::Value>,
     files: Arc<HashMap<String, String>>,
     pages: BBTreeMap<String, Document>,
-    /// The bundled pages, for a page side on its own thread.
     packed: Arc<HashMap<String, Vec<u8>>>,
-    /// The window that this page side runs alone on its thread, which ends with it.
     owner: Option<u64>,
     ended: bool,
     quit: bool,
@@ -62,12 +56,10 @@ pub struct Desktop {
 }
 
 thread_local! {
-    /// The page side of this thread.
     // WARNING: no destructor, because at exit it would run after `HOSTS`, which its drop needs.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
 
-/// What each page side starts from.
 struct Template {
     rust_main: bool,
     version: Option<String>,
@@ -260,7 +252,6 @@ impl Desktop {
                 if runtime.is_none() {
                     self.titles(cx.as_deref_mut())?;
                 }
-                // Titles tell the main side.
                 if !self.queue.pending() && !(self.main.is_some() && self.link.main_pending()) {
                     return Ok(());
                 }
@@ -425,7 +416,6 @@ impl Desktop {
                                                 as isize,
                                         ),
                                     ),
-                                    // The main side joins and shows a child, see `create_window`.
                                     (later && show && !child, WindowChange::Show(true)),
                                 ] {
                                     if apply {
@@ -801,7 +791,6 @@ impl Desktop {
                             let runtime = runtime.clone();
                             let link = self.link.clone();
                             cx.update_window(handle, |window, _| {
-                                // Like Electron, the area is in window points, which the page zoom doesn't scale.
                                 let scale = window.scale_factor() / window.zoom();
                                 window.capture(move |frame, cx| {
                                     let data = match frame.and_then(|frame| png(frame, scale, &rect, false)) {
@@ -849,7 +838,6 @@ impl Desktop {
                         if on == view.fullscreen.is_some() {
                             continue;
                         }
-                        // Like Chrome, leaving keeps the window fullscreen when the page did not make it so.
                         let before = view.fullscreen.take().map(|[before, _]| before);
                         let mut was = false;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
@@ -934,7 +922,6 @@ impl Desktop {
             }
             let text = title.as_deref().unwrap_or("");
             view.title = title.clone();
-            // A main script can prevent the change, so it sets the title itself.
             if !self.host.borrow().rust_main {
                 self.link.event(
                     format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
@@ -947,7 +934,6 @@ impl Desktop {
         Ok(())
     }
 
-    /// Frees the nodes that the last GC found dead, and gives back what the pages can build again.
     fn trim(&self) {
         for view in self.views.values() {
             if let Some(page) = &view.renderer {
@@ -983,7 +969,6 @@ impl Desktop {
                 let Some([width, height]) = app.host.borrow().viewports.get(&id).copied() else {
                     continue;
                 };
-                // The page viewport is zoomed, the content view is in window points.
                 let zoom = app
                     .views
                     .get(&id)
@@ -1014,7 +999,6 @@ impl Desktop {
                 else {
                     continue;
                 };
-                // A page's fullscreen ends when its window leaves fullscreen.
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
                 };
@@ -1195,7 +1179,6 @@ impl Desktop {
                 Some(delay.clamp(1, 1 << 31) as u64)
             })
         })();
-        // The window is gone, and its thread with it.
         if runtime.try_borrow().is_ok_and(|app| app.ended) {
             cx.defer(|cx| {
                 PAGE_SIDE.with(|side| side.take());
@@ -1317,10 +1300,7 @@ impl Desktop {
         } = self;
         drop(api);
         let main = main.context("Missing the main side")?;
-        apps_webview::on_main_thread(
-            |task| renderer::native::sync(|| task()),
-            renderer::native::post,
-        );
+        apps_webview::on_main_thread(|task| renderer::native::sync(task), renderer::native::post);
         let mcp = mcp.map(|port| mcp::start(port, link.clone())).transpose()?;
         let packed = pages
             .iter()
@@ -1440,7 +1420,7 @@ impl Desktop {
                         .args(&command[1..])
                         .spawn();
                 }
-                // AppKit exits with 0 after this hook, so a failure code must exit here.
+                // WARNING: AppKit exits with 0 after this hook, so a failure code must exit here.
                 if exit.exit_code() != 0 {
                     std::process::exit(exit.exit_code());
                 }
@@ -1486,8 +1466,6 @@ impl Desktop {
         Ok(exit.exit_code())
     }
 
-    /// Starts a page side on the thread that draws its windows. `owner` is its one window, when the
-    /// thread is that window's alone.
     fn start(
         template: Arc<Template>,
         link: Link,
@@ -1587,7 +1565,6 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
             app.trim();
         }
         Desktop::drive(runtime, cx);
-        // The frame that the trim asks for frees the old arrays, then free pages go back to the system.
         cx.timer(Duration::from_secs(1), |_| {
             std::thread::spawn(release_free_memory);
         })
@@ -1596,7 +1573,6 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
     .detach();
 }
 
-/// Returns freed pages that the system allocator keeps to the system.
 fn release_free_memory() {
     #[cfg(target_os = "macos")]
     {
@@ -1613,7 +1589,6 @@ fn release_free_memory() {
     }
 }
 
-/// Checks a window host call, so bad input throws in JS and never reaches `Desktop::pump`.
 pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
     let number = |value: &serde_json::Value, low: f64, high: f64| {
         value
@@ -1639,7 +1614,6 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
                     "title" | "icon" => value.is_string(),
                     "opacity" => number(value, 0., 1.),
                     "parent" => value.is_u64(),
-                    // `bootstrap.js` maps the names to NSVisualEffectMaterial and NSVisualEffectState values.
                     "vibrancy" => number(value, 0., 22.),
                     "visualEffectState" => number(value, 0., 2.),
                     "titleBarStyle" => {
@@ -1730,7 +1704,6 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// The window state that `BrowserWindow` caches, in screen points.
 fn window_state(window: &renderer::Window) -> serde_json::Value {
     state_json(&window.window_state(), window.is_window_active())
 }
@@ -1801,7 +1774,6 @@ mod tests {
             }
         }
 
-        /// The arguments of the queued commands, which stay queued: native ones first.
         fn commands(&self) -> Vec<serde_json::Value> {
             let mut commands = self.link.native_commands();
             for message in self.queue.take() {
@@ -2072,7 +2044,7 @@ mod tests {
 
     #[test]
     fn window_errors_are_synchronous_and_closed_windows_are_ignored() {
-        let code = "__apps.app.whenReady().then(()=>{try{new __apps.BrowserWindow({webPreferences:{}})}catch(e){globalThis.rejected=e.message}globalThis.win=new __apps.BrowserWindow();win.close()})";
+        let code = "__apps.app.whenReady().then(()=>{try{new __apps.BrowserWindow({unknownOption:1})}catch(e){globalThis.rejected=e.message}globalThis.win=new __apps.BrowserWindow();win.close()})";
         let files = BBTreeMap::from([(
             "app.js".into(),
             format!(
@@ -2087,7 +2059,7 @@ mod tests {
             desktop.js()
                 .eval("rejected+':'+__apps.BrowserWindow.getAllWindows().length+':'+win.isDestroyed()", "test")
                 .unwrap(),
-            "Unsupported BrowserWindow option: webPreferences:0:true"
+            "Unsupported BrowserWindow option: unknownOption:0:true"
         );
         assert!(desktop.js().eval("win.show()", "test").is_err());
         desktop.command(serde_json::json!({"op":"window","args":["title",2,"stale"]}));

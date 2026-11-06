@@ -45,7 +45,7 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
   function Readable(options) { if (!(this instanceof Readable)) return new Readable(options); Stream.call(this, options); initReadable(this, options); }
   inherit(Readable, Stream);
   define(Readable, class {
-    get readable() { const s = this._readableState; return !!s && s.readable !== false && !this.destroyed && !this.errored && !s.endEmitted; }
+    get readable() { const state = this._readableState; return !!state && state.readable !== false && !this.destroyed && !this.errored && !state.endEmitted; }
     set readable(value) { if (this._readableState) this._readableState.readable = !!value; }
     get readableEnded() { return this._readableState.endEmitted; }
     get readableFlowing() { return this._readableState.flowing; }
@@ -57,107 +57,107 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
     _read() { this.destroy(error(Error, 'ERR_METHOD_NOT_IMPLEMENTED', 'The _read() method is not implemented')); }
     _destroy(reason, callback) { callback(reason); }
     push(chunk, encoding) {
-      const s = this._readableState;
-      s.reading = false;
+      const state = this._readableState;
+      state.reading = false;
       if (chunk === null) {
-        if (s.ended) return false;
-        s.ended = true;
-        if (s.decoder) { const tail = s.decoder.end(); if (tail) { s.buffer.push(tail); s.length += size(s, tail); } }
+        if (state.ended) return false;
+        state.ended = true;
+        if (state.decoder) { const tail = state.decoder.end(); if (tail) { state.buffer.push(tail); state.length += size(state, tail); } }
         this._signal();
         return false;
       }
       if (this.destroyed) return false;
-      if (s.ended) { this.destroy(error(Error, 'ERR_STREAM_PUSH_AFTER_EOF', 'stream.push() after EOF')); return false; }
-      if (!s.objectMode) {
+      if (state.ended) { this.destroy(error(Error, 'ERR_STREAM_PUSH_AFTER_EOF', 'stream.push() after EOF')); return false; }
+      if (!state.objectMode) {
         if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding);
         else if (ArrayBuffer.isView(chunk)) chunk = chunk instanceof Buffer ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         else throw error(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array');
-        if (s.decoder) chunk = s.decoder.write(chunk);
-        if (!chunk.length) return s.length < s.highWaterMark;
+        if (state.decoder) chunk = state.decoder.write(chunk);
+        if (!chunk.length) return state.length < state.highWaterMark;
       }
-      s.buffer.push(chunk); s.length += size(s, chunk);
+      state.buffer.push(chunk); state.length += size(state, chunk);
       this._signal();
-      return s.length < s.highWaterMark;
+      return state.length < state.highWaterMark;
     }
     unshift(chunk, encoding) {
-      const s = this._readableState;
+      const state = this._readableState;
       if (chunk === null) return this.push(null);
-      if (!s.objectMode && typeof chunk === 'string' && !s.decoder) chunk = Buffer.from(chunk, encoding);
-      s.buffer.unshift(chunk); s.length += size(s, chunk);
+      if (!state.objectMode && typeof chunk === 'string' && !state.decoder) chunk = Buffer.from(chunk, encoding);
+      state.buffer.unshift(chunk); state.length += size(state, chunk);
       this._signal();
     }
     _signal() {
-      const s = this._readableState;
-      if (s.flowing) { this._flow(); return; }
-      if (s.listening && !s.pending) { s.pending = true; queueMicrotask(() => { s.pending = false; if (!this.destroyed) this.emit('readable'); this._end(); }); }
+      const state = this._readableState;
+      if (state.flowing) { this._flow(); return; }
+      if (state.listening && !state.pending) { state.pending = true; queueMicrotask(() => { state.pending = false; if (!this.destroyed) this.emit('readable'); this._end(); }); }
     }
     _pull() {
-      const s = this._readableState;
-      if (s.reading || s.ended || this.destroyed || s.length >= s.highWaterMark) return;
-      s.reading = true;
-      this._read(s.highWaterMark);
+      const state = this._readableState;
+      if (state.reading || state.ended || this.destroyed || state.length >= state.highWaterMark) return;
+      state.reading = true;
+      this._read(state.highWaterMark);
     }
     _flow() {
-      const s = this._readableState;
-      if (s.draining) return;
-      s.draining = true;
-      try { while (s.flowing && s.buffer.length && !this.destroyed) { const chunk = s.buffer.shift(); s.length -= size(s, chunk); this.emit('data', chunk); } }
-      finally { s.draining = false; }
+      const state = this._readableState;
+      if (state.draining) return;
+      state.draining = true;
+      try { while (state.flowing && state.buffer.length && !this.destroyed) { const chunk = state.buffer.shift(); state.length -= size(state, chunk); this.emit('data', chunk); } }
+      finally { state.draining = false; }
       this._end();
-      if (s.flowing && !s.ended) queueMicrotask(() => this._pull());
+      if (state.flowing && !state.ended) queueMicrotask(() => this._pull());
     }
     _end() {
-      const s = this._readableState;
-      if (!s.ended || s.length || s.endEmitted || s.ending || !(s.flowing || s.consumed)) return;
-      s.ending = true;
-      queueMicrotask(() => { if (s.endEmitted || s.length || this.destroyed) { s.ending = false; return; } s.endEmitted = true; this.emit('end'); autoDestroy(this); });
+      const state = this._readableState;
+      if (!state.ended || state.length || state.endEmitted || state.ending || !(state.flowing || state.consumed)) return;
+      state.ending = true;
+      queueMicrotask(() => { if (state.endEmitted || state.length || this.destroyed) { state.ending = false; return; } state.endEmitted = true; this.emit('end'); autoDestroy(this); });
     }
     read(count) {
-      const s = this._readableState;
-      s.consumed = true;
+      const state = this._readableState;
+      state.consumed = true;
       let chunk = null;
-      if (s.buffer.length && count !== 0 && !(count > s.length && !s.ended)) {
-        if (s.objectMode) chunk = s.buffer.shift();
+      if (state.buffer.length && count !== 0 && !(count > state.length && !state.ended)) {
+        if (state.objectMode) chunk = state.buffer.shift();
         else {
-          const all = s.buffer.length === 1 ? s.buffer[0] : s.decoder ? s.buffer.join('') : Buffer.concat(s.buffer);
+          const all = state.buffer.length === 1 ? state.buffer[0] : state.decoder ? state.buffer.join('') : Buffer.concat(state.buffer);
           chunk = count === undefined || count >= all.length ? all : all.slice(0, count);
-          s.buffer = chunk.length < all.length ? [all.slice(chunk.length)] : [];
+          state.buffer = chunk.length < all.length ? [all.slice(chunk.length)] : [];
         }
-        s.length -= size(s, chunk);
+        state.length -= size(state, chunk);
       }
       if (chunk !== null) this.emit('data', chunk);
-      if (s.ended) this._end(); else queueMicrotask(() => this._pull());
+      if (state.ended) this._end(); else queueMicrotask(() => this._pull());
       return chunk;
     }
     on(name, listener) {
       Stream.prototype.on.call(this, name, listener);
-      const s = this._readableState;
-      if (name === 'data' && s.flowing !== false) this.resume();
-      if (name === 'readable' && !s.listening) { s.listening = true; s.flowing = false; if (s.length || s.ended) this._signal(); else queueMicrotask(() => this._pull()); }
+      const state = this._readableState;
+      if (name === 'data' && state.flowing !== false) this.resume();
+      if (name === 'readable' && !state.listening) { state.listening = true; state.flowing = false; if (state.length || state.ended) this._signal(); else queueMicrotask(() => this._pull()); }
       return this;
     }
     addListener(name, listener) { return this.on(name, listener); }
-    pause() { const s = this._readableState; if (s.flowing !== false) { s.flowing = false; this.emit('pause'); } return this; }
+    pause() { const state = this._readableState; if (state.flowing !== false) { state.flowing = false; this.emit('pause'); } return this; }
     resume() {
-      const s = this._readableState;
-      if (!s.flowing) { s.flowing = true; s.listening = false; queueMicrotask(() => { if (!s.flowing) return; this.emit('resume'); this._flow(); }); }
+      const state = this._readableState;
+      if (!state.flowing) { state.flowing = true; state.listening = false; queueMicrotask(() => { if (!state.flowing) return; this.emit('resume'); this._flow(); }); }
       return this;
     }
     isPaused() { return this._readableState.flowing === false; }
     setEncoding(encoding) {
-      const s = this._readableState;
-      s.decoder = new StringDecoder(encoding); s.encoding = s.decoder.encoding;
-      if (!s.objectMode && s.buffer.length) { const text = s.decoder.write(Buffer.concat(s.buffer)); s.buffer = text ? [text] : []; s.length = text.length; }
+      const state = this._readableState;
+      state.decoder = new StringDecoder(encoding); state.encoding = state.decoder.encoding;
+      if (!state.objectMode && state.buffer.length) { const text = state.decoder.write(Buffer.concat(state.buffer)); state.buffer = text ? [text] : []; state.length = text.length; }
       return this;
     }
     pipe(destination, { end = true } = {}) {
-      const s = this._readableState;
+      const state = this._readableState;
       const ondata = chunk => { if (destination.write(chunk) === false) this.pause(); };
-      const ondrain = () => { if (s.flowing === false) this.resume(); };
+      const ondrain = () => { if (state.flowing === false) this.resume(); };
       const onend = () => destination.end();
       const onerror = failure => { cleanup(); if (!destination.listenerCount('error')) destination.emit('error', failure); };
-      const cleanup = () => { this.off('data', ondata); this.off('end', onend); destination.off('drain', ondrain); destination.off('error', onerror); destination.off('close', cleanup); destination.off('finish', cleanup); s.pipes = s.pipes.filter(pipe => pipe.destination !== destination); };
-      s.pipes.push({ destination, cleanup });
+      const cleanup = () => { this.off('data', ondata); this.off('end', onend); destination.off('drain', ondrain); destination.off('error', onerror); destination.off('close', cleanup); destination.off('finish', cleanup); state.pipes = state.pipes.filter(pipe => pipe.destination !== destination); };
+      state.pipes.push({ destination, cleanup });
       this.on('data', ondata);
       if (end && destination !== globalThis.process?.stdout && destination !== globalThis.process?.stderr) this.once('end', onend);
       destination.on('drain', ondrain); destination.prependListener('error', onerror); destination.once('close', cleanup); destination.once('finish', cleanup);
@@ -179,7 +179,7 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
       return this;
     }
     async *[Symbol.asyncIterator]() {
-      const s = this._readableState;
+      const state = this._readableState;
       let failed = null, wake = null;
       const signal = () => { const resolve = wake; wake = null; resolve?.(); };
       const onerror = reason => { failed = reason; signal(); };
@@ -189,13 +189,13 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
           if (failed) throw failed;
           const chunk = this.destroyed ? null : this.read();
           if (chunk !== null) { yield chunk; continue; }
-          if (s.endEmitted || (s.ended && !s.length)) return;
+          if (state.endEmitted || (state.ended && !state.length)) return;
           if (this.destroyed) { if (this.errored) throw this.errored; throw error(Error, 'ERR_STREAM_PREMATURE_CLOSE', 'Premature close'); }
           await new Promise(resolve => { wake = resolve; });
         }
       } finally {
         this.off('readable', signal); this.off('end', signal); this.off('close', signal); this.off('error', onerror);
-        if (!(s.ended && !s.length) && !this.destroyed) this.destroy();
+        if (!(state.ended && !state.length) && !this.destroyed) this.destroy();
       }
     }
     static from(iterable, options) {
@@ -240,7 +240,7 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
   function Writable(options) { if (!(this instanceof Writable)) return new Writable(options); Stream.call(this, options); initWritable(this, options); }
   inherit(Writable, Stream);
   class WritableMethods {
-    get writable() { const s = this._writableState; return !!s && s.writable !== false && !this.destroyed && !this.errored && !s.ending; }
+    get writable() { const state = this._writableState; return !!state && state.writable !== false && !this.destroyed && !this.errored && !state.ending; }
     set writable(value) { if (this._writableState) this._writableState.writable = !!value; }
     get writableEnded() { return this._writableState.ending; }
     get writableFinished() { return this._writableState.finished; }
@@ -251,40 +251,40 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
     get writableCorked() { return this._writableState.corked; }
     _write(chunk, encoding, callback) { if (this._writev) this._writev([{ chunk, encoding }], callback); else callback(error(Error, 'ERR_METHOD_NOT_IMPLEMENTED', 'The _write() method is not implemented')); }
     write(chunk, encoding, callback) {
-      const s = this._writableState;
+      const state = this._writableState;
       if (typeof encoding === 'function') { callback = encoding; encoding = null; }
-      encoding ||= s.defaultEncoding;
+      encoding ||= state.defaultEncoding;
       if (chunk === null) throw error(TypeError, 'ERR_STREAM_NULL_VALUES', 'May not write null values to stream');
-      if (!s.objectMode) {
-        if (typeof chunk === 'string') { if (s.decodeStrings) { chunk = Buffer.from(chunk, encoding); encoding = 'buffer'; } }
+      if (!state.objectMode) {
+        if (typeof chunk === 'string') { if (state.decodeStrings) { chunk = Buffer.from(chunk, encoding); encoding = 'buffer'; } }
         else if (ArrayBuffer.isView(chunk)) { chunk = chunk instanceof Buffer ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength); encoding = 'buffer'; }
         else throw error(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array');
       }
-      const failure = s.ending ? error(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end') : this.destroyed ? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call write after a stream was destroyed') : null;
-      if (failure) { queueMicrotask(() => callback?.(failure)); if (s.ending) this.destroy(failure); return false; }
-      s.length += size(s, chunk);
-      const ok = s.length < s.highWaterMark;
-      if (!ok) s.needDrain = true;
-      s.buffer.push({ chunk, encoding, callback });
-      if (!s.writing && !s.corked) this._next();
+      const failure = state.ending ? error(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end') : this.destroyed ? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call write after a stream was destroyed') : null;
+      if (failure) { queueMicrotask(() => callback?.(failure)); if (state.ending) this.destroy(failure); return false; }
+      state.length += size(state, chunk);
+      const ok = state.length < state.highWaterMark;
+      if (!ok) state.needDrain = true;
+      state.buffer.push({ chunk, encoding, callback });
+      if (!state.writing && !state.corked) this._next();
       return ok;
     }
     _next() {
-      const s = this._writableState;
-      if (s.writing || s.corked || this.destroyed) return;
-      const entries = this._writev && s.buffer.length > 1 ? s.buffer.splice(0) : [s.buffer.shift()];
+      const state = this._writableState;
+      if (state.writing || state.corked || this.destroyed) return;
+      const entries = this._writev && state.buffer.length > 1 ? state.buffer.splice(0) : [state.buffer.shift()];
       if (!entries[0]) { this._finish(); return; }
-      s.writing = true;
+      state.writing = true;
       let sync = true, called = false;
       const done = failure => {
         if (called) return;
         called = true;
         const after = () => {
-          s.writing = false;
-          for (const entry of entries) { s.length -= size(s, entry.chunk); entry.callback?.(failure ?? null); }
+          state.writing = false;
+          for (const entry of entries) { state.length -= size(state, entry.chunk); entry.callback?.(failure ?? null); }
           if (failure) { this.destroy(failure); return; }
-          if (s.buffer.length) { this._next(); return; }
-          if (s.needDrain) { s.needDrain = false; if (!s.ending) this.emit('drain'); }
+          if (state.buffer.length) { this._next(); return; }
+          if (state.needDrain) { state.needDrain = false; if (!state.ending) this.emit('drain'); }
           this._finish();
         };
         if (sync) queueMicrotask(after); else after();
@@ -293,14 +293,14 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
       sync = false;
     }
     _finish() {
-      const s = this._writableState;
-      if (!s.ending || s.finalCalled || s.writing || s.buffer.length || this.destroyed) return;
-      s.finalCalled = true;
+      const state = this._writableState;
+      if (!state.ending || state.finalCalled || state.writing || state.buffer.length || this.destroyed) return;
+      state.finalCalled = true;
       queueMicrotask(() => {
         const after = failure => {
           if (failure) { this.destroy(failure); return; }
-          s.finished = true;
-          for (const finisher of s.finishers.splice(0)) finisher(null);
+          state.finished = true;
+          for (const finisher of state.finishers.splice(0)) finisher(null);
           this.emit('finish');
           autoDestroy(this);
         };
@@ -308,17 +308,17 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
       });
     }
     end(chunk, encoding, callback) {
-      const s = this._writableState;
+      const state = this._writableState;
       if (typeof chunk === 'function') { callback = chunk; chunk = null; } else if (typeof encoding === 'function') { callback = encoding; encoding = null; }
       if (chunk !== null && chunk !== undefined) this.write(chunk, encoding);
-      if (s.corked) { s.corked = 1; this.uncork(); }
-      const failure = s.finished ? error(Error, 'ERR_STREAM_ALREADY_FINISHED', 'Cannot call end after a stream was finished') : this.destroyed ? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call end after a stream was destroyed') : null;
-      if (callback) { if (failure || s.finished) queueMicrotask(() => callback(failure)); else s.finishers.push(callback); }
-      if (!s.ending) { s.ending = true; this._finish(); }
+      if (state.corked) { state.corked = 1; this.uncork(); }
+      const failure = state.finished ? error(Error, 'ERR_STREAM_ALREADY_FINISHED', 'Cannot call end after a stream was finished') : this.destroyed ? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call end after a stream was destroyed') : null;
+      if (callback) { if (failure || state.finished) queueMicrotask(() => callback(failure)); else state.finishers.push(callback); }
+      if (!state.ending) { state.ending = true; this._finish(); }
       return this;
     }
     cork() { this._writableState.corked++; }
-    uncork() { const s = this._writableState; if (s.corked && !--s.corked) this._next(); }
+    uncork() { const state = this._writableState; if (state.corked && !--state.corked) this._next(); }
     setDefaultEncoding(encoding) { this._writableState.defaultEncoding = encoding; return this; }
     _destroy(reason, callback) { callback(reason); }
     static fromWeb(stream) { const writer = stream.getWriter(); return new Writable({ write(chunk, _encoding, callback) { writer.write(chunk).then(() => callback(), callback); }, final(callback) { writer.close().then(() => callback(), callback); }, destroy(reason, callback) { (reason ? writer.abort(reason) : Promise.resolve()).then(() => callback(reason), callback); } }); }
@@ -350,8 +350,8 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
       this._transform(chunk, encoding, (failure, data) => {
         if (failure) { callback(failure); return; }
         if (data != null) this.push(data);
-        const s = this._readableState;
-        if (s.ended || s.length < s.highWaterMark) callback(); else this._pending = callback;
+        const state = this._readableState;
+        if (state.ended || state.length < state.highWaterMark) callback(); else this._pending = callback;
       });
     }
     _read() { const callback = this._pending; this._pending = null; callback?.(); }

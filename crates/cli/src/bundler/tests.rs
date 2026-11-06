@@ -1321,7 +1321,6 @@ fn three_webgpu_renders_a_cube() {
             .iter()
             .position(|n| n.tag == "canvas")
             .unwrap();
-        // Each `image` call starts a readback when the canvas changed, so a new frame shows up a call later.
         let present = |old: Option<*const ()>| {
             for _ in 0..5000 {
                 engine.tick().unwrap();
@@ -2616,7 +2615,6 @@ fn workers_keep_native_addons_from_earlier_modules() {
     );
 }
 
-/// The CSS that the bundler keeps for the stylesheet link of a page.
 fn linked_css(page: &str) -> String {
     Document::parse(page)
         .nodes

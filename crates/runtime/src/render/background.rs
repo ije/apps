@@ -10,11 +10,11 @@ use std::{
 
 type Backgrounds = HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>;
 
-/// The bitmap of a file once a worker decoded it, empty when the file is no bitmap.
 pub(super) type Decoding = Arc<Mutex<Option<renderer::RenderImage>>>;
 
-/// Draws the window again once `decoding` is done, checking on each frame.
-fn landed(decoding: Decoding) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
+fn redraw_when_decoded(
+    decoding: Decoding,
+) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
     move |window, _| {
         if decoding
             .lock()
@@ -23,7 +23,7 @@ fn landed(decoding: Decoding) -> impl FnOnce(&mut renderer::Window, &mut rendere
         {
             window.refresh();
         } else {
-            window.on_next_frame(landed(decoding));
+            window.on_next_frame(redraw_when_decoded(decoding));
         }
     }
 }
@@ -197,7 +197,7 @@ pub(super) fn css_background(
                                                 {
                                                     jobs.1 += 1;
                                                 }
-                                                window.on_next_frame(landed(slot));
+                                                window.on_next_frame(redraw_when_decoded(slot));
                                             }
                                             return;
                                         };
@@ -367,8 +367,6 @@ pub(super) fn css_background(
                                     )
                             })
                     });
-                    // A gradient repeated in tiles of whole device pixels draws from one bitmap of a few tiles,
-                    // the same for every box, so new boxes don't raster their whole area.
                     let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
                     let radii = radius.resolve(bounds.size);
                     let [[tw, th], [x, y]] =
@@ -532,7 +530,6 @@ pub(super) fn css_background(
     {
         return layers.into_iter().map(Into::into).collect();
     }
-    // Blended layers mix with the layers and color below them, inside an isolated group.
     let mut group = renderer::node().absolute().top_0().left_0().size_full();
     if let Some((ink, alpha)) = style.get(Prop::BACKGROUND_COLOR).and_then(style::color) {
         let mut color = renderer::node()

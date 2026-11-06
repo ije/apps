@@ -46,7 +46,6 @@ globalThis.__appsElectron = (call, EventEmitter, ready) => {
   });
   const handled = input => { const url = typeof input === 'string' ? input : input?.url ?? String(input), scheme = /^([a-z][a-z\d+.-]*):/i.exec(url)?.[1]?.toLowerCase(); return scheme ? handlers.get(scheme) : undefined; };
 
-  // Electron's built-in updater needs a signed app with a feed. There is none here, so it only reports that.
   const autoUpdater = Object.assign(new EventEmitter(), {
     getFeedURL: () => '', setFeedURL() {}, quitAndInstall() {},
     checkForUpdates() { queueMicrotask(() => autoUpdater.emit('error', new Error('Could not get code signature for running application'))); },

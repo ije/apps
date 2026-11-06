@@ -1,7 +1,3 @@
-//! Video and audio playback for pages. The runtime loads this library only for apps with the video or
-//! audio feature, and the library links FFmpeg dynamically. Each media element gets one thread that
-//! demuxes and decodes, and one shared output stream mixes the audio of the playing elements.
-
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{c_char, c_int, c_void},
@@ -10,26 +6,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Version of the C ABI. The runtime rejects a library with another version.
 pub const ABI: u32 = 2;
 
-/// Returns a runtime buffer of `length` bytes that the library fills.
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
-/// Runtime callbacks. All but `waker` also run on player threads.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
     pub waker: extern "C" fn() -> *mut c_void,
     pub wake: extern "C" fn(waker: *mut c_void),
     pub drop_waker: extern "C" fn(waker: *mut c_void),
-    /// Returns `length` bytes for pixels, which the runtime owns once `apps_media_frame` returns them,
-    /// until it gives them back with `apps_media_recycle`.
+    // WARNING: returns `length` bytes for pixels, which the runtime owns once `apps_media_frame` returns them,
+    // until it gives them back with `apps_media_recycle`.
     pub alloc: extern "C" fn(length: usize) -> *mut u8,
     pub free: extern "C" fn(bytes: *mut u8, length: usize),
 }
 
-/// A video frame of straight-alpha BGRA pixels from `Host::alloc`.
 #[repr(C)]
 pub struct Frame {
     pub pixels: *mut u8,
@@ -44,9 +36,7 @@ pub const VOLUME: u32 = 3;
 pub const MUTED: u32 = 4;
 pub const SPEED: u32 = 5;
 
-/// Decoded audio that plays ahead of the clock, in seconds.
 const AHEAD: f64 = 0.3;
-/// Decoded video frames that wait for their time.
 const FRAMES: usize = 3;
 
 static HOST: OnceLock<Host> = OnceLock::new();
@@ -76,7 +66,6 @@ impl Drop for Waker {
     }
 }
 
-/// Pixels from `Host::alloc`, freed unless the runtime takes them.
 struct Pixels {
     bytes: *mut u8,
     width: u32,
@@ -132,6 +121,7 @@ unsafe extern "C" {
 #[cfg(not(ffmpeg))]
 mod missing {
     use super::*;
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn apps_ffmpeg_open(
         _: *const c_char,
         _: *const u8,
@@ -171,7 +161,6 @@ mod missing {
 #[cfg(not(ffmpeg))]
 use missing::*;
 
-/// The media time, which runs while the element plays. The mixer moves it to the audio it plays.
 struct Clock {
     time: f64,
     at: Instant,
@@ -200,7 +189,6 @@ impl Clock {
     }
 }
 
-/// Interleaved samples at the output rate. Each output frame moves the media time by `step` seconds.
 struct Chunk {
     time: f64,
     step: f64,
@@ -208,10 +196,8 @@ struct Chunk {
     read: usize,
 }
 
-/// The audio of one element and its clock, shared with the mixer.
 struct Audio {
     chunks: VecDeque<Chunk>,
-    /// Samples in `chunks` that did not play yet.
     queued: usize,
     gain: f32,
     clock: Clock,
@@ -248,7 +234,6 @@ impl Audio {
         self.queued = 0;
     }
 
-    /// Drops the samples that the clock passed, for apps without an audio output.
     fn skip(&mut self, channels: usize) {
         let now = self.clock.now();
         while let Some(chunk) = self.chunks.front()
@@ -260,7 +245,6 @@ impl Audio {
     }
 }
 
-/// One output stream for the app. It pauses while no element plays, so idle apps keep the device asleep.
 struct Mixer {
     rate: u32,
     channels: usize,
@@ -369,21 +353,15 @@ fn mixer() -> Option<&'static Mixer> {
 #[derive(Default)]
 struct State {
     playing: bool,
-    /// The first frame and some audio are decoded since the load or the last seek.
     ready: bool,
     closed: bool,
     seek: Option<f64>,
     speed: Option<f64>,
-    /// Counts seeks, so a decode that started before one is dropped.
     generation: u64,
     frames: VecDeque<Pixels>,
-    /// Buffers of frames that were never shown or that the runtime gave back, for the next frames.
     spare: Vec<Pixels>,
-    /// Shows the next frame at once, as after a load or a seek.
     show: bool,
-    /// The loop was woken for the first frame in `frames`.
     woken: bool,
-    /// JSON event arguments after the element id.
     events: Vec<String>,
 }
 
@@ -394,7 +372,6 @@ struct Shared {
 }
 
 impl Shared {
-    /// Runs the clock and the element's audio while it plays and is ready.
     fn update(&self, state: &State) {
         let running = state.playing && state.ready && !state.closed;
         let mut audio = lock(&self.audio);
@@ -483,9 +460,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     let (mut video_done, mut audio_done) = (!has_video, !has_audio);
     let (mut speed, mut generation) = (1., 0);
     let (mut audio_end, mut last_frame) = (0., -1. / 30.);
-    // The seek target that frames and samples before it are dropped for, and whether it was reported.
     let (mut target, mut loaded) = (Some(0.), false);
-    // The last video frame dropped before the target, shown when the track ends before one reaches it.
     let mut skipped = None;
     // WARNING: a blocked track waits behind the other track's full packet queue until that track decodes, so it counts as ready.
     let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);

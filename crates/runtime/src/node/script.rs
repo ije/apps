@@ -6,8 +6,6 @@ use crate::{
 use anyhow::{Context, Result};
 use std::{cell::RefCell, rc::Rc, sync::mpsc, time::Duration};
 
-/// Runs a script chunk as a plain process, without windows, for `ELECTRON_RUN_AS_NODE`.
-/// `argv` is `[execPath, script, ...arguments]`.
 pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     let script = argv
         .get(1)

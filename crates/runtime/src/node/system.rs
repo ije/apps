@@ -209,7 +209,6 @@ impl Codec {
         Ok(codec)
     }
 
-    /// Runs `input` through the codec with a zlib flush mode (0 none, 2 sync, 3 full, 4 finish). Gzip input may hold several members.
     pub(super) fn write(
         &mut self,
         mut input: &[u8],
@@ -295,7 +294,7 @@ impl Codec {
     }
 }
 
-pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
+pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
     match op {
         "hash" => {
             let key = if args[2].is_null() {
@@ -365,7 +364,6 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                 vec![0u32; 32 * r],
                 vec![0u32; 32 * r],
             );
-            // BlockMix with Salsa20/8 (RFC 7914): even outputs go to the first half of `y`, odd ones to the second.
             let mix = |x: &mut [u32], y: &mut [u32]| {
                 let mut t: [u32; 16] = x[x.len() - 16..].try_into().unwrap();
                 for i in 0..2 * r {
@@ -503,8 +501,6 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             ensure!(!addresses.is_empty(), "No address found");
             Ok(json!(addresses))
         }
-        // Sends one query through the system resolver (libresolv) and returns the answers of the asked type as
-        // [type, ...fields] in Node's field order. Errors are c-ares codes, like ENOTFOUND.
         "resolve" => {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
@@ -635,7 +631,6 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
                     |at: usize| -> Result<u16> { Ok(u16::from_be_bytes(read(at, 2)?.try_into()?)) };
                 let long =
                     |at: usize| -> Result<u32> { Ok(u32::from_be_bytes(read(at, 4)?.try_into()?)) };
-                // Reads a possibly compressed name and returns it with the offset after it.
                 let label = |mut at: usize| -> Result<(String, usize)> {
                     let (mut labels, mut end) = (Vec::new(), None);
                     for _ in 0..128 {
@@ -1035,8 +1030,10 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             {
                 let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
                 unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+                // WARNING: `tv_usec` is `i32` on macOS and `i64` on Linux.
+                #[allow(clippy::useless_conversion)]
                 let micros =
-                    |time: libc::timeval| time.tv_sec as i64 * 1_000_000 + i64::from(time.tv_usec);
+                    |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
                 Ok(
                     json!({"userCPUTime":micros(usage.ru_utime),"systemCPUTime":micros(usage.ru_stime),"maxRSS":usage.ru_maxrss / 1024,"sharedMemorySize":usage.ru_ixrss,"unsharedDataSize":usage.ru_idrss,"unsharedStackSize":usage.ru_isrss,"minorPageFault":usage.ru_minflt,"majorPageFault":usage.ru_majflt,"swappedOut":usage.ru_nswap,"fsRead":usage.ru_inblock,"fsWrite":usage.ru_oublock,"ipcSent":usage.ru_msgsnd,"ipcReceived":usage.ru_msgrcv,"signalsCount":usage.ru_nsignals,"voluntaryContextSwitches":usage.ru_nvcsw,"involuntaryContextSwitches":usage.ru_nivcsw}),
                 )
@@ -1051,6 +1048,8 @@ pub(crate) fn system(op: &str, args: &Value) -> Result<Value> {
             unsafe {
                 let mut usage: libc::rusage = std::mem::zeroed();
                 libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+                // WARNING: `tv_usec` is `i32` on macOS and `i64` on Linux.
+                #[allow(clippy::useless_conversion)]
                 let micros =
                     |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
                 Ok(json!({"user":micros(usage.ru_utime),"system":micros(usage.ru_stime)}))

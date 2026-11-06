@@ -9,31 +9,26 @@ use std::{
     rc::Rc,
 };
 
-/// The shaped lines of a text node, shared with whoever needs positions in it.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
 struct TextLayoutInner {
-    /// The width the lines were shaped for, 0 for the min-content size and `None` when unconstrained.
     shaped_width: Option<Pixels>,
     lines: Vec<WrappedLine>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncated: bool,
     size: Size<Pixels>,
-    /// The first and last line's baselines.
     baselines: [Pixels; 2],
     bounds: Option<Bounds<Pixels>>,
 }
 
-/// What a text layout depends on, with the layout it holds. Equal inputs keep the layout.
 pub(crate) struct TextState {
     text: SharedString,
     runs: Vec<TextRun>,
     style: TextStyle,
     scale: f32,
     pub(crate) layout: TextLayout,
-    /// The min-content and max-content sizes and baselines of wrapping text.
     probes: Cell<[Option<Probe>; 2]>,
 }
 
@@ -65,7 +60,6 @@ impl TextState {
         }
     }
 
-    /// The same text in another style. Runs that came from the old style follow the new one.
     pub(crate) fn restyled(&self, own: bool, style: &TextStyle, scale: f32) -> Self {
         Self::new(
             self.text.clone(),
@@ -108,7 +102,7 @@ impl TextState {
             && wrap_width == inner.wrap_width
             && inner.shaped_width != Some(px(0.))
             && truncate.is_none()
-            // A truncated layout answers an unconstrained probe with the truncated size,
+            // WARNING: A truncated layout answers an unconstrained probe with the truncated size,
             // so it is never reused.
             && !inner.truncated
         {
@@ -164,10 +158,19 @@ impl TextState {
                     .runs
                     .iter()
                     .enumerate()
-                    .flat_map(|(run_ix, run)| {
-                        run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                            (WrapBoundary { run_ix, glyph_ix }, glyph)
-                        })
+                    .flat_map(|(run_index, run)| {
+                        run.glyphs
+                            .iter()
+                            .enumerate()
+                            .map(move |(glyph_index, glyph)| {
+                                (
+                                    WrapBoundary {
+                                        run_index,
+                                        glyph_index,
+                                    },
+                                    glyph,
+                                )
+                            })
                     })
                     .peekable();
                 while let Some((boundary, glyph)) = glyphs.next() {
@@ -318,7 +321,6 @@ impl TextLayout {
             .unwrap_or_default()
     }
 
-    /// Shapes `text` in `style` to wrap at `width`, outside the tree, with its lines at `bounds`.
     pub fn shape(
         text: SharedString,
         runs: Vec<TextRun>,
@@ -351,8 +353,6 @@ impl TextLayout {
     }
 }
 
-/// Cuts the text that does not fit `width`, or `line_clamp` rows of `wrap_width`, and ends it
-/// with `affix`.
 fn truncate_text(
     system: &super::TextSystem,
     style: &TextStyle,
@@ -375,7 +375,6 @@ fn truncate_text(
     ) else {
         return unchanged();
     };
-    // The cut index and the end of the row it is in.
     let cut = match clamp {
         Some((max, wrap)) => {
             let mut rows = 0;
@@ -386,7 +385,9 @@ fn truncate_text(
                 let ends = line
                     .wrap_boundaries
                     .iter()
-                    .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                    .map(|boundary| {
+                        layout.runs[boundary.run_index].glyphs[boundary.glyph_index].index
+                    })
                     .chain([layout.len]);
                 let mut row_start = 0;
                 for end in ends {

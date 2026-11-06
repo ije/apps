@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Builds FFmpeg as one shared library for the video and audio features into target/ffmpeg/<system>-<arch>.
 # WARNING: FFmpeg is LGPL only while GPL and nonfree parts stay off. Apps load this library
 # dynamically and ship FFmpeg.LICENSE next to it, so users can replace it.
 set -euo pipefail
@@ -94,7 +93,7 @@ make -C "$build" -j"$jobs"
 make -C "$build" install-headers DESTDIR="$build/install"
 rm -rf "$build/install/share" "$build/install/lib/pkgconfig"
 
-# The library exports only what the media library calls, so the linker drops the rest of FFmpeg.
+# WARNING: the library exports only what the media library calls, so the linker drops the rest of FFmpeg.
 lib=$build/install/lib
 mkdir -p "$lib"
 config=$build/ffbuild/config.mak

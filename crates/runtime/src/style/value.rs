@@ -1,6 +1,5 @@
 use super::{Lengths, Prop, Style, color, parser};
 
-/// The shorthand and its top, right, bottom and left longhands.
 pub(crate) const PADDING: [Prop; 5] = [
     Prop::PADDING,
     Prop::PADDING_TOP,
@@ -16,7 +15,6 @@ pub(crate) const MARGIN: [Prop; 5] = [
     Prop::MARGIN_LEFT,
 ];
 
-/// The width, style and color of the top, right, bottom and left borders.
 pub(crate) const BORDERS: [[Prop; 3]; 4] = [
     [
         Prop::BORDER_TOP_WIDTH,
@@ -72,8 +70,6 @@ pub fn length(value: &str, base: f32, font: f32, vw: f32, vh: f32) -> f32 {
         .unwrap_or(0.)
 }
 
-/// Cells of one `grid-template-areas` row. Like the spec tokenizer, a run of dots is one `.` cell,
-/// and dots end a name, so `".a b."` has four cells.
 pub(crate) fn area_cells(row: &str) -> Vec<&str> {
     let mut cells = Vec::new();
     let mut rest = row.trim_start();
@@ -88,11 +84,10 @@ pub(crate) fn area_cells(row: &str) -> Vec<&str> {
 }
 
 pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
-    // Most values have no strings, escapes, comments or URLs, so a byte scan splits them like
+    // WARNING: most values have no strings, escapes, comments or URLs, so a byte scan splits them like
     // the tokenizer below at a fraction of the cost.
     let bytes = value.as_bytes();
     let mut parts = Vec::new();
-    // Open brackets, two bits each, innermost lowest.
     let (mut open, mut depth, mut start, mut closed) = (0u64, 0u32, 0, false);
     let simple = 'scan: {
         for (index, &byte) in bytes.iter().enumerate() {
@@ -146,7 +141,6 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     tokenized(value, separator)
 }
 
-/// `components` with the CSS tokenizer, for values with strings, escapes, comments or URLs.
 fn tokenized(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut input = cssparser::Parser::new(value);
@@ -157,7 +151,6 @@ fn tokenized(value: &str, separator: char) -> Vec<&str> {
         let Ok(token) = input.next_including_whitespace().cloned() else {
             break;
         };
-        // A function or block ends a value, so `rotate(1deg)scale(2)` is two values.
         if separator == ' '
             && std::mem::take(&mut block)
             && !matches!(
@@ -581,9 +574,7 @@ fn split_values_like_the_tokenizer() {
     }
 }
 
-/// A number as Chrome serializes it: six significant digits, without trailing zeros.
 pub(crate) fn number(value: f64) -> String {
-    // Conversions leave float noise like 1e-17 where the result is 0.
     let value = if value.abs() < 1e-9 { 0. } else { value };
     let digits = if value == 0. || !value.is_finite() {
         0

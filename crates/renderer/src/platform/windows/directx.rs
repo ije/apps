@@ -1,10 +1,7 @@
-//! Direct3D 11 rendering into DirectComposition swap chains. All windows share one device,
-//! one set of pipelines and one atlas.
-
 use crate::{
     DevicePixels, Rgba, Size,
     atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
-    frame::{Cmd, RenderFrame, Target, TextParams, bytes},
+    frame::{Command, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
 use anyhow::{Context as _, Result, ensure};
@@ -33,7 +30,6 @@ thread_local! {
     static GPU: RefCell<Option<Rc<Gpu>>> = const { RefCell::new(None) };
 }
 
-/// The current device, made again after the old one was lost.
 fn gpu() -> Result<Rc<Gpu>> {
     GPU.with_borrow_mut(|slot| {
         // SAFETY: plain device query.
@@ -62,7 +58,6 @@ macro_rules! shader {
     };
 }
 
-/// Compiles a shader at launch, when the build had no `fxc`.
 #[cfg(not(renderer_shaders))]
 fn compile(entry: &str) -> Result<Cow<'static, [u8]>> {
     use windows::{Win32::Graphics::Direct3D::Fxc::D3DCompile, core::PCSTR};
@@ -114,7 +109,6 @@ struct Pipeline {
     blend: ID3D11BlendState,
 }
 
-/// An instance buffer, grown to fit the largest frame.
 struct Instances {
     buffer: ID3D11Buffer,
     view: Option<ID3D11ShaderResourceView>,
@@ -186,7 +180,6 @@ impl Gpu {
             );
             Ok((device, context.context("missing device context")?, level))
         };
-        // Software rendering keeps the app usable without a GPU driver, like in some VMs.
         let (device, context, level) =
             create(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| create(D3D_DRIVER_TYPE_WARP))?;
         // SAFETY: plain COM calls on the new device.
@@ -198,7 +191,7 @@ impl Gpu {
                 let mut desc = D3D11_BLEND_DESC::default();
                 let target = &mut desc.RenderTarget[0];
                 target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
+                // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
                 if let Some(source) = source {
                     target.BlendEnable = true.into();
                     target.SrcBlend = source;
@@ -335,7 +328,6 @@ impl Gpu {
         }
     }
 
-    /// Writes this frame's instances of one kind and returns their view.
     fn upload(
         &self,
         kind: usize,
@@ -382,7 +374,6 @@ impl Gpu {
     }
 }
 
-/// Replaces the contents of a dynamic buffer.
 fn write(context: &ID3D11DeviceContext, buffer: &ID3D11Buffer, data: &[u8]) -> Result<()> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: the buffer is at least `data.len()` bytes.
@@ -394,7 +385,6 @@ fn write(context: &ID3D11DeviceContext, buffer: &ID3D11Buffer, data: &[u8]) -> R
     Ok(())
 }
 
-/// The alpha correction ratios for a DirectWrite gamma, as in Windows Terminal.
 fn gamma_ratios(gamma: f32) -> [f32; 4] {
     const RATIOS: [[f32; 4]; 13] = [
         [0.0000, 0.0000, 0.0000, 0.0000],
@@ -422,7 +412,6 @@ fn gamma_ratios(gamma: f32) -> [f32; 4] {
     ]
 }
 
-/// An offscreen layer texture.
 struct Layer {
     texture: ID3D11Texture2D,
     view: Option<ID3D11RenderTargetView>,
@@ -430,10 +419,8 @@ struct Layer {
     size: [u32; 2],
 }
 
-/// The swap chain of a window and its DirectComposition visual.
 struct Surface {
     swap_chain: IDXGISwapChain1,
-    /// The back buffer and its view, released while the swap chain resizes.
     back: Option<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)>,
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
@@ -465,7 +452,6 @@ impl Surface {
             let swap_chain = gpu
                 .factory
                 .CreateSwapChainForComposition(&gpu.device, &desc, None)?;
-            // Below child windows, like embedded web views.
             let target = gpu.composition.CreateTargetForHwnd(hwnd, false)?;
             let visual = gpu.composition.CreateVisual()?;
             visual.SetContent(&swap_chain)?;
@@ -502,7 +488,6 @@ pub(crate) struct Renderer {
     clear: [f32; 4],
     size: [u32; 2],
     surface: Option<Surface>,
-    /// The offscreen layer textures, kept across frames.
     pool: Vec<Layer>,
     frame: RenderFrame,
 }
@@ -528,7 +513,6 @@ impl Renderer {
         &self.gpu.atlas
     }
 
-    /// The color behind the content.
     pub fn set_background(&mut self, color: Rgba) {
         self.clear = if self.opaque {
             [color.r, color.g, color.b, 1.]
@@ -567,7 +551,6 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         match self.render(scene, capture) {
             Ok(pixels) => pixels.map(|pixels| Ok((self.size, pixels))),
@@ -575,7 +558,6 @@ impl Renderer {
                 eprintln!("apps: failed to render: {error:#}");
                 // SAFETY: plain device query.
                 if unsafe { self.gpu.device.GetDeviceRemovedReason() }.is_err() {
-                    // The next frames draw with a new device, once the driver is back.
                     self.surface = None;
                     super::run_after(Duration::from_millis(100), || {
                         crate::app::update(|app| {
@@ -716,7 +698,6 @@ impl Renderer {
         };
         let globals = gpu.globals.as_ref().context("missing globals buffer")?;
         let batch = gpu.batch.as_ref().context("missing batch buffer")?;
-        // Binds a render target with its viewport and globals.
         let bind = |target: Target| -> Result<()> {
             let [width, height] = frame.pixels(target);
             let viewport = D3D11_VIEWPORT {
@@ -778,10 +759,11 @@ impl Renderer {
             context.PSSetSamplers(0, Some(slice::from_ref(&gpu.sampler)));
         }
         let mut current = Target::Frame;
-        for cmd in &frame.cmds {
-            match cmd {
-                // Tiles of one texture keep it bound, with their own globals.
-                Cmd::Pass(target, false) if frame.texture(*target) == frame.texture(current) => {
+        for command in &frame.commands {
+            match command {
+                Command::Pass(target, false)
+                    if frame.texture(*target) == frame.texture(current) =>
+                {
                     current = *target;
                     write(
                         context,
@@ -789,33 +771,33 @@ impl Renderer {
                         bytes(&[frame.globals(current, &gpu.text)]),
                     )?;
                 }
-                Cmd::Pass(target, clear_target) => {
+                Command::Pass(target, clear_target) => {
                     current = *target;
                     bind(current)?;
                     if *clear_target {
                         clear(current);
                     }
                 }
-                Cmd::Quads(range) => draw(QUADS, range, None)?,
-                Cmd::Shadows(range) => draw(SHADOWS, range, None)?,
-                Cmd::Underlines(range) => draw(UNDERLINES, range, None)?,
-                Cmd::Mono(id, range) => {
+                Command::Quads(range) => draw(QUADS, range, None)?,
+                Command::Shadows(range) => draw(SHADOWS, range, None)?,
+                Command::Underlines(range) => draw(UNDERLINES, range, None)?,
+                Command::Mono(id, range) => {
                     if let Some(texture) = atlas(*id) {
                         draw(MONO, range, Some(texture))?;
                     }
                 }
-                Cmd::Poly(id, range) => {
+                Command::Poly(id, range) => {
                     if let Some(texture) = atlas(*id) {
                         draw(POLY, range, Some(texture))?;
                     }
                 }
-                Cmd::Blur { src, dst, index } => {
+                Command::Blur { src, dst, index } => {
                     bind(*dst)?;
                     clear(*dst);
                     draw(BLURS, &(*index..*index + 1), srv(*src))?;
                     bind(current)?;
                 }
-                Cmd::Copy { src, dst, region } => {
+                Command::Copy { src, dst, region } => {
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
                     let (left, top) = ((region[0] - from[0]) as u32, (region[1] - from[1]) as u32);
                     // SAFETY: the region lies within both textures.
@@ -839,7 +821,7 @@ impl Renderer {
                         );
                     }
                 }
-                Cmd::Composite {
+                Command::Composite {
                     src,
                     mask,
                     backdrop,
@@ -859,7 +841,6 @@ impl Renderer {
     }
 }
 
-/// The RGBA rows of a drawn frame.
 fn read_back(gpu: &Gpu, texture: &ID3D11Texture2D, size: [u32; 2]) -> Result<Vec<u8>> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: size[0],

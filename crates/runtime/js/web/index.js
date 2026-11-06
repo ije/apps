@@ -22,18 +22,18 @@ globalThis.__appsWeb = call => {
       eventStates.set(this, { type: String(type), bubbles: !!options.bubbles, cancelable: !!options.cancelable, composed: !!options.composed,
         defaultPrevented: false, target: null, currentTarget: null, eventPhase: 0, timeStamp: Date.now() - (globalThis.performance?.timeOrigin ?? Date.now()), dispatching: false, stopped: false, immediate: false, passive: false });
     }
-    preventDefault() { const s = eventStates.get(this); if (s.cancelable && !s.passive) s.defaultPrevented = true; }
+    preventDefault() { const state = eventStates.get(this); if (state.cancelable && !state.passive) state.defaultPrevented = true; }
     stopPropagation() { eventStates.get(this).stopped = true; }
-    stopImmediatePropagation() { const s = eventStates.get(this); s.stopped = s.immediate = true; }
-    composedPath() { const s = eventStates.get(this); return s.dispatching ? [...(s.path ?? [s.target])] : []; }
+    stopImmediatePropagation() { const state = eventStates.get(this); state.stopped = state.immediate = true; }
+    composedPath() { const state = eventStates.get(this); return state.dispatching ? [...(state.path ?? [state.target])] : []; }
     get cancelBubble() { return eventStates.get(this).stopped; }
     set cancelBubble(value) { if (value) this.stopPropagation(); }
     get returnValue() { return !this.defaultPrevented; }
     set returnValue(value) { if (!value) this.preventDefault(); }
     get isTrusted() { return !!eventStates.get(this).trusted; }
     initEvent(type, bubbles = false, cancelable = false) {
-      const s = eventStates.get(this); if (s.dispatching) return;
-      Object.assign(s, { type: String(type), bubbles: !!bubbles, cancelable: !!cancelable, defaultPrevented: false, target: null, stopped: false, immediate: false });
+      const state = eventStates.get(this); if (state.dispatching) return;
+      Object.assign(state, { type: String(type), bubbles: !!bubbles, cancelable: !!cancelable, defaultPrevented: false, target: null, stopped: false, immediate: false });
     }
   }
   for (const name of ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target', 'currentTarget', 'eventPhase', 'timeStamp']) Object.defineProperty(Event.prototype, name, { enumerable: true, get() { return eventStates.get(this)[name]; } });
@@ -68,24 +68,24 @@ globalThis.__appsWeb = call => {
     }
     dispatchEvent(event) {
       if (!(event instanceof Event)) throw new TypeError('Expected an Event');
-      const s = eventStates.get(event);
-      if (s.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
-      Object.assign(s, { target: this, currentTarget: this, eventPhase: 2, dispatching: true });
+      const state = eventStates.get(event);
+      if (state.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
+      Object.assign(state, { target: this, currentTarget: this, eventPhase: 2, dispatching: true });
       const target = eventTargets.get(this), list = [...(target.get(event.type) ?? [])];
       try {
         for (const item of list) {
-          if (s.immediate) break;
+          if (state.immediate) break;
           if (!(target.get(event.type) ?? []).includes(item)) continue;
           if (item.once) this.removeEventListener(event.type, item.callback, item.capture);
-          s.passive = item.passive;
+          state.passive = item.passive;
           try { if (typeof item.callback === 'function') item.callback.call(this, event); else item.callback.handleEvent(event); }
           catch (error) { console.error(error); }
-          s.passive = false;
+          state.passive = false;
         }
         // WARNING: only own `on*` properties run here. Accessor handlers, like DOM ones, are listeners in their place.
-        try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!s.immediate && typeof handler === 'function') handler.call(this, event); }
+        try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!state.immediate && typeof handler === 'function') handler.call(this, event); }
         catch (error) { console.error(error); }
-      } finally { Object.assign(s, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
+      } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
       return !event.defaultPrevented;
     }
   }
@@ -245,14 +245,14 @@ globalThis.__appsWeb = call => {
     }
     get size() { return params.get(this).list.length; }
     append(name, value) { params.get(this).list.push([usv(name), usv(value)]); updateParams(this); }
-    delete(name, value) { name = usv(name); if (value !== undefined) value = usv(value); const s = params.get(this); s.list = s.list.filter(pair => pair[0] !== name || (value !== undefined && pair[1] !== value)); updateParams(this); }
+    delete(name, value) { name = usv(name); if (value !== undefined) value = usv(value); const state = params.get(this); state.list = state.list.filter(pair => pair[0] !== name || (value !== undefined && pair[1] !== value)); updateParams(this); }
     get(name) { name = usv(name); return params.get(this).list.find(pair => pair[0] === name)?.[1] ?? null; }
     getAll(name) { name = usv(name); return params.get(this).list.filter(pair => pair[0] === name).map(pair => pair[1]); }
     has(name, value) { name = usv(name); if (value !== undefined) value = usv(value); return params.get(this).list.some(pair => pair[0] === name && (value === undefined || pair[1] === value)); }
     set(name, value) {
-      name = usv(name); value = usv(value); const s = params.get(this), index = s.list.findIndex(pair => pair[0] === name);
-      if (index < 0) s.list.push([name, value]);
-      else { s.list[index][1] = value; s.list = s.list.filter((pair, i) => pair[0] !== name || i === index); }
+      name = usv(name); value = usv(value); const state = params.get(this), index = state.list.findIndex(pair => pair[0] === name);
+      if (index < 0) state.list.push([name, value]);
+      else { state.list[index][1] = value; state.list = state.list.filter((pair, i) => pair[0] !== name || i === index); }
       updateParams(this);
     }
     sort() { params.get(this).list.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0); updateParams(this); }

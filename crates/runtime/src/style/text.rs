@@ -54,36 +54,27 @@ pub(crate) struct InlineText {
     pub cursors: Box<[(usize, renderer::CursorStyle)]>,
     pub shadows: Box<[(f32, f32, f32, u32)]>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
-    /// The line height of the text up to each end offset, which sizes its inline boxes in a row.
     pub line_heights: Box<[(usize, LineHeight)]>,
 }
 
-/// An inline box with its own layout, like an `inline-block` or an image, that a placeholder holds a place for.
 #[derive(Clone, Copy)]
 pub(crate) struct Atom {
     pub node: usize,
-    /// The placeholder in the text.
     pub at: usize,
     pub run: usize,
 }
 
-/// An inline box in the text with something to paint or room around its text.
 #[derive(Clone, Copy)]
 pub(crate) struct InlineBox {
-    /// The node in `ranges`.
     pub index: usize,
     pub fill: u32,
-    /// Padding and border width: top, right, bottom and left.
     pub edges: [f32; 4],
     pub borders: [f32; 4],
     pub border: u32,
-    /// From its first character to its left border edge.
     pub lead: f32,
-    /// From the position after its last character to its right border edge.
     pub trail: f32,
 }
 
-/// A computed `line-height`. A number scales with the font size of the text that inherits it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum LineHeight {
     Normal,
@@ -258,7 +249,6 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
     }
 }
 
-/// A CSS `letter-spacing` or `word-spacing` value.
 pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::Pixels {
     renderer::px(
         style
@@ -270,8 +260,7 @@ pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::P
     )
 }
 
-/// CSS 2.1 9.4.2: an inline box without content and without inline padding, border or margin makes no line.
-pub(crate) fn phantom(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
     let node = &doc.nodes[id];
     let style = &styles.values[id];
     match node.tag.as_str() {
@@ -318,10 +307,9 @@ pub(crate) fn phantom(doc: &Document, styles: &ComputedStyles, id: usize) -> boo
         && node
             .children
             .iter()
-            .all(|&child| phantom(doc, styles, child))
+            .all(|&child| makes_no_line(doc, styles, child))
 }
 
-/// Removes the last character of inline text, a space or a line break, from its run and ranges.
 fn pop(
     text: &mut String,
     runs: &mut Vec<renderer::TextRun>,
@@ -340,9 +328,7 @@ fn pop(
     }
 }
 
-/// Whether an inline box holds a block-level box. The block splits it into the lines before and after it, so
-/// the box lays out as a block.
-pub(crate) fn splits(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
     let inline = |id: usize| {
         let tag = doc.nodes[id].tag.as_str();
         !tag.starts_with('#')
@@ -368,7 +354,6 @@ pub(crate) fn splits(doc: &Document, styles: &ComputedStyles, id: usize) -> bool
     let mut pending: Vec<usize> = doc.nodes[id].children.clone();
     while let Some(child) = pending.pop() {
         let style = &styles.values[child];
-        // A `<br>` is a line break whatever its display.
         if doc.nodes[child].tag.starts_with('#')
             || doc.nodes[child].tag == "br"
             || style
@@ -389,7 +374,6 @@ pub(crate) fn splits(doc: &Document, styles: &ComputedStyles, id: usize) -> bool
     false
 }
 
-/// Builds one text layout for an element whose content is only text and plain inline elements.
 pub(crate) fn inline_text(
     doc: &Document,
     styles: &ComputedStyles,
@@ -411,7 +395,6 @@ pub(crate) fn inline_text(
         .iter()
         .position(|&sibling| sibling == id)
         .unwrap_or(0);
-    // Text in a flex or grid container is an item of its own, so its edges are trimmed.
     let item = doc.nodes[id].parent.is_some_and(|parent| {
         styles.values[parent]
             .get(Prop::DISPLAY)
@@ -426,32 +409,26 @@ pub(crate) fn inline_text(
                         && styles.values[sibling]
                             .get(Prop::DISPLAY)
                             .is_none_or(|value| value.starts_with("inline"))
-                        && !splits(doc, styles, sibling)
+                        && !holds_block_box(doc, styles, sibling)
             })
     };
-    // Boxes that make no line, like empty inlines, keep no spaces around them.
-    let trailing = inline_sibling(
-        siblings
-            .get(position + 1..)
-            .and_then(|rest| rest.iter().find(|&&sibling| !phantom(doc, styles, sibling))),
-    );
+    let trailing = inline_sibling(siblings.get(position + 1..).and_then(|rest| {
+        rest.iter()
+            .find(|&&sibling| !makes_no_line(doc, styles, sibling))
+    }));
     let mut text = String::new();
     let mut runs: Vec<renderer::TextRun> = Vec::new();
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
     let mut boxes: Vec<InlineBox> = Vec::new();
     let mut atoms: Vec<Atom> = Vec::new();
-    // Flex and grid containers make their children items, not boxes in a line.
     let atomic_allowed = !own
         && !parent
             .get(Prop::DISPLAY)
             .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"));
-    // Room for the boxes that open before the next text.
     let mut opening = 0f32;
-    // Per box: `opening` at its left border edge, and the run and its end inset at its right border edge.
     let mut marks: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
     let mut cursors = Vec::new();
-    // Inline `::before` and `::after` boxes are content of the line, so spaces next to them stay.
     let [before, after] = [0, 1].map(|index| {
         !own && styles.pseudos.get(&id).is_some_and(|pseudos| {
             let pseudo = &pseudos[index];
@@ -471,7 +448,7 @@ pub(crate) fn inline_text(
         && !inline_sibling(siblings.get(..position).and_then(|rest| {
             rest.iter()
                 .rev()
-                .find(|&&sibling| !phantom(doc, styles, sibling))
+                .find(|&&sibling| !makes_no_line(doc, styles, sibling))
         }));
     let mut pending: Vec<_> = if own {
         vec![(id, None, None)]
@@ -505,14 +482,12 @@ pub(crate) fn inline_text(
         }
         let node = &doc.nodes[child];
         let style = &styles.values[child];
-        // Comments and hidden boxes, like a hidden `<br>`, add nothing to the text.
         if node.tag == "#comment"
             || !node.tag.starts_with('#') && style.get(Prop::DISPLAY) == Some("none")
         {
             continue;
         }
         if node.tag == "br" {
-            // A collapsible space before a forced break hangs, so it takes no room in its line.
             if text.ends_with(' ')
                 && !style
                     .get(Prop::WHITE_SPACE)
@@ -520,7 +495,6 @@ pub(crate) fn inline_text(
             {
                 pop(&mut text, &mut runs, &mut ranges);
             }
-            // An empty range gives the `<br>` a box at the end of its line, like Chrome.
             ranges.push((child, text.len()..text.len()));
             text.push('\n');
             runs.push(text_run(style, &styles.lengths[child], 1));
@@ -611,16 +585,21 @@ pub(crate) fn inline_text(
             || style.iter().any(|(key, value)| {
                 key.is_known()
                     && parent.value(key) != Some(value)
-                    // A relative box that is not moved lays out like a static one.
                     && !(key == Prop::POSITION
                         && &**value == "relative"
-                        && [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT, Prop::Z_INDEX]
-                            .into_iter()
-                            .all(|prop| {
-                                style
-                                    .get(prop)
-                                    .is_none_or(|value| matches!(value, "auto" | "0" | "0px"))
-                            }))
+                        && [
+                            Prop::TOP,
+                            Prop::RIGHT,
+                            Prop::BOTTOM,
+                            Prop::LEFT,
+                            Prop::Z_INDEX,
+                        ]
+                        .into_iter()
+                        .all(|prop| {
+                            style
+                                .get(prop)
+                                .is_none_or(|value| matches!(value, "auto" | "0" | "0px"))
+                        }))
                     && !matches!(
                         &**value,
                         "" | "0"
@@ -637,7 +616,6 @@ pub(crate) fn inline_text(
                             | "transparent"
                             | "currentcolor"
                             | "solid"
-                            // What the `background` shorthand sets by default.
                             | "0% 0%"
                             | "repeat"
                             | "scroll"
@@ -646,9 +624,7 @@ pub(crate) fn inline_text(
                     )
                     && !matches!(
                         key,
-                        // Checked above: `nowrap` is a flag of its runs.
                         Prop::WHITE_SPACE
-                            // Inline boxes reserve their padding, border and margin in the text.
                             | Prop::PADDING
                             | Prop::PADDING_TOP
                             | Prop::PADDING_RIGHT
@@ -688,7 +664,6 @@ pub(crate) fn inline_text(
                             | Prop::USER_SELECT
                             | Prop::WEBKIT_USER_SELECT
                             | Prop::FONT_SIZE
-                            // Colors of borders without width, like Tailwind's `currentColor` borders.
                             | Prop::BORDER_TOP_COLOR
                             | Prop::BORDER_RIGHT_COLOR
                             | Prop::BORDER_BOTTOM_COLOR
@@ -710,7 +685,6 @@ pub(crate) fn inline_text(
                             | Prop::OUTLINE_STYLE
                             | Prop::OUTLINE_WIDTH
                             | Prop::OUTLINE_OFFSET
-                            // Sizes, vertical margins and item or container properties don't apply to inline boxes.
                             | Prop::WIDTH
                             | Prop::HEIGHT
                             | Prop::MIN_WIDTH
@@ -878,14 +852,12 @@ pub(crate) fn inline_text(
     if text.is_empty() {
         return None;
     }
-    // Boxes alone need no text layout: their line is a row of boxes.
     if !atoms.is_empty() && text.chars().all(|c| c == '\u{fffc}' || c.is_whitespace()) {
         return None;
     }
     let pseudo_run = |style: &Style| {
         let units = &styles.lengths[id];
         let mut run = text_run(style, units, 0);
-        // `::first-letter` and `::first-line` may change the size inside the line.
         run.font_size = style
             .get(Prop::FONT_SIZE)
             .and_then(|value| units.resolve(value, units.font.em))
@@ -988,7 +960,6 @@ pub(crate) fn inline_text(
     })
 }
 
-/// Where lines may break inside words, from `word-break` and `overflow-wrap`.
 pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
     match (style.get(Prop::WORD_BREAK), style.get(Prop::OVERFLOW_WRAP)) {
         (Some("break-all"), _) => renderer::WordBreak::BreakAll,
@@ -1011,7 +982,6 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
                 let family = family.trim().trim_matches(['\'', '"']);
                 let lower = family.to_ascii_lowercase();
                 let generic: &[&str] = match lower.as_str() {
-                    // Like Chrome, the `ui-*` families are not supported, so lists fall through to the next family.
                     "ui-monospace" | "ui-serif" | "ui-sans-serif" | "ui-rounded" => return None,
                     "system-ui" | "-apple-system" | "blinkmacsystemfont" => &[".SystemUIFont"],
                     "sans-serif" => &[
@@ -1076,7 +1046,6 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         Some(value) if value.starts_with("oblique") => renderer::FontStyle::Oblique,
         _ => renderer::FontStyle::Normal,
     };
-    // OpenType features in cascade order, so `font-feature-settings` wins over the `font-variant-*` keywords.
     let mut features: Vec<(String, u32)> = Vec::new();
     if style.get(Prop::FONT_KERNING) == Some("none") {
         features.push(("kern".into(), 0));

@@ -29,79 +29,52 @@ use std::{
     sync::Arc,
 };
 
-/// The page of one window, shared with the elements that paint it.
 pub(crate) struct PageState {
     pub(crate) id: u64,
-    /// The animation frame callbacks wait for the next frame.
     queued: Cell<bool>,
     pub(crate) runtime: Rc<RefCell<Desktop>>,
     pub(crate) host: Rc<RefCell<Host>>,
     pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
-    /// By browser, the bounds it was given and the node revision its source was checked at.
+    #[allow(clippy::type_complexity)]
     pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64, bool)>>,
-    /// The `canvas` and `iframe` nodes, found again when the document changes.
     tagged: RefCell<(u64, Vec<usize>, Vec<usize>)>,
-    /// The `id` index of the document, kept while the document is unchanged.
     ids: RefCell<(u64, Rc<effects::Ids>)>,
-    /// By inline SVG: its style, size and content hash, its source, and its parsed boxes.
     svgs: RefCell<HashMap<usize, element::Svg>>,
-    /// By form field, the selection while focused and the text length it drew last, to scroll a moved caret into view.
     fields: RefCell<HashMap<usize, input::Caret>>,
-    /// Background image files that workers decode, with the node that wants them and the bitmap once it is done.
     decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
-    /// A drag area was pressed, so the next drag moves the window.
     pub(crate) moving: Cell<bool>,
-    /// The files dragged over the window.
     pub(crate) dropped: RefCell<Vec<PathBuf>>,
-    /// The pressed mouse buttons, as DOM `buttons` bits.
     buttons: Cell<u8>,
-    /// The screen position of the content area, until the window moves.
     pub(crate) origin: Cell<Option<renderer::Point<renderer::Pixels>>>,
     window: WindowId,
-    /// A script read geometry, so this build only lays the page out.
     reflowing: Cell<bool>,
-    /// Boxes whose animations wait until they come into view, with their clipping ancestors.
     parked: RefCell<Vec<(usize, Clips)>>,
-    /// Animated boxes in view that painted no keyed layer, so their opacity can't be patched.
     flat: RefCell<rustc_hash::FxHashSet<usize>>,
-    /// From when composite frames may promote their layers to the compositor, and whether they are.
     promote: Cell<Option<(std::time::Instant, bool)>>,
-    /// By box whose keyed layer keeps a transform: the bounds and parent perspective its transform
-    /// resolves with, and the transform drawn last.
-    pub(super) spun: RefCell<rustc_hash::FxHashMap<usize, Spun>>,
-    /// The caret drawn last: its node, offset and text length, when it moved, and its blink timer by phase.
+    pub(super) composited_transforms: RefCell<rustc_hash::FxHashMap<usize, CompositedTransform>>,
     caret: RefCell<Option<input::Blink>>,
-    /// The FPS HUD of `apps run`.
     hud: RefCell<Option<hud::Hud>>,
-    /// By element, what its kept boxes were built from, and the frame they hold for: viewport size,
-    /// scale, font loads and the top layer.
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
-    /// The collapsed margins of each parent's children, kept while its subtree's geometry stays.
     walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
-    /// The entries of `kept` that this build replaced, to undo when the window never gets the build.
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
     layout_queued: Cell<bool>,
-    /// The canvas color that the native window has.
     #[cfg(target_os = "macos")]
     canvas: std::cell::Cell<(u32, u8)>,
 }
 
-/// Clipping ancestors with their clipped axes, see [`clips`].
 type Clips = Vec<(usize, [bool; 2])>;
-type Spun = (
+type CompositedTransform = (
     renderer::Bounds<renderer::Pixels>,
     Option<(f32, [f32; 2])>,
     effects::Matrix,
 );
 
 thread_local! {
-    /// The app and the window of the page scripts that run now.
     static SCRIPTS: Cell<Option<(*mut App, Option<*mut Window>)>> = const { Cell::new(None) };
     static VIEWS: RefCell<HashMap<u64, std::rc::Weak<PageState>>> = RefCell::default();
 }
 
-/// Runs page script `f`, which may lay out its page with `cx` and `window`, see [`reflow`].
 // WARNING: `f` must not use `cx` or `window`: a reflow reaches them through pointers while it runs.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
     crate::jsc::REFLOW.set(Some(reflow));
@@ -112,22 +85,19 @@ pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnO
     result
 }
 
-/// Writes `text` to the clipboard, or reads it without text, for the page scripts that run now.
 fn clipboard(text: Option<String>) -> Option<String> {
     let (cx, _) = SCRIPTS.get()?;
     // WARNING: the pointer comes from `scripted`, whose caller does not touch it until the script returns.
     let cx = unsafe { &*cx };
     match text {
         Some(text) => {
-            cx.write_to_clipboard(text);
+            cx.write_clipboard(text);
             Some(String::new())
         }
-        None => Some(cx.read_from_clipboard().unwrap_or_default()),
+        None => Some(cx.read_clipboard().unwrap_or_default()),
     }
 }
 
-/// Runs edit `command` of `webContents` in the page, like the keyboard: copy and cut write
-/// what the page copied to the clipboard, and paste reads it. Without an app it skips the clipboard.
 pub(crate) fn edit(
     renderer: &crate::jsc::JsContext,
     app: Option<(&mut App, Option<&mut Window>)>,
@@ -141,13 +111,13 @@ pub(crate) fn edit(
     let result = match app {
         Some((cx, window)) => {
             let pasted = matches!(command, "paste" | "pasteAndMatchStyle")
-                .then(|| cx.read_from_clipboard().unwrap_or_default());
+                .then(|| cx.read_clipboard().unwrap_or_default());
             let result = scripted(cx, window, || run(pasted.as_deref().unwrap_or(text)));
             if let Ok(copied) = &result
                 && matches!(command, "copy" | "cut")
                 && !copied.is_empty()
             {
-                cx.write_to_clipboard(copied.clone());
+                cx.write_clipboard(copied.clone());
             }
             result
         }
@@ -158,7 +128,6 @@ pub(crate) fn edit(
     }
 }
 
-/// Lays page `id` out now when it changed since its last layout, like a browser's forced reflow.
 pub(crate) fn reflow(id: u64) {
     let Some((cx, window)) = SCRIPTS.get() else {
         return;
@@ -192,7 +161,6 @@ pub(crate) fn reflow(id: u64) {
     }
 }
 
-/// Runs the page's resize observers and scroll listeners at the start of the next frame.
 fn queue_layout(view: Rc<PageState>, window: &mut Window) {
     if view.layout_queued.replace(true) {
         return;
@@ -217,7 +185,6 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
     });
 }
 
-/// Runs the page's animation frame callbacks on the next frame.
 // WARNING: once per frame: a second queued run would call the callbacks the first one requested in the same
 // frame, and both would queue again, so every request outside a frame added a run per frame.
 pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
@@ -226,8 +193,6 @@ pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
     }
 }
 
-/// Runs the page's animation frame callbacks before the frame lays out, and again on the next
-/// frame while the page asks for one.
 fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     view.queued.set(false);
     let renderer = view.runtime.try_borrow().ok().and_then(|app| {
@@ -260,7 +225,6 @@ fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     cx.defer(move |cx| Desktop::drive(runtime, cx));
 }
 
-/// The DOM `button` of a mouse button.
 fn button(button: MouseButton) -> u8 {
     match button {
         MouseButton::Left => 0,
@@ -272,7 +236,6 @@ fn button(button: MouseButton) -> u8 {
 }
 
 impl PageState {
-    /// The `screenX` and `screenY` of window position `at`, in screen points.
     fn screen(&self, window: &Window, at: renderer::Point<renderer::Pixels>) -> [f32; 2] {
         let origin = self.origin.get().unwrap_or_else(|| {
             let origin = window.window_state().content.origin;
@@ -321,7 +284,7 @@ impl PageView {
             reflowing: Cell::new(false),
             parked: RefCell::default(),
             flat: RefCell::default(),
-            spun: RefCell::default(),
+            composited_transforms: RefCell::default(),
             promote: Cell::new(None),
             caret: RefCell::default(),
             hud: RefCell::default(),
@@ -430,8 +393,6 @@ impl PageView {
                 // WARNING: like browsers, listeners run before the frame that shows the new offset, so what they
                 // place by the scroll position never lags it, also on the first event after an idle frame.
                 queue_layout(view.clone(), window);
-                // Like browsers, the wheel scrolls only the boxes around the element under the pointer, so a
-                // box that an overlay covers doesn't scroll. The hit test uses the styles of the frame on screen.
                 let (mut target, mut wheel) = (None, false);
                 if let Ok(host) = view.host.try_borrow() {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
@@ -597,7 +558,6 @@ impl PageView {
                         .is_some_and(|value| value == "none"),
                 };
             }
-            // Table rows and row groups are flattened out of the tree above; they show when their cells do.
             for &node in &dom.cull.cells {
                 if visible[node] {
                     let mut parent = doc.nodes[node].parent;
@@ -665,7 +625,7 @@ impl PageView {
             })
             .map(|(id, style, _)| {
                 let base = &styles.values[*id];
-                let turns = TURNS.iter().any(|&prop| {
+                let turns = TRANSFORM_PROPS.iter().any(|&prop| {
                     style.get(prop).is_some_and(|value| value != "none")
                         || style.get(prop) != base.get(prop)
                 });
@@ -704,7 +664,7 @@ impl PageView {
             }
         }
         let relaid = !restore.is_empty();
-        retire(dom, &visible, &styles, |image| window.drop_image(image));
+        drop_hidden_images(dom, &visible, &styles, |image| window.drop_image(image));
         self.svgs
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
@@ -815,7 +775,6 @@ impl PageView {
                     .position(|n| n.tag == "body")
                     .and_then(canvas)
             })
-            // Like Chromium, a dark color scheme paints the canvas dark unless the window is transparent.
             .or_else(|| match state.backgrounds.get(&self.id).copied() {
                 Some(color) if color.1 == 0 => Some(color),
                 _ if dark => Some((0x121212, 255)),
@@ -846,7 +805,7 @@ impl PageView {
             && !relaid
             && paint.iter().all(|(id, style)| {
                 let flags = cull::flags(&doc.nodes[*id].tag, style, &styles.lengths[*id], height)
-                    & (cull::MOVED | cull::BLOCKED);
+                    & (cull::MOVES_CONTENT | cull::UNCULLABLE);
                 info.get(*id)
                     .is_some_and(|info| info.flags & flags == flags)
             });
@@ -854,8 +813,8 @@ impl PageView {
         if unchanged {
             for info in &mut info {
                 info.flags &= !(cull::CHANGED
-                    | cull::RELISTED
-                    | cull::STALE
+                    | cull::CHILDREN_CHANGED
+                    | cull::GEOMETRY_CHANGED
                     | cull::COMPOSITED
                     | cull::TRANSFORMED
                     | cull::ANIMATED);
@@ -865,7 +824,7 @@ impl PageView {
             walk(&doc, dom, &styles);
             let walk = std::mem::take(&mut dom.cull.walk);
             // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
-            // A new viewport size is left to `cull::VIEWPORT`, as for kept styles, so a resize that restyles colors
+            // A new viewport size is left to `cull::READS_VIEWPORT`, as for kept styles, so a resize that restyles colors
             // keeps culling.
             let units = |lengths: &style::Lengths| {
                 let [font, root] = [lengths.font, lengths.root];
@@ -903,8 +862,8 @@ impl PageView {
                     .1
             };
             for (id, style) in &paint {
-                info[*id].flags =
-                    own_flags(&doc.nodes[*id].tag, style, *id) & (cull::MOVED | cull::BLOCKED);
+                info[*id].flags = own_flags(&doc.nodes[*id].tag, style, *id)
+                    & (cull::MOVES_CONTENT | cull::UNCULLABLE);
             }
             for &(id, _) in walk.nodes.iter().rev() {
                 let id = id as usize;
@@ -957,7 +916,6 @@ impl PageView {
                         ) || node.tag == "button"
                             && control::kind("button", None, false, style)
                                 .is_some_and(|(_, boxed)| boxed);
-                        // These build from their siblings or counters, see `cull::FRAMED`.
                         let pseudos = styles.pseudos.get(&id);
                         let framed = matches!(
                             node.tag.as_str(),
@@ -994,7 +952,6 @@ impl PageView {
                                 Some("absolute" | "fixed" | "sticky")
                             )
                             || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid"))
-                            // The text around an atomic inline box reserves its size.
                             || style
                                 .get(Prop::DISPLAY)
                                 .is_some_and(|value| value.starts_with("inline-"))
@@ -1016,10 +973,10 @@ impl PageView {
                             );
                         (
                             flags,
-                            u16::from(volatile) * cull::VOLATILE
-                                | u16::from(framed) * cull::FRAMED
-                                | u16::from(heighted) * cull::HEIGHTED
-                                | u16::from(input) * cull::INPUT,
+                            (u16::from(volatile) * cull::ALWAYS_REBUILT)
+                                | (u16::from(framed) * cull::READS_LAST_FRAME)
+                                | (u16::from(heighted) * cull::READS_HEIGHT)
+                                | (u16::from(input) * cull::INPUT),
                         )
                     }
                 };
@@ -1033,7 +990,7 @@ impl PageView {
                 for &child in &node.children {
                     let child_info = &info[child];
                     below |= child_info.flags;
-                    if child_info.flags & cull::OUT != 0 {
+                    if child_info.flags & cull::OUT_OF_FLOW != 0 {
                         out = out.wrapping_add(child_info.subtree);
                     } else {
                         std::hash::Hasher::write_usize(&mut list, child);
@@ -1085,22 +1042,22 @@ impl PageView {
                         info[id].flags
                             | flags
                             | (u16::from(reshaped) * cull::CHANGED)
-                            | (u16::from(relisted) * cull::RELISTED)
+                            | (u16::from(relisted) * cull::CHILDREN_CHANGED)
                             | (marks & !cull::INPUT)
-                            | (u16::from(dom.focus == Some(id)) * (cull::BLOCKED | cull::VOLATILE))
+                            | (u16::from(dom.focus == Some(id))
+                                * (cull::UNCULLABLE | cull::ALWAYS_REBUILT))
                             | below
-                                & (cull::BLOCKED
-                                    | cull::VIEWPORT
-                                    | cull::VOLATILE
-                                    | cull::FRAMED
-                                    | cull::HEIGHTED)
+                                & (cull::UNCULLABLE
+                                    | cull::READS_VIEWPORT
+                                    | cull::ALWAYS_REBUILT
+                                    | cull::READS_LAST_FRAME
+                                    | cull::READS_HEIGHT)
                     },
                 };
             }
             dom.cull.walk = walk;
         }
-        self.spun.borrow_mut().clear();
-        // A drawn frame takes promoted layers back, see `composite`.
+        self.composited_transforms.borrow_mut().clear();
         self.promote.set(
             (!composited.is_empty()).then(|| (now + std::time::Duration::from_millis(300), false)),
         );
@@ -1175,7 +1132,7 @@ impl PageView {
                 let mut node = Some(id);
                 while let Some(id) = node.filter(|&id| around.insert(id)) {
                     dom.grids.remove(&id);
-                    info[id].flags |= cull::STALE;
+                    info[id].flags |= cull::GEOMETRY_CHANGED;
                     node = crate::dom::flat_parent(&doc, dom, &styles, id);
                 }
                 stale = true;
@@ -1184,7 +1141,7 @@ impl PageView {
         if stale {
             dom.measurements.sizes.retain(|&(id, ..), _| {
                 info.get(id)
-                    .is_none_or(|info| info.flags & cull::STALE == 0)
+                    .is_none_or(|info| info.flags & cull::GEOMETRY_CHANGED == 0)
             });
         }
         dom.text_layouts.clear();
@@ -1294,7 +1251,6 @@ impl PageView {
         }
         // WARNING: the page scroll is kept under the document node, which never renders as an element.
         let page_scroll = dom.scroll.entry(0).or_default().clone();
-        // The page scrolls unless the root, or the body when the root's overflow is visible, hides it.
         let html = doc.nodes[0]
             .children
             .iter()
@@ -1322,11 +1278,9 @@ impl PageView {
             .and_then(|id| styles.values[id].get(Prop::OVERFLOW_Y))
             .unwrap_or("visible");
         let page_scrolls = !matches!(overflow, "hidden" | "clip");
-        // Like browsers, only the root element's value applies to the page, not the body's.
         let page_overscroll = html.map_or_else(Default::default, |html| {
             element::overscroll(&styles.values[html])
         });
-        // Like Chromium, the page's bar takes the body's `::-webkit-scrollbar` styles, then the root's.
         let page_bar = html.filter(|_| page_scrolls).and_then(|html| {
             let parts = body
                 .and_then(|body| styles.scrollbars.get(&body))
@@ -1353,7 +1307,7 @@ impl PageView {
             }
             // WARNING: a scroll farther than the overscan could bring culled boxes into view. A new
             // viewport size keeps culling: spacers whose parent changed width lay out again, and
-            // `cull::VIEWPORT` subtrees are not culled.
+            // `cull::READS_VIEWPORT` subtrees are not culled.
             dom.cull.resized = dom.cull.frame[..2] != frame[..2];
             dom.cull.enabled = !std::mem::take(&mut dom.cull.off)
                 && dom.cull.frame[2..] == frame[2..]
@@ -1368,7 +1322,6 @@ impl PageView {
                 resized: dom.cull.resized,
             })
         });
-        // The root never leaves the page: a fullscreen root is the page at the window size.
         let top_layer: Vec<usize> = dom
             .top_layer
             .iter()
@@ -1404,7 +1357,7 @@ impl PageView {
             }
             ids.1.clone()
         };
-        // What inline SVGs and positioned boxes read beyond their subtree goes into the keys of the boxes around
+        // WARNING: what inline SVGs and positioned boxes read beyond their subtree goes into the keys of the boxes around
         // them, so a kept box never holds one that would build differently.
         let mut inputs = rustc_hash::FxHashMap::<usize, u64>::default();
         {
@@ -1455,7 +1408,7 @@ impl PageView {
         {
             // WARNING: the scale and fonts resize boxes without new revisions, and the top layer takes boxes out
             // of their parents, so a change builds every box again. A new viewport size builds the subtrees with
-            // viewport units, see `cull::VIEWPORT`; other boxes key on their containing block.
+            // viewport units, see `cull::READS_VIEWPORT`; other boxes key on their containing block.
             let mut kept = self.kept_frame.borrow_mut();
             if kept.0[2..] != frame[2..] || kept.1 != top_layer {
                 kept.1 = top_layer.clone();
@@ -1475,8 +1428,6 @@ impl PageView {
             [width - page_space[1], height],
             None,
         );
-        // Each box of the top layer paints over the page and the boxes before it, after its `::backdrop`,
-        // laid out in the viewport and never culled.
         build.zone = None;
         let mut overlay: Vec<renderer::Child> = Vec::new();
         for &id in &top_layer {
@@ -1542,7 +1493,6 @@ impl PageView {
                     .into(),
                 );
             }
-            // The boxes of the top layer with a z-index paint around it, as in a stacking context.
             overlay.push(
                 renderer::node()
                     .absolute()
@@ -1673,16 +1623,14 @@ impl PageView {
     }
 }
 
-/// The properties that turn a composited box, see `cull::TRANSFORMED`.
-const TURNS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
+const TRANSFORM_PROPS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
 
-/// Whether two styles differ in nothing but `opacity` and transforms, which composite frames patch.
 fn composites(a: &style::Style, b: &style::Style) -> bool {
-    let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY && !TURNS.contains(prop);
+    let rest =
+        |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY && !TRANSFORM_PROPS.contains(prop);
     a.iter().filter(rest).eq(b.iter().filter(rest))
 }
 
-/// Wakes the view for the next animation change, with an opacity-only frame while `composite`.
 fn animate(
     view: &Rc<PageState>,
     dom: &mut crate::dom::State,
@@ -1756,9 +1704,6 @@ fn animation_events(
     Desktop::drive(runtime, cx);
 }
 
-/// An animation frame that only changes the opacity and transform of boxes with keyed layers: it
-/// samples the animations, patches those layers in the last frame's scene and shows it again. Any
-/// other change, or a transform that moves a box's center, draws the whole frame.
 fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     if window.will_draw() {
         return;
@@ -1811,7 +1756,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
         .iter()
         .map(|&id| (id, clips(doc, &styles, id).collect()))
         .collect();
-    let mut spun = view.spun.borrow_mut();
+    let mut composited_transforms = view.composited_transforms.borrow_mut();
     // WARNING: a box whose center moves could change what it covers and intersects, so only spins
     // and pulses about the center keep their layout.
     let centered =
@@ -1841,8 +1786,10 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
             if Rc::ptr_eq(old, style) {
                 return true;
             }
-            let turns = TURNS.iter().any(|&prop| old.get(prop) != style.get(prop));
-            let matrix = match spun.get_mut(id).filter(|_| turns) {
+            let turns = TRANSFORM_PROPS
+                .iter()
+                .any(|&prop| old.get(prop) != style.get(prop));
+            let matrix = match composited_transforms.get_mut(id).filter(|_| turns) {
                 Some((bounds, perspective, last)) => {
                     let matrix =
                         effects::transform(style, &styles.lengths[*id], *bounds, *perspective)
@@ -1872,7 +1819,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                 let on = animated.iter().all(|(id, ..)| {
                     let timeline = dom.motion.timeline(*id, &styles, &times);
                     let opacities: Vec<f32> = timeline.iter().map(effects::opacity).collect();
-                    let transforms = match spun.get(id) {
+                    let transforms = match composited_transforms.get(id) {
                         Some((bounds, perspective, last)) => {
                             let transforms: Vec<_> = timeline
                                 .iter()
@@ -1917,10 +1864,14 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                     false
                 }
             }));
-    if patched && spun.keys().any(|id| dom.animating.contains_key(id)) {
+    if patched
+        && composited_transforms
+            .keys()
+            .any(|id| dom.animating.contains_key(id))
+    {
         dom.bounds.set_moved();
     }
-    drop((flat, spun));
+    drop((flat, composited_transforms));
     if patched {
         dom.animating
             .extend(animated.into_iter().map(|(id, style, _)| (id, style)));
@@ -1949,8 +1900,6 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     }
 }
 
-/// Whether box `id` was in the viewport and in its clipping ancestors `clips` on their clipped axes at
-/// the last layout. A box without bounds or without area counts as seen.
 fn in_view(
     bounds: &crate::dom::LayoutMirror,
     [width, height]: [f32; 2],
@@ -1971,7 +1920,6 @@ fn in_view(
         && clips.all(|(clip, axes)| bounds.get(&clip).is_none_or(|&rect| overlaps(rect, axes)))
 }
 
-/// The ancestors that clip box `id`, with their clipped axes. The list ends at a positioned box, which can escape them.
 fn clips<'a>(
     doc: &'a crate::dom::Document,
     styles: &'a style::ComputedStyles,
@@ -2003,7 +1951,6 @@ fn clips<'a>(
     })
 }
 
-/// Brings the walk of the composed tree up to date. The composed children must be swapped in.
 fn walk(doc: &crate::dom::Document, dom: &mut crate::dom::State, styles: &style::ComputedStyles) {
     if dom
         .cull
@@ -2022,8 +1969,7 @@ fn walk(doc: &crate::dom::Document, dom: &mut crate::dom::State, styles: &style:
     }
 }
 
-/// Drops the cached images of nodes that are not displayed. Canvases keep their pixels.
-fn retire(
+fn drop_hidden_images(
     dom: &mut crate::dom::State,
     visible: &[bool],
     styles: &style::ComputedStyles,
@@ -2167,7 +2113,7 @@ mod tests {
         let mut released = Vec::new();
         let mut visible = vec![false; doc.nodes.len()];
         (visible[0], visible[second]) = (true, true);
-        retire(&mut dom, &visible, &styles, |image| released.push(image.id));
+        drop_hidden_images(&mut dom, &visible, &styles, |image| released.push(image.id));
         assert_eq!(dom.canvases[&canvas].pixels.pixels()[0].red(), 255);
         assert_eq!(released.len(), 2);
         assert!(released.contains(&dom.canvases[&canvas].image.id));
@@ -2176,7 +2122,7 @@ mod tests {
         assert!(!dom.backgrounds.contains_key(&(second, 64)));
         released.clear();
         for _ in 0..2 {
-            retire(&mut dom, &[], &styles, |image| released.push(image.id));
+            drop_hidden_images(&mut dom, &[], &styles, |image| released.push(image.id));
         }
         assert!(dom.backgrounds.is_empty());
         assert!(dom.canvases.contains_key(&canvas));

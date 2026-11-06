@@ -19,18 +19,14 @@ struct State {
     smoothing: bool,
     spacing: [f32; 2],
     font: Rc<str>,
-    /// The part of the text width that is left of the anchor: 0, 0.5 or 1.
     align: f32,
-    /// 0 alphabetic, 1 top, 2 middle, 3 bottom, 4 hanging, 5 ideographic.
     baseline: u8,
     clip: Option<Rc<skia::Mask>>,
 }
 
-/// A 2D context: its pixels, the drawing state, and the current path in canvas pixels.
 pub struct Canvas {
     pub pixels: skia::Pixmap,
     pub image: Arc<renderer::RenderImage>,
-    /// Keep `image` current. Only a `<canvas>` on a page needs it, so an offscreen canvas has one pixel copy.
     pub present: bool,
     state: State,
     stack: Vec<State>,
@@ -39,7 +35,6 @@ pub struct Canvas {
     glyph_bytes: usize,
 }
 
-/// Font, glyph, size bits, scale bits, subpixel variant and emoji.
 type GlyphKey = (usize, u32, u32, u32, u8, bool);
 
 type Glyph = (
@@ -48,7 +43,6 @@ type Glyph = (
     Vec<u8>,
 );
 
-/// Lays out canvas text in a `font` value like `bold 14px Inter`. Tabs and newlines become spaces.
 pub fn line(
     system: &renderer::TextSystem,
     aliases: &std::collections::HashMap<String, String>,
@@ -110,7 +104,6 @@ pub fn line(
     )
 }
 
-/// The ink of a line from its origin: left, right, above and below the baseline. All are 0 without ink.
 pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 4] {
     let mut ink: Option<[f32; 4]> = None;
     for run in &line.runs {
@@ -136,9 +129,11 @@ pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 
 fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     let (shape, stops): (Vec<f32>, Vec<(f32, String)>) = serde_json::from_str(spec).ok()?;
     // WARNING: tiny-skia has no start radius, so the stops move out by it. Inside it the first color fills.
-    let start = (shape.len() == 6)
-        .then(|| shape[2] / shape[5])
-        .unwrap_or(0.);
+    let start = if shape.len() == 6 {
+        shape[2] / shape[5]
+    } else {
+        0.
+    };
     let stops = stops
         .iter()
         .filter_map(|(offset, color)| {
@@ -171,7 +166,6 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     }
 }
 
-/// Adds an elliptical arc in canvas pixels, joined to the current point with a line.
 fn arc(
     path: &mut skia::PathBuilder,
     t: skia::Transform,
@@ -214,7 +208,6 @@ fn arc(
     }
 }
 
-/// Web fonts, and the system fonts once `system` asks for them, since loading those takes tens of milliseconds.
 pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, bool)> {
     static FONTS: LazyLock<Mutex<(Arc<usvg::fontdb::Database>, bool)>> =
         LazyLock::new(Mutex::default);
@@ -287,9 +280,9 @@ impl Canvas {
         })
     }
 
-    /// Runs the `CanvasRenderingContext2D` operations from `dom.js`: a code and its arguments. Strings are
-    /// UTF-16 lengths of consecutive parts of `strings`, and `putImageData` bytes are in `data`. `image`
-    /// returns the pixels of another canvas or image node.
+    // WARNING: runs the `CanvasRenderingContext2D` operations from `dom.js`: a code and its arguments. Strings are
+    // UTF-16 lengths of consecutive parts of `strings`, and `putImageData` bytes are in `data`. `image`
+    // returns the pixels of another canvas or image node.
     pub fn draw<'a>(
         &mut self,
         ops: &[f32],
@@ -510,7 +503,6 @@ impl Canvas {
                         } else if let Some(path) =
                             state.transform.invert().and_then(|t| path.transform(t))
                         {
-                            // The path is in canvas pixels, while the line width follows the transform.
                             self.pixels.stroke_path(
                                 &path,
                                 &paint(&state.stroke, state.alpha, blend, identity),
@@ -565,7 +557,6 @@ impl Canvas {
                     let (line, [ascent, descent, em_ascent, em_descent]) =
                         line(system, aliases, &state.font, value, state.spacing);
                     let advance = f32::from(line.width);
-                    // Text wider than `maxWidth` is squeezed horizontally. Rounding errors in the widths are not worth a blurry layer.
                     let squeeze = if advance > a[3] + 1e-3 {
                         a[3] / advance
                     } else {
@@ -592,7 +583,6 @@ impl Canvas {
                     }
                     // WARNING: glyphs rasterize at most 1024 pixels per em and larger text scales the layer up, so a huge font or transform cannot allocate huge glyphs.
                     let raster = scale.min(1024. / f32::from(line.font_size));
-                    // Glyphs rasterize at the device scale into a layer, which an upright transform places on whole pixels, so text stays as sharp as page text.
                     let upright =
                         raster == scale && t.kx == 0. && t.ky == 0. && t.sx > 0. && t.sx == t.sy;
                     let (fx, fy, to_canvas) = if upright {
@@ -786,7 +776,6 @@ impl Canvas {
                     else {
                         continue;
                     };
-                    // Source coordinates use the natural size, which can differ from the decoded pixels.
                     let (x, y) = (dw / sw, dh / sh);
                     let paint = skia::Paint {
                         shader: skia::Pattern::new(
@@ -862,33 +851,32 @@ impl Canvas {
                     let (sx, sy) = (w.signum(), h.signum());
                     let r: [f32; 8] =
                         std::array::from_fn(|i| a[4 + i] * if i % 2 == 0 { sx } else { sy });
-                    // How far a Bézier handle stops from the corner of a quarter circle.
-                    const K: f32 = 0.447_715_25;
+                    const CORNER_CURVE: f32 = 0.447_715_25;
                     let start = point(x + r[0], y);
                     self.path.move_to(start.0, start.1);
                     for (line, c1, c2, end) in [
                         (
                             (right - r[2], y),
-                            (right - r[2] * K, y),
-                            (right, y + r[3] * K),
+                            (right - r[2] * CORNER_CURVE, y),
+                            (right, y + r[3] * CORNER_CURVE),
                             (right, y + r[3]),
                         ),
                         (
                             (right, bottom - r[5]),
-                            (right, bottom - r[5] * K),
-                            (right - r[4] * K, bottom),
+                            (right, bottom - r[5] * CORNER_CURVE),
+                            (right - r[4] * CORNER_CURVE, bottom),
                             (right - r[4], bottom),
                         ),
                         (
                             (x + r[6], bottom),
-                            (x + r[6] * K, bottom),
-                            (x, bottom - r[7] * K),
+                            (x + r[6] * CORNER_CURVE, bottom),
+                            (x, bottom - r[7] * CORNER_CURVE),
                             (x, bottom - r[7]),
                         ),
                         (
                             (x, y + r[1]),
-                            (x, y + r[1] * K),
-                            (x + r[0] * K, y),
+                            (x, y + r[1] * CORNER_CURVE),
+                            (x + r[0] * CORNER_CURVE, y),
                             (x + r[0], y),
                         ),
                     ] {
@@ -992,7 +980,6 @@ impl Canvas {
         Ok(())
     }
 
-    /// Whether the point in canvas pixels is in the current path, or in its stroke.
     pub fn hit(&self, x: f32, y: f32, even_odd: bool, stroke: bool) -> bool {
         let Some(path) = self.path.clone().finish() else {
             return false;
@@ -1083,8 +1070,6 @@ pub fn render_svg(
     Ok(render_image(&pixels))
 }
 
-/// The SVG's size, the box of its content in its own coordinates, and for each element with an id, its box on
-/// the canvas and its object box in its own coordinates, as `[x, y, width, height]`.
 pub type SvgGeometry = ([f32; 2], [f32; 4], Vec<(String, [f32; 4], [f32; 4])>);
 
 pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
@@ -1119,7 +1104,6 @@ pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
             pending.extend(group.children().iter().map(|child| (child, transform)));
         }
     }
-    // A `viewBox` puts the content in one unnamed group, whose box is in the SVG's own coordinates.
     let content = match tree.root().children() {
         [usvg::Node::Group(group)] if group.id().is_empty() => group.bounding_box(),
         _ => tree.root().bounding_box(),
@@ -1131,8 +1115,6 @@ pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
     )
 }
 
-/// The object box `[x, y, width, height]` and the path length of the element with the id `h2o-shape` in an SVG
-/// source, in its own coordinates. Results are cached by source.
 pub fn svg_shape(source: &str) -> Option<([f32; 4], f32)> {
     type Shapes = std::collections::HashMap<String, Option<([f32; 4], f32)>>;
     thread_local! {
@@ -1142,11 +1124,10 @@ pub fn svg_shape(source: &str) -> Option<([f32; 4], f32)> {
         return shape;
     }
     let shape = svg_tree(source).ok().and_then(|tree| {
-        let node = tree.node_by_id("h2o-shape")?;
+        let node = tree.node_by_id("apps-shape")?;
         let rect = node.bounding_box();
         let length = match node {
             usvg::Node::Path(path) => {
-                // Curves are measured as 16 chords each, close to the exact length for SVG shapes.
                 let (mut length, mut start, mut last) =
                     (0., skia::Point::zero(), skia::Point::zero());
                 let mut add = |from: skia::Point, to: skia::Point| {
@@ -1226,7 +1207,6 @@ mod tests {
     #[test]
     fn arcs_gradients_and_rounded_rects_draw_like_paths() {
         let mut canvas = Canvas::new(100, 40).unwrap();
-        // A full circle, then a rounded rect whose corner is outside the fill.
         draw(
             &mut canvas,
             &[
@@ -1345,7 +1325,7 @@ mod tests {
 
     #[test]
     fn svg_boxes_map_elements_to_canvas_and_own_coordinates() {
-        let (size, content, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="h2o-7" width="10" height="10"/></g></svg>"##).unwrap());
+        let (size, content, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="apps-7" width="10" height="10"/></g></svg>"##).unwrap());
         assert_eq!(size, [200., 100.]);
         assert_eq!(content, [5., 5., 35., 35.]);
         let find = |name: &str| {
@@ -1356,7 +1336,7 @@ mod tests {
         };
         assert_eq!(find("r"), Some(([20., 10., 60., 40.], [10., 5., 30., 20.])));
         assert_eq!(
-            find("h2o-7"),
+            find("apps-7"),
             Some(([10., 60., 20., 20.], [0., 0., 10., 10.]))
         );
         let (_, _, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><rect id="s" width="10" height="10"/></defs><use id="u" href="#s" x="20" y="10" transform="scale(2)"/></svg>"##).unwrap());

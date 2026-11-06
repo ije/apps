@@ -23,18 +23,14 @@ use taffy::{
 
 const NONE: u32 = u32::MAX;
 
-/// What a kept box draws besides its background, border and children.
 enum Kind {
     Box,
     Image(Arc<crate::RenderImage>, crate::ObjectFit),
-    /// Text, and whether it has its own runs instead of the inherited style's.
     Text(bool),
     Measured,
-    /// Paints the list of the parent stacking context: the boxes with a negative z-index, or the others.
     Layers(bool),
 }
 
-/// A box kept from frame to frame.
 struct Slot {
     key: (u64, u32),
     live: bool,
@@ -47,21 +43,14 @@ struct Slot {
     kind: Kind,
     measure: Option<Box<MeasureFn>>,
     state: Option<Rc<dyn Any>>,
-    /// The text style its parent passed, and its own.
     inherited: Rc<TextStyle>,
     text: Rc<TextStyle>,
     cache: Cache,
-    /// The unrounded layout, relative to the parent, in device pixels.
     layout: Layout,
     baselines: Baselines,
-    // This frame:
-    /// The unrounded absolute origin in device pixels, without element offsets.
     origin: Point<f32>,
-    /// The bounds its hooks and its box got, and its bounds in layout units.
     bounds: [Bounds<Pixels>; 3],
-    /// Its hitbox in `Tree::hitboxes`, or `NONE`.
     hitbox: u32,
-    /// Painted from the list of its stacking context.
     listed: bool,
 }
 
@@ -92,40 +81,26 @@ impl Slot {
     }
 }
 
-/// The boxes of a window, kept across frames. Each pass commits the view's nodes into it: a node
-/// with an id, or at the same place in its nearest parent with an id, updates its kept box, and
-/// only boxes whose layout inputs changed lose their layout caches. A kept subtree is linked as it is.
 #[derive(Default)]
 pub struct Tree {
     slots: Vec<Slot>,
     free: Vec<u32>,
     keys: FxHashMap<(u64, u32), u32>,
-    /// How often each identity was committed in this pass.
     occurrences: FxHashMap<u64, u32>,
     scopes: Vec<u64>,
     pass: u32,
-    /// By box, the pass that last committed or linked it.
     seen: Vec<u32>,
-    /// Boxes that parents dropped in this pass, freed unless the pass linked them again.
     orphans: Vec<u32>,
     root: Option<u32>,
-    /// The scale and font generation the kept boxes were measured with.
     measured_with: (f32, usize),
-    /// The viewport, while the root is committed.
     stretch: Option<Size<Pixels>>,
-    /// This frame's hitboxes of boxes with events or a cursor.
     hitboxes: Vec<Hitbox>,
-    /// By stacking context, its boxes with a z-index and the content masks where they are, sorted.
     layers: FxHashMap<u32, Vec<(i32, u32, ContentMask<Pixels>)>>,
-    /// The children of the boxes being committed.
     kids: Vec<NodeId>,
-    /// The text style the root inherits, and the style of free slots.
     initial: Rc<TextStyle>,
     blank: Rc<Style>,
-    /// Styles and text styles by a hash of some of their values, so equal ones are shared.
     styles: Interned<Style>,
     texts: Interned<TextStyle>,
-    /// The stacking lists being filled by prepaint, and the stacking contexts being painted.
     stacks: Vec<Vec<(i32, u32, ContentMask<Pixels>)>>,
     painting: Vec<u32>,
 }
@@ -137,7 +112,6 @@ fn identity(id: Option<ElementId>, scope: u64) -> u64 {
 }
 
 impl Tree {
-    /// Starts a pass. Kept boxes are dropped when the scale or the fonts changed.
     pub(crate) fn begin(&mut self, scale: f32, fonts: usize) {
         if mem::replace(&mut self.measured_with, (scale, fonts)) != (scale, fonts) {
             self.slots.clear();
@@ -152,12 +126,10 @@ impl Tree {
         self.scopes.clear();
     }
 
-    /// Whether the box of the node with `id` is kept, so the view can link it with [`Child::Kept`].
     pub fn contains(&self, id: impl Into<ElementId>) -> bool {
         self.keys.contains_key(&(identity(Some(id.into()), 0), 0))
     }
 
-    /// Commits the root and frees the boxes no pass reaches anymore.
     pub(crate) fn commit_root(
         &mut self,
         root: Child,
@@ -192,7 +164,6 @@ impl Tree {
         }
     }
 
-    /// Gives a kept subtree the text style of its new place.
     fn inherit(&mut self, index: u32, inherited: &Rc<TextStyle>, scale: f32) {
         let slot = &mut self.slots[index as usize];
         if Rc::ptr_eq(&slot.inherited, inherited) {
@@ -265,7 +236,6 @@ impl Tree {
         if id.is_some() {
             self.scopes.push(identity);
         }
-        // Children collect on a shared stack, so an unchanged list allocates nothing.
         let start = self.kids.len();
         for child in children {
             if let Some(child) = self.commit(child, &text, scale) {
@@ -297,7 +267,6 @@ impl Tree {
             Some(_) if !restyled && stretch.is_none() => None,
             _ => Some(style.to_taffy(scale)),
         };
-        // Like the root element of a page, `auto` sizes of the root fill the viewport.
         if let Some(viewport) = stretch
             && let Some(taffy) = &mut taffy
         {
@@ -392,12 +361,11 @@ impl Tree {
         self.scopes.last().copied().unwrap_or_default()
     }
 
-    /// Drops the layout caches of a box and the boxes around it.
     fn dirty(&mut self, mut index: u32) {
         while index != NONE {
             let slot = &mut self.slots[index as usize];
             let parent = slot.parent;
-            // An empty cache means its parents were cleared too, unless it was just made.
+            // WARNING: an empty cache means its parents were cleared too, unless it was just made.
             if matches!(slot.cache.clear(), ClearState::AlreadyEmpty)
                 && parent != NONE
                 && self.slots[parent as usize].cache.is_empty()
@@ -408,8 +376,6 @@ impl Tree {
         }
     }
 
-    /// Frees the boxes that parents dropped in this pass and that it did not link again, with their
-    /// subtrees, except boxes the pass moved.
     fn free_orphans(&mut self) {
         let pass = self.pass;
         let mut pending = mem::take(&mut self.orphans);
@@ -432,8 +398,6 @@ impl Tree {
         }
     }
 
-    /// Moves the kept boxes to the front of the arena and drops the free slots, after a pass dropped
-    /// most boxes, like the first frame of a long page before culling.
     fn compact(&mut self) {
         let mut moved = vec![NONE; self.slots.len()];
         let mut slots = Vec::with_capacity(self.slots.len() - self.free.len());
@@ -463,7 +427,6 @@ impl Tree {
         self.layers.clear();
     }
 
-    /// Lays out the boxes whose caches were dropped.
     pub(crate) fn layout(&mut self, root: NodeId, viewport: Size<Pixels>, window: &mut Window) {
         let scale = window.scale_factor();
         taffy::compute_root_layout(
@@ -480,8 +443,6 @@ impl Tree {
         );
     }
 
-    /// The bounds of a box at `origin`: edges snap to device pixels in absolute coordinates, so
-    /// boxes that touch keep touching wherever they are. The second bounds keep layout units.
     fn bounds(&self, index: u32, origin: Point<f32>, window: &Window) -> [Bounds<Pixels>; 2] {
         let scale = window.scale_factor();
         let layout = &self.slots[index as usize].layout;
@@ -740,7 +701,6 @@ impl Tree {
         });
     }
 
-    /// Paints the boxes with a z-index of the stacking context being painted, in order.
     fn paint_layers(&mut self, negative: bool, window: &mut Window) {
         let Some(&context) = self.painting.last() else {
             return;
@@ -757,10 +717,8 @@ fn index_of(node: NodeId) -> u32 {
     usize::from(node) as u32
 }
 
-/// Values shared by equal ones: repeated boxes, like the rows of a list, keep one style.
 struct Interned<T> {
     values: FxHashMap<u64, Vec<Rc<T>>>,
-    /// The size after which unused values are dropped.
     limit: usize,
 }
 
@@ -880,7 +838,6 @@ fn text_measurement(state: TextState) -> (Rc<dyn Any>, Box<MeasureFn>) {
     )
 }
 
-/// The boxes and the window while taffy lays them out.
 struct LayoutTree<'a> {
     slots: &'a mut [Slot],
     window: &'a mut Window,
@@ -929,9 +886,6 @@ impl LayoutTree<'_> {
         output
     }
 
-    /// Lays out a flex container. A row container sized by its content in a definite width fits it, between
-    /// its min-content and max-content widths, like Chrome; taffy gives a one-line container its max-content
-    /// width, which overflows.
     fn flexbox(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
         let output = taffy::compute_flexbox_layout(self, node, inputs);
         let style = &self.slots[usize::from(node)].taffy;
@@ -1002,7 +956,6 @@ impl LayoutTree<'_> {
                 );
                 let (measured, lines) = measure(text, known, available, window);
                 baselines = lines;
-                // Measured sizes round up to 1/64 device pixel, like Chrome's `LayoutUnit`.
                 taffy::Size {
                     width: (measured.width.0.max(0.) * scale * 64.).ceil() / 64.,
                     height: (measured.height.0.max(0.) * scale * 64.).ceil() / 64.,
@@ -1018,8 +971,6 @@ impl LayoutTree<'_> {
         output
     }
 
-    /// A box's baselines from its laid out children, like Chrome: a block's are its first and last child's
-    /// with one, a line's last is its last item that aligns baselines.
     fn baselines(&self, index: usize, output: &LayoutOutput) -> Baselines {
         let slot = &self.slots[index];
         let style = &slot.taffy;
@@ -1044,8 +995,6 @@ impl LayoutTree<'_> {
                     && child.taffy.display != taffy::Display::None
             });
         let at = |child: &Slot, value: f32| child.layout.location.y + value;
-        // A grid places its items out of flow, so it takes its baseline from the marked item. An item
-        // without one gives its bottom border edge.
         let source = slot
             .children
             .iter()
@@ -1150,7 +1099,7 @@ impl LayoutPartialTree for LayoutTree<'_> {
     }
 }
 
-// Out-of-flow boxes are positioned by their parent, which is always their containing block, and
+// WARNING: out-of-flow boxes are positioned by their parent, which is always their containing block, and
 // layout is never rounded, so the hoisted lists are not kept.
 impl LayoutContainingBlock for LayoutTree<'_> {
     type OofItemStyle<'a>
@@ -1270,14 +1219,12 @@ mod tests {
         tree.begin(1., 0);
         tree.commit_root(page(vec![row(1), row(2), row(3)]), viewport, 1.);
         assert_eq!(live(&tree), 1 + 3 * 3);
-        // The second row is linked as it is, and the third one is freed with its children.
         tree.begin(1., 0);
         let kept = slot(&tree, 2).children.clone();
         tree.commit_root(page(vec![row(1), Child::Kept(2usize.into())]), viewport, 1.);
         assert_eq!(live(&tree), 1 + 2 * 3);
         assert!(tree.contains(2usize) && !tree.contains(3usize));
         assert_eq!(slot(&tree, 2).children, kept);
-        // A kept box that moves under a new parent stays, and the parent it left is freed.
         tree.begin(1., 0);
         let moved = node().id(4usize).child(Child::Kept(2usize.into())).into();
         tree.commit_root(page(vec![moved]), viewport, 1.);

@@ -67,7 +67,6 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 json!({"private":base64(private),"public":base64(key.public_key().as_ref()),"pkcs8":base64(document.as_ref())}),
             )
         }
-        // `ECDSA` signatures are IEEE P1363 (r || s) and `ec` ones are DER. RSA keys are PKCS#1 DER.
         "sign" | "verify" => {
             let algorithm = args[0].as_str().context("Expected algorithm")?;
             let secret = bytes(&args[1])?;

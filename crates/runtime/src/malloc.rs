@@ -18,7 +18,7 @@ unsafe extern "C" {
     fn _NSGetExecutablePath(path: *mut c_char, size: *mut u32) -> c_int;
 }
 
-/// Runs before `main`, before any code of the app.
+// WARNING: runs before `main`, before any code of the app.
 unsafe extern "C" fn start(
     _count: c_int,
     arguments: *const *const c_char,
@@ -34,7 +34,7 @@ unsafe extern "C" fn start(
                 .strip_prefix(NAME.to_bytes())
                 .is_some_and(|rest| rest.first() == Some(&b'='))
             {
-                // Child processes and `process.env` don't see it.
+                // WARNING: child processes and `process.env` don't see it.
                 libc::unsetenv(NAME.as_ptr());
                 return;
             }
@@ -53,13 +53,10 @@ unsafe extern "C" fn start(
     }
 }
 
-/// Blocks up to this size are kept per thread when freed.
 const SMALL: usize = 512;
 const CLASSES: usize = SMALL / 16 + 1;
-/// The most bytes that one thread keeps of one size.
 const KEPT: u32 = 64 * 1024;
 
-/// Freed small blocks by size in steps of 16 bytes, each holding the next one.
 // WARNING: `MallocSpaceEfficient` makes malloc and free slower, and frames build and drop thousands of small
 // blocks. A thread takes back what it freed without calling them, and big blocks still go back to the system.
 struct Bins {
@@ -68,7 +65,6 @@ struct Bins {
 }
 
 impl Bins {
-    /// Gives all blocks back to malloc.
     fn flush(&mut self) {
         for head in &mut self.heads {
             let mut next = std::mem::replace(head, null_mut());
@@ -97,7 +93,6 @@ thread_local! {
     };
 }
 
-/// Gives the blocks that this thread keeps back to malloc, while it is quiet.
 pub(crate) fn flush() {
     // SAFETY: only this thread touches its bins, and `flush` calls no allocator method that uses them.
     let _ = BINS.try_with(|bins| unsafe { (*bins.get()).flush() });
@@ -109,7 +104,6 @@ fn small(layout: Layout) -> bool {
     layout.size() <= SMALL && layout.align() <= 16
 }
 
-/// The layout that malloc gets for a small block, so any block of its class fits.
 fn rounded(class: usize) -> Layout {
     // SAFETY: the size is at most `SMALL` and 16 is a power of two.
     unsafe { Layout::from_size_align_unchecked(class << 4, 16) }

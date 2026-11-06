@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The runtime loads the cdylib in `apps run` only. `apps build` doesn't ship it.
 [lib]
 crate-type = ["cdylib"]
 

@@ -3,47 +3,24 @@ use crate::{dom::Document, style};
 use renderer::{Child, px};
 use std::{collections::HashMap, rc::Rc};
 
-/// The subtree paints outside its box or keeps native state, so it is never replaced by a spacer.
-pub(crate) const BLOCKED: u16 = 1;
-/// The box's own style, tag, text or attributes changed this frame in a way that can resize boxes.
+pub(crate) const UNCULLABLE: u16 = 1;
 pub(crate) const CHANGED: u16 = 2;
-/// The box moves its content at paint time, so nothing below it is culled.
-pub(crate) const MOVED: u16 = 4;
-/// The box is not in the flow: not displayed, or absolutely positioned.
-pub(crate) const OUT: u16 = 8;
+pub(crate) const MOVES_CONTENT: u16 = 4;
+pub(crate) const OUT_OF_FLOW: u16 = 8;
 pub(crate) const HIDDEN: u16 = 16;
-/// A block box in the flow without auto vertical margins or baseline alignment, whose height
-/// does not depend on its parent's.
-pub(crate) const SOLID: u16 = 32;
-/// The box has a definite height or flex basis, so a column flex container could shrink it.
-pub(crate) const SIZED: u16 = 64;
-/// The box's geometry changed this frame, so its cached measurements are dropped.
-pub(crate) const STALE: u16 = 128;
-/// The box's children in the flow are not the ones of the last frame.
-pub(crate) const RELISTED: u16 = 256;
-/// The subtree sizes something in viewport units, so a frame that resizes the viewport lays it out.
-pub(crate) const VIEWPORT: u16 = 512;
-/// Only the box's opacity animates, so it paints through a keyed layer that `render::composite`
-/// patches between frames.
+pub(crate) const PLAIN_BLOCK: u16 = 32;
+pub(crate) const DEFINITE_SIZE: u16 = 64;
+pub(crate) const GEOMETRY_CHANGED: u16 = 128;
+pub(crate) const CHILDREN_CHANGED: u16 = 256;
+pub(crate) const READS_VIEWPORT: u16 = 512;
 pub(crate) const COMPOSITED: u16 = 1024;
-/// The composited box's transform animates too, so its layer and hit testing keep a transform that
-/// `render::composite` patches.
 pub(crate) const TRANSFORMED: u16 = 2048;
-/// The subtree builds from more than its nodes, styles and place, like form controls, media, lists,
-/// tables and scroll boxes, so the window never keeps its boxes from the last frame.
-pub(crate) const VOLATILE: u16 = 4096;
-/// Something in the subtree animates this frame, so its boxes are built again.
+pub(crate) const ALWAYS_REBUILT: u16 = 4096;
 pub(crate) const ANIMATED: u16 = 8192;
-/// The subtree builds from the last frame's layout or from other nodes, like grids, positioned boxes,
-/// tables and lists. Nothing it reads changes in a frame where no node, style, focus or viewport changed,
-/// so only such frames keep its boxes.
-pub(crate) const FRAMED: u16 = 16384;
-/// The subtree reads the height of its containing block.
-pub(crate) const HEIGHTED: u16 = 32768;
-/// In `LayoutNode.marks` only: the box builds from more than its subtree, see `Cull.inputs`.
+pub(crate) const READS_LAST_FRAME: u16 = 16384;
+pub(crate) const READS_HEIGHT: u16 = 32768;
 pub(crate) const INPUT: u16 = 1;
 
-/// Whether a box's own values read the height of its containing block.
 pub(crate) fn reads_height(style: &style::Style) -> bool {
     [
         Prop::HEIGHT,
@@ -70,51 +47,32 @@ pub(crate) fn reads_height(style: &style::Style) -> bool {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Info {
-    /// The geometry revision of the subtree.
     pub(crate) revision: u64,
-    /// The revision of the subtree's nodes and styles.
     pub(crate) subtree: u64,
     pub(crate) flags: u16,
 }
 
 #[derive(Default)]
 pub(crate) struct Cull {
-    /// This frame's subtree revisions and flags, by node.
     pub(crate) info: Vec<Info>,
-    /// By node, the subtree revision when its bounds were recorded, its size with margins (the
-    /// unsnapped cell size for a grid item), and its margins.
     pub(crate) placed: Vec<(u64, [f32; 2], [f32; 4])>,
-    /// The content box width and height of each box at its last layout, before transforms.
     pub(crate) widths: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    /// Set when a parent of a spacer changed its width, so the next frame lays everything out.
     pub(crate) off: bool,
-    /// Whether this frame culls, kept for the container query pass of the same frame.
     pub(crate) enabled: bool,
-    /// The viewport size, scale and font loads of the last frame.
     pub(crate) frame: [f32; 4],
-    /// Whether this frame has another viewport size than the last one.
     pub(crate) resized: bool,
-    /// The scroll offsets of the last frame, by scroll container, `0` for the page.
     pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
-    /// The nodes that are not hidden, built with `info`.
     pub(crate) visible: Vec<bool>,
-    /// A walk of the composed tree, parents first, kept until the tree changes.
     pub(crate) walk: crate::dom::Walk,
-    /// The table cells of `walk`, whose rows the box tree flattens.
     pub(crate) cells: Vec<usize>,
-    /// Inline SVGs, positioned boxes and grids, which build from more than their subtree, see
-    /// `element::own_inputs`.
     pub(crate) inputs: Vec<usize>,
-    /// The newest node revision, focus and styles that `info` was built from, without animated paint.
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
     pub(crate) subtrees: Subtrees,
 }
 
-/// The nodes of each subtree that `shift` moved, by root, and the document revision they were listed at.
 pub(crate) type Subtrees = (u64, rustc_hash::FxHashMap<usize, Vec<usize>>);
 
 impl Cull {
-    /// Gives back the room for node ids past `len`. A new frame builds the rest again.
     pub(crate) fn trim(&mut self, len: usize) {
         self.placed.truncate(len);
         self.placed.shrink_to_fit();
@@ -130,17 +88,14 @@ impl Cull {
     }
 }
 
-/// The visible vertical range of a subtree, from the last frame's bounds of its clipping ancestors.
 pub(super) struct Zone {
     pub(super) top: f32,
     pub(super) bottom: f32,
     pub(super) clips: Vec<usize>,
-    /// The viewport changed size since the last frame.
     pub(super) resized: bool,
 }
 
 impl Zone {
-    /// The visible vertical range in the window, from this frame's bounds of the clipping ancestors.
     fn visible(&self, bounds: &crate::dom::LayoutMirror, window: &renderer::Window) -> [f32; 2] {
         self.clips.iter().filter_map(|clip| bounds.get(clip)).fold(
             [0., f32::from(window.viewport_size().height)],
@@ -149,21 +104,16 @@ impl Zone {
     }
 }
 
-/// Consecutive culled children, replaced by one spacer.
 #[derive(Debug, PartialEq)]
 pub(super) struct Run {
     pub(super) members: Vec<usize>,
     pub(super) top: f32,
     pub(super) height: f32,
     pub(super) width: f32,
-    /// The top margin of the first member and the bottom margin of the last.
     pub(super) margins: [f32; 2],
-    /// Changed boxes before the run in a wrapping container, with their width with margins at
-    /// the last layout. A new width may move boxes to other lines.
     pub(super) watch: Vec<(usize, f32)>,
 }
 
-/// Whether the styles differ only in properties that do not move or resize boxes.
 pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
     let paint = |prop: Prop| {
         let name = prop.name();
@@ -247,8 +197,6 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
     }
 }
 
-/// Hashes what a box shows without its style: first what can size it (the tag, text, form state and the
-/// attributes that act on their own), then all attributes.
 pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut shape = rustc_hash::FxHasher::default();
@@ -272,7 +220,6 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     (own, attrs.finish())
 }
 
-/// The flags of a box's own style.
 pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u16 {
     let display = style.get(Prop::DISPLAY).unwrap_or("inline");
     let position = style.get(Prop::POSITION).unwrap_or("static");
@@ -333,8 +280,6 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
                     .get(prop)
                     .is_some_and(|value| matches!(value, "scroll" | "auto"))
             });
-    // A box with `display: none` builds nothing, so it never makes its parent framed. Grids and positioned boxes
-    // key on what they read, see `element::Reuse`.
     let framed = !matches!(
         display,
         "block"
@@ -371,18 +316,21 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             .into_iter()
             .any(|prop| style.get(prop).is_some_and(|value| value != "auto"));
     [
-        (moved, MOVED),
-        (blocked, BLOCKED),
-        (volatile, VOLATILE),
-        (framed, FRAMED),
+        (moved, MOVES_CONTENT),
+        (blocked, UNCULLABLE),
+        (volatile, ALWAYS_REBUILT),
+        (framed, READS_LAST_FRAME),
         (
             display == "none" || matches!(position, "absolute" | "fixed"),
-            OUT,
+            OUT_OF_FLOW,
         ),
         (display == "none", HIDDEN),
-        (solid, SOLID),
-        (!auto(Prop::HEIGHT) || !auto(Prop::FLEX_BASIS), SIZED),
-        (reads_height(style), HEIGHTED),
+        (solid, PLAIN_BLOCK),
+        (
+            !auto(Prop::HEIGHT) || !auto(Prop::FLEX_BASIS),
+            DEFINITE_SIZE,
+        ),
+        (reads_height(style), READS_HEIGHT),
         (
             style.iter().any(|(prop, value)| {
                 let bytes = value.as_bytes();
@@ -400,15 +348,13 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
                                 .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
                     })
             }),
-            VIEWPORT,
+            READS_VIEWPORT,
         ),
     ]
     .into_iter()
     .fold(0, |flags, (on, bit)| if on { flags | bit } else { flags })
 }
 
-/// The bounds of a child that can be culled, with its width including horizontal margins,
-/// and its vertical margins.
 pub(super) fn member(
     info: Info,
     (placed, [width, _], margins): (u64, [f32; 2], [f32; 4]),
@@ -417,9 +363,9 @@ pub(super) fn member(
     margin: f32,
     flex: bool,
 ) -> Option<([f32; 4], [f32; 2])> {
-    let fits = info.flags & (BLOCKED | SOLID) == SOLID
-        && (!flex || info.flags & SIZED == 0)
-        && (!zone.resized || info.flags & VIEWPORT == 0);
+    let fits = info.flags & (UNCULLABLE | PLAIN_BLOCK) == PLAIN_BLOCK
+        && (!flex || info.flags & DEFINITE_SIZE == 0)
+        && (!zone.resized || info.flags & READS_VIEWPORT == 0);
     if !fits || info.revision == 0 || placed != info.revision {
         return None;
     }
@@ -428,9 +374,6 @@ pub(super) fn member(
         .then_some(([x, y, width, height], [margins[0], margins[2]]))
 }
 
-/// Groups the children that `member` accepts into runs of boxes that touch through their
-/// margins and the gap. Children that `shown` rejects take no space; any other child ends a
-/// run. Returns the run of each child.
 pub(super) fn plan(
     children: &[usize],
     shown: impl Fn(usize) -> bool,
@@ -472,17 +415,12 @@ pub(super) fn plan(
     (slots, runs)
 }
 
-/// Groups whole lines of a wrapping row flex container into runs of lines that touch through
-/// the gap. `item` gives a child's margin box at the last layout and whether `member` accepts
-/// it; a line with any other child ends a run, and a child without a box ends the plan.
-/// Returns the run of each child.
 pub(super) fn lines(
     children: &[usize],
     shown: impl Fn(usize) -> bool,
     mut item: impl FnMut(usize) -> Option<(bool, [f32; 4])>,
     gap: f32,
 ) -> (Vec<usize>, Vec<Option<Run>>) {
-    // Each line: the indexes of its children, whether all are members, and its top and bottom.
     let mut lines: Vec<(Vec<usize>, bool, [f32; 2])> = Vec::new();
     let mut right = f32::MIN;
     for (index, &child) in children.iter().enumerate() {
@@ -541,7 +479,6 @@ pub(super) fn lines(
     (slots, runs)
 }
 
-/// Moves the recorded bounds of culled subtrees with their spacer.
 pub(super) fn shift(
     doc: &Document,
     shadows: &rustc_hash::FxHashMap<usize, usize>,
@@ -579,9 +516,6 @@ pub(super) fn shift(
     }
 }
 
-/// A fixed size box in place of a run. After layout it moves the recorded bounds of the run
-/// with it, and draws the frame again when the run came into view or the parent changed its
-/// width, so the wrong frame is never shown.
 pub(super) fn spacer(
     run: Run,
     parent: usize,
@@ -660,9 +594,6 @@ pub(super) fn spacer(
     .into()
 }
 
-/// A zero size box at the padding box origin of a grid, in place of its culled items, which
-/// come with their bounds from the origin. After layout it moves their recorded bounds, and
-/// draws the frame again when one came into view.
 pub(super) fn anchor(
     items: Vec<(usize, [f32; 4])>,
     zone: Rc<Zone>,
@@ -746,44 +677,47 @@ mod tests {
                 600.,
             )
         };
-        assert_eq!(flags("w") & VIEWPORT, VIEWPORT);
-        assert_eq!(flags("x") & VIEWPORT, VIEWPORT);
-        assert_eq!(flags("a") & VIEWPORT, 0);
-        assert_eq!(flags("n") & VIEWPORT, 0);
+        assert_eq!(flags("w") & READS_VIEWPORT, READS_VIEWPORT);
+        assert_eq!(flags("x") & READS_VIEWPORT, READS_VIEWPORT);
+        assert_eq!(flags("a") & READS_VIEWPORT, 0);
+        assert_eq!(flags("n") & READS_VIEWPORT, 0);
         let text = doc.nodes[id("v")]
             .parent
             .map_or(0, |list| doc.nodes[list].children[0]);
         assert_eq!(
-            super::flags("#text", &styles.values[text], &styles.lengths[text], 600.) & SOLID,
+            super::flags("#text", &styles.values[text], &styles.lengths[text], 600.) & PLAIN_BLOCK,
             0
         );
         for (name, expected) in [
-            ("a", SOLID),
-            ("b", MOVED | BLOCKED | SOLID),
-            ("c", BLOCKED | OUT),
-            ("d", OUT | HIDDEN),
-            ("e", BLOCKED | SOLID),
-            ("f", BLOCKED | SOLID),
-            ("s", BLOCKED | SOLID),
-            ("t", SOLID),
-            ("g", BLOCKED),
-            ("h", MOVED | BLOCKED | SOLID),
-            ("i", SOLID),
-            ("j", SOLID),
+            ("a", PLAIN_BLOCK),
+            ("b", MOVES_CONTENT | UNCULLABLE | PLAIN_BLOCK),
+            ("c", UNCULLABLE | OUT_OF_FLOW),
+            ("d", OUT_OF_FLOW | HIDDEN),
+            ("e", UNCULLABLE | PLAIN_BLOCK),
+            ("f", UNCULLABLE | PLAIN_BLOCK),
+            ("s", UNCULLABLE | PLAIN_BLOCK),
+            ("t", PLAIN_BLOCK),
+            ("g", UNCULLABLE),
+            ("h", MOVES_CONTENT | UNCULLABLE | PLAIN_BLOCK),
+            ("i", PLAIN_BLOCK),
+            ("j", PLAIN_BLOCK),
             ("k", 0),
             ("l", 0),
             ("m", 0),
-            ("n", SOLID),
+            ("n", PLAIN_BLOCK),
             ("o", 0),
-            ("p", SIZED | HEIGHTED),
-            ("q", SOLID | SIZED),
+            ("p", DEFINITE_SIZE | READS_HEIGHT),
+            ("q", PLAIN_BLOCK | DEFINITE_SIZE),
             ("r", 0),
-            ("u", SOLID),
-            ("v", SOLID),
+            ("u", PLAIN_BLOCK),
+            ("v", PLAIN_BLOCK),
         ] {
-            assert_eq!(flags(name) & !(VOLATILE | FRAMED), expected, "{name}");
+            assert_eq!(
+                flags(name) & !(ALWAYS_REBUILT | READS_LAST_FRAME),
+                expected,
+                "{name}"
+            );
         }
-        // Boxes placed or numbered by their siblings build again in frames that change something.
         for (name, framed) in [
             ("a", false),
             ("b", false),
@@ -796,11 +730,10 @@ mod tests {
             ("m", false),
             ("v", true),
         ] {
-            assert_eq!(flags(name) & FRAMED != 0, framed, "{name}");
+            assert_eq!(flags(name) & READS_LAST_FRAME != 0, framed, "{name}");
         }
-        // Scroll boxes build their bars from the scroll state, so they build again each frame.
-        assert_eq!(flags("y") & VOLATILE, VOLATILE);
-        assert_eq!(flags("a") & VOLATILE, 0);
+        assert_eq!(flags("y") & ALWAYS_REBUILT, ALWAYS_REBUILT);
+        assert_eq!(flags("a") & ALWAYS_REBUILT, 0);
     }
 
     #[test]
@@ -861,12 +794,12 @@ mod tests {
         let (mut doc, ..) = page("<p class=x data-v=1 id=a>text</p>");
         let id = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let start = content(&doc.nodes[id]);
-        doc.nodes[id].attrs.set("class", "y".into());
-        doc.nodes[id].attrs.set("data-v", "2".into());
+        doc.nodes[id].attrs.set("class", "y");
+        doc.nodes[id].attrs.set("data-v", "2");
         let cosmetic = content(&doc.nodes[id]);
         assert_eq!(cosmetic.0, start.0);
         assert_ne!(cosmetic.1, start.1);
-        doc.nodes[id].attrs.set("colspan", "2".into());
+        doc.nodes[id].attrs.set("colspan", "2");
         assert_ne!(content(&doc.nodes[id]).0, start.0);
         doc.nodes[id].attrs.remove("colspan");
         assert_eq!(content(&doc.nodes[id]), cosmetic);
@@ -884,7 +817,7 @@ mod tests {
         };
         let info = Info {
             revision: 7,
-            flags: SOLID,
+            flags: PLAIN_BLOCK,
             ..Info::default()
         };
         let below = [0., 1300., 100., 20.];
@@ -902,7 +835,7 @@ mod tests {
         assert_eq!(member(info, 7, below, false), Some([0., 1300., 116., 20.]));
         let viewport = Info {
             revision: 7,
-            flags: SOLID | VIEWPORT,
+            flags: PLAIN_BLOCK | READS_VIEWPORT,
             ..Info::default()
         };
         assert!(member(viewport, 7, below, false).is_some());
@@ -949,7 +882,7 @@ mod tests {
             member(
                 Info {
                     revision: 0,
-                    flags: SOLID,
+                    flags: PLAIN_BLOCK,
                     ..Info::default()
                 },
                 0,
@@ -961,7 +894,7 @@ mod tests {
         assert_eq!(
             member(
                 Info {
-                    flags: SOLID | BLOCKED,
+                    flags: PLAIN_BLOCK | UNCULLABLE,
                     ..info
                 },
                 7,
@@ -974,7 +907,7 @@ mod tests {
         assert_eq!(
             member(
                 Info {
-                    flags: SOLID | SIZED,
+                    flags: PLAIN_BLOCK | DEFINITE_SIZE,
                     ..info
                 },
                 7,
@@ -986,7 +919,7 @@ mod tests {
         assert_eq!(
             member(
                 Info {
-                    flags: SOLID | SIZED,
+                    flags: PLAIN_BLOCK | DEFINITE_SIZE,
                     ..info
                 },
                 7,
@@ -1106,7 +1039,6 @@ mod tests {
 
     #[test]
     fn wrapped_lines_are_culled_whole() {
-        // Lines of margin boxes: 1 2 3 | 4 5 6 | 7 8 | 9 | 10, where 8 changed and 11 is new.
         let boxes: HashMap<usize, (bool, [f32; 4])> = [
             (1, (true, [0., 0., 100., 20.])),
             (2, (true, [104., 0., 204., 18.])),

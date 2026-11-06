@@ -9,10 +9,8 @@ use std::{collections::HashMap, fs, path::Path};
 
 const HEADER: &[u8; 8] = b"APP\0\x01\0\0\0";
 
-/// The attribute that carries the bundled CSS of a `<link rel="stylesheet">` in a bundled page.
 pub const LINK_SHEET: &str = "apps-sheet";
 
-/// Parses a bundled page, moving the CSS of its stylesheet links into the nodes.
 pub fn page(source: &str) -> Document {
     let mut doc = Document::parse(source);
     for node in &mut doc.nodes {
@@ -25,7 +23,7 @@ pub fn page(source: &str) -> Document {
     doc
 }
 
-/// Packs a page for other threads, because its documents can't cross threads.
+// WARNING: packs a page for other threads, because its documents can't cross threads.
 pub(crate) fn pack_page(doc: &Document) -> Result<Vec<u8>> {
     Ok(postcard::to_allocvec(doc)?)
 }
@@ -152,7 +150,6 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
     Ok((name.into(), product_name.into(), version.into(), identifier))
 }
 
-/// Optional runtime features. Apps get the ones marked `true` unless package.json `features` changes them.
 pub const FEATURES: [(&str, bool); 6] = [
     ("webgpu", false),
     ("video", false),
@@ -162,7 +159,6 @@ pub const FEATURES: [(&str, bool); 6] = [
     ("localNetwork", false),
 ];
 
-/// The bit of `feature` in a set returned by `disabled_features`.
 pub fn feature_bit(feature: &str) -> u32 {
     1 << FEATURES
         .iter()
@@ -170,8 +166,6 @@ pub fn feature_bit(feature: &str) -> u32 {
         .expect("Known feature")
 }
 
-/// Applies package.json `features` in order: `"name"` enables, `"-name"` disables, `"*"` means all.
-/// Returns the disabled features as bits by `FEATURES` index.
 pub fn disabled_features(source: Option<&str>) -> Result<u32> {
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;

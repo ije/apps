@@ -295,7 +295,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
   // WARNING: a session needs a system web view only for its cookies and storage, so that one starts on first use.
   const sessions = new Map();
   class Session extends EventEmitter {
-    #partition; #holder; #agent = null;
+    #partition; #agent = null;
     constructor(partition) {
       super();
       this.#partition = partition;
@@ -435,7 +435,7 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
   let nextReply = 0;
   // WARNING: native code sends the reply through the main queue, so it can't arrive before `replies` holds it.
   const later = (op, value) => new Promise(resolve => { const id = ++nextReply; native(op, { ...value, async: id }); replies.set(id, resolve); });
-  // Not frozen, as in Electron, where tests replace its functions.
+  // WARNING: not frozen, as in Electron, where tests replace its functions.
   const dialog = {
     showOpenDialog: async (...args) => later('dialog.open', options(args)),
     showOpenDialogSync: (...args) => { const result = native('dialog.open', options(args)); return result.canceled ? undefined : result.filePaths; },
@@ -508,7 +508,6 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
           for (let i = start; i <= end; i++) items[i].checked = items[i] === this;
         }
         if (key === 'reload' || key === 'forcereload') return contents?.reload();
-        // Like Electron, the zoom roles step the zoom level by 0.5.
         if (key === 'resetzoom' || key === 'zoomin' || key === 'zoomout') { if (contents) contents.zoomLevel = key === 'resetzoom' ? 0 : contents.zoomLevel + (key === 'zoomin' ? 0.5 : -0.5); return; }
         if (!key && typeof action === 'function') action(this, window, event);
       };
@@ -672,13 +671,12 @@ globalThis.__appsNativeShell = (call, EventEmitter) => {
     getPrimaryDisplay: () => native('screen.displays')[0],
     getCursorScreenPoint: () => native('screen.cursor'),
     getDisplayNearestPoint: point => nearest(point.x, point.y),
-    // On macOS, screen coordinates are already DIP.
     screenToDipPoint: point => ({ ...point }),
     dipToScreenPoint: point => ({ ...point }),
     screenToDipRect: (_window, rect) => ({ ...rect }),
     dipToScreenRect: (_window, rect) => ({ ...rect }),
     getDisplayMatching(rect) {
-      const area = display => { const b = display.bounds; return Math.max(0, Math.min(b.x + b.width, rect.x + rect.width) - Math.max(b.x, rect.x)) * Math.max(0, Math.min(b.y + b.height, rect.y + rect.height) - Math.max(b.y, rect.y)); };
+      const area = display => { const bounds = display.bounds; return Math.max(0, Math.min(bounds.x + bounds.width, rect.x + rect.width) - Math.max(bounds.x, rect.x)) * Math.max(0, Math.min(bounds.y + bounds.height, rect.y + rect.height) - Math.max(bounds.y, rect.y)); };
       const best = native('screen.displays').reduce((best, display) => area(display) > area(best) ? display : best);
       return area(best) > 0 ? best : nearest(rect.x + rect.width / 2, rect.y + rect.height / 2);
     },

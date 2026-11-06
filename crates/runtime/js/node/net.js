@@ -89,7 +89,6 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
     unref() { this._referenced = false; return this; }
   }
   const connect = (...args) => { const [options] = normalize(args); return new Socket(options).connect(...args); };
-  // Addresses are 128-bit BigInts with IPv4 mapped to ::ffff:a.b.c.d, as BlockList compares them.
   const parseIP = (text, family) => {
     text = String(text);
     if (family === 'ipv4') { const parts = text.split('.'); return parts.length === 4 && parts.every(part => /^(?:0|[1-9]\d{0,2})$/.test(part) && part < 256) ? parts.reduce((n, part) => n << 8n | BigInt(part), 0xffffn) : undefined; }

@@ -1,7 +1,3 @@
-//! Compiles the Metal shaders, and the HLSL shaders of release builds, ahead of time when the
-//! compiler is installed, so apps skip shader compilation at launch. Without it, the shaders are
-//! compiled at runtime.
-
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
@@ -17,7 +13,6 @@ fn hlsl() {
     let source = "src/platform/windows/shaders.hlsl";
     println!("cargo::rerun-if-changed={source}");
     println!("cargo::rerun-if-env-changed=RENDERER_FXC");
-    // `fxc` ships with the Windows SDK.
     let sdk = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
     let mut versions: Vec<_> = std::fs::read_dir(&sdk)
         .into_iter()

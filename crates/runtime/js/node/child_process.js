@@ -30,7 +30,6 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       this.stdout = output('stdout');
       this.stderr = output('stderr');
       this.stdio = [this.stdin, this.stdout, this.stderr];
-      // Extra pipes are sockets in the child, so like in Node they are duplex here.
       for (let index = 3; index < options.stdio.length; index++) {
         if (options.stdio[index] !== 'pipe') { this.stdio[index] = null; continue; }
         const name = 'fd' + index, id = result.id;

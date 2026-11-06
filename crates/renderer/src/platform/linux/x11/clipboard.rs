@@ -35,18 +35,14 @@ x11rb::atom_manager! {
         UTF8_STRING,
         UTF8_MIME_0: b"text/plain;charset=utf-8",
         UTF8_MIME_1: b"text/plain;charset=UTF-8",
-        // ISO Latin-1.
         STRING,
         TEXT,
         TEXT_MIME_UNKNOWN: b"text/plain",
-        // The property on our window that selection owners write into.
         APPS_CLIPBOARD,
     }
 }
 
-/// Some owners take seconds to answer.
 const TIMEOUT: Duration = Duration::from_millis(4000);
-/// The longest wait between the segments of an incremental transfer.
 const SEGMENT_TIMEOUT: Duration = Duration::from_millis(10);
 
 struct Connection {
@@ -71,7 +67,6 @@ impl Connection {
             0,
             WindowClass::COPY_FROM_PARENT,
             COPY_FROM_PARENT,
-            // Property changes carry incremental transfers, and the destroy ends the server thread.
             &CreateWindowAux::new()
                 .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
@@ -90,7 +85,6 @@ enum Handover {
 struct Inner {
     server: Connection,
     atoms: Atoms,
-    /// The text while this app owns the clipboard.
     text: Mutex<Option<Vec<u8>>>,
     handover: Mutex<Handover>,
     handover_done: Condvar,
@@ -130,7 +124,6 @@ impl Clipboard {
 
     pub fn write(&self, text: &str) -> Result<()> {
         let inner = &self.inner;
-        // ICCCM 2.6.1.3: ownership is asserted again whenever the data changes.
         inner.server.conn.set_selection_owner(
             inner.server.window,
             inner.atoms.CLIPBOARD,
@@ -180,7 +173,6 @@ impl Clipboard {
                 .filter(|format| available.contains(format))
                 .take(1)
                 .collect(),
-            // Without a target list, each format is tried.
             None => formats.to_vec(),
         };
         for format in candidates {
@@ -204,7 +196,6 @@ impl Drop for Clipboard {
         if let Err(error) = inner.hand_over() {
             eprintln!("apps: clipboard manager: {error:#}");
         }
-        // The destroy notification stops the server thread.
         let _ = inner.server.conn.destroy_window(inner.server.window);
         let _ = inner.server.conn.flush();
         if let Some(thread) = self.thread.take() {
@@ -224,10 +215,9 @@ impl Inner {
         Ok(owner == self.server.window)
     }
 
-    /// Converts the clipboard to `target` and returns the bytes and their format.
     fn read_single(&self, reader: &Connection, target: Atom) -> Result<(Vec<u8>, Atom)> {
         let atoms = &self.atoms;
-        // Deleted first, so the property notification shows when the owner got the request.
+        // WARNING: deleted first, so the property notification shows when the owner got the request.
         reader
             .conn
             .delete_property(reader.window, atoms.APPS_CLIPBOARD)?;
@@ -248,7 +238,6 @@ impl Inner {
             };
             match event {
                 Event::SelectionNotify(event) => {
-                    // ICCCM 2.4: the target matches the request, and no property means no data.
                     if event.property == NONE || event.target != target {
                         bail!("the clipboard can't be converted");
                     }
@@ -269,7 +258,7 @@ impl Inner {
                     if reply.type_ != atoms.INCR {
                         return Ok((reply.value, reply.type_));
                     }
-                    // The property is deleted only with its own type, which says the segments may come.
+                    // WARNING: the property is deleted only with its own type, which says the segments may come.
                     let reply = reader
                         .conn
                         .get_property(
@@ -288,7 +277,6 @@ impl Inner {
                     incremental = Some(Vec::with_capacity(size as usize));
                     deadline += SEGMENT_TIMEOUT;
                 }
-                // Each segment of an incremental transfer comes as a new property value.
                 Event::PropertyNotify(event)
                     if event.atom == atoms.APPS_CLIPBOARD && event.state == Property::NEW_VALUE =>
                 {
@@ -316,19 +304,16 @@ impl Inner {
         bail!("timed out reading the clipboard")
     }
 
-    /// Answers the requests for our clipboard until the window is destroyed.
     fn serve(&self) -> Result<()> {
         loop {
             match self.server.conn.wait_for_event()? {
                 Event::DestroyNotify(_) => return Ok(()),
-                // Another app owns the clipboard now.
                 Event::SelectionClear(event) if event.selection == self.atoms.CLIPBOARD => {
                     *self.text.lock().unwrap() = None;
                 }
                 Event::SelectionRequest(event) => {
                     self.answer(event)?;
                     let mut handover = self.handover.lock().unwrap();
-                    // Only the contents count as written, not the target list.
                     if let Handover::InProgress { written, notified } = &mut *handover
                         && event.target != self.atoms.TARGETS
                     {
@@ -339,7 +324,7 @@ impl Inner {
                         }
                     }
                 }
-                // Some clipboard managers say they are done before they ask for the contents.
+                // WARNING: some clipboard managers say they are done before they ask for the contents.
                 Event::SelectionNotify(event)
                     if event.selection == self.atoms.CLIPBOARD_MANAGER =>
                 {
@@ -390,7 +375,6 @@ impl Inner {
                 )?;
                 true
             }
-            // The clipboard was lost, or the format is not text.
             _ => false,
         };
         conn.send_event(
@@ -415,12 +399,11 @@ impl Inner {
         Ok(())
     }
 
-    /// Asks the clipboard manager to keep the text after the app quits.
     fn hand_over(&self) -> Result<()> {
         if self.text.lock().unwrap().is_none() || !self.is_owner()? {
             return Ok(());
         }
-        // Locked before the request, so the server thread can't finish before this waits.
+        // WARNING: locked before the request, so the server thread can't finish before this waits.
         let mut handover = self.handover.lock().unwrap();
         self.server.conn.convert_selection(
             self.server.window,

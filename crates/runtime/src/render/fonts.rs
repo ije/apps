@@ -2,8 +2,6 @@ use crate::dom::{Document, State};
 use crate::style::{FONT_FORMATS, FONT_TECHS};
 use std::{collections::HashMap, path::PathBuf};
 
-/// The `src` entries of `@font-face` and `FontFace` that can load, in order: `("local", name)` or
-/// `("url", url)`. URLs with a `format()` or `tech()` that `@pierre/apps` doesn't support are left out.
 pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
     crate::style::components(src, ',')
         .into_iter()
@@ -49,13 +47,8 @@ pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// A face's family, `src`, `unicode-range` and status.
 pub(crate) type Face = (String, String, Option<String>, &'static str);
 
-/// Loads the `@font-face` fonts that the latest style pass used, once per URL. Each face tries its
-/// sources in order until one loads. A face with a `unicode-range` loads only when the page text
-/// uses one of its characters, and faces that cover more of them load first, since the first face
-/// of several with one name is the one that draws. Returns whether fonts changed, and the faces.
 pub(crate) fn load(
     doc: &Document,
     state: &mut State,
@@ -263,7 +256,6 @@ mod tests {
         );
         assert_eq!(state.fonts["missing.woff2"], None);
         assert!(!state.fonts.contains_key("cyrillic.woff2"));
-        // The face that covers more of the page text loads first, so the other one loads last.
         assert_eq!(state.font_aliases["Ranked"], "H2O Test CFF");
         let width = |state: &State, font: &str, text: &str| {
             crate::render::canvas::line(&system, &state.font_aliases, font, text, [0.; 2])

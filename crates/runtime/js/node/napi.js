@@ -31,7 +31,7 @@
   number: value => +value,
   string: value => String(value),
   to_object: value => { if (value == null) throw TypeError('Cannot convert null or undefined to object'); return Object(value); },
-  error: (kind, code, message) => { const e = new ({Error, TypeError, RangeError})[kind](message); if (code !== undefined) e.code = code; return e; },
+  error: (kind, code, message) => { const error = new ({Error, TypeError, RangeError})[kind](message); if (code !== undefined) error.code = code; return error; },
   symbol: description => Symbol(description),
   bigint: value => BigInt(value),
   bigint_i64: value => BigInt.asIntN(64, value).toString(),

@@ -28,7 +28,6 @@ fn id(doc: &Document, selector: &str) -> usize {
         .unwrap()
 }
 
-/// The CSS Tailwind generates for each class, with `author` CSS for themes and utilities.
 fn generated(author: &str, classes: &[&str]) -> Vec<String> {
     let mut compiler = super::Compiler::default();
     let mut sheets = vec![Rc::new(super::Stylesheet::parse(&format!(
@@ -47,7 +46,6 @@ fn generated(author: &str, classes: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Writes the CSS of the classes in `$TW_LIST` to `$TW_OUT` as JSON, to diff with Tailwind.
 #[test]
 #[ignore]
 fn dump() {
@@ -70,7 +68,6 @@ fn dump() {
     .unwrap();
 }
 
-/// Tailwind 4.3.3's output, written in the compiler's compact form.
 fn assert_generated(author: &str, expected: &[(&str, &str)]) {
     let classes: Vec<_> = expected.iter().map(|(class, _)| *class).collect();
     for ((class, css), actual) in expected.iter().zip(generated(author, &classes)) {

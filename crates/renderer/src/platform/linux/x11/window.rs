@@ -32,7 +32,6 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-/// A window's state that X11 events update.
 pub(super) struct Shared {
     pub id: xproto::Window,
     pub callbacks: Callbacks,
@@ -40,13 +39,12 @@ pub(super) struct Shared {
     state: RefCell<State>,
     mapped: Cell<bool>,
     obscured: Cell<bool>,
-    /// The app wants frames.
     wants: Cell<bool>,
     timer: Cell<Option<RegistrationToken>>,
 }
 
 struct State {
-    /// Taken when the window closes: GPU objects must not outlive the X window.
+    // WARNING: taken when the window closes: GPU objects must not outlive the X window.
     renderer: Option<Renderer>,
     bounds: Bounds<Pixels>,
     active: bool,
@@ -54,11 +52,9 @@ struct State {
     maximized: [bool; 2],
     hidden: bool,
     counter: sync::Counter,
-    /// The value to set the sync counter to after the next resize, for smooth live resizing.
     sync: Option<sync::Int64>,
 }
 
-/// A native X11 window and its wgpu surface.
 pub(crate) struct Window {
     shared: Rc<Shared>,
     client: Rc<Client>,
@@ -75,7 +71,6 @@ impl Window {
         let xcb = &client.xcb;
         let atoms = &client.atoms;
         let screen = &xcb.setup().roots[client.screen];
-        // A transparent window needs a visual with alpha, which costs the compositor a blend.
         let visual = options
             .transparent
             .then(|| {
@@ -121,7 +116,6 @@ impl Window {
                 0,
                 xproto::WindowClass::INPUT_OUTPUT,
                 visual,
-                // A border pixel is required with a colormap.
                 &xproto::CreateWindowAux::new()
                     .border_pixel(screen.black_pixel)
                     .colormap(colormap)
@@ -165,7 +159,6 @@ impl Window {
                 xproto::AtomEnum::CARDINAL,
                 &[counter],
             ))?;
-            // XDND version 5.
             check(xcb.change_property32(
                 xproto::PropMode::REPLACE,
                 id,
@@ -174,7 +167,6 @@ impl Window {
                 &[5],
             ))?;
             if options.titlebar_hidden || options.frameless {
-                // Motif hints without decorations.
                 check(xcb.change_property32(
                     xproto::PropMode::REPLACE,
                     id,
@@ -263,7 +255,6 @@ impl Window {
             visual,
         };
         window.set_title(&options.title);
-        // Desktops match windows to their app by class, like `StartupWMClass` in a desktop file.
         let name = super::super::app_name();
         let class = [name.as_bytes(), b"\0", name.as_bytes(), b"\0"].concat();
         let _ = xcb.change_property8(
@@ -346,7 +337,6 @@ impl Window {
         let _ = xcb.flush();
     }
 
-    /// Keeps the window above `parent`, or detaches it.
     pub fn set_parent(&self, parent: Option<rwh::RawWindowHandle>) {
         let (xcb, id) = (&self.client.xcb, self.shared.id);
         let _ = match parent {
@@ -384,7 +374,6 @@ impl Window {
     }
 
     pub fn minimize(&self) {
-        // ICCCM's iconic state.
         self.client.send_wm_message(
             self.shared.id,
             self.client.atoms.WM_CHANGE_STATE,
@@ -394,7 +383,6 @@ impl Window {
 
     pub fn zoom(&self) {
         let atoms = &self.client.atoms;
-        // 2 toggles the states.
         self.client.send_wm_message(
             self.shared.id,
             atoms._NET_WM_STATE,
@@ -441,7 +429,6 @@ impl Window {
 
     pub fn start_window_move(&self) {
         let xcb = &self.client.xcb;
-        // The window manager takes the pointer grab for the move.
         let _ = xcb.ungrab_pointer(x11rb::CURRENT_TIME);
         let Ok(pointer) = reply(xcb.query_pointer(self.shared.id)) else {
             return;
@@ -486,7 +473,6 @@ impl Shared {
         self.mapped.get() && !self.obscured.get()
     }
 
-    /// Ticks at the display's refresh rate while the app wants frames and the window can be seen.
     fn start_frames(self: &Rc<Self>) {
         if self.timer.get().is_some() || !self.visible() {
             return;
@@ -501,17 +487,14 @@ impl Shared {
                     return TimeoutAction::Drop;
                 };
                 let more = shared.callbacks.frame();
-                // An unmap or close stopped the ticks while the frame ran.
                 if shared.timer.get().is_none() {
                     return TimeoutAction::Drop;
                 }
-                // An idle window stops ticking, so it gets no callbacks until it changes.
                 if more == Some(false) {
                     shared.wants.set(false);
                     shared.timer.set(None);
                     return TimeoutAction::Drop;
                 }
-                // Frames that were missed are skipped.
                 let now = Instant::now();
                 let mut next = deadline + refresh;
                 while next < now {
@@ -549,7 +532,6 @@ impl Shared {
         }
     }
 
-    /// Shows the content again when the X server lost it.
     pub fn expose(&self) {
         if self.mapped.get() {
             self.callbacks.appearance_changed();
@@ -565,7 +547,6 @@ impl Shared {
         self.state.borrow_mut().sync = Some(value);
     }
 
-    /// A `ConfigureNotify`, in device pixels.
     pub fn configure(&self, x: i32, y: i32, width: i32, height: i32) {
         let Some(scale) = self.client.upgrade().map(|client| client.scale_factor) else {
             return;
@@ -577,7 +558,7 @@ impl Shared {
         let resized = {
             let mut state = self.state.borrow_mut();
             let resized = logical.size != state.bounds.size;
-            // The origin of a resize event can be wrong, so only moves update it.
+            // WARNING: the origin of a resize event can be wrong, so only moves update it.
             if resized {
                 state.bounds.size = logical.size;
                 if let Some(renderer) = &mut state.renderer {

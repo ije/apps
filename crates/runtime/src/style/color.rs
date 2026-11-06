@@ -234,7 +234,6 @@ const EPSILON: f64 = 216. / 24389.;
 type Rgb = Option<(u32, u8)>;
 
 thread_local! {
-    /// Parsed colors by source, since paint reads the same `oklch()` values every frame.
     static COLORS: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Rgb>> = Default::default();
 }
 
@@ -245,7 +244,7 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
     }
     let color = parse(value, 0).map(|(space, channels, alpha)| {
         let rgb = convert(space, channels, Space::Srgb);
-        // Browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
+        // WARNING: browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
         let [r, g, b] = rgb.map(|v| ((v as f32).clamp(0., 1.) * 255.).round() as u32);
         (
             r << 16 | g << 8 | b,
@@ -262,7 +261,6 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
     color
 }
 
-/// Returns the color in its own space. `none` channels are NaN.
 fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
     if let Some(hex) = value.strip_prefix('#') {
         if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -542,7 +540,6 @@ fn convert(from: Space, values: [f64; 3], to: Space) -> [f64; 3] {
     }
 }
 
-/// HSL or HWB channels as sRGB. Missing channels become 0.
 fn hsl(space: Space, values: [f64; 3]) -> [f64; 3] {
     let [a, b, c] = values.map(|v| if v.is_nan() { 0. } else { v });
     let (white, black, saturation, light) = if space == Space::Hwb {
@@ -563,7 +560,6 @@ fn hsl(space: Space, values: [f64; 3]) -> [f64; 3] {
     })
 }
 
-/// Converts to XYZ D65. Missing channels become 0.
 fn to_xyz(space: Space, values: [f64; 3]) -> [f64; 3] {
     let [a, b, c] = values.map(|v| if v.is_nan() { 0. } else { v });
     let linear = |v: f64| {
@@ -617,7 +613,6 @@ fn to_xyz(space: Space, values: [f64; 3]) -> [f64; 3] {
     }
 }
 
-/// Converts from XYZ D65. Powerless hues become NaN.
 fn from_xyz(space: Space, xyz: [f64; 3]) -> [f64; 3] {
     let gamma = |v: f64| {
         let abs = v.abs();

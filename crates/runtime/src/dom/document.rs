@@ -2,7 +2,6 @@ use super::Selector;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
-/// Attributes in source order, like the DOM attribute list.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Attrs(Vec<(String, String)>);
@@ -34,7 +33,6 @@ impl Attrs {
         }
     }
 
-    /// Sets a value in place, so updates of an existing attribute reuse its strings.
     pub fn set(&mut self, name: &str, value: &str) {
         match self.get_mut(name) {
             Some(old) => value.clone_into(old),
@@ -91,7 +89,6 @@ pub struct Node {
     pub(crate) inline: Option<crate::style::Declarations>,
     #[serde(skip)]
     pub(crate) state: u16,
-    /// The value a script or the user gave a form control, which its `value` attribute no longer gives.
     #[serde(skip)]
     pub(crate) value: Option<String>,
 }
@@ -107,20 +104,16 @@ fn stamp() -> u64 {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The nodes of a document, each with a revision that changes on every mutable access, so
-/// caches can skip unchanged nodes without comparing them.
 // WARNING: revisions are unique across documents, so a cache never mistakes one node for another.
 #[derive(Clone, Debug, Default)]
 pub struct Nodes {
     list: Vec<Node>,
     revisions: Vec<u64>,
     latest: u64,
-    /// The revision of the last access that could change a node's parent or children, see [`Nodes::edit`].
     tree: u64,
 }
 
 impl Nodes {
-    /// Cuts the arena to `len` nodes and gives back the room it had.
     pub(crate) fn truncate(&mut self, len: usize) {
         self.list.truncate(len);
         self.list.shrink_to_fit();
@@ -152,7 +145,6 @@ impl Nodes {
         self.list.iter_mut()
     }
 
-    /// A mutable access that keeps the tree revision, for hot writes of text, attributes and states.
     // WARNING: walks of the whole tree are kept until the tree revision changes, so the node's `parent` and
     // `children` must stay. All other mutable accesses count as tree changes.
     pub(crate) fn edit(&mut self, id: usize) -> Option<&mut Node> {
@@ -162,7 +154,6 @@ impl Nodes {
         Some(node)
     }
 
-    /// Swaps a node for another that a pass needs for a while, and returns it. The tree revision stays.
     // WARNING: the pass must put the node back before anything else reads the tree.
     pub(crate) fn swap(&mut self, id: usize, node: Node) -> Node {
         self.latest = stamp();
@@ -170,18 +161,15 @@ impl Nodes {
         std::mem::replace(&mut self.list[id], node)
     }
 
-    /// The revision of the last change of any node's parent or children.
     pub(crate) fn tree(&self) -> u64 {
         self.tree
     }
 
-    /// Swaps in the children a frame lays out, like slotted shadow trees, and returns the old ones.
     // WARNING: the revision stays, so the frame must put the old children back before it ends.
     pub fn compose_children(&mut self, id: usize, children: Vec<usize>) -> Vec<usize> {
         std::mem::replace(&mut self.list[id].children, children)
     }
 
-    /// Puts back the revisions of nodes that a pass only swapped out and back, and the newest revisions.
     // WARNING: only for passes that change no other node, so nothing misses a real change.
     pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64, tree: u64) {
         for &(id, revision) in revisions {
@@ -191,12 +179,10 @@ impl Nodes {
         self.tree = tree;
     }
 
-    /// The newest revision of any node, so it changes whenever a node does.
     pub fn latest(&self) -> u64 {
         self.latest
     }
 
-    /// The revision of a node, never 0.
     pub fn revision(&self, id: usize) -> u64 {
         self.revisions[id]
     }
@@ -329,9 +315,7 @@ enum Content {
 struct Builder {
     nodes: Vec<Node>,
     stack: Vec<Open>,
-    /// The active formatting elements with their attributes, `None` for a marker.
     active: Vec<Option<(usize, Attrs)>>,
-    /// Whether each node is on the stack of open elements.
     opened: Vec<bool>,
     last: rustc_hash::FxHashMap<u64, usize>,
     bound: [usize; 7],
@@ -703,7 +687,6 @@ impl Builder {
         Content::Markup
     }
 
-    /// Opens again the formatting elements that closed with an element they were in, like `<b>` after `</p>`.
     fn reconstruct(&mut self) {
         let Some(Some((last, _))) = self.active.last() else {
             return;
@@ -726,7 +709,6 @@ impl Builder {
         }
     }
 
-    /// Moves `child` to the end of `parent`.
     fn adopt(&mut self, child: usize, parent: usize) {
         if let Some(old) = self.nodes[child].parent {
             self.nodes[old].children.retain(|&id| id != child);
@@ -735,8 +717,6 @@ impl Builder {
         self.nodes[parent].children.push(child);
     }
 
-    /// The HTML adoption agency algorithm for the end tag of formatting element `subject`, which
-    /// splits misnested formatting elements, like `<b><p>x</b>y` into `<b></b><p><b>x</b>y`.
     // WARNING: it edits the stack in the middle, so the open elements from the formatting element up
     // are taken off and pushed again, which recomputes the scope positions.
     fn adoption(&mut self, subject: &str) {
@@ -1393,7 +1373,6 @@ impl Builder {
                     self.adoption("nobr");
                     self.reconstruct();
                 }
-                // Like browsers, at most three equal formatting elements are reopened.
                 let marker = self
                     .active
                     .iter()
@@ -2003,7 +1982,6 @@ impl Document {
                     && matches!(builder.mode, Mode::Initial)
                     && builder.stack.is_empty()
                 {
-                    // A doctype keeps its name, then its public and system ids after NULs when it has them.
                     let body = rest[9.min(close)..close].trim_ascii();
                     let (name, tail) = body
                         .split_once(|c: char| c.is_ascii_whitespace())
@@ -2085,15 +2063,14 @@ impl Document {
         text
     }
 
-    /// Serializes the subtree as HTML, with its comments, which hydration markers of pages need.
     pub fn serialize(&self, id: usize) -> String {
         self.write(id, false, None)
     }
 
-    /// Serializes the subtree for an SVG source, without comments because XML rejects `--` in them. With
-    /// `mark`, each element without an id gets the id `h2o-<node>`, so SVG geometry can be traced back to
-    /// nodes. `attrs` gives the attributes that replace an element's own, like its `style`; an empty value
-    /// drops the attribute. Elements never keep their own `style`.
+    // WARNING: serializes the subtree for an SVG source, without comments because XML rejects `--` in them. With
+    // `mark`, each element without an id gets the id `apps-<node>`, so SVG geometry can be traced back to
+    // nodes. `attrs` gives the attributes that replace an element's own, like its `style`; an empty value
+    // drops the attribute. Elements never keep their own `style`.
     pub fn serialize_svg(
         &self,
         id: usize,
@@ -2180,7 +2157,7 @@ impl Document {
                     result.push('"');
                 }
                 if mark && !node.attrs.contains_key("id") {
-                    result.push_str(&format!(" id=\"h2o-{id}\""));
+                    result.push_str(&format!(" id=\"apps-{id}\""));
                 }
                 let extra = match replaced {
                     Some(replaced) => replaced,

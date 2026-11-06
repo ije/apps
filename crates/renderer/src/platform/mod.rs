@@ -1,5 +1,3 @@
-//! One module per OS. Each provides `Platform`, `Window`, `TextSystem`, `Atlas` and `post`.
-
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

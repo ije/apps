@@ -1,4 +1,3 @@
-//! Chrome's look for form controls whose `appearance` is not `none`.
 use crate::style::{self, Prop};
 use renderer::Child;
 use std::{fmt::Write, rc::Rc};
@@ -15,14 +14,10 @@ pub(super) enum Control {
     Progress,
     Meter,
     Color,
-    /// A `<details>` triangle, open when `checked`.
     Disclosure,
-    /// The resize grip of a textarea.
     Resizer,
 }
 
-/// The control a node draws, and whether its box keeps Chrome's thin rounded border. Like Chrome, a page
-/// that styles the border or background of a box gets plain CSS painting, though a select keeps its arrow.
 pub(super) fn kind(
     tag: &str,
     input: Option<&str>,
@@ -38,7 +33,6 @@ pub(super) fn kind(
     let input = input.map(str::to_ascii_lowercase);
     let control = match (tag, input.as_deref()) {
         ("button", _) | (_, Some("button" | "submit" | "reset")) => Control::Button,
-        // A select that shows several rows is a list box, drawn like a field.
         ("select", _) if list => Control::Field,
         ("select", _) => Control::Menu,
         ("textarea", _) => Control::Field,
@@ -65,7 +59,6 @@ pub(super) fn kind(
         Control::Field | Control::Menu => ("solid", &[0xffffff, 0x3b3b3b, 0xefefef]),
         _ => return Some((control, false)),
     };
-    // The UA border colors: black or white for buttons, gray for fields, and their faded disabled colors.
     let edges: &[u32] = if matches!(control, Control::Button | Control::Color) {
         &[0x000000, 0xffffff, 0x767676, 0xc3c3c3]
     } else {
@@ -98,7 +91,6 @@ pub(super) fn kind(
     (boxed || control == Control::Menu).then_some((control, boxed))
 }
 
-/// What the drawing depends on, besides the size.
 #[derive(Clone, PartialEq, Default)]
 pub(super) struct Look {
     pub control: Control,
@@ -108,14 +100,11 @@ pub(super) struct Look {
     pub hover: bool,
     pub active: bool,
     pub dark: bool,
-    /// The accent, or the color of a meter's value or of a color well.
     pub accent: u32,
     pub ink: u32,
-    /// The position of a range, progress or meter value, from 0 to 1, or below 0 when there is none.
     pub value: f32,
 }
 
-/// A layer over the padding box that draws the control's marks.
 pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child {
     renderer::canvas(
         |_, _| (),
@@ -161,7 +150,6 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
 
 fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
     let hex = |color: u32| format!("#{color:06x}");
-    // Chromium's dark controls have solid disabled colors, and its light ones are 30% opaque.
     let solid =
         look.disabled && look.dark && matches!(look.control, Control::Check | Control::Radio);
     let edge = if solid {
@@ -263,7 +251,6 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
                     Control::Meter => x + 1. + (length - 2.) * look.value,
                     _ => x + length * look.value,
                 };
-                // Progress and range values have a darker edge; a meter's value fills the track inside its edge.
                 write!(
                     body,
                     r#"<clipPath id="v"><rect x="{x}" y="{y}" width="{}" height="{bar}"/></clipPath><g clip-path="url(#v)">"#,
@@ -302,7 +289,6 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
             }
         }
         Control::Menu => {
-            // Chrome's arrow ends 2px before the padding edge.
             write!(
                 body,
                 r#"<path d="M{} {}l3.5 3.5l3.5 -3.5" fill="none" stroke="{}" stroke-width="1.5"/>"#,
@@ -337,7 +323,6 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
             .ok()?;
         }
         Control::Resizer => {
-            // Two dark lines, each with a light line below for dark backgrounds.
             for (color, drop) in [("#000", 0.), ("#fff", 0.5)] {
                 write!(
                     body,
@@ -366,13 +351,11 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
     ))
 }
 
-/// Chrome's hovered accent: the color with its lightness lowered.
 fn darken(color: u32) -> u32 {
     let channel = |shift: u32| ((color >> shift & 0xff) as f32 * 0.8) as u32;
     channel(16) << 16 | channel(8) << 8 | channel(0)
 }
 
-/// The border and background a boxed control paints instead of its CSS ones in its state, if they differ.
 pub(super) fn box_colors(look: &Look) -> (Option<u32>, Option<u32>) {
     if look.disabled {
         return (None, None);

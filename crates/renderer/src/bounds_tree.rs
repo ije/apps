@@ -1,10 +1,8 @@
 use crate::{Bounds, geometry::Unit};
 use std::{cmp, fmt::Debug, ptr::NonNull};
 
-/// More children make the tree shorter, but each node slower to scan.
 const MAX_CHILDREN: usize = 12;
 
-/// An R-tree that orders overlapping bounds.
 #[derive(Debug)]
 pub(crate) struct BoundsTree<U>
 where
@@ -12,7 +10,6 @@ where
 {
     nodes: Vec<Node<U>>,
     root: Option<usize>,
-    /// The leaf with the highest order, checked first.
     max_leaf: Option<usize>,
     insert_path: Vec<usize>,
     search_stack: Vec<NonNull<Node<U>>>,
@@ -23,7 +20,6 @@ struct Node<U>
 where
     U: Clone + Debug + Default + PartialEq,
 {
-    /// Covers all descendants.
     bounds: Bounds<U>,
     max_order: u32,
     kind: NodeKind,
@@ -31,18 +27,12 @@ where
 
 #[derive(Debug, Clone)]
 enum NodeKind {
-    Leaf {
-        order: u32,
-    },
-    Internal {
-        /// 2 to `MAX_CHILDREN` children.
-        children: NodeChildren,
-    },
+    Leaf { order: u32 },
+    Internal { children: NodeChildren },
 }
 
 #[derive(Debug, Clone)]
 struct NodeChildren {
-    // The child with the highest max order is always last.
     indices: [usize; MAX_CHILDREN],
     len: u8,
 }
@@ -70,8 +60,6 @@ impl NodeChildren {
     }
 }
 
-/// Empties a list kept from frame to frame. One huge frame, like a very long line, leaves a capacity that
-/// later frames don't need, so a list much bigger than its last use shrinks.
 pub(crate) fn clear_list<T>(list: &mut Vec<T>) {
     let used = list.len();
     list.clear();
@@ -89,8 +77,6 @@ impl<U: Unit> BoundsTree<U> {
         self.search_stack.clear();
     }
 
-    /// Returns the order of the new bounds: one above the highest order of the bounds it
-    /// intersects.
     pub fn insert(&mut self, new_bounds: Bounds<U>) -> u32 {
         let max_intersecting = self.find_max_ordering(&new_bounds);
         let ordering = max_intersecting + 1;
@@ -141,7 +127,6 @@ impl<U: Unit> BoundsTree<U> {
                     max_found = cmp::max(max_found, *order);
                 }
                 NodeKind::Internal { children } => {
-                    // The highest child is last, so it is popped first.
                     self.search_stack.extend(
                         children
                             .as_slice()
@@ -204,7 +189,6 @@ impl<U: Unit> BoundsTree<U> {
 
             self.insert_path.push(current_idx);
 
-            // The child whose bounds grow least, by half perimeter.
             let mut best_child_idx = children.as_slice()[0];
             let mut best_child_pos = 0;
             let mut best_cost = bounds
@@ -226,7 +210,6 @@ impl<U: Unit> BoundsTree<U> {
 
                     if let NodeKind::Internal { children } = &mut node.kind {
                         children.push(new_leaf_idx);
-                        // Keeps the highest child last.
                         if order <= node.max_order {
                             let last = children.len() - 1;
                             children.indices.swap(last - 1, last);
@@ -237,7 +220,6 @@ impl<U: Unit> BoundsTree<U> {
                     node.max_order = cmp::max(node.max_order, order);
                     break;
                 } else {
-                    // The node is full, so the best leaf and the new one move into a new node.
                     let sibling_bounds = self.nodes[best_child_idx].bounds;
                     let sibling_order = self.nodes[best_child_idx].max_order;
 
@@ -285,7 +267,6 @@ impl<U: Unit> BoundsTree<U> {
             if node.max_order < order {
                 node.max_order = order;
 
-                // Moves the updated child last. The deepest node did that when the leaf was added.
                 if let Some(child_idx) = updated_child_idx
                     && let NodeKind::Internal { children } = &mut node.kind
                     && let Some(pos) = children.as_slice().iter().position(|&c| c == child_idx)

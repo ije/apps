@@ -1,5 +1,3 @@
-//! Keyboard and IME translation.
-
 use crate::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, PlatformInput,
 };
@@ -8,7 +6,6 @@ use windows::Win32::{
     UI::Input::{Ime::*, KeyboardAndMouse::*},
 };
 
-/// The last modifier state sent, so repeated modifier key downs send nothing.
 #[derive(Default)]
 pub(super) struct KeyState {
     pub modifiers: Option<Modifiers>,
@@ -33,7 +30,6 @@ pub(super) fn capslock() -> Capslock {
     }
 }
 
-/// The input of a key message, or `None` when it sends nothing.
 pub(super) fn key_event(
     state: &mut KeyState,
     wparam: WPARAM,
@@ -65,7 +61,6 @@ pub(super) fn key_event(
             };
             let key = named_key(vkey).map(str::to_owned).or_else(|| {
                 if modifiers.shift && shifts_to_symbol(vkey) {
-                    // `shift-1` is sent as `!`.
                     let shifted = translate(vkey, scan_code, true);
                     if shifted.is_some() {
                         modifiers.shift = false;
@@ -164,7 +159,6 @@ fn shifts_to_symbol(vkey: VIRTUAL_KEY) -> bool {
     ) || (VK_0.0..=VK_9.0).contains(&vkey.0)
 }
 
-/// The text of a key with only shift held, without changing dead key state.
 fn translate(vkey: VIRTUAL_KEY, scan_code: u32, shift: bool) -> Option<String> {
     let mut state = [0u8; 256];
     if shift {
@@ -178,7 +172,6 @@ fn translate(vkey: VIRTUAL_KEY, scan_code: u32, shift: bool) -> Option<String> {
         .filter(|text| text.chars().next().is_some_and(|char| !char.is_control()))
 }
 
-/// The text a key types.
 fn key_char(vkey: VIRTUAL_KEY, scan_code: u32) -> Option<String> {
     let mut state = [0u8; 256];
     // SAFETY: plain keyboard state query into a local buffer.
@@ -191,7 +184,6 @@ fn key_char(vkey: VIRTUAL_KEY, scan_code: u32) -> Option<String> {
         .filter(|text| text.chars().next().is_some_and(|char| !char.is_control()))
 }
 
-/// A composition string of the IME.
 pub(super) fn composition(context: HIMC, kind: IME_COMPOSITION_STRING) -> Option<Vec<u16>> {
     // SAFETY: the first call returns the byte length, the second fills a buffer of that size.
     unsafe {
@@ -205,7 +197,6 @@ pub(super) fn composition(context: HIMC, kind: IME_COMPOSITION_STRING) -> Option
     }
 }
 
-/// The caret of the composition string, kept next to the text still being converted.
 pub(super) fn composition_caret(context: HIMC, len: usize) -> usize {
     // SAFETY: plain IME queries into a local buffer.
     unsafe {

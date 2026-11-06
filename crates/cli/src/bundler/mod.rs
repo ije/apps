@@ -55,18 +55,14 @@ struct Shared {
     workers: RefCell<BBTreeMap<(PathBuf, Realm), usize>>,
     scripts: RefCell<Vec<String>>,
     cache: Option<Rc<Cache>>,
-    /// Features that package.json disables, as bits by `apps_runtime::bundle::FEATURES` index.
     disabled: u32,
     aliases: Option<(PathBuf, Vec<String>)>,
     preload: Option<PathBuf>,
     loaders: Option<Rc<Loaders>>,
-    /// `env` in package.json, which `import.meta.env` adds to its build values.
     env: Value,
-    /// Modules that start a process, where `import.meta.main` is true.
     process_entries: RefCell<BTreeSet<PathBuf>>,
 }
 
-/// The package.json `loaders`, as file name suffixes and module specifiers, running in one main engine.
 struct Loaders {
     modules: Vec<(String, String)>,
     files: BBTreeMap<String, String>,
@@ -130,12 +126,10 @@ struct Linker<'a, 'b> {
     imported: Vec<usize>,
     required: Vec<usize>,
     resolved: serde_json::Map<String, Value>,
-    /// Bindings of `createRequire(import.meta.url)`, whose calls with a string literal bundle like `require()`.
     requires: Vec<oxc_semantic::SymbolId>,
     error: Option<anyhow::Error>,
 }
 
-/// The named exports of `electron` and `@pierre/apps`.
 const ELECTRON: &[&str] = &[
     "app",
     "BrowserWindow",
@@ -171,7 +165,6 @@ const ELECTRON: &[&str] = &[
     "ClipboardItem",
 ];
 
-/// `$appsN<module>.<name>`: how linked module code reads an import, so it needs no `with` scope.
 fn namespace_access(dep: usize, name: &str) -> String {
     let identifier = name.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '$')
         && name
@@ -184,7 +177,6 @@ fn namespace_access(dep: usize, name: &str) -> String {
     }
 }
 
-/// Rewrites references to import bindings into namespace reads. Namespace getters keep them live.
 struct Imports<'a, 'b> {
     ast: AstBuilder<'a>,
     allocator: &'a Allocator,
@@ -228,7 +220,7 @@ impl<'a> Imports<'a, '_> {
         }
     }
 
-    /// `(0, ns.f)` keeps `this` undefined when an imported function is called.
+    // WARNING: `(0, ns.f)` keeps `this` undefined when an imported function is called.
     fn callee(&self, expression: &mut Expression<'a>) {
         if let Expression::Identifier(ident) = expression
             && let Some(binding) = self.binding(ident).filter(|(_, name)| name != "*").cloned()
@@ -276,7 +268,6 @@ impl<'a> VisitMut<'a> for Imports<'a, '_> {
     }
 }
 
-/// Finds top-level `await` and `for await`.
 struct TopLevelAwait(bool, bool);
 
 impl<'a> Visit<'a> for TopLevelAwait {
@@ -311,7 +302,6 @@ impl<'a> VisitMut<'a> for Awaits<'a> {
     }
 }
 
-/// Collects `$appsN<module>.<name>` reads; `None` means the whole namespace is used.
 struct Uses(Vec<(usize, Option<String>)>);
 
 impl<'a> Visit<'a> for Uses {
@@ -354,7 +344,6 @@ impl<'a> Visit<'a> for Uses {
 }
 
 impl<'a> Linker<'a, '_> {
-    /// Bundles an HTML page of the app and returns its `apps:///` URL.
     fn page(&mut self, target: PathBuf) -> Result<&'a str> {
         self.cacheable = false;
         if !self.builder.assets.contains_key(&target) {
@@ -931,7 +920,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
 }
 
 impl Builder {
-    /// Bundles a script for a worker or child process and returns its chunk number.
     fn script_chunk(&mut self, path: PathBuf) -> Result<usize> {
         let realm = if self.realm == Realm::Renderer {
             Realm::Renderer
@@ -957,7 +945,6 @@ impl Builder {
         Ok(index)
     }
 
-    /// The URL of a file that a `?url` import asks for: a chunk for scripts, or a bundled asset. Other files have none.
     fn url_of(&mut self, path: &Path) -> Result<Option<String>> {
         if matches!(
             path.extension().and_then(|e| e.to_str()),
@@ -3914,7 +3901,6 @@ thread_local! {
     static DOWNLOADS: RefCell<HashMap<String, String>> = RefCell::default();
 }
 
-/// A remote file uses its URL as its path, so `parent()` gives the base URL of its imports.
 fn is_remote(path: &Path) -> bool {
     path.to_str()
         .is_some_and(|path| path.starts_with("https://") || path.starts_with("http://"))
@@ -3926,7 +3912,6 @@ fn remote_base(directory: &Path) -> Option<url::Url> {
         .flatten()
 }
 
-/// Downloads `reference` when it is an HTTP URL or relative to a remote file. Returns `None` for local files.
 fn remote(directory: &Path, reference: &str, http: bool) -> Result<Option<(PathBuf, String)>> {
     let mut url = match remote_base(directory) {
         Some(base) => {
@@ -4281,7 +4266,6 @@ fn html(
     Ok(doc.serialize(0))
 }
 
-/// Resolves a local `src`, `href` or `@import` path.
 fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
     // WARNING: like a web server root, `/x` is the app folder, and a path from it cannot leave it.
     let path = match reference.strip_prefix('/') {
@@ -4298,7 +4282,6 @@ fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Resolves `@import "package"` to the stylesheet of an npm package, like postcss-import.
 fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
     let count = if name.starts_with('@') { 2 } else { 1 };
     let package = name.split('/').take(count).collect::<Vec<_>>().join("/");

@@ -1,6 +1,3 @@
-//! The FPS HUD of `apps run`, shown with Cmd+Alt+F. The runtime passes the cost of each frame and paints
-//! the boxes and text that this library lays out.
-
 mod probe;
 
 use std::{
@@ -10,24 +7,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Changes with `Item` or a function signature, and must match the runtime.
+// WARNING: changes with `Item` or a function signature, and must match the runtime.
 const ABI: u32 = 1;
-/// Frames kept for the readings and the chart.
 const CAPACITY: usize = 120;
-/// How often the readings change. Per frame they change too fast to read.
 const READOUT: Duration = Duration::from_millis(500);
 const FPS_WINDOW: Duration = Duration::from_secs(1);
-/// FPS readings kept for its range, 5 seconds.
 const RATES: usize = 10;
-/// How fast the chart scale shrinks back after a slow frame. It grows at once.
 const AXIS_DECAY: f32 = 0.04;
 
 const TEXT: f32 = 12.;
-/// The advance of a monospace glyph.
 const CHAR: f32 = TEXT * 0.6;
-/// Fits the widest row: a label, a value and a `[min max]` range.
 const INNER: f32 = CHAR * 34.;
-/// Where values end, before the range.
 const VALUE: f32 = INNER - CHAR * 16.;
 const ROW: f32 = 16.;
 const PAD: f32 = 10.;
@@ -46,15 +36,11 @@ const GOOD: u32 = 0x30d158ff;
 const WARN: u32 = 0xff9f0aff;
 const BAD: u32 = 0xff453aff;
 
-/// A box when `len` is 0, else a line of text. Bounds are in window pixels.
 #[repr(C)]
 pub struct Item {
     pub bounds: [f32; 4],
-    /// RGBA.
     pub color: u32,
-    /// The corner radius of a box, or the font size of text.
     pub size: f32,
-    /// Text alignment in its bounds: 0 left, 1 center, 2 right.
     pub align: u32,
     pub text: *const u8,
     pub len: usize,
@@ -62,14 +48,10 @@ pub struct Item {
 
 #[derive(Clone, Copy, Default)]
 struct Readout {
-    /// The display rate, where the platform reports it.
     hz: Option<f32>,
-    /// The rate that the frame cost allows, up to the display rate.
     max: f32,
-    /// Frames drawn in the last second, and its range over the last readings.
     fps: f32,
     fps_range: [f32; 2],
-    /// Milliseconds.
     frame: f32,
     frame_range: [f32; 2],
     p95: f32,
@@ -77,23 +59,15 @@ struct Readout {
 }
 
 pub struct Hud {
-    /// The render to paint time of the last frames, in seconds.
     frames: VecDeque<f32>,
-    /// When the frames of the last second were drawn.
     times: VecDeque<Instant>,
-    /// The last FPS readings.
     rates: VecDeque<f32>,
-    /// The next frame is the HUD's own, so it is not a sample.
     own: bool,
-    /// The last paint was a sample, so a second pass of its frame replaces it.
     recorded: bool,
-    /// The page drew a frame since the last tick.
     drawn: bool,
     readout: Readout,
     readout_at: Option<Instant>,
-    /// One display refresh, in seconds.
     budget: f32,
-    /// The top of the chart scale, in seconds.
     axis: f32,
     usage: Arc<Mutex<Option<probe::Usage>>>,
     _stop: mpsc::Sender<()>,
@@ -396,7 +370,6 @@ pub unsafe extern "C" fn apps_perfhud_paint(
     }
     quad([x, y + CHART - 1., INNER, 1.], RULE, 0.);
     let level = |draw: f32| y + (CHART - LINE) * (1. - (draw / hud.axis).min(1.));
-    // One display refresh: frames above it are dropped.
     quad([x, level(hud.budget), INNER, 1.], RULE, 0.);
     let slot = INNER / CAPACITY as f32;
     let lead = CAPACITY - hud.frames.len();

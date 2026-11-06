@@ -620,7 +620,6 @@ impl<'i> RuleBodyItemParser<'i, Item, ()> for Rules {
     }
 }
 
-/// Parses a media condition or, with `supports`, an `@supports` condition evaluated to `All` or `not all`.
 fn condition(
     input: &mut Parser<'_>,
     or: bool,
@@ -777,8 +776,6 @@ fn condition(
     })
 }
 
-/// Replaces `env()`: a desktop window has no safe area or keyboard insets, so they are `0px`, and other
-/// names take their fallback. One without a fallback stays and makes the value invalid.
 fn environment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
@@ -874,8 +871,6 @@ pub(crate) struct FontUnits {
     pub cap: f32,
     pub ic: f32,
     pub lh: f32,
-    /// Whether the font size comes from an absolute length here or in an ancestor, which stops
-    /// monospace fonts from getting their smaller default size, like Chrome.
     pub absolute: bool,
 }
 
@@ -901,7 +896,6 @@ pub(crate) struct Lengths {
     pub container: Option<[f32; 2]>,
 }
 
-/// The lengths of each node, as an index in a list of the few that differ.
 #[derive(Clone, Default)]
 pub(crate) struct NodeLengths {
     ids: Vec<u32>,
@@ -910,7 +904,6 @@ pub(crate) struct NodeLengths {
 }
 
 impl NodeLengths {
-    /// Gives all nodes `lengths`.
     pub(crate) fn reset(&mut self, count: usize, lengths: Lengths) {
         self.ids.clear();
         self.ids.resize(count, 0);
@@ -919,7 +912,6 @@ impl NodeLengths {
         self.last = 0;
     }
 
-    /// Makes room for new nodes, which get the lengths of node 0.
     pub(crate) fn resize(&mut self, count: usize) {
         let first = self.ids.first().copied().unwrap_or_default();
         self.ids.resize(count, first);
@@ -983,7 +975,6 @@ impl Lengths {
             vars,
         };
         let value = parser.atom()?;
-        // Infinite results clamp to the largest length, like WebKit (CSS Values 4).
         (parser.rest.trim().is_empty() && !value.0.is_nan())
             .then_some((value.0.clamp(-33_554_428., 33_554_428.), value.1))
     }

@@ -1,5 +1,5 @@
 # Agents Guide
- 
+
 A tiny, high performance, memory-safe electron alternative with compatible API.
 
 ## Goals

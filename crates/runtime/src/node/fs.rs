@@ -1,4 +1,4 @@
-use super::{SIGNALS, bytes, system::system};
+use super::{SIGNALS, bytes, system};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -72,6 +72,7 @@ pub(super) struct Files(Mutex<(u64, HashMap<u64, Arc<File>>)>);
 impl Files {
     fn file(&self, id: &Value) -> Result<Arc<File>> {
         let id = id.as_u64().context("Expected descriptor")?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut files = self.0.lock().unwrap();
         if let Some(file) = files.1.get(&id) {
             return Ok(file.clone());
@@ -292,7 +293,7 @@ impl Files {
                         };
                         time.context("Time is out of range")
                     };
-                    // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS let this work on directories and read-only files.
+                    // WARNING: FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS let this work on directories and read-only files.
                     OpenOptions::new()
                         .access_mode(0x100)
                         .custom_flags(0x0200_0000)
@@ -600,7 +601,7 @@ impl Files {
                     }
                 }
             }
-            _ => system(op, args),
+            _ => system::call(op, args),
         }
     }
 }

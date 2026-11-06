@@ -5,10 +5,8 @@ use crate::{
 };
 use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, Rgba, point, px};
 
-/// A 4x4 column-major matrix.
 pub(crate) type Matrix = [f32; 16];
 
-/// The nodes with each `id` attribute in node order, built once per frame when first needed.
 pub(crate) type Ids = std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>;
 
 pub(crate) fn index<'a>(
@@ -59,7 +57,7 @@ fn rotate(axis: [f32; 3], angle: f32) -> Option<Matrix> {
         return None;
     }
     let [x, y, z] = axis.map(|value| value / length);
-    // Quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
+    // WARNING: quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
     let quarter = angle / std::f32::consts::FRAC_PI_2;
     let (s, c) = if (quarter - quarter.round()).abs() < 1e-6 {
         [(0., 1.), (1., 0.), (0., -1.), (-1., 0.)][(quarter.round() as i64).rem_euclid(4) as usize]
@@ -98,7 +96,6 @@ fn perspective(distance: f32) -> Matrix {
     m
 }
 
-/// Resolves a CSS position like `transform-origin` against a size.
 pub(crate) fn origin(value: &str, units: &Lengths, size: [f32; 2]) -> [f32; 3] {
     let parts = components(value, ' ');
     let (x, y) = match parts.as_slice() {
@@ -121,9 +118,6 @@ pub(crate) fn origin(value: &str, units: &Lengths, size: [f32; 2]) -> [f32; 3] {
     [x, y, z]
 }
 
-/// The CSS transform of a box with the given window bounds, as a matrix from untransformed to
-/// transformed window coordinates in logical pixels. It includes `transform-origin` and the
-/// parent's `perspective` (distance and window origin).
 pub(crate) fn transform(
     style: &Style,
     units: &Lengths,
@@ -135,7 +129,6 @@ pub(crate) fn transform(
         if let Some(percent) = value.strip_suffix('%') {
             return percent.parse::<f32>().ok().map(|value| value / 100.);
         }
-        // A percentage in `calc()`, like Tailwind's `scale: calc(100% * -1)`, resolves against 100.
         match units.math(value, 100., &[])? {
             (value, parser::Kind::Number) => Some(value as f32),
             (percent, parser::Kind::Length)
@@ -288,13 +281,11 @@ pub(crate) fn transform(
         .filter(|result| *result != IDENTITY)
 }
 
-/// The translation of a matrix that only translates in 2D.
 pub(crate) fn translation(matrix: &Matrix) -> Option<[f32; 2]> {
     let plain = translate(matrix[12], matrix[13], 0.);
     (*matrix == plain).then_some([matrix[12], matrix[13]])
 }
 
-/// Maps a point through a matrix, with the perspective divide.
 pub(crate) fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     let w = matrix[3] * x + matrix[7] * y + matrix[15];
     (w > 1e-4).then(|| {
@@ -305,7 +296,6 @@ pub(crate) fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     })
 }
 
-/// Whether the back of a transformed box faces the viewer.
 pub(crate) fn backface(matrix: &Matrix, bounds: Bounds<Pixels>) -> bool {
     let center = bounds.center();
     let [cx, cy] = [f32::from(center.x), f32::from(center.y)];
@@ -319,7 +309,6 @@ pub(crate) fn backface(matrix: &Matrix, bounds: Bounds<Pixels>) -> bool {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0.
 }
 
-/// A color matrix and opacity as a 4x5 row-major matrix.
 fn color_matrix(filter: Option<style::Filter>, opacity: f32) -> Option<[f32; 20]> {
     if filter.is_none() && opacity >= 1. {
         return None;
@@ -350,8 +339,6 @@ fn then_matrix(inner: &[f32; 20], outer: &[f32; 20]) -> [f32; 20] {
     result
 }
 
-/// The effects of a CSS `filter`, innermost first. Each blur and drop shadow gets its own layer,
-/// and consecutive color functions share one.
 pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Vec<PaintEffect> {
     let mut effects: Vec<PaintEffect> = Vec::new();
     let push_matrix = |effects: &mut Vec<PaintEffect>, matrix: [f32; 20]| {
@@ -409,7 +396,6 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
     effects
 }
 
-/// Maps the primitives of an inline SVG `<filter>` to effects.
 fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Vec<PaintEffect> {
     let id = reference.trim().trim_matches(['"', '\'']);
     let Some(id) = id.strip_prefix('#') else {
@@ -508,7 +494,6 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
     if offset != point(px(0.), px(0.))
         && let Some(blur) = effects.iter().position(|effect| effect.blur > px(0.))
     {
-        // `feOffset` after a blur of the alpha is the usual drop shadow recipe.
         let sigma = effects.remove(blur).blur;
         effects.push(PaintEffect {
             shadow: Some((offset, sigma, renderer::black().opacity(0.5))),
@@ -518,7 +503,6 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
     effects
 }
 
-/// The blur and color matrix of a CSS `backdrop-filter`.
 pub(crate) fn backdrop(value: &str, units: &Lengths) -> Option<(Pixels, Option<[f32; 20]>)> {
     let mut blur = px(0.);
     let mut matrix: Option<[f32; 20]> = None;
@@ -556,11 +540,8 @@ pub(crate) fn blend_mode(value: &str) -> BlendMode {
     }
 }
 
-/// How a `clip-path` clips a box of the given size.
 pub(crate) enum Clip {
-    /// A rounded rectangle, relative to the box.
     Rounded([f32; 4], [f32; 4]),
-    /// SVG shapes, in the box's coordinates.
     Shape(String),
 }
 
@@ -745,8 +726,6 @@ fn angle(value: &str) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
-/// The first argument of a gradient without its `in <space> [<method> hue]`, which picks the
-/// interpolation space and is not part of the shape, and that space.
 fn first_argument(body: &str) -> (String, Option<String>) {
     let parts = style::components(body, ',');
     let words: Vec<&str> = parts
@@ -771,7 +750,6 @@ fn first_argument(body: &str) -> (String, Option<String>) {
     }
 }
 
-/// The axis a linear gradient changes along, `1` for vertical, when it is parallel to one.
 pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
     if kind.trim_start_matches("repeating-") != "linear-gradient" {
         return None;
@@ -794,7 +772,6 @@ pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
     }
 }
 
-/// The size of a gradient's tile in a box and where the first tile sits.
 pub(crate) fn tile(
     size: &str,
     position: &str,
@@ -832,10 +809,7 @@ pub(crate) fn tile(
     [[tw, th], at]
 }
 
-/// The SVG of a CSS gradient layer covering a `width` by `height` box, sized, placed and
-/// repeated like a background or mask layer.
 #[allow(clippy::too_many_arguments)]
-/// The color stops of a gradient line `extent` long, in order and with all their offsets.
 fn gradient_stops<S: AsRef<str>>(
     parts: &[S],
     prelude: bool,
@@ -897,8 +871,6 @@ fn gradient_stops<S: AsRef<str>>(
     )
 }
 
-/// `mask-image` layers that are all axis-aligned linear gradients and intersect, as the alpha of each
-/// device pixel along x and along y. Their product is the mask, so it takes no rendering.
 pub(super) fn axis_mask(
     style: &style::Style,
     units: &Lengths,
@@ -977,6 +949,7 @@ pub(super) fn axis_mask(
     Some(axes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gradient_svg(
     kind: &str,
     body: &str,
@@ -1015,7 +988,6 @@ pub(crate) fn gradient_svg(
                 prelude = true;
                 degrees
             } else if space.is_some() && !first.is_empty() {
-                // Like browsers, an interpolation space with words that are no direction makes the gradient invalid.
                 return None;
             } else {
                 prelude = space.is_some();
@@ -1130,8 +1102,6 @@ pub(crate) fn gradient_svg(
         _ => return None,
     };
     let mut offsets = gradient_stops(&parts, prelude, &units, extent)?;
-    // SVG gradients mix in sRGB, so other spaces get extra stops. Without `in`, colors other
-    // than the legacy ones mix in Oklab.
     let space = space
         .filter(|space| !space.starts_with("srgb"))
         .or_else(|| {
@@ -1269,7 +1239,6 @@ pub(crate) fn gradient_svg(
     ))
 }
 
-/// Appends a box size and the units that lengths resolve with, as hex bits, to a cache key.
 pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
     let [font, root] = [units.font, units.root]
         .map(|font| [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]);
@@ -1290,7 +1259,6 @@ pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
     }
 }
 
-/// The `opacity` of a style, from 0 to 1.
 pub(super) fn opacity(style: &style::Style) -> f32 {
     style
         .get(Prop::OPACITY)
@@ -1337,7 +1305,6 @@ mod tests {
         let [x, y] = mask(fades, Some("intersect"), [100, 50]).unwrap();
         assert!(x[0] < 0.1 && x[50] >= 0.999);
         assert!(y[0] >= 0.999 && y[49] < 0.1);
-        // Layers that add can't be multiplied, and other shapes go through the SVG.
         assert!(mask(fades, None, [100, 50]).is_none());
         assert!(
             mask(
@@ -1372,7 +1339,6 @@ mod tests {
         );
         let quarter = transform(&style(&[("rotate", "90deg")]), &units, bounds, None).unwrap();
         assert_eq!(translation(&quarter), None);
-        // The center stays put and the top-left corner turns around it.
         assert!(close(map(&quarter, [105., 60.]).unwrap(), [105., 60.]));
         assert!(close(map(&quarter, [100., 50.]).unwrap(), [115., 55.]));
         let corner = transform(

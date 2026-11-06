@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashMap, io::Write, path::PathBuf};
 
-/// The page of a page worker's thread. It has no window, and windows don't use this id.
 pub(crate) const WORKER_PAGE: u64 = 0;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
@@ -15,18 +14,15 @@ pub enum Role {
     Renderer(u64),
 }
 
-/// Wakes the event loop of the thread that started a native operation.
 #[derive(Clone, Default)]
 pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
 
 thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
 
 thread_local! {
-    /// Event loop start, idle start and total idle time, for `performance.eventLoopUtilization()`.
     pub(crate) static IDLE: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Instant>, std::time::Duration)> = std::cell::Cell::default();
 }
 
-/// Marks where the thread's event loop starts or stops waiting.
 pub(crate) fn idle(waiting: bool) {
     IDLE.with(|idle| {
         let (start, since, total) = idle.get();
@@ -59,7 +55,6 @@ impl Waker {
     }
 }
 
-/// Wakes when dropped, for state that `poll` only sees after a task ends or is cancelled.
 pub(crate) struct WakeOnDrop(pub(crate) Waker);
 
 impl Drop for WakeOnDrop {
@@ -100,10 +95,8 @@ pub struct Host {
     pub app_path: PathBuf,
     pub paths: HashMap<String, PathBuf>,
     pub relaunch: Option<Vec<String>>,
-    /// `process.argv` of a script that `ELECTRON_RUN_AS_NODE` runs.
     pub argv: Option<Vec<String>>,
     pub packaged: bool,
-    /// Features that package.json disables, as bits by `bundle::FEATURES` index.
     pub disabled: u32,
     pub native_modules: HashMap<String, PathBuf>,
     pub assets: HashMap<String, PathBuf>,
@@ -112,7 +105,6 @@ pub struct Host {
     pub pages: HashMap<u64, Page>,
     pub dom: rustc_hash::FxHashMap<u64, crate::dom::State>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
-    /// By page, the paths of the files dropped on it. Page `File`s carry only the index, see `webUtils.getPathForFile`.
     pub dropped: HashMap<u64, Vec<String>>,
     pub browsers: crate::desktop::browser::State,
     pub logs: std::collections::VecDeque<Value>,
@@ -145,7 +137,6 @@ impl Host {
         Ok(())
     }
 
-    /// Queues a window or app command. A host without a link belongs to a worker or a test.
     pub(crate) fn command(&mut self, command: Value) {
         use crate::desktop::link::{ToMain, ToPage, native_command};
         match &self.link {
@@ -210,7 +201,7 @@ impl Host {
         }
     }
 
-    /// Applies the page writes that `dom.js` queued: `code, a, b, c` runs of 32-bit integers, where string arguments are UTF-16 lengths of consecutive parts of `text`.
+    // WARNING: applies the page writes that `dom.js` queued: `code, a, b, c` runs of 32-bit integers, where string arguments are UTF-16 lengths of consecutive parts of `text`.
     // WARNING: `dom.js` mirrors the tree for reads, so only this batch and `dom.html` may change nodes, attributes or text of a page.
     pub(crate) fn batch(&mut self, id: u64, codes: &[u8], mut text: &str) -> Result<Value> {
         let node = |doc: &Document, value: i32| {
@@ -219,7 +210,6 @@ impl Host {
                 .filter(|&id| doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty()))
                 .context("Invalid node")
         };
-        /// Drops the children that left `parent` while its list was stale.
         fn prune(doc: &mut Document, parent: usize) {
             let mut children = std::mem::take(&mut doc.nodes[parent].children);
             children.retain(|&child| doc.nodes[child].parent == Some(parent));
@@ -564,7 +554,6 @@ impl Host {
         })
     }
 
-    /// Runs WebGPU `op` of page `id` with arguments as JSON text.
     pub fn gpu(&mut self, id: u64, op: &str, args: &[u8]) -> Result<Value> {
         ensure!(self.enabled("webgpu"), "The webgpu feature is disabled");
         let page = self.pages.get_mut(&id).context("Window is closed")?;
@@ -582,7 +571,6 @@ impl Host {
         Ok(result)
     }
 
-    /// Runs media `op` of page `id`. Frames that are due go to the page images.
     pub fn media(&mut self, id: u64, op: &str, args: &Value) -> Result<Value> {
         let disabled = self.disabled;
         let page = self.pages.get_mut(&id).context("Window is closed")?;
@@ -992,7 +980,6 @@ impl Host {
     }
 }
 
-/// The file of a bundled asset URL, or of a local file URL in a local page.
 pub(crate) fn local_file(
     assets: &HashMap<String, PathBuf>,
     state: &crate::dom::State,

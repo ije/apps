@@ -41,7 +41,6 @@ impl Payload {
         Self { value, buffers }
     }
 
-    /// Takes the binary arguments of the current call, so `value` can outlive it.
     pub fn snapshot(value: Value) -> Self {
         Self {
             value,
@@ -99,7 +98,6 @@ impl Payload {
     }
 }
 
-/// Moves out bytes that the frame owns alone, and copies borrowed or shared ones.
 fn own(bytes: &mut Bytes) -> Bytes {
     if bytes.is_unique() {
         std::mem::take(bytes)
@@ -108,7 +106,6 @@ fn own(bytes: &mut Bytes) -> Bytes {
     }
 }
 
-/// Takes binary argument `value` of the current call, for an op that keeps it.
 pub(crate) fn read(value: &Value) -> Option<Result<Bytes>> {
     let index = value.get("$appsBytes")?.as_u64()?;
     Some(FRAMES.with(|frames| {
@@ -120,7 +117,6 @@ pub(crate) fn read(value: &Value) -> Option<Result<Bytes>> {
     }))
 }
 
-/// Borrows binary argument `value` of the current call without a copy.
 pub(crate) fn slice(value: &Value) -> Option<Result<&[u8]>> {
     let index = value.get("$appsBytes")?.as_u64()?;
     Some(
@@ -130,7 +126,7 @@ pub(crate) fn slice(value: &Value) -> Option<Result<&[u8]>> {
     )
 }
 
-/// The bytes of binary argument `index` of the current call. They stay valid until the call returns.
+// WARNING: the bytes of binary argument `index` of the current call. They stay valid until the call returns.
 pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
     FRAMES.with(|frames| {
         let frames = frames.borrow();
@@ -139,7 +135,6 @@ pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
     })
 }
 
-/// Returns `bytes` as a binary result of the current call, or as base64 outside a call.
 pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
     let bytes = bytes.into();
     FRAMES.with(|frames| match frames.borrow_mut().last_mut() {
@@ -151,7 +146,7 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
     })
 }
 
-/// The bytes of an `ArrayBuffer` or typed array. JavaScriptCore pins them, so they stay valid while the value lives.
+// WARNING: the bytes of an `ArrayBuffer` or typed array. JavaScriptCore pins them, so they stay valid while the value lives.
 pub(crate) fn view<'a>(
     api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
@@ -189,7 +184,6 @@ pub(crate) fn view<'a>(
     })
 }
 
-/// Keeps the values that `input` borrowed bytes from alive until it drops.
 pub(crate) struct Roots<'a> {
     api: &'a crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
@@ -204,7 +198,7 @@ impl Drop for Roots<'_> {
     }
 }
 
-/// The bytes of each item of array `values`. They stay valid while the returned `Roots` live.
+// WARNING: the bytes of each item of array `values`. They stay valid while the returned `Roots` live.
 pub(crate) fn input<'a>(
     api: &'a crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,

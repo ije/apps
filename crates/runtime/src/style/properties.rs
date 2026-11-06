@@ -1,7 +1,6 @@
 use rustc_hash::FxHashMap;
 use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 
-/// A CSS property name. Known names have fixed ids in name order; other names are interned per thread.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Prop(u32, PhantomData<*const ()>);
 
@@ -436,7 +435,6 @@ thread_local! {
 }
 
 impl Prop {
-    /// The property, interning a name that is not known yet.
     pub(crate) fn new(name: &str) -> Self {
         known(name).unwrap_or_else(|| {
             INTERNED.with(|interned| {
@@ -478,12 +476,10 @@ impl Prop {
         })
     }
 
-    /// How many names are interned. A name that `find` doesn't know yet gets an id only by growing it.
     pub(crate) fn interned() -> usize {
         INTERNED.with(|interned| interned.borrow().0.len())
     }
 
-    /// The property if any style can hold it.
     pub(crate) fn find(name: &str) -> Option<Self> {
         known(name).or_else(|| INTERNED.with(|interned| interned.borrow().1.get(name).copied()))
     }
@@ -505,7 +501,6 @@ impl Prop {
         self.0 & CUSTOM != 0
     }
 
-    /// A property that `@pierre/apps` knows. Other names are kept for the CSSOM but never applied.
     pub(crate) fn is_known(self) -> bool {
         (self.0 as usize) < NAMES.len()
     }
@@ -529,14 +524,10 @@ pub(crate) type Vars = Rc<Vec<(Prop, Rc<str>)>>;
 
 const WORDS: usize = (Known::Count as usize).div_ceil(64);
 
-/// Property values, sorted by property, so known properties come first. Custom properties are
-/// kept apart, shared between styles.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     entries: Vec<(Prop, Rc<str>)>,
     vars: Vars,
-    /// Which known properties are set, and how many are set in the words before each word, so
-    /// a known property finds its entry with one popcount.
     known: [u64; WORDS],
     before: [u16; WORDS],
 }
@@ -546,7 +537,6 @@ impl Style {
         Self::default()
     }
 
-    /// The index of the property's entry, or where it goes.
     fn position(&self, prop: Prop) -> Result<usize, usize> {
         let id = prop.0 as usize;
         if prop.is_custom() {
@@ -565,7 +555,6 @@ impl Style {
         }
     }
 
-    /// Updates the known set for `prop`, by `delta` entries.
     fn count(&mut self, prop: Prop, delta: i16) {
         let id = prop.0 as usize;
         if id < NAMES.len() {

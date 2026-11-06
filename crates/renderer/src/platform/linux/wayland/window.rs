@@ -26,7 +26,6 @@ use wayland_protocols::{
     },
 };
 
-/// A configure that applies with the next `xdg_surface.configure`.
 struct Configure {
     size: Option<Size<Pixels>>,
     maximized: bool,
@@ -35,27 +34,22 @@ struct Configure {
     suspended: bool,
 }
 
-/// A window's state that Wayland events update.
 pub(super) struct Shared {
     pub surface: wl_surface::WlSurface,
     pub callbacks: Callbacks,
     client: Weak<Client>,
     state: RefCell<State>,
     transparent: bool,
-    /// The app wants frames.
     wants: Cell<bool>,
-    /// A frame callback is committed or requested, so the compositor will time the next frame.
     callback: Cell<bool>,
-    /// A frame runs soon, from the loop or a timer.
     scheduled: Cell<bool>,
     configured: Cell<bool>,
-    /// Shown by the app; a window is mapped with its first frame.
     shown: Cell<bool>,
     presented: Cell<bool>,
 }
 
 struct State {
-    /// Taken when the window closes: GPU objects must not outlive the surface.
+    // WARNING: taken when the window closes: GPU objects must not outlive the surface.
     renderer: Option<Renderer>,
     xdg: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
@@ -63,7 +57,6 @@ struct State {
     viewport: Option<wp_viewport::WpViewport>,
     fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     size: Size<Pixels>,
-    /// The size to go back to after maximizing or full screen.
     windowed: Size<Pixels>,
     scale: f32,
     outputs: Vec<u32>,
@@ -75,7 +68,6 @@ struct State {
     active: bool,
 }
 
-/// A native Wayland toplevel and its wgpu surface.
 pub(crate) struct Window {
     shared: Rc<Shared>,
     client: Rc<Client>,
@@ -95,7 +87,6 @@ impl Window {
         let xdg = globals.wm_base.get_xdg_surface(&surface, qh, id.clone());
         let toplevel = xdg.get_toplevel(qh, id.clone());
         toplevel.set_title(options.title.clone());
-        // Desktops match windows to their app by id, the name of its desktop file.
         toplevel.set_app_id(super::super::app_name());
         let decoration = globals.decoration_manager.as_ref().map(|manager| {
             let decoration = manager.get_toplevel_decoration(&toplevel, qh, id.clone());
@@ -186,7 +177,6 @@ impl Window {
             .borrow_mut()
             .windows
             .insert(id, Rc::downgrade(&shared));
-        // The compositor sends the first configure after this commit.
         surface.commit();
         client.consume_startup_token(&surface);
         Ok(Self {
@@ -226,7 +216,6 @@ impl Window {
         let shared = &self.shared;
         let (drawn, capture) = {
             let mut state = shared.state.borrow_mut();
-            // The frame callback is committed with the frame.
             if !shared.callback.replace(true) {
                 shared.surface.frame(&self.client.qh, shared.surface.id());
             }
@@ -234,10 +223,7 @@ impl Window {
         };
         match drawn {
             Drawn::Presented => shared.presented.set(true),
-            // A mapped surface still gets its frame callback with a plain commit, which paces
-            // the retries of a covered window.
             _ if shared.presented.get() => shared.surface.commit(),
-            // Before the first frame no callback comes, so a timer retries.
             _ => shared.callback.set(false),
         }
         if drawn == Drawn::Repaint {
@@ -260,7 +246,6 @@ impl Window {
 
     pub fn state(&self) -> WindowState {
         let state = self.shared.state.borrow();
-        // Wayland windows don't know where they are.
         let bounds = Bounds::new(point(px(0.), px(0.)), state.size);
         let display = self
             .shared
@@ -333,7 +318,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         let mut state = self.shared.state.borrow_mut();
         state.renderer.take();
-        // Roles go before their surfaces.
+        // WARNING: roles go before their surfaces.
         if let Some(decoration) = &state.decoration {
             decoration.destroy();
         }
@@ -370,12 +355,10 @@ impl Shared {
     }
 
     fn tick(self: &Rc<Self>) {
-        // An idle window waits for no callbacks until it changes.
         if self.callbacks.frame() == Some(false) {
             self.wants.set(false);
             return;
         }
-        // The frame callback of the presented frame times the next one.
         if self.callback.get() || self.scheduled.replace(true) {
             return;
         }
@@ -431,7 +414,6 @@ impl Shared {
                 }
             }
             state.xdg.set_window_geometry(0, 0, width, height);
-            // The compositor can skip what is behind an opaque window.
             if !self.transparent {
                 let region = client.globals.compositor.create_region(&client.qh, ());
                 region.add(0, 0, width, height);
@@ -499,7 +481,6 @@ impl Shared {
                 if configure.maximized || configure.fullscreen {
                     return configure.size;
                 }
-                // Compositors can leave the size to the window after maximizing.
                 let size = if unmaximized {
                     Some(state.windowed)
                 } else {
@@ -515,7 +496,6 @@ impl Shared {
         };
         self.set_size_and_scale(size, None);
         if self.configured.replace(true) {
-            // The acknowledged configure applies with the next commit.
             self.callbacks.appearance_changed();
         } else {
             self.schedule();
@@ -544,7 +524,6 @@ impl Shared {
         };
         let fractional = client.globals.fractional_scale_manager.is_some();
         let scale = match &event {
-            // Newer compositors send the scale, so the outputs only matter for older ones.
             wl_surface::Event::PreferredBufferScale { factor } if !fractional => Some(*factor),
             wl_surface::Event::Enter { output } | wl_surface::Event::Leave { output }
                 if !fractional

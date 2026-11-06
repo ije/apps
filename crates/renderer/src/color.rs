@@ -1,4 +1,3 @@
-/// A color with straight alpha, all channels from 0 to 1, in sRGB.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 pub struct Rgba {
@@ -8,7 +7,6 @@ pub struct Rgba {
     pub a: f32,
 }
 
-/// A color from `0xRRGGBBAA`.
 pub fn rgba(hex: u32) -> Rgba {
     let channel = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.;
     Rgba {
@@ -56,7 +54,6 @@ impl Rgba {
     pub fn is_opaque(&self) -> bool {
         self.a >= 1.
     }
-    /// Paints `other` over this color.
     pub fn blend(self, other: Self) -> Self {
         if other.a >= 1. {
             return other;

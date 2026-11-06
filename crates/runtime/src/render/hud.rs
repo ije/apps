@@ -1,6 +1,3 @@
-//! The FPS HUD that `apps run` shows on Cmd+Alt+F. The apps_perfhud library next to the runtime measures and
-//! lays it out. `apps build` doesn't ship the library, so built apps can't show it.
-
 use super::PageState;
 use anyhow::{Context, Result, ensure};
 use renderer::{Bounds, TextAlign, TextRun, Timer, Window, point, px, size};
@@ -22,12 +19,10 @@ const FONT: &str = if cfg!(target_os = "macos") {
     "DejaVu Sans Mono"
 };
 
-/// A box when `len` is 0, else a line of text, as the library lays them out.
 #[repr(C)]
 struct Item {
     bounds: [f32; 4],
     color: u32,
-    /// The corner radius of a box, or the font size of text.
     size: f32,
     align: u32,
     text: *const u8,
@@ -46,7 +41,6 @@ struct Library {
 pub(crate) struct Hud {
     raw: NonNull<c_void>,
     library: &'static Library,
-    /// When the frame that is drawn now started to render.
     pub(crate) started: Cell<Instant>,
     timer: RefCell<Option<Timer>>,
 }
@@ -71,7 +65,6 @@ impl Hud {
         window.refresh();
     }
 
-    /// Records the frame and paints the HUD over the page.
     pub(crate) fn paint(&self, window: &mut Window) {
         let size = window.viewport_size();
         unsafe {
@@ -123,7 +116,6 @@ fn load() -> Result<Library> {
     }
 }
 
-/// Ticks the HUD of `view` every half second while it is shown, and draws a frame when the page is idle.
 fn tick(view: Weak<PageState>, window: &Window) -> Timer {
     window.timer(Duration::from_millis(500), move |window, _| {
         let Some(data) = view.upgrade() else {

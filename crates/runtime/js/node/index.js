@@ -1,7 +1,7 @@
 globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOptions, deepEqual }, info) => {
   const windows = info.platform === 'win32';
   const bytes = text => { if(typeof text !== 'string')return new Buffer(text.buffer, text.byteOffset, text.byteLength); const length = text.length, out = new Buffer(length); for (let i = 0; i < length; i++) out[i] = text.charCodeAt(i); return out; };
-  const binary = data => { let s = ''; for (let i = 0; i < data.length; i += 8192) s += String.fromCharCode.apply(null, data.subarray(i, i + 8192)); return s; };
+  const binary = data => { let state = ''; for (let i = 0; i < data.length; i += 8192) state += String.fromCharCode.apply(null, data.subarray(i, i + 8192)); return state; };
   const view = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
   const utf8 = /^utf-?8$/i, utf8Encoder = new TextEncoder(), utf8Decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   const error = (Type, code, message) => Object.assign(new Type(message), { code });
@@ -14,7 +14,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const encodings = { __proto__: null, utf8: 'utf8', 'utf-8': 'utf8', ucs2: 'utf16le', 'ucs-2': 'utf16le', utf16le: 'utf16le', 'utf-16le': 'utf16le', latin1: 'latin1', binary: 'latin1', base64: 'base64', base64url: 'base64url', hex: 'hex', ascii: 'ascii' };
   const normalize = encoding => encoding == null ? 'utf8' : encodings[encoding] ?? encodings[String(encoding).toLowerCase()];
   const encodingOf = encoding => { const value = encoding === null ? undefined : normalize(encoding); if (!value) throw error(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`); return value; };
-  // Takes a normalized encoding.
   const encode = (value, encoding = 'utf8') => {
     if (encoding === 'utf8') return utf8Encoder.encode(value);
     if (encoding === 'hex') return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]);
@@ -242,7 +241,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       return [first, start, j];
     };
     const reserved = (p, colon) => /^(?:CON|PRN|AUX|NUL|COM[1-9\xb9\xb2\xb3]|LPT[1-9\xb9\xb2\xb3])$/.test(p.slice(0, colon).toUpperCase());
-    // [device, rootEnd, absolute] as Node's win32 resolve and normalize (`normal`) read them.
     const head = (p, normal) => {
       if (isSep(p.charCodeAt(0))) {
         if (!windows || p.length < 2 || !isSep(p.charCodeAt(1))) return ['', 1, true];
@@ -460,9 +458,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (name === 'stat' || name === 'lstat' || name === 'fstat') return args[1]?.bigint ? new BigIntStats(result) : new Stats(result);
     if (name === 'statfs') return new StatFs(result, args[1]?.bigint);
     if (name === 'readdir') {
-      const o = options(args[1]), raw = o.encoding === 'buffer';
+      const opts = options(args[1]), raw = opts.encoding === 'buffer';
       return result.map(([name, type]) => {
-        if (!o.withFileTypes) return raw ? Buffer.from(name) : name;
+        if (!opts.withFileTypes) return raw ? Buffer.from(name) : name;
         const index = Math.max(name.lastIndexOf('/'), windows ? name.lastIndexOf('\\') : -1), base = name.slice(index + 1);
         return new Dirent(raw ? Buffer.from(base) : base, type, index < 0 ? args[0] : path.join(args[0], name.slice(0, index)));
       });
@@ -479,7 +477,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     async write(buffer, ...args) { return { bytesWritten: await asyncCall('write', this.#fd, ...chunk(buffer, ...args)), buffer }; }
     async readv(buffers, position) { const list = vectors(buffers); return { bytesRead: scatter(list, bytes(await asyncCall('read', this.#fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)))), buffers }; }
     async writev(buffers, position) { return { bytesWritten: await asyncCall('write', this.#fd, Buffer.concat(vectors(buffers)), offsetOrNull(position)), buffers }; }
-    async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const b = await asyncCall('read', this.#fd, 1048576, null); if (!b.length) break; chunks.push(bytes(b)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
+    async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const chunk = await asyncCall('read', this.#fd, 1048576, null); if (!chunk.length) break; chunks.push(bytes(chunk)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
     async writeFile(data, o) { const { encoding, signal } = options(o), bytes = view(data, encoding); let at = 0; do { aborted(signal); at += await asyncCall('write', this.#fd, bytes.subarray(at, at + 1048576), null); } while (at < bytes.length); }
     async appendFile(data, o) { await this.writeFile(data, o); }
     async stat(options) { const result = await asyncCall('fstat', this.#fd); return options?.bigint ? new BigIntStats(result) : new Stats(result); }
@@ -558,7 +556,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   };
   const named = (part, name) => typeof part === 'string' ? (fold ? part.toLowerCase() === name.toLowerCase() : part === name) : part.test(name);
   const globbed = (parts, names, i = 0, j = 0) => i === parts.length ? j === names.length : parts[i] === '**' ? globbed(parts, names, i + 1, j) || (j < names.length && names[j][0] !== '.' && globbed(parts, names, i, j + 1)) : j < names.length && named(parts[i], names[j]) && globbed(parts, names, i + 1, j + 1);
-  // Yields ['readdir' | 'lstat', path] steps for a sync or async driver, and returns the matches.
   const glob = function* (patterns, o = {}) {
     const cwd = o.cwd === undefined ? call('cwd') : pathArg(o.cwd), results = new Map(), excludes = Array.isArray(o.exclude) && o.exclude.flatMap(expand).map(text => split(text).map(segment));
     const excluded = (rel, entry) => excludes ? excludes.some(parts => globbed(parts, split(rel))) : !!o.exclude?.(o.withFileTypes ? entry : rel);
@@ -880,36 +877,36 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const url = {
     URL, URLSearchParams,
     fileURLToPath(value) {
-      const u = typeof value === 'string' ? new URL(value) : value;
-      if (u.protocol === 'apps:') return path.join(info.appPath, decodeURIComponent(u.pathname));
-      if (u.protocol !== 'file:') throw Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
-      if (/%2f/i.test(u.pathname) || (windows && /%5c/i.test(u.pathname))) throw Object.assign(new TypeError(`File URL path must not include encoded ${windows ? '\\ or /' : '/'} characters`), { code: 'ERR_INVALID_FILE_URL_PATH' });
-      const pathname = decodeURIComponent(u.pathname);
-      if (!windows) { if (u.hostname && u.hostname !== 'localhost') throw Object.assign(new TypeError(`File URL host must be "localhost" or empty on ${info.platform}`), { code: 'ERR_INVALID_FILE_URL_HOST' }); return pathname; }
-      if (u.hostname) return `\\\\${u.hostname}${pathname.replaceAll('/', '\\')}`;
+      const url = typeof value === 'string' ? new URL(value) : value;
+      if (url.protocol === 'apps:') return path.join(info.appPath, decodeURIComponent(url.pathname));
+      if (url.protocol !== 'file:') throw Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
+      if (/%2f/i.test(url.pathname) || (windows && /%5c/i.test(url.pathname))) throw Object.assign(new TypeError(`File URL path must not include encoded ${windows ? '\\ or /' : '/'} characters`), { code: 'ERR_INVALID_FILE_URL_PATH' });
+      const pathname = decodeURIComponent(url.pathname);
+      if (!windows) { if (url.hostname && url.hostname !== 'localhost') throw Object.assign(new TypeError(`File URL host must be "localhost" or empty on ${info.platform}`), { code: 'ERR_INVALID_FILE_URL_HOST' }); return pathname; }
+      if (url.hostname) return `\\\\${url.hostname}${pathname.replaceAll('/', '\\')}`;
       if (!/^\/[A-Za-z]:/.test(pathname)) throw Object.assign(new TypeError('File URL path must be absolute'), { code: 'ERR_INVALID_FILE_URL_PATH' });
       return pathname.slice(1).replaceAll('/', '\\');
     },
     pathToFileURL(value) {
       let resolved = path.resolve(value);
       if (/[\\/]$/.test(value) && !resolved.endsWith(path.sep)) resolved += '/';
-      const u = new URL('file://');
-      if (windows && resolved.startsWith('\\\\')) { const [host, ...rest] = resolved.slice(2).split('\\'); u.hostname = host; resolved = '/' + rest.join('/'); }
+      const url = new URL('file://');
+      if (windows && resolved.startsWith('\\\\')) { const [host, ...rest] = resolved.slice(2).split('\\'); url.hostname = host; resolved = '/' + rest.join('/'); }
       else if (windows) resolved = '/' + resolved.replaceAll('\\', '/');
-      u.pathname = resolved.replace(/[%\n\r\t#?\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
-      return u;
+      url.pathname = resolved.replace(/[%\n\r\t#?\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+      return url;
     },
     format(value, options) {
       if (typeof value === 'string') return value;
       if (value === null || typeof value !== 'object') throw typeError('urlObject', 'one of type object or string', value);
       if (value instanceof URL) {
-        const flag = (name, fallback) => options?.[name] == null ? fallback : !!options[name], u = new URL(value.href);
-        if (!flag('auth', true)) { u.username = ''; u.password = ''; }
-        if (!flag('fragment', true)) u.hash = '';
-        if (!flag('search', true)) u.search = '';
-        if (!flag('unicode', false) || !u.hostname) return u.href;
-        const start = u.href.indexOf(u.hostname, u.protocol.length);
-        return u.href.slice(0, start) + domain(u.hostname, true) + u.href.slice(start + u.hostname.length);
+        const flag = (name, fallback) => options?.[name] == null ? fallback : !!options[name], url = new URL(value.href);
+        if (!flag('auth', true)) { url.username = ''; url.password = ''; }
+        if (!flag('fragment', true)) url.hash = '';
+        if (!flag('search', true)) url.search = '';
+        if (!flag('unicode', false) || !url.hostname) return url.href;
+        const start = url.href.indexOf(url.hostname, url.protocol.length);
+        return url.href.slice(0, start) + domain(url.hostname, true) + url.href.slice(start + url.hostname.length);
       }
       const auth = value.auth ? encodeURIComponent(value.auth).replace(/%3A/gi, ':') + '@' : '', query = value.query !== null && typeof value.query === 'object' ? querystring.stringify(value.query) : '';
       let protocol = value.protocol || '', pathname = (value.pathname || '').replace(/[#?]/g, c => c === '#' ? '%23' : '%3F'), hash = value.hash || '', search = (value.search || (query && '?' + query) || '').replaceAll('#', '%23'), host = '';
@@ -1153,7 +1150,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   // WARNING: SIGWINCH is hooked only when a terminal stream gets its first `resize` listener.
   const resizing = new Set(), resizable = stream => stream.on('newListener', name => { if (name !== 'resize' || resizing.has(stream)) return; if (!resizing.size) sync('tty.watch'); resizing.add(stream); });
   let streams;
-  // Makes process.stdout and stderr terminal streams. They are created before `__apps.stream` exists.
+  // WARNING: makes process.stdout and stderr terminal streams. They are created before `__apps.stream` exists.
   const terminal = (stream, modules) => { streams = modules; return resizable(Object.setPrototypeOf(stream, tty.WriteStream.prototype)); };
   return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, dns, tty, details, sync, asyncCall, poll, terminal };
 };

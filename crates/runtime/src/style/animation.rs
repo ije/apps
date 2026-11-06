@@ -44,23 +44,17 @@ pub(crate) struct Animation {
     iterations: f64,
     direction: String,
     fill: String,
-    /// The default easing of keyframes.
     timing: String,
-    /// The easing of each iteration, which `Element.animate()` sets.
     easing: String,
     end_delay: f64,
     iteration_start: f64,
-    /// How keyframes combine with the value below: `replace`, `add` or `accumulate`.
     composite: String,
-    /// The element (0), its `::before` (1) or `::after` (2). Pseudo-element animations have names like
-    /// `::before\0spin`, so their clocks and events stay apart.
     pub pseudo: u8,
     tracks: Vec<(Prop, Keyframes)>,
 }
 
 type Keyframes = Vec<(f64, String, String)>;
 
-/// The animated style of each node, and whether it changes layout.
 type Animated = Vec<(usize, Rc<Style>, bool)>;
 
 impl Animation {
@@ -178,7 +172,6 @@ impl Animation {
     }
 }
 
-/// The computed values of keyframes `(offset, declarations, easing)` for an element with `style`, by property.
 fn tracks(
     style: &Style,
     rules: &[(f64, Style, String)],
@@ -203,7 +196,6 @@ fn tracks(
         resolve_style(&mut frame, Some(style), None, &custom, registry);
         resolve_keywords(&mut frame, Some(style));
         for (key, value) in declarations.iter() {
-            // Custom properties that can't interpolate switch halfway, like in browsers.
             if value.ends_with("!important") || !animatable(key, registry) && !key.is_custom() {
                 continue;
             }
@@ -227,9 +219,6 @@ fn tracks(
 }
 
 impl Animation {
-    /// Writes the animated values into `out`. Returns the seconds until the values can change
-    /// next (0 while they change continuously, `None` when they never change), and whether the
-    /// animation has ended.
     pub fn sample(
         &self,
         elapsed: f64,
@@ -237,7 +226,6 @@ impl Animation {
         registry: &Registry,
         out: &mut Style,
     ) -> (Option<f64>, bool) {
-        // The phases of Web Animations: before `start`, active, and after `stop`.
         let length = if self.duration == 0. {
             0.
         } else {
@@ -297,7 +285,6 @@ impl Animation {
                 .iter()
                 .map(|(at, value, timing)| (*at, Cow::Borrowed(value.as_str()), timing.as_str()))
                 .collect();
-            // Missing ends and added keyframes take the value below: earlier animations, or the element's own.
             let replace = self.composite == "replace";
             if !replace || keys[0].0 > 0. || keys[keys.len() - 1].0 < 1. {
                 let under = out
@@ -331,7 +318,6 @@ impl Animation {
                 .unwrap_or(0)
                 .min(keys.len().saturating_sub(2));
             let (from, to) = (&keys[index], &keys[(index + 1).min(keys.len() - 1)]);
-            // An easing that overshoots goes past the first or last keyframe.
             let local = if to.0 > from.0 {
                 let local = (progress - from.0) / (to.0 - from.0);
                 if (0. ..=1.).contains(&progress) {
@@ -396,9 +382,7 @@ struct Clock {
     started: bool,
     iteration: f64,
     delay: f64,
-    /// Whether script paused (`true`) or played it, over `animation-play-state`.
     held: Option<bool>,
-    /// Script canceled it, so it stays off until its name changes.
     canceled: bool,
 }
 
@@ -409,7 +393,6 @@ struct Transition {
     from: String,
     to: String,
     start: Instant,
-    /// The seconds since `start` where script paused it.
     held: Option<f64>,
     delay: f64,
     duration: f64,
@@ -431,25 +414,20 @@ impl Transition {
     }
 }
 
-/// An animation from `Element.animate()`. Script keeps its timing model and sends the current time, so this
-/// only runs the clock between updates.
 pub(crate) struct Scripted {
     id: u32,
-    /// Keyframes as `(offset, declarations, easing)`.
     rules: Vec<(f64, Style, String)>,
     effect: Animation,
-    /// What owns the style that the keyframes were resolved against, and its custom properties.
     base: Option<(Rc<dyn std::any::Any>, super::Vars)>,
-    /// The current time in seconds at `since`, and the playback rate while time runs.
     time: f64,
     rate: Option<f64>,
     since: Instant,
 }
 
 impl Scripted {
-    /// A script animation from its keyframes `(offset, CSS declarations, easing)`, its timing in seconds
-    /// `[delay, end delay, duration, iterations, iteration start]`, `[direction, fill, easing, composite]` and
-    /// pseudo-element slot.
+    // WARNING: A script animation from its keyframes `(offset, CSS declarations, easing)`, its timing in seconds
+    // `[delay, end delay, duration, iterations, iteration start]`, `[direction, fill, easing, composite]` and
+    // pseudo-element slot.
     pub fn new(
         id: u32,
         keyframes: &[(f64, &str, String)],
@@ -495,7 +473,6 @@ impl Scripted {
             })
     }
 
-    /// The style it animates and its owner: the element's, or one of its pseudo-elements'.
     fn base<'a>(
         &self,
         id: usize,
@@ -508,7 +485,6 @@ impl Scripted {
                 (pair.clone(), &pair[usize::from(slot) - 1])
             }
         };
-        // Styles without CSS animations hold no custom properties, so the keyframes get the node's.
         let vars = &styles.vars[id];
         Some((
             owner,
@@ -522,7 +498,6 @@ impl Scripted {
         ))
     }
 
-    /// Resolves the keyframes again when the style changed.
     fn resolve(&mut self, owner: Rc<dyn std::any::Any>, base: &Style, registry: &Registry) {
         if self
             .base
@@ -540,26 +515,17 @@ pub(crate) struct Motion {
     previous: Vec<Rc<Style>>,
     clocks: HashMap<usize, Vec<Clock>>,
     transitions: HashMap<usize, Vec<Transition>>,
-    /// The last animated style of each node, with its base style and animated values.
     styled: HashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
     pub custom: HashMap<usize, Style>,
-    /// The timer that wakes the view for the next animation change.
     pub wake: Option<(Instant, renderer::Timer)>,
-    /// Nodes whose animations wait until their box comes into view, from the last update.
     pub parked: Vec<usize>,
-    /// The animations from `Element.animate()` of each node, in composite order.
     scripted: HashMap<usize, Vec<Scripted>>,
-    /// The last id of a CSS animation or transition, so script can find them.
     serial: u32,
-    /// Events from script controls, for the next update.
     queued: Vec<(usize, &'static str, String, f64)>,
-    /// The animated `::before` and `::after` styles of the last update.
     pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
 }
 
 impl Motion {
-    /// The style of node `id` at each of `times`, sampled like `update` from its last clocks without
-    /// changing them or sending events, so a compositor can play it.
     pub fn timeline(&self, id: usize, styles: &ComputedStyles, times: &[Instant]) -> Vec<Style> {
         let registry = &*styles.registry;
         let base = &*styles.values[id];
@@ -615,7 +581,6 @@ impl Motion {
             .collect()
     }
 
-    /// When the next animation or transition event of node `id` fires after `now`, if any.
     pub fn next_event(&self, id: usize, styles: &ComputedStyles, now: Instant) -> Option<Instant> {
         let effects = styles.animations.get(&id).map_or(&[][..], Vec::as_slice);
         let clocks = self.clocks.get(&id).map_or(&[][..], Vec::as_slice);
@@ -657,14 +622,11 @@ impl Motion {
             .min()
     }
 
-    /// Gives back the room for node ids past `len`.
     pub fn trim(&mut self, len: usize) {
         self.previous.truncate(len);
         self.previous.shrink_to_fit();
     }
 
-    /// Keeps the style a script read from a new node, as transitions start from it, like after a browser's
-    /// forced style.
     pub fn read(&mut self, id: usize, style: &Rc<Style>) {
         if self.previous.len() <= id {
             self.previous.resize_with(id + 1, Default::default);
@@ -683,8 +645,6 @@ impl Motion {
         self.scripted.remove(&id);
     }
 
-    /// Adds or replaces the script animation `id` of `node`, at `time` seconds and running at `rate`, or
-    /// paused with `None`.
     pub fn script(&mut self, node: usize, mut animation: Scripted, time: f64, rate: Option<f64>) {
         animation.time = time;
         animation.rate = rate.filter(|rate| *rate != 0.);
@@ -696,7 +656,6 @@ impl Motion {
         list.insert(index, animation);
     }
 
-    /// Removes the script animation `id`, and returns its node.
     pub fn unscript(&mut self, id: u32) -> Option<usize> {
         let node = self.scripted.iter().find_map(|(&node, list)| {
             list.iter()
@@ -711,9 +670,9 @@ impl Motion {
         Some(node)
     }
 
-    /// The CSS transitions and then the CSS animations of `nodes` that script sees, as `[serial, node, kind, name,
-    /// time, state, [delay, end delay, duration, iterations, iteration start], direction, fill, easing, frames]`
-    /// with times in ms, infinite iterations as -1 and frames as `[offset, property, value, easing]`.
+    // WARNING: the CSS transitions and then the CSS animations of `nodes` that script sees, as `[serial, node, kind, name,
+    // time, state, [delay, end delay, duration, iterations, iteration start], direction, fill, easing, frames]`
+    // with times in ms, infinite iterations as -1 and frames as `[offset, property, value, easing]`.
     pub fn css(
         &self,
         nodes: &[usize],
@@ -760,7 +719,6 @@ impl Motion {
                 continue;
             };
             for (clock, effect) in clocks.iter().zip(effects) {
-                // Finished animations that don't fill are gone for script, like canceled ones.
                 if clock.canceled
                     || effect.pseudo != 0 && !pseudos
                     || clock.ended && !matches!(effect.fill.as_str(), "forwards" | "both")
@@ -834,8 +792,6 @@ impl Motion {
         list
     }
 
-    /// Runs a script control on the CSS animation or transition `serial`: `pause`, `play`, `seek` to `time` ms,
-    /// `finish` or `cancel`. Returns whether it found it.
     pub fn css_control(
         &mut self,
         serial: u32,
@@ -938,7 +894,6 @@ impl Motion {
         false
     }
 
-    /// The values that the script animations of `node` or its pseudo-element `pseudo` give it now.
     pub fn scripted(&mut self, node: usize, pseudo: u8, styles: &ComputedStyles) -> Option<Style> {
         let now = Instant::now();
         let list = self.scripted.get_mut(&node)?;
@@ -958,8 +913,6 @@ impl Motion {
         (!out.is_empty()).then_some(out)
     }
 
-    /// Samples the animations and transitions at `now`. `shown` tells whether a node's box was in view
-    /// at the last layout; animations that can't move an unshown box don't wake the view.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
@@ -1266,7 +1219,7 @@ impl Motion {
                     id,
                     effect.tracks.iter().all(|(key, _)| PAINT.contains(key)),
                     effect.tracks.iter().all(|(key, frames)| {
-                        still(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                        keeps_box_in_place(*key, frames.iter().map(|(_, value, _)| value.as_str()))
                     }),
                     if effect.tracks.is_empty() {
                         end
@@ -1277,8 +1230,6 @@ impl Motion {
                 ));
             }
         }
-        // Script animations come after CSS animations in composite order. Script runs their finish, so only
-        // their changes wake the view.
         for (&id, list) in &mut self.scripted {
             if visible.get(id) != Some(&true) {
                 continue;
@@ -1309,7 +1260,7 @@ impl Motion {
                     id,
                     tracks.iter().all(|(key, _)| PAINT.contains(key)),
                     tracks.iter().all(|(key, frames)| {
-                        still(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                        keeps_box_in_place(*key, frames.iter().map(|(_, value, _)| value.as_str()))
                     }),
                     change,
                     f64::INFINITY,
@@ -1338,12 +1289,11 @@ impl Motion {
                         out.insert(transition.property, value);
                     }
                     let time = transition.elapsed(now) - transition.delay;
-                    // A transition that script paused never changes.
                     let held = transition.held.map(|_| f64::INFINITY);
                     wakes.push((
                         id,
                         PAINT.contains(&transition.property),
-                        still(
+                        keeps_box_in_place(
                             transition.property,
                             [transition.from.as_str(), transition.to.as_str()].into_iter(),
                         ),
@@ -1478,7 +1428,6 @@ impl Motion {
                 (id, style, layout.contains(&id))
             })
             .collect();
-        // Animated pseudo-elements draw from their own styles, and their host rebuilds with its own one.
         let mut pairs: HashMap<usize, [Style; 2]> = HashMap::new();
         for ((id, slot), values) in pseudo {
             let Some(pair) = styles.pseudos.get(&id).filter(|_| !values.is_empty()) else {
@@ -1503,13 +1452,10 @@ impl Motion {
     }
 }
 
-/// `composite: add` of an animation value onto the value below it, or with `accumulate`, matching transform and
-/// filter functions combine their arguments. `None` where values don't add, so the animation value replaces.
 fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
-    // A number with its unit, like `10px` or `0.5`.
     fn number(text: &str) -> Option<(f64, &str)> {
         let bytes = text.as_bytes();
-        // An `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
+        // WARNING: an `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
         let end = (0..bytes.len())
             .find(|&index| {
                 let byte = bytes[index];
@@ -1558,7 +1504,6 @@ fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<Str
                             {
                                 return None;
                             }
-                            // Scales and the filters that are 1 when unchanged combine as `a + b - 1`.
                             let offset = if name.starts_with("scale")
                                 || matches!(
                                     name,
@@ -1607,8 +1552,7 @@ fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<Str
     Some(parts?.join(" "))
 }
 
-/// Whether animated paint values keep the box where it is, so they can't move it into view.
-fn still<'a>(prop: Prop, mut values: impl Iterator<Item = &'a str>) -> bool {
+fn keeps_box_in_place<'a>(prop: Prop, mut values: impl Iterator<Item = &'a str>) -> bool {
     match prop {
         Prop::TRANSLATE => false,
         Prop::TRANSFORM => values.all(|value| {
@@ -1777,21 +1721,16 @@ pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Optio
     })
 }
 
-/// Parsed pairs by a hash of the property and values, with those values.
 type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Lerp>)>;
 
-/// Two values parsed once, so each frame only mixes numbers and writes them.
 #[derive(Clone, Debug)]
 pub(crate) enum Lerp {
     Same(String),
-    /// `visibility`: the end values outside (0, 1), `visible` between them.
     Visible(String, String),
     List(Vec<Lerp>, &'static str),
     Function(String, Box<Lerp>),
     Color((u32, u8), (u32, u8)),
-    /// Two numbers and their unit, rounded to integers for `z-index` and `order`.
     Number(f64, f64, String, bool),
-    /// Two lengths in other units, mixed in `calc()`.
     Calc(String, String, bool),
 }
 
@@ -1985,7 +1924,6 @@ impl Lerp {
 
     fn write(&self, t: f64, out: &mut String) {
         use std::fmt::Write;
-        // Six significant digits, like browsers serialize animated values.
         let round = |value: f64, integer: bool| {
             if integer {
                 value.round().to_string()
@@ -2069,7 +2007,6 @@ fn time(value: &str) -> Option<f64> {
         .map(|value| value * scale)
 }
 
-/// The points `(input, output)` of a `linear()` easing, or `None` with fewer than two.
 fn linear_points(value: &str) -> Option<Rc<[(f64, f64)]>> {
     type Points = HashMap<String, Option<Rc<[(f64, f64)]>>>;
     thread_local! {
@@ -2102,7 +2039,6 @@ fn linear_points(value: &str) -> Option<Rc<[(f64, f64)]>> {
         );
     }
     let points = (stops.len() >= 2).then(|| {
-        // The first input defaults to 0, the last to 1, inputs never go back, and missing ones spread out evenly.
         stops[0].0.get_or_insert(0.);
         let last = stops.len() - 1;
         let mut largest = f64::MIN;
@@ -2151,7 +2087,6 @@ pub(crate) fn easing(value: &str, progress: f64) -> f64 {
             let Some(points) = linear_points(value) else {
                 return progress;
             };
-            // Inputs before the first point or after the last extend the first or last segment.
             let index = points
                 .iter()
                 .rposition(|point| point.0 <= progress)
@@ -2211,8 +2146,6 @@ pub(crate) fn easing(value: &str, progress: f64) -> f64 {
     let bezier = |t: f64, a: f64, b: f64| {
         3. * (1. - t) * (1. - t) * t * a + 3. * (1. - t) * t * t * b + t * t * t
     };
-    // Newton's method first and bisection when it stalls, both to 1e-7 like browsers, so a symmetric curve
-    // gives exactly 0.5 at its middle.
     let mut t = progress;
     for _ in 0..8 {
         let x = bezier(t, curve[0], curve[2]) - progress;
@@ -2621,8 +2554,6 @@ mod tests {
         );
     }
 
-    /// Runs a page like the view does: a frame at each requested wake, on the next 120 Hz
-    /// vsync. Returns the frames drawn in `seconds` and the wake delays.
     fn frames(html: &str, seconds: f64) -> (usize, Vec<Option<f64>>) {
         let doc = Document::parse(&format!(
             "<style>@keyframes spin{{to{{transform:rotate(360deg)}}}}@keyframes blink{{50%{{opacity:0}}}}@keyframes grow{{to{{width:10px}}}}@keyframes still{{to{{display:none}}}}@keyframes show{{to{{opacity:1}}}}</style>{html}"
@@ -2827,9 +2758,7 @@ mod tests {
         assert_eq!(easing("linear(0, 1)", 0.3), 0.3);
         assert!((easing("linear(0, 0.25 50%, 1)", 0.25) - 0.125).abs() < 1e-9);
         assert!((easing("linear(0, 0.25 50%, 1)", 0.75) - 0.625).abs() < 1e-9);
-        // `0.5` has no input, so it goes halfway between 0 and 40%.
         assert!((easing("linear(0, 0.5, 1 40%, 1)", 0.2) - 0.5).abs() < 1e-9);
-        // Two inputs hold the output, and inputs never go back.
         assert_eq!(easing("linear(0, 0.5 20% 60%, 1)", 0.4), 0.5);
         assert_eq!(easing("linear(0, 1 50%, 0.2 30%)", 0.5), 0.2);
         assert!((easing("linear(0, 1)", 1.5) - 1.5).abs() < 1e-9);
@@ -2861,7 +2790,6 @@ mod tests {
             (0., "opacity:0", "linear".into()),
             (1., "opacity:1", "linear".into()),
         ];
-        // Iterations start halfway, and every other one runs backwards.
         let alternate = new(
             &frames,
             [0., 0., 1., 3., 0.5],
@@ -2871,12 +2799,10 @@ mod tests {
         );
         assert_eq!(opacity(&alternate, 0.6), Some(0.9));
         assert_eq!(opacity(&alternate, 3.), None);
-        // A negative end delay cuts the active interval, where a finished animation holds its time.
         let cut = new(&frames, [0.2, -0.5, 1., 1., 0.], "normal", "both", "linear");
         assert_eq!(opacity(&cut, 0.), Some(0.));
         assert_eq!(opacity(&cut, 0.5), Some(0.3));
         assert_eq!(opacity(&cut, 0.7), Some(0.5));
-        // The effect easing applies to the whole iteration and can overshoot the keyframes.
         let spring = new(
             &frames,
             [0., 0., 1., 1., 0.],
@@ -2885,7 +2811,6 @@ mod tests {
             "linear(0, 1.2 60%, 1)",
         );
         assert_eq!(opacity(&spring, 0.6), Some(1.2));
-        // A single keyframe animates from the element's own value.
         let single = new(
             &[(1., "opacity:1", "linear".into())],
             [0., 0., 1., 1., 0.],
@@ -2894,7 +2819,6 @@ mod tests {
             "linear",
         );
         assert_eq!(opacity(&single, 0.5), Some(0.75));
-        // Motion keeps the clock between updates, and paused animations never wake the view.
         let mut motion = Motion::default();
         motion.script(
             id,
@@ -2996,10 +2920,8 @@ mod tests {
             false,
             &mut events,
         );
-        // Unregistered custom properties switch halfway.
         let own = animated.iter().find(|(id, ..)| *id == div).unwrap();
         assert_eq!(own.1.get(Prop::new("--x")), Some("b"));
-        // `::before` animates its own style, and its host draws again.
         let pair = &motion.pseudos.iter().find(|(id, _)| *id == p).unwrap().1;
         assert_eq!(pair[0].get(Prop::OPACITY), Some("0.5"));
         assert!(animated.iter().any(|(id, ..)| *id == p));

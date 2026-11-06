@@ -27,7 +27,6 @@ pub(super) fn paint_text(
 ) {
     let smoothing = window.font_smoothing();
     let shift = |row: usize| rows.get(row).map_or(px(0.), |row| row.shift);
-    // Justified rows widen each space by the row gap.
     let justify = |row: usize, index: usize| {
         rows.get(row)
             .filter(|row| row.gap > px(0.))
@@ -46,8 +45,6 @@ pub(super) fn paint_text(
             ),
         ),
         |window| {
-            // The strut sets the baseline, so fallback fonts (emoji) and larger first-letter or
-            // first-line runs don't move it. Taller runs move their row down with `drop`.
             let baseline = window.text_system().baseline(
                 strut,
                 line.font_size,
@@ -72,7 +69,7 @@ pub(super) fn paint_text(
             let mut first_run = (0, 0);
             for (row, boundary) in wraps.iter().map(Some).chain([None]).enumerate() {
                 let (end, right) = boundary.map_or((line.len, line.width), |boundary| {
-                    let glyph = &line.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    let glyph = &line.runs[boundary.run_index].glyphs[boundary.glyph_index];
                     (glyph.index, glyph.position.x)
                 });
                 if !shown(row) {
@@ -172,22 +169,27 @@ pub(super) fn paint_text(
             };
             let (mut left, from) = match wrap.checked_sub(1).map(|row| wraps[row]) {
                 Some(at) => (
-                    line.runs[at.run_ix].glyphs[at.glyph_ix].position.x,
-                    (at.run_ix, at.glyph_ix),
+                    line.runs[at.run_index].glyphs[at.glyph_index].position.x,
+                    (at.run_index, at.glyph_index),
                 ),
                 None => (px(0.), (0, 0)),
             };
-            let mut run_index = 0;
+            let mut text_run = 0;
             let mut run_end = runs.first().map_or(0, |run| run.len);
             let mut spaced = (usize::MAX, 0, 0.);
-            'rows: for (run_ix, run) in line.runs.iter().enumerate().skip(from.0) {
+            'rows: for (run_index, run) in line.runs.iter().enumerate().skip(from.0) {
                 let glyph_size = window
                     .text_system()
                     .bounding_box(run.font_id, run.font_size)
                     .size;
-                let skip = if run_ix == from.0 { from.1 } else { 0 };
-                for (glyph_ix, glyph) in run.glyphs.iter().enumerate().skip(skip) {
-                    if wraps.get(wrap) == Some(&renderer::WrapBoundary { run_ix, glyph_ix }) {
+                let skip = if run_index == from.0 { from.1 } else { 0 };
+                for (glyph_index, glyph) in run.glyphs.iter().enumerate().skip(skip) {
+                    if wraps.get(wrap)
+                        == Some(&renderer::WrapBoundary {
+                            run_index,
+                            glyph_index,
+                        })
+                    {
                         wrap += 1;
                         left = glyph.position.x;
                     }
@@ -195,16 +197,16 @@ pub(super) fn paint_text(
                         break 'rows;
                     }
                     let index = offset + glyph.index;
-                    while index >= run_end && run_index + 1 < runs.len() {
-                        run_index += 1;
-                        run_end += runs[run_index].len;
+                    while index >= run_end && text_run + 1 < runs.len() {
+                        text_run += 1;
+                        run_end += runs[text_run].len;
                     }
                     let color = ink.unwrap_or_else(|| {
                         highlights
                             .iter()
                             .find(|highlight| highlight.range.contains(&index))
                             .and_then(|highlight| highlight.color)
-                            .unwrap_or(runs[run_index].color)
+                            .unwrap_or(runs[text_run].color)
                     });
                     if color.a == 0. {
                         continue;
@@ -251,9 +253,6 @@ pub(super) fn spaces(text: &str) -> f32 {
     text.bytes().filter(|byte| *byte == b' ').count() as f32
 }
 
-/// How much space each row needs above and below the paragraph's strut, like Chrome's line boxes: every
-/// run's font sits centered in its own line height, in device pixels. Like browsers, fallback fonts (emoji)
-/// count only with `line-height: normal`; other heights center the run's own font.
 fn row_extents<'a>(
     lines: impl IntoIterator<Item = &'a renderer::WrappedLineLayout>,
     runs: &[renderer::TextRun],
@@ -284,7 +283,7 @@ fn row_extents<'a>(
         let ends: Vec<usize> = line
             .wrap_boundaries
             .iter()
-            .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .map(|boundary| layout.runs[boundary.run_index].glyphs[boundary.glyph_index].index)
             .collect();
         let first = rows.len();
         rows.resize(first + ends.len() + 1, root);
@@ -340,7 +339,6 @@ fn row_extents<'a>(
         .collect()
 }
 
-/// Whether node `id` repeats its padding and border on each of its rows.
 fn computed_clone(view: &super::PageState, id: usize) -> bool {
     view.host.borrow().dom.get(&view.id).is_some_and(|dom| {
         dom.computed.as_ref().is_some_and(|styles| {
@@ -365,11 +363,6 @@ pub(crate) fn text_position(
     Some(position)
 }
 
-/// Where an inline element's text starts and ends, and the top and height of its content area in a row:
-/// its font's ascent and descent around the paragraph's baseline, like Chrome. A range that starts at a
-/// wrap starts on the next row.
-/// Where the text from `index` starts. The end of a row and the start of the next share an index, which
-/// `text_position` gives as the end of the row.
 fn text_start(
     layout: &renderer::TextLayout,
     text: &str,
@@ -393,8 +386,6 @@ fn text_start(
     }))
 }
 
-/// The boxes of the text from `start` to `end`, one per row, as tall as the font in `font`: its top in the
-/// row and its height.
 pub(crate) fn text_rects(
     layout: &renderer::TextLayout,
     text: &str,
@@ -422,7 +413,8 @@ pub(crate) fn text_rects(
         for boundary in &line.wrap_boundaries {
             starts.push(
                 offset
-                    + line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index,
+                    + line.unwrapped_layout.runs[boundary.run_index].glyphs[boundary.glyph_index]
+                        .index,
             );
         }
         offset += line.len() + 1;
@@ -482,7 +474,6 @@ pub(crate) fn text_index(
     mut position: Point<Pixels>,
 ) -> Result<usize, usize> {
     let (top, line_height) = (layout.bounds().top(), layout.line_height());
-    // Rows move down by their drop, so the row is the last one that starts above the point.
     let row = rows
         .iter()
         .enumerate()
@@ -497,7 +488,6 @@ pub(crate) fn text_index(
         .max(top + line_height * row as f32)
         .min(top + line_height * (row as f32 + 1.) - px(0.01));
     if placed.gap > px(0.) {
-        // Justified rows: pick the closest character boundary of the row.
         let end = rows.get(row + 1).map_or(text.len(), |next| next.start);
         return (placed.start..=end)
             .filter(|&index| text.is_char_boundary(index))
@@ -540,7 +530,7 @@ fn first_line(
         .and_then(|lines| {
             let line = lines.first()?;
             let boundary = line.wrap_boundaries.first()?;
-            Some(line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            Some(line.unwrapped_layout.runs[boundary.run_index].glyphs[boundary.glyph_index].index)
         })
         .unwrap_or(len);
     if let Some(mode) = mode {
@@ -555,28 +545,20 @@ fn first_line(
 pub(super) struct InlineText {
     pub(super) data: Rc<style::InlineText>,
     pub(super) view: Rc<super::PageState>,
-    /// The size each atomic box of `data` had in the last layout, and where this one places it.
     pub(super) atoms: Rc<[AtomSlot]>,
-    /// For justified text, whether the last row is justified too.
     pub(super) justify: Option<bool>,
-    /// For text measured here, the lines shaped at the snapped width and their runs.
     pub(super) shaped: std::cell::RefCell<Option<(renderer::TextLayout, Vec<renderer::TextRun>)>>,
-    /// The hitboxes of cursors and the rows, from prepaint.
     pub(super) prepainted: std::cell::RefCell<(
         Vec<(renderer::Hitbox, renderer::CursorStyle)>,
         crate::dom::Rows,
     )>,
 }
 
-/// An atomic inline box of a paragraph.
 pub(super) struct AtomSlot {
-    /// Width, height and baseline.
     pub(super) size: [f32; 3],
     pub(super) at: std::cell::Cell<Point<Pixels>>,
 }
 
-/// The box around an atomic inline box, which moves it to its place in the text. It reports a size that
-/// the text didn't reserve, and the next frame lays the text out again.
 pub(super) struct AtomBox {
     pub(super) slots: Rc<[AtomSlot]>,
     pub(super) index: usize,
@@ -619,7 +601,6 @@ impl renderer::Hooks for AtomBox {
     }
 }
 
-/// The runs with the room that the atomic boxes take.
 fn with_atoms(
     data: &style::InlineText,
     sizes: impl Fn(usize) -> f32,
@@ -632,17 +613,12 @@ fn with_atoms(
     }
 }
 
-/// What a measured paragraph depends on, with its last measurement. Equal inputs keep it.
 struct Measured {
     data: Rc<style::InlineText>,
-    /// The size of each atomic box.
     atoms: Box<[[f32; 3]]>,
-    /// The text style of the cached measurement.
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
-    /// The last measured wrap width and text width.
     measured: Rc<std::cell::Cell<[Pixels; 2]>>,
     cached: std::cell::Cell<Option<(Option<Pixels>, renderer::Size<Pixels>)>>,
-    /// The first and last baselines of the cached layout.
     baselines: std::cell::Cell<[Pixels; 2]>,
 }
 
@@ -769,7 +745,7 @@ impl renderer::Hooks for InlineText {
         let node_layout = cx.text_layout().cloned();
         let window = &mut *cx.window;
         if let Some(measured) = &measured {
-            // Bounds snap to device pixels and can be a little narrower than the measured
+            // WARNING: bounds snap to device pixels and can be a little narrower than the measured
             // wrap or text width, which must not wrap or truncate again.
             let wrap = measured
                 .get()
@@ -830,13 +806,15 @@ impl renderer::Hooks for InlineText {
                     let (right, end) = boundary.map_or(
                         (line.unwrapped_layout.width, line.unwrapped_layout.width),
                         |boundary| {
-                            let x = glyphs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x;
+                            let x = glyphs[boundary.run_index].glyphs[boundary.glyph_index]
+                                .position
+                                .x;
                             let previous = boundary
-                                .glyph_ix
+                                .glyph_index
                                 .checked_sub(1)
-                                .map(|glyph| &glyphs[boundary.run_ix].glyphs[glyph])
+                                .map(|glyph| &glyphs[boundary.run_index].glyphs[glyph])
                                 .or_else(|| {
-                                    let run = boundary.run_ix.checked_sub(1)?;
+                                    let run = boundary.run_index.checked_sub(1)?;
                                     glyphs[run].glyphs.last()
                                 });
                             let hanging = previous.filter(|glyph| {
@@ -845,11 +823,10 @@ impl renderer::Hooks for InlineText {
                             (x, hanging.map_or(x, |glyph| glyph.position.x))
                         },
                     );
-                    // The text indent only applies to the first row of the text.
                     let indent = if rows.is_empty() { indent } else { px(0.) };
                     let free = (bounds.size.width - indent - (end - left)).max(px(0.));
                     let next = boundary.map_or(offset + line.len(), |boundary| {
-                        offset + glyphs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+                        offset + glyphs[boundary.run_index].glyphs[boundary.glyph_index].index
                     });
                     let gaps = spaces(self.data.text.get(start..next).unwrap_or("").trim_end());
                     let justified = match self.justify {
@@ -885,8 +862,6 @@ impl renderer::Hooks for InlineText {
                 }
             }
         }
-        // A box's padding and border stay in the row where it starts, and a `box-decoration-break: clone`
-        // box repeats them in each row.
         for inline in &self.data.boxes {
             let (id, range) = &self.data.ranges[inline.index];
             if inline.lead == 0. || range.start == range.end {
@@ -946,7 +921,6 @@ impl renderer::Hooks for InlineText {
                 ))
             })
             .collect();
-        // Inline boxes are recorded in layout units like Chrome, not at the snapped bounds.
         let shift = exact.origin - bounds.origin;
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
@@ -967,7 +941,6 @@ impl renderer::Hooks for InlineText {
                 window,
             ) {
                 let font = [top, height];
-                // The box of a node takes in its padding and border.
                 if let Some(inline) = boxed {
                     a.x -= px(inline.lead);
                     b.x = if inline.trail.is_nan() {
@@ -981,7 +954,6 @@ impl renderer::Hooks for InlineText {
                 let (left, width) = if a.y == b.y {
                     (a.x, b.x - a.x)
                 } else {
-                    // A box on several rows is the union of its pieces, which can overflow the text like Chrome's.
                     let spans = spans.get_or_insert_with(|| {
                         let mut spans = Vec::new();
                         let mut offset = 0;
@@ -996,10 +968,9 @@ impl renderer::Hooks for InlineText {
                                         offset + line.len(),
                                     ),
                                     |boundary| {
-                                        let glyph =
-                                            &glyphs[boundary.run_ix].glyphs[boundary.glyph_ix];
-                                        // A space before the break hangs outside the row.
-                                        let hanging = glyphs[..=boundary.run_ix]
+                                        let glyph = &glyphs[boundary.run_index].glyphs
+                                            [boundary.glyph_index];
+                                        let hanging = glyphs[..=boundary.run_index]
                                             .iter()
                                             .rev()
                                             .flat_map(|run| run.glyphs.iter().rev())
@@ -1209,7 +1180,6 @@ impl renderer::Hooks for InlineText {
                 let start = range.start + crate::dom::shown_index(source, text, *start);
                 let end = range.start + crate::dom::shown_index(source, text, *end);
                 if caret {
-                    // `auto` and `currentcolor` use the text color.
                     let ink = [Prop::CARET_COLOR, Prop::COLOR]
                         .into_iter()
                         .find_map(|prop| style::color(styles.values[*id].get(prop)?))
@@ -1278,7 +1248,6 @@ impl renderer::Hooks for InlineText {
                 }
             };
             if blur > 0. {
-                // The CSS blur radius is twice the gaussian deviation.
                 let effect = renderer::PaintEffect {
                     blur: px(blur / 2.),
                     ..Default::default()

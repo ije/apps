@@ -15,7 +15,6 @@ fn main() {
         if home.ends_with("Contents/MacOS") {
             home = home.parent().unwrap().join("Resources");
         }
-        // A built app passes all of its arguments to process.argv. Otherwise the arguments after `--` go there.
         let packaged = home.join("app.bundle").is_file() || home.join("app.js").is_file();
         // WARNING: like Electron, these flags come before the script and are not arguments of it.
         if std::env::var_os("ELECTRON_RUN_AS_NODE")

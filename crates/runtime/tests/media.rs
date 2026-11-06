@@ -1,4 +1,4 @@
-//! Media elements need FFmpeg from scripts/build-ffmpeg.sh. Without an audio output, audio keeps its time silently.
+// WARNING: media elements need FFmpeg from scripts/build-ffmpeg.sh. Without an audio output, audio keeps its time silently.
 
 use apps_runtime::{
     dom::Document,

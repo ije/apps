@@ -10,7 +10,6 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-/// A connection with its prepared statements, kept by SQL text.
 struct Database(
     *mut sql::sqlite3,
     RefCell<HashMap<String, *mut sql::sqlite3_stmt>>,
@@ -253,8 +252,8 @@ impl Database {
     }
 }
 
-/// Writes an IndexedDB key as bytes whose order is the key order: numbers, dates, strings, binary, then arrays.
-/// Strings and binary use Firefox's code unit encoding, which never starts a unit with 0, so 0 ends them.
+// WARNING: writes an IndexedDB key as bytes whose order is the key order: numbers, dates, strings, binary, then arrays.
+// Strings and binary use Firefox's code unit encoding, which never starts a unit with 0, so 0 ends them.
 fn encode_key(key: &Value, out: &mut Vec<u8>) -> Result<()> {
     let unit = |out: &mut Vec<u8>, unit: u32| {
         if unit < 0x7f {
@@ -364,7 +363,7 @@ fn decode_key(bytes: &[u8], at: &mut usize) -> Option<Value> {
     })
 }
 
-/// The stored form of an IndexedDB key: hex keeps the byte order in a TEXT column.
+// WARNING: the stored form of an IndexedDB key: hex keeps the byte order in a TEXT column.
 fn hex_key(wire: &str) -> Result<String> {
     let mut bytes = Vec::new();
     encode_key(&serde_json::from_str(wire)?, &mut bytes)?;
@@ -388,10 +387,8 @@ fn wire_key(hex: Option<String>) -> Value {
 }
 
 type SessionKey = (String, u64);
-/// The values of a window's session storage, with their total size in bytes.
 type Session = (usize, BTreeMap<String, String>);
 static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
-/// Contexts whose IndexedDB transaction found the database busy, woken when a write transaction ends.
 static WAITING: Mutex<Vec<crate::host::Waker>> = Mutex::new(Vec::new());
 // WARNING: SQLite doesn't wait for a connection that switches the journal mode, whatever the busy
 // timeout, and each window opens its databases on its own thread.
@@ -411,11 +408,9 @@ pub(crate) struct State {
     transactions: HashMap<u64, Transaction>,
     next_id: u64,
     idle: Vec<Database>,
-    /// localStorage keys in order, valid while the database's `data_version` matches.
     keys: Option<(Option<String>, Vec<String>)>,
 }
 
-/// Drops the session storage of a closed window.
 pub(crate) fn forget(window: u64) {
     if let Some(sessions) = SESSIONS.get()
         && let Ok(mut sessions) = sessions.lock()

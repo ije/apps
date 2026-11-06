@@ -1,5 +1,3 @@
-//! CPU, memory and GPU use of this process, read on a thread of its own.
-
 use std::{
     collections::VecDeque,
     sync::{Mutex, mpsc},
@@ -7,20 +5,15 @@ use std::{
 };
 
 const INTERVAL: Duration = Duration::from_millis(500);
-/// Rates are averaged over this window, so they don't change at every reading.
 const WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 pub struct Usage {
-    /// Percent of one core.
     pub cpu: f32,
-    /// The memory the process owns, like Activity Monitor's Memory column.
     pub memory: u64,
-    /// Percent of GPU time, where the platform reports it per process.
     pub gpu: Option<f32>,
 }
 
-/// Reads every half second into `usage` until the sender of `stop` is dropped.
 pub fn run(usage: &Mutex<Option<Usage>>, stop: &mpsc::Receiver<()>) {
     let mut history = VecDeque::<(Instant, Duration, Option<Duration>)>::new();
     loop {
@@ -78,8 +71,6 @@ fn cpu_time() -> Option<Duration> {
     ))
 }
 
-/// `ri_phys_footprint`, the dirty and compressed memory of the process. Unlike the resident size, it leaves
-/// out the shared pages of system frameworks.
 #[cfg(target_os = "macos")]
 fn memory() -> Option<u64> {
     let mut info = unsafe { std::mem::zeroed::<libc::rusage_info_v2>() };
@@ -93,7 +84,6 @@ fn memory() -> Option<u64> {
     (status == 0).then_some(info.ri_phys_footprint)
 }
 
-/// `RssAnon`: the heap, stacks and private mappings, without mapped files.
 #[cfg(target_os = "linux")]
 fn memory() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -110,7 +100,6 @@ fn memory() -> Option<u64> {
     )
 }
 
-/// `PrivateUsage`, the commit size in Task Manager.
 #[cfg(windows)]
 fn memory() -> Option<u64> {
     use windows::Win32::System::{
@@ -131,8 +120,6 @@ fn memory() -> Option<u64> {
     .then_some(counters.PrivateUsage as u64)
 }
 
-/// The GPU time of this process: `accumulatedGPUTime` of the accelerator clients it created, which is what
-/// Activity Monitor shows. Intel Macs don't report it.
 #[cfg(target_os = "macos")]
 fn gpu_time() -> Option<Duration> {
     use core_foundation::{
@@ -247,7 +234,6 @@ fn gpu_time() -> Option<Duration> {
     None
 }
 
-/// One refresh of the screen with the key window.
 #[cfg(target_os = "macos")]
 pub fn refresh_period() -> Option<f32> {
     let rate = objc2_app_kit::NSScreen::mainScreen(objc2::MainThreadMarker::new()?)?

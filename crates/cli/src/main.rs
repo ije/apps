@@ -157,7 +157,6 @@ fn run_cli() -> Result<i32> {
     };
     match command.as_str() {
         "run" => {
-            // Port 0 picks a free port once, so `--watch` restarts keep it.
             let mcp = match (mcp, mcp_port) {
                 (false, _) => None,
                 (true, 0) => Some(

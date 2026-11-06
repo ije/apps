@@ -5,7 +5,6 @@ use super::{
 use crate::{Bounds, Half, Pixels, Point, Window, black, fill, point, px, size};
 use std::{ops::Range, rc::Rc};
 
-// Leaves room below the underline for its stroke while keeping it below the baseline.
 const UNDERLINE_DESCENT_OFFSET_FACTOR: f32 = 0.618;
 
 pub fn underline_y_offset(line_height: Pixels, ascent: Pixels, descent: Pixels) -> Pixels {
@@ -179,16 +178,21 @@ fn paint_line(line: LinePaint, window: &mut Window) {
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
-        for (run_ix, run) in layout.runs.iter().enumerate() {
+        for (run_index, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, run.font_size).size;
 
-            for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+            for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
-                if glyph_ix == 0 && run_ix == 0 {
+                if glyph_index == 0 && run_index == 0 {
                     first_glyph_x = glyph_origin.x;
                 }
 
-                if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
+                if wraps.peek()
+                    == Some(&&WrapBoundary {
+                        run_index,
+                        glyph_index,
+                    })
+                {
                     wraps.next();
                     if let Some((underline_origin, underline_style, underline_range)) =
                         current_underline.as_mut()
@@ -247,7 +251,6 @@ fn paint_line(line: LinePaint, window: &mut Window) {
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
-                    // ignore style runs that apply to a partial glyph
                     while let Some(run) = style_run {
                         if glyph.index < run_end + (run.len as usize) {
                             break;
@@ -371,8 +374,8 @@ fn paint_line(line: LinePaint, window: &mut Window) {
 
         let mut last_line_end_x = first_glyph_x + layout.width;
         if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
+            let run = &layout.runs[boundary.run_index];
+            let glyph = &run.glyphs[boundary.glyph_index];
             last_line_end_x -= glyph.position.x;
         }
 
@@ -441,13 +444,18 @@ fn paint_line_background(line: LinePaint, window: &mut Window) {
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
-        for (run_ix, run) in layout.runs.iter().enumerate() {
+        for (run_index, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, run.font_size).size;
 
-            for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+            for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
 
-                if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
+                if wraps.peek()
+                    == Some(&&WrapBoundary {
+                        run_index,
+                        glyph_index,
+                    })
+                {
                     wraps.next();
                     if let Some((background_origin, background_color)) = current_background.as_mut()
                     {
@@ -485,7 +493,6 @@ fn paint_line_background(line: LinePaint, window: &mut Window) {
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
-                    // ignore style runs that apply to a partial glyph
                     while let Some(run) = style_run {
                         if glyph.index < run_end + (run.len as usize) {
                             break;
@@ -531,8 +538,8 @@ fn paint_line_background(line: LinePaint, window: &mut Window) {
 
         let mut last_line_end_x = origin.x + layout.width;
         if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
+            let run = &layout.runs[boundary.run_index];
+            let glyph = &run.glyphs[boundary.glyph_index];
             last_line_end_x -= glyph.position.x;
         }
 
@@ -575,7 +582,7 @@ fn line_paint_bounds(
     let row_ends = wrap_boundaries
         .iter()
         .map(|boundary| {
-            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+            layout.runs[boundary.run_index].glyphs[boundary.glyph_index]
                 .position
                 .x
         })
@@ -604,8 +611,12 @@ fn aligned_origin_x(
     layout: &LineLayout,
     wrap_boundary: Option<&&WrapBoundary>,
 ) -> Pixels {
-    let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
-        layout.runs[*run_ix].glyphs[*glyph_ix].position.x
+    let end_of_line = if let Some(WrapBoundary {
+        run_index,
+        glyph_index,
+    }) = wrap_boundary
+    {
+        layout.runs[*run_index].glyphs[*glyph_index].position.x
     } else {
         layout.width
     };

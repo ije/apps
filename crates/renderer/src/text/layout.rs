@@ -16,7 +16,6 @@ pub struct LineLayout {
     pub ascent: Pixels,
     pub descent: Pixels,
     pub runs: Vec<ShapedRun>,
-    /// In UTF-8 bytes.
     pub len: usize,
 }
 
@@ -31,10 +30,8 @@ pub struct ShapedRun {
 pub struct ShapedGlyph {
     pub id: GlyphId,
 
-    /// Relative to the line.
     pub position: Point<Pixels>,
 
-    /// The UTF-8 byte index of the glyph's text.
     pub index: usize,
 
     pub is_emoji: bool,
@@ -56,7 +53,6 @@ impl LineLayout {
         }
     }
 
-    /// The character boundary closest to `x`, like for up and down arrow keys.
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
         let mut prev_index = 0;
         let mut prev_x = px(0.);
@@ -97,6 +93,7 @@ impl LineLayout {
         self.width
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_wrap_boundaries(
         &self,
         text: &str,
@@ -110,16 +107,15 @@ impl LineLayout {
         let inside = |index: usize| nowrap.iter().any(|range| range.contains(&index));
         let mut prev_index = 0;
         let mut boundaries = Vec::new();
-        // Break opportunities for `wrap`: the boundary, its x, and the x where the words before it end.
         let constrain = wrap != TextWrap::Wrap && max_lines.is_none();
         let mut breaks = Vec::new();
         let mut words_end = 0.;
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
+        let mut first_non_whitespace_index = None;
+        let mut last_candidate_index = None;
         let mut last_candidate_x = px(0.);
         let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
+            run_index: 0,
+            glyph_index: 0,
         };
         let mut last_boundary_x = px(0.);
         let (mut prev_ch, mut hyphen_after) = ('\0', false);
@@ -127,16 +123,22 @@ impl LineLayout {
             .runs
             .iter()
             .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                        glyph.index,
-                    )
-                })
+            .flat_map(move |(run_index, run)| {
+                run.glyphs
+                    .iter()
+                    .enumerate()
+                    .map(move |(glyph_index, glyph)| {
+                        let character = text[glyph.index..].chars().next().unwrap();
+                        (
+                            WrapBoundary {
+                                run_index,
+                                glyph_index,
+                            },
+                            character,
+                            glyph.position.x,
+                            glyph.index,
+                        )
+                    })
             })
             .peekable();
 
@@ -147,26 +149,24 @@ impl LineLayout {
             let joined = !nowrap.is_empty() && inside(index) && inside(prev_index);
             prev_index = index;
 
-            if first_non_whitespace_ix.is_some()
+            if first_non_whitespace_index.is_some()
                 && ch != ' '
                 && !joined
                 && (prev_ch == ' '
-                    // An object in the text, like an inline box, can break on both sides.
                     || prev_ch == '\u{fffc}'
                     || !is_word_char(ch)
                     || word_break == WordBreak::BreakAll
-                    // UAX #14: a hyphen inside a word breaks after it, but not before a digit.
                     || hyphen_after && ch.is_alphabetic())
             {
-                last_candidate_ix = Some(boundary);
+                last_candidate_index = Some(boundary);
                 last_candidate_x = x;
                 if constrain {
                     breaks.push((boundary, x.0, words_end));
                 }
             }
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
+            if ch != ' ' && first_non_whitespace_index.is_none() {
+                first_non_whitespace_index = Some(boundary);
             }
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x, _)| *x);
@@ -174,18 +174,16 @@ impl LineLayout {
                 words_end = next_x.0;
             }
             let width = next_x - last_boundary_x;
-            // The first line is shortened by the text indent.
             let available = if boundaries.is_empty() {
                 wrap_width - indent
             } else {
                 wrap_width
             };
 
-            // Spaces at the end of a line hang, and float error must not wrap a line.
             if ch != ' '
                 && width > available + px(0.01)
                 && boundary > last_boundary
-                && (last_candidate_ix.is_some() || word_break != WordBreak::Normal && !joined)
+                && (last_candidate_index.is_some() || word_break != WordBreak::Normal && !joined)
             {
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -193,8 +191,8 @@ impl LineLayout {
                     break;
                 }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
+                if let Some(last_candidate_index) = last_candidate_index.take() {
+                    last_boundary = last_candidate_index;
                     last_boundary_x = last_candidate_x;
                 } else {
                     last_boundary = boundary;
@@ -209,14 +207,12 @@ impl LineLayout {
             return boundaries;
         }
 
-        // Like WebKit's `InlineContentConstrainer`: choose the breaks with the least summed
-        // raggedness `100 * |(width - ideal) / 15|^3`, where widths skip trailing spaces.
         breaks.insert(
             0,
             (
                 WrapBoundary {
-                    run_ix: 0,
-                    glyph_ix: 0,
+                    run_index: 0,
+                    glyph_index: 0,
                 },
                 0.,
                 0.,
@@ -240,7 +236,6 @@ impl LineLayout {
             lines.push(index);
         }
         lines.push(n - 1);
-        // Balance keeps the line count up to 12 lines, like WebKit.
         let count = lines.len() - 1;
         let exact = wrap == TextWrap::Balance && count <= 12;
         let ideal = match wrap {
@@ -266,7 +261,6 @@ impl LineLayout {
             while start < i && width(start, i) > max {
                 start += 1;
             }
-            // WebKit: when no line can start at a reached break, the next line is filled greedily.
             if wrap == TextWrap::Pretty && start > last_valid {
                 let end = (last_valid + 2..n)
                     .take_while(|&end| width(last_valid, end) <= max)
@@ -279,7 +273,6 @@ impl LineLayout {
             }
             for from in start..i {
                 let line_width = width(from, i);
-                // Pretty lines must stay within 45px of the ideal width, except near the end.
                 let line =
                     if wrap == TextWrap::Pretty && i + 5 < n && (line_width - ideal).abs() > 45. {
                         f32::INFINITY
@@ -325,15 +318,13 @@ pub struct WrappedLineLayout {
     pub wrap_width: Option<Pixels>,
 }
 
-/// The glyph that starts a wrapped line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WrapBoundary {
-    pub run_ix: usize,
-    pub glyph_ix: usize,
+    pub run_index: usize,
+    pub glyph_index: usize,
 }
 
 impl WrappedLineLayout {
-    /// In UTF-8 bytes.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.unwrapped_layout.len
@@ -357,43 +348,42 @@ impl WrappedLineLayout {
         position: Point<Pixels>,
         line_height: Pixels,
     ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, false)
+        self.find_index_for_position(position, line_height, false)
     }
 
-    /// Like [`Self::index_for_position`], but returns the nearest character boundary.
     pub fn closest_index_for_position(
         &self,
         position: Point<Pixels>,
         line_height: Pixels,
     ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, true)
+        self.find_index_for_position(position, line_height, true)
     }
 
-    fn _index_for_position(
+    fn find_index_for_position(
         &self,
         position: Point<Pixels>,
         line_height: Pixels,
         closest: bool,
     ) -> Result<usize, usize> {
-        let wrapped_line_ix = (position.y / line_height) as usize;
+        let wrapped_line_index = (position.y / line_height) as usize;
 
-        let (wrapped_line_start_index, wrapped_line_start_x) = if wrapped_line_ix > 0 {
-            let Some(line_start_boundary) = self.wrap_boundaries.get(wrapped_line_ix - 1) else {
+        let (wrapped_line_start_index, wrapped_line_start_x) = if wrapped_line_index > 0 {
+            let Some(line_start_boundary) = self.wrap_boundaries.get(wrapped_line_index - 1) else {
                 return Err(0);
             };
-            let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
-            let glyph = &run.glyphs[line_start_boundary.glyph_ix];
+            let run = &self.unwrapped_layout.runs[line_start_boundary.run_index];
+            let glyph = &run.glyphs[line_start_boundary.glyph_index];
             (glyph.index, glyph.position.x)
         } else {
             (0, Pixels::ZERO)
         };
 
         let (wrapped_line_end_index, wrapped_line_end_x) =
-            if wrapped_line_ix < self.wrap_boundaries.len() {
-                let next_wrap_boundary_ix = wrapped_line_ix;
-                let next_wrap_boundary = self.wrap_boundaries[next_wrap_boundary_ix];
-                let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
-                let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
+            if wrapped_line_index < self.wrap_boundaries.len() {
+                let next_wrap_boundary_index = wrapped_line_index;
+                let next_wrap_boundary = self.wrap_boundaries[next_wrap_boundary_index];
+                let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_index];
+                let glyph = &run.glyphs[next_wrap_boundary.glyph_index];
                 (glyph.index, glyph.position.x)
             } else {
                 (self.unwrapped_layout.len, self.unwrapped_layout.width)
@@ -411,7 +401,7 @@ impl WrappedLineLayout {
                     .unwrapped_layout
                     .closest_index_for_x(position_in_unwrapped_line.x))
             } else {
-                // The shaper can place a trailing zero-width wrap boundary glyph slightly past
+                // WARNING: the shaper can place a trailing zero-width wrap boundary glyph slightly past
                 // the line's width, so the row can extend past where `index_for_x` has glyphs.
                 self.unwrapped_layout
                     .index_for_x(position_in_unwrapped_line.x)
@@ -420,32 +410,30 @@ impl WrappedLineLayout {
         }
     }
 
-    /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
-        let mut line_start_ix = 0;
+        let mut line_start_index = 0;
         let line_end_indices = self
             .wrap_boundaries
             .iter()
             .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
+                let run = &self.unwrapped_layout.runs[wrap_boundary.run_index];
+                let glyph = &run.glyphs[wrap_boundary.glyph_index];
                 glyph.index
             })
             .chain([self.len()])
             .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
-            if index < line_start_ix {
+        for (line_index, line_end_index) in line_end_indices {
+            let line_y = line_index as f32 * line_height;
+            if index < line_start_index {
                 break;
-            } else if index > line_end_ix {
-                line_start_ix = line_end_ix;
+            } else if index > line_end_index {
+                line_start_index = line_end_index;
                 continue;
             } else {
-                // The first row starts at zero, so the space before its first character counts.
-                let line_start_x = if ix == 0 {
+                let line_start_x = if line_index == 0 {
                     px(0.)
                 } else {
-                    self.unwrapped_layout.x_for_index(line_start_ix)
+                    self.unwrapped_layout.x_for_index(line_start_index)
                 };
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
                 return Some(point(x, line_y));
@@ -461,12 +449,9 @@ pub(crate) struct LineLayoutCache {
     state: RefCell<Lines>,
 }
 
-/// Lines unused for this many frames are dropped.
 const MAX_AGE: u32 = 60;
-/// Past this many bytes, only the lines of the last frame are kept.
 const MAX_BYTES: usize = 4 << 20;
 
-/// Layouts with the frame they were last used in and their size in bytes.
 type Entries<T> = FxHashMap<Rc<CacheKey>, (Rc<T>, Cell<u32>, usize)>;
 
 #[derive(Default)]
@@ -515,7 +500,6 @@ impl LineLayoutCache {
         *frame = current.wrapping_add(1);
     }
 
-    /// The wrapped layout and the text of the line.
     #[allow(clippy::too_many_arguments)]
     pub fn layout_wrapped_line(
         &self,
@@ -649,7 +633,7 @@ impl LineLayoutCache {
     }
 }
 
-// Combining marks, like Thai vowel signs or Arabic diacritics, are shaped at the x of their base
+// WARNING: combining marks, like Thai vowel signs or Arabic diacritics, are shaped at the x of their base
 // character, so they must not take a cell. A glyph less than half a cell past the last base is one.
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
@@ -675,7 +659,6 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     }
 }
 
-/// Adds the letter and word spacing of the runs to the glyph positions and the width.
 fn apply_spacing(layout: &mut LineLayout, text: &str, runs: &[FontRun]) {
     let mut ends = Vec::with_capacity(runs.len());
     let mut end = 0;
@@ -808,18 +791,29 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
     }
 }
 
-/// Whether a character joins the word before it, so lines don't break before it.
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
-        // Latin-1 Supplement, Latin Extended-A and B, Cyrillic.
         || matches!(c, '\u{00C0}'..='\u{024F}' | '\u{0400}'..='\u{04FF}')
-        // Latin Extended Additional, combining diacritical marks, Bengali.
         || matches!(c, '\u{1E00}'..='\u{1EFF}' | '\u{0300}'..='\u{036F}' | '\u{0980}'..='\u{09FF}')
-        // Punctuation that stays with the word: `a-b`, `I'm`, `100%`, `3.14`, trailing `,.:;`.
-        || matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';')
-        // Closing punctuation never starts a line (UAX #14 LB13).
+        || matches!(
+            c,
+            '-' | '_'
+                | '.'
+                | '\''
+                | '’'
+                | '‘'
+                | '$'
+                | '%'
+                | '@'
+                | '#'
+                | '^'
+                | '~'
+                | ','
+                | '='
+                | ':'
+                | ';'
+        )
         || matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…' | '⋯')
-        // Non-breaking glue.
         || matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
 }
 
@@ -828,7 +822,6 @@ mod tests {
     use super::*;
     use crate::{point, px};
 
-    // A layout with one 10px glyph per character.
     fn layout(text: &str) -> LineLayout {
         LineLayout {
             font_size: px(10.),
@@ -872,12 +865,12 @@ mod tests {
                     nowrap,
                 )
                 .iter()
-                .map(|boundary| boundary.glyph_ix)
+                .map(|boundary| boundary.glyph_index)
                 .collect()
         };
         assert_eq!(breaks("ab\u{fffc}cd", &[]), [2, 3]);
         assert_eq!(breaks("ab cd ef", &[]), [3, 6]);
-        assert_eq!(breaks("ab cd ef", &[0..5]), [6]);
+        assert_eq!(breaks("ab cd ef", std::slice::from_ref(&(0..5))), [6]);
     }
 
     #[test]
@@ -894,14 +887,13 @@ mod tests {
         );
         let found: Vec<_> = boundaries
             .iter()
-            .map(|boundary| boundary.glyph_ix)
+            .map(|boundary| boundary.glyph_index)
             .collect();
         assert_eq!(found, [3, 6, 11]);
     }
 
     #[test]
     fn balance_and_pretty_even_out_lines() {
-        // Nine 40px words with 10px spaces, in a 200px line.
         let text = ["aaaa"; 9].join(" ");
         let layout = layout(&text);
         for (wrap, starts) in [
@@ -920,7 +912,7 @@ mod tests {
             );
             let found: Vec<_> = boundaries
                 .iter()
-                .map(|boundary| boundary.glyph_ix)
+                .map(|boundary| boundary.glyph_index)
                 .collect();
             assert_eq!(found, starts, "{wrap:?}");
         }

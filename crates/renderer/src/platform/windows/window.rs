@@ -37,41 +37,32 @@ use windows::{
 
 static CLASS: AtomicU16 = AtomicU16::new(0);
 
-/// The input state of a window.
 struct State {
     renderer: Renderer,
     keys: events::KeyState,
-    /// The last press: button, time, position and click count.
     click: (MouseButton, Instant, POINT, usize),
-    /// A pending high surrogate of `WM_CHAR`.
     surrogate: Option<u16>,
 }
 
 struct Inner {
     hwnd: HWND,
     callbacks: Callbacks,
-    /// The title bar is drawn by the app, which extends the content to the top edge.
     hide_title_bar: bool,
     scale: Cell<f32>,
-    /// The app wants frames, also while the window is hidden or minimized.
     wants_frames: Cell<bool>,
     movable: Cell<bool>,
     closable: Cell<bool>,
-    /// The minimum and maximum content size; zero is no limit.
     limits: Cell<(Size<Pixels>, Size<Pixels>)>,
-    /// The style and frame to restore after fullscreen.
     fullscreen: Cell<Option<(isize, RECT)>>,
     size_move: Cell<bool>,
     resizing: Cell<bool>,
     hovered: Cell<bool>,
     position: Cell<Point<Pixels>>,
-    /// The non-client button that was pressed, clicked once it is released over it.
     nc_pressed: Cell<Option<u32>>,
     ime: Cell<bool>,
     state: RefCell<State>,
 }
 
-/// A native window and its swap chain.
 pub(crate) struct Window {
     inner: Rc<Inner>,
     atlas: Rc<DirectXAtlas>,
@@ -84,7 +75,6 @@ impl Window {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             if CLASS.load(Ordering::Relaxed) == 0 {
-                // The icon of a built app is its first resource.
                 let icon = LoadImageW(
                     Some(instance.into()),
                     PCWSTR(1 as _),
@@ -175,11 +165,10 @@ impl Window {
                     SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
                 );
             }
-            // Without this, a window without a title bar can keep the taskbar behind it.
+            // WARNING: without this, a window without a title bar can keep the taskbar behind it.
             let _ = SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1 as _)));
             DragAcceptFiles(hwnd, true);
             set_dark_mode(hwnd);
-            // The bounds are in points of the primary display, with the frame's top left at the origin.
             let scale = monitor_scale(MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY));
             let bounds = options.bounds.scale(scale);
             let [left, top, right, bottom] = if options.outer_size {
@@ -218,13 +207,11 @@ impl Window {
         logical_rect(client, self.inner.scale.get()).size
     }
 
-    /// Paints on each display refresh until a frame wants no more.
     pub fn request_frame(&self) {
         self.inner.wants_frames.set(true);
         start_frames(self.inner.hwnd);
     }
 
-    /// Draws once even when the window is hidden or covered, for captures.
     pub fn force_frame(&self) {
         let inner = Rc::downgrade(&self.inner);
         run_after(Duration::ZERO, move || {
@@ -412,7 +399,6 @@ impl Window {
                     let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
                     let _ = SetWindowDisplayAffinity(hwnd, affinity);
                 }
-                // An owned window stays above its owner.
                 WindowChange::Parent(parent, _) => {
                     let owner = match parent {
                         Some(rwh::RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
@@ -503,7 +489,7 @@ impl Window {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
             if GetForegroundWindow() != hwnd {
-                // Windows only lets a process that just got input take the foreground, so this
+                // WARNING: Windows only lets a process that just got input take the foreground, so this
                 // sends an Alt press.
                 let key = |flags| INPUT {
                     r#type: INPUT_KEYBOARD,
@@ -524,7 +510,6 @@ impl Window {
         }
     }
 
-    /// Resizes the content area.
     pub fn resize(&self, size: Size<Pixels>) {
         let size = size.scale(self.inner.scale.get());
         let [left, top, right, bottom] = frame_insets(self.inner.hwnd);
@@ -601,8 +586,6 @@ pub(super) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     unsafe { LoadCursorW(None, name) }.ok()
 }
 
-/// Sends a key down to the window before it is translated into characters. Returns whether the
-/// app handled it, so it types nothing.
 pub(super) fn key_down(msg: &MSG) -> bool {
     // SAFETY: only our windows have our class, whose user data is the window state.
     let inner = unsafe {
@@ -623,8 +606,6 @@ pub(super) fn key_down(msg: &MSG) -> bool {
     input.is_some_and(|input| inner.callbacks.input(input))
 }
 
-/// Draws when the app changed something, and stops frames once it wants no more. Returns
-/// `false` while the app is busy.
 fn frame(inner: &Inner) -> bool {
     match inner.callbacks.frame() {
         Some(more) => {
@@ -638,7 +619,6 @@ fn frame(inner: &Inner) -> bool {
     }
 }
 
-/// The frame around the content: left, top, right and bottom, in physical pixels.
 fn frame_insets(hwnd: HWND) -> [i32; 4] {
     let (mut frame, mut client, mut origin) = (RECT::default(), RECT::default(), POINT::default());
     // SAFETY: plain window queries.
@@ -655,7 +635,6 @@ fn frame_insets(hwnd: HWND) -> [i32; 4] {
     ]
 }
 
-/// The invisible resize border and padding of a frame.
 fn frame_thickness(hwnd: HWND) -> (i32, i32) {
     // SAFETY: plain metric queries.
     unsafe {
@@ -668,7 +647,6 @@ fn frame_thickness(hwnd: HWND) -> (i32, i32) {
     }
 }
 
-/// Matches the title bar to the system's dark mode.
 fn set_dark_mode(hwnd: HWND) {
     let (mut light, mut size) = (1u32, 4u32);
     // SAFETY: the value is a DWORD read into a local.
@@ -692,7 +670,6 @@ fn set_dark_mode(hwnd: HWND) {
     }
 }
 
-/// Places the IME windows at the caret.
 fn ime_position(inner: &Inner) {
     let callbacks = inner.callbacks;
     let Some(bounds) = callbacks
@@ -757,7 +734,6 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-/// Handles a window message, or returns `None` for the default handling.
 fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
     let hwnd = inner.hwnd;
     let callbacks = inner.callbacks;
@@ -825,11 +801,10 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
     // a borrow of the state.
     unsafe {
         match msg {
-            // A click on the title bar activates the window before the app sees the click.
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => {
                 if wparam.0 & 0xFFFF != WA_INACTIVE as usize {
-                    // Alt-tab can leave a stale Alt, since the key up went to another window.
+                    // WARNING: alt-tab can leave a stale Alt, since the key up went to another window.
                     if let Ok(mut state) = inner.state.try_borrow_mut() {
                         state.keys = events::KeyState::default();
                     }
@@ -879,7 +854,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 if inner.wants_frames.get() {
                     start_frames(hwnd);
                 }
-                // Drawn now, so a live resize shows content of the new size.
                 frame(inner);
                 Some(0)
             }
@@ -915,13 +889,11 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
             WM_NCCALCSIZE
                 if inner.hide_title_bar && inner.fullscreen.get().is_none() && wparam.0 != 0 =>
             {
-                // The default frame without its title bar.
                 let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
                 let top = (*params).rgrc[0].top;
                 let result = DefWindowProcW(hwnd, msg, wparam, lparam);
                 (*params).rgrc[0].top = top;
                 if IsZoomed(hwnd).as_bool() {
-                    // A maximized window reaches past the screen by its frame.
                     (*params).rgrc[0].top += frame_thickness(hwnd).1;
                 }
                 Some(result.0)
@@ -963,7 +935,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 if !inner.hide_title_bar {
                     return area.map(|area| area as isize);
                 }
-                // Without a title bar the default handling has no top resize edge.
+                // WARNING: without a title bar the default handling has no top resize edge.
                 let (frame_x, frame_y) = frame_thickness(hwnd);
                 let point = screen();
                 if has(WS_THICKFRAME)
@@ -989,7 +961,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                         if enabled {
                             let _ = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
                         } else {
-                            // The IME context is per thread, so only this window's composition ends.
+                            // WARNING: the IME context is per thread, so only this window's composition ends.
                             let context = ImmGetContext(hwnd);
                             if GetFocus() == hwnd && !context.is_invalid() {
                                 let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
@@ -1094,8 +1066,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 }));
                 Some((msg == WM_XBUTTONUP) as isize)
             }
-            // Windows moves the window from the title bar, zooms it on a double click and shows
-            // its menu on a right click.
             WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_NCRBUTTONDOWN | WM_NCMBUTTONDOWN
             | WM_NCLBUTTONUP | WM_NCRBUTTONUP | WM_NCMBUTTONUP
                 if wparam.0 as u32 == HTCAPTION =>
@@ -1114,7 +1084,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 })) {
                     return Some(0);
                 }
-                // The buttons act on release, as the default handling would.
                 let hit = wparam.0 as u32;
                 (button == MouseButton::Left && matches!(hit, HTMINBUTTON | HTMAXBUTTON | HTCLOSE))
                     .then(|| {
@@ -1196,7 +1165,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 if let Some(input) = input {
                     callbacks.input(input);
                 }
-                // Also keeps a released Alt from opening the window menu.
+                // WARNING: also keeps a released Alt from opening the window menu.
                 Some(0)
             }
             WM_CHAR => {
@@ -1236,7 +1205,6 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 }
                 let flags = lparam.0 as u32;
                 let result = if flags == 0 {
-                    // Some IMEs cancel the composition this way.
                     callbacks.replace_text_in_range(None, "");
                     Some(0)
                 } else {

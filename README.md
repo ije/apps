@@ -1,6 +1,6 @@
 # @pierre/apps
- 
-A tiny(small bundle), high performance, low memory usage and memory-safe electron alternative with compatible API design.
+
+A tiny, fast, memory-safe Electron alternative with a compatible API.
  
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps run --watch` / `-W`: Restart when the entry or its imports change. Watching is off by default.

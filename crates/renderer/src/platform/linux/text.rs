@@ -17,7 +17,6 @@ use swash::{
     zeno::{Format, Vector},
 };
 
-/// Fonts through fontdb, shaping through cosmic-text and glyphs through swash.
 pub(crate) struct TextSystem(RefCell<State>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -47,9 +46,7 @@ struct State {
     fonts: Fonts,
     scratch: ShapeBuffer,
     scale: ScaleContext,
-    /// Glyph images rendered to find their bounds, kept for the raster that usually follows.
     pending: FxHashMap<RenderGlyphParams, swash::scale::image::Image>,
-    /// Every face loaded so far, indexed by `FontId`.
     loaded: Vec<LoadedFont>,
     loaded_ids: FxHashMap<(fontdb::ID, FontKey), FontId>,
     families: FxHashMap<FontKey, Vec<FontId>>,
@@ -123,7 +120,6 @@ impl TextSystem {
                 ids
             }
         };
-        // The nearest weight, preferring the requested style.
         let italic = font.style != FontStyle::Normal;
         candidates
             .iter()
@@ -212,7 +208,6 @@ impl TextSystem {
         };
         if image.content != Content::Mask {
             let premultiplied = matches!(image.source, Source::ColorOutline(_));
-            // RGBA to straight-alpha BGRA. Color outlines are drawn premultiplied.
             for pixel in image.data.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
                 let alpha = pixel[3] as u32;
@@ -233,7 +228,7 @@ impl TextSystem {
             len: text.len(),
             ..Default::default()
         };
-        // Paragraph separators break cosmic-text lines, so each paragraph is shaped on its own.
+        // WARNING: paragraph separators break cosmic-text lines, so each paragraph is shaped on its own.
         let mut start = 0;
         if text
             .bytes()
@@ -253,7 +248,6 @@ impl TextSystem {
         layout
     }
 
-    /// Swash renders grayscale coverage without font smoothing, so no color needs extra weight.
     pub fn glyph_dilation_for_color(&self, _: Rgba) -> u8 {
         0
     }
@@ -327,8 +321,6 @@ impl State {
             .with_context(|| format!("unable to render glyph via swash for {params:?}"))
     }
 
-    /// The font id of a face cosmic-text fell back to, loading it first if needed. Its features
-    /// are empty, which only matters when it is passed back in as a font run.
     fn font_id_for_cosmic_id(&mut self, id: fontdb::ID) -> Option<FontId> {
         if let Some(index) = self.loaded.iter().position(|font| font.font.id() == id) {
             return Some(FontId(index));
@@ -377,7 +369,6 @@ impl State {
         let system = self.fonts.get();
         let line = ShapeLine::new(system, segment, &attrs, cosmic_text::Shaping::Advanced, 4);
         let mut lines = Vec::with_capacity(1);
-        // Lines are wrapped by the caller.
         line.layout_to_buffer(
             &mut self.scratch,
             f32::from(font_size),

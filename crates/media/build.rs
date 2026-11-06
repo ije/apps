@@ -42,7 +42,6 @@ fn main() {
     if os == "linux" {
         link("-Wl,-rpath,$ORIGIN".to_owned());
     }
-    // The library goes next to the media library in target/<profile> and in deps for tests.
     let profile = out.ancestors().nth(3).unwrap();
     let path = lib.join(name);
     for folder in [profile.to_owned(), profile.join("deps")] {

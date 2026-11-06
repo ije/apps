@@ -12,14 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A field's selection while focused, and the length of the text it drew.
 pub(super) type Caret = (Option<[usize; 2]>, usize);
 
-/// A caret's node, offset and text length, when it moved, and the timer of its next blink by phase.
 pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 
-/// Paints the caret of a collapsed selection. Like browsers, it shows for 500 ms after it moves,
-/// then blinks every 500 ms. Inactive windows and `caret-color: transparent` show no caret.
 pub(super) fn paint_caret(
     view: &PageState,
     key: [usize; 3],
@@ -48,22 +44,17 @@ pub(super) fn paint_caret(
     }
 }
 
-/// The text of an `input` or `textarea`: its value or placeholder, the selection and the caret. It
-/// scrolls its box to keep a moved caret in view, and records its layout for hit tests and IME.
 pub(super) struct FieldText {
     pub(super) id: usize,
     pub(super) view: Rc<PageState>,
     pub(super) text: Rc<str>,
-    /// The value of a password field, whose `text` shows a bullet for each code point.
     pub(super) password: Option<String>,
     pub(super) run: renderer::TextRun,
     pub(super) placeholder: bool,
     pub(super) single_line: bool,
     pub(super) caret: renderer::Rgba,
     pub(super) selection: (Option<u32>, u32),
-    /// The scroll position of the box that clips the text.
     pub(super) handle: renderer::ScrollHandle,
-    /// The selection while the field has focus, from prepaint.
     pub(super) selected: std::cell::Cell<Option<[usize; 2]>>,
 }
 
@@ -75,8 +66,6 @@ impl From<FieldText> for renderer::Child {
     }
 }
 
-/// The width a field with a percentage width adds to its parent's max-content size. Like Chrome's
-/// compressible controls, it adds nothing to the min-content size, and fills the field once its width is known.
 pub(super) fn natural_width(natural: Pixels) -> renderer::Node {
     renderer::node().measure(natural, |&natural, _, known, available, _| {
         let width = known.width.unwrap_or(match available.width {
@@ -98,7 +87,6 @@ impl renderer::Hooks for FieldText {
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        // An empty field shows its caret before the placeholder.
         let selected = dom
             .selection
             .get(&self.id)
@@ -121,7 +109,6 @@ impl renderer::Hooks for FieldText {
             );
         }
         drop(host);
-        // Like browsers, a moved caret scrolls into view, and a single-line field scrolls back when it loses focus.
         let state = (selected, self.text.len());
         if view.fields.borrow_mut().insert(self.id, state) != Some(state) {
             let (shown, old) = (self.handle.bounds(), self.handle.offset());
@@ -273,7 +260,6 @@ impl PageState {
         cx.defer(move |cx| Desktop::drive(runtime, cx));
     }
 
-    /// `dragenter`, `dragover` and `dragleave` of files dragged from other apps.
     fn drag_files(&self, kind: &str, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
         let names: Vec<_> = self
             .dropped
@@ -346,7 +332,6 @@ impl PageState {
     }
 }
 
-/// The edited value of field `id` when it is a password, whose layout shows bullets.
 fn password<'a>(
     host: &crate::host::Host,
     view: u64,
@@ -363,8 +348,7 @@ fn password<'a>(
 }
 
 impl PageView {
-    /// Asks the main side's `before-input-event`, and answers whether it prevented the key.
-    fn before_input(&self, kind: &str, event: &renderer::KeyDownEvent, _cx: &mut App) -> bool {
+    fn before_input(&self, kind: &str, event: &renderer::KeyDownEvent) -> bool {
         if !crate::desktop::link::INPUT_LISTENERS.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
@@ -449,7 +433,7 @@ impl renderer::View for PageView {
                     cx.stop_propagation();
                     return;
                 }
-                if self.before_input("keyDown", event, cx) {
+                if self.before_input("keyDown", event) {
                     cx.stop_propagation();
                     return;
                 }
@@ -466,7 +450,6 @@ impl renderer::View for PageView {
                     cx.stop_propagation();
                     return;
                 }
-                // Before the app menu exists, cmd-q still quits.
                 if cfg!(target_os = "macos")
                     && modifiers.platform
                     && !modifiers.control
@@ -507,7 +490,7 @@ impl renderer::View for PageView {
                     keystroke: event.keystroke.clone(),
                     is_held: false,
                 };
-                if self.before_input("keyUp", &held, cx) {
+                if self.before_input("keyUp", &held) {
                     return;
                 }
                 Desktop::dispatch(
@@ -631,15 +614,12 @@ impl renderer::View for PageView {
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let state = self.editing()?;
-        // The IME asks right after an edit, before the next frame lays out the new text.
+        // WARNING: the IME asks right after an edit, before the next frame lays out the new text.
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
         let password = password(&host, self.id, id, &state);
-        // A contenteditable host has no text layout itself, so the range starts in one of its text
-        // nodes: the caret's node when it starts at the caret (a line start is also the end of the
-        // line before), else the first node that reaches it.
         let caret = state["node"]
             .as_u64()
             .map(|node| node as usize)
@@ -670,7 +650,6 @@ impl renderer::View for PageView {
             }
             found.unwrap_or((id, range))
         };
-        // A field's text has a layout, so the range gets its own rectangle, where the IME shows its candidates.
         if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&node) {
             let content = &text[span.clone()];
             let [start, end] = [range.start, range.end].map(|index| {

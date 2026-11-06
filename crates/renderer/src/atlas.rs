@@ -10,10 +10,9 @@ use std::{
     cell::{Cell, RefCell},
 };
 
-/// Past this many glyph pixels, glyphs unused for `MAX_AGE` frames are dropped.
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
 const MAX_AGE: u32 = 60;
-/// Removed tiles are freed this many frames later, when no frame in flight reads them.
+// WARNING: removed tiles are freed this many frames later, when no frame in flight reads them.
 // WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
 // one to read a tile, is done before the frame after the free paints. More drawables need more.
 const IN_FLIGHT: u32 = 2;
@@ -22,7 +21,6 @@ pub(crate) const MIN_TEXTURE_SIDE: i32 = 1024;
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub(crate) enum AtlasKey {
     Glyph(RenderGlyphParams),
-    /// A [`crate::RenderImage`] by id.
     Image(u64),
 }
 
@@ -45,25 +43,20 @@ pub(crate) trait AtlasBackend {
     fn remove(&mut self, tile: AtlasTile);
 }
 
-/// A tile, `None` for a glyph without pixels, with the offset of its pixels from the glyph
-/// origin and the frame it was last used in.
 struct Entry {
     tile: Option<AtlasTile>,
     origin: Point<DevicePixels>,
     used: Cell<u32>,
 }
 
-/// Glyphs and images packed into GPU textures, by key.
 pub(crate) struct Atlas<B> {
     tiles: RefCell<FxHashMap<AtlasKey, Entry>>,
-    /// Removed tiles with the frame they were removed in.
     retired: RefCell<Vec<(u32, AtlasTile)>>,
     frame: Cell<u32>,
     glyph_pixels: Cell<usize>,
     pub(crate) backend: RefCell<B>,
 }
 
-/// The offset of a tile's pixels from the glyph origin, their size and bytes.
 pub(crate) type Raster<B> = (Point<DevicePixels>, Size<DevicePixels>, B);
 
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
@@ -83,7 +76,6 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
-    /// The tile and the offset of its pixels. `build` returns `None` for a glyph without pixels.
     pub fn get_or_insert_with(
         &self,
         key: &AtlasKey,
@@ -124,8 +116,6 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
-    /// Ends a frame, frees the removed tiles that no frame reads anymore, and drops the glyphs
-    /// unused for a while once there are too many.
     pub fn finish_frame(&self) {
         let frame = self.frame.replace(self.frame.get().wrapping_add(1));
         let mut retired = self.retired.borrow_mut();
@@ -160,8 +150,6 @@ impl<B: AtlasBackend> Atlas<B> {
         self.glyph_pixels.set(glyph_pixels);
     }
 
-    /// Frees the removed tiles now, for a renderer that stops drawing. `wait` returns once no
-    /// frame in flight reads them, and runs only when there are some.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn free_retired(&self, wait: impl FnOnce()) {
         let mut retired = self.retired.borrow_mut();
@@ -175,7 +163,6 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
-    /// Drops every tile, for a lost device.
     #[cfg(not(target_os = "macos"))]
     pub fn clear(&self, reset: impl FnOnce(&mut B)) {
         self.tiles.borrow_mut().clear();
@@ -185,11 +172,9 @@ impl<B: AtlasBackend> Atlas<B> {
     }
 }
 
-/// Textures of one kind, with slots of freed textures reused.
 pub(crate) struct TextureList<T> {
     pub textures: Vec<Option<T>>,
     pub free: Vec<usize>,
-    /// A texture whose tiles were all freed, kept for the next texture of its size.
     spare: Option<usize>,
 }
 
@@ -208,8 +193,6 @@ impl<T> TextureList<T> {
         self.textures.get(index)?.as_ref()
     }
 
-    /// Keeps the texture at `index`, which has no tiles left, and drops the one kept before if
-    /// it is still `empty`.
     pub fn emptied(&mut self, index: usize, empty: impl Fn(&T) -> bool) {
         if let Some(old) = self.spare.replace(index)
             && old != index
@@ -220,7 +203,6 @@ impl<T> TextureList<T> {
         }
     }
 
-    /// Drops the kept texture if it is still `empty`, for a renderer that stops drawing.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn trim(&mut self, empty: impl Fn(&T) -> bool) {
         if let Some(index) = self.spare.take()
@@ -246,7 +228,6 @@ impl<T> TextureList<T> {
     }
 }
 
-/// One atlas texture's space, packed by etagere.
 pub(crate) struct Packer {
     allocator: etagere::BucketedAtlasAllocator,
     size: Size<DevicePixels>,
@@ -269,9 +250,6 @@ impl Packer {
         self.live == 0
     }
 
-    /// The tile bounds and id, or `None` when the texture is full. An empty texture only takes
-    /// a tile that would get a new texture of its size, so a kept image texture is not filled
-    /// with glyphs.
     pub fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -295,7 +273,6 @@ impl Packer {
         ))
     }
 
-    /// Frees a tile and returns whether the texture is empty.
     pub fn free(&mut self, id: u32) -> bool {
         self.allocator.deallocate(etagere::AllocId::deserialize(id));
         self.live = self.live.saturating_sub(1);
@@ -308,7 +285,6 @@ mod tests {
     use super::*;
     use crate::scene::AtlasTextureId;
 
-    /// Packers in place of textures, counting the textures made and the tiles freed.
     #[derive(Default)]
     struct Fake {
         list: TextureList<Packer>,
@@ -381,13 +357,11 @@ mod tests {
                 .0;
             inserted.push(tile);
             atlas.finish_frame();
-            // A tile is freed only once the frames that drew it are done.
             let backend = atlas.backend.borrow();
             assert!(backend.freed.len() as u64 <= frame.saturating_sub(IN_FLIGHT as u64));
             assert_eq!(&backend.freed[..], &inserted[..backend.freed.len()]);
         }
         assert!(atlas.backend.borrow().made <= IN_FLIGHT as usize + 2);
-        // A small glyph does not land in the kept image texture.
         let glyph = Size::new(DevicePixels(10), DevicePixels(10));
         let tile = atlas
             .get_or_insert_with(&AtlasKey::Image(1000), &mut || {

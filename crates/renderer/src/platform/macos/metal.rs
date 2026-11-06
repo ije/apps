@@ -1,7 +1,7 @@
 use crate::{
     DevicePixels, Size,
     atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
-    frame::{Cmd, Globals, RenderFrame, Target, TextParams, bytes},
+    frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
 use anyhow::{Context as _, Result, ensure};
@@ -32,16 +32,11 @@ use std::{
 };
 
 const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
-// The smallest maximum texture size of the Metal GPU families on macOS.
 const MAX_TEXTURE_SIZE: u32 = 16384;
-/// Metal requires buffers to be bound at 256-byte aligned offsets.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MIN_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-/// After this many frames in a row that use at most a quarter of the instance buffer size, the
-/// size halves.
 const SHRINK_FRAMES: u32 = 120;
-/// Unused layer textures are kept this many frames, for layers that come back.
 const SPARE_FRAMES: u8 = 3;
 
 pub(crate) type MetalAtlas = Atlas<AtlasTextures>;
@@ -50,11 +45,9 @@ type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
-/// Instance buffers returned by finished frames, shared by every window.
 struct BufferPool {
     size: usize,
     buffers: Vec<(Buffer, usize)>,
-    /// Frames in a row whose instance data fit in a quarter of `size`.
     small: u32,
 }
 
@@ -76,7 +69,6 @@ impl BufferPool {
             return Ok(buffer);
         }
         let options = if unified {
-            // The CPU only writes these, which the write-combined cache speeds up.
             MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined
         } else {
             MTLResourceOptions::StorageModeManaged
@@ -87,7 +79,6 @@ impl BufferPool {
         Ok((buffer, self.size))
     }
 
-    /// Sets the buffer size and drops the pooled buffers of the old size.
     fn resize(&mut self, size: usize) {
         if size != self.size {
             self.size = size;
@@ -97,8 +88,6 @@ impl BufferPool {
     }
 }
 
-/// A drawn frame that shows where this value drops: on the main thread inside AppKit's transaction,
-/// or on the render thread when the main thread stopped waiting for it.
 pub(crate) struct Present(Option<super::Sendable<Box<dyn FnOnce()>>>);
 
 impl Drop for Present {
@@ -119,18 +108,13 @@ pub(crate) struct Renderer {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Pipelines,
     atlas: Rc<MetalAtlas>,
-    /// The offscreen layer textures with their size and the frames since they were last used.
     pool: Vec<(Texture, [u32; 2], u8)>,
-    /// The pool index of each layer texture of the frame.
     targets: Vec<usize>,
     frame: RenderFrame,
-    /// Effect layers that Core Animation plays in sublayers, see [`Self::promote`].
     promoted: Vec<Promoted>,
-    /// The sublayers changed, so the next frame presents in the Core Animation transaction.
     restacked: bool,
 }
 
-/// A recorded frame, and the drawables of the sublayers it draws.
 type Rendered = (
     Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     Vec<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
@@ -138,7 +122,6 @@ type Rendered = (
 
 struct Promoted {
     key: u64,
-    /// The scene layer.
     index: usize,
     sublayer: Retained<CAMetalLayer>,
     drawn: bool,
@@ -194,7 +177,7 @@ impl Pipelines {
             // SAFETY: index zero is within the color attachment array.
             let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
             attachment.setPixelFormat(FORMAT);
-            // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
+            // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
             let source = match blend {
                 Blend::Over => Some(MTLBlendFactor::SourceAlpha),
                 Blend::Premultiplied => Some(MTLBlendFactor::One),
@@ -225,7 +208,6 @@ impl Pipelines {
 
 impl Renderer {
     pub fn new(transparent: bool) -> Result<Self> {
-        // Prefer a low power GPU on Intel Macs. Apple silicon has one GPU.
         let device = MTLCopyAllDevices()
             .iter()
             .min_by_key(|device| (device.isRemovable(), !device.isLowPower()))
@@ -239,10 +221,8 @@ impl Renderer {
         layer.setPixelFormat(FORMAT);
         // WARNING: without a color space the display shows CSS colors in its own wider gamut, more saturated than browsers.
         layer.setColorspace(srgb.as_deref());
-        // An opaque layer can be shown directly by the display.
         layer.setOpaque(!transparent);
         layer.setMaximumDrawableCount(3);
-        // Backdrop filters, blend modes and captures read from the drawable.
         layer.setFramebufferOnly(false);
         layer.setAllowsNextDrawableTimeout(false);
         layer.setNeedsDisplayOnBoundsChange(true);
@@ -251,7 +231,6 @@ impl Renderer {
                 | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
         );
         let unified = device.hasUnifiedMemory();
-        // Apple GPUs can share atlas textures with the CPU.
         let shared = device.supportsFamily(MTLGPUFamily::Apple1);
         let queue = device.newCommandQueue().context("creating command queue")?;
         let atlas = Rc::new(Atlas::new(AtlasTextures {
@@ -278,12 +257,6 @@ impl Renderer {
         })
     }
 
-    /// Plays scene layer `index`, keyed `key`, in a sublayer over the window region `region` of
-    /// device pixels: `opacities` and, unless empty, `transforms` (column-major, in points of the
-    /// window, y down) every `step` seconds from now, holding the last ones. A new sublayer gets its
-    /// content with the next frame, which must present before the transaction ends: one frame for
-    /// all sublayers, since Core Animation may show any of the frames presented in it. Returns
-    /// whether the sublayer is new.
     #[allow(clippy::too_many_arguments)]
     pub fn promote(
         &mut self,
@@ -421,7 +394,6 @@ impl Renderer {
         fresh
     }
 
-    /// Takes the promoted layers back into the window frame, from the next frame on.
     pub fn demote(&mut self) {
         if self.promoted.is_empty() {
             return;
@@ -441,21 +413,18 @@ impl Renderer {
         &self.layer
     }
 
-    /// Sets the size of the next drawables. Only the thread that draws changes it, so a frame always
-    /// fits its scene.
+    // WARNING: sets the size of the next drawables. Only the thread that draws changes it, so a frame always
+    // fits its scene.
     pub fn set_drawable_size(&self, size: CGSize) {
         if self.layer.drawableSize() != size {
             self.layer.setDrawableSize(size);
         }
     }
 
-    /// The last frame drawn with [`Self::set_presents_with_transaction`].
     pub fn take_present(&mut self) -> Option<Present> {
         self.present.take()
     }
 
-    /// Keeps the next frame for [`Self::take_present`], so it can show in the Core Animation
-    /// transaction of the main thread and a live resize shows it in step with the window.
     pub fn set_presents_with_transaction(&mut self, on: bool) {
         self.presents_with_transaction = on;
     }
@@ -465,8 +434,6 @@ impl Renderer {
         self.layer.setOpaque(!transparent);
     }
 
-    /// Frees the layer textures the last frame did not use, the removed and kept atlas textures
-    /// and big instance buffers, for a window that stops drawing.
     pub fn trim(&mut self) {
         self.pool.retain(|(_, _, idle)| *idle == 0);
         // WARNING: command buffers of one queue complete in order, so an empty one waits for the frames in flight.
@@ -482,7 +449,6 @@ impl Renderer {
         POOL.with(|pool| pool.borrow_mut().resize(MIN_INSTANCE_BUFFER_SIZE));
     }
 
-    /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         let size = self.layer.drawableSize();
         if size.width < 1. || size.height < 1. {
@@ -802,40 +768,39 @@ impl Renderer {
             };
         }
         let pipelines = &self.pipelines;
-        for cmd in &frame.cmds {
-            match cmd {
-                // Tiles of one texture share its encoder, with their own globals.
-                Cmd::Pass(target, false)
+        for command in &frame.commands {
+            match command {
+                Command::Pass(target, false)
                     if let Some(encoder) = &encoder
                         && frame.texture(*target) == frame.texture(current.0) =>
                 {
                     set_globals(encoder, &frame.globals(*target, &text));
                     current = (*target, false);
                 }
-                // Targets are cleared right away, since a later pass may draw into them.
-                Cmd::Pass(target, clear) => {
+                // WARNING: targets are cleared right away, since a later pass may draw into them.
+                Command::Pass(target, clear) => {
                     end!();
                     current = (*target, *clear);
                     if *clear {
                         pass!();
                     }
                 }
-                Cmd::Quads(range) => draw(pass!(), &pipelines.quads, 0, range),
-                Cmd::Shadows(range) => draw(pass!(), &pipelines.shadows, 1, range),
-                Cmd::Underlines(range) => draw(pass!(), &pipelines.underlines, 2, range),
-                Cmd::Mono(id, range) => {
+                Command::Quads(range) => draw(pass!(), &pipelines.quads, 0, range),
+                Command::Shadows(range) => draw(pass!(), &pipelines.shadows, 1, range),
+                Command::Underlines(range) => draw(pass!(), &pipelines.underlines, 2, range),
+                Command::Mono(id, range) => {
                     let encoder = pass!();
                     if atlas(encoder, *id) {
                         draw(encoder, &pipelines.mono, 3, range);
                     }
                 }
-                Cmd::Poly(id, range) => {
+                Command::Poly(id, range) => {
                     let encoder = pass!();
                     if atlas(encoder, *id) {
                         draw(encoder, &pipelines.poly, 4, range);
                     }
                 }
-                Cmd::Blur { src, dst, index } => {
+                Command::Blur { src, dst, index } => {
                     end!();
                     let blur = begin(*dst, true)?;
                     // SAFETY: the layer textures live until the command buffer completes.
@@ -844,7 +809,7 @@ impl Renderer {
                     blur.endEncoding();
                     current.1 = false;
                 }
-                Cmd::Copy { src, dst, region } => {
+                Command::Copy { src, dst, region } => {
                     end!();
                     current.1 = false;
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
@@ -879,7 +844,7 @@ impl Renderer {
                     }
                     blit.endEncoding();
                 }
-                Cmd::Composite {
+                Command::Composite {
                     src,
                     mask,
                     backdrop,
@@ -935,7 +900,6 @@ struct Binding {
     offset: usize,
 }
 
-/// Packs a frame's instance data into pooled buffers.
 struct Writer {
     device: Device,
     pool: Rc<RefCell<BufferPool>>,
@@ -1028,7 +992,7 @@ impl Writer {
                 self.current.0.didModifyRange(NSRange::new(0, self.offset));
             }
         }
-        // Metal retains encoded buffers until the frame completes; only the last one is pooled.
+        // WARNING: Metal retains encoded buffers until the frame completes; only the last one is pooled.
         self.current
     }
 }

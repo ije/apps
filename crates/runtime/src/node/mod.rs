@@ -36,7 +36,7 @@ unsafe extern "system" {
     fn WaitForSingleObject(handle: std::os::windows::io::RawHandle, milliseconds: u32) -> u32;
 }
 
-/// Runs `done` on a thread after the child exits. The child stays unreaped for `try_wait`.
+// WARNING: runs `done` on a thread after the child exits. The child stays unreaped for `try_wait`.
 pub(crate) fn on_exit(child: Exit, done: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("apps-exit".into())
@@ -271,7 +271,6 @@ impl State {
                 let id = self.next;
                 let op = args[0].as_str().context("Expected operation")?.to_owned();
                 let payload = crate::jsc::payload::Payload::snapshot(args[1].take());
-                // Slow work uses its own pool so it cannot stall queued file operations.
                 let slow = matches!(
                     op.as_str(),
                     "lookup" | "resolve" | "zlib" | "pbkdf2" | "scrypt" | "hkdf"

@@ -619,7 +619,6 @@ fn hit_testing_takes_the_box_painted_last() {
         ]) {
             dom.bounds.insert(id, bounds);
         }
-        // The panel comes first in the tree but paints last, like a z-index layer.
         dom.painted = vec![0; ids.iter().max().unwrap() + 1];
         for (order, id) in [ids[0], ids[3], ids[4], ids[1], ids[2]]
             .into_iter()
@@ -1267,7 +1266,6 @@ fn bitmaps_free_their_pixels() {
     assert_eq!(result, "ok");
     let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
     assert!(!host.borrow().dom[&1].canvases.contains_key(&id));
-    // An offscreen canvas keeps no copy to show and costs the page no frames.
     host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
     engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
     let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
@@ -1277,7 +1275,6 @@ fn bitmaps_free_their_pixels() {
         assert!(!host.dom[&1].canvases[&kept].present);
         assert_eq!(host.dom[&1].canvases[&kept].pixels.pixels()[0].alpha(), 255);
     }
-    // Bitmaps that nobody closes go with a GC, which their pixels bring on.
     engine
         .eval(
             r#"globalThis.source = new OffscreenCanvas(1024, 1024); source.getContext('2d').fillRect(0, 0, 1024, 1024);

@@ -2148,7 +2148,7 @@ pub(crate) unsafe extern "C" fn load(
     }
 }
 
-// Node-API calls that addon threads make, so these take no environment and skip the thread check.
+// WARNING: Node-API calls that addon threads make, so these take no environment and skip the thread check.
 macro_rules! raw_api {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
         #[unsafe(no_mangle)]
@@ -2430,7 +2430,6 @@ api!(napi_ref_threadsafe_function(env, function: Ptr) {
 });
 
 impl State {
-    /// Finishes async work and threadsafe calls of this thread's addons, on the event loop.
     pub(crate) fn drain(self: &Rc<Self>) {
         for environment in self.environments.borrow().clone() {
             environment.drain();
@@ -2511,7 +2510,6 @@ impl State {
         }
     }
 
-    /// Whether addon work keeps the event loop alive.
     pub(crate) fn pending(&self) -> bool {
         self.active.get() > 0
             || self.threadsafe.get() > 0

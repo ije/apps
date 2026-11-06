@@ -11,7 +11,6 @@ fn expand_border(key: &str, value: &str, out: &mut Vec<(String, String)>) -> boo
     true
 }
 
-/// Expands a shorthand or block-logical property into longhands; inline-logical ones stay for the cascade. Returns false for other properties.
 pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
         "inline-size" => "width",
@@ -69,15 +68,18 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         return true;
     }
-    const BOX: [&str; 4] = ["top", "right", "bottom", "left"];
+    const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
     let (names, kind): (Vec<String>, u8) = match key {
         "margin" | "padding" | "scroll-margin" | "scroll-padding" => {
-            (BOX.map(|side| format!("{key}-{side}")).into(), 0)
+            (SIDES.map(|side| format!("{key}-{side}")).into(), 0)
         }
-        "inset" => (BOX.map(String::from).into(), 0),
+        "inset" => (SIDES.map(String::from).into(), 0),
         "border-width" | "border-style" | "border-color" => {
             let suffix = &key[7..];
-            (BOX.map(|side| format!("border-{side}-{suffix}")).into(), 0)
+            (
+                SIDES.map(|side| format!("border-{side}-{suffix}")).into(),
+                0,
+            )
         }
         "border-radius" => (
             ["top-left", "top-right", "bottom-right", "bottom-left"]
@@ -131,7 +133,7 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 "border-inline" => &["inline-start", "inline-end"],
                 "border-block" => &["top", "bottom"],
                 "outline" => &[""],
-                _ => &BOX,
+                _ => &SIDES,
             };
             let mut names = Vec::new();
             for side in sides {

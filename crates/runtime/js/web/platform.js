@@ -52,7 +52,6 @@ globalThis.__appsPlatform = (call, node) => {
     return mark.startTime;
   };
   const clear = (type, name) => { for (let i = timeline.length - 1; i >= 0; i--) if (timeline[i].entryType === type && (name === undefined || timeline[i].name === String(name))) timeline.splice(i, 1); };
-  // Node's timerify() entries go to observers only, not to the timeline.
   class PerformanceNodeEntry extends PerformanceEntry {
     #detail;
     constructor(name, start, duration, detail) { super(name, 'function', start, duration); this.#detail = detail; }

@@ -82,7 +82,6 @@ static int AppsTagOrder(const void *a, const void *b) {
 #define AppsPut16(at, value) (at)[0] = (uint8_t)((value) >> 8), (at)[1] = (uint8_t)(value)
 #define AppsPut32(at, value) AppsPut16(at, (value) >> 16), AppsPut16((at) + 2, value)
 
-// Decodes WOFF and WOFF2 data with CoreText, and writes the first face back as an sfnt font.
 bool apps_font_sfnt(const uint8_t *bytes, size_t length, uint8_t *(*allocate)(void *, size_t), void *context) {
     CFDataRef data = CFDataCreate(NULL, bytes, (CFIndex)length);
     CFArrayRef descriptors = data ? CTFontManagerCreateFontDescriptorsFromData(data) : NULL;
@@ -282,7 +281,6 @@ static void AppsNativeEmit(NSDictionary *event) {
 }
 @end
 
-// The Dock tile progress bar of BrowserWindow.setProgressBar(), drawn like Electron's.
 @interface AppsDockProgress : NSView
 @property double value;
 @end
@@ -871,7 +869,6 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSImage *image = [args length] ? [[NSImage alloc] initWithContentsOfFile:args] : nil;
         if ([args length] && !image) return strdup("{\"error\":\"Cannot load the icon image\"}");
         NSApp.applicationIconImage = image;
-        // The progress bar draws the icon itself.
         if (NSApp.dockTile.contentView) { ((NSImageView *)NSApp.dockTile.contentView).image = NSApp.applicationIconImage; [NSApp.dockTile display]; }
     } else if ([op isEqualToString:@"app.about"]) {
         if (args == [NSNull null]) [NSApp orderFrontStandardAboutPanelWithOptions:AppsAboutOptions ?: @{}];

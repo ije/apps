@@ -173,7 +173,6 @@ macro_rules! float_unit {
     };
 }
 
-/// Logical pixels.
 #[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct Pixels(pub f32);
@@ -186,13 +185,11 @@ impl Pixels {
     }
 }
 
-/// Device pixels as floats.
 #[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ScaledPixels(pub f32);
 float_unit!(ScaledPixels);
 
-/// Whole device pixels.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct DevicePixels(pub i32);
@@ -667,8 +664,6 @@ impl Radii<Pixels> {
             y: self.y.scale(factor),
         }
     }
-    /// Squares corners with a zero radius and scales all radii down until adjacent corners fit
-    /// the box, like CSS.
     pub fn clamp_radii_for_quad_size(self, size: Size<Pixels>) -> Self {
         let (mut x, mut y) = (self.x, self.y);
         for (x, y) in [
@@ -719,7 +714,6 @@ impl From<Pixels> for Edges<Pixels> {
     }
 }
 
-/// A rectangle clip, rounded when `corner_radii` is not zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct ContentMask<P> {
@@ -743,7 +737,6 @@ impl ContentMask<Pixels> {
             corner_radii: self.corner_radii.scale(factor),
         }
     }
-    /// The overlap of two masks. When both are rounded, the rounded rectangle of `self` wins.
     pub fn intersect(&self, other: &Self) -> Self {
         let rounded = if self.corner_radii.is_zero() {
             other
@@ -768,12 +761,11 @@ impl<P: Default> From<Bounds<P>> for ContentMask<P> {
     }
 }
 
-/// Rounds midpoints toward zero, so a 1px line at 150% stays 1 device pixel.
+// WARNING: rounds midpoints toward zero, so a 1px line at 150% stays 1 device pixel.
 pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
     (value.abs() - 0.5).ceil().copysign(value)
 }
 
-/// Rounds midpoints up, like Chrome's `LayoutUnit::Round` that snaps boxes to device pixels.
 pub(crate) fn round_half_up(value: f32) -> f32 {
     (value + 0.5).floor()
 }
@@ -782,8 +774,8 @@ pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }
 
-/// Truncates to 1/64 of a device pixel, like Chrome's `LayoutUnit`. The tiny bias keeps a size
-/// that is already in layout units from losing one to float error.
+// WARNING: truncates to 1/64 of a device pixel, like Chrome's `LayoutUnit`. The tiny bias keeps a size
+// that is already in layout units from losing one to float error.
 pub fn to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor * 64. * (1. + 1e-6)).trunc() / 64.
 }

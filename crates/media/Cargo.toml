@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The runtime loads the cdylib only for apps with the video or audio feature. The rlib lets tests build it.
+# WARNING: the rlib lets tests build the library.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

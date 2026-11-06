@@ -104,71 +104,71 @@
   };
   class ReadableStreamDefaultController {
     constructor(token) { if (token !== controllers) throw new TypeError('Illegal constructor'); }
-    get desiredSize() { const s = controllers.get(this); return s.state === 'errored' ? null : s.state === 'closed' ? 0 : s.hwm - s.total; }
+    get desiredSize() { const controller = controllers.get(this); return controller.state === 'errored' ? null : controller.state === 'closed' ? 0 : controller.hwm - controller.total; }
     close() {
-      const s = controllers.get(this);
-      if (s.closing || s.state !== 'readable') throw new TypeError('Stream is not readable');
-      s.closing = true; drain(s);
+      const controller = controllers.get(this);
+      if (controller.closing || controller.state !== 'readable') throw new TypeError('Stream is not readable');
+      controller.closing = true; drain(controller);
     }
     enqueue(value) {
-      const s = controllers.get(this);
-      if (s.closing || s.state !== 'readable') throw new TypeError('Stream is not readable');
-      if (s.reads.length) s.reads.shift().resolve({ value, done: false });
+      const controller = controllers.get(this);
+      if (controller.closing || controller.state !== 'readable') throw new TypeError('Stream is not readable');
+      if (controller.reads.length) controller.reads.shift().resolve({ value, done: false });
       else {
         try {
-          const size = Number(s.size(value));
+          const size = Number(controller.size(value));
           if (!Number.isFinite(size) || size < 0) throw new RangeError('Invalid chunk size');
-          s.queue.push({ value, size }); s.total += size;
-        } catch (error) { errorReadable(s, error); throw error; }
+          controller.queue.push({ value, size }); controller.total += size;
+        } catch (error) { errorReadable(controller, error); throw error; }
       }
-      pull(s);
+      pull(controller);
     }
     error(error) { errorReadable(controllers.get(this), error); }
   }
   class ReadableByteStreamController extends ReadableStreamDefaultController {
     get byobRequest() {
-      const s = controllers.get(this), read = s.reads.first;
-      if (!read?.view || s.state !== 'readable') return null;
-      if (!s.byob || requests.get(s.byob).read !== read || requests.get(s.byob).filled !== read.filled) {
-        s.byob = new ReadableStreamBYOBRequest(requests);
-        requests.set(s.byob, { s, read, filled: read.filled });
+      const controller = controllers.get(this), read = controller.reads.first;
+      if (!read?.view || controller.state !== 'readable') return null;
+      if (!controller.byob || requests.get(controller.byob).read !== read || requests.get(controller.byob).filled !== read.filled) {
+        controller.byob = new ReadableStreamBYOBRequest(requests);
+        requests.set(controller.byob, { s: controller, read, filled: read.filled });
       }
-      return s.byob;
+      return controller.byob;
     }
     enqueue(value) {
-      const s = controllers.get(this);
-      if (s.closing || s.state !== 'readable') throw new TypeError('Stream is not readable');
+      const controller = controllers.get(this);
+      if (controller.closing || controller.state !== 'readable') throw new TypeError('Stream is not readable');
       if (!ArrayBuffer.isView(value) || !value.byteLength) throw new TypeError('Expected a nonempty byte view');
       const chunk = transfer(value);
-      s.queue.push({ value: chunk, size: chunk.byteLength }); s.total += chunk.byteLength;
-      drain(s); pull(s);
+      controller.queue.push({ value: chunk, size: chunk.byteLength }); controller.total += chunk.byteLength;
+      drain(controller); pull(controller);
     }
   }
   class ReadableStreamBYOBRequest {
     constructor(token) { if (token !== requests) throw new TypeError('Illegal constructor'); }
     get view() {
-      const r = requests.get(this);
-      return r && (r.s.reads.first === r.read || r.s.state === 'closed') && r.filled === r.read.filled ? r.read.view.subarray(r.filled) : null;
+      const request = requests.get(this);
+      return request && (request.s.reads.first === request.read || request.s.state === 'closed') && request.filled === request.read.filled ? request.read.view.subarray(request.filled) : null;
     }
     respond(count) {
-      const r = requests.get(this), view = this.view;
+      const request = requests.get(this), view = this.view;
       count = Number(count);
       if (!view) throw new TypeError('BYOB request is no longer active');
-      if (!Number.isInteger(count) || count < 0 || count > view.byteLength || (!count && r.s.state === 'readable')) throw new RangeError('Invalid byte count');
-      requests.delete(this); r.s.byob = null;
-      if (r.s.state === 'closed') { if (count) throw new TypeError('Closed stream requires zero bytes'); return; }
-      r.read.filled += count;
-      const read = r.read;
+      if (!Number.isInteger(count) || count < 0 || count > view.byteLength || (!count && request.s.state === 'readable')) throw new RangeError('Invalid byte count');
+      requests.delete(this); request.s.byob = null;
+      if (request.s.state === 'closed') { if (count) throw new TypeError('Closed stream requires zero bytes'); return; }
+      request.read.filled += count;
+      const read = request.read;
       if (read.filled >= read.min) {
         const aligned = read.filled - read.filled % read.width;
         if (aligned < read.filled) {
           const rest = read.view.slice(aligned, read.filled);
-          r.s.queue.push({ value: rest, size: rest.byteLength }); r.s.total += rest.byteLength;
+          request.s.queue.push({ value: rest, size: rest.byteLength }); request.s.total += rest.byteLength;
         }
-        r.s.reads.shift();
+        request.s.reads.shift();
         read.resolve({ value: new read.ctor(read.view.buffer, read.offset, aligned / read.width), done: false });
       }
-      drain(r.s); pull(r.s);
+      drain(request.s); pull(request.s);
     }
     respondWithNewView(view) {
       const current = this.view;
@@ -178,37 +178,37 @@
   }
   class ReadableStreamDefaultReader {
     constructor(stream) {
-      const s = readable.get(stream);
-      if (!s || s.reader) throw new TypeError('Stream is locked or invalid');
-      const r = { stream: s, closed: deferred(), byob: false };
-      readers.set(this, r); s.reader = r;
-      if (s.state === 'closed') r.closed.resolve();
-      if (s.state === 'errored') r.closed.reject(s.error);
+      const state = readable.get(stream);
+      if (!state || state.reader) throw new TypeError('Stream is locked or invalid');
+      const reader = { stream: state, closed: deferred(), byob: false };
+      readers.set(this, reader); state.reader = reader;
+      if (state.state === 'closed') reader.closed.resolve();
+      if (state.state === 'errored') reader.closed.reject(state.error);
     }
     get closed() { return readers.get(this).closed.promise; }
     read() {
-      const r = readers.get(this), s = r.stream;
-      if (!s) return Promise.reject(new TypeError('Reader was released'));
-      s.disturbed = true;
-      if (s.state === 'closed') return Promise.resolve({ value: undefined, done: true });
-      if (s.state === 'errored') return Promise.reject(s.error);
+      const reader = readers.get(this), stream = reader.stream;
+      if (!stream) return Promise.reject(new TypeError('Reader was released'));
+      stream.disturbed = true;
+      if (stream.state === 'closed') return Promise.resolve({ value: undefined, done: true });
+      if (stream.state === 'errored') return Promise.reject(stream.error);
       const read = deferred();
-      if (s.autoAllocate) Object.assign(read, { view: new Uint8Array(s.autoAllocate), ctor: Uint8Array, offset: 0, width: 1, min: 1, filled: 0 });
-      s.reads.push(read); drain(s); pull(s);
+      if (stream.autoAllocate) Object.assign(read, { view: new Uint8Array(stream.autoAllocate), ctor: Uint8Array, offset: 0, width: 1, min: 1, filled: 0 });
+      stream.reads.push(read); drain(stream); pull(stream);
       return read.promise;
     }
-    cancel(reason) { const s = readers.get(this).stream; return s ? cancel(s, reason) : Promise.reject(new TypeError('Reader was released')); }
+    cancel(reason) { const stream = readers.get(this).stream; return stream ? cancel(stream, reason) : Promise.reject(new TypeError('Reader was released')); }
     releaseLock() {
-      const r = readers.get(this), s = r.stream;
-      if (!s) return;
+      const reader = readers.get(this), stream = reader.stream;
+      if (!stream) return;
       const error = new TypeError('Reader was released');
-      r.closed.reject(error); r.closed = deferred(); r.closed.reject(error);
-      while (s.reads.length) {
-        const read = s.reads.shift();
-        if (read.filled) { const value = read.view.slice(0, read.filled); s.queue.unshift({ value, size: value.byteLength }); s.total += value.byteLength; }
+      reader.closed.reject(error); reader.closed = deferred(); reader.closed.reject(error);
+      while (stream.reads.length) {
+        const read = stream.reads.shift();
+        if (read.filled) { const value = read.view.slice(0, read.filled); stream.queue.unshift({ value, size: value.byteLength }); stream.total += value.byteLength; }
         read.reject(error);
       }
-      s.byob = null; s.reader = null; r.stream = null;
+      stream.byob = null; stream.reader = null; reader.stream = null;
     }
   }
   class ReadableStreamBYOBReader extends ReadableStreamDefaultReader {
@@ -217,18 +217,18 @@
       super(stream); readers.get(this).byob = true;
     }
     read(view, options = {}) {
-      const s = readers.get(this).stream;
-      if (!s) return Promise.reject(new TypeError('Reader was released'));
+      const stream = readers.get(this).stream;
+      if (!stream) return Promise.reject(new TypeError('Reader was released'));
       if (!ArrayBuffer.isView(view) || !view.byteLength) return Promise.reject(new TypeError('Expected a nonempty byte view'));
       const width = view.BYTES_PER_ELEMENT || 1, min = options.min === undefined ? 1 : Number(options.min);
       if (!Number.isInteger(min) || min < 1 || min * width > view.byteLength) return Promise.reject(new RangeError('Invalid minimum'));
-      s.disturbed = true;
-      if (s.state === 'errored') return Promise.reject(s.error);
+      stream.disturbed = true;
+      if (stream.state === 'errored') return Promise.reject(stream.error);
       const read = deferred(), ctor = view.constructor, offset = view.byteOffset;
       Object.assign(read, { view: transfer(view), ctor, offset, width, min: min * width, filled: 0 });
-      s.reads.push(read);
-      if (s.state === 'closed') finishReadable(s);
-      else { drain(s); pull(s); }
+      stream.reads.push(read);
+      if (stream.state === 'closed') finishReadable(stream);
+      else { drain(stream); pull(stream); }
       return read.promise;
     }
   }
@@ -241,14 +241,14 @@
       const autoAllocate = source.autoAllocateChunkSize;
       if (bytes && autoAllocate !== undefined && (!Number.isInteger(autoAllocate) || autoAllocate <= 0)) throw new TypeError('Invalid allocation size');
       const controller = bytes ? new ReadableByteStreamController(controllers) : new ReadableStreamDefaultController(controllers);
-      const s = { source, controller, bytes, autoAllocate, hwm: highWaterMark(strategy.highWaterMark, bytes ? 0 : 1), size: strategy.size ?? (() => 1),
+      const state = { source, controller, bytes, autoAllocate, hwm: highWaterMark(strategy.highWaterMark, bytes ? 0 : 1), size: strategy.size ?? (() => 1),
         state: 'readable', reader: null, queue: new Queue(), reads: new Queue(), total: 0, started: false, closing: false, disturbed: false, pulling: false, pullAgain: false };
-      readable.set(this, s); controllers.set(controller, s);
+      readable.set(this, state); controllers.set(controller, state);
       const start = source.start?.(controller);
-      Promise.resolve(start).then(() => { s.started = true; pull(s); }, error => errorReadable(s, error));
+      Promise.resolve(start).then(() => { state.started = true; pull(state); }, error => errorReadable(state, error));
     }
     get locked() { return !!readable.get(this).reader; }
-    cancel(reason) { const s = readable.get(this); return s.reader ? Promise.reject(new TypeError('Stream is locked')) : cancel(s, reason); }
+    cancel(reason) { const state = readable.get(this); return state.reader ? Promise.reject(new TypeError('Stream is locked')) : cancel(state, reason); }
     getReader(options = {}) {
       if (options.mode !== undefined && options.mode !== 'byob') throw new TypeError('Invalid reader mode');
       return options.mode === 'byob' ? new ReadableStreamBYOBReader(this) : new ReadableStreamDefaultReader(this);
@@ -303,17 +303,17 @@
       return transform.readable;
     }
     tee() {
-      const s = readable.get(this), reader = this.getReader(), canceled = [false, false], reasons = [], branches = [], outputs = [], complete = deferred();
+      const state = readable.get(this), reader = this.getReader(), canceled = [false, false], reasons = [], branches = [], outputs = [], complete = deferred();
       let reading = null;
       for (let i = 0; i < 2; i++) outputs.push(new ReadableStream({
-        ...(s.bytes ? { type: 'bytes' } : {}),
+        ...(state.bytes ? { type: 'bytes' } : {}),
         start(controller) { branches[i] = controller; },
         pull() {
           if (reading) return reading;
           reading = reader.read().then(({ value, done }) => {
             for (let j = 0; j < 2; j++) if (!canceled[j]) {
               if (done) branches[j].close();
-              else branches[j].enqueue(s.bytes ? value.slice() : value);
+              else branches[j].enqueue(state.bytes ? value.slice() : value);
             }
             if (done) { complete.resolve(); reader.releaseLock(); }
           }, error => {
@@ -399,38 +399,38 @@
   };
   class WritableStreamDefaultController {
     constructor(token) { if (token !== controllers) throw new TypeError('Illegal constructor'); }
-    get signal() { const s = controllers.get(this); return (s.abortController ??= new AbortController()).signal; }
+    get signal() { const controller = controllers.get(this); return (controller.abortController ??= new AbortController()).signal; }
     error(error) { errorWritable(controllers.get(this), error); }
   }
   class WritableStreamDefaultWriter {
     constructor(stream) {
-      const s = writable.get(stream);
-      if (!s || s.writer) throw new TypeError('Stream is locked or invalid');
-      const w = { stream: s, ready: s.ready, closed: deferred() }; s.writer = w; writers.set(this, w);
-      s.closed.promise.then(w.closed.resolve, w.closed.reject);
+      const state = writable.get(stream);
+      if (!state || state.writer) throw new TypeError('Stream is locked or invalid');
+      const writer = { stream: state, ready: state.ready, closed: deferred() }; state.writer = writer; writers.set(this, writer);
+      state.closed.promise.then(writer.closed.resolve, writer.closed.reject);
     }
     get closed() { return writers.get(this).closed.promise; }
     get ready() { return writers.get(this).ready.promise; }
-    get desiredSize() { const s = writers.get(this).stream; if (!s) throw new TypeError('Writer was released'); return s.state === 'errored' ? null : s.state === 'closed' ? 0 : s.hwm - s.total; }
+    get desiredSize() { const stream = writers.get(this).stream; if (!stream) throw new TypeError('Writer was released'); return stream.state === 'errored' ? null : stream.state === 'closed' ? 0 : stream.hwm - stream.total; }
     write(value) {
-      const s = writers.get(this).stream;
-      if (!s || s.state !== 'writable' || s.closing) return Promise.reject(s?.error ?? new TypeError('Stream is not writable'));
+      const stream = writers.get(this).stream;
+      if (!stream || stream.state !== 'writable' || stream.closing) return Promise.reject(stream?.error ?? new TypeError('Stream is not writable'));
       try {
-        const size = Number(s.size(value));
+        const size = Number(stream.size(value));
         if (!Number.isFinite(size) || size < 0) throw new RangeError('Invalid chunk size');
-        const item = { ...deferred(), value, size }; s.queue.push(item); s.total += size; updatePressure(s); advance(s); return item.promise;
-      } catch (error) { errorWritable(s, error); return Promise.reject(error); }
+        const item = { ...deferred(), value, size }; stream.queue.push(item); stream.total += size; updatePressure(stream); advance(stream); return item.promise;
+      } catch (error) { errorWritable(stream, error); return Promise.reject(error); }
     }
-    close() { const s = writers.get(this).stream; return s ? closeWritable(s) : Promise.reject(new TypeError('Writer was released')); }
-    abort(reason) { const s = writers.get(this).stream; return s ? abortWritable(s, reason) : Promise.reject(new TypeError('Writer was released')); }
+    close() { const stream = writers.get(this).stream; return stream ? closeWritable(stream) : Promise.reject(new TypeError('Writer was released')); }
+    abort(reason) { const stream = writers.get(this).stream; return stream ? abortWritable(stream, reason) : Promise.reject(new TypeError('Writer was released')); }
     releaseLock() {
-      const w = writers.get(this), s = w.stream;
-      if (!s) return;
+      const writer = writers.get(this), stream = writer.stream;
+      if (!stream) return;
       const error = new TypeError('Writer was released');
-      w.ready.reject(error); w.closed.reject(error);
-      w.ready = deferred(); w.closed = deferred(); w.ready.reject(error); w.closed.reject(error);
-      s.ready = deferred(); if (s.state === 'errored') s.ready.reject(s.error); else if (!s.pressure) s.ready.resolve();
-      w.stream = null; s.writer = null;
+      writer.ready.reject(error); writer.closed.reject(error);
+      writer.ready = deferred(); writer.closed = deferred(); writer.ready.reject(error); writer.closed.reject(error);
+      stream.ready = deferred(); if (stream.state === 'errored') stream.ready.reject(stream.error); else if (!stream.pressure) stream.ready.resolve();
+      writer.stream = null; stream.writer = null;
     }
   }
   class WritableStream {
@@ -438,51 +438,51 @@
       if (sink.type !== undefined) throw new RangeError('Invalid sink type');
       if (strategy.size !== undefined && typeof strategy.size !== 'function') throw new TypeError('Invalid size function');
       const controller = new WritableStreamDefaultController(controllers);
-      const s = { sink, controller, hwm: highWaterMark(strategy.highWaterMark, 1), size: strategy.size ?? (() => 1), state: 'writable',
+      const state = { sink, controller, hwm: highWaterMark(strategy.highWaterMark, 1), size: strategy.size ?? (() => 1), state: 'writable',
         queue: new Queue(), total: 0, busy: false, started: false, closing: false, pressure: false, ready: deferred(), closed: deferred(), writer: null };
-      writable.set(this, s); controllers.set(controller, s);
-      if (s.hwm > 0) s.ready.resolve(); else s.pressure = true;
+      writable.set(this, state); controllers.set(controller, state);
+      if (state.hwm > 0) state.ready.resolve(); else state.pressure = true;
       const start = sink.start?.(controller);
-      Promise.resolve(start).then(() => { s.started = true; advance(s); }, error => errorWritable(s, error));
+      Promise.resolve(start).then(() => { state.started = true; advance(state); }, error => errorWritable(state, error));
     }
     get locked() { return !!writable.get(this).writer; }
     getWriter() { return new WritableStreamDefaultWriter(this); }
-    close() { const s = writable.get(this); return s.writer ? Promise.reject(new TypeError('Stream is locked')) : closeWritable(s); }
-    abort(reason) { const s = writable.get(this); return s.writer ? Promise.reject(new TypeError('Stream is locked')) : abortWritable(s, reason); }
+    close() { const state = writable.get(this); return state.writer ? Promise.reject(new TypeError('Stream is locked')) : closeWritable(state); }
+    abort(reason) { const state = writable.get(this); return state.writer ? Promise.reject(new TypeError('Stream is locked')) : abortWritable(state, reason); }
   }
   class TransformStreamDefaultController {
     constructor(token) { if (token !== controllers) throw new TypeError('Illegal constructor'); }
     get desiredSize() { return controllers.get(this).readable.desiredSize; }
-    enqueue(value) { const s = controllers.get(this); s.readable.enqueue(value); if (s.readable.desiredSize <= 0 && !s.blocked) { s.blocked = true; s.ready = deferred(); } }
-    error(error) { const s = controllers.get(this); s.readable.error(error); errorWritable(s.writable, error); s.ready.resolve(); }
-    terminate() { const s = controllers.get(this); s.readable.close(); errorWritable(s.writable, new TypeError('Transform terminated')); s.ready.resolve(); }
+    enqueue(value) { const controller = controllers.get(this); controller.readable.enqueue(value); if (controller.readable.desiredSize <= 0 && !controller.blocked) { controller.blocked = true; controller.ready = deferred(); } }
+    error(error) { const controller = controllers.get(this); controller.readable.error(error); errorWritable(controller.writable, error); controller.ready.resolve(); }
+    terminate() { const controller = controllers.get(this); controller.readable.close(); errorWritable(controller.writable, new TypeError('Transform terminated')); controller.ready.resolve(); }
   }
   class TransformStream {
     constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
       if (transformer.readableType !== undefined || transformer.writableType !== undefined) throw new RangeError('Transform types are not supported');
       const controller = new TransformStreamDefaultController(controllers);
-      const s = { ready: deferred(), blocked: true };
-      controllers.set(controller, s);
+      const state = { ready: deferred(), blocked: true };
+      controllers.set(controller, state);
       const start = deferred();
       let canceled = false;
       const cancel = reason => { if (canceled) return; canceled = true; return transformer.cancel?.(reason); };
       this.readable = new ReadableStream({
-        start(c) { s.readable = c; return start.promise; },
-        pull() { s.blocked = false; s.ready.resolve(); },
-        cancel(reason) { errorWritable(s.writable, reason); s.ready.resolve(); return cancel(reason); },
+        start(c) { state.readable = c; return start.promise; },
+        pull() { state.blocked = false; state.ready.resolve(); },
+        cancel(reason) { errorWritable(state.writable, reason); state.ready.resolve(); return cancel(reason); },
       }, { ...readableStrategy, highWaterMark: readableStrategy.highWaterMark ?? 0 });
       this.writable = new WritableStream({
         start() { return start.promise; },
         async write(value) {
-          if (s.blocked) await s.ready.promise;
-          if (s.writable.state !== 'writable') throw s.writable.error;
+          if (state.blocked) await state.ready.promise;
+          if (state.writable.state !== 'writable') throw state.writable.error;
           try { if (transformer.transform) await transformer.transform(value, controller); else controller.enqueue(value); }
           catch (error) { controller.error(error); throw error; }
         },
-        async close() { try { await transformer.flush?.(controller); s.readable.close(); } catch (error) { controller.error(error); throw error; } },
-        abort(reason) { s.readable.error(reason); s.ready.resolve(); return cancel(reason); },
+        async close() { try { await transformer.flush?.(controller); state.readable.close(); } catch (error) { controller.error(error); throw error; } },
+        abort(reason) { state.readable.error(reason); state.ready.resolve(); return cancel(reason); },
       }, writableStrategy);
-      s.writable = writable.get(this.writable);
+      state.writable = writable.get(this.writable);
       try { start.resolve(transformer.start?.(controller)); } catch (error) { start.reject(error); throw error; }
     }
   }

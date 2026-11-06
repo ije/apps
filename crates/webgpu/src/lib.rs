@@ -1,5 +1,3 @@
-//! WebGPU for pages. The runtime calls it through the C ABI below.
-
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -15,19 +13,15 @@ use std::{
 };
 use wgpu::*;
 
-/// Version of the C ABI. The runtime rejects a library with another version.
 pub const ABI: u32 = 1;
 
-/// Returns a runtime buffer of `length` bytes that the library fills.
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
-/// Runtime callbacks. Only `wake` and `drop_waker` run on other threads.
+// WARNING: runtime callbacks. Only `wake` and `drop_waker` run on other threads.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
-    /// Returns the bytes of the `$appsBytes` argument `index` of the current call, or null.
     pub read: extern "C" fn(index: usize, length: *mut usize) -> *const u8,
-    /// Adds bytes to the current call result and returns their `$appsBytes` index, or `usize::MAX`.
     pub write: extern "C" fn(bytes: *const u8, length: usize) -> usize,
     pub waker: extern "C" fn() -> *mut c_void,
     pub wake: extern "C" fn(waker: *mut c_void),
@@ -232,7 +226,6 @@ struct Canvas {
     texture: u64,
     opaque: bool,
     dirty: bool,
-    /// Whether the runtime holds an image of this canvas.
     image: bool,
     readbacks: [(Buffer, Arc<AtomicU8>, u64); 2],
     frames: u64,
@@ -1553,7 +1546,6 @@ impl Gpu {
         })
     }
 
-    /// Returns `None` until the canvas has an image, then whether a new frame of `size` went to `alloc`.
     fn image(
         &mut self,
         node: usize,

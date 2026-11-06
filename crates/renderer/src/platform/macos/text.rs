@@ -55,7 +55,6 @@ use std::sync::OnceLock;
 
 use super::open_type::apply_features_and_fallbacks;
 
-/// The `wght` variation axis tag.
 const WGHT: i64 = 0x77676874;
 
 unsafe extern "C" {
@@ -73,7 +72,6 @@ unsafe extern "C" {
     ) -> core_text::font::CTFontRef;
 }
 
-/// The `wght` axis value of a variable font instance.
 fn variation_weight(font: &CTFont) -> Option<f32> {
     let variations = unsafe { CTFontCopyVariation(font.as_concrete_TypeRef()) };
     if variations.is_null() {
@@ -94,8 +92,7 @@ const kCGImageAlphaNoneSkipFirst: u32 = 6;
 #[allow(non_upper_case_globals)]
 const kCGBitmapByteOrder32Little: u32 = 2 << 12;
 
-/// Fonts through font-kit, shaping through CoreText and glyphs through CoreGraphics.
-pub(crate) struct TextSystem(RefCell<AppleTextSystemState>);
+pub(crate) struct TextSystem(RefCell<State>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -104,7 +101,7 @@ struct FontKey {
     font_fallbacks: Option<FontFallbacks>,
 }
 
-struct AppleTextSystemState {
+struct State {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
@@ -112,13 +109,11 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    /// Faces at a point size, by font and size bits.
     sized: HashMap<(FontId, u32), CTFont>,
-    /// The font of each shaped run's face, kept alive so its address stays unique.
+    // WARNING: the font of each shaped run's face, kept alive so its address stays unique.
     natives: HashMap<usize, (CTFont, FontId)>,
 }
 
-/// The installed font families, listed once for all windows.
 static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     unsafe extern "C" {
         fn CTFontManagerCopyAvailableFontFamilyNames() -> CFArrayRef;
@@ -143,7 +138,7 @@ impl TextSystem {
                 .name("font families".into())
                 .spawn(|| std::sync::LazyLock::force(&FAMILIES).len());
         });
-        Self(RefCell::new(AppleTextSystemState {
+        Self(RefCell::new(State {
             memory_source: MemSource::empty(),
             system_source: SystemSource::new(),
             fonts: Vec::new(),
@@ -189,7 +184,7 @@ impl TextSystem {
                 font_ids
             }
         };
-        // font-kit maps Medium (0.23) to weight 530, so 500 would pick Regular. Map Apple's weight
+        // WARNING: font-kit maps Medium (0.23) to weight 530, so 500 would pick Regular. Map Apple's weight
         // constants to CSS weights 100 to 900 instead, as browsers do.
         let properties = candidates
             .iter()
@@ -217,8 +212,8 @@ impl TextSystem {
         let index = font_kit::matching::find_best_match(
             &properties,
             &font_kit::properties::Properties {
-                style: fontkit_style(font.style),
-                weight: fontkit_weight(font.weight),
+                style: font_kit_style(font.style),
+                weight: font_kit_weight(font.weight),
                 stretch: Default::default(),
             },
         )?;
@@ -248,8 +243,7 @@ impl TextSystem {
     pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         let state = self.0.borrow();
         let font = &state.fonts[font_id.0];
-        let metrics = font_kit_metrics_to_metrics(font.metrics());
-        // Like Chromium, the em box comes from the typographic metrics in the OS/2 table.
+        let metrics = font_kit_metrics(font.metrics());
         let typo = font
             .load_font_table(u32::from_be_bytes(*b"OS/2"))
             .filter(|table| table.len() >= 72)
@@ -311,8 +305,6 @@ impl TextSystem {
         self.0.borrow_mut().layout_line(text, font_size, font_runs)
     }
 
-    /// With font smoothing on, CoreGraphics thickens strokes by an amount that depends on the
-    /// text color's luminance. This picks the same level.
     pub fn glyph_dilation_for_color(&self, color: Rgba) -> u8 {
         if !font_smoothing_allowed_by_user() {
             return 0;
@@ -340,12 +332,11 @@ fn font_smoothing_allowed_by_user() -> bool {
         let Some(number) = value.downcast_into::<CFNumber>() else {
             return true;
         };
-        // Only an explicit value of `0` means that font smoothing is disabled.
         number.to_i64() != Some(0)
     })
 }
 
-impl AppleTextSystemState {
+impl State {
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         let fonts = fonts
             .into_iter()
@@ -363,7 +354,7 @@ impl AppleTextSystemState {
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
-        // Families resolved before, maybe to system fonts, must be resolved again.
+        // WARNING: families resolved before, maybe to system fonts, must be resolved again.
         self.font_selections.clear();
         self.font_ids_by_font_key.clear();
         Ok(())
@@ -418,7 +409,7 @@ impl AppleTextSystemState {
             let Some(postscript_name) = font.postscript_name() else {
                 continue;
             };
-            // Dedup only within this call: a family can load again under another `FontKey`, and
+            // WARNING: dedup only within this call: a family can load again under another `FontKey`, and
             // a check against `font_ids_by_postscript_name` would leave that call empty.
             if !postscript_names_seen.insert(postscript_name.clone()) {
                 continue;
@@ -444,7 +435,6 @@ impl AppleTextSystemState {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
     }
 
-    /// The face at `size`, created once.
     // WARNING: every new copy of a variable face, like the system font, builds its CoreText caches
     // again, which costs most of the time of shaping a line.
     fn sized(&mut self, font_id: FontId, size: f32) -> CTFont {
@@ -462,7 +452,6 @@ impl AppleTextSystemState {
             .clone()
     }
 
-    /// The face with its `wght` axis at `weight`, created once.
     fn weighted(&mut self, font_id: FontId, weight: f32) -> FontId {
         let base = self.fonts[font_id.0].native_font();
         let variations = CFDictionary::from_CFType_pairs(&[(
@@ -533,7 +522,7 @@ impl AppleTextSystemState {
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
         let scale = Transform2F::from_scale(params.scale_factor);
-        let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
+        let bounds: Bounds<DevicePixels> = bounds_from_rect_i32(font.raster_bounds(
             params.glyph_id.0,
             params.font_size.into(),
             scale,
@@ -541,7 +530,6 @@ impl AppleTextSystemState {
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
         )?);
 
-        // 1 pixel of room on each side for CoreGraphics anti-aliasing.
         Ok(bounds.dilate(DevicePixels(1)))
     }
 
@@ -553,7 +541,6 @@ impl AppleTextSystemState {
         if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
             anyhow::bail!("glyph bounds are empty");
         } else {
-            // A subpixel offset needs 1 more pixel for anti-aliasing.
             let mut bitmap_size = glyph_bounds.size;
             if params.subpixel_variant.x > 0 {
                 bitmap_size.width += DevicePixels(1);
@@ -616,7 +603,6 @@ impl AppleTextSystemState {
                 cx.set_should_smooth_fonts(false);
             }
 
-            // Bottom-left origin and scale, to match font-kit's `raster_bounds`.
             cx.translate(
                 -glyph_bounds.origin.x.0 as CGFloat,
                 (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
@@ -668,7 +654,6 @@ impl AppleTextSystemState {
                     .collect();
             }
             if params.is_emoji {
-                // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
                 for pixel in bytes.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                     let a = pixel[3] as f32 / 255.;
@@ -691,7 +676,7 @@ impl AppleTextSystemState {
 
         {
             let mut text = text;
-            // CoreText merges adjacent runs that end up in equal fonts, including runs of
+            // WARNING: CoreText merges adjacent runs that end up in equal fonts, including runs of
             // different fonts that fall back to the same one, so every other run that inserts
             // text is set a hair larger to keep ligatures from forming across them. The first
             // run keeps its exact size: SF tracks by its exact point size, and a nudged size
@@ -701,7 +686,7 @@ impl AppleTextSystemState {
                 let text_run;
                 (text_run, text) = text.split_at(run.len);
 
-                let utf16_start = string.char_len(); // insert at end of string
+                let utf16_start = string.char_len();
                 // WARNING: `replace_str` can drop some code points, like a BOM at the start.
                 string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
                 let utf16_end = string.char_len();
@@ -730,7 +715,7 @@ impl AppleTextSystemState {
         let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
         let glyph_runs = line.glyph_runs();
         let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
-        let mut ix_converter = StringIndexConverter::new(text);
+        let mut index_converter = StringIndexConverter::new(text);
         let mut shift = 0f32;
         let mut emoji_end = None;
         for run in glyph_runs.into_iter() {
@@ -741,7 +726,6 @@ impl AppleTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            // Undo the nudge that keeps ligatures from forming across runs.
             let shaped_size = font.pt_size() as f32;
             let run_size = font_runs
                 .iter()
@@ -788,13 +772,13 @@ impl AppleTextSystemState {
                     &mut runs.last_mut().unwrap().glyphs
                 }
             };
-            for ((&glyph_id, position), &glyph_utf16_ix) in run
+            for ((&glyph_id, position), &glyph_utf16_index) in run
                 .glyphs()
                 .iter()
                 .zip(run.positions().iter())
                 .zip(run.string_indices().iter())
             {
-                ix_converter.seek_to_utf16_ix(usize::try_from(glyph_utf16_ix).unwrap());
+                index_converter.seek_to_utf16_index(usize::try_from(glyph_utf16_index).unwrap());
                 if let Some(end) = emoji_end.take() {
                     shift = end - position.x as f32;
                 }
@@ -802,7 +786,7 @@ impl AppleTextSystemState {
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(x, position.y as f32).map(px),
-                    index: ix_converter.utf8_ix,
+                    index: index_converter.utf8_index,
                     is_emoji,
                 });
                 if let Some(doubled) = &doubled {
@@ -840,39 +824,38 @@ impl AppleTextSystemState {
 #[derive(Debug, Clone)]
 struct StringIndexConverter<'a> {
     text: &'a str,
-    utf8_ix: usize,
-    utf16_ix: usize,
+    utf8_index: usize,
+    utf16_index: usize,
 }
 
 impl<'a> StringIndexConverter<'a> {
     fn new(text: &'a str) -> Self {
         Self {
             text,
-            utf8_ix: 0,
-            utf16_ix: 0,
+            utf8_index: 0,
+            utf16_index: 0,
         }
     }
 
-    /// Moves forward or back to the first character at or after `utf16_target`.
-    fn seek_to_utf16_ix(&mut self, utf16_target: usize) {
-        while self.utf16_ix > utf16_target
-            && let Some(c) = self.text[..self.utf8_ix].chars().next_back()
+    fn seek_to_utf16_index(&mut self, utf16_target: usize) {
+        while self.utf16_index > utf16_target
+            && let Some(c) = self.text[..self.utf8_index].chars().next_back()
         {
-            self.utf8_ix -= c.len_utf8();
-            self.utf16_ix -= c.len_utf16();
+            self.utf8_index -= c.len_utf8();
+            self.utf16_index -= c.len_utf16();
         }
-        for (ix, c) in self.text[self.utf8_ix..].char_indices() {
-            if self.utf16_ix >= utf16_target {
-                self.utf8_ix += ix;
+        for (offset, c) in self.text[self.utf8_index..].char_indices() {
+            if self.utf16_index >= utf16_target {
+                self.utf8_index += offset;
                 return;
             }
-            self.utf16_ix += c.len_utf16();
+            self.utf16_index += c.len_utf16();
         }
-        self.utf8_ix = self.text.len();
+        self.utf8_index = self.text.len();
     }
 }
 
-fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
+fn font_kit_metrics(metrics: Metrics) -> FontMetrics {
     FontMetrics {
         units_per_em: metrics.units_per_em,
         ascent: metrics.ascent,
@@ -893,7 +876,7 @@ fn bounds_from_rect(rect: RectF) -> Bounds<f32> {
     }
 }
 
-fn bounds_from_rect_i(rect: RectI) -> Bounds<DevicePixels> {
+fn bounds_from_rect_i32(rect: RectI) -> Bounds<DevicePixels> {
     Bounds {
         origin: point(DevicePixels(rect.origin_x()), DevicePixels(rect.origin_y())),
         size: size(DevicePixels(rect.width()), DevicePixels(rect.height())),
@@ -904,11 +887,11 @@ fn size_from_vector2f(vec: Vector2F) -> Size<f32> {
     size(vec.x(), vec.y())
 }
 
-fn fontkit_weight(value: FontWeight) -> FontkitWeight {
+fn font_kit_weight(value: FontWeight) -> FontkitWeight {
     FontkitWeight(value.0)
 }
 
-fn fontkit_style(style: FontStyle) -> FontkitStyle {
+fn font_kit_style(style: FontStyle) -> FontkitStyle {
     match style {
         FontStyle::Normal => FontkitStyle::Normal,
         FontStyle::Italic => FontkitStyle::Italic,

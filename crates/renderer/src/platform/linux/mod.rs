@@ -42,9 +42,7 @@ const SCROLL_LINES: f32 = 3.;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_DISTANCE: Pixels = px(5.);
 const DEFAULT_CURSOR: &str = "left_ptr";
-/// How long a clipboard or drop transfer from another app may take.
 const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
-/// Frames are retried at this pace when the compositor gives no frame callback.
 const RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
 
 #[derive(Clone)]
@@ -80,8 +78,6 @@ impl Platform {
         let mut errors = Vec::new();
         let mut client = None;
         if wayland {
-            // Without server decorations, windows on Wayland have no title bar, while XWayland
-            // windows get one from the compositor.
             match wayland::Client::new(&handle, x11) {
                 Ok(wayland) => client = Some(Client::Wayland(wayland)),
                 Err(error) => errors.push(format!("{error:#}")),
@@ -108,7 +104,7 @@ impl Platform {
         post_local(on_launch);
         let client = self.client.clone();
         let result = self.event_loop.borrow_mut().run(None, &mut (), |_| {
-            // Requests with replies can read X events into xcb's queue, which doesn't wake the loop.
+            // WARNING: requests with replies can read X events into xcb's queue, which doesn't wake the loop.
             if let Client::X11(client) = &client {
                 client.process_events();
             }
@@ -174,14 +170,12 @@ fn with_loop<R>(f: impl FnOnce(&LoopHandle<'static, ()>) -> R) -> R {
     LOOP.with(|cell| f(cell.get().expect("the event loop runs on the main thread")))
 }
 
-/// Runs `f` on the main thread, from any thread.
 pub(crate) fn post(f: Box<dyn FnOnce() + Send>) {
     if let Some(sender) = POST.get() {
         let _ = sender.lock().map(|sender| sender.send(f));
     }
 }
 
-/// Runs `f` on the main thread after `delay`.
 pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
     let mut f = Some(f);
     with_loop(|handle| {
@@ -194,14 +188,12 @@ pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
     });
 }
 
-/// Runs `f` on the main thread after the current event.
 fn post_local(f: impl FnOnce() + 'static) {
     with_loop(|handle| {
         handle.insert_idle(move |_| f());
     });
 }
 
-/// A native window: an X11 window or a Wayland surface.
 pub(crate) enum Window {
     X11(x11::Window),
     Wayland(wayland::Window),
@@ -229,12 +221,10 @@ impl Window {
         each!(self, window => window.content_size())
     }
 
-    /// Asks for frames until a frame wants no more.
     pub fn request_frame(&self) {
         each!(self, window => window.request_frame())
     }
 
-    /// Draws once even when the window is hidden or covered, for captures.
     pub fn force_frame(&self) {
         each!(self, window => window.force_frame())
     }
@@ -251,7 +241,6 @@ impl Window {
         each!(self, window => window.set_title(title))
     }
 
-    /// Linux windows have no native buttons.
     pub fn set_button_visibility(&self, _visible: bool) {}
     pub fn set_button_position(&self, _position: Option<Point<Pixels>>) {}
 
@@ -260,7 +249,6 @@ impl Window {
     }
 
     pub fn change(&self, change: WindowChange) {
-        // Window managers own placement, levels and the window buttons, so the other changes are ignored.
         match change {
             WindowChange::Show(_) | WindowChange::Restore => self.activate(),
             WindowChange::Parent(parent, _) => {
@@ -288,7 +276,6 @@ impl Window {
         each!(self, window => window.activate())
     }
 
-    /// Resizes the content area.
     pub fn resize(&self, size: Size<Pixels>) {
         each!(self, window => window.resize(size))
     }
@@ -297,7 +284,6 @@ impl Window {
         each!(self, window => window.start_window_move())
     }
 
-    /// Linux desktops maximize a window on a title bar double click.
     pub fn titlebar_double_click(&self) {
         self.zoom();
     }
@@ -307,7 +293,6 @@ impl Window {
     }
 }
 
-/// The app's name for the desktop: the executable's name.
 fn app_name() -> String {
     std::env::current_exe()
         .ok()
@@ -315,7 +300,6 @@ fn app_name() -> String {
         .unwrap_or_else(|| "apps".to_owned())
 }
 
-/// Counts clicks of the same button close together in time and place.
 #[derive(Default)]
 struct Clicks {
     last: Option<(MouseButton, Instant, Point<Pixels>)>,
@@ -337,7 +321,6 @@ impl Clicks {
     }
 }
 
-/// Sends a key press, then types its text when nothing handled it.
 fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool) {
     let modifiers = keystroke.modifiers;
     let text = keystroke.key_char.clone().filter(|_| {
@@ -349,12 +332,10 @@ fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool) {
     }
 }
 
-/// An input method change, applied after the caller drops its borrows.
 enum Ime {
     Commit(String),
     Preedit(String),
     Unmark,
-    /// Drops the marked text, when focus leaves.
     Clear,
 }
 
@@ -373,12 +354,10 @@ impl Ime {
     }
 }
 
-/// Where the input method shows its candidates: the selection, in window points.
 fn ime_area(callbacks: Callbacks) -> Option<Bounds<Pixels>> {
     callbacks.bounds_for_range(callbacks.selected_text_range()?.range)
 }
 
-/// Feeds a key to the compose table, for dead keys.
 fn compose(
     state: &mut xkb::compose::State,
     pre_edit: &mut Option<String>,
@@ -414,7 +393,6 @@ fn compose(
     }
 }
 
-/// An XKB context for the keymaps X11 and Wayland send, which need no local definitions.
 fn new_xkb_context() -> Result<xkb::Context> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_DEFAULT_INCLUDES);
     anyhow::ensure!(
@@ -534,7 +512,6 @@ fn keystroke_from_xkb(state: &xkb::State, mut modifiers: Modifiers, keycode: Key
         {
             if key.is_ascii_graphic() {
                 key_utf8.to_lowercase()
-            // Ctrl-a is `a`, but ctrl-0..9 control codes like ctrl-[ stay digits.
             } else if key_utf32 <= 0x1f && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
             {
                 ((key_utf32 as u8 + 0x40) as char)
@@ -549,11 +526,9 @@ fn keystroke_from_xkb(state: &xkb::State, mut modifiers: Modifiers, keycode: Key
             name
         }
     };
-    // Shift is kept for letters only, not for digits and symbols.
     if modifiers.shift && key.chars().count() == 1 && key.to_lowercase() == key.to_uppercase() {
         modifiers.shift = false;
     }
-    // Control characters and DEL type nothing.
     let key_char =
         (key_utf32 >= 32 && key_utf32 != 127 && !key_utf8.is_empty()).then_some(key_utf8);
     Keystroke {
@@ -563,7 +538,6 @@ fn keystroke_from_xkb(state: &xkb::State, mut modifiers: Modifiers, keycode: Key
     }
 }
 
-/// The US key on a key of a layout without Latin letters, so shortcuts still work.
 fn guess_ascii(keycode: Keycode, shift: bool) -> Option<char> {
     Some(match (keycode.raw(), shift) {
         (24, _) => 'q',
@@ -614,7 +588,6 @@ fn guess_ascii(keycode: Keycode, shift: bool) -> Option<char> {
     })
 }
 
-/// The symbol a dead key shows while it composes.
 fn dead_key(keysym: Keysym) -> Option<String> {
     let symbol = match keysym {
         Keysym::dead_grave => "`",
@@ -655,7 +628,6 @@ fn dead_key(keysym: Keysym) -> Option<String> {
     Some(symbol.to_owned())
 }
 
-/// Cursor theme names, from Chromium's cursor factory.
 fn cursor_names(style: CursorStyle) -> &'static [&'static str] {
     match style {
         CursorStyle::Arrow | CursorStyle::None => &[DEFAULT_CURSOR],
@@ -682,12 +654,10 @@ fn cursor_names(style: CursorStyle) -> &'static [&'static str] {
     }
 }
 
-/// The local files of a `text/uri-list`.
 fn file_paths(list: &str) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt as _;
     list.lines()
         .filter_map(|line| line.trim().strip_prefix("file://"))
-        // A host may come before the path.
         .filter_map(|rest| rest.find('/').map(|slash| &rest[slash..]))
         .map(|path| {
             let mut bytes = Vec::with_capacity(path.len());
@@ -713,7 +683,6 @@ fn file_paths(list: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Reads a pipe until the writer closes it, or fails after `PIPE_READ_TIMEOUT` without data.
 fn read_pipe(mut reader: std::io::PipeReader) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];

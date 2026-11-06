@@ -1,6 +1,3 @@
-//! Video and audio live in `apps-media`, a library that links FFmpeg. The runtime loads it for apps with
-//! the video or audio feature, and `apps build` ships it and FFmpeg only for them.
-
 use super::gpu::{Alloc, Output, alloc, drop_waker, wake, waker};
 use anyhow::{Context, Result, anyhow, ensure};
 use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLock};
@@ -71,7 +68,6 @@ pub fn library_name(platform: &str) -> &'static str {
     }
 }
 
-/// The FFmpeg library that the media library links.
 pub fn ffmpeg_name(platform: &str) -> &'static str {
     match platform {
         "macos" => "libffmpeg.dylib",
@@ -118,7 +114,6 @@ fn load() -> Result<Library> {
     }
 }
 
-/// The media elements of one page. The library loads on the first element.
 #[derive(Default)]
 pub struct Media {
     raw: Option<(NonNull<c_void>, &'static Library)>,
@@ -185,7 +180,6 @@ impl Media {
         })
     }
 
-    /// The events since the last poll as JSON text.
     pub fn poll(&mut self) -> Vec<u8> {
         let Some((raw, library)) = self.raw else {
             return b"[]".to_vec();
@@ -195,7 +189,6 @@ impl Media {
         output.finish()
     }
 
-    /// Takes the frame that element `id` shows now.
     pub fn frame(&mut self, id: u64) -> Option<renderer::RenderImage> {
         let (raw, library) = self.raw?;
         let mut frame = Frame {
@@ -216,7 +209,6 @@ impl Media {
         ))
     }
 
-    /// Gives the pixels of a frame of element `id` back, for its next frames.
     pub fn recycle(&mut self, id: u64, image: renderer::RenderImage) {
         let Some((raw, library)) = self.raw else {
             return;

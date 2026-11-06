@@ -34,8 +34,8 @@ struct State {
 }
 
 impl App {
-    /// Registers a handler for `ipcRenderer.invoke()`. Handlers run on a small thread pool, so a
-    /// handler that never returns should start its own thread and report with [`AppHandle`].
+    // WARNING: registers a handler for `ipcRenderer.invoke()`. Handlers run on a small thread pool, so a
+    // handler that never returns should start its own thread and report with [`AppHandle`].
     pub fn handle(
         &self,
         channel: &str,
@@ -51,7 +51,6 @@ impl App {
         Ok(())
     }
 
-    /// Returns a handle that other threads can use.
     pub fn app_handle(&self) -> AppHandle {
         AppHandle(self.0.link.clone())
     }
@@ -61,13 +60,10 @@ impl App {
     }
 }
 
-/// Reaches the app from any thread.
 #[derive(Clone)]
 pub struct AppHandle(Link);
 
 impl AppHandle {
-    /// Emits `channel` to `ipcRenderer.on()` listeners in the preload of `window`. The event is
-    /// dropped when the window is closed or has no preload.
     pub fn send(&self, window: u64, channel: &str, value: Value) {
         self.0.page(ToPage::Bridge(
             window,

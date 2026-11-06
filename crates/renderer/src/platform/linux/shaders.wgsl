@@ -5,7 +5,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 fn color_brightness(color: vec3<f32>) -> f32 {
-    // REC. 601 luminance coefficients for perceived brightness
     return dot(color, vec3<f32>(0.30, 0.59, 0.11));
 }
 
@@ -33,7 +32,6 @@ fn apply_contrast_and_gamma_correction(sample: f32, color: vec3<f32>, enhanced_c
     return apply_alpha_correction(contrasted, brightness, gamma_ratios);
 }
 
-// The render target covers `viewport_size` device pixels from `viewport_origin` of the window.
 struct Globals {
     gamma_ratios: vec4<f32>,
     viewport_size: vec2<f32>,
@@ -83,7 +81,7 @@ struct ContentMask {
     radii: Radii,
 }
 
-// Four floats, not `vec4<f32>`, which WGSL aligns to 16 bytes.
+// WARNING: four floats, not `vec4<f32>`, which WGSL aligns to 16 bytes.
 struct Rgba {
     r: f32,
     g: f32,
@@ -152,7 +150,6 @@ fn gaussian(x: f32, sigma: f32) -> f32{
     return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * M_PI_F) * sigma);
 }
 
-// An approximation of the error function, for the gaussian integral.
 fn erf(v: vec2<f32>) -> vec2<f32> {
     let s = sign(v);
     let a = abs(v);
@@ -171,9 +168,6 @@ fn blur_along_x(x: f32, y: f32, sigma: f32, corner: vec2<f32>, half_size: vec2<f
   return integral.y - integral.x;
 }
 
-// The radii and the sides (-1 for left or top, 1 for right or bottom) of the corner whose box
-// holds the point, else of the point's quadrant. Radii can pass the middle of a side when the
-// opposite corner is smaller. A corner with one zero radius is square.
 fn pick_corner(center_to_point: vec2<f32>, half_size: vec2<f32>, radii: Radii) -> vec4<f32> {
     let c = center_to_point;
     let tl = vec2<f32>(radii.x.top_left, radii.y.top_left);
@@ -197,7 +191,6 @@ fn pick_corner(center_to_point: vec2<f32>, half_size: vec2<f32>, radii: Radii) -
     return vec4<f32>(select(vec2<f32>(0.0), radius, radius.x > 0.0 && radius.y > 0.0), side);
 }
 
-// Signed distance to the quad's outer edge: positive outside, negative inside.
 fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Radii) -> f32 {
     let half_size = bounds.size / 2.0;
     let center = bounds.origin + half_size;
@@ -220,11 +213,8 @@ fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: vec2<f32>) ->
         let k1 = length(corner_center_to_point / (corner_radius * corner_radius));
         return k0 * (k0 - 1.0) / k1;
     } else {
-        // Signed distance to the quad inset by the radius: negative inside, positive outside.
         let signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside.
             length(max(vec2<f32>(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside.
             min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
 
         return signed_distance_to_inset_quad - corner_radius.x;
@@ -235,7 +225,6 @@ fn window_position(position: vec4<f32>) -> vec2<f32> {
     return position.xy + globals.viewport_origin;
 }
 
-// Coverage of the rounded part of a content mask.
 fn mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     if (mask.radii.x.top_left == 0.0 && mask.radii.x.top_right == 0.0 &&
             mask.radii.x.bottom_right == 0.0 && mask.radii.x.bottom_left == 0.0) {
@@ -244,7 +233,6 @@ fn mask_alpha(position: vec2<f32>, mask: ContentMask) -> f32 {
     return saturate(0.5 - quad_sdf(position, mask.rounded, mask.radii));
 }
 
-// Premultiplies the color when the target uses premultiplied alpha.
 fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
     let alpha = color.a * alpha_factor;
     let multiplier = select(1.0, alpha, globals.premultiplied_alpha != 0u);
@@ -267,7 +255,7 @@ struct QuadVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) border_color: vec4<f32>,
     @location(1) @interpolate(flat) quad_id: u32,
-    // Naga has no `clip_distance`, so fragments clip with these.
+    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
     @location(2) clip_distances: vec4<f32>,
     @location(3) @interpolate(flat) background_color: vec4<f32>,
 }
@@ -296,7 +284,6 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 }
 
 fn quad_color(input: QuadVarying) -> vec4<f32> {
-    // Clip here, since there is no `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -323,11 +310,8 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
     let point = window_position(input.position) - quad.bounds.origin;
     let center_to_point = point - half_size;
 
-    // The SDF threshold for including a pixel: 0.5 is the shortest distance from a pixel's center
-    // to its edge.
     let antialias_threshold = 0.5;
 
-    // Radii and sides of the nearest corner
     let corner = pick_corner(center_to_point, half_size, quad.corner_radii);
     let corner_radius = corner.xy;
     let left = corner.z < 0.0;
@@ -337,23 +321,19 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
         select(quad.border_widths.right, quad.border_widths.left, left),
         select(quad.border_widths.bottom, quad.border_widths.top, top));
 
-    // Zero-width borders turn negative so that `inner_sdf >= antialias_threshold`, which draws no
+    // WARNING: zero-width borders turn negative so that `inner_sdf >= antialias_threshold`, which draws no
     // anti-aliasing pixels for them.
     let reduced_border =
         vec2<f32>(select(border.x, -antialias_threshold, border.x == 0.0),
                   select(border.y, -antialias_threshold, border.y == 0.0));
 
-    // Far borders wider than half the quad reach past its center, like the top border of an empty `<hr>`.
     let far_border = vec2<f32>(
         select(quad.border_widths.left, quad.border_widths.right, left),
         select(quad.border_widths.top, quad.border_widths.bottom, top));
     let reduced_far_border = select(far_border, vec2<f32>(-antialias_threshold), far_border == vec2<f32>(0.0));
 
-    // From the corner of the quad to the point, mirrored into the bottom right quadrant. Both
-    // components are <= 0.
     let corner_to_point = corner.zw * center_to_point - half_size;
 
-    // From the center of the rounded corner to the point, also mirrored.
     let corner_center_to_point = corner_to_point + corner_radius;
 
     let is_near_rounded_corner =
@@ -375,12 +355,8 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
         return blend_color(background_color, 1.0);
     }
 
-    // Positive outside the outer edge, negative inside.
     let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
 
-    // Approximate signed distance to the inner edge of the border: negative within the border,
-    // positive inside it. Rounded corners with varying border widths approximate the ellipse, and
-    // -1.0 marks points known to be outside the edge.
     var inner_sdf = 0.0;
     if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
         inner_sdf = -max(straight_border_inner_corner_to_point.x,
@@ -394,16 +370,12 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
     }
 
-    // Negative when inside the border
     let border_sdf = max(inner_sdf, outer_sdf);
 
     var color = background_color;
     if (border_sdf < antialias_threshold) {
         var border_color = input.border_color;
 
-        // A quad of some sides keeps their pixels. A pixel belongs to the side with the least depth into the
-        // border over the side's width, so neighbors meet on the line from the outer corner to the inner one,
-        // like CSS.
         let sides = quad.border_style >> 8u;
         if (sides != 0u) {
             let widths = vec4<f32>(quad.border_widths.top, quad.border_widths.right,
@@ -419,7 +391,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                     if ((sides & (1u << b)) != 0u || widths[b] <= 0.0) {
                         continue;
                     }
-                    // Distance to where side b takes over, along the normal of that line.
                     let scale = select(widths[a] + widths[b], length(vec2<f32>(widths[a], widths[b])), (a + b) % 2u == 1u);
                     nearest = min(nearest, (depths[b] * widths[a] - depths[a] * widths[b]) / scale);
                 }
@@ -428,7 +399,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
             border_color.a *= coverage;
         }
 
-        // Exact distance to the inner edge, for the double and dotted styles.
         let inner_bounds = Bounds(
             quad.bounds.origin + vec2<f32>(quad.border_widths.left, quad.border_widths.top),
             max(vec2<f32>(0.0), quad.bounds.size - vec2<f32>(
@@ -447,41 +417,31 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                 max(0.0, quad.corner_radii.y.bottom_left - quad.border_widths.bottom)));
         let inner_depth = quad_sdf(point + quad.bounds.origin, inner_bounds, inner_radii);
 
-        // Double borders keep the outer and inner thirds.
         if ((quad.border_style & 255u) == 3u) {
             let depth = -outer_sdf;
             let width = depth + inner_depth;
             border_color.a *= saturate(antialias_threshold - min(depth - width / 3.0, width * 2.0 / 3.0 - depth));
         }
 
-        // Dashed (1) and dotted (2) border logic
         if ((quad.border_style & 255u) == 1u || (quad.border_style & 255u) == 2u) {
-            // Position along the perimeter in dash space, where each dash period has length 1.
             var t = 0.0;
 
-            // Total dash periods, so the spacing can be adjusted to divide it evenly.
             var max_t = 0.0;
 
-            // Dash size follows the border width, as in browsers, so dashes of different sides
-            // don't overlap. Dashes are 2 widths long, dots 1, and gaps 1.
             let dotted = (quad.border_style & 255u) == 2u;
             let dash_length_per_width = select(2.0, 1.0, dotted);
             let dash_gap_per_width = 1.0;
             let dash_period_per_width = dash_length_per_width + dash_gap_per_width;
 
-            // Dash periods per pixel. A velocity of 1 / 10 is one dash every 10 pixels.
             var dash_velocity = 0.0;
 
             let dv_numerator = 1.0 / dash_period_per_width;
 
             if (unrounded) {
-                // Without rounded corners, each side lays out its own dashes, so each side starts
-                // and ends with a dash.
                 let is_horizontal =
                         corner_center_to_point.x <
                         corner_center_to_point.y;
 
-                // The wider of the opposite sides, since the nearest one can have no border.
                 let dashed_border = vec2<f32>(
                         max(
                             quad.border_widths.bottom,
@@ -498,7 +458,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                 t = select(point.y, point.x, is_horizontal) * dash_velocity;
                 max_t = select(size.y, size.x, is_horizontal) * dash_velocity;
             } else {
-                // With rounded corners, dashes go clockwise around the whole perimeter.
                 let r_tr = vec2<f32>(quad.corner_radii.x.top_right, quad.corner_radii.y.top_right);
                 let r_br = vec2<f32>(quad.corner_radii.x.bottom_right, quad.corner_radii.y.bottom_right);
                 let r_bl = vec2<f32>(quad.corner_radii.x.bottom_left, quad.corner_radii.y.bottom_left);
@@ -509,13 +468,11 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                 let w_b = quad.border_widths.bottom;
                 let w_l = quad.border_widths.left;
 
-                // Straight side dash velocities
                 let dv_t = select(dv_numerator / w_t, 0.0, w_t <= 0.0);
                 let dv_r = select(dv_numerator / w_r, 0.0, w_r <= 0.0);
                 let dv_b = select(dv_numerator / w_b, 0.0, w_b <= 0.0);
                 let dv_l = select(dv_numerator / w_l, 0.0, w_l <= 0.0);
 
-                // Straight side lengths in dash space
                 let s_t = (size.x - r_tl.x - r_tr.x) * dv_t;
                 let s_r = (size.y - r_tr.y - r_br.y) * dv_r;
                 let s_b = (size.x - r_br.x - r_bl.x) * dv_b;
@@ -526,15 +483,12 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                 let corner_dash_velocity_bl = corner_dash_velocity(dv_b, dv_l);
                 let corner_dash_velocity_tl = corner_dash_velocity(dv_t, dv_l);
 
-                // Corner lengths in dash space, with the mean radius of elliptical corners. Dots
-                // follow the middle of the border.
                 let middle = select(0.0, 0.5, dotted);
                 let c_tr = max(0.0, (r_tr.x + r_tr.y) / 2.0 - middle * max(w_t, w_r)) * (M_PI_F / 2.0) * corner_dash_velocity_tr;
                 let c_br = max(0.0, (r_br.x + r_br.y) / 2.0 - middle * max(w_b, w_r)) * (M_PI_F / 2.0) * corner_dash_velocity_br;
                 let c_bl = max(0.0, (r_bl.x + r_bl.y) / 2.0 - middle * max(w_b, w_l)) * (M_PI_F / 2.0) * corner_dash_velocity_bl;
                 let c_tl = max(0.0, (r_tl.x + r_tl.y) / 2.0 - middle * max(w_t, w_l)) * (M_PI_F / 2.0) * corner_dash_velocity_tl;
 
-                // Dash space up to each segment
                 let upto_tr = s_t;
                 let upto_r = upto_tr + c_tr;
                 let upto_br = upto_r + s_r;
@@ -552,26 +506,21 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                     if (!left) {
                         if (top) {
                             dash_velocity = corner_dash_velocity_tr;
-                            // Clockwise, radians go from pi/2 to 0 here, since y is flipped.
                             t = upto_r - corner_t * dash_velocity;
                         } else {
                             dash_velocity = corner_dash_velocity_br;
-                            // Clockwise, radians go from 0 to pi/2 here.
                             t = upto_br + corner_t * dash_velocity;
                         }
                     } else {
                         if (!top) {
                             dash_velocity = corner_dash_velocity_bl;
-                            // Clockwise, radians go from pi/2 to 0 here, since x is flipped.
                             t = upto_l - corner_t * dash_velocity;
                         } else {
                             dash_velocity = corner_dash_velocity_tl;
-                            // Clockwise, radians go from 0 to pi/2 here, since both axes are flipped.
                             t = upto_tl + corner_t * dash_velocity;
                         }
                     }
                 } else {
-                    // Straight borders
                     let is_horizontal =
                             corner_center_to_point.x <
                             corner_center_to_point.y;
@@ -597,10 +546,8 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
 
             let dash_length = dash_length_per_width / dash_period_per_width;
 
-            // Straight borders start and end with a dash.
             max_t -= select(0.0, dash_length, unrounded);
             if (max_t >= 1.0) {
-                // Stretch the gaps to divide max_t evenly.
                 let dash_count = floor(max_t);
                 let dash_period = max_t / dash_count;
                 if (dotted) {
@@ -614,7 +561,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
                         antialias_threshold);
                 }
             } else if (unrounded) {
-                // Too short for a full gap between the end dashes, so shrink the gap.
                 let dash_gap = max_t - dash_length;
                 if (dash_gap > 0.0) {
                     let dash_period = dash_length + dash_gap;
@@ -628,7 +574,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
             }
         }
 
-        // Blend the border over the background, then fade to the background past the inner edge.
         let blended_border = over(background_color, border_color);
         color = mix(background_color, blended_border,
                     saturate(antialias_threshold - inner_sdf));
@@ -637,8 +582,6 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
     return blend_color(color, saturate(antialias_threshold - outer_sdf));
 }
 
-// The slower side velocity (larger dashes). A side without a border has velocity 0, not +inf,
-// so the other side's velocity is used.
 fn corner_dash_velocity(dv1: f32, dv2: f32) -> f32 {
     if (dv1 == 0.0) {
         return dv2;
@@ -649,13 +592,10 @@ fn corner_dash_velocity(dv1: f32, dv2: f32) -> f32 {
     }
 }
 
-// `t` is within the dash when `fmod(t, period) < length`.
 fn dash_alpha(t: f32, period: f32, length: f32, dash_velocity: f32, antialias_threshold: f32) -> f32 {
     let half_period = period / 2;
     let half_length = length / 2;
-    // In [-half_period, half_period]. The dash is in [-half_length, half_length].
     let centered = fmod(t + half_period - half_length, period) - half_period;
-    // Negative inside the dash.
     let signed_distance = abs(centered) - half_length;
     return saturate(antialias_threshold - signed_distance / dash_velocity);
 }
@@ -669,16 +609,12 @@ fn dot_alpha(t: f32, period: f32, dot_length: f32, dash_velocity: f32, depth: f3
     return saturate(antialias_threshold - (length(vec2<f32>(along, across)) - width / 2.0));
 }
 
-// Approximate distance to a quarter ellipse, good enough for anti-aliasing when the ellipse is
-// not very eccentric. `point` must be positive. Negative outside, positive inside.
 fn quarter_ellipse_sdf(point: vec2<f32>, radii: vec2<f32>) -> f32 {
     let circle_vec = point / radii;
     let unit_circle_sdf = length(circle_vec) - 1.0;
-    // Scales the unit circle distance by the average radius.
     return unit_circle_sdf * (radii.x + radii.y) * -0.5;
 }
 
-// Modulus that has the same sign as `a`.
 fn fmod(a: f32, b: f32) -> f32 {
     return a - b * trunc(a / b);
 }
@@ -686,17 +622,14 @@ fn fmod(a: f32, b: f32) -> f32 {
 struct Shadow {
     order: u32,
     blur_radius: f32,
-    // The shadow rect for drop shadows, the hole rect for inset shadows.
     bounds: Bounds,
     corner_radii: Radii,
     content_mask: ContentMask,
     color: Rgba,
-    // Used only by inset shadows, as a rounded clip that keeps the shadow inside the element.
     element_bounds: Bounds,
     element_corner_radii: Radii,
-    // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    pad: u32,
 }
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
 
@@ -704,7 +637,7 @@ struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) shadow_id: u32,
-    // Naga has no `clip_distance`, so fragments clip with these.
+    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -717,7 +650,6 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     if (shadow.inset != 0u) {
         geometry = shadow.element_bounds;
     } else {
-        // Room for the gaussian tail, which fades out within 3 sigma.
         let margin = 3.0 * shadow.blur_radius;
         geometry = shadow.bounds;
         geometry.origin -= vec2<f32>(margin);
@@ -734,7 +666,6 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 
 @fragment
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
-    // Clip here, since there is no `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -752,13 +683,11 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         let distance = quad_sdf(position, shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
-        // Sample only where the gaussian is not near zero.
         let low = center_to_point.y - half_size.y;
         let high = center_to_point.y + half_size.y;
         let start = clamp(-3.0 * shadow.blur_radius, low, high);
         let end = clamp(3.0 * shadow.blur_radius, low, high);
 
-        // Four samples are enough.
         let step = (end - start) / 4.0;
         var y = start + step * 0.5;
         alpha = 0.0;
@@ -770,7 +699,6 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         }
     }
 
-    // An inset shadow is the inverse of the blurred hole rect, clipped to the element.
     let inside = saturate(0.5 - quad_sdf(position, shadow.element_bounds, shadow.element_corner_radii));
     if (shadow.inset != 0u) {
         alpha = (1.0 - alpha) * inside;
@@ -796,7 +724,7 @@ struct UnderlineVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) underline_id: u32,
-    // Naga has no `clip_distance`, so fragments clip with these.
+    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -818,7 +746,6 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     const WAVE_FREQUENCY: f32 = 2.0;
     const WAVE_HEIGHT_RATIO: f32 = 0.8;
 
-    // Clip here, since there is no `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -884,7 +811,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, globals.grayscale_enhanced_contrast, globals.gamma_ratios);
 
-    // Alpha clip after using the derivatives.
+    // WARNING: alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -928,14 +855,13 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // Alpha clip after using the derivatives.
+    // WARNING: alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = b_poly_sprites[input.sprite_id];
     let position = window_position(input.position);
-    // Sprite bounds are whole device pixels, so square corners cover every pixel.
     let rx = sprite.corner_radii.x;
     let square = rx.top_left == 0.0 && rx.top_right == 0.0 && rx.bottom_right == 0.0 && rx.bottom_left == 0.0;
     var corners = 1.0;
@@ -1010,7 +936,6 @@ fn vs_composite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     return out;
 }
 
-// Samples a premultiplied texel of a texture covering `rect` of the window, transparent outside it.
 fn sample_layer(position: vec2<f32>, rect: vec4<f32>) -> vec4<f32> {
     let uv = (position - rect.xy) / rect.zw;
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
@@ -1019,8 +944,6 @@ fn sample_layer(position: vec2<f32>, rect: vec4<f32>) -> vec4<f32> {
     return textureSampleLevel(t_sprite, s_sprite, uv, 0.0);
 }
 
-// Sums gaussian taps along `direction`, one per `texel` window pixels and fewer for wide blurs.
-// Tap `i` weighs exp(-x^2 / 2 sigma^2) = q^(i^2), so each weight is the last one times q^(2i - 1).
 fn gaussian_sample(position: vec2<f32>, direction: vec2<f32>, sigma: f32, texel: f32, rect: vec4<f32>) -> vec4<f32> {
     if (sigma < 0.25) {
         return sample_layer(position, rect);
@@ -1087,7 +1010,6 @@ fn soft_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     return select(cb + (2.0 * cs - 1.0) * (d - cb), cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb), cs <= vec3<f32>(0.5));
 }
 
-// The CSS blend modes, on unpremultiplied colors.
 fn blend_mode(cb: vec3<f32>, cs: vec3<f32>, mode: u32) -> vec3<f32> {
     switch (mode) {
         case 1u: { return cb * cs; }
@@ -1166,7 +1088,6 @@ fn fs_composite(input: CompositeVarying) -> @location(0) vec4<f32> {
     if ((c.flags & COMPOSITE_BLEND) != 0u && color.a > 0.0) {
         let backdrop = textureSampleLevel(t_backdrop, s_sprite, (target_position - c.backdrop_rect.xy) / c.backdrop_rect.zw, 0.0);
         if (c.blend == 16u) {
-            // plus-lighter adds both layers.
             return vec4<f32>(min(color.rgb + backdrop.rgb, vec3<f32>(1.0)) - backdrop.rgb * (1.0 - color.a), color.a);
         }
         let cb = select(vec3<f32>(0.0), backdrop.rgb / backdrop.a, backdrop.a > 0.0);
@@ -1201,8 +1122,6 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
-// One direction of a separable blur. A target at a lower resolution covers `scale` window pixels
-// per pixel, and its taps average blocks of the source.
 @fragment
 fn fs_blur(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = b_blurs[input.blur_id];

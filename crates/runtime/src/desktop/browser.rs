@@ -103,7 +103,6 @@ impl State {
     pub fn take_attaches(&mut self) -> Vec<(u64, u64)> {
         std::mem::take(&mut self.attaches)
     }
-    /// Asks for the attach again, because the window is still on its way.
     pub fn defer_attach(&mut self, id: u64, window: u64) {
         self.attaches.push((id, window));
     }

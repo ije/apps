@@ -3,7 +3,6 @@ use crate::style::Prop;
 use renderer::{Bounds, Child, Hooks, NodeCx, Pixels, Point, Window, point, px};
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
-/// Turns a box a quarter turn for vertical writing modes.
 pub(super) struct Turned {
     clockwise: bool,
     block: f32,
@@ -12,7 +11,6 @@ pub(super) struct Turned {
 }
 
 impl Turned {
-    /// A box `block` wide and `inline` tall that holds `child` turned.
     pub(super) fn node(child: Child, clockwise: bool, block: f32, inline: f32) -> renderer::Node {
         let mut style = renderer::Style {
             position: renderer::Position::Absolute,
@@ -32,7 +30,6 @@ impl Turned {
 
     fn matrix(&self, origin: Point<Pixels>) -> super::effects::Matrix {
         let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
-        // Clockwise maps (u, v) to (block - v, u); counterclockwise to (v, inline - u).
         let mut m = super::effects::IDENTITY;
         if self.clockwise {
             [m[0], m[1], m[4], m[5]] = [0., 1., -1., 0.];
@@ -60,7 +57,6 @@ impl Hooks for Turned {
     }
 }
 
-/// Paints a box with the CSS transform of its style around itself, for pseudo-elements.
 pub(super) struct Transformed {
     pub(super) style: Rc<style::Style>,
     pub(super) units: style::Lengths,
@@ -90,10 +86,8 @@ impl Hooks for Transformed {
     }
 }
 
-/// Paints a box through an effect layer.
 pub(super) struct Effected {
     pub(super) effect: renderer::PaintEffect,
-    /// The corner radii of the effect's backdrop, which covers the box.
     pub(super) backdrop: Option<renderer::Radii<renderer::Length>>,
 }
 
@@ -110,12 +104,9 @@ impl Hooks for Effected {
     }
 }
 
-/// Where a sticky box sticks.
 pub(super) struct Sticky {
     pub(super) scroll: renderer::ScrollHandle,
-    /// The scroll container's border widths.
     pub(super) border: [f32; 4],
-    /// The containing block, with the borders and padding around its content box.
     pub(super) block: Option<(usize, [f32; 4])>,
 }
 
@@ -127,46 +118,25 @@ pub(super) struct DomBox {
     pub(super) sticky: Option<Sticky>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
-    /// The containing block of an absolute box when it is not the parent, `0` for the initial one.
     pub(super) container: Option<usize>,
-    /// The containing block size the box was laid out in, taken from the last frame.
     pub(super) sized: Option<[f32; 2]>,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
-    /// The group opacity, when the box paints through an effect layer.
     pub(super) effects: Option<f32>,
-    /// The layer is keyed by the box, see `cull::COMPOSITED`.
     pub(super) composited: bool,
-    /// The keyed layer keeps a transform, see `cull::TRANSFORMED`.
     pub(super) transformed: bool,
-    /// The parent's perspective, and the parent.
     pub(super) perspective: Option<((f32, String), usize)>,
     pub(super) units: style::Lengths,
-    /// The subtree revision to record with the bounds.
     pub(super) revision: u64,
-    /// The horizontal and vertical padding and borders.
     pub(super) sides: [f32; 2],
-    /// The margins after collapsing.
     pub(super) margin: [f32; 4],
-    /// The size of the grid cell the box fills, before layout snaps it to pixels.
     pub(super) cell: Option<[f32; 2]>,
-    /// The grid that uses the box's baselines, and whether the box aligns them. Prepaint records the
-    /// baselines, and draws the frame again when the baselines of an aligned box change.
     pub(super) grid: Option<(usize, bool)>,
-    /// For a table, its rows with their cells, then its row groups with their rows. They have no box of their
-    /// own, so their bounds are the union of their members'.
     pub(super) parts: Rc<[(usize, Vec<usize>)]>,
-    /// For a cell with collapsed borders, the half borders it shares with its neighbors, outside its box.
     pub(super) shared: Option<[f32; 4]>,
-    /// For an inline box, its height on one line and the leading above and below its font's content area,
-    /// which browsers leave out of its rectangle.
     pub(super) leading: Option<[f32; 3]>,
-    /// The box shows in place of another, like the chosen option of a closed select, and reports no box.
     pub(super) boxless: bool,
-    /// For an inline box, its first and last text and its top and bottom padding and border. Its rectangle
-    /// spans its text's, whatever else its line holds.
     pub(super) text: Option<([usize; 2], [f32; 2])>,
-    /// The bounds and transform from prepaint, for paint.
     pub(super) placed: Cell<(Bounds<Pixels>, Option<super::effects::Matrix>)>,
 }
 
@@ -174,7 +144,6 @@ impl Hooks for DomBox {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let (exact, baselines) = (cx.exact, cx.baselines);
         let window = &mut *cx.window;
-        // Positions keep layout units like Chrome; the inner element paints at snapped bounds.
         let mut bounds = exact;
         let mut offset = point(px(0.), px(0.));
         if let Some((axes, block, margin)) = self.anchor
@@ -219,7 +188,6 @@ impl Hooks for DomBox {
                     .y
                     .min(viewport.bottom() - px(bottom) - bounds.bottom());
             }
-            // A sticky box never leaves its containing block, which was laid out first.
             if let Some([x, y, width, height]) =
                 block.and_then(|(parent, [top, right, bottom, left])| {
                     let view = &*self.view;
@@ -284,8 +252,6 @@ impl Hooks for DomBox {
             offset += shift;
             bounds.origin += shift;
         }
-        // A fixed box sits at its insets and margins in the viewport. With both insets, auto margins share
-        // the free space, and a horizontal pair never goes below zero.
         if self.fixed {
             let viewport = window.viewport_size();
             for axis in 0..2 {
@@ -356,11 +322,10 @@ impl Hooks for DomBox {
         if self.transformed {
             let matrix = *matrix.get_or_insert(super::effects::IDENTITY);
             self.view
-                .spun
+                .composited_transforms
                 .borrow_mut()
                 .insert(self.id, (bounds, perspective, matrix));
         }
-        // Plain translations move the box instead of painting it through a layer.
         if !self.transformed
             && let Some([x, y]) = matrix.as_ref().and_then(super::effects::translation)
         {
@@ -557,7 +522,6 @@ impl Hooks for DomBox {
 }
 
 impl DomBox {
-    /// The rounded `clip-path` and the effect layers of the box, innermost first.
     fn effects(
         &self,
         bounds: Bounds<Pixels>,
@@ -664,7 +628,7 @@ impl DomBox {
                 }
                 let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
                     (Some(shape), Some(layers)) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"h2o-clip\">{shape}</clipPath></defs><g clip-path=\"url(#h2o-clip)\">{layers}</g></svg>"
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
                     ),
                     (Some(shape), None) => format!(
                         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
@@ -687,7 +651,6 @@ impl DomBox {
                 .get(&self.id)
                 .and_then(|(_, image)| image.clone().map(|image| (image, bounds)))
         });
-        // A hidden or transparent box filters nothing, so it skips the copy and blur of what is behind it.
         let shown = self.effects.unwrap_or(1.) > 0.
             && style
                 .get(Prop::VISIBILITY)
@@ -731,7 +694,6 @@ impl DomBox {
             || isolate
             || self.composited;
         if needed {
-            // One filter function and no clip can share the outer layer.
             if layers.len() == 1 && clip.is_none() {
                 let filter = layers.pop().unwrap();
                 layers.push(renderer::PaintEffect {
@@ -748,7 +710,6 @@ impl DomBox {
     }
 }
 
-/// Paints through the effect layers, the last one outermost.
 fn nest_effects(
     layers: &mut Vec<renderer::PaintEffect>,
     window: &mut Window,
@@ -760,7 +721,6 @@ fn nest_effects(
     }
 }
 
-/// The layers of `mask-image` as SVG content covering a box, the first layer on top.
 fn mask_svg(
     style: &style::Style,
     units: style::Lengths,
@@ -843,7 +803,7 @@ fn mask_svg(
         ) && let Some(start) = svg.find('>')
             && let Some(end) = svg.rfind("</svg>")
         {
-            // Each layer is its own SVG document, so its `id`s must not collide.
+            // WARNING: each layer is its own SVG document, so its `id`s must not collide.
             content.push_str(
                 &svg[start + 1..end]
                     .replace("id=\"", &format!("id=\"m{index}"))

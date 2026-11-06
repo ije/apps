@@ -5,7 +5,6 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
   const fresh = new WeakSet();
-  // With `buffers`, ArrayBuffers go there instead of into base64 text. `transfer` lists the objects that move.
   const encode = (value, buffers, transfer) => {
     const seen = new Map(), nodes = [];
     const visit = value => {

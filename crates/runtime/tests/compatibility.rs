@@ -1051,7 +1051,6 @@ fn node_event_targets_timerify_loop_use_and_net_addresses_match_node() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn node_dns_resolver_reads_answers_like_node() {
-    // A local DNS server with the answers that Node 24 was checked against.
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -1241,7 +1240,6 @@ fn node_fs_vectors_statfs_and_glob_match_node() {
 
 #[test]
 fn node_crypto_keys_signatures_and_kdfs_match_node() {
-    // Keys, signatures and digests below come from Node 24.
     run(r#"
         const {assert,crypto,util}=__apps,msg=Buffer.from('hello h2o'),hash=value=>crypto.createHash('sha256').update(value).digest('hex');
         const rsaDer='MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC1g8caNlHfV5pKM5XtVKZYhyipR8ftOOdvAKj8Nd1/AoU9cF42yGHO5PZxkCbIRYISOfLcGqyRqOp6kIPisVHvA/ixKUdGX0xEoCVhbHWMTTWiXlXXe+vnVcFbRMyMWA9sf6fDzlV1a1N75AnPzHfpbWsrLoS3gvZnsWE0TYHQeRRH5iz/VsMc62IJIhnPEhy1AiFCtKd4guycGbi5oT+HTfIy4Sw4xUrfjIB7H7Xn54mVeDR4dDEXtv/PQYtP1Wuq9NgPy0gFZ8fu7ENwyDBZY0QQ6/kzVgMua6C9DVxnFA2hTgnLO+AQLLaRN5iKWzfjQ4iz4harp0Nmze/Va7v7AgMBAAECggEAGWakr6yHU4pg+zOcg6xTZP3GY74O98mn9Wwxua2uCTk957r4VuaUGA20K8Xg734ZStn/fEFirIrnWUSCTZsZMf9WcjBVGuojdFJhjhsimKzbWGqmzPNjWqmxAnKDxLteroUaDI2CKbQzEsTMLLSv2SN976U1tFqS3IWW6pNSxcIBg4fSub9PgVwoo4SoOcr6njftKrH/U3D65TsoYshy8wEkbpIL7zOiaW3TuLceQMx9U6rEtEGza92mVKOsRTqNluOvXJr/nmQcrNxpShf9A3sXfz7TgHkAbUFwWKT8UYY0oIiFvMhirOulx14mbSOKqcUOx8QqTMxlHVuzXnVBpQKBgQD7RM2ALY7niUqjpb+/jUsfh+iexOXmdg9Cks0beiI3ZlRD4BCYkLTS55PtRqLi7vKY/nFlyPwvOVS3G1UFNiHQJJSqeu1hLR8X7vYwX3ZD/TuipAn8XaWSLu/xzZnLpEqne887QQuiVjqP3XhpUcQVIQChPFj94WaAciGfAQi5pwKBgQC47rzs4j+qPnWCoS+Vvf3bBxgVrlJM+q7ss7XLQYK26mNFPKboBeJzLzD6v83VtwlqYbynZqndgmgfKy4NrxrGyIJde34cLUPXt4qtbyhdxN6fjOP+wwBA9fpIUW7IswwlOz/yerPI9JHAMZs/MFjzKrP+nenfD6eVZy4CglANjQKBgQDmblSfxigWAnxm06yjuKo6QmN8p0nHLmIURZjAKCOU9s00ahoOMDcEa8fnhC4BO+1TjZTlKYrMrCEaw4AXBWvA/KsyJQXpZn3rbwRrnEBTXbsBDrrxq9gZ1d3KvSjb7tFgA1UrHB3VRIr0QMEapRfT4K45L6TVP47HIOPgdAxSZQKBgQCsSQXK7hB/ywZwtzd8mm6oIZjHggp8WsKiE94WSKa9P+lRtGqOGAVaZ6mKwSvCoW3tJLa7gcJYccgM2Y5jAzG/5UbGTmkzWNwuWHiikL8bdHAuVfSGACb5Xe9YdjzuTxfOi79MaBGb8nTih5RpLuJ/T9Y2K+mYfJ4UavaLMdngdQKBgQCn537D4+XAgxJKf0Z6fjSz1vUi39Tcmsn+oV7+nf7U8RfehFl69HarNpem5rfjmaUnghOSgd6gJVYPzlCI6AcyQfGdYUjeRxfl5/mWMtzSGX7rEM4wkhJVlmPAP3qth3i5zSfQ8/Mp8jX/+gn/FglHTOMOJDlncL8zJTi+FTEfuQ==';

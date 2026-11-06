@@ -145,20 +145,14 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
     source.len()
 }
 
-/// Match results and their dependencies, by selector address, node, scope and combinator flag.
 type Matches = rustc_hash::FxHashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[Dependency]>)>;
 
-/// Element children positions of one parent: index, count, index among the same tag, count of that tag.
 type Positions = Rc<HashMap<usize, [usize; 4]>>;
 
 type NthPositions = Rc<(rustc_hash::FxHashMap<usize, usize>, Vec<Dependency>)>;
 
-/// A node and dependency kind as `id * KINDS + kind`, with its revision when a result read it.
 pub(crate) type Dependency = (u32, u32);
 
-/// A node as selectors last saw it: a value and a revision per dependency kind, which are tag and attributes,
-/// parent, children, emptiness, tag, state, and the `style` attribute. Values are hashes, since a copy of every
-/// node per scope costs far more than the rare missed change.
 // WARNING: the `style` attribute has a kind of its own, so script that sets styles keeps the matches of the
 // subtree. Only the node's own style and `[style]` selectors depend on it.
 // WARNING: revisions come from one counter, so a freed node's snapshot can go: values that depended on it
@@ -172,27 +166,20 @@ const KINDS: usize = 7;
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
-    /// The attributes the scope's selectors read.
     pub(crate) attributes: rustc_hash::FxHashSet<String>,
     nodes: Vec<Snapshot>,
-    /// The document revision of each node when `nodes` last compared it.
     seen: Vec<u64>,
     values: Matches,
-    /// Dependencies stored in `values`, to bound its memory.
     size: usize,
     positions: rustc_hash::FxHashMap<usize, (u32, Positions)>,
-    /// `:nth-child(An+B of S)` positions by selector list, parent and scope: each matching child's index,
-    /// and what matching S on the children depends on.
     nth: rustc_hash::FxHashMap<(usize, usize, Option<usize>), NthPositions>,
     pub(crate) dependencies: Vec<Dependency>,
-    /// The last revision given to a node.
     revision: u32,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<u32>)>,
 }
 
 impl SelectorCache {
-    /// Drops the snapshot of a node that left the document.
     pub fn forget(&mut self, id: usize) {
         if let Some(snapshot) = self.nodes.get_mut(id) {
             *snapshot = Snapshot::default();
@@ -200,7 +187,6 @@ impl SelectorCache {
         }
     }
 
-    /// Drops what the next matches can compute again, and the room for ids past `len`.
     pub fn trim(&mut self, len: usize) {
         self.values = Default::default();
         self.size = 0;
@@ -511,8 +497,6 @@ impl Selector {
         Ok(())
     }
 
-    /// Interaction states and `:has()` used here; nested `&` lists are added to `parents`.
-    /// Adds the attributes that the selector reads, without those of `&` parents.
     pub(crate) fn attributes(&self, names: &mut rustc_hash::FxHashSet<String>) {
         if let Some((_, previous)) = &self.previous {
             previous.attributes(names);
@@ -722,13 +706,10 @@ impl Selector {
         source
     }
 
-    /// Parses a stylesheet selector list; an invalid list gives no selectors.
     pub(crate) fn parse(source: &str, parent: Option<&SelectorList>) -> Vec<Self> {
         Self::list(source, parent, false, true).unwrap_or_default()
     }
 
-    /// Parses a selector list of a page query, which also rejects unknown pseudo-classes and
-    /// pseudo-elements. Lists past the nesting and length limits match nothing.
     pub(crate) fn try_parse(source: &str) -> anyhow::Result<Vec<Self>> {
         Self::list(source, None, true, true)
             .ok_or_else(|| anyhow::anyhow!("SyntaxError: '{source}' is not a valid selector"))
@@ -1109,9 +1090,6 @@ impl Selector {
                                 || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
                         }),
                         "has" => {
-                            // A relative selector starts at the children (`>`, ` `) or at the next element
-                            // siblings (one per leading `+`, all after a `~`), and each later `>` or ` ` goes one
-                            // level or any number of levels deeper.
                             let (mut children, mut siblings, mut depth) = (false, 0usize, 0usize);
                             for selector in parsed {
                                 let (mut levels, mut steps, mut current) =
@@ -1586,7 +1564,6 @@ impl Selector {
                 }
             }
         })();
-        // A compound without combinators or nested lists is as cheap to match again as to look up.
         if compound {
             return result;
         }

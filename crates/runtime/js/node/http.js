@@ -72,8 +72,8 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
       this.listening=true;queueMicrotask(()=>this.emit('listening'));return this;
     }
     _handle(request,server){return new Promise(resolve=>{
-      const socket=new RequestSocket(server.requestIP(request),this.address()),req=new IncomingMessage(socket),u=new URL(request.url);
-      Object.assign(headersOf(request.headers,req),{method:request.method,url:u.pathname+u.search,_body:request.body});
+      const socket=new RequestSocket(server.requestIP(request),this.address()),req=new IncomingMessage(socket),url=new URL(request.url);
+      Object.assign(headersOf(request.headers,req),{method:request.method,url:url.pathname+url.search,_body:request.body});
       const res=new ServerResponse(req);res._resolve=resolve;
       this._active.add(socket);socket.once('close',()=>this._active.delete(socket));res.once('close',()=>socket.destroy());
       if(this.timeout)socket.setTimeout(this.timeout,()=>{if(!this.emit('timeout',socket))socket.destroy();});
@@ -90,7 +90,6 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     constructor(options={}){super();Object.assign(this,{options:{path:null,...options},keepAlive:!!options.keepAlive,keepAliveMsecs:options.keepAliveMsecs??1000,maxSockets:options.maxSockets??Infinity,maxFreeSockets:options.maxFreeSockets??256,maxTotalSockets:options.maxTotalSockets??Infinity,defaultPort:80,protocol:'http:',requests:{},sockets:{},freeSockets:{}});}
     destroy(){}
   }
-  const errno=code=>{const value=globalThis.__apps?.os.constants.errno[code];return value===undefined?undefined:-value;};
   const failure=(error,url)=>{
     const message=String(error?.message??error),number=/os error (\d+)/.exec(message)?.[1],code=number&&Object.keys(globalThis.__apps?.os.constants.errno??{}).find(name=>globalThis.__apps.os.constants.errno[name]===+number);
     if(code)return net.failure({code,errno:-number,syscall:/connect/i.test(message)?'connect':'read',address:url.hostname.replace(/^\[|\]$/g,''),port:+url.port||(url.protocol==='https:'?443:80)});
@@ -102,7 +101,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     constructor(input,options,callback){
       super({autoDestroy:false});
       if(typeof options==='function'){callback=options;options={};}
-      if(typeof input==='string'||input instanceof URL){const u=new URL(input);options={protocol:u.protocol,hostname:u.hostname.replace(/^\[|\]$/g,''),port:u.port,path:u.pathname+u.search,...(u.username||u.password?{auth:`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`}:{}),...options};}else options={...input,...options};
+      if(typeof input==='string'||input instanceof URL){const url=new URL(input);options={protocol:url.protocol,hostname:url.hostname.replace(/^\[|\]$/g,''),port:url.port,path:url.pathname+url.search,...(url.username||url.password?{auth:`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`}:{}),...options};}else options={...input,...options};
       const protocol=options.protocol??'http:',host=options.hostname||options.host||'localhost',port=options.port??options.defaultPort;
       this._url=new URL(`${protocol}//${host.includes(':')?`[${host}]`:host}${port?':'+port:''}${options.path??'/'}`);
       Object.assign(this,{method:(options.method??'GET').toUpperCase(),path:options.path??'/',host,protocol,agent:options.agent,reusedSocket:false,maxHeadersCount:null,aborted:false,res:null,socket:new RequestSocket(null,null),_chunks:[],_abort:new AbortController()});

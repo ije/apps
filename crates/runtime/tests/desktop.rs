@@ -665,7 +665,6 @@ fn native_browser_window_extras_and_child_windows() {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    // Lists the app's windows as the window server sees them.
     let lister = r#"
         #import <Foundation/Foundation.h>
         #import <CoreGraphics/CoreGraphics.h>

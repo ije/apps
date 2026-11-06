@@ -191,7 +191,7 @@ unsafe fn build_view_class() -> *const AnyClass {
             sel!(viewDidChangeEffectiveAppearance),
             view_did_change_effective_appearance as extern "C" fn(_, Sel),
         );
-        // Keeps AppKit from beeping on keys with modifiers.
+        // WARNING: keeps AppKit from beeping on keys with modifiers.
         decl.add_method(
             sel!(doCommandBySelector:),
             do_command_by_selector as extern "C" fn(_, Sel, Sel),
@@ -320,7 +320,6 @@ struct TrafficLightButtons {
     zoom: Retained<NSButton>,
 }
 
-/// What the render thread reads of a native window, which only the main thread can touch.
 #[derive(Clone, Copy, Default)]
 struct Mirror {
     scale: f32,
@@ -329,8 +328,6 @@ struct Mirror {
     state: WindowState,
 }
 
-/// The display link frames of a window. The main thread knows where the window is, and the render
-/// thread whether it wants frames, so frames don't wait for a busy main thread.
 struct Frames {
     source: WindowFrameSource,
     wants: bool,
@@ -355,10 +352,8 @@ impl Frames {
     }
 }
 
-/// How long `displayLayer` waits for the frame of a new size.
 const RESIZE_WAIT: Duration = Duration::from_millis(8);
 
-/// A display link tick, which draws a frame on the render thread unless one is on its way.
 struct Tick {
     callbacks: Callbacks,
     pending: AtomicBool,
@@ -386,9 +381,7 @@ extern "C" fn free_tick(context: *mut c_void) {
     drop(unsafe { Arc::from_raw(context as *const Tick) });
 }
 
-/// Draws a frame on the render thread.
 fn step(callbacks: Callbacks) {
-    // An idle window stops its display link, so it gets no callbacks until it changes.
     if callbacks.frame() == Some(false) {
         callbacks.with(|window, _| window.platform.stop_frames());
     }
@@ -401,7 +394,6 @@ struct State {
     layer: Retained<CAMetalLayer>,
     mirror: Arc<Mutex<Mirror>>,
     frames: Arc<Mutex<Frames>>,
-    /// The last mouse move or wheel event, while a busy page has not taken it.
     motion: Option<Arc<Mutex<Option<PlatformInput>>>>,
     cursor: CursorStyle,
     last_key_equivalent: Option<KeyDownEvent>,
@@ -410,12 +402,8 @@ struct State {
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
     synthetic_drag_counter: usize,
-    /// The next left click also focuses the window.
     first_mouse: bool,
-    /// The newest left press or drag, for a window move that the page starts later.
     last_press: Option<Retained<AnyObject>>,
-    /// The whole view is app-owned title bar content, so AppKit neither drags the window from it
-    /// nor delays title bar clicks. The app moves the window with `start_window_move`.
     app_owns_titlebar_drag: bool,
     traffic_light_position: Option<Point<Pixels>>,
     traffic_light_frames: Option<TrafficLightFrames>,
@@ -424,11 +412,8 @@ struct State {
     is_exiting_fullscreen: bool,
     closed: bool,
     focusable: bool,
-    /// The content ratio and the extra size it leaves out, kept while the user resizes.
     aspect: Option<(f64, NSSize)>,
-    /// The parent window, joined while this one is shown.
     parent: Option<objc2::rc::Weak<NSWindow>>,
-    /// Shown as a sheet of the parent.
     sheet: bool,
 }
 
@@ -451,7 +436,7 @@ impl State {
             .native_window()
             .screen()
             .map_or(2., |screen| screen.backingScaleFactor() as f32);
-        // AppKit can report 0 for a window without a screen.
+        // WARNING: AppKit can report 0 for a window without a screen.
         if factor == 0. { 2. } else { factor }
     }
 
@@ -513,7 +498,6 @@ impl State {
         }
     }
 
-    /// Publishes the window's state to the render thread.
     fn update_mirror(&self) {
         *self.mirror.lock().unwrap_or_else(PoisonError::into_inner) = Mirror {
             scale: self.scale_factor(),
@@ -523,13 +507,12 @@ impl State {
         };
     }
 
-    /// Tells the frames where the window is now.
     fn locate_frames(&self) {
         // SAFETY: plain property reads on a live window.
         let screen: *mut AnyObject = unsafe { msg_send![self.native_window, screen] };
         let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
         frames.visible = self.is_visible();
-        // AppKit can report no screen while displays are reconfigured.
+        // WARNING: AppKit can report no screen while displays are reconfigured.
         frames.display = display_id_for_screen(screen);
         frames.sync();
     }
@@ -570,7 +553,7 @@ impl State {
         if self.traffic_light_frames.is_none() {
             self.traffic_light_frames = self.capture_traffic_light_frames();
         }
-        // AppKit can recreate the standard buttons, so each layout reads the live views.
+        // WARNING: AppKit can recreate the standard buttons, so each layout reads the live views.
         let Some(buttons) = self.traffic_light_buttons() else {
             return;
         };
@@ -622,7 +605,6 @@ impl State {
 
 type Shared = Rc<RefCell<State>>;
 
-/// What the render thread keeps of a native window that the main thread opened.
 struct Opened {
     window: *mut AnyObject,
     view: NonNull<AnyObject>,
@@ -697,7 +679,7 @@ fn open_native(
         anyhow::ensure!(!native_view.is_null(), "AppKit did not create the view");
         if options.transparent {
             let () = msg_send![native_window, setOpaque: Bool::NO];
-            // Not `clearColor`, which breaks the window shadow.
+            // WARNING: not `clearColor`, which breaks the window shadow.
             let color = NSColor::colorWithSRGBRed_green_blue_alpha(0., 0., 0., 0.0001);
             let () = msg_send![native_window, setBackgroundColor: &*color];
         }
@@ -761,7 +743,7 @@ fn open_native(
             let () = msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
         }
         let () = msg_send![native_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
-        // Views become layer backed on their own after joining a window, which breaks the
+        // WARNING: views become layer backed on their own after joining a window, which breaks the
         // Metal layer, so this one is layer backed from the start.
         let () = msg_send![native_view, setWantsLayer: Bool::YES];
         let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
@@ -778,7 +760,7 @@ fn open_native(
         if options.show {
             let () = msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
         }
-        // The origin from `initWithContentRect` can be off when the key screen is not the primary one.
+        // WARNING: the origin from `initWithContentRect` can be off when the key screen is not the primary one.
         let () = msg_send![native_window, setFrameTopLeftPoint: rect.origin];
         if options.frameless {
             set_button_visibility(&state, false);
@@ -821,7 +803,7 @@ fn set_button_visibility(state: &Shared, visible: bool) {
     }
 }
 
-/// The strong reference to a native window. AppKit must release it on the main thread.
+// WARNING: the strong reference to a native window. AppKit must release it on the main thread.
 struct NativeRef(*mut AnyObject);
 // SAFETY: only the main thread sends the window messages.
 unsafe impl Send for NativeRef {}
@@ -837,7 +819,6 @@ impl Drop for NativeRef {
     }
 }
 
-/// What any thread can ask of a native window, without the thread that draws it.
 #[derive(Clone)]
 pub struct WindowControl {
     native: Arc<NativeRef>,
@@ -848,8 +829,6 @@ pub struct WindowControl {
 unsafe impl Send for WindowControl {}
 unsafe impl Sync for WindowControl {}
 
-/// The render thread's side of a native window: its Metal renderer, and what it reads and asks of
-/// the window on the main thread.
 pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
@@ -909,7 +888,6 @@ impl Window {
         self.control.mirror().content
     }
 
-    /// Starts display link frames until a frame wants no more.
     pub fn request_frame(&self) {
         let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
         frames.wants = true;
@@ -944,7 +922,6 @@ impl Window {
         self.renderer.borrow_mut().set_presents_with_transaction(on);
     }
 
-    /// Draws once even when the window is hidden or covered, for captures.
     pub fn force_frame(&self) {
         let callbacks = self.callbacks;
         post(callbacks.thread, Box::new(move || step(callbacks)));
@@ -954,7 +931,6 @@ impl Window {
         self.renderer.borrow_mut().draw(scene, capture)
     }
 
-    /// See [`super::metal::Renderer::promote`].
     pub fn promote(
         &self,
         key: u64,
@@ -981,8 +957,6 @@ impl Window {
         self.control.mirror().state
     }
 
-    /// See [`WindowControl::change`]. The layer also turns transparent now, so the next frame
-    /// clears to transparent.
     pub fn change(&self, change: WindowChange) {
         if let WindowChange::Vibrancy(material, _) = change {
             self.renderer
@@ -1029,7 +1003,6 @@ impl WindowControl {
         Some(self.mirror().state)
     }
 
-    /// Runs `f` with the window on the main thread, unless it closed by then.
     fn later(&self, f: impl FnOnce(&NSWindow, &Shared) + Send + 'static) {
         let native = self.native.clone();
         native_post(Box::new(move || {
@@ -1217,7 +1190,6 @@ impl WindowControl {
                                             NSAutoresizingMaskOptions::ViewWidthSizable
                                                 | NSAutoresizingMaskOptions::ViewHeightSizable,
                                         );
-                                        // NSVisualEffectBlendingModeBehindWindow
                                         let () = msg_send![&*view, setBlendingMode: 0isize];
                                         content.addSubview_positioned_relativeTo(
                                             &view,
@@ -1254,7 +1226,6 @@ impl WindowControl {
         self.change(WindowChange::Show(true));
     }
 
-    /// Resizes the content area.
     pub fn resize(&self, size: Size<Pixels>) {
         self.later(move |window, _| {
             window.setContentSize(NSSize::new(size.width.0 as f64, size.height.0 as f64))
@@ -1281,7 +1252,6 @@ impl WindowControl {
         });
     }
 
-    /// Does what the user set for a double click on a title bar.
     pub fn titlebar_double_click(&self) {
         self.later(|window, _| {
             // SAFETY: NSUserDefaults reads and plain window actions.
@@ -1345,8 +1315,6 @@ impl Drop for Window {
     }
 }
 
-/// Joins the parent window, as its sheet or as a child above it. Returns whether it is a sheet,
-/// which AppKit shows itself.
 fn attach(window: &NSWindow, state: &Shared) -> bool {
     let Some((parent, sheet)) = state
         .try_borrow()
@@ -1378,7 +1346,6 @@ fn detach(window: &NSWindow) {
     }
 }
 
-/// Tells the view about a window change after the current event.
 fn report_change(state: &Shared) {
     let callbacks = state.try_borrow().map(|state| {
         state.update_mirror();
@@ -1389,7 +1356,6 @@ fn report_change(state: &Shared) {
     }
 }
 
-/// Merges `new` into the waiting `old`, when it only moves further.
 fn merge_motion(old: &mut PlatformInput, new: &PlatformInput) -> bool {
     match (old, new) {
         (PlatformInput::MouseMove(old), PlatformInput::MouseMove(new))
@@ -1418,8 +1384,6 @@ fn merge_motion(old: &mut PlatformInput, new: &PlatformInput) -> bool {
     }
 }
 
-/// Sends a mouse or wheel event to the render thread. A busy page gets the newest mouse move and
-/// the sum of the wheel events, as AppKit does for a busy main thread.
 fn send_pointer(state: &Shared, callbacks: Callbacks, input: PlatformInput) {
     let motion = matches!(
         input,
@@ -1491,7 +1455,6 @@ unsafe fn is_ours(window: *mut AnyObject) -> bool {
     unsafe { msg_send![window, isKindOfClass: classes().0] }
 }
 
-/// The window state of one of our windows or views.
 unsafe fn get_state(object: &AnyObject) -> Option<Shared> {
     unsafe {
         let raw = *object
@@ -1519,7 +1482,6 @@ unsafe fn drop_state(object: &AnyObject) {
     }
 }
 
-/// The callbacks of a window, read without holding its state.
 fn callbacks(this: &AnyObject) -> Option<Callbacks> {
     // SAFETY: AppKit calls these methods on our classes only.
     let state = unsafe { get_state(this) }?;
@@ -1551,7 +1513,6 @@ extern "C" fn dealloc_view(this: &AnyObject, _: Sel) {
 fn add_mouse_tracking_area(view: &NSView) {
     let options = NSTrackingAreaOptions::MouseEnteredAndExited
         | NSTrackingAreaOptions::MouseMoved
-        // Inactive windows still see the mouse, for hover.
         | NSTrackingAreaOptions::ActiveAlways
         | NSTrackingAreaOptions::InVisibleRect;
     // SAFETY: the view owns and retains the tracking area.
@@ -1593,7 +1554,6 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
             CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
             CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
             CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
-            // Undocumented private class methods.
             CursorStyle::ResizeUpLeftDownRight => {
                 msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
             }
@@ -1627,8 +1587,6 @@ extern "C" fn handle_key_down(this: &AnyObject, _: Sel, event: *mut AnyObject) {
     handle_key_event(this, event, false);
 }
 
-/// Whether the input source composes text, like Japanese or Chinese input methods, as opposed
-/// to keyboard layouts and ASCII modes like Japanese Romaji.
 unsafe fn is_ime_input_source_active() -> bool {
     unsafe {
         let source = TISCopyCurrentKeyboardInputSource();
@@ -1673,7 +1631,7 @@ fn input_context_handles(this: &AnyObject, event: *mut AnyObject) -> bool {
     }
 }
 
-// Things to test when changing this:
+// WARNING: things to test when changing this:
 //  U.S. layout: `alt-t` reaches the app; typing `j k` in a field inserts both characters.
 //  Brazilian layout: `" space` types an unmarked quote, `" backspace` deletes the marked quote.
 //  Japanese input: `a i left down up enter enter` types 愛, and `j i` types じ.
@@ -1693,7 +1651,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
     };
     match input {
         PlatformInput::KeyDown(down) => {
-            // AppKit sends some keys as a key equivalent, then again as a key down when that was
+            // WARNING: AppKit sends some keys as a key equivalent, then again as a key down when that was
             // not handled. The second one is skipped.
             let same = |a: &KeyDownEvent, b: &KeyDownEvent| {
                 a.keystroke == b.keystroke && a.is_held == b.is_held
@@ -1712,7 +1670,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
             let modifiers = keystroke.modifiers;
             let plain = !modifiers.control && !modifiers.function && !modifiers.platform;
             let composing = callbacks.marked_text_range().is_some();
-            // Composed keys, keys without text (arrows, escape) and printable keys of a composing
+            // WARNING: composed keys, keys without text (arrows, escape) and printable keys of a composing
             // input method go to the input method first. It calls `doCommandBySelector:` for keys
             // it does not want, which sends them to the app.
             let ime_printable = !composing
@@ -1750,7 +1708,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
                 callbacks.replace_text_in_range(None, text);
                 return Bool::YES;
             }
-            // Key equivalents with modifiers other than fn stay with AppKit, or cmd-` stops working.
+            // WARNING: key equivalents with modifiers other than fn stay with AppKit, or cmd-` stops working.
             if key_equivalent
                 && modifiers
                     != (Modifiers {
@@ -1785,7 +1743,6 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
         return;
     };
     match &mut input {
-        // A ctrl-left click is a right click on macOS.
         PlatformInput::MouseDown(
             down @ MouseDownEvent {
                 button: MouseButton::Left,
@@ -1806,7 +1763,6 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
             down.first_mouse = true;
             lock.first_mouse = false;
         }
-        // The matching left up of a ctrl-left click is a right up.
         PlatformInput::MouseUp(
             up @ MouseUpEvent {
                 button: MouseButton::Left,
@@ -1844,8 +1800,6 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
                 ..
             },
         ) => {
-            // Drags repeat while the button is held, so a selection keeps scrolling when the
-            // mouse rests outside the window. File drags make their own events.
             if !lock.external_files_dragged {
                 lock.synthetic_drag_counter += 1;
                 synthetic_drag(
@@ -1861,7 +1815,6 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
             drop(lock);
         }
         PlatformInput::ModifiersChanged(changed) => {
-            // Only real changes are sent.
             if lock.last_modifiers.as_ref().is_some_and(|last| {
                 last.modifiers == changed.modifiers && last.capslock == changed.capslock
             }) {
@@ -1887,7 +1840,7 @@ fn synthetic_drag(state: Weak<RefCell<State>>, id: usize, event: MouseMoveEvent)
             if lock.synthetic_drag_counter != id {
                 return;
             }
-            // A menu can take the mouse up, so the button must still be down.
+            // WARNING: A menu can take the mouse up, so the button must still be down.
             let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
             let bit = match event.pressed_button {
                 Some(MouseButton::Left) | None => 0,
@@ -1935,7 +1888,6 @@ extern "C" fn window_did_resize(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     }
 }
 
-/// Keeps the aspect ratio with its extra size, after AppKit applied the content aspect ratio.
 extern "C" fn window_will_resize(
     this: &AnyObject,
     _: Sel,
@@ -2023,7 +1975,7 @@ extern "C" fn window_did_exit_fullscreen(this: &AnyObject, _: Sel, _: *mut AnyOb
     };
     if let Ok(mut lock) = state.try_borrow_mut() {
         lock.is_exiting_fullscreen = false;
-        // Buttons moved during the transition hold their fullscreen frames.
+        // WARNING: buttons moved during the transition hold their fullscreen frames.
         lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
         lock.move_traffic_light();
     }
@@ -2037,7 +1989,6 @@ extern "C" fn window_did_change_state(this: &AnyObject, _: Sel, _: *mut AnyObjec
     }
 }
 
-/// Publishes the view's size and scale, then tells the app.
 fn update_size(state: &Shared) {
     let Ok(lock) = state.try_borrow() else {
         return;
@@ -2057,7 +2008,6 @@ extern "C" fn window_did_change_screen(this: &AnyObject, _: Sel, _: *mut AnyObje
         return;
     };
     if let Ok(lock) = state.try_borrow() {
-        // The display link follows the new screen.
         lock.locate_frames();
     }
     update_size(&state);
@@ -2073,7 +2023,7 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
         return;
     };
     let active = lock.native_window().isKeyWindow();
-    // AppKit can send a spurious `windowDidBecomeKey` to the previous key window when a popup
+    // WARNING: AppKit can send a spurious `windowDidBecomeKey` to the previous key window when a popup
     // opens while the app is inactive, which later keeps that window from being activated.
     if selector == sel!(windowDidBecomeKey:) && !active {
         let window = lock.native_window;
@@ -2143,8 +2093,6 @@ extern "C" fn set_frame_size(this: &AnyObject, _: Sel, new: NSSize) {
     update_size(&state);
 }
 
-/// AppKit asks for the layer's contents, during a live resize for one. The render thread draws the
-/// frame now, and this thread presents it in the same Core Animation transaction.
 extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let Some(callbacks) = callbacks(this) else {
         return;
@@ -2190,7 +2138,6 @@ extern "C" fn selected_range(this: &AnyObject, _: Sel) -> NSRange {
         .map_or(NSRange::invalid(), |selection| selection.range.into())
 }
 
-/// The window frame, with the content area at the top for windows with a title bar.
 fn get_frame(this: &AnyObject) -> NSRect {
     // SAFETY: AppKit calls this on our views.
     let Some(state) = (unsafe { get_state(this) }) else {
@@ -2233,7 +2180,6 @@ extern "C" fn first_rect_for_character_range(
         })
 }
 
-/// The text of an NSString or NSAttributedString.
 unsafe fn text_of(text: *mut AnyObject) -> String {
     unsafe {
         let attributed: Bool = msg_send![text, isKindOfClass: class!(NSAttributedString)];
@@ -2306,7 +2252,6 @@ extern "C" fn attributed_substring_for_proposed_range(
     }
 }
 
-// The selector is ignored, since the app may bind the key to something else.
 extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
     // SAFETY: AppKit calls this on our views.
     let Some(state) = (unsafe { get_state(this) }) else {
@@ -2338,7 +2283,6 @@ extern "C" fn view_did_change_effective_appearance(this: &AnyObject, _: Sel) {
     if let Some(callbacks) = callbacks {
         callbacks.appearance_changed();
     }
-    // AppKit can lay the traffic lights out again for the new appearance.
     if let Ok(mut lock) = state.try_borrow_mut() {
         lock.move_traffic_light();
     }
@@ -2354,9 +2298,6 @@ extern "C" fn accepts_first_mouse(this: &AnyObject, _: Sel, _: *mut AnyObject) -
     Bool::YES
 }
 
-/// The part of the view that is app-owned title bar content. Windows that own their title bar
-/// claim the whole view, so AppKit neither drags the window from it nor delays the clicks to
-/// tell double clicks apart.
 extern "C" fn opaque_rect_for_window_move_when_in_titlebar(this: &AnyObject, _: Sel) -> NSRect {
     // SAFETY: AppKit calls this on our views.
     let owned = unsafe { get_state(this) }.is_some_and(|state| {

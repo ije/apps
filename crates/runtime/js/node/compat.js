@@ -76,8 +76,7 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
     DEFAULT_MIN_VERSION: 'TLSv1.2', DEFAULT_MAX_VERSION: 'TLSv1.3', DEFAULT_ECDH_CURVE: 'auto', CLIENT_RENEG_LIMIT: 3, CLIENT_RENEG_WINDOW: 600,
   };
 
-  // Node ships undici as its fetch, and here fetch is native, so the package is this small layer over it.
-  const body = (response, signal) => {
+  const body = response => {
     const output = response.body ? stream.Readable.fromWeb(response.body) : stream.Readable.from([]);
     const read = () => new Promise((resolve, reject) => { const chunks = []; output.on('data', chunk => chunks.push(chunk)).once('end', () => resolve(Buffer.concat(chunks))).once('error', reject); });
     return Object.assign(output, {
@@ -107,7 +106,7 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
       }
       const response = await fetch(url, init), result = {};
       for (const [name, value] of response.headers) result[name] = name === 'set-cookie' ? response.headers.getSetCookie() : value;
-      const reply = { statusCode: response.status, statusText: response.statusText, headers: result, trailers: {}, opaque, context: {}, body: body(response, signal) };
+      const reply = { statusCode: response.status, statusText: response.statusText, headers: result, trailers: {}, opaque, context: {}, body: body(response) };
       if (callback) { callback(null, reply); return; }
       return reply;
     }

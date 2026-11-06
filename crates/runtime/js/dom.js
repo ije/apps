@@ -34,7 +34,6 @@
     changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  // Parsed `<webview>` elements have no wrapper until something reads them.
   let webviewScan = true, pickFiles;
   const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
@@ -88,7 +87,6 @@
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
   let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
   const selectionPending = new Set();
-  // The top layer, open modal and other dialogs, shown auto and hint popovers, fullscreen elements, and boxes that take close requests, in order.
   const topLayer = [], modals = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
   const selectionChanged = (target = document) => {
     if (selectionPending.has(target)) return;
@@ -322,7 +320,6 @@
   }
   const token = value => { value = String(value); if (!value) throw new DOMException('Token is empty', 'SyntaxError'); if (/[\t\n\f\r ]/.test(value)) throw new DOMException('Token contains whitespace', 'InvalidCharacterError'); return value; };
   const tokens = list => { const value = list.value; if (value !== list._source) { list._source = value; list._tokens = [...new Set(value.split(/[\t\n\f\r ]+/).filter(Boolean))]; } return list._tokens; };
-  // A token list reads indexes like `classList[0]` from its live tokens, as the DOM's indexed property getter.
   const tokenIndex = key => { if (typeof key !== 'string') return -1; const i = +key; return i >>> 0 === i && String(i) === key ? i : -1; };
   const indexed = {
     get(list, key, receiver) { const i = tokenIndex(key); return i < 0 ? Reflect.get(list, key, receiver) : tokens(list)[i]; },
@@ -479,7 +476,6 @@
     get name() { return own(this._m).split('\0')[0]; } get publicId() { return own(this._m).split('\0')[1] ?? ''; } get systemId() { return own(this._m).split('\0')[2] ?? ''; }
     get textContent() { return null; } set textContent(_) {} get nodeValue() { return null; } set nodeValue(_) {}
   }
-  // Like the HTML parser, a page without an HTML doctype, or with a legacy one, is in quirks mode.
   const quirks = doctype => !doctype || doctype.name !== 'html' || /^(-\/\/w3o\/\/dtd w3 html strict 3\.0\/\/en\/\/|-\/w3c\/dtd html 4\.0 transitional\/en|html)$/i.test(doctype.publicId) || doctype.systemId.toLowerCase() === 'http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd'
     || /^(\+\/\/silmaril\/\/dtd html pro v0r11 19970101\/\/|-\/\/(as|advasoft ltd)\/\/dtd html 3\.0 aswedit \+ extensions\/\/|-\/\/ietf\/\/dtd html|-\/\/metrius\/\/dtd metrius presentational\/\/|-\/\/microsoft\/\/dtd internet explorer [23]\.0|-\/\/netscape comm\. corp\.\/\/dtd|-\/\/o'reilly and associates\/\/dtd html|-\/\/softquad|-\/\/spyglass\/\/dtd html 2\.0 extended\/\/|-\/\/sq\/\/dtd html 2\.0 hotmetal \+ extensions\/\/|-\/\/sun microsystems corp\.\/\/dtd hotjava|-\/\/w3c\/\/dtd html (3|4\.0 (frameset|transitional)|experimental)|-\/\/w3c\/\/dtd w3 html\/\/|-\/\/w3o\/\/dtd w3 html 3\.0\/\/|-\/\/webtechs\/\/dtd mozilla html)/i.test(doctype.publicId)
     || !doctype.systemId && /^-\/\/w3c\/\/dtd html 4\.01 (frameset|transitional)\/\//i.test(doctype.publicId);
@@ -508,7 +504,7 @@
   };
   const declarationText = list => {
     const out = [], done = new Set();
-    for (const [name, value, priority] of list) {
+    for (const [name, , priority] of list) {
       if (done.has(name)) continue;
       let text = '';
       for (const [shorthand, parts] of shorthands) {
@@ -624,7 +620,6 @@
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
     scrollIntoView(options = {}) {
       if (typeof options === 'boolean') options = { block: options ? 'start' : 'end' };
-      // The target grows by its scroll-margin, and each scroller's view shrinks by its scroll-padding.
       const target = this.getBoundingClientRect(), own = getComputedStyle(this), margin = side => parseFloat(own['scrollMargin' + side]) || 0;
       let left = target.left - margin('Left'), top = target.top - margin('Top');
       const width = target.width + margin('Left') + margin('Right'), height = target.height + margin('Top') + margin('Bottom');
@@ -654,7 +649,6 @@
     focus() {
       if (active === this || !focusable(this)) return;
       const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), focusVisible(this));
-      // A selection set before the focus drew no caret.
       if (this.isContentEditable && selection.isCollapsed) selection._send();
       const mark = native ? trusted : event => event;
       if (previous) { commit(previous); dispatch(previous, mark(new FocusEvent('blur', { composed: true, relatedTarget: this }))); dispatch(previous, mark(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }))); }
@@ -916,7 +910,6 @@
   const stackOf = node => node._popover === 'hint' ? hints : autos;
   const position = node => { const i = autos.indexOf(node); return i >= 0 ? i : hints.includes(node) ? autos.length + hints.indexOf(node) : -1; };
   const nearestPopover = (node, list) => { for (const item of node ? path(node) : []) if (list.includes(item)) return item; return null; };
-  // The open popover that a new box nests in: through its flat tree parent or its invoker, whichever is higher.
   const ancestorPopover = (node, list, invoker) => [path(node)[1], invoker].map(item => nearestPopover(item, list)).reduce((a, b) => b && (!a || list.indexOf(b) > list.indexOf(a)) ? b : a, null);
   const hideAll = (list, end) => { for (let guard = 0; list.length && list.at(-1) !== end && guard < 1000; guard++) hidePopover(list.at(-1), false, true); };
   const hideUntil = end => { if (hints.includes(end)) return hideAll(hints, end); hideAll(hints, null); if (end === document || autos.includes(end)) hideAll(autos, end === document ? null : end); };
@@ -950,7 +943,6 @@
     const previous = node._returnFocus; node._returnFocus = null;
     if (focus && previous?.isConnected && active && node.contains(active)) previous.focus();
   };
-  // A dialog that closes or leaves the document leaves the open dialogs and, when modal, the top layer, without events.
   const closeDialog = dialog => {
     drop(dialogs, dialog); drop(watchers, dialog);
     if (dialog._modal) { dialog._modal = false; drop(modals, dialog); flag(dialog, 4, false); layer(dialog, false); }
@@ -988,7 +980,6 @@
     }
     requestClose(result) { if (this.open && dispatch(this, new Event('cancel', { cancelable: true }))) this.close(result); }
   }
-  // A close request goes to the box opened last: a dialog closes after a `cancel` that may stop it, when its `closedby` allows it, and a popover hides.
   const closeRequest = () => {
     const top = watchers.at(-1);
     if (!top) return false;
@@ -996,11 +987,9 @@
     else if (top.closedBy !== 'none' && dispatch(top, trusted(new Event('cancel', { cancelable: true })))) top.close();
     return true;
   };
-  // An element reference attribute: the element set through the property, else the element with that id in its tree.
   const referenced = (node, name, key) => { const set = node[key]?.deref(); if (set && node.hasAttribute(name)) return set; const id = node.getAttribute(name); return id ? node.getRootNode().getElementById?.(id) ?? null : null; };
   const reference = (node, name, key, value) => { if (value === null || value === undefined) { node[key] = null; node.removeAttribute(name); } else { if (!(value instanceof Element)) throw new TypeError('Expected an Element'); node[key] = new WeakRef(value); node.setAttribute(name, ''); } };
   const commands = /^(toggle-popover|show-popover|hide-popover|show-modal|close|request-close)$/;
-  // The popover that a button opens or closes, when its `popovertarget` or popover `command` points to one.
   const invoked = node => {
     if (!(node instanceof HTMLButtonElement || node instanceof HTMLInputElement && /^(button|submit|reset|image)$/.test(node.type)) || disabled(node)) return null;
     const target = node.localName === 'button' && node.commandForElement;
@@ -1009,7 +998,6 @@
     const popover = node.popoverTargetElement;
     return popover?.popover ? popover : null;
   };
-  // Runs the `commandfor` or else the `popovertarget` action of an activated button.
   const invoke = (button, target) => {
     const element = button.localName === 'button' ? button.commandForElement : null;
     if (element) {
@@ -1051,7 +1039,6 @@
       return !!this._popover;
     },
   });
-  // Presses outside the open popovers and dialogs light dismiss them, when the press starts and ends in the same one.
   let pressedPopover = null, pressedDialog = null;
   const lightDismiss = (down, target, x, y) => {
     if (autos.length || hints.length) {
@@ -1066,7 +1053,6 @@
       else { const same = clicked === pressedDialog, top = dialogs.at(-1); pressedDialog = null; if (same && top && top !== clicked && top.closedBy === 'any') top.requestClose(); }
     }
   };
-  // Elements leave fullscreen, the last first, and each gets `fullscreenchange`, or the document once it left.
   const exitFullscreen = (all, native = false) => {
     const exited = all ? fullscreens.splice(0) : fullscreens.splice(-1);
     for (const node of exited.reverse()) { flag(node, 16, false); layer(node, false); }
@@ -1117,7 +1103,6 @@
     }
     decode() { if (!this._loading && this.src) this._loadImage(); return this._loading ?? Promise.resolve(); }
   }
-  // Bundled and local files load in Rust by URL, other sources as bytes.
   const resource = async (source, kind) => {
     if (source.startsWith('data:')) { const comma = source.indexOf(','), payload = source.slice(comma + 1); return source.slice(0, comma).endsWith(';base64') ? Uint8Array.from(atob(payload), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(payload)); }
     if (/^(apps|file):$/.test(new URL(source, globalThis.location?.href).protocol)) return source;
@@ -1201,7 +1186,6 @@
       const source = this.getAttribute('poster'), token = this._posterToken = {};
       if (this.localName === 'video' && source && !(this._ready > 1)) resource(resolved(source), 'Poster').then(data => this._posterToken === token && decode(this, data)).catch(() => {});
     }
-    // Picks the src attribute or the first playable <source> child, then loads it unless preload is none.
     _select(force = false) {
       const element = this.getAttribute('src') === null ? [...this.children].find(child => child.localName === 'source' && child.hasAttribute('src') && (!child.type || this.canPlayType(child.type))) : this;
       if (!element && !this._network) return;
@@ -1618,7 +1602,7 @@
     selectNode(node) { this.setStartBefore(node); this.setEndAfter(node); }
     selectNodeContents(node) { this.setStart(node, 0); this.setEnd(node, node.nodeType === 3 ? node.length : node.childNodes.length); }
     collapse(start = false) { if (start) this.setEnd(this.startContainer, this.startOffset); else this.setStart(this.endContainer, this.endOffset); }
-    cloneRange() { const r = new Range(); Object.assign(r, this); return r; }
+    cloneRange() { const range = new Range(); Object.assign(range, this); return range; }
     toString() { if (this.startContainer === this.endContainer && this.startContainer.nodeType === 3) return this.startContainer.data.slice(this.startOffset, this.endOffset); return this.cloneContents().textContent; }
     cloneContents() {const fragment=document.createDocumentFragment(),range=this;const copy=(node,parent)=>{if(node.nodeType===3){const start=node===range.startContainer?range.startOffset:0,end=node===range.endContainer?range.endOffset:node.length;if(comparePoints(node,end,range.startContainer,range.startOffset)>0&&comparePoints(node,start,range.endContainer,range.endOffset)<0)parent.append(document.createTextNode(node.data.slice(start,end)));return;}for(const child of node.childNodes){const index=node.childNodes.indexOf(child);if(comparePoints(node,index,range.startContainer,range.startOffset)>=0&&comparePoints(node,index+1,range.endContainer,range.endOffset)<=0)parent.append(child.cloneNode(true));else if(comparePoints(node,index+1,range.startContainer,range.startOffset)>0&&comparePoints(node,index,range.endContainer,range.endOffset)<0){if(child.nodeType===3)copy(child,parent);else{const clone=child.cloneNode(false);copy(child,clone);parent.append(clone);}}}};if(!this.collapsed)copy(this.commonAncestorContainer,fragment);return fragment;}
     deleteContents() {
@@ -1683,7 +1667,6 @@
       const range = this.ranges[0], caret = !!range?.collapsed && !!active?.isContentEditable && active.contains(range.startContainer);
       if (!range) return;
       const nodes = rangeNodes(range).map(({node,start,end}) => [node._id,start,end]);
-      // An empty line has no text to hold the caret, so its line break does.
       if (caret && !nodes.length) { const { startContainer: parent, startOffset: offset } = range, child = parent.nodeType === 1 ? parent.childNodes[offset] ?? parent.lastChild : null; if (child?.localName === 'br') nodes.push([child._id, 0, 0]); }
       call('dom.selection', 0, nodes, caret);
     }
@@ -1805,7 +1788,7 @@
     fillRect(x, y, width, height) { this._op(21, x, y, width, height); } strokeRect(x, y, width, height) { this._op(22, x, y, width, height); } clearRect(x, y, width, height) { this._op(23, x, y, width, height); }
     fillText(text, x, y, maxWidth) { this._text(24, text, x, y, maxWidth); } strokeText(text, x, y, maxWidth) { this._text(27, text, x, y, maxWidth); }
     _text(code, text, x, y, maxWidth = Infinity) { text = String(text); if (arguments.length > 4 && arguments[4] !== undefined && !(Number.isFinite(+maxWidth) && maxWidth > 0)) return; this._texts.push(alone(text)); this._op(code, text.length, x, y, maxWidth); }
-    measureText(text) { const s = this._state, [width, left, right, top, bottom, ascent, descent, emAscent, emDescent] = call('dom.measureText', this.canvas._id, String(text), this.font, parseFloat(s.letterSpacing), parseFloat(s.wordSpacing)); const base = { top: emAscent, hanging: ascent * 0.8, middle: (emAscent - emDescent) / 2, bottom: -emDescent, ideographic: -descent }[s.textBaseline] ?? 0, anchor = width * ({ center: 0.5, right: 1, end: 1 }[s.textAlign] ?? 0); return Object.assign(Object.create(TextMetrics.prototype), { width, actualBoundingBoxLeft: left === right ? anchor : anchor - left, actualBoundingBoxRight: left === right ? -anchor : right - anchor, actualBoundingBoxAscent: top - base, actualBoundingBoxDescent: bottom + base, fontBoundingBoxAscent: ascent - base, fontBoundingBoxDescent: descent + base, emHeightAscent: emAscent - base, emHeightDescent: emDescent + base, hangingBaseline: ascent * 0.8 - base, alphabeticBaseline: -base, ideographicBaseline: -descent - base }); }
+    measureText(text) { const state = this._state, [width, left, right, top, bottom, ascent, descent, emAscent, emDescent] = call('dom.measureText', this.canvas._id, String(text), this.font, parseFloat(state.letterSpacing), parseFloat(state.wordSpacing)); const base = { top: emAscent, hanging: ascent * 0.8, middle: (emAscent - emDescent) / 2, bottom: -emDescent, ideographic: -descent }[state.textBaseline] ?? 0, anchor = width * ({ center: 0.5, right: 1, end: 1 }[state.textAlign] ?? 0); return Object.assign(Object.create(TextMetrics.prototype), { width, actualBoundingBoxLeft: left === right ? anchor : anchor - left, actualBoundingBoxRight: left === right ? -anchor : right - anchor, actualBoundingBoxAscent: top - base, actualBoundingBoxDescent: bottom + base, fontBoundingBoxAscent: ascent - base, fontBoundingBoxDescent: descent + base, emHeightAscent: emAscent - base, emHeightDescent: emDescent + base, hangingBaseline: ascent * 0.8 - base, alphabeticBaseline: -base, ideographicBaseline: -descent - base }); }
     getContextAttributes() { return { alpha: this._alpha, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; } isContextLost() { return false; } drawFocusIfNeeded() {} reset() { this._resize(); }
     getTransform() { this._flush(); const [a, b, c, d, e, f] = call('dom.canvasQuery', this.canvas._id); return { a, b, c, d, e, f, is2D: true }; }
     isPointInPath(x, y, rule = 'nonzero') { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, rule === 'evenodd', false); } isPointInStroke(x, y) { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, false, true); }
@@ -2140,7 +2123,6 @@
   globalThis.__appsAnimationFrame = () => {
     animationTimer = undefined;
     const now = performance.now(), callbacks = [...animationFrames];
-    // Script animations see the frame time while the callbacks run, and their pending tasks finish first.
     timelineTime = now; microtask(() => { timelineTime = null; });
     if (pendingAnimations.size) { const ready = [...pendingAnimations]; pendingAnimations.clear(); for (const animation of ready) readyAnimation(animation); }
     for (const [id, callback] of callbacks) {
@@ -2155,7 +2137,6 @@
     return id;
   };
   globalThis.cancelAnimationFrame = id => animationFrames.delete(id);
-  // Web Animations. `Animation` keeps the timing model and sends its keyframes, timing and current time to Rust, which samples them every frame. A timer runs its finish.
   let timelineTime = null;
   const timelineNow = () => { if (timelineTime === null) { timelineTime = performance.now(); microtask(() => { timelineTime = null; }); } return timelineTime; };
   class AnimationTimeline { constructor() { if (new.target === AnimationTimeline) throw new TypeError('Illegal constructor'); } get currentTime() { return timelineNow(); } get duration() { return null; } }
@@ -2210,7 +2191,6 @@
     return Object.assign(result, { progress: timing.easing === 'linear' ? directed : call('dom.easing', timing.easing, directed), currentIteration: iteration });
   };
   const frameKeys = new Set(['offset', 'easing', 'composite']);
-  // Keyframes as `{ offset, computed, easing, composite, props: [[css name, value]] }`, from a list of keyframes or from lists of values by property.
   const keyframesOf = input => {
     if (input == null) return [];
     if (typeof input !== 'object') throw new TypeError('Keyframes must be an object or an array');
@@ -2242,7 +2222,6 @@
       if (offset < previous) throw new TypeError('Keyframe offsets must be in animationOrder');
       previous = offset;
     }
-    // Missing offsets: the first keyframe goes to 0, the last to 1, and the others spread out evenly between known ones.
     const known = frames.map(frame => frame.offset ?? frame.computed);
     if (frames.length === 1) known[0] ??= 1;
     else if (frames.length) { known[0] ??= 0; known[frames.length - 1] ??= 1; }
@@ -2256,7 +2235,6 @@
     return frames;
   };
   const camelName = name => name.startsWith('--') ? name : name === 'float' ? 'cssFloat' : name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-  // Effects keep `{ target, pseudo, frames, timing, composite, animation }`.
   const effects = new WeakMap();
   let retimed, animationOrder, replaceable, filling;
   class AnimationEffect {
@@ -2286,10 +2264,8 @@
     setKeyframes(keyframes) { const effect = effects.get(this); effect.frames = keyframesOf(keyframes); if (effect.animation) retimed(effect.animation); }
   }
   class AnimationPlaybackEvent extends Event { constructor(type, init = {}) { super(type, init); this.currentTime = init?.currentTime ?? null; this.timelineTime = init?.timelineTime ?? null; } }
-  // The animations that are not idle, for `getAnimations()` and replacing.
   const liveAnimations = new Set();
   let animationIds = 0;
-  // Pending play and pause tasks finish at the next animation frame, which is their ready time, like in browsers.
   const pendingAnimations = new Set();
   let readyAnimation;
   class Animation extends EventTarget {
@@ -2299,7 +2275,6 @@
       retimed = animation => animation.#update(false, false);
       animationOrder = animation => animation.#id;
       filling = animation => animation.#fills();
-      // Finished animations that fill and that newer ones fully cover are removed, so filling animations don't pile up.
       replaceable = animation => animation.#replace === 'active' && animation.playState === 'finished' && animation.#fills();
       readyAnimation = animation => animation.#commit();
     }
@@ -2314,7 +2289,6 @@
     #apply() { if (this.#pendingRate !== null) { this.#rate = this.#pendingRate; this.#pendingRate = null; } }
     #end() { return this.#effect ? computedTiming(effects.get(this.#effect).timing, null, 1).endTime : 0; }
     #fills() { const fill = this.#effect ? effects.get(this.#effect).timing.fill : 'none'; return this.#rate < 0 ? fill === 'backwards' || fill === 'both' : fill === 'forwards' || fill === 'both'; }
-    // Sets the current time without the finished checks.
     #seek(time) { const now = this.#now(); if (this.#hold !== null || this.#start === null || now === null || this.#rate === 0) this.#hold = time; else this.#start = now - time / this.#rate; if (now === null) this.#start = null; this.#previous = null; }
     get effect() { return this.#effect; }
     set effect(effect) {
@@ -2378,7 +2352,6 @@
     get finished() { return this.#finished; }
     // WARNING: browsers resolve the promises at once but fire the events in a later task.
     #fire(type, timelineTime, currentTime = this.#current()) { setTimeout(() => this.dispatchEvent(new AnimationPlaybackEvent(type, { currentTime, timelineTime }))); }
-    // Runs the pending task at the frame time.
     #commit() {
       const now = this.#now();
       if (now === null || !this.pending) return;
@@ -2459,7 +2432,6 @@
       const values = call('dom.animated', target._id) ?? {};
       for (const frame of effect.frames) for (const [name] of frame.props) if (values[name] !== undefined) target.style.setProperty(name, values[name]);
     }
-    // Updates the finished state after a change, like the spec's "update an animation's finished state", then sends the state to Rust.
     #update(seek, now) {
       const end = this.#end(), rate = this.#rate, time = this.#now();
       const unconstrained = seek ? this.#current() : this.#start !== null && time !== null ? (time - this.#start) * rate : null;
@@ -2517,7 +2489,6 @@
     }
   }
   for (const name of ['finish', 'cancel', 'remove']) handler(Animation.prototype, name);
-  // CSS animations and transitions run in Rust. Script sees them as these objects, found again by their serial.
   const cssAnimations = new Map(), cssData = new WeakMap(), cssToken = Symbol();
   class CSSAnimation extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get animationName() { return cssData.get(this).name; } }
   class CSSTransition extends Animation { constructor(token) { if (token !== cssToken) throw new TypeError('Illegal constructor'); super(); } get transitionProperty() { return cssData.get(this).name; } }
@@ -2531,7 +2502,6 @@
     setTimeout(() => animation.dispatchEvent(new AnimationPlaybackEvent(done ? 'finish' : 'cancel', { currentTime, timelineTime })));
     data.ended = done;
     if (!done) data.state = 'idle';
-    // Rust lists only finished animations that fill, so the others leave the cache.
     if (!done || !['forwards', 'both'].includes(effects.get(data.effect).timing.fill)) cssAnimations.delete(data.serial);
     return true;
   };
@@ -2556,18 +2526,15 @@
     Object.assign(cssData.get(animation), { time, state });
     return animation;
   };
-  // Reads the state again from Rust; gone ones are idle.
   const cssState = animation => {
     const data = cssData.get(animation), target = data.effect.target;
     if (data.state !== 'idle') {
       const entry = target && call('dom.cssAnimations', target._id, false, true).find(entry => entry[0] === data.serial);
-      // An animation that ended without filling is gone from Rust but stays finished.
       if (entry) Object.assign(data, { time: entry[4], state: entry[5] }); else Object.assign(data, data.ended ? { time: computedTiming(effects.get(data.effect).timing, null, 1).endTime, state: 'finished' } : { time: null, state: 'idle' });
     }
     return data;
   };
   const cssControl = (animation, action, time = 0) => { const data = cssData.get(animation); if (call('dom.cssControl', data.serial, action, time)) cssState(animation); return data; };
-  // Settles the objects of an animation event from Rust; returns whether one settled.
   const cssEvent = (type, id, data) => {
     const kind = type.startsWith('animation') ? 'animation' : 'transition', name = kind === 'animation' ? data.animationName : data.propertyName;
     if (!/(end|cancel)$/.test(type)) return false;
@@ -2599,9 +2566,7 @@
     commitStyles: { value() { const target = cssData.get(this).effect.target, computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
   });
   const cssOf = (node, subtree) => {
-    // Pseudo-element animations belong to the subtree, like in browsers.
     const list = call('dom.cssAnimations', node._id, subtree, subtree).map(cssEntry);
-    // The whole document lists every live one, so the others leave the cache.
     if (node._id === 0) { const live = new Set(list); for (const [serial, animation] of cssAnimations) if (!live.has(animation)) cssAnimations.delete(serial); }
     return list;
   };
@@ -2628,7 +2593,6 @@
     removeListener(callback) { this.removeEventListener('change', callback); }
   }
   Object.assign(globalThis, { MediaQueryList, MediaQueryListEvent, matchMedia: query => new MediaQueryList(query) });
-  // A `<webview>` shows through a native view that main keeps over its box, so its bounds follow the layout of each frame.
   const webviewRefs = new Set(), attachedWebviews = new Map(), webviewReplies = new Map();
   let nextWebviewReply = 0;
   const webviewCall = (guest, data) => call('dom.open', 'webview', 'call', guest, data);
@@ -2711,7 +2675,7 @@
       query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
     }
   };
-  // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
+  // WARNING: resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
   globalThis.__appsLayout=()=>{resizeLayout();for(const id of call('dom.scrollEvents'))wrap(id)?.dispatchEvent(new Event('scroll',{bubbles:!id}));__appsMediaChanged();};
   const mediaLayout=globalThis.__appsLayout;
   globalThis.__appsLayout=()=>{
@@ -2777,7 +2741,6 @@
     if (placeholder) node.replaceChild(created, placeholder); else node.insertBefore(created, after ?? null);
     return [created, 0];
   };
-  // Undo and redo entries by editing host, and the text a composition replaced.
   const histories = new WeakMap();
   let composed = null;
   globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null) => {
@@ -2817,7 +2780,6 @@
       else if (inputType === 'insertLineBreak' && !plain) { const br = document.createElement('br'); range.insertNode(br); if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.data && !br.nextSibling.nextSibling) br.after(document.createElement('br')); selection.collapse(br.parentNode, br.parentNode.childNodes.indexOf(br) + 1); }
       else { const [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset]; if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at); }
     }
-    // Typing in a row undoes in one step, and a composition undoes as the text it committed.
     if (!mark && !inputType.startsWith('history')) {
       const history = histories.get(target) ?? histories.set(target, { undo: [], redo: [] }).get(target), last = history.undo.at(-1);
       const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)], inserted = control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '';
@@ -2867,7 +2829,6 @@
     const state = __appsEditing(), ranged = state ? state.start !== state.end : !selection.isCollapsed, writable = !!state && !active.readOnly && !disabled(active);
     return (command === 'selectAll' || (command === 'undo' || command === 'redo' ? !!histories.get(active)?.[command].length : command === 'copy' ? ranged : writable && (command !== 'cut' || ranged))) && (!/^(copy|cut|paste)$/.test(command) || native > 0);
   };
-  // The main process runs `setWindowOpenHandler()` while this waits, and returns the new window's id or null.
   const openWindow = globalThis.open = (url = '', target = '', features = '') => {
     [url, target, features] = [url, target, features].map(String);
     try { url = url && new URL(url, document.baseURI).href; } catch { throw new DOMException(`Invalid URL '${url}'`, 'SyntaxError'); }
@@ -2890,7 +2851,6 @@
   globalThis.__appsFrameEvent=(id,event)=>{const target=wrap(id);if(event.type==='did-finish-load')dispatch(target,new Event('load'));else if(event.type==='did-fail-load')dispatch(target,new Event('error'));else if(event.type==='message')dispatch(target,new MessageEvent('message',{data:event.data,origin:'null'}));};
   globalThis.__appsClipboard = (type, text = '') => {
     const target = active ?? document.body, data = new DataTransfer();
-    // Like browsers, a password field neither copies nor cuts its text.
     if (type !== 'paste' && target.localName === 'input' && target.type === 'password') return '';
     if (type === 'paste') data.setData('text/plain', text);
     if (dispatch(target, trusted(new ClipboardEvent(type, { bubbles: true, cancelable: true, composed: true, clipboardData: data })))) {
@@ -2905,7 +2865,6 @@
   };
   const fileType=name=>({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf','html':'text/html','htm':'text/html','css':'text/css','js':'text/javascript','csv':'text/csv','xml':'text/xml','zip':'application/zip','mp3':'audio/mpeg','wav':'audio/wav','mp4':'video/mp4','webm':'video/webm'})[name.split('.').at(-1).toLowerCase()]??'application/octet-stream';
   const picks=new Map();let nextPick=0;
-  // Like browsers, only user input opens the file panel, so a page can't open it by itself.
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.from(atob(data),char=>char.charCodeAt(0))],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
   // WARNING: the clipboard answers only while a page script runs from the app's event loop, and it holds text only.
@@ -2923,7 +2882,6 @@
   }
   Object.defineProperty(navigator, 'clipboard', { value: new Clipboard(), configurable: true, enumerable: true });
   globalThis.ClipboardItem = ClipboardItem; globalThis.Clipboard = Clipboard;
-  // Files dragged from other apps. As in browsers, they can be read only in `drop`, which fires only if the last `dragover` was canceled.
   let dragTarget = null, dragData = null, dragAccepted = false;
   const dragEvent = (type, target, x, y, relatedTarget = null, dataTransfer = dragData) => { const event = trusted(new DragEvent(type, { bubbles: true, cancelable: type !== 'dragleave', composed: true, clientX: x, clientY: y, relatedTarget, dataTransfer })); dispatch(target, event); return event; };
   globalThis.__appsDrag = (kind, x, y, names) => {
@@ -2990,7 +2948,6 @@
   };
   const tabOrder = () => {
     const list = [], stack = [document];
-    // A modal dialog makes what is below it in the top layer inert.
     const above = modals.length ? topLayer.slice(topLayer.indexOf(modals.at(-1))) : null;
     while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable) && (!above || path(node).some(item => above.includes(item)))) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
     return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
@@ -3022,7 +2979,6 @@
         const key = named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
         data = { ...data, key, code, keyCode: keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }
-      // Like browsers, Escape leaves fullscreen before the page sees it.
       if (name === 'keydown' && data.key === 'Escape' && fullscreens.length) { exitFullscreen(true); return false; }
       const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data }));
       if (!dispatch(target, event)) return false;

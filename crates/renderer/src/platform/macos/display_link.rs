@@ -61,7 +61,7 @@ unsafe impl Send for DisplayEntry {}
 struct SubscriberId(u64);
 
 fn lock_registry() -> MutexGuard<'static, Registry> {
-    // Ignore poison: the map stays valid, and a panic in the extern "C" callback aborts.
+    // WARNING: ignore poison: the map stays valid, and a panic in the extern "C" callback aborts.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -89,7 +89,6 @@ fn subscribe(
 ) -> Result<SubscriberId> {
     let needs_link = !lock_registry().displays.contains_key(&display_id);
     let new_link = if needs_link {
-        // Created outside the registry lock, see the lock order warning above.
         Some(unsafe {
             sys::DisplayLink::new(
                 display_id,
@@ -107,7 +106,7 @@ fn subscribe(
         let subscriber_id = SubscriberId(registry.next_subscriber_id);
         registry.next_subscriber_id += 1;
         let entry = match (registry.displays.entry(display_id), new_link) {
-            // Dropping an unused `new_link` is safe: a link that never started has no io thread.
+            // WARNING: dropping an unused `new_link` is safe: a link that never started has no io thread.
             (btree_map::Entry::Occupied(entry), _) => entry.into_mut(),
             (btree_map::Entry::Vacant(vacant), Some(link)) => vacant.insert(DisplayEntry {
                 link,
@@ -115,7 +114,6 @@ fn subscribe(
                 subscribers: Vec::new(),
             }),
             (btree_map::Entry::Vacant(_), None) => {
-                // Entries are never removed, so this can't happen.
                 anyhow::bail!("display link registry entry vanished for display {display_id}");
             }
         };
@@ -127,7 +125,6 @@ fn subscribe(
             None
         } else {
             entry.running = true;
-            // Started after the lock is released.
             Some(entry.link.clone())
         };
         (subscriber_id, link_to_start)
@@ -167,14 +164,11 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     };
 
     if let Some(mut link) = link_to_stop {
-        // A last output callback can still run after this. It finds no subscribers.
+        // WARNING: A last output callback can still run after this. It finds no subscribers.
         let _ = unsafe { link.stop() };
     }
 }
 
-/// Per-window frame requests. The dispatch source merges vsync ticks from the display's io thread
-/// and calls `callback(data)` on a system queue, so a busy main thread holds up no frames. `free`
-/// gets `data` when the source is gone.
 pub(crate) struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
@@ -237,7 +231,7 @@ impl WindowFrameSource {
 impl Drop for WindowFrameSource {
     fn drop(&mut self) {
         self.stop();
-        // The callback can't reach this source after `stop`. Cancel so the handler never runs
+        // WARNING: the callback can't reach this source after `stop`. Cancel so the handler never runs
         // again, and the finalizer frees its context.
         self.frame_requests.cancel();
     }

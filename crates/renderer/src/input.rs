@@ -6,7 +6,6 @@ pub struct Modifiers {
     pub control: bool,
     pub alt: bool,
     pub shift: bool,
-    /// Command on macOS, the Windows key on Windows, Super on Linux.
     pub platform: bool,
     pub function: bool,
 }
@@ -16,7 +15,6 @@ pub struct Capslock {
     pub on: bool,
 }
 
-/// A key press: the key name, like `a` or `enter`, and the text it types, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Keystroke {
     pub modifiers: Modifiers,
@@ -25,7 +23,6 @@ pub struct Keystroke {
 }
 
 impl Keystroke {
-    /// Parses `cmd-shift-a`, `ctrl-enter` or `a`. `secondary` is cmd on macOS and ctrl elsewhere.
     pub fn parse(source: &str) -> Option<Self> {
         let mut modifiers = Modifiers::default();
         let mut key = None;
@@ -82,9 +79,7 @@ pub enum NavigationDirection {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollDelta {
-    /// Precise pixels, from a trackpad.
     Pixels(Point<Pixels>),
-    /// Lines, from a mouse wheel.
     Lines(Point<f32>),
 }
 
@@ -109,7 +104,6 @@ impl ScrollDelta {
 #[derive(Clone, Debug, Default)]
 pub struct KeyDownEvent {
     pub keystroke: Keystroke,
-    /// The key is held down and repeating.
     pub is_held: bool,
 }
 
@@ -130,7 +124,6 @@ pub struct MouseDownEvent {
     pub position: Point<Pixels>,
     pub modifiers: Modifiers,
     pub click_count: usize,
-    /// The click activated the window.
     pub first_mouse: bool,
 }
 
@@ -160,18 +153,13 @@ pub struct MouseExitEvent {
     pub position: Point<Pixels>,
 }
 
-/// Where a scroll event is in a trackpad gesture.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollPhase {
-    /// The device reports no gestures.
     #[default]
     None,
-    /// Fingers touched the trackpad or began to move.
     Began,
     Changed,
-    /// Fingers left the trackpad.
     Ended,
-    /// The system goes on scrolling after the fingers left.
     Momentum,
     MomentumEnded,
 }
@@ -184,7 +172,6 @@ pub struct ScrollWheelEvent {
     pub modifiers: Modifiers,
 }
 
-/// Files dragged onto a window from another app.
 #[derive(Clone, Debug)]
 pub enum FileDropEvent {
     Entered {
@@ -252,7 +239,6 @@ mouse_event!(MouseMoveEvent, MouseMove);
 mouse_event!(MouseExitEvent, MouseExited);
 mouse_event!(ScrollWheelEvent, ScrollWheel);
 
-/// Mouse listeners run twice: front to back in the capture phase, then back to front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispatchPhase {
     Bubble,
@@ -268,7 +254,6 @@ impl DispatchPhase {
     }
 }
 
-/// A text selection in UTF-16 code units.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Utf16Selection {
     pub range: Range<usize>,

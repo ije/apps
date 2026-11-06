@@ -1,4 +1,3 @@
-// Demuxes and decodes one media file with FFmpeg. One player thread owns each AppsMedia.
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
@@ -29,7 +28,6 @@ typedef struct {
   Track video, audio;
   AVBufferRef *device;
   enum AVPixelFormat hardware;
-  // picture keeps the last video frame, so it can be shown after the track ends.
   AVFrame *frame, *software, *picture;
   AVPacket *packet;
   struct SwsContext *scale;
@@ -216,7 +214,6 @@ static int push(Track *track, AVPacket *packet) {
   return 0;
 }
 
-// Feeds `track` one queued packet, or the end once the file is read. Returns 0 when it needs more packets.
 static int feed(AppsMedia *m, Track *track) {
   if (track->length) {
     AVPacket *packet = track->queue[track->head];
@@ -278,7 +275,7 @@ static int audio(AppsMedia *m, const float **samples, int *count, double *time) 
   return 2;
 }
 
-// Decodes the next frame of a wanted track (1 video, 2 audio). Returns 1 for a video frame (convert it with
+// WARNING: decodes the next frame of a wanted track (1 video, 2 audio). Returns 1 for a video frame (convert it with
 // apps_ffmpeg_pixels), 2 for interleaved float samples, 3 to call again, 4 when the wanted tracks wait behind
 // the full packet queue of the other track, 0 when the wanted tracks ended, or an error.
 int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *height, const float **samples, int *count) {
@@ -325,7 +322,6 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
   }
 }
 
-// Writes the last video frame as BGRA pixels of the size apps_ffmpeg_next returned.
 int apps_ffmpeg_pixels(AppsMedia *m, uint8_t *pixels) {
   AVFrame *frame = m->picture;
   if (frame->format == m->hardware && frame->hw_frames_ctx) {
@@ -365,7 +361,6 @@ int apps_ffmpeg_seek(AppsMedia *m, double time) {
   return status;
 }
 
-// Changes the audio speed. The resampler plays it faster or slower, so the pitch changes with it.
 void apps_ffmpeg_speed(AppsMedia *m, double speed) {
   if (speed == m->speed) return;
   m->speed = speed;

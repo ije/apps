@@ -1,5 +1,3 @@
-//! DirectWrite fonts, shaping and glyph rasterization.
-
 use crate::{
     Bounds, DevicePixels, Pixels, Point, Rgba, Size, point, px, size,
     text::{
@@ -40,7 +38,6 @@ struct State {
     custom: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
     by_font: FxHashMap<Font, FontId>,
-    /// Fonts by the address of their face, for the faces DirectWrite falls back to.
     by_face: FxHashMap<usize, FontId>,
     utf16: Vec<u16>,
 }
@@ -119,7 +116,6 @@ impl TextSystem {
                 .factory
                 .CreateFontCollectionFromFontSet(&state.builder.CreateFontSet()?)?;
         }
-        // Fonts selected before, maybe from system fonts, are selected again.
         state.by_font.clear();
         Ok(())
     }
@@ -216,7 +212,6 @@ impl TextSystem {
         })
     }
 
-    /// One alpha byte per pixel, or straight-alpha BGRA pixels for emoji.
     pub fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
@@ -259,7 +254,7 @@ impl TextSystem {
     pub fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut state = self.0.borrow_mut();
         let result = if text.contains(['\u{2028}', '\u{2029}']) {
-            // DirectWrite breaks lines at these even without wrapping, so each part is laid out alone.
+            // WARNING: DirectWrite breaks lines at these even without wrapping, so each part is laid out alone.
             let mut layout = LineLayout {
                 font_size,
                 len: text.len(),
@@ -320,7 +315,6 @@ impl TextSystem {
         })
     }
 
-    /// DirectWrite needs no dilation.
     pub fn glyph_dilation_for_color(&self, _color: Rgba) -> u8 {
         0
     }
@@ -329,7 +323,6 @@ impl TextSystem {
 impl State {
     fn select(&mut self, font: &Font) -> Option<FontId> {
         let id = self.find(font).or_else(|| {
-            // Fonts installed since launch.
             let mut system = None;
             // SAFETY: plain factory query.
             if unsafe {
@@ -401,7 +394,6 @@ impl State {
         None
     }
 
-    /// The OpenType features, with ligatures and contextual alternates on unless turned off.
     fn typography(&self, features: &FontFeatures) -> Result<IDWriteTypography> {
         let tag = |name: &str| {
             DWRITE_FONT_FEATURE_TAG(u32::from_le_bytes(
@@ -434,7 +426,6 @@ impl State {
         }
     }
 
-    /// Falls back to `families` before the system fallbacks.
     fn fallbacks(&self, families: &[String]) -> Result<Option<IDWriteFontFallback>> {
         if families.is_empty() {
             return Ok(None);
@@ -566,7 +557,6 @@ impl State {
             };
             layout.Draw(Some((&raw mut context).cast()), &renderer, 0., 0.)?;
             let (width, mut runs) = (context.width, context.runs);
-            // Undoes the nudge.
             for run in &mut runs {
                 let shaped = run.font_size.0;
                 run.font_size = font_runs
@@ -620,7 +610,6 @@ impl State {
                 DWRITE_RENDERING_MODE1::default(),
                 DWRITE_GRID_FIT_MODE::default(),
             );
-            // The scale is in the transform, so the DPI is the default.
             self.fonts[params.font_id.0]
                 .face
                 .GetRecommendedRenderingMode(
@@ -651,7 +640,6 @@ impl State {
         }
     }
 
-    /// Paints the color layers of a COLR glyph over each other, into straight-alpha BGRA.
     fn rasterize_color(
         &self,
         params: &RenderGlyphParams,
@@ -697,7 +685,6 @@ impl State {
                 alpha.clear();
                 alpha.resize(layer_width * (rect.bottom - rect.top) as usize, 0);
                 analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &rect, &mut alpha)?;
-                // Layers in the text color are drawn black, as emoji tiles have no text color.
                 let color = if layer.paletteIndex == 0xFFFF {
                     DWRITE_COLOR_F {
                         a: 1.,
@@ -773,7 +760,6 @@ fn localized(names: &IDWriteLocalizedStrings, locale: &HSTRING) -> windows::core
     }
 }
 
-/// The layout being drawn, passed to the renderer callbacks.
 struct Context<'a> {
     state: &'a mut State,
     text: &'a str,
@@ -784,7 +770,6 @@ struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// The UTF-8 index of a UTF-16 index, at or after the last one.
     fn utf8_index(&mut self, utf16: usize) -> usize {
         for char in self.text[self.utf8..].chars() {
             if self.utf16 >= utf16 {
@@ -796,7 +781,6 @@ impl Context<'_> {
         self.utf8
     }
 
-    /// The font of a face DirectWrite picked, which can be a fallback face.
     fn font_id(&mut self, face: &IDWriteFontFace3) -> Option<FontId> {
         if let Some(id) = self.state.by_face.get(&(face.as_raw() as usize)) {
             return Some(*id);
@@ -902,7 +886,6 @@ impl IDWriteTextRenderer_Impl for Renderer_Impl {
             let mut glyphs = Vec::with_capacity(count);
             let mut utf16 = description.textPosition as usize;
             let mut start = 0;
-            // Each cluster is the text whose cluster map entries share a first glyph.
             while start < clusters.len() {
                 let first = clusters[start] as usize;
                 let end = clusters[start..]
@@ -974,7 +957,6 @@ impl IDWriteTextRenderer_Impl for Renderer_Impl {
     }
 }
 
-/// Whether a glyph of a color font has color layers.
 fn is_color_glyph(factory: &IDWriteFactory5, face: &IDWriteFontFace3, glyph: GlyphId) -> bool {
     let (index, advance, offset) = (glyph.0 as u16, 0., DWRITE_GLYPH_OFFSET::default());
     let run = DWRITE_GLYPH_RUN {

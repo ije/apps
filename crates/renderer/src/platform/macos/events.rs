@@ -59,7 +59,6 @@ pub(crate) unsafe fn platform_input_from_native(
         let native_event = native_event.cast::<NSEvent>().as_ref()?;
         let event_type = native_event.r#type();
 
-        // AppKit also sends private event types that are not in NSEventType.
         match event_type.0 {
             0 | 21 | 32 | 33 | 35 | 36 | 37 => {
                 return None;
@@ -101,7 +100,6 @@ pub(crate) unsafe fn platform_input_from_native(
                         button,
                         position: point(
                             px(native_event.locationInWindow().x as f32),
-                            // AppKit window coordinates start at the bottom left.
                             window_height - px(native_event.locationInWindow().y as f32),
                         ),
                         modifiers: read_modifiers(native_event),
@@ -132,7 +130,6 @@ pub(crate) unsafe fn platform_input_from_native(
                     })
                 })
             }
-            // Some mice, like the Logitech MX Master, send back and forward buttons as swipes.
             NSEventType::Swipe => {
                 let navigation_direction = match native_event.phase() {
                     NSEventPhase::Ended => match native_event.deltaX() {
@@ -286,7 +283,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         Some(NSHomeFunctionKey) => "home".to_string(),
         Some(NSEndFunctionKey) => "end".to_string(),
         Some(NSDeleteFunctionKey) => "delete".to_string(),
-        // The Insert key sends NSHelpFunctionKey, not NSInsertFunctionKey.
+        // WARNING: the Insert key sends NSHelpFunctionKey, not NSInsertFunctionKey.
         Some(NSHelpFunctionKey) => "insert".to_string(),
         Some(NSF1FunctionKey) => "f1".to_string(),
         Some(NSF2FunctionKey) => "f2".to_string(),
@@ -324,8 +321,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         Some(NSF34FunctionKey) => "f34".to_string(),
         Some(NSF35FunctionKey) => "f35".to_string(),
         _ => {
-            // Cases to test when modifying this:
-            //
+            // WARNING: cases to test when modifying this:
             //           qwerty key | none | cmd   | cmd-shift
             // * Armenian         s | ս    | cmd-s | cmd-shift-s  (layout is non-ASCII, so use the cmd layout)
             // * Dvorak+QWERTY    s | o    | cmd-s | cmd-shift-s  (layout switches on cmd)
@@ -339,17 +335,14 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
             let mut chars_with_shift = chars_for_modified_key(native_event.keyCode(), SHIFT_MOD);
             let always_use_cmd_layout = always_use_command_layout();
 
-            // Handle Dvorak+QWERTY / Russian / Armenian
             if command || always_use_cmd_layout {
                 let chars_with_cmd = chars_for_modified_key(native_event.keyCode(), CMD_MOD);
                 let chars_with_both =
                     chars_for_modified_key(native_event.keyCode(), CMD_MOD | SHIFT_MOD);
 
-                // Skip this when cmd-shift gives the same character as cmd (Norwegian).
+                // WARNING: skip this when cmd-shift gives the same character as cmd (Norwegian).
                 if chars_with_both != chars_with_cmd {
                     chars_with_shift = chars_with_both;
-
-                // Some layouts report cmd-shift-s as cmd-s (Ukrainian).
                 } else if chars_with_cmd.to_ascii_uppercase() != chars_with_cmd {
                     chars_with_shift = chars_with_cmd.to_ascii_uppercase();
                 }
@@ -404,14 +397,12 @@ fn always_use_command_layout() -> bool {
     chars_for_modified_key(0, CMD_MOD).is_ascii()
 }
 
-// Carbon modifier masks (cmdKey, shiftKey, optionKey) shifted right by 8, as UCKeyTranslate takes them.
 const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
 const SHIFT_MOD: u32 = 2;
 const OPTION_MOD: u32 = 8;
 
 fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
-    // Carbon kVK_Space.
     const CG_SPACE_KEY: u16 = 49;
     #[allow(non_upper_case_globals)]
     const kUCKeyActionDown: u16 = 0;

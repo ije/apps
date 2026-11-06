@@ -38,7 +38,6 @@ type MainPost = fn(Box<dyn FnOnce() + Send>);
 #[cfg(target_os = "macos")]
 static MAIN_THREAD: OnceLock<(MainSync, MainPost)> = OnceLock::new();
 
-/// Sets how browsers reach the main thread, which owns the native web views.
 pub fn on_main_thread(sync: MainSync, post: MainPost) {
     #[cfg(target_os = "macos")]
     let _ = MAIN_THREAD.set((sync, post));
@@ -56,7 +55,6 @@ fn sync_main<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     result.expect("The main thread dropped a browser call")
 }
 
-/// A pointer that the main thread uses for the thread that asked.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct Native(*mut c_void);
@@ -72,7 +70,6 @@ impl Native {
 
 static WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 
-/// Sets the callback that wakes the app loop when a browser queues an event.
 pub fn on_event(wake: impl Fn() + Send + Sync + 'static) {
     let _ = WAKE.set(Box::new(wake));
 }

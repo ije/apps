@@ -1,6 +1,3 @@
-//! Turns a scene into draw commands for the platform renderers, including the offscreen
-//! layers that effects are painted into.
-
 use crate::{
     BlendMode, Bounds, Point, ScaledPixels, Size,
     scene::{
@@ -20,8 +17,6 @@ const COMPOSITE_SHADOW: u32 = 8;
 const COMPOSITE_BACKDROP: u32 = 16;
 const COMPOSITE_BLEND: u32 = 32;
 
-/// The shader globals of one render target, which covers `viewport_size` device pixels from
-/// `viewport_origin` of the window.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Globals {
@@ -44,7 +39,6 @@ pub struct TextParams {
     pub is_bgr: bool,
 }
 
-/// Draws an offscreen layer onto a target. `mask_tile` is in mask texture pixels.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Composite {
@@ -69,7 +63,6 @@ pub struct Composite {
     pub blend: u32,
 }
 
-/// One direction of a separable blur, drawn at `scale` window pixels per target pixel.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Blur {
@@ -80,20 +73,14 @@ pub struct Blur {
     pub scale: f32,
 }
 
-/// Blurs at least this wide, in device pixels, run at half resolution: the gaussian hides the
-/// lost detail, and both passes draw a quarter of the pixels.
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
 
-/// The window, or an offscreen layer covering part of the window.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     Frame,
     Layer(usize),
 }
 
-/// An offscreen layer: a pooled texture whose first pixel is at `origin` in window device
-/// pixels, with `scale` window pixels per texture pixel. Small layers share one texture as tiles,
-/// and draw only inside `bounds`.
 pub struct Layer {
     pub texture: usize,
     pub origin: [i32; 2],
@@ -101,7 +88,6 @@ pub struct Layer {
     bounds: [f32; 4],
 }
 
-/// The texture that the small layers of one nesting depth share, packed in rows.
 struct Shelf {
     texture: usize,
     x: i32,
@@ -111,21 +97,18 @@ struct Shelf {
 
 type Deferred = (Target, Option<AtlasTextureId>, Composite);
 
-pub enum Cmd {
-    /// Draw the next commands into the target, cleared first if `true`.
+pub enum Command {
     Pass(Target, bool),
     Quads(Range<u32>),
     Shadows(Range<u32>),
     Underlines(Range<u32>),
     Mono(AtlasTextureId, Range<u32>),
     Poly(AtlasTextureId, Range<u32>),
-    /// Draw a blur into the cleared `dst`, then continue with the previous target.
     Blur {
         src: Target,
         dst: Target,
         index: u32,
     },
-    /// Copy the `[x, y, width, height]` window region.
     Copy {
         src: Target,
         dst: Target,
@@ -139,7 +122,6 @@ pub enum Cmd {
     },
 }
 
-/// The instance data and commands of one frame, kept to reuse the allocations.
 #[derive(Default)]
 pub struct RenderFrame {
     pub quads: Vec<Quad>,
@@ -149,33 +131,26 @@ pub struct RenderFrame {
     pub poly: Vec<PolychromeSprite>,
     pub composites: Vec<Composite>,
     pub blurs: Vec<Blur>,
-    pub cmds: Vec<Cmd>,
+    pub commands: Vec<Command>,
     pub layers: Vec<Layer>,
-    /// The size of each pooled texture the layers use.
     pub textures: Vec<[u32; 2]>,
     free: Vec<usize>,
     shelves: Vec<Option<Shelf>>,
-    /// The composites of tiles, per depth, that wait until the effects of a batch are drawn.
     deferred: Vec<Vec<Deferred>>,
     window: [u32; 2],
     max_texture: f32,
     copy: bool,
-    /// Effect layers of the window that the compositor plays, so the frame leaves them out.
     pub skip: Vec<usize>,
-    /// Of those, the layers whose content `record` draws into a target of its own, listed after it
-    /// in `promoted` with that target and their `[x, y, width, height]` window region.
     pub content: Vec<usize>,
     pub promoted: Vec<(usize, Target, [i32; 4])>,
 }
 
-/// Copies the primitives of `keys` in their order.
 fn extend<T: Copy>(items: &mut Vec<T>, primitives: &[T], keys: &[SortKey]) -> Range<u32> {
     let start = items.len() as u32;
     items.extend(keys.iter().map(|key| primitives[key[2] as usize]));
     start..items.len() as u32
 }
 
-/// The whole device pixels that cover `bounds`, as `[x, y, width, height]`.
 pub fn region(bounds: Bounds<ScaledPixels>) -> [i32; 4] {
     let [x, y] = [bounds.origin.x.0.floor(), bounds.origin.y.0.floor()];
     let [right, bottom] = [
@@ -214,8 +189,6 @@ pub fn bytes<T>(items: &[T]) -> &[u8] {
 }
 
 impl RenderFrame {
-    /// Records the scene for a `window` sized frame. Backdrops and blend modes need `copy`,
-    /// the support for copying from the window texture.
     pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
         self.quads.clear();
         self.shadows.clear();
@@ -224,7 +197,7 @@ impl RenderFrame {
         self.poly.clear();
         self.composites.clear();
         self.blurs.clear();
-        self.cmds.clear();
+        self.commands.clear();
         self.layers.clear();
         self.textures.clear();
         self.free.clear();
@@ -246,8 +219,8 @@ impl RenderFrame {
         }
         // WARNING: shelf textures grow while the frame is recorded, so composites read their final size.
         if !self.shelves.is_empty() {
-            for cmd in 0..self.cmds.len() {
-                if let Cmd::Composite { src, index, .. } = self.cmds[cmd] {
+            for command in 0..self.commands.len() {
+                if let Command::Composite { src, index, .. } = self.commands[command] {
                     let rect = self.rect(src);
                     self.composites[index as usize].source_rect = rect;
                 }
@@ -255,7 +228,6 @@ impl RenderFrame {
         }
     }
 
-    /// The pooled texture of a target, `None` for the window.
     pub fn texture(&self, target: Target) -> Option<usize> {
         match target {
             Target::Frame => None,
@@ -263,7 +235,6 @@ impl RenderFrame {
         }
     }
 
-    /// The `[x, y, width, height]` window region the target covers.
     pub fn rect(&self, target: Target) -> [f32; 4] {
         match target {
             Target::Frame => [0., 0., self.window[0] as f32, self.window[1] as f32],
@@ -280,7 +251,6 @@ impl RenderFrame {
         }
     }
 
-    /// The size of the target in its own pixels.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn pixels(&self, target: Target) -> [f32; 2] {
         match target {
@@ -311,12 +281,10 @@ impl RenderFrame {
         }
     }
 
-    /// Returns a target covering the `[x, y, width, height]` region of the window.
     fn acquire(&mut self, region: [i32; 4]) -> Target {
         self.acquire_scaled(region, 1)
     }
 
-    /// Like `acquire`, with `scale` window pixels per texture pixel.
     fn acquire_scaled(&mut self, region: [i32; 4], scale: i32) -> Target {
         let size = [region[2], region[3]].map(|side| (side.max(1) as u32).div_ceil(scale as u32));
         let fit = self
@@ -335,7 +303,6 @@ impl RenderFrame {
         let texture = match fit {
             Some(index) => self.free.swap_remove(index),
             None => {
-                // Round up so textures can be reused by later frames.
                 let max = self.max_texture as u32;
                 self.textures
                     .push(size.map(|value| (value.div_ceil(256) * 256).min(max)));
@@ -357,13 +324,11 @@ impl RenderFrame {
         Target::Layer(self.layers.len() - 1)
     }
 
-    /// Returns a tile of the shared texture of `depth` for `region`, and whether the texture must
-    /// be cleared first. `None` when the region is too big for a tile.
     fn tile(&mut self, region: [i32; 4], target: Target, depth: usize) -> Option<(Target, bool)> {
         let size = self
             .window
             .map(|value| (value.div_ceil(256) * 256).min(self.max_texture as u32) as i32);
-        // A transparent pixel around each tile keeps filtering from reading the next tile.
+        // WARNING: A transparent pixel around each tile keeps filtering from reading the next tile.
         let (w, h) = (region[2] + 2, region[3] + 2);
         if w > size[0] / 2 || h > size[1] / 2 {
             return None;
@@ -410,7 +375,6 @@ impl RenderFrame {
         Some((Target::Layer(self.layers.len() - 1), clear))
     }
 
-    /// Composites the waiting tiles of `depth` into `target`.
     fn flush(&mut self, target: Target, depth: usize) {
         let Some(deferred) = self
             .deferred
@@ -419,9 +383,9 @@ impl RenderFrame {
         else {
             return;
         };
-        self.cmds.push(Cmd::Pass(target, false));
+        self.commands.push(Command::Pass(target, false));
         for (src, mask, composite) in deferred.drain(..) {
-            self.cmds.push(Cmd::Composite {
+            self.commands.push(Command::Composite {
                 src,
                 mask,
                 backdrop: None,
@@ -446,22 +410,24 @@ impl RenderFrame {
         clear: bool,
         depth: usize,
     ) {
-        self.cmds.push(Cmd::Pass(target, clear));
+        self.commands.push(Command::Pass(target, clear));
         let primitives = &scene.layers[layer];
         for batch in scene.batches(layer) {
-            let cmd = match batch {
-                Batch::Quads(keys) => Cmd::Quads(extend(&mut self.quads, &primitives.quads, keys)),
+            let command = match batch {
+                Batch::Quads(keys) => {
+                    Command::Quads(extend(&mut self.quads, &primitives.quads, keys))
+                }
                 Batch::Shadows(keys) => {
-                    Cmd::Shadows(extend(&mut self.shadows, &primitives.shadows, keys))
+                    Command::Shadows(extend(&mut self.shadows, &primitives.shadows, keys))
                 }
                 Batch::Underlines(keys) => {
-                    Cmd::Underlines(extend(&mut self.underlines, &primitives.underlines, keys))
+                    Command::Underlines(extend(&mut self.underlines, &primitives.underlines, keys))
                 }
                 Batch::Mono(texture, keys) => {
-                    Cmd::Mono(texture, extend(&mut self.mono, &primitives.mono, keys))
+                    Command::Mono(texture, extend(&mut self.mono, &primitives.mono, keys))
                 }
                 Batch::Poly(texture, keys) => {
-                    Cmd::Poly(texture, extend(&mut self.poly, &primitives.poly, keys))
+                    Command::Poly(texture, extend(&mut self.poly, &primitives.poly, keys))
                 }
                 Batch::Effects(keys) => {
                     for key in keys {
@@ -475,12 +441,10 @@ impl RenderFrame {
                     continue;
                 }
             };
-            self.cmds.push(cmd);
+            self.commands.push(command);
         }
     }
 
-    /// The integer `[x, y, width, height]` region covering `bounds`, limited to what can be seen
-    /// and to the maximum texture size with a border pixel on each side.
     fn region(&self, bounds: Bounds<ScaledPixels>, limit: [f32; 4]) -> Option<[i32; 4]> {
         let max = self.max_texture - 2.;
         let x0 = bounds.origin.x.0.floor().max(limit[0]);
@@ -496,9 +460,6 @@ impl RenderFrame {
         (x1 > x0 && y1 > y0).then_some([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
     }
 
-    /// Blurs `region` of `src` into a new target. Returns it with the sigma that the composite
-    /// still blurs vertically: a narrow blur leaves that half to the composite, while a wide one
-    /// blurs both ways at half resolution, which the composite scales up.
     fn blur(&mut self, src: Target, region: [i32; 4], sigma: f32, release: bool) -> (Target, f32) {
         let covered = match src {
             Target::Layer(_) => self.rect(src).map(|value| value as i32),
@@ -538,7 +499,7 @@ impl RenderFrame {
                 Target::Frame => 1.,
             },
         });
-        self.cmds.push(Cmd::Blur { src, dst, index });
+        self.commands.push(Command::Blur { src, dst, index });
     }
 
     fn composite(
@@ -549,8 +510,8 @@ impl RenderFrame {
         backdrop: Option<Target>,
         composite: Composite,
     ) {
-        self.cmds.push(Cmd::Pass(target, false));
-        self.cmds.push(Cmd::Composite {
+        self.commands.push(Command::Pass(target, false));
+        self.commands.push(Command::Composite {
             src,
             mask,
             backdrop,
@@ -632,7 +593,7 @@ impl RenderFrame {
             )
         {
             let copy = self.acquire(region);
-            self.cmds.push(Cmd::Copy {
+            self.commands.push(Command::Copy {
                 src: target,
                 dst: copy,
                 region,
@@ -673,7 +634,7 @@ impl RenderFrame {
         let Some(region) = self.region(content, reach) else {
             return;
         };
-        // Tiles must hold all their content, since drawing past a tile would reach the next one.
+        // WARNING: tiles must hold all their content, since drawing past a tile would reach the next one.
         let whole = Some(region)
             == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
         let tile = (!copies && !blurs && whole)
@@ -688,7 +649,6 @@ impl RenderFrame {
                 tile
             }
             None => {
-                // A transparent pixel around the content keeps the clamped edges smooth.
                 let texture =
                     self.acquire([region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2]);
                 self.record_layer(scene, primitive.layer, texture, true, depth + 1);
@@ -756,7 +716,7 @@ impl RenderFrame {
             .flatten()
             .map(|region| {
                 let copy = self.acquire(region);
-                self.cmds.push(Cmd::Copy {
+                self.commands.push(Command::Copy {
                     src: target,
                     dst: copy,
                     region,
@@ -787,7 +747,7 @@ impl RenderFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blur, Cmd, Composite, Globals, RenderFrame};
+    use super::{Blur, Command, Composite, Globals, RenderFrame};
     use crate::{
         Bounds, ContentMask, ScaledPixels, Size,
         scene::{
@@ -797,7 +757,6 @@ mod tests {
     };
     use std::mem::size_of;
 
-    /// A frame of one `opacity` group around a quad at `[x, y, width, height]`, scaled by `scale`.
     fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
         let bounds = |[x, y, w, h]: [f32; 4]| {
             Bounds::new(
@@ -889,7 +848,6 @@ mod tests {
                 ..Default::default()
             }));
             scene.pop_effect();
-            // Covers the layer only once it turns, and must still draw over it.
             scene.insert(Primitive::Quad(Quad {
                 bounds: bounds([205., 140., 25., 20.]),
                 content_mask: mask,
@@ -902,11 +860,11 @@ mod tests {
             let mut frame = RenderFrame::default();
             frame.record(scene, [800, 600], 16384, true);
             let order: Vec<_> = frame
-                .cmds
+                .commands
                 .iter()
-                .filter_map(|cmd| match cmd {
-                    Cmd::Quads(range) => Some(format!("quads {range:?}")),
-                    Cmd::Composite { index, .. } => Some(format!("composite {index}")),
+                .filter_map(|command| match command {
+                    Command::Quads(range) => Some(format!("quads {range:?}")),
+                    Command::Composite { index, .. } => Some(format!("composite {index}")),
                     _ => None,
                 })
                 .collect();
@@ -973,10 +931,9 @@ mod tests {
         };
         assert_eq!((across.direction, across.scale), ([1., 0.], 2.));
         assert_eq!((down.direction, down.scale), ([0., 1.], 2.));
-        // The composite only scales up the half-size result, which covers the same window region.
         let composite = wide.composites[0];
         assert_eq!(composite.blur, 0.);
-        let Some(Cmd::Composite { src, .. }) = wide.cmds.last() else {
+        let Some(Command::Composite { src, .. }) = wide.commands.last() else {
             panic!("a composite last")
         };
         let [width, height] = wide.pixels(*src);
@@ -987,8 +944,8 @@ mod tests {
     fn small_tiles_get_a_small_texture() {
         let frame = record([3072, 2048], [100., 100., 24., 24.], 1.);
         assert_eq!(frame.textures, [[256, 256]]);
-        let source = frame.cmds.iter().find_map(|cmd| match cmd {
-            Cmd::Composite { index, .. } => Some(frame.composites[*index as usize].source_rect),
+        let source = frame.commands.iter().find_map(|command| match command {
+            Command::Composite { index, .. } => Some(frame.composites[*index as usize].source_rect),
             _ => None,
         });
         assert_eq!(source.map(|rect| [rect[2], rect[3]]), Some([256., 256.]));

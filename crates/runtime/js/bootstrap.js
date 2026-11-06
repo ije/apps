@@ -4,7 +4,6 @@
   delete globalThis.__appsNative;
   delete globalThis.__appsRole;
   delete globalThis.__appsDisabled;
-  // A disabled feature is a stub that throws when it is called, so imports and feature checks still work.
   const feature = name => {
     const fail = () => { throw new Error(`The ${name} feature is disabled. Add "${name}" to "features" in package.json`); };
     const stub = new Proxy(function() {}, { get: (_, key) => typeof key === 'symbol' || key === 'then' ? undefined : stub, apply: fail, construct: fail });
@@ -311,7 +310,7 @@
   const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new ClientRequest(options), isOnline, get online() { return isOnline(); } });
   pty = globalThis.__appsPty(call);
   delete globalThis.__appsPty;
-  // Like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
+  // WARNING: like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
   delete globalThis.__appsBrowser;
@@ -626,7 +625,7 @@
     else quit();
   };
   hooks.contents = id => windows.get(id)?.webContents ?? null;
-  // Pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
+  // WARNING: pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
   // A `<webview>` is a WebContentsView that main keeps over the element, and its events go to the element.
   const webviews = new Map();
   const webview = (win, op, guestId, data) => {
@@ -645,7 +644,6 @@
       };
       const drop = () => { if (webviews.delete(guest.id) && !guest.isDestroyed()) guest.close(); };
       webviews.set(guest.id, { view, guest, drop });
-      // A page that goes away can't detach its guests.
       contents.once('did-start-loading', drop);
       win.once('closed', drop);
       contents.emit('did-attach-webview', event(), guest);
@@ -690,7 +688,6 @@
       return String(win.id);
     } catch (error) { hooks.report(error); return 'null'; }
   };
-  // `<input type=file>`: main opens the panel and reads the files, as a page can't read files by path.
   const pickFiles = async (win, { id, multiple, directory, accept }) => {
     let files = null;
     try {
@@ -710,7 +707,6 @@
   };
   const num = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return value; };
   const int = (value, name) => Math.round(num(value, name));
-  // NSVisualEffectMaterial and NSVisualEffectState values.
   const materials = { 'appearance-based': 0, titlebar: 3, selection: 4, menu: 5, popover: 6, sidebar: 7, header: 10, sheet: 11, window: 12, hud: 13, 'fullscreen-ui': 15, tooltip: 17, content: 18, 'under-window': 21, 'under-page': 22 };
   const material = type => { if (!type) return null; if (!Object.hasOwn(materials, type)) throw new TypeError(`Invalid vibrancy type: ${type}`); return materials[type]; };
   const effectStates = ['followWindow', 'active', 'inactive'];
@@ -719,17 +715,17 @@
   // WARNING: Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
   const argb = color => /^#([\da-f]{4}|[\da-f]{8})$/i.test(color) ? '#' + color.slice(color.length === 5 ? 2 : 3) + color.slice(1, color.length === 5 ? 2 : 3) : color;
   const resize = (win, next, content) => {
-    const s = state(win), { bounds, content: inner } = s, base = content ? inner : bounds, target = { ...base };
+    const windowState = state(win), { bounds, content: inner } = windowState, base = content ? inner : bounds, target = { ...base };
     for (const key of ['x', 'y', 'width', 'height']) if (next?.[key] !== undefined) target[key] = int(next[key], key);
     if (info.platform !== 'darwin' && (target.x !== base.x || target.y !== base.y)) throw Error('Moving a window is only available on macOS');
     const [dx, dy, dw, dh] = [inner.x - bounds.x, inner.y - bounds.y, bounds.width - inner.width, bounds.height - inner.height];
     if (content) Object.assign(target, { x: target.x - dx, y: target.y - dy, width: target.width + dw, height: target.height + dh });
-    target.width = Math.min(Math.max(target.width, s.min[0], 1), s.max[0] || 16384);
-    target.height = Math.min(Math.max(target.height, s.min[1], 1), s.max[1] || 16384);
+    target.width = Math.min(Math.max(target.width, windowState.min[0], 1), windowState.max[0] || 16384);
+    target.height = Math.min(Math.max(target.height, windowState.min[1], 1), windowState.max[1] || 16384);
     call('window', 'bounds', win.id, target.x, target.y, target.width, target.height);
-    s.bounds = target;
-    if (win.isNormal()) s.normal = { ...target };
-    s.content = { x: target.x + dx, y: target.y + dy, width: target.width - dw, height: target.height - dh };
+    windowState.bounds = target;
+    if (win.isNormal()) windowState.normal = { ...target };
+    windowState.content = { x: target.x + dx, y: target.y + dy, width: target.width - dw, height: target.height - dh };
   };
   class BrowserWindow extends events.EventEmitter {
     constructor(options = {}) {
@@ -763,7 +759,7 @@
     load(html) { return this.webContents._load('load', String(html), 'apps://app/'); }
     loadFile(file, options) { return this.webContents.loadFile(file, options); }
     loadURL(url) { return this.webContents.loadURL(url); }
-    setWindowButtonPosition(position) { const s = state(this); s.buttonPosition = position ?? null; call('window', 'buttonPosition', this.id, position ? int(position.x, 'x') : null, position ? int(position.y, 'y') : null); }
+    setWindowButtonPosition(position) { const windowState = state(this); windowState.buttonPosition = position ?? null; call('window', 'buttonPosition', this.id, position ? int(position.x, 'x') : null, position ? int(position.y, 'y') : null); }
     getWindowButtonPosition() { return state(this).buttonPosition ?? null; }
     setAutoHideCursor() { state(this); }
     setTitleBarOverlay() { state(this); }
@@ -796,8 +792,8 @@
     setWindowButtonVisibility(visible) { state(this); call('window', 'buttons', this.id, !!visible); }
     isDestroyed() { return !windows.has(this.id); }
     getTitle() { return state(this).title; }
-    setTitle(title) { const s = state(this); s.title = String(title); call('window', 'title', this.id, s.title); }
-    setBackgroundColor(color) { const s = state(this), background = argb(String(color)); call('window', 'background', this.id, background); s.background = background; }
+    setTitle(title) { const windowState = state(this); windowState.title = String(title); call('window', 'title', this.id, windowState.title); }
+    setBackgroundColor(color) { const windowState = state(this), background = argb(String(color)); call('window', 'background', this.id, background); windowState.background = background; }
     getBounds() { return { ...state(this).bounds }; }
     setBounds(bounds) { resize(this, bounds, false); }
     getContentBounds() { return { ...state(this).content }; }
@@ -810,10 +806,10 @@
     setPosition(x, y) { resize(this, { x, y }, false); }
     center() { state(this); call('window', 'center', this.id); }
     getMinimumSize() { return [...state(this).min]; }
-    setMinimumSize(width, height) { const s = state(this), min = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...min, ...s.max); s.min = min; }
+    setMinimumSize(width, height) { const windowState = state(this), min = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...min, ...windowState.max); windowState.min = min; }
     getMaximumSize() { return [...state(this).max]; }
-    setMaximumSize(width, height) { const s = state(this), max = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...s.min, ...max); s.max = max; }
-    #flag(key, value) { const s = state(this); call('window', key, this.id, !!value); s[key] = !!value; }
+    setMaximumSize(width, height) { const windowState = state(this), max = [int(width, 'width'), int(height, 'height')]; call('window', 'limits', this.id, ...windowState.min, ...max); windowState.max = max; }
+    #flag(key, value) { const windowState = state(this); call('window', key, this.id, !!value); windowState[key] = !!value; }
     isResizable() { return state(this).resizable; }
     setResizable(resizable) { this.#flag('resizable', resizable); }
     isMovable() { return state(this).movable; }
@@ -832,8 +828,8 @@
     unmaximize() { state(this).maximized = false; call('window', 'unmaximize', this.id); }
     isMaximized() { return state(this).maximized; }
     restore() { state(this).minimized = false; call('window', 'restore', this.id); }
-    isNormal() { const s = state(this); return !s.minimized && !s.maximized && !s.fullscreen; }
-    getNormalBounds() { const s = state(this); return { ...(this.isNormal() ? s.bounds : s.normal) }; }
+    isNormal() { const windowState = state(this); return !windowState.minimized && !windowState.maximized && !windowState.fullscreen; }
+    getNormalBounds() { const windowState = state(this); return { ...(this.isNormal() ? windowState.bounds : windowState.normal) }; }
     setFullScreen(flag) { state(this).fullscreen = !!flag; call('window', 'fullscreen', this.id, !!flag); }
     isFullScreen() { return state(this).fullscreen; }
     show() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'show', this.id); }
@@ -843,17 +839,16 @@
     focus() { Object.assign(state(this), { visible: true, focused: true }); call('window', 'focus', this.id); }
     blur() { state(this).focused = false; call('window', 'blur', this.id); }
     isFocused() { return state(this).focused; }
-    setOpacity(opacity) { const s = state(this), value = Math.min(Math.max(num(opacity, 'opacity'), 0), 1); call('window', 'opacity', this.id, value); s.opacity = value; }
+    setOpacity(opacity) { const windowState = state(this), value = Math.min(Math.max(num(opacity, 'opacity'), 0), 1); call('window', 'opacity', this.id, value); windowState.opacity = value; }
     getOpacity() { return state(this).opacity; }
     setHasShadow(hasShadow) { this.#flag('shadow', hasShadow); }
     hasShadow() { return state(this).shadow; }
     setIgnoreMouseEvents(ignore, { forward = false } = {}) { state(this); call('window', 'ignoreMouse', this.id, !!ignore, !!forward); }
     setVisibleOnAllWorkspaces(visible, { visibleOnFullScreen = false, skipTransformProcessType = false } = {}) {
-      const s = state(this);
-      // Like Electron, only an app without a Dock icon shows windows over fullscreen apps.
+      const windowState = state(this);
       if (!skipTransformProcessType) call('native.app.activationPolicy', visibleOnFullScreen ? 'accessory' : 'regular');
       call('window', 'workspaces', this.id, !!visible, !!visibleOnFullScreen);
-      s.workspaces = !!visible;
+      windowState.workspaces = !!visible;
     }
     isVisibleOnAllWorkspaces() { return state(this).workspaces; }
     setContentProtection(enable) { this.#flag('contentProtection', enable); }
@@ -863,27 +858,26 @@
     setAspectRatio(aspectRatio, extraSize = {}) { state(this); call('window', 'aspectRatio', this.id, Math.max(num(aspectRatio, 'aspectRatio'), 0), int(extraSize.width ?? 0, 'width'), int(extraSize.height ?? 0, 'height')); }
     setProgressBar(progress) { state(this); call('native.app.progress', num(progress, 'progress')); }
     flashFrame(flag) {
-      const s = state(this);
+      const windowState = state(this);
       // WARNING: request ids start at 0, and an active app gets -1, no request.
-      if (flag) s.attention = call('native.app.attention', 'critical');
-      else if (s.attention >= 0) { call('native.app.cancelAttention', s.attention); s.attention = -1; }
+      if (flag) windowState.attention = call('native.app.attention', 'critical');
+      else if (windowState.attention >= 0) { call('native.app.cancelAttention', windowState.attention); windowState.attention = -1; }
     }
     setSkipTaskbar() { state(this); }
     setMenu(menu) { state(this); if (menu !== null && !(menu instanceof nativeShell.Menu)) throw new TypeError('Invalid Menu'); }
     removeMenu() { state(this); }
     setVibrancy(type) {
-      const s = state(this), value = material(type);
-      call('window', 'vibrancy', this.id, value, s.effect);
-      // Like Electron, the page is transparent over vibrancy unless it has a background color.
-      call('window', 'background', this.id, s.background ?? (value === null && !s.transparent ? '#fff' : '#0000'));
+      const windowState = state(this), value = material(type);
+      call('window', 'vibrancy', this.id, value, windowState.effect);
+      call('window', 'background', this.id, windowState.background ?? (value === null && !windowState.transparent ? '#fff' : '#0000'));
     }
     setParentWindow(parent) {
-      const s = state(this);
-      if (s.modal) throw Error('Can not be called for modal window');
+      const windowState = state(this);
+      if (windowState.modal) throw Error('Can not be called for modal window');
       if (parent !== null && !(parent instanceof BrowserWindow)) throw new TypeError('Expected a BrowserWindow or null');
       for (let win = parent; win; win = win.getParentWindow()) if (win === this) throw Error('A window cannot be its own ancestor');
       call('window', 'parent', this.id, parent?.id ?? null);
-      s.parent = parent?.id ?? 0;
+      windowState.parent = parent?.id ?? 0;
     }
     getParentWindow() { return windows.get(state(this).parent) ?? null; }
     getChildWindows() { state(this); return [...windows.values()].filter(win => states.get(win).parent === this.id); }
@@ -898,7 +892,6 @@
     for (const method of ['center', 'unmaximize', 'showInactive', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop',
       'setHasShadow', 'setIgnoreMouseEvents', 'setFocusable', 'setAspectRatio', 'setProgressBar', 'flashFrame', 'setSkipTaskbar', 'setIcon', 'setMenu', 'removeMenu', win32 ? 'setOpacity' : 'setVisibleOnAllWorkspaces'])
       BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is not supported on ${info.platform}`); };
-    // What Electron itself does on these platforms.
     Object.assign(BrowserWindow.prototype, { setVibrancy() { state(this); } }, win32
       ? { setVisibleOnAllWorkspaces() { state(this); }, isVisibleOnAllWorkspaces() { state(this); return false; } }
       : { setOpacity() { state(this); }, getOpacity() { state(this); return 1; }, setContentProtection() { state(this); }, isContentProtected() { state(this); return false; } });
@@ -992,15 +985,15 @@
     else if (name === 'closed') { if (win) closed(win); }
     else if (name === 'resize') win?.contentView.setBounds({ x: 0, y: 0, ...data });
     else if (name === 'state') {
-      const s = win && states.get(win);
-      if (!s) return;
+      const windowState = win && states.get(win);
+      if (!windowState) return;
       // WARNING: the first state is the window's initial state, so it only reports focus.
-      const old = s.native ?? { ...data, focused: false }, [x, y, width, height] = data.frame, [left, top, innerWidth, innerHeight] = data.content;
-      s.native = data;
-      Object.assign(s, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
+      const old = windowState.native ?? { ...data, focused: false }, [x, y, width, height] = data.frame, [left, top, innerWidth, innerHeight] = data.content;
+      windowState.native = data;
+      Object.assign(windowState, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
       const resized = old.frame[2] !== width || old.frame[3] !== height;
       // WARNING: zoom and fullscreen animations report the frames in between as normal, so only moves and finished live resizes are normal bounds.
-      if (win.isNormal() && !data.resizing && (old.resizing || !resized)) s.normal = { x, y, width, height };
+      if (win.isNormal() && !data.resizing && (old.resizing || !resized)) windowState.normal = { x, y, width, height };
       win.contentView.setBounds({ x: 0, y: 0, width: innerWidth, height: innerHeight });
       for (const [key, on, off] of [['minimized', 'minimize', 'restore'], ['maximized', 'maximize', 'unmaximize'], ['fullscreen', 'enter-full-screen', 'leave-full-screen'], ['visible', 'show', 'hide']])
         if (old[key] !== data[key]) win.emit(data[key] ? on : off);

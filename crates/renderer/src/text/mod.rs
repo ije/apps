@@ -1,10 +1,10 @@
-mod element;
 mod layout;
 mod line;
+mod paragraph;
 
-pub use element::*;
 pub use layout::*;
 pub use line::*;
+pub use paragraph::*;
 
 use crate::{Bounds, Pixels, Point, Rgba, Size, platform, px};
 use anyhow::{Context as _, Result};
@@ -26,10 +26,8 @@ pub struct FontId(pub usize);
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
-/// Glyphs are rasterized at this many horizontal offsets within a pixel.
 pub const SUBPIXEL_VARIANTS_X: u8 = 4;
 
-/// The degree of blackness of a font, from 100 to 900, with 400 as normal.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct FontWeight(pub f32);
 
@@ -59,7 +57,6 @@ pub enum FontStyle {
     Oblique,
 }
 
-/// OpenType features, as tags and values.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct FontFeatures(pub Rc<[(String, u32)]>);
 
@@ -69,7 +66,6 @@ impl FontFeatures {
     }
 }
 
-/// Families to try, in order, when a glyph is missing from the font.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
 pub struct FontFallbacks(pub Rc<[String]>);
 
@@ -81,7 +77,6 @@ impl FontFallbacks {
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Font {
-    /// The family name. `.SystemUIFont` is the platform's interface font.
     pub family: SharedString,
     pub features: FontFeatures,
     pub fallbacks: Option<FontFallbacks>,
@@ -109,7 +104,6 @@ pub fn font(family: impl Into<SharedString>) -> Font {
     }
 }
 
-/// The measurements of a typeface, in font units.
 #[derive(Clone, Copy, Debug)]
 pub struct FontMetrics {
     pub units_per_em: u32,
@@ -119,9 +113,7 @@ pub struct FontMetrics {
     pub cap_height: f32,
     pub x_height: f32,
     pub bounding_box: Bounds<f32>,
-    /// Browsers on macOS add 15% of the height to the ascent of Times, Helvetica and Courier.
     pub tall_ascent: bool,
-    /// The part of the em box above the baseline.
     pub em_ascent: f32,
 }
 
@@ -135,11 +127,8 @@ impl FontMetrics {
 pub enum DecorationStyle {
     #[default]
     Solid,
-    /// Two lines, one thickness apart.
     Double,
-    /// Square dots, one thickness long and apart.
     Dotted,
-    /// Dashes and gaps, two thicknesses long.
     Dashed,
     Wavy,
 }
@@ -149,7 +138,6 @@ pub struct UnderlineStyle {
     pub thickness: Pixels,
     pub color: Option<Rgba>,
     pub style: DecorationStyle,
-    /// The distance from the baseline, like CSS `text-underline-offset`. `None` places it in the descent.
     pub offset: Option<Pixels>,
 }
 
@@ -168,28 +156,20 @@ pub enum TextAlign {
     Right,
 }
 
-/// Where lines may break inside a word, like CSS `word-break` and `overflow-wrap`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WordBreak {
-    /// Only between words; a longer word overflows.
     #[default]
     Normal,
-    /// Inside a word that does not fit its line alone.
     BreakWord,
-    /// Like `BreakWord`, and the min-content width is the widest character.
     Anywhere,
-    /// Between any two characters.
     BreakAll,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextWrap {
-    /// Each line takes as many words as fit.
     #[default]
     Wrap,
-    /// Lines get about the same width.
     Balance,
-    /// Lines avoid a ragged edge and a short last line.
     Pretty,
 }
 
@@ -202,26 +182,19 @@ pub enum WhiteSpace {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct TextRun {
-    /// The length in UTF-8 bytes.
     pub len: usize,
     pub font: Font,
     pub color: Rgba,
     pub background_color: Option<Rgba>,
     pub underline: Option<UnderlineStyle>,
     pub strikethrough: Option<StrikethroughStyle>,
-    /// Extra space after each character, like CSS `letter-spacing`.
     pub letter_spacing: Pixels,
-    /// Extra space after each space, like CSS `word-spacing`.
     pub word_spacing: Pixels,
-    /// A font size for this run instead of the line's.
     pub font_size: Option<Pixels>,
-    /// Space before the first and after the last character, like the padding of an inline box.
     pub inset: [Pixels; 2],
-    /// The text can't wrap between its characters, like CSS `white-space: nowrap` in a line that can.
     pub nowrap: bool,
 }
 
-/// A run of text in one font, as the shaper sees it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct FontRun {
     pub len: usize,
@@ -233,7 +206,6 @@ pub struct FontRun {
     pub nowrap: bool,
 }
 
-/// A glyph raster: the cache key of its atlas tile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RenderGlyphParams {
     pub font_id: FontId,
@@ -259,17 +231,15 @@ impl Hash for RenderGlyphParams {
     }
 }
 
-/// The fonts of the app, shared by the text systems of its windows.
 pub struct Fonts {
     pub(crate) platform: platform::TextSystem,
     fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
     metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
-    /// Advances when fonts are added, so cached layouts made with the old fonts go away.
     generation: Cell<usize>,
 }
 
-/// Fonts, metrics and shaped lines, used on the main thread only. Each window has its own
-/// cache of shaped lines over the app's fonts.
+// WARNING: fonts, metrics and shaped lines, used on the main thread only. Each window has its own
+// cache of shaped lines over the app's fonts.
 pub struct TextSystem {
     shared: Rc<Fonts>,
     font_runs: Cell<Vec<FontRun>>,
@@ -314,7 +284,6 @@ impl TextSystem {
         }
     }
 
-    /// A text system with its own line cache over the same fonts.
     pub(crate) fn for_window(&self) -> Self {
         Self {
             shared: self.shared.clone(),
@@ -324,7 +293,6 @@ impl TextSystem {
         }
     }
 
-    /// Drops the lines shaped with fonts that changed since.
     fn lines(&self) -> &LineLayoutCache {
         let generation = self.shared.generation.get();
         if self.generation.replace(generation) != generation {
@@ -340,12 +308,10 @@ impl TextSystem {
         names
     }
 
-    /// Advances whenever fonts are added.
     pub(crate) fn generation(&self) -> usize {
         self.shared.generation.get()
     }
 
-    /// Drops cached layouts and font choices.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform.add_fonts(fonts)?;
         self.fonts.borrow_mut().clear();
@@ -353,7 +319,6 @@ impl TextSystem {
         Ok(())
     }
 
-    /// The font, or the first fallback family that loads.
     pub fn resolve_font(&self, font: &Font) -> FontId {
         if let Some(Some(id)) = self.fonts.borrow().get(font) {
             return *id;
@@ -404,7 +369,6 @@ impl TextSystem {
         Ok(advance.map(|value| px(value * font_size.0)))
     }
 
-    /// The advance of `0`, the CSS `ch` unit.
     pub fn ch_advance(&self, font_id: FontId, font_size: Pixels) -> Result<Pixels> {
         Ok(self.advance(font_id, font_size, '0')?.width)
     }
@@ -429,12 +393,10 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.ascent, font_size))
     }
 
-    /// The part of the em box above the baseline, in pixels.
     pub fn em_ascent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| px(metrics.em_ascent * font_size.0))
     }
 
-    /// The ascent, descent and line gap rounded like browsers do for `line-height: normal`.
     pub fn line_metrics(&self, font_id: FontId, font_size: Pixels) -> [Pixels; 3] {
         self.read_metrics(font_id, |metrics| {
             let scale = |value: f32| (value / metrics.units_per_em as f32 * font_size.0).round();
@@ -448,7 +410,6 @@ impl TextSystem {
         })
     }
 
-    /// The baseline in a line box, from metrics rounded to device pixels like Chrome.
     pub fn baseline(
         &self,
         font_id: FontId,
@@ -460,12 +421,10 @@ impl TextSystem {
         (((line_height * scale - ascent - descent) / 2.).floor() + ascent) / scale
     }
 
-    /// Below the baseline, so usually negative.
     pub fn descent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.read_metrics(font_id, |metrics| metrics.scale(metrics.descent, font_size))
     }
 
-    /// The glyph's pixels, `None` when it has none.
     pub(crate) fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
@@ -478,7 +437,6 @@ impl TextSystem {
         Ok(Some((bounds.origin, size, bytes)))
     }
 
-    /// The ink of a glyph from its origin, in logical pixels with y up: left, right, top and bottom. Glyphs without ink have none.
     pub fn glyph_bounds(
         &self,
         font_id: FontId,
@@ -515,7 +473,6 @@ impl TextSystem {
         bounds.filter(|[left, right, top, bottom]| right > left && top > bottom)
     }
 
-    /// Rasterizes a glyph on the CPU, for drawing outside the scene: the offset of its pixels from the glyph origin, their size, and alpha bytes, or straight-alpha BGRA for emoji.
     pub fn glyph_pixels(
         &self,
         font_id: FontId,
@@ -542,7 +499,6 @@ impl TextSystem {
         .flatten()
     }
 
-    /// Drops the layouts that were not used for a while.
     pub(crate) fn finish_frame(&self) {
         self.lines.finish_frame();
     }
@@ -557,7 +513,6 @@ impl TextSystem {
         font_runs.clear();
         let mut last: Option<(&TextRun, FontId)> = None;
         for (len, run) in runs {
-            // Background colors do not change glyphs, so they never split a font run.
             let decoration_changed = !last.is_some_and(|(last, _)| {
                 last.color == run.color
                     && last.underline == run.underline
@@ -598,7 +553,6 @@ impl TextSystem {
         font_runs
     }
 
-    /// Lays out one line, without newlines.
     pub fn layout_line(
         &self,
         text: &str,
@@ -614,7 +568,6 @@ impl TextSystem {
         layout
     }
 
-    /// Shapes one line, without newlines, for painting.
     pub fn shape_line(
         &self,
         text: &str,
@@ -640,7 +593,6 @@ impl TextSystem {
         }
     }
 
-    /// Shapes text with newlines, wrapping each line at `wrap_width`.
     pub fn shape_text(
         &self,
         text: SharedString,
@@ -662,8 +614,6 @@ impl TextSystem {
         )
     }
 
-    /// Like [`Self::shape_text`], but the first line is shortened by `indent`, like CSS
-    /// `text-indent`, and lines break with `wrap`.
     #[allow(clippy::too_many_arguments)]
     pub fn shape_text_indented(
         &self,
@@ -720,7 +670,6 @@ impl TextSystem {
                 decoration_runs,
                 text,
             });
-            // Skips the newline.
             if let Some(&run) = runs.peek() {
                 used += 1;
                 if used == run.len {
@@ -733,7 +682,6 @@ impl TextSystem {
     }
 }
 
-/// A run of one text color and decoration.
 #[derive(Debug, Clone)]
 pub struct DecorationRun {
     pub len: u32,

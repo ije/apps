@@ -108,7 +108,6 @@ pub(crate) fn tls() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
-/// Downloads an HTTP or HTTPS URL and follows redirects. `apps build` uses it for remote imports.
 pub fn download(url: &str) -> Result<Vec<u8>> {
     let mut http = HttpConnector::new_with_resolver(Dns(false));
     http.enforce_http(false);
@@ -178,11 +177,9 @@ impl Drop for Listening {
     }
 }
 
-/// The bundled assets of the app, which pages and workers of any thread can fetch.
 pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf>> =
     std::sync::OnceLock::new();
 
-/// The `localNetwork` feature: pages may reach private networks, for apps with servers in child processes or on a LAN.
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

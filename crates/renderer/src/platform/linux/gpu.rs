@@ -1,7 +1,7 @@
 use crate::{
     DevicePixels, Size,
     atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
-    frame::{Cmd, Globals, RenderFrame, Target, TextParams, bytes},
+    frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -21,7 +21,6 @@ use std::{
 
 const SHADERS: &str = include_str!("shaders.wgsl");
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
-/// Grayscale text with a gamma of 1.8.
 const TEXT: TextParams = TextParams {
     gamma_ratios: [
         0.1469 * 65536. / 65025.,
@@ -35,10 +34,8 @@ const TEXT: TextParams = TextParams {
 };
 
 pub(crate) type GpuAtlas = Atlas<AtlasTextures>;
-/// A frame's size and RGBA rows, when it was captured.
 pub(crate) type Capture = Option<Result<([u32; 2], Vec<u8>)>>;
 
-/// The display connection, which the GL backend needs before any surface exists.
 #[derive(Debug)]
 struct Display(rwh::RawDisplayHandle);
 
@@ -71,14 +68,12 @@ struct Pipelines {
     blurs: wgpu::RenderPipeline,
 }
 
-/// The GPU device, shared by every window.
 struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     lost: Arc<AtomicBool>,
-    /// The format of color atlas textures, BGRA when the GPU can sample it.
     color_format: wgpu::TextureFormat,
     layouts: Layouts,
     sampler: wgpu::Sampler,
@@ -91,7 +86,6 @@ thread_local! {
 }
 
 impl Gpu {
-    /// The shared GPU, or a new one when there is none or it was lost, with a surface for `window`.
     fn get(
         display: rwh::RawDisplayHandle,
         window: rwh::RawWindowHandle,
@@ -131,7 +125,6 @@ impl Gpu {
 
     fn new(instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Self> {
         let mut adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        // Integrated GPUs first: they use less power, and the compositor usually draws with them.
         adapters.sort_by_key(|adapter| {
             let info = adapter.get_info();
             let kind = match info.device_type {
@@ -288,7 +281,6 @@ impl Gpu {
         }
     }
 
-    /// The pipelines that draw into `format` targets, built once per format.
     fn pipelines(&self, format: wgpu::TextureFormat) -> Rc<Pipelines> {
         if let Some((_, pipelines)) = self
             .pipelines
@@ -340,7 +332,7 @@ impl Gpu {
                     cache: None,
                 })
         };
-        // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
+        // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
         let over = Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -396,25 +388,19 @@ impl Gpu {
     }
 }
 
-/// What a draw did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Drawn {
     Presented,
-    /// Nothing was shown, and the scene must be painted again.
     Repaint,
-    /// Nothing was shown, because the window can't be seen.
     Skipped,
 }
 
-/// Draws scenes into one window's surface.
 pub(crate) struct Renderer {
     gpu: Rc<Gpu>,
     display: rwh::RawDisplayHandle,
     window: rwh::RawWindowHandle,
-    /// `None` only while a lost GPU is replaced.
     surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
-    /// The opaque and the transparent alpha modes.
     alpha_modes: [wgpu::CompositeAlphaMode; 2],
     pipelines: Rc<Pipelines>,
     atlas: Rc<GpuAtlas>,
@@ -422,9 +408,7 @@ pub(crate) struct Renderer {
     globals_group: wgpu::BindGroup,
     globals_stride: u64,
     instances: wgpu::Buffer,
-    /// Bound in place of a missing mask or backdrop.
     empty: wgpu::TextureView,
-    /// The offscreen layer textures, kept across frames.
     pool: Vec<(wgpu::Texture, wgpu::TextureView)>,
     frame: RenderFrame,
 }
@@ -502,7 +486,6 @@ impl Renderer {
             wgpu::PresentMode::Fifo
         };
         let config = wgpu::SurfaceConfiguration {
-            // Backdrops, blend modes and captures copy from the frame when the surface allows it.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | (caps.usages & wgpu::TextureUsages::COPY_SRC),
             format,
@@ -578,7 +561,6 @@ impl Renderer {
         self.gpu.device.limits().max_texture_dimension_2d
     }
 
-    /// Draws the scene. With `capture`, also returns the frame's size and RGBA rows.
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> (Drawn, Capture) {
         if self.gpu.lost.load(Ordering::Relaxed) || self.surface.is_none() {
             let result = self.recover();
@@ -596,7 +578,7 @@ impl Renderer {
         let output = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output) => output,
             wgpu::CurrentSurfaceTexture::Suboptimal(output) => {
-                // Textures must go before the surface can be configured again.
+                // WARNING: textures must go before the surface can be configured again.
                 drop(output);
                 surface.configure(&self.gpu.device, &self.config);
                 return (
@@ -628,7 +610,7 @@ impl Renderer {
             Ok(readback) => readback,
             Err(error) => {
                 eprintln!("apps: failed to render: {error:#}");
-                // Queue writes are staged before encoding, so they are flushed even when the frame fails.
+                // WARNING: queue writes are staged before encoding, so they are flushed even when the frame fails.
                 self.gpu.queue.submit(std::iter::empty());
                 return (Drawn::Repaint, capture.then(|| Err(error)));
             }
@@ -641,7 +623,6 @@ impl Renderer {
         )
     }
 
-    /// Makes a new GPU after the old one was lost, keeping the window's surface settings.
     fn recover(&mut self) -> Result<()> {
         // WARNING: a window has one swapchain at a time, so the old surface goes first.
         self.surface = None;
@@ -709,7 +690,6 @@ impl Renderer {
         result
     }
 
-    /// Uploads the frame's globals and instances, and returns a bind group for each instance array.
     fn prepare(&mut self, frame: &RenderFrame) -> Result<[wgpu::BindGroup; 7]> {
         let gpu = &self.gpu;
         for (index, size) in frame.textures.iter().enumerate() {
@@ -744,7 +724,6 @@ impl Renderer {
         }
         self.pool.truncate(frame.textures.len());
 
-        // One globals entry for the window, then one for each offscreen layer.
         let stride = self.globals_stride as usize;
         let mut globals = vec![0; stride * (frame.layers.len() + 1)];
         for (index, target) in std::iter::once(Target::Frame)
@@ -772,7 +751,7 @@ impl Renderer {
             bytes(&frame.composites),
             bytes(&frame.blurs),
         ];
-        // wgpu rejects empty bindings, so empty arrays still take 16 bytes.
+        // WARNING: wgpu rejects empty bindings, so empty arrays still take 16 bytes.
         let limits = gpu.device.limits();
         let alignment = u64::from(limits.min_storage_buffer_offset_alignment);
         let mut offsets = [0; 7];
@@ -839,7 +818,6 @@ impl Renderer {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let mut pass: Option<wgpu::RenderPass<'static>> = None;
         let mut current = (Target::Frame, true);
-        // Begins a pass on the current target when none is open.
         macro_rules! pass {
             () => {{
                 if pass.is_none() {
@@ -869,33 +847,33 @@ impl Renderer {
                 pass.as_mut().unwrap()
             }};
         }
-        for cmd in &frame.cmds {
-            match cmd {
-                // Tiles of one texture share its render pass, with their own globals.
-                Cmd::Pass(target, false)
+        for command in &frame.commands {
+            match command {
+                Command::Pass(target, false)
                     if let Some(pass) = &mut pass
                         && frame.texture(*target) == frame.texture(current.0) =>
                 {
                     pass.set_bind_group(0, &self.globals_group, &[globals_offset(*target)]);
                     current = (*target, false);
                 }
-                // Targets are cleared right away, since a later pass may draw into them.
-                Cmd::Pass(target, clear) => {
+                // WARNING: targets are cleared right away, since a later pass may draw into them.
+                Command::Pass(target, clear) => {
                     pass = None;
                     current = (*target, *clear);
                     if *clear {
                         pass!();
                     }
                 }
-                Cmd::Quads(range) => draw(pass!(), &pipelines.quads, &instances[0], None, range),
-                Cmd::Shadows(range) => {
+                Command::Quads(range) => {
+                    draw(pass!(), &pipelines.quads, &instances[0], None, range)
+                }
+                Command::Shadows(range) => {
                     draw(pass!(), &pipelines.shadows, &instances[1], None, range)
                 }
-                Cmd::Underlines(range) => {
+                Command::Underlines(range) => {
                     draw(pass!(), &pipelines.underlines, &instances[2], None, range)
                 }
-                Cmd::Mono(id, range) => {
-                    // A texture the atlas released belongs to a stale paint.
+                Command::Mono(id, range) => {
                     if let Some(texture) = atlas.get(*id) {
                         draw(
                             pass!(),
@@ -906,7 +884,7 @@ impl Renderer {
                         );
                     }
                 }
-                Cmd::Poly(id, range) => {
+                Command::Poly(id, range) => {
                     if let Some(texture) = atlas.get(*id) {
                         draw(
                             pass!(),
@@ -917,7 +895,7 @@ impl Renderer {
                         );
                     }
                 }
-                Cmd::Blur { src, dst, index } => {
+                Command::Blur { src, dst, index } => {
                     pass = None;
                     let saved = current.0;
                     current = (*dst, true);
@@ -932,7 +910,7 @@ impl Renderer {
                     pass = None;
                     current.0 = saved;
                 }
-                Cmd::Copy { src, dst, region } => {
+                Command::Copy { src, dst, region } => {
                     pass = None;
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
                     encoder.copy_texture_to_texture(
@@ -963,7 +941,7 @@ impl Renderer {
                         },
                     );
                 }
-                Cmd::Composite {
+                Command::Composite {
                     src,
                     mask,
                     backdrop,

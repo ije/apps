@@ -96,7 +96,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   globalThis.__appsBridgeReceive=message=>{
     if(message.kind==='reply'){if(queue.length)enqueue(()=>settle(message));else settle(message);return null;}
     if(message.kind==='event'){if(emitter)enqueue(message);return null;}
-    if(message.kind==='sync'){drain();const e=event(message.sender);try{emit(message.channel,e,...decode(message.args,message.sender));}catch(error){report(error);}return encode(e.returnValue,message.sender);}
+    if(message.kind==='sync'){drain();const eventObject=event(message.sender);try{emit(message.channel,eventObject,...decode(message.args,message.sender));}catch(error){report(error);}return encode(eventObject.returnValue,message.sender);}
     if(message.kind==='expose'){__appsSyncBridge();return null;}
     if(message.kind==='dom'){
       if(typeof role!=='object'||!('renderer'in role)||message.sender?.preload!==role.renderer)throw new Error('DOM access is only available to the preload');

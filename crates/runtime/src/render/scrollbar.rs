@@ -1,6 +1,3 @@
-//! Scrollbars. By default they are macOS overlay bars that show while the box scrolls or the pointer is
-//! over them, then fade out. `::-webkit-scrollbar` styles give bars that always show and take layout space.
-
 use crate::style::Prop;
 use crate::style::{self, Style};
 use renderer::{
@@ -14,23 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long an overlay bar stays after the last scroll, and how long it then fades.
 const HOLD: Duration = Duration::from_millis(1000);
 const FADE: Duration = Duration::from_millis(300);
-/// AppKit's overlay `NSScroller`: bar, idle knob and hovered knob widths, regular then thin.
 const OVERLAY: [[f32; 3]; 2] = [[17., 6., 11.], [15., 4., 9.]];
-/// The knob's distance from the bar's edges, and its shortest length.
 const INSET: f32 = 3.;
 const SHORTEST: f32 = 26.;
 
-/// A `::-webkit-scrollbar-*` box.
 #[derive(Clone, Copy)]
 struct Part {
     fill: Rgba,
     radius: f32,
     border: f32,
     edge: Rgba,
-    /// How far `background-clip` keeps the fill inside the box.
     clip: f32,
 }
 
@@ -97,22 +89,15 @@ impl Part {
     }
 }
 
-/// How a box draws its bars.
 pub(crate) struct Look {
-    /// Light knobs, for dark color schemes.
     dark: bool,
     thin: bool,
-    /// `scrollbar-color`: thumb, then track.
     colors: Option<[Rgba; 2]>,
-    /// `::-webkit-scrollbar` bar sizes (x height, y width) and parts: bar, track, thumb, corner, hovered thumb.
     custom: Option<([f32; 2], [Option<Part>; 5])>,
-    /// Axes, x then y, whose custom bar shows without overflow: `overflow: scroll` or `scrollbar-gutter: stable`.
     pub(super) forced: [bool; 2],
 }
 
 impl Look {
-    /// `None` when `scrollbar-width: none` or `::-webkit-scrollbar { display: none }` hides the bars.
-    /// `backdrop` is the nearest opaque background color behind the bars.
     pub(crate) fn new(
         style: &Style,
         parts: Option<&[Option<Style>; 5]>,
@@ -123,8 +108,6 @@ impl Look {
         if width == "none" {
             return None;
         }
-        // A `color-scheme` picks the knobs; without one, a dark backdrop does, by HSL lightness like Chromium.
-        // Transparent windows follow the system appearance.
         let scheme = style.get(Prop::COLOR_SCHEME).unwrap_or("");
         let system = || crate::desktop::native::theme_state() & 1 != 0;
         let mut look = Look {
@@ -157,7 +140,6 @@ impl Look {
                         .is_some_and(|value| value.starts_with("stable")),
             ],
         };
-        // Like Chromium, `scrollbar-width` and `scrollbar-color` turn the `::-webkit-scrollbar` styles off.
         if let Some(parts) = parts
             && let Some(bar) = &parts[0]
             && width == "auto"
@@ -182,7 +164,6 @@ impl Look {
         Some(look)
     }
 
-    /// The axes, x then y, whose bar shows for a box that scrolls on `axes` by up to `max`.
     pub(crate) fn shown(&self, axes: [bool; 2], max: Point<Pixels>) -> [bool; 2] {
         let max = [max.x, max.y];
         [0, 1].map(|axis| {
@@ -196,7 +177,6 @@ impl Look {
         })
     }
 
-    /// The layout space of shown custom bars: x is the height at the bottom, y the width at the right.
     pub(crate) fn space(&self, shown: [bool; 2]) -> [f32; 2] {
         self.custom.as_ref().map_or([0.; 2], |(size, _)| {
             [0, 1].map(|axis| if shown[axis] { size[axis] } else { 0. })
@@ -206,13 +186,9 @@ impl Look {
 
 #[derive(Default)]
 pub(super) struct State {
-    /// The offset of the last frame.
     offset: Option<Point<Pixels>>,
-    /// When the box last scrolled, or the pointer left its bar.
     active: Option<Instant>,
-    /// The axis of the bar under the pointer, and whether the pointer is on its thumb.
     hover: Option<(usize, bool)>,
-    /// The dragged bar, and where the pointer holds its thumb.
     drag: Option<(usize, f32)>,
     wake: Option<(Instant, Timer)>,
 }
@@ -220,10 +196,8 @@ pub(super) struct State {
 pub(super) struct Bar {
     hitbox: Hitbox,
     zone: Bounds<Pixels>,
-    /// Along the axis: the start and length of the track and of the thumb.
     track: [f32; 2],
     thumb: [f32; 2],
-    /// The visible length and the scroll range.
     view: f32,
     max: f32,
 }
@@ -232,16 +206,12 @@ fn along(position: Point<Pixels>, axis: usize) -> f32 {
     f32::from(if axis == 0 { position.x } else { position.y })
 }
 
-/// The bars of a scroll box. It also anchors the scroll range at the padding edge, as a zero-size box.
 pub(super) struct Scrollbar {
     pub(super) id: usize,
     pub(super) handle: ScrollHandle,
     pub(super) look: Option<Look>,
-    /// The axes, x then y, that the user scrolls.
     pub(super) axes: [bool; 2],
-    /// The layout space the bars have, from `Look::space`.
     pub(super) reserved: [f32; 2],
-    /// Top, right, bottom and left border widths.
     pub(super) borders: [f32; 4],
     pub(super) origin: [f32; 2],
 }
@@ -331,7 +301,6 @@ impl Scrollbar {
             if !shown[axis] {
                 return None;
             }
-            // The bar runs along `axis` at the far side of the other axis, and stops short of the other bar.
             let cross = 1 - axis;
             let mut origin = [0.; 2];
             let mut extent = [0.; 2];
@@ -357,7 +326,6 @@ impl Scrollbar {
                     .max(shortest)
                     .min(track[1]);
                 thumb[0] += (track[1] - thumb[1]) * (-offset[axis] / max[axis]).clamp(0., 1.);
-                // Like NSScroller, overlay knobs shrink against the edge while the box bounces.
                 if look.custom.is_none() && stretch[axis] != 0. {
                     let end = thumb[0] + thumb[1];
                     thumb[1] = (thumb[1] - stretch[axis].abs()).max(shortest.min(thumb[1]));
@@ -445,7 +413,6 @@ impl Scrollbar {
             if alpha <= 0. {
                 continue;
             }
-            // The knob sits `INSET` from the far edge; a hovered bar widens it and shows the track.
             let width = if active { wide } else { idle };
             let cross = [bar_width - INSET - width, width];
             let (thumb_color, track_color) = look
@@ -568,7 +535,6 @@ impl Scrollbar {
                 if position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1] {
                     state.drag = Some((axis, position - bar.thumb[0]));
                 } else if bar.max > 0. {
-                    // A click on the track scrolls a page toward it, by WebKit's page step.
                     let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
                     let step = if position < bar.thumb[0] { step } else { -step };
                     let mut offset = handle.target();

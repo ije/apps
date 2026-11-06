@@ -1,7 +1,5 @@
-//! Windows: Win32 windows, Direct3D 11 through DirectComposition, and DirectWrite.
-//!
-//! Screen coordinates are physical pixels with the origin at the top left of the primary
-//! display. Logical pixels divide them by the window's scale factor.
+// WARNING: screen coordinates are physical pixels with the origin at the top left of the primary
+// display. Logical pixels divide them by the window's scale factor.
 
 mod directx;
 mod events;
@@ -32,19 +30,14 @@ use windows::{
 pub(crate) use text::TextSystem;
 pub(crate) use window::Window;
 
-/// Runs the `Box<Box<dyn FnOnce() + Send>>` in the lparam.
 const WM_POST: u32 = WM_USER + 1;
-/// Runs the `Box<Box<dyn FnOnce()>>` in the lparam.
 const WM_LOCAL: u32 = WM_USER + 2;
 
-/// The hidden window that runs posted work and timers, and gets session messages.
 static PLATFORM: AtomicIsize = AtomicIsize::new(0);
-/// The windows that want a frame on each display refresh.
 static WANTED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static VSYNC: OnceLock<Thread> = OnceLock::new();
 
 thread_local! {
-    /// The cursor shown over the content of our windows.
     static CURSOR: Cell<Option<HCURSOR>> = const { Cell::new(None) };
 }
 
@@ -58,9 +51,7 @@ impl Platform {
     pub fn new() -> Self {
         // SAFETY: plain Win32 setup on the main thread.
         unsafe {
-            // Fails when a manifest already set the awareness.
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            // WebView2 needs a single threaded COM apartment on this thread.
             let _ = OleInitialize(None);
             let instance = GetModuleHandleW(None).unwrap_or_default();
             let class = WNDCLASSW {
@@ -143,7 +134,6 @@ impl Platform {
     }
 
     pub fn write_clipboard(&self, text: &str) {
-        // Clipboard text ends at the first NUL.
         let wide: Vec<u16> = text
             .replace('\0', " ")
             .encode_utf16()
@@ -195,7 +185,6 @@ impl Platform {
     }
 }
 
-/// Runs `f` on the main thread, from any thread.
 pub(crate) fn post(f: Box<dyn FnOnce() + Send>) {
     let raw = Box::into_raw(Box::new(f));
     // SAFETY: the platform window takes back the box.
@@ -214,7 +203,6 @@ pub(crate) fn post(f: Box<dyn FnOnce() + Send>) {
     }
 }
 
-/// Runs `f` on the main thread after `delay`.
 pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
     let f: Box<dyn FnOnce()> = Box::new(f);
     let raw = Box::into_raw(Box::new(f));
@@ -251,7 +239,6 @@ unsafe extern "system" fn platform_proc(
             }
             WM_QUERYENDSESSION => return LRESULT(1),
             WM_ENDSESSION if wparam.0 != 0 => {
-                // Windows can end the process once this returns.
                 crate::app::events::quit();
                 std::process::exit(0);
             }
@@ -261,7 +248,6 @@ unsafe extern "system" fn platform_proc(
     LRESULT(0)
 }
 
-/// Paints `hwnd` on each display refresh until `stop_frames`.
 fn start_frames(hwnd: HWND) {
     let mut wanted = WANTED.lock().unwrap();
     if !wanted.contains(&(hwnd.0 as isize)) {
@@ -287,7 +273,6 @@ fn stop_frames(hwnd: HWND) {
         .retain(|&wanted| wanted != hwnd.0 as isize);
 }
 
-/// Invalidates the windows that want frames after each composition, and sleeps while none do.
 fn vsync() {
     let mut timing = DWM_TIMING_INFO {
         cbSize: size_of::<DWM_TIMING_INFO>() as u32,
@@ -326,7 +311,6 @@ fn vsync() {
     }
 }
 
-/// The scale factor of a monitor.
 fn monitor_scale(monitor: HMONITOR) -> f32 {
     let (mut x, mut y) = (USER_DEFAULT_SCREEN_DPI, USER_DEFAULT_SCREEN_DPI);
     // SAFETY: plain monitor query.

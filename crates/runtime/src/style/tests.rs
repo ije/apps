@@ -674,7 +674,6 @@ fn inline_boxes_and_atoms_stay_in_one_text_layout() {
     assert_eq!(run_of("b").inset[1], renderer::px(5.));
     assert!(run_of("d").nowrap);
     assert!(!run_of("e").nowrap);
-    // Boxes alone are a row of boxes, and flex children are items.
     assert!(inline_text(&doc, &computed, element(&doc, "#alone")).is_none());
     assert!(inline_text(&doc, &computed, element(&doc, "#flex")).is_none());
 }
@@ -1820,7 +1819,6 @@ fn media_results_restyle_their_nodes_and_rebuild_scopes_only_for_other_rules() {
             &computed.values[div]["font-size"],
             format!("{}px", width / 50.)
         );
-        // Values without viewport units or rules under a new media result are kept and get the new viewport.
         if let Some(last) = last.filter(|_| width != 300.) {
             assert!(Rc::ptr_eq(&last.values[p], &computed.values[p]));
             assert!(!Rc::ptr_eq(&last.values[div], &computed.values[div]));
@@ -1997,7 +1995,6 @@ fn inherited_custom_properties_are_shared_until_a_node_sets_one() {
             .map(|(_, value)| &**value),
         Some("1px")
     );
-    // Styles hold no custom properties, so nodes that read none of them share one style.
     assert!(computed.values[element(&doc, "#d")].vars().is_empty());
 }
 
@@ -2824,12 +2821,11 @@ fn block_in_inline_splits_and_empty_inlines_make_no_line() {
             })
             .unwrap()
     };
-    assert!(splits(&doc, &computed, id("h")));
-    assert!(!splits(&doc, &computed, id("s")));
-    assert!(phantom(&doc, &computed, id("s")));
-    assert!(!phantom(&doc, &computed, id("t")));
-    assert!(!phantom(&doc, &computed, id("u")));
-    // A hidden `<br>` breaks nothing, and the space before a break hangs.
+    assert!(holds_block_box(&doc, &computed, id("h")));
+    assert!(!holds_block_box(&doc, &computed, id("s")));
+    assert!(makes_no_line(&doc, &computed, id("s")));
+    assert!(!makes_no_line(&doc, &computed, id("t")));
+    assert!(!makes_no_line(&doc, &computed, id("u")));
     let inline = inline_text(&doc, &computed, id("q")).unwrap();
     assert_eq!(&*inline.text, "a b\nc");
     assert_eq!(

@@ -1,7 +1,3 @@
-//! The path between the main side of an app (its main script or Rust handlers) and the page side
-//! (windows, pages and their preloads). The sides share no state and can run on different threads,
-//! so all they say goes through here.
-
 use crate::{host::Host, jsc::JavaScriptCore, jsc::JsContext, jsc::payload::Payload};
 use anyhow::{Context, Result};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
@@ -26,7 +22,6 @@ type Job = Box<dyn FnOnce() + Send>;
 type Wake = Box<dyn Fn() + Send + Sync>;
 type Spawner = Box<dyn Fn(u64, Arc<PageQueue>)>;
 
-/// The view of a native window, for the web views that attach to it.
 #[derive(Clone, Copy)]
 struct NativeHandle(RawWindowHandle);
 
@@ -38,34 +33,22 @@ impl HasWindowHandle for NativeHandle {
 }
 
 pub(crate) enum ToMain {
-    /// A script that delivers an app or window event.
     Event(String, &'static str),
-    /// A bridge message from a preload.
     Bridge(Payload),
-    /// `ipcRenderer.sendSync()`, while the preload waits.
     Sync(Payload, Answer),
-    /// `window.open()`, or a read of the window it opened, while the page waits.
-    /// A key for `before-input-event`, which answers whether the page and menus get it.
     Input(u64, Value, Answer),
     Open(u64, Value, Answer),
-    /// A new window needs its page side.
     Spawn(u64),
-    /// A window opened.
     Window(u64, WindowId, WindowControl),
-    /// A command for a native window, or for the app.
     Native(Value),
-    /// The app has no page to inspect, so developer tools inspect the main script.
     OpenTools,
 }
 
 pub(crate) enum ToPage {
-    /// A window or app command.
     Command(Value),
-    /// A bridge message for the preload of a window.
     Bridge(u64, Payload),
 }
 
-/// What the main side sends to one page side.
 #[derive(Default)]
 pub(crate) struct PageQueue {
     queue: Mutex<VecDeque<ToPage>>,
@@ -110,9 +93,7 @@ impl PageQueue {
 
 struct Queues {
     main: Mutex<VecDeque<ToMain>>,
-    /// The queue of the one page side that runs all windows, without threads per window.
     page: Arc<PageQueue>,
-    /// By window, the queues of the page sides that run one window each.
     pages: Mutex<HashMap<u64, Arc<PageQueue>>>,
     per_window: AtomicBool,
     wake_main: OnceLock<Wake>,
@@ -146,7 +127,6 @@ impl Link {
         }
     }
 
-    /// The queue of the page side that all windows share.
     pub(crate) fn shared_queue(&self) -> Arc<PageQueue> {
         self.0.page.clone()
     }
@@ -163,7 +143,6 @@ impl Link {
             .cloned()
     }
 
-    /// Gives each window its own page side from now on. What was sent so far moves to them.
     pub(crate) fn set_per_window(&self) {
         let waiting = self.0.page.take();
         self.0.per_window.store(true, Ordering::Release);
@@ -182,7 +161,6 @@ impl Link {
         }
     }
 
-    /// Opens a window, from a `create` command.
     pub(crate) fn create_window(&self, command: Value) {
         let Some(id) = command["args"][1].as_u64() else {
             return;
@@ -238,7 +216,6 @@ impl Link {
         self.main(ToMain::Event(source, url));
     }
 
-    /// Sends to the page side of the window that the message names.
     pub(crate) fn page(&self, message: ToPage) {
         let window = match &message {
             ToPage::Bridge(id, _) => Some(*id),
@@ -249,7 +226,6 @@ impl Link {
         }
     }
 
-    /// Sends a command to every page side.
     pub(crate) fn page_all(&self, command: Value) {
         if !self.0.per_window.load(Ordering::Acquire) {
             return self.0.page.push(ToPage::Command(command));
@@ -265,7 +241,6 @@ impl Link {
         }
     }
 
-    /// The window is closing: its queue stays with its page side, which ends after that.
     fn forget_page(&self, window: u64) {
         self.0
             .pages
@@ -297,14 +272,12 @@ impl Link {
             .collect()
     }
 
-    /// Asks the app to quit, from any thread. The main side ends it on its next turn.
     pub(crate) fn quit(&self, code: i32) {
         self.0.exit_code.store(code, Ordering::Release);
         self.0.quit.store(true, Ordering::Release);
         self.wake_main();
     }
 
-    /// Asks the app to quit with a failure code, unless it already has one.
     pub(crate) fn fail(&self) {
         let _ = self
             .0
@@ -322,7 +295,7 @@ impl Link {
         self.0.exit_code.load(Ordering::Acquire)
     }
 
-    /// Asks the main side and waits for its answer. Main must never wait for a page like this.
+    // WARNING: asks the main side and waits for its answer. Main must never wait for a page like this.
     pub(crate) fn ask(&self, message: impl FnOnce(Answer) -> ToMain) -> Result<Payload> {
         let (answer, reply) = mpsc::sync_channel(1);
         self.main(message(answer));
@@ -334,20 +307,17 @@ impl Link {
     }
 }
 
-/// Whether the app listens for `before-input-event`, so keys of other apps skip the round trip to main.
 pub(crate) static INPUT_LISTENERS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 thread_local! { static MAIN: RefCell<Weak<Main>> = RefCell::default(); }
 
-/// Runs a turn of the main side of this thread.
 pub(crate) fn drive_main() {
     if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
         main.drive();
     }
 }
 
-/// Whether a command needs only the native window, so a busy page holds it up for nothing.
 pub(crate) fn native_command(command: &Value) -> bool {
     command["op"] == "focus"
         || command["op"] == "window"
@@ -389,7 +359,6 @@ pub(crate) fn native_command(command: &Value) -> bool {
             )
 }
 
-/// A window state as `__appsEvent('state')` takes it.
 pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value {
     let rect = |bounds: Bounds<renderer::Pixels>| {
         [
@@ -403,7 +372,6 @@ pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value 
     json!({"frame":rect(state.frame),"content":rect(state.content),"minimized":state.minimized,"maximized":state.maximized,"fullscreen":state.fullscreen,"visible":state.visible,"focused":focused,"resizing":state.resizing})
 }
 
-/// The main side: the main script, or the Rust handlers.
 pub(crate) struct Main {
     pub(crate) engine: Option<JsContext>,
     pub(crate) host: Rc<RefCell<Host>>,
@@ -412,16 +380,11 @@ pub(crate) struct Main {
     link: Link,
     pool: RefCell<Option<mpsc::Sender<Job>>>,
     windows: RefCell<HashMap<u64, (WindowId, WindowControl)>>,
-    /// The windows that exist or are on their way.
     opened: RefCell<std::collections::BTreeSet<u64>>,
-    /// Starts the page side of a window on its own thread.
     spawner: RefCell<Option<Spawner>>,
-    /// The commands of windows that are still opening.
     waiting: RefCell<Vec<Value>>,
-    /// The windows whose state changed since the main script last heard.
     changed: RefCell<Vec<u64>>,
     tools: RefCell<Option<super::devtools::DevTools>>,
-    /// The time of the armed timer of `drive`, and whether `drive` is running.
     wake: Cell<Option<Instant>>,
     driving: Cell<bool>,
     ended: Cell<bool>,
@@ -465,12 +428,10 @@ impl Main {
         *self.spawner.borrow_mut() = Some(spawner);
     }
 
-    /// The window that opened first, of those that are open.
     pub(crate) fn first_window(&self) -> Option<u64> {
         self.opened.borrow().first().copied()
     }
 
-    /// Runs what the page side sent, and returns whether there was anything.
     pub(crate) fn receive(&self) -> bool {
         let messages = std::mem::take(
             &mut *self
@@ -518,7 +479,7 @@ impl Main {
                     }
                 }
                 (ToMain::Window(id, window, control), _) => {
-                    // A window that closed on its way here must not stay retained.
+                    // WARNING: A window that closed on its way here must not stay retained.
                     if self.opened.borrow().contains(&id) {
                         self.windows.borrow_mut().insert(id, (window, control));
                     }
@@ -536,14 +497,12 @@ impl Main {
                     }
                 },
                 (ToMain::OpenTools, None) => {}
-                // A dropped answer tells the page that there is no main script.
                 (
                     ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..) | ToMain::Input(..),
                     None,
                 ) => {}
             }
         }
-        // Web views attach to native windows, which can still be on their way.
         let mut host = self.host.borrow_mut();
         for (browser, parent) in host.browsers.take_attaches() {
             match self
@@ -577,7 +536,6 @@ impl Main {
                             eprintln!("apps: {error}");
                         }
                     }
-                    // The window is busy, so its state comes on the next turn.
                     Some((None, _)) => self.changed.borrow_mut().push(id),
                     None => {}
                 }
@@ -586,7 +544,6 @@ impl Main {
         busy
     }
 
-    /// A native window told something, on the main thread.
     pub(crate) fn window_event(&self, window: WindowId, event: WindowEvent) {
         let id = self
             .windows
@@ -605,7 +562,6 @@ impl Main {
                 drop(changed);
                 self.link.wake_main();
             }
-            // A main script can keep the window open, and Rust apps always close it.
             WindowEvent::CloseRequested if self.engine.is_some() => self
                 .link
                 .event(format!("__appsEvent('close',{id})"), "apps:close"),
@@ -613,7 +569,6 @@ impl Main {
         }
     }
 
-    /// Runs a command of `native_command` without the page side.
     fn native(&self, command: Value) {
         let args = &command["args"];
         if command["op"] == "focus" {
@@ -736,7 +691,6 @@ impl Main {
         window.change(change);
     }
 
-    /// Runs a Rust handler on the pool, and sends its result to the preload that asked.
     fn invoke(&self, mut message: Value) {
         let Some(window) = message["sender"]["preload"].as_u64() else {
             return;
@@ -785,7 +739,6 @@ impl Main {
         let _ = jobs.send(job);
     }
 
-    /// One turn of the main side's loop, on the main thread.
     pub(crate) fn drive(self: &Rc<Self>) {
         // WARNING: AppKit runs nested loops under main scripts, like for a dialog. Those turns
         // only take messages, so a page that waits for an answer gets it.
@@ -846,7 +799,6 @@ impl Main {
             if next >= 0 {
                 delay = next;
             }
-            // The tick can attach web views.
             self.receive();
             let logs: Vec<_> = self.host.borrow_mut().logs.drain(..).collect();
             if let Some(tools) = &*self.tools.borrow() {

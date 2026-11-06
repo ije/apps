@@ -6,27 +6,20 @@ use crate::{
 
 pub type DrawOrder = u32;
 
-/// The draw order, the atlas texture of a sprite and the index of a primitive. Sorted, they
-/// give the paint order.
 pub(crate) type SortKey = [u32; 3];
 
-/// The primitives of one frame. Layer 0 is the window; every effect paints into its own layer.
 pub struct Scene {
     pub(crate) layers: Vec<SceneLayer>,
     active: Vec<usize>,
     spare: Vec<SceneLayer>,
-    /// The layers of effects painted with a key, by key.
     pub(crate) keyed: Vec<(u64, usize)>,
 }
 
-/// The primitives painted into the window or into one effect.
 #[derive(Default)]
 pub(crate) struct SceneLayer {
     tree: BoundsTree<ScaledPixels>,
     stack: Vec<DrawOrder>,
-    /// The effect applied to this layer, `None` for the window.
     pub(crate) effect: Option<EffectState>,
-    /// The union of the clipped bounds of all primitives in this layer.
     pub(crate) bounds: Option<Bounds<ScaledPixels>>,
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) quads: Vec<Quad>,
@@ -34,7 +27,6 @@ pub(crate) struct SceneLayer {
     pub(crate) mono: Vec<MonochromeSprite>,
     pub(crate) poly: Vec<PolychromeSprite>,
     pub(crate) effects: Vec<EffectPrimitive>,
-    /// The keys of the shadows, quads, underlines, mono and poly sprites and effects.
     keys: [Vec<SortKey>; 6],
 }
 
@@ -75,7 +67,6 @@ impl SceneLayer {
         }
     }
 
-    /// Inserts a primitive drawn in `bounds`, ordered by `reach` when it can move within it.
     fn insert(
         &mut self,
         bounds: Bounds<ScaledPixels>,
@@ -127,7 +118,6 @@ impl SceneLayer {
         self.keys[kind].push([order, texture, index as u32 - 1]);
     }
 
-    /// Sorts the keys into paint order. The index keeps ties in insertion order.
     fn finish(&mut self) {
         for keys in &mut self.keys {
             keys.sort_unstable();
@@ -151,7 +141,6 @@ impl Scene {
         &mut self.layers[index]
     }
 
-    /// Paints the next primitives at one draw order, so they keep their paint order.
     pub(crate) fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let layer = self.current();
         let order = layer.tree.insert(bounds);
@@ -217,8 +206,6 @@ impl Scene {
             .insert(bounds, content_mask.bounds, primitive, reach);
     }
 
-    /// Sets the opacity of the layer painted with `key`, and its transform unless `None`. `false`
-    /// without such a layer, or when a new transform needs a new frame.
     pub(crate) fn patch(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
         let Some(&(_, index)) = self.keyed.iter().find(|(keyed, _)| *keyed == key) else {
             return false;
@@ -237,7 +224,6 @@ impl Scene {
         let Some(bounds) = effect_bounds(&self.layers[index]) else {
             return true;
         };
-        // Only a layer painted in the window is ordered to turn, see `pop_effect`.
         self.layers[0]
             .effects
             .iter_mut()
@@ -246,8 +232,6 @@ impl Scene {
             .is_some()
     }
 
-    /// Whether the window paints over the effect of scene layer `index` within `reach`, or the
-    /// effect is not painted in the window.
     pub(crate) fn paints_over(&self, index: usize, reach: Bounds<ScaledPixels>) -> bool {
         let window = &self.layers[0];
         let Some(own) = window.effects.iter().find(|effect| effect.layer == index) else {
@@ -296,13 +280,11 @@ impl Scene {
         }
     }
 
-    /// The batches of a layer, in paint order, as keys of the layer's primitives.
     pub(crate) fn batches(&self, layer: usize) -> Batches<'_> {
         Batches(self.layers[layer].keys.each_ref().map(Vec::as_slice))
     }
 }
 
-/// What an effect layer draws in its parent: its content with blur and shadow, transformed, and its backdrop.
 fn effect_bounds(layer: &SceneLayer) -> Option<Bounds<ScaledPixels>> {
     let effect = layer.effect.as_ref()?;
     let bounds = layer.bounds.map(|content| {
@@ -324,7 +306,6 @@ fn effect_bounds(layer: &SceneLayer) -> Option<Bounds<ScaledPixels>> {
     }
 }
 
-/// Maps bounds through a 4x4 column-major matrix and returns the bounding box of the result.
 pub(crate) fn transform_bounds(
     matrix: &[f32; 16],
     bounds: Bounds<ScaledPixels>,
@@ -366,8 +347,6 @@ pub(crate) enum Batch<'a> {
     Effects(&'a [SortKey]),
 }
 
-/// The keys of each primitive kind that are not batched yet. A batch is the run of keys of one
-/// kind and texture that come before the first key of the other kinds.
 pub(crate) struct Batches<'a>([&'a [SortKey]; 6]);
 
 impl<'a> Iterator for Batches<'a> {
@@ -400,7 +379,6 @@ impl<'a> Iterator for Batches<'a> {
     }
 }
 
-/// How an effect layer mixes with the content below it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum BlendMode {
@@ -424,27 +402,17 @@ pub enum BlendMode {
     PlusLighter = 16,
 }
 
-/// An effect applied to everything painted inside [`crate::Window::paint_effect`].
 #[derive(Clone, Debug)]
 pub struct PaintEffect {
-    /// A 4x4 column-major matrix from the effect's coordinates to window coordinates, in logical pixels.
     pub transform: Option<[f32; 16]>,
-    /// Multiplies the alpha of the whole group.
     pub opacity: f32,
-    /// A 4x5 row-major color matrix applied to unpremultiplied colors, like SVG `feColorMatrix`.
     pub color_matrix: Option<[f32; 20]>,
-    /// The standard deviation of a gaussian blur.
     pub blur: Pixels,
-    /// A drop shadow of the group's alpha: offset, standard deviation and color.
     pub shadow: Option<(Point<Pixels>, Pixels, Rgba)>,
     pub blend_mode: BlendMode,
-    /// A rounded rectangle that clips the group.
     pub clip: Option<(Bounds<Pixels>, Radii<Pixels>)>,
-    /// An image whose alpha masks the group, stretched over the bounds.
     pub mask: Option<(std::sync::Arc<RenderImage>, Bounds<Pixels>)>,
-    /// A filter for the content below the given rounded rectangle.
     pub backdrop: Option<Backdrop>,
-    /// Names the layer, so [`crate::Window::patch_opacity`] can change it in the kept scene.
     pub key: Option<u64>,
 }
 
@@ -465,14 +433,11 @@ impl Default for PaintEffect {
     }
 }
 
-/// A filter applied to the content below an element, like CSS `backdrop-filter`.
 #[derive(Clone, Debug)]
 pub struct Backdrop {
     pub bounds: Bounds<Pixels>,
     pub corner_radii: Radii<Pixels>,
-    /// The standard deviation of a gaussian blur.
     pub blur: Pixels,
-    /// A 4x5 row-major color matrix, like SVG `feColorMatrix`.
     pub color_matrix: Option<[f32; 20]>,
 }
 
@@ -484,7 +449,6 @@ pub(crate) struct BackdropState {
     pub color_matrix: Option<[f32; 20]>,
 }
 
-/// A [`PaintEffect`] in device pixels.
 #[derive(Clone, Debug)]
 pub(crate) struct EffectState {
     pub transform: Option<[f32; 16]>,
@@ -524,8 +488,6 @@ pub enum BorderStyle {
 #[repr(C)]
 pub(crate) struct Quad {
     pub order: DrawOrder,
-    /// The `BorderStyle` in the low byte, and in bits 8 to 11 the sides it keeps (top, right, bottom, left),
-    /// or none for all.
     pub border_style: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -558,7 +520,6 @@ pub(crate) struct Shadow {
     pub color: Rgba,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Radii<ScaledPixels>,
-    /// 0 is a drop shadow outside the element, 1 an inset shadow inside it.
     pub inset: u32,
     pub pad: u32,
 }
@@ -592,7 +553,6 @@ pub(crate) struct PolychromeSprite {
 pub(crate) struct AtlasTile {
     pub texture_id: AtlasTextureId,
     pub tile_id: u32,
-    /// The empty pixels around the content.
     pub padding: u32,
     pub bounds: Bounds<DevicePixels>,
 }
@@ -607,15 +567,12 @@ pub(crate) struct AtlasTextureId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub(crate) enum AtlasTextureKind {
-    /// One alpha byte per pixel, for glyphs.
     Monochrome = 0,
-    /// BGRA pixels, for images and emoji.
     Polychrome = 1,
 }
 
 static NEXT_IMAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// A decoded image: straight-alpha BGRA pixels.
 pub struct RenderImage {
     pub id: u64,
     width: u32,
@@ -624,7 +581,6 @@ pub struct RenderImage {
 }
 
 impl RenderImage {
-    /// `bytes` holds `width * height` straight-alpha BGRA pixels.
     pub fn new(width: u32, height: u32, bytes: Vec<u8>) -> Self {
         assert_eq!(bytes.len(), width as usize * height as usize * 4);
         Self {
@@ -643,7 +599,6 @@ impl RenderImage {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    /// The pixels, to reuse their memory once the image is dropped from the window.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
