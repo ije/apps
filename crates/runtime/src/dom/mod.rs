@@ -4,7 +4,8 @@ mod selector;
 
 pub use document::{Attrs, Document, Node, escape};
 pub(crate) use selector::{
-    ACTIVE, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache, SelectorList,
+    ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache,
+    SelectorList,
 };
 
 use crate::style;
@@ -48,13 +49,18 @@ pub(crate) type SvgBoxes = (
 type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
 
 pub(crate) struct LayoutNode {
-    pub node: Node,
-    /// The document revision that `node` was copied at.
+    /// The hashes of `cull::content`.
+    pub shape: u64,
+    pub attrs: u64,
+    /// The document revision that the hashes are from.
     pub seen: u64,
     pub style: Rc<style::Style>,
     /// A hash of the units the style's lengths resolve with.
     pub units: u64,
-    pub children: Vec<(usize, u64)>,
+    /// A hash of the children in the flow.
+    pub list: u64,
+    /// A hash of the children in the flow with their revisions.
+    pub kids: u64,
     /// The summed revisions of the children out of the flow.
     pub(crate) out: u64,
     pub revision: u64,
@@ -62,6 +68,8 @@ pub(crate) struct LayoutNode {
     pub geometry: u64,
     /// The culling flags of the box's own style.
     pub flags: u16,
+    /// The culling flags that its tag and pseudo-elements give, with `cull::INPUT`.
+    pub marks: u16,
 }
 
 /// Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
@@ -83,6 +91,64 @@ impl Drop for MirrorMemory {
     fn drop(&mut self) {
         drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.0.as_ptr(), self.1)) });
     }
+}
+
+/// All nodes of a composed tree in document order, each with its parent's id or `u32::MAX`, kept until the tree
+/// changes. Pages that only change styles, text or attributes then don't chase the children of every node.
+#[derive(Default)]
+pub(crate) struct Walk {
+    tree: u64,
+    composed: rustc_hash::FxHashMap<usize, Vec<usize>>,
+    pub(crate) nodes: Rc<Vec<(u32, u32)>>,
+}
+
+impl Walk {
+    /// Walks the tree again if it changed, or takes the nodes of `shared` if that is the same walk, and returns
+    /// whether the nodes changed.
+    pub(crate) fn update(
+        &mut self,
+        doc: &Document,
+        composed: &rustc_hash::FxHashMap<usize, Vec<usize>>,
+        shared: Option<&Walk>,
+    ) -> bool {
+        let tree = doc.nodes.tree();
+        if self.tree == tree && !self.nodes.is_empty() && self.composed == *composed {
+            return false;
+        }
+        self.tree = tree;
+        self.composed.clone_from(composed);
+        if let Some(shared) = shared
+            .filter(|shared| shared.tree == tree && !shared.nodes.is_empty())
+            .filter(|shared| shared.composed == *composed)
+        {
+            self.nodes = shared.nodes.clone();
+            return true;
+        }
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        let mut pending = vec![(0, u32::MAX)];
+        while let Some((id, parent)) = pending.pop() {
+            nodes.push((id, parent));
+            pending.extend(
+                composed
+                    .get(&(id as usize))
+                    .unwrap_or(&doc.nodes[id as usize].children)
+                    .iter()
+                    .rev()
+                    .map(|&child| (child as u32, id)),
+            );
+        }
+        self.nodes = Rc::new(nodes);
+        true
+    }
+}
+
+/// The shadow hosts in tree order and the nodes assigned to each slot, kept until the tree changes.
+#[derive(Default)]
+struct ShadowWalk {
+    tree: u64,
+    count: usize,
+    hosts: Vec<usize>,
+    slots: HashMap<usize, Vec<usize>>,
 }
 
 /// Node states that scripts set: a checked checkbox, radio or option, whether that replaces the
@@ -320,6 +386,15 @@ pub struct State {
     /// The last styles while `computed` is out of date, so a restyle keeps the old style of nodes whose values
     /// stay the same.
     previous: Option<Rc<style::ComputedStyles>>,
+    /// The styles before those. Once frames dropped them, the next style pass reuses their lists.
+    // WARNING: a list per node is megabytes on big pages, and a new one costs a page fault per 16 KB.
+    old_styles: Option<Rc<style::ComputedStyles>>,
+    /// A walk of the composed tree before `display: contents`, with the boxes that are always selectable and
+    /// room for the marks of a pass.
+    pub(crate) style_walk: Walk,
+    editable: Vec<usize>,
+    select_marks: Vec<u8>,
+    shadow_walk: Rc<ShadowWalk>,
     pub(crate) grids: rustc_hash::FxHashMap<
         usize,
         (
@@ -335,14 +410,12 @@ pub struct State {
     /// The max-content width of grids that shrink to fit, when their tracks were last sized.
     pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
     pub(crate) baselines: crate::render::grid::Baselines,
-    /// Boxed, since the list is as long as the node arena, whose free slots outnumber the nodes after a big page
-    /// shrinks.
-    pub(crate) layout_nodes: Vec<Option<Box<LayoutNode>>>,
+    pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
     /// When each box last painted, counted across frames. Hit tests take the box painted last.
     pub painted: Vec<u64>,
     pub(crate) paint_count: u64,
-    pub(crate) inline_text: std::collections::HashMap<usize, Option<Rc<style::InlineText>>>,
+    pub(crate) inline_text: rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>,
     pub(crate) layout_revision: u64,
     /// Counts style recomputes, so `layout_flags` knows when the mirror's style bits are old.
     style_epoch: u64,
@@ -495,6 +568,10 @@ impl State {
         free.drain(..cut);
         free.shrink_to_fit();
         self.free = free.into();
+        self.old_styles = None;
+        self.style_walk = Default::default();
+        self.select_marks = Vec::new();
+        self.inline_text = Default::default();
         self.style_cache.trim(len);
         self.layout_nodes.truncate(len);
         self.layout_nodes.shrink_to_fit();
@@ -548,9 +625,7 @@ impl State {
                 computed.values[id] = Rc::default();
                 computed.flags.resize(doc.nodes.len(), 0);
                 computed.flags[id] = 0;
-                computed
-                    .lengths
-                    .resize(doc.nodes.len(), computed.lengths[0]);
+                computed.lengths.resize(doc.nodes.len());
                 computed
                     .user_select
                     .resize(doc.nodes.len(), (style::UserSelect::None, 0));
@@ -1264,12 +1339,12 @@ pub fn call(
             let repaint = focus == 0
                 && (ids.iter().any(control) || state.interaction[index].iter().any(control));
             if op == "dom.focus" {
-                if let Some(node) = state.focus.and_then(|id| doc.nodes.get_mut(id)) {
+                if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
                     node.state &= !(FOCUS | FOCUS_VISIBLE);
                 }
                 state.focus = ids.first().copied();
-                if let Some(id) = state.focus {
-                    doc.nodes[id].state |= if args[1].as_bool() == Some(false) {
+                if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
+                    node.state |= if args[1].as_bool() == Some(false) {
                         FOCUS
                     } else {
                         FOCUS | FOCUS_VISIBLE
@@ -1277,12 +1352,14 @@ pub fn call(
                 }
             }
             for &id in &state.interaction[index] {
-                if let Some(node) = doc.nodes.get_mut(id) {
+                if let Some(node) = doc.nodes.edit(id) {
                     node.state &= !flag;
                 }
             }
             for &id in &ids {
-                doc.nodes[id].state |= flag;
+                if let Some(node) = doc.nodes.edit(id) {
+                    node.state |= flag;
+                }
             }
             state.interaction[index] = ids;
             if used {
@@ -2794,7 +2871,30 @@ pub(crate) fn styles(
         return computed.clone();
     }
     state.drop_removed(doc);
-    let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
+    if let Some(styles) = state.old_styles.take().and_then(|styles| Rc::try_unwrap(styles).ok()) {
+        state.style_cache.spare = Some(styles.into());
+    }
+    if state.shadow_walk.tree != doc.nodes.tree()
+        || state.shadow_walk.count != state.shadows.len()
+    {
+        let mut hosts = Vec::new();
+        let mut pending = if state.shadows.is_empty() { vec![] } else { vec![0] };
+        while let Some(id) = pending.pop() {
+            if let Some(&root) = state.shadows.get(&id) {
+                hosts.push(id);
+                pending.push(root);
+            }
+            pending.extend(&doc.nodes[id].children);
+        }
+        state.shadow_walk = Rc::new(ShadowWalk {
+            tree: doc.nodes.tree(),
+            count: state.shadows.len(),
+            hosts,
+            slots: slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root))),
+        });
+    }
+    let shadow_walk = state.shadow_walk.clone();
+    let slots = &shadow_walk.slots;
     let mut context = style::StyleContext {
         reduced_motion,
         theme,
@@ -2807,10 +2907,11 @@ pub(crate) fn styles(
             .map(|(_, sheet, user)| (sheet.clone(), *user))
             .collect(),
         previous: state.computed.clone().or_else(|| state.previous.take()),
+        top_layer: !state.top_layer.is_empty(),
         ..Default::default()
     };
     if !state.shadows.is_empty() {
-        let mut required = HashSet::from([0]);
+        let mut required = rustc_hash::FxHashSet::from_iter([0]);
         for &node in slots
             .keys()
             .chain(state.shadows.keys())
@@ -2838,7 +2939,7 @@ pub(crate) fn styles(
     // WARNING: the first pass computes only hosts, roots, slots and their ancestors to collect `:host` declarations and slot styles; pass 1 recomputes every node with them.
     // WARNING: each shadow tree cascades with its root swapped in as the document, which stamps both nodes, so
     // their revisions go back afterwards: the style pass changed no node, and kept boxes compare revisions.
-    let latest = doc.nodes.latest();
+    let (latest, tree) = (doc.nodes.latest(), doc.nodes.tree());
     let swapped: Vec<(usize, u64)> = std::iter::once(0)
         .chain(state.shadows.values().copied())
         .map(|id| (id, doc.nodes.revision(id)))
@@ -2865,9 +2966,8 @@ pub(crate) fn styles(
                 &mut result,
             );
         }
-        let mut pending = vec![0];
         context.parts.clear();
-        while let Some(id) = pending.pop() {
+        for &id in &shadow_walk.hosts {
             if let Some(&root) = state.shadows.get(&id) {
                 if let Some(rules) = result.parts.get(&id).cloned() {
                     let mut batch: HashMap<usize, Vec<_>> = HashMap::new();
@@ -2948,8 +3048,8 @@ pub(crate) fn styles(
                     children: vec![root],
                     ..Default::default()
                 };
-                let document = std::mem::replace(&mut doc.nodes[0], scoped_doc);
-                let shadow = std::mem::replace(&mut doc.nodes[root], scoped_root);
+                let document = doc.nodes.swap(0, scoped_doc);
+                let shadow = doc.nodes.swap(root, scoped_root);
                 let top = (
                     result.values[0].clone(),
                     result.lengths[0],
@@ -2965,25 +3065,20 @@ pub(crate) fn styles(
                     Some(&context),
                     &mut result,
                 );
-                (
-                    result.values[0],
-                    result.lengths[0],
-                    result.flags[0],
-                    result.vars[0],
-                ) = top;
-                doc.nodes[0] = document;
-                doc.nodes[root] = shadow;
+                let lengths;
+                (result.values[0], lengths, result.flags[0], result.vars[0]) = top;
+                result.lengths.set(0, lengths);
+                doc.nodes.swap(0, document);
+                doc.nodes.swap(root, shadow);
                 if pass == 0 {
                     context
                         .hosts
                         .insert(id, std::mem::take(&mut result.host_declarations));
                 }
-                pending.push(root);
             }
-            pending.extend(&doc.nodes[id].children);
         }
         if pass == 0 {
-            for (&slot, assigned) in &slots {
+            for (&slot, assigned) in slots {
                 for &child in assigned {
                     context.inherited.insert(
                         child,
@@ -3018,7 +3113,7 @@ pub(crate) fn styles(
             }
         }
     }
-    doc.nodes.restore(&swapped, latest);
+    doc.nodes.restore(&swapped, latest, tree);
     state.style_cache.finish();
     state.sheets.retain(|text, _| Rc::strong_count(text) > 1);
     for (&host, &root) in &state.shadows {
@@ -3026,27 +3121,57 @@ pub(crate) fn styles(
             .children
             .insert(host, doc.nodes[root].children.clone());
     }
-    for (slot, assigned) in slots {
+    for (&slot, assigned) in slots {
         if !assigned.is_empty() {
-            result.children.insert(slot, assigned);
+            result.children.insert(slot, assigned.clone());
         }
     }
-    let mut order = Vec::new();
-    let mut pending = vec![(0, (style::UserSelect::Text, 0), false)];
-    while let Some((id, inherited, hidden)) = pending.pop() {
-        let node = &doc.nodes[id];
+    if state
+        .style_walk
+        .update(doc, &result.children, state.style_cache.document_walk())
+    {
+        state.editable.clear();
+        state.editable.extend(
+            state
+                .style_walk
+                .nodes
+                .iter()
+                .map(|&(id, _)| id as usize)
+                .filter(|&id| {
+                    let node = &doc.nodes[id];
+                    matches!(node.tag.as_str(), "input" | "textarea")
+                        || node.attrs.get("contenteditable").is_some_and(|value| {
+                            matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "" | "true" | "plaintext-only"
+                            )
+                        })
+                }),
+        );
+    }
+    const HIDDEN: u8 = 1;
+    const EDITABLE: u8 = 2;
+    let marks = &mut state.select_marks;
+    marks.clear();
+    marks.resize(doc.nodes.len(), 0);
+    for &id in &state.editable {
+        marks[id] = EDITABLE;
+    }
+    for &(id, parent) in state.style_walk.nodes.iter() {
+        let id = id as usize;
+        let (inherited, hidden) = match parent {
+            u32::MAX => ((style::UserSelect::Text, 0), false),
+            parent => (
+                result.user_select[parent as usize],
+                marks[parent as usize] & HIDDEN != 0,
+            ),
+        };
         let flags = result.flags[id];
         let hidden = hidden || flags & style::DISPLAY_NONE != 0;
+        marks[id] |= u8::from(hidden) * HIDDEN;
         let mode = if hidden || flags & style::INVISIBLE != 0 {
             style::UserSelect::None
-        } else if matches!(node.tag.as_str(), "input" | "textarea")
-            || node.attrs.get("contenteditable").is_some_and(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "" | "true" | "plaintext-only"
-                )
-            })
-        {
+        } else if marks[id] & EDITABLE != 0 {
             style::UserSelect::Text
         } else if flags & style::SELECT_NONE != 0 {
             style::UserSelect::None
@@ -3057,36 +3182,29 @@ pub(crate) fn styles(
         } else {
             inherited.0
         };
-        let selection = (mode, if mode == inherited.0 { inherited.1 } else { id });
-        result.user_select[id] = selection;
-        order.push(id);
-        pending.extend(
-            result
-                .children
-                .get(&id)
-                .unwrap_or(&node.children)
-                .iter()
-                .map(|&child| (child, selection, hidden)),
-        );
+        result.user_select[id] = (mode, if mode == inherited.0 { inherited.1 } else { id });
     }
-    for id in order.into_iter().rev() {
-        let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
-        let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
-        if children.iter().any(|&child| contents(child)) {
-            let mut flattened = Vec::new();
-            for &child in children {
-                if contents(child) {
-                    flattened.extend(
-                        result
-                            .children
-                            .get(&child)
-                            .unwrap_or(&doc.nodes[child].children),
-                    );
-                } else {
-                    flattened.push(child);
+    if result.flags.iter().any(|flags| flags & style::DISPLAY_CONTENTS != 0) {
+        for &(id, _) in state.style_walk.nodes.iter().rev() {
+            let id = id as usize;
+            let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
+            let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
+            if children.iter().any(|&child| contents(child)) {
+                let mut flattened = Vec::new();
+                for &child in children {
+                    if contents(child) {
+                        flattened.extend(
+                            result
+                                .children
+                                .get(&child)
+                                .unwrap_or(&doc.nodes[child].children),
+                        );
+                    } else {
+                        flattened.push(child);
+                    }
                 }
+                result.children.insert(id, flattened);
             }
-            result.children.insert(id, flattened);
         }
     }
     if animating {
@@ -3103,6 +3221,7 @@ pub(crate) fn styles(
     state.linted = false;
     state.computed = Some(result.clone());
     state.previous = None;
+    state.old_styles = context.previous.take();
     result
 }
 

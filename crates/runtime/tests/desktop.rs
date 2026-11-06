@@ -320,6 +320,134 @@ fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
+fn animation_end_handlers_run_before_the_final_frame() {
+    use base64::Engine;
+
+    let main = r#"
+        const { app, BrowserWindow } = __apps;
+        app.whenReady().then(async () => {
+            const win = new BrowserWindow({ width: 300, height: 200 });
+            await win.loadFile('apps:///index.html');
+            await win.webContents.capturePage();
+            await win.webContents.executeJavaScript("document.querySelector('div').style.animation = 'exit .3s linear'");
+            for (let i = 0; i < 40; i++) {
+                const image = await win.webContents.capturePage({ x: 40, y: 40, width: 1, height: 1 });
+                console.log('FRAME ' + Buffer.from(image.toPNG()).toString('base64'));
+            }
+            console.log('ANIMATION_PAINT_OK'); app.quit();
+        });
+    "#;
+    let page = r#"
+        <style>
+            body { margin:0; background:lime; }
+            div { width:100px; height:100px; background:red; }
+            @keyframes exit { to { opacity:0; transform:scale(.95); } }
+        </style>
+        <div></div>
+        <script>
+            const box = document.querySelector('div');
+            box.addEventListener('animationend', () => queueMicrotask(() => box.remove()));
+        </script>
+    "#;
+    let output = run_window_test(main, page);
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("ANIMATION_PAINT_OK"),
+        "{text}"
+    );
+    let red: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("FRAME "))
+        .map(|encoded| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0)[0]
+        })
+        .collect();
+    assert_eq!(red.len(), 40, "{text}");
+    assert!(red.iter().any(|&value| value > 0 && value < 250), "{red:?}");
+    assert_eq!(red.last(), Some(&0), "{red:?}");
+    assert!(
+        red.windows(2)
+            .all(|pair| pair[1] <= pair[0].saturating_add(2)),
+        "The closing popup flashed: {red:?}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
+fn textarea_content_sizing_follows_text_and_constraints() {
+    let main = r#"
+        const { app, BrowserWindow, ipcMain } = __apps;
+        let finished = false;
+        ipcMain.on('done', () => { finished = true; console.log('FIELD_SIZING_OK'); app.quit(); });
+        app.whenReady().then(async () => {
+            const win = new BrowserWindow({ width: 600, height: 500 });
+            await win.loadFile('apps:///index.html');
+            while (!finished) await win.webContents.capturePage();
+        });
+    "#;
+    let page = r#"
+        <style>
+            textarea { display:block; font:16px/20px monospace; padding:6px; border:1px solid; width:200px; box-sizing:border-box; }
+            #content { field-sizing:content; }
+            section { display:flex; width:240px; }
+            section textarea { field-sizing:content; width:100%; }
+            aside { width:32px; flex-shrink:0; }
+            main { display:grid; grid-template-columns:200px; }
+            main textarea { field-sizing:content; width:100%; }
+        </style>
+        <textarea id=content rows=8 placeholder='Add a comment'></textarea>
+        <textarea id=fixed rows=2></textarea>
+        <section><aside></aside><textarea id=flex rows=2 placeholder='Add a comment'></textarea></section>
+        <main><textarea rows=8>one
+two
+three</textarea></main>
+        <script type='preload'>__apps.contextBridge.exposeInMainWorld('done', () => __apps.ipcRenderer.send('done'));</script>
+        <script>
+            const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const field = document.getElementById('content');
+            const height = element => element.getBoundingClientRect().height;
+            const check = (actual, expected, label) => { if (Math.abs(actual - expected) > 1) throw Error(`${label}: ${actual}, expected ${expected}`); };
+            setTimeout(async () => {
+                check(height(field), 34, 'placeholder ignores rows');
+                check(height(document.getElementById('fixed')), 54, 'fixed keeps rows');
+                check(height(document.getElementById('flex')), 34, 'flex percentage width');
+                check(height(document.querySelector('main')), 74, 'grid content height');
+                field.value = 'one\ntwo\nthree'; await frame();
+                check(height(field), 74, 'multiline value');
+                field.value = 'word '.repeat(20); await frame();
+                if (height(field) <= 74) throw Error('text does not wrap');
+                field.style.maxHeight = '64px'; await frame();
+                check(height(field), 64, 'maximum height');
+                field.style.height = '44px'; await frame();
+                check(height(field), 44, 'explicit height');
+                field.style.height = ''; field.style.maxHeight = ''; field.value = ''; await frame();
+                check(height(field), 34, 'shrinks to placeholder');
+                field.removeAttribute('placeholder'); await frame();
+                check(height(field), 34, 'empty line');
+                field.style.minHeight = '80px'; await frame();
+                check(height(field), 80, 'minimum height');
+                done();
+            }, 200);
+        </script>
+    "#;
+    let output = run_window_test(main, page);
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("FIELD_SIZING_OK"),
+        "{text}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
 fn layout_callbacks_can_request_the_next_frame() {
     let main = r#"
         const { app, BrowserWindow, ipcMain } = __apps;

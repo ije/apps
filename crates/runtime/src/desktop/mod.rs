@@ -957,6 +957,8 @@ impl Desktop {
                 page.dirty = true;
             }
         }
+        #[cfg(target_os = "macos")]
+        crate::malloc::flush();
     }
 
     pub(crate) fn drive(runtime: Rc<RefCell<Self>>, cx: &mut App) {

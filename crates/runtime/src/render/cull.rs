@@ -40,6 +40,8 @@ pub(crate) const ANIMATED: u16 = 8192;
 pub(crate) const FRAMED: u16 = 16384;
 /// The subtree reads the height of its containing block.
 pub(crate) const HEIGHTED: u16 = 32768;
+/// In `LayoutNode.marks` only: the box builds from more than its subtree, see `Cull.inputs`.
+pub(crate) const INPUT: u16 = 1;
 
 /// Whether a box's own values read the height of its containing block.
 pub(crate) fn reads_height(style: &style::Style) -> bool {
@@ -96,6 +98,10 @@ pub(crate) struct Cull {
     pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     /// The nodes that are not hidden, built with `info`.
     pub(crate) visible: Vec<bool>,
+    /// A walk of the composed tree, parents first, kept until the tree changes.
+    pub(crate) walk: crate::dom::Walk,
+    /// The table cells of `walk`, whose rows the box tree flattens.
+    pub(crate) cells: Vec<usize>,
     /// Inline SVGs, positioned boxes and grids, which build from more than their subtree, see
     /// `element::own_inputs`.
     pub(crate) inputs: Vec<usize>,
@@ -112,6 +118,8 @@ impl Cull {
     pub(crate) fn trim(&mut self, len: usize) {
         self.placed.truncate(len);
         self.placed.shrink_to_fit();
+        self.walk = Default::default();
+        self.cells = Vec::new();
         if self.info.len() > len {
             self.info.truncate(len);
             self.info.shrink_to_fit();
@@ -239,14 +247,29 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
     }
 }
 
-/// Whether the attributes differ only in ones that act through the style or not at all.
-pub(super) fn cosmetic_attrs(old: &crate::dom::Attrs, new: &crate::dom::Attrs) -> bool {
-    old.iter().chain(new.iter()).all(|(name, _)| {
-        matches!(name.as_str(), "class" | "style" | "id" | "title")
+/// Hashes what a box shows without its style: first what can size it (the tag, text, form state and the
+/// attributes that act on their own), then all attributes.
+pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut shape = rustc_hash::FxHasher::default();
+    node.tag.hash(&mut shape);
+    node.text.hash(&mut shape);
+    // WARNING: a form control's value and checked state draw like its text.
+    node.value.hash(&mut shape);
+    (node.state & (crate::dom::CHECKED | crate::dom::DIRTY)).hash(&mut shape);
+    let mut own = shape.finish();
+    let mut attrs = rustc_hash::FxHasher::default();
+    for pair in node.attrs.iter() {
+        pair.hash(&mut attrs);
+        let name = pair.0.as_str();
+        if !(matches!(name, "class" | "style" | "id" | "title")
             || name.starts_with("data-")
-            || name.starts_with("aria-")
-            || old.get(name) == new.get(name)
-    })
+            || name.starts_with("aria-"))
+        {
+            own = own.wrapping_add(rustc_hash::FxBuildHasher.hash_one(pair));
+        }
+    }
+    (own, attrs.finish())
 }
 
 /// The flags of a box's own style.
@@ -808,17 +831,37 @@ mod tests {
         let (doc, ..) = page(
             "<p id=a class=x data-v=1 hidden></p><p id=b class=y data-v=2 hidden></p><p class=x></p><img src=a><img src=b>",
         );
-        let attrs = |index: usize| {
-            &doc.nodes
-                .iter()
-                .filter(|node| !node.attrs.iter().next().is_none())
-                .nth(index)
-                .unwrap()
-                .attrs
+        let shape = |index: usize| {
+            content(
+                doc.nodes
+                    .iter()
+                    .filter(|node| !node.attrs.iter().next().is_none())
+                    .nth(index)
+                    .unwrap(),
+            )
+            .0
         };
-        assert!(cosmetic_attrs(attrs(0), attrs(1)));
-        assert!(!cosmetic_attrs(attrs(0), attrs(2)));
-        assert!(!cosmetic_attrs(attrs(3), attrs(4)));
+        assert_eq!(shape(0), shape(1));
+        assert_ne!(shape(0), shape(2));
+        assert_ne!(shape(3), shape(4));
+    }
+
+    #[test]
+    fn content_hash_tells_what_can_resize_a_box() {
+        let (mut doc, ..) = page("<p class=x data-v=1 id=a>text</p>");
+        let id = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        let start = content(&doc.nodes[id]);
+        doc.nodes[id].attrs.set("class", "y".into());
+        doc.nodes[id].attrs.set("data-v", "2".into());
+        let cosmetic = content(&doc.nodes[id]);
+        assert_eq!(cosmetic.0, start.0);
+        assert_ne!(cosmetic.1, start.1);
+        doc.nodes[id].attrs.set("colspan", "2".into());
+        assert_ne!(content(&doc.nodes[id]).0, start.0);
+        doc.nodes[id].attrs.remove("colspan");
+        assert_eq!(content(&doc.nodes[id]), cosmetic);
+        doc.nodes[id].value = Some("v".into());
+        assert_ne!(content(&doc.nodes[id]).0, start.0);
     }
 
     #[test]

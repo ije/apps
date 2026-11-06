@@ -1601,7 +1601,7 @@ impl Compiler {
         &mut self,
         sheets: &mut Vec<Rc<Stylesheet>>,
         doc: &Document,
-        order: &[usize],
+        order: &[(u32, u32)],
     ) -> Option<Update<'_>> {
         let index = sheets.iter().position(|sheet| {
             sheet
@@ -1714,7 +1714,7 @@ impl Config {
         sheets: &mut Vec<Rc<Stylesheet>>,
         index: usize,
         doc: &Document,
-        order: &[usize],
+        order: &[(u32, u32)],
     ) -> Update<'_> {
         let mut used = String::new();
         let first = self.header.is_none();
@@ -1734,7 +1734,8 @@ impl Config {
         if self.scanned.len() < doc.nodes.len() {
             self.scanned.resize(doc.nodes.len(), 0);
         }
-        for &id in order {
+        for &(id, _) in order {
+            let id = id as usize;
             let revision = doc.nodes.revision(id);
             if std::mem::replace(&mut self.scanned[id], revision) == revision {
                 continue;

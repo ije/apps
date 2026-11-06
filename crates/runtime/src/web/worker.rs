@@ -245,6 +245,8 @@ impl State {
                             let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
                             if wait != delay && matches!(message, Err(mpsc::RecvTimeoutError::Timeout)) {
                                 api.shrink();
+                                #[cfg(target_os = "macos")]
+                                crate::malloc::flush();
                             }
                             crate::host::idle(false);
                             match message {

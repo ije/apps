@@ -866,7 +866,7 @@ fn source(input: &mut Parser<'_>, output: &mut String) -> Result<(), ParseError<
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FontUnits {
     pub em: f32,
     pub ch: f32,
@@ -893,12 +893,69 @@ impl FontUnits {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Lengths {
     pub font: FontUnits,
     pub root: FontUnits,
     pub viewport: [f32; 2],
     pub container: Option<[f32; 2]>,
+}
+
+/// The lengths of each node, as an index in a list of the few that differ.
+#[derive(Clone, Default)]
+pub(crate) struct NodeLengths {
+    ids: Vec<u32>,
+    list: Vec<Lengths>,
+    last: u32,
+}
+
+impl NodeLengths {
+    /// Gives all nodes `lengths`.
+    pub(crate) fn reset(&mut self, count: usize, lengths: Lengths) {
+        self.ids.clear();
+        self.ids.resize(count, 0);
+        self.list.clear();
+        self.list.push(lengths);
+        self.last = 0;
+    }
+
+    /// Makes room for new nodes, which get the lengths of node 0.
+    pub(crate) fn resize(&mut self, count: usize) {
+        let first = self.ids.first().copied().unwrap_or_default();
+        self.ids.resize(count, first);
+    }
+
+    pub(crate) fn set(&mut self, id: usize, lengths: Lengths) {
+        if self.list[self.last as usize] != lengths {
+            // WARNING: only the newest values are searched, or a page with a font size per node gets quadratic.
+            let mut newest = self.list.iter().enumerate().rev().take(32);
+            self.last = match newest.find(|(_, old)| **old == lengths) {
+                Some((index, _)) => index as u32,
+                None => {
+                    self.list.push(lengths);
+                    self.list.len() as u32 - 1
+                }
+            };
+        }
+        self.ids[id] = self.last;
+    }
+
+    pub(crate) fn get(&self, id: usize) -> Option<&Lengths> {
+        self.ids.get(id).map(|&index| &self.list[index as usize])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_len(&self) -> usize {
+        self.list.len()
+    }
+}
+
+impl std::ops::Index<usize> for NodeLengths {
+    type Output = Lengths;
+
+    fn index(&self, id: usize) -> &Lengths {
+        &self.list[self.ids[id] as usize]
+    }
 }
 
 impl Lengths {

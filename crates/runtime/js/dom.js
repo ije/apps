@@ -2,7 +2,19 @@
   const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask;
   delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
   // WARNING: records mirror the Rust tree for reads. Writes queue as `code, a, b, c` integers, with strings in `texts` and their lengths in place, and reach Rust in one `dom.batch` before any other host call and at the microtask checkpoint that ends the turn, so Rust never reads a stale page.
-  class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : new Map(); this.up = null; this.kids = []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
+  // WARNING: a Map per element costs hundreds of bytes and these lists are short, so attributes are a flat list in source order. Elements without attributes share `noAttrs`, and text and comments share `noKids`, so `setAttribute` must replace it and nothing may add to it.
+  class Attrs {
+    constructor(list = []) { this.list = list; }
+    get size() { return this.list.length / 2; }
+    get(name) { const list = this.list; for (let i = 0; i < list.length; i += 2) if (list[i] === name) return list[i + 1]; }
+    has(name) { const list = this.list; for (let i = 0; i < list.length; i += 2) if (list[i] === name) return true; return false; }
+    set(name, value) { const list = this.list; for (let i = 0; i < list.length; i += 2) if (list[i] === name) { list[i + 1] = value; return this; } list.push(name, value); return this; }
+    delete(name) { const list = this.list; for (let i = 0; i < list.length; i += 2) if (list[i] === name) { list.splice(i, 2); return true; } return false; }
+    keys() { return this.list.filter((_, i) => !(i & 1)); }
+    *[Symbol.iterator]() { const list = this.list; for (let i = 0; i < list.length; i += 2) yield [list[i], list[i + 1]]; }
+  }
+  const noAttrs = new Attrs(), noKids = Object.freeze([]);
+  class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : noAttrs; this.up = null; this.kids = tag === '#text' || tag === '#comment' ? noKids : []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
   const records = [], texts = [], orphans = [];
   // WARNING: `changed` marks writes that can detach or create nodes since the last `dom.release`, so idle sweeps skip it.
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
@@ -55,7 +67,8 @@
   const load = list => {
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
-      for (i += 5; i < end; i += 2) rec.attrs.set(list[i], list[i + 1]);
+      if (end > i + 5) rec.attrs = new Attrs(list.slice(i + 5, end));
+      i = end;
       if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; }
     }
   };
@@ -64,9 +77,10 @@
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
-  const detach = rec => { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; rec.text = ''; };
+  const detach = rec => { if (rec.kids.length) { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; } rec.text = ''; };
   // WARNING: wrappers hold their wrapped parent and children so that listeners and expandos live as long as their tree.
-  const hold = (parent, child) => { child._parent?._held?.delete(child); child._parent = parent; (parent._held ??= new Set()).add(child); };
+  const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
+  const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
   const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
@@ -323,7 +337,7 @@
     toString() { return this.value; }
   }
   class Node {
-    constructor(id, tag) { const rec = this._m = records[id]; this._id = id; this._held = null; this._parent = null; rec.ref = new WeakRef(this); wrapped.push(rec); registered.push(id); this.nodeType = types[tag] ?? 1; this.nodeName = names.get(tag) ?? (tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
+    constructor(id, tag) { const rec = this._m = records[id]; this._id = id; this._held = null; this._parent = null; this._slot = 0; rec.ref = new WeakRef(this); wrapped.push(rec); registered.push(id); this.nodeType = types[tag] ?? 1; this.nodeName = names.get(tag) ?? (tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     get ownerDocument() { if(this.nodeType===9)return null;const root=this.getRootNode();return root.nodeType===9?root:document; }
     get parentNode() { return of(this._m.up); }
     get parentElement() { const up = this._m.up; return up && up.tag[0] !== '#' ? of(up) : null; }
@@ -386,7 +400,7 @@
       const record = observed ? { type: 'childList', target: this, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling } : null;
       if (this._shadow) signal(this, child);
       rangesRemove(this, child, i);
-      op(3, this._id, child._id); this._m.kids.splice(i, 1); kid.up = null; this._held?.delete(child); child._parent = null;
+      op(3, this._id, child._id); this._m.kids.splice(i, 1); kid.up = null; unhold(child); child._parent = null;
       if (connected) reactions(kid, 'disconnectedCallback');
       forgetRemoved();
       if (record) change(record);
@@ -558,6 +572,7 @@
     getOwnPropertyDescriptor: (target, key) => Reflect.getOwnPropertyDescriptor(target, key) ?? (typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length) ? { value: styleKey(key) ? target.getPropertyValue(styleName(key)) : target.item(Number(key)), writable: true, enumerable: true, configurable: true } : undefined),
   });
   const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
+  const datasetOwner = Symbol(), datasetHandler = { get: (target, name) => target[datasetOwner].getAttribute('data-' + cssName(name)) ?? undefined, set: (target, name, value) => { target[datasetOwner].setAttribute('data-' + cssName(name), value); return true; }, has: (target, name) => typeof name === 'string' && target[datasetOwner].hasAttribute('data-' + cssName(name)), deleteProperty: (target, name) => { target[datasetOwner].removeAttribute('data-' + cssName(name)); return true; }, ownKeys: target => target[datasetOwner].getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) };
   class Element extends Node {
     constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??[...definitions].find(([,ctor])=>ctor===new.target)?.[0];if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; }
     get attributes() { const attrs = listOf(NamedNodeMap, Array.from(this._m.attrs, ([name, value]) => new Attr(this, name, value))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
@@ -568,12 +583,12 @@
     get id() { return this.getAttribute('id') ?? ''; } set id(value) { this.setAttribute('id', value); }
     get className() { return this.getAttribute('class') ?? ''; } set className(value) { this.setAttribute('class', value); }
     get classList() { return this._classList ??= new DOMTokenList(this, 'class'); } set classList(value) { this.classList.value = value; }
-    get dataset() { return this._dataset ??= new Proxy({}, { get: (_, name) => this.getAttribute('data-' + cssName(name)) ?? undefined, set: (_, name, value) => { this.setAttribute('data-' + cssName(name), value); return true; }, has: (_, name) => typeof name === 'string' && this.hasAttribute('data-' + cssName(name)), deleteProperty: (_, name) => { this.removeAttribute('data-' + cssName(name)); return true; }, ownKeys: () => this.getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) }); }
+    get dataset() { return this._dataset ??= new Proxy({ [datasetOwner]: this }, datasetHandler); }
     getAttribute(name) { return this._m.attrs.get(attrName(this, name)) ?? null; }
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); attrs.set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover')) attributeChanged(this, name, oldValue, value); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover')) attributeChanged(this, name, oldValue, value); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
     removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (name === 'slot' || name === 'name' || name === 'open' || name === 'popover') attributeChanged(this, name, oldValue, null); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }

@@ -14,6 +14,12 @@ fn inflate(bytes: &[u8]) -> String {
     text
 }
 
+#[cfg(target_os = "macos")]
+mod malloc;
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: malloc::Allocator = malloc::Allocator;
+
 pub mod bundle;
 pub mod desktop;
 pub mod dom;

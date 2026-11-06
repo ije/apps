@@ -16,7 +16,7 @@ mod value;
 
 pub(crate) use animation::{Animation, Motion, Scripted, easing};
 pub use color::color;
-pub(crate) use parser::{DROPPED, FontUnits, Lengths};
+pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::expand;
 pub(crate) use text::{
     InlineText, LineHeight, cursor, font, inline_text, line_height, phantom, restyle,
@@ -34,6 +34,8 @@ pub(crate) const INVISIBLE: u8 = 4;
 pub(crate) const SELECT_NONE: u8 = 8;
 pub(crate) const SELECT_ALL: u8 = 16;
 pub(crate) const SELECT_TEXT: u8 = 32;
+/// The style sets a CSS counter.
+const COUNTED: u8 = 64;
 
 fn flags(style: &Style) -> u8 {
     let get = |prop| style.get(prop).unwrap_or("");
@@ -50,6 +52,16 @@ fn flags(style: &Style) -> u8 {
             "text" => SELECT_TEXT,
             _ => 0,
         }
+        | flag(
+            [
+                Prop::COUNTER_RESET,
+                Prop::COUNTER_INCREMENT,
+                Prop::COUNTER_SET,
+            ]
+            .into_iter()
+            .any(|prop| style.contains(prop)),
+            COUNTED,
+        )
 }
 
 const UA: &str = "
@@ -347,31 +359,69 @@ struct StyleKey {
     shadowed: [Option<Vec<Declared>>; 2],
 }
 
+/// The rare inputs of a node's style: `:host` declarations, `::selection`, and `::slotted()` and `::part()`.
+#[derive(PartialEq)]
+struct RareInputs {
+    host: Option<Style>,
+    selection: Option<Style>,
+    shadowed: [Option<Vec<Declared>>; 2],
+}
+
+/// Hashes font units as a `StyleKey` holds them.
+fn units_hash(bits: &[u32; 6]) -> u64 {
+    bits.iter().fold(0, |hash: u64, &bits| {
+        (hash.rotate_left(5) ^ u64::from(bits)).wrapping_mul(0x517c_c1b7_2722_0a95)
+    })
+}
+
 struct CachedNode {
     parent: Option<StyleRef>,
     /// The parent's custom properties, and the node's.
     inherited: Option<Vars>,
     vars: Vars,
-    font: [u32; 6],
-    root: [u32; 6],
-    host: Option<Style>,
-    selection: Option<Style>,
-    shadowed: [Option<Vec<Declared>>; 2],
+    /// Hashes of the font units of the parent and the root.
+    font: u64,
+    root: u64,
+    rare: Option<Box<RareInputs>>,
     value: Rc<CachedStyle>,
 }
 
 impl CachedNode {
     fn new(key: &StyleKey, value: Rc<CachedStyle>, inherited: Option<&Vars>, vars: &Vars) -> Self {
+        let rare = (key.host.is_some()
+            || key.selection.is_some()
+            || key.shadowed.iter().any(Option::is_some))
+        .then(|| {
+            Box::new(RareInputs {
+                host: key.host.clone(),
+                selection: key.selection.clone(),
+                shadowed: key.shadowed.clone(),
+            })
+        });
         Self {
             parent: key.parent.clone(),
             inherited: inherited.cloned(),
             vars: vars.clone(),
-            font: key.font,
-            root: key.root,
-            host: key.host.clone(),
-            selection: key.selection.clone(),
-            shadowed: key.shadowed.clone(),
+            font: units_hash(&key.font),
+            root: units_hash(&key.root),
+            rare,
             value,
+        }
+    }
+
+    fn same_rare(
+        &self,
+        host: Option<&Style>,
+        selection: Option<&Style>,
+        shadowed: [Option<&Vec<Declared>>; 2],
+    ) -> bool {
+        match &self.rare {
+            None => host.is_none() && selection.is_none() && shadowed == [None, None],
+            Some(rare) => {
+                rare.host.as_ref() == host
+                    && rare.selection.as_ref() == selection
+                    && rare.shadowed.each_ref().map(Option::as_ref) == shadowed
+            }
         }
     }
 }
@@ -438,7 +488,9 @@ struct StyleScope {
     states: u16,
     matches: SelectorCache,
     /// By node id. Boxed, since the list is as long as the document's node arena in every scope.
-    nodes: Vec<Option<Box<MatchedRules>>>,
+    nodes: Vec<Option<MatchedRules>>,
+    /// The matched rule lists of the nodes, shared when equal.
+    lists: rustc_hash::FxHashSet<Rc<[(usize, [usize; 3])]>>,
     /// The cascade order of each rule. Tailwind's generated rules share one block of keys in
     /// Tailwind's order, so new utilities join the scope without rebuilding it.
     keys: Vec<u64>,
@@ -612,9 +664,10 @@ struct MatchedRules {
     checked: std::cell::Cell<u64>,
     cached: Option<CachedNode>,
     // WARNING: matching collects many duplicates before the dedup, so the list is boxed to its length.
-    dependencies: Box<[(usize, u64)]>,
-    rules: Vec<(usize, [usize; 3])>,
-    pseudos: Vec<usize>,
+    dependencies: Box<[crate::dom::Dependency]>,
+    /// The list is shared by the nodes of a scope that match the same rules.
+    rules: Rc<[(usize, [usize; 3])]>,
+    pseudos: Box<[usize]>,
     columns: usize,
 }
 
@@ -721,6 +774,9 @@ pub(crate) struct StyleCache {
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Vars)>,
     pub(crate) scripted: Registry,
     scheme: Option<Rc<str>>,
+    pub(crate) spare: Option<SpareStyles>,
+    /// The walks of the document and each shadow tree, by root.
+    walks: FxHashMap<usize, Rc<TreeWalk>>,
 }
 
 type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
@@ -746,6 +802,37 @@ type CollapsedTable = (
 );
 
 impl StyleCache {
+    fn walk(&mut self, doc: &Document, root: usize) -> Rc<TreeWalk> {
+        let walk = self.walks.remove(&root).and_then(|walk| Rc::try_unwrap(walk).ok());
+        let mut walk = walk.unwrap_or_else(|| TreeWalk {
+            walk: Default::default(),
+            used: Default::default(),
+            special: Vec::new(),
+            tables: Vec::new(),
+        });
+        if walk.walk.update(doc, &Default::default(), None) {
+            walk.special.clear();
+            walk.tables.clear();
+            for &(id, _) in walk.walk.nodes.iter() {
+                let id = id as usize;
+                match doc.nodes[id].tag.as_str() {
+                    "meta" | "style" | "link" => walk.special.push(id),
+                    "table" => walk.tables.push(id),
+                    _ => {}
+                }
+            }
+        }
+        walk.used.set(self.pass);
+        let walk = Rc::new(walk);
+        self.walks.insert(root, walk.clone());
+        walk
+    }
+
+    /// The walk of the document, which has no shadow trees or slots in it.
+    pub(crate) fn document_walk(&self) -> Option<&crate::dom::Walk> {
+        self.walks.get(&0).map(|walk| &walk.walk)
+    }
+
     /// Drops what the scopes keep for nodes that left the document.
     pub(crate) fn forget(&mut self, gone: &[usize]) {
         for scope in &mut self.scopes {
@@ -761,9 +848,12 @@ impl StyleCache {
     /// Drops what the next style pass can compute again, and the room for node ids past `len`.
     pub(crate) fn trim(&mut self, len: usize) {
         self.values = Default::default();
+        self.spare = None;
+        self.walks = Default::default();
         for scope in &mut self.scopes {
             scope.nodes.truncate(len);
             scope.nodes.shrink_to_fit();
+            scope.lists = Default::default();
             scope.matches.trim(len);
         }
     }
@@ -1015,6 +1105,7 @@ impl StyleCache {
         }
         self.sheets.retain(|_, (used, ..)| *used == pass);
         self.tables.retain(|_, (used, ..)| *used == pass);
+        self.walks.retain(|_, walk| walk.used.get() == pass);
         self.inheritable
             .retain(|_, (from, _)| Rc::strong_count(from) > 1);
         self.derived.clear();
@@ -3273,7 +3364,9 @@ pub(crate) struct StyleContext {
     pub parts: FxHashMap<usize, Vec<Declared>>,
     pub inherited: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
     pub roots: FxHashMap<usize, (Rc<Style>, Lengths, Vars)>,
-    pub required: Option<std::collections::HashSet<usize>>,
+    pub required: Option<rustc_hash::FxHashSet<usize>>,
+    /// The page has a top layer, which fullscreen boxes are in.
+    pub top_layer: bool,
     pub animated: HashMap<usize, Style>,
     pub reduced_motion: bool,
     pub theme: u32,
@@ -3287,6 +3380,37 @@ pub(crate) struct StyleContext {
     pub previous: Option<Rc<ComputedStyles>>,
 }
 
+/// The nodes of a tree in document order, and those that give style sheets or the color scheme, kept until the
+/// tree changes.
+struct TreeWalk {
+    walk: crate::dom::Walk,
+    used: std::cell::Cell<u64>,
+    special: Vec<usize>,
+    tables: Vec<usize>,
+}
+
+/// The per-node lists of old styles, which the next style pass fills again without allocating them.
+#[derive(Default)]
+pub(crate) struct SpareStyles {
+    values: Vec<Rc<Style>>,
+    vars: Vec<Vars>,
+    flags: Vec<u8>,
+    lengths: NodeLengths,
+    user_select: Vec<(UserSelect, usize)>,
+}
+
+impl From<ComputedStyles> for SpareStyles {
+    fn from(styles: ComputedStyles) -> Self {
+        Self {
+            values: styles.values,
+            vars: styles.vars,
+            flags: styles.flags,
+            lengths: styles.lengths,
+            user_select: styles.user_select,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
     /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
@@ -3295,7 +3419,7 @@ pub(crate) struct ComputedStyles {
     /// The custom properties of each node.
     pub vars: Vec<Vars>,
     pub flags: Vec<u8>,
-    pub lengths: Vec<Lengths>,
+    pub lengths: NodeLengths,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
     pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
     /// `::backdrop` of the elements in the top layer.
@@ -3360,14 +3484,25 @@ pub(crate) fn compute_styles(
     style_cache: &mut StyleCache,
     context: Option<&StyleContext>,
 ) -> ComputedStyles {
+    let count = doc.nodes.len();
+    let spare = style_cache.spare.take().unwrap_or_default();
     let mut out = ComputedStyles {
-        values: vec![Rc::default(); doc.nodes.len()],
-        vars: vec![Vars::default(); doc.nodes.len()],
-        flags: vec![0; doc.nodes.len()],
-        lengths: vec![Lengths::new(16., width, height); doc.nodes.len()],
-        user_select: vec![(UserSelect::None, 0); doc.nodes.len()],
+        values: spare.values,
+        vars: spare.vars,
+        flags: spare.flags,
+        lengths: spare.lengths,
+        user_select: spare.user_select,
         ..Default::default()
     };
+    out.values.clear();
+    out.values.resize(count, Rc::default());
+    out.vars.clear();
+    out.vars.resize(count, Vars::default());
+    out.flags.clear();
+    out.flags.resize(count, 0);
+    out.lengths.reset(count, Lengths::new(16., width, height));
+    out.user_select.clear();
+    out.user_select.resize(count, (UserSelect::None, 0));
     cascade(
         doc,
         [width, height],
@@ -3435,16 +3570,21 @@ pub(crate) fn cascade(
         keyframes: HashMap::new(),
         properties: Registry::default(),
     };
-    let mut order = Vec::new();
+    let root = match doc.nodes[0].children.as_slice() {
+        &[child] if doc.nodes[child].tag == "apps-shadow-root" => child,
+        _ => 0,
+    };
+    let walk = style_cache.walk(doc, root);
+    let order = walk.walk.nodes.as_slice();
     let mut sheets = Vec::new();
-    let mut pending = vec![0];
     let mut scheme = None;
-    let mut fullscreen = false;
-    while let Some(id) = pending.pop() {
+    // WARNING: the page sets a fullscreen state together with the top layer, so other pages skip this scan.
+    let fullscreen = context.is_none_or(|context| context.top_layer)
+        && order
+            .iter()
+            .any(|&(id, _)| doc.nodes[id as usize].state & crate::dom::FULLSCREEN != 0);
+    for &id in &walk.special {
         let node = &doc.nodes[id];
-        order.push(id);
-        pending.extend(node.children.iter().rev());
-        fullscreen |= node.state & crate::dom::FULLSCREEN != 0;
         if node.tag == "meta"
             && node
                 .attrs
@@ -3496,10 +3636,6 @@ pub(crate) fn cascade(
         }
         sheets.extend(style_cache.sheet(doc, id, cache));
     }
-    let root = match doc.nodes[0].children.as_slice() {
-        &[child] if doc.nodes[child].tag == "apps-shadow-root" => child,
-        _ => 0,
-    };
     if let Some(adopted) = style_cache.adopted.get(&root) {
         sheets.extend(
             adopted
@@ -3597,7 +3733,7 @@ pub(crate) fn cascade(
         let live: Vec<_> = style_cache.scopes.iter().map(|scope| scope.id).collect();
         style_cache.queries.retain(|key, _| live.contains(&key.0));
     }
-    let tailwind = style_cache.tailwind.update(&mut sheets, doc, &order);
+    let tailwind = style_cache.tailwind.update(&mut sheets, doc, order);
     if let Some(update) = &tailwind
         && !(update.replaced.is_empty() && update.added.is_empty())
     {
@@ -3965,6 +4101,7 @@ pub(crate) fn cascade(
             states: 0,
             matches: SelectorCache::default(),
             nodes: Vec::new(),
+            lists: Default::default(),
             keys: Vec::new(),
             block: None,
             sequence: 0,
@@ -4033,7 +4170,7 @@ pub(crate) fn cascade(
     let scoped = &mut style_cache.scopes[scope];
     let scope = scoped.id;
     scoped.used = style_cache.pass;
-    scoped.matches.update(doc, &order);
+    scoped.matches.update(doc, order);
     if scoped.nodes.len() < doc.nodes.len() {
         scoped.nodes.resize_with(doc.nodes.len(), || None);
     }
@@ -4063,7 +4200,8 @@ pub(crate) fn cascade(
     let mut root = FontUnits::new(16.);
     let mut font_metrics = HashMap::new();
     let mut passed_on = FxHashMap::default();
-    for &id in &order {
+    for &(id, _) in order {
+        let id = id as usize;
         if context
             .and_then(|context| context.required.as_ref())
             .is_some_and(|required| !required.contains(&id))
@@ -4075,7 +4213,7 @@ pub(crate) fn cascade(
             styles[id] = style.clone();
             custom[id] = vars.clone();
             style_flags[id] = flags(style);
-            lengths[id] = *units;
+            lengths.set(id, *units);
             continue;
         }
         let inherited = context.and_then(|context| context.inherited.get(&id));
@@ -4150,11 +4288,9 @@ pub(crate) fn cascade(
                     }
                     _ => false,
                 };
-                same && cached.font == font_key
-                    && cached.root == root_font
-                    && cached.host.as_ref() == host
-                    && cached.selection.as_ref() == selection
-                    && cached.shadowed.each_ref().map(Option::as_ref) == shadowed
+                same && cached.font == units_hash(&font_key)
+                    && cached.root == units_hash(&root_font)
+                    && cached.same_rare(host, selection, shadowed)
             })
             .and_then(|cached| {
                 let (vars, changed) =
@@ -4167,7 +4303,7 @@ pub(crate) fn cascade(
                     scoped.nodes[id].as_ref()
                     && matches.valid_since(&cached.dependencies, &cached.checked)
                 {
-                    (cached.rules.clone(), cached.pseudos.clone(), cached.columns)
+                    (cached.rules.to_vec(), cached.pseudos.to_vec(), cached.columns)
                 } else {
                     matches.dependencies.clear();
                     matches.depend(id, 0);
@@ -4238,14 +4374,25 @@ pub(crate) fn cascade(
                     }
                     matches.dependencies.sort_unstable();
                     matches.dependencies.dedup();
-                    scoped.nodes[id] = Some(Box::new(MatchedRules {
+                    if scoped.lists.len() > 65536 {
+                        scoped.lists.clear();
+                    }
+                    let shared = match scoped.lists.get(matched.as_slice()) {
+                        Some(list) => list.clone(),
+                        None => {
+                            let list: Rc<[_]> = matched.as_slice().into();
+                            scoped.lists.insert(list.clone());
+                            list
+                        }
+                    };
+                    scoped.nodes[id] = Some(MatchedRules {
                         checked: std::cell::Cell::new(matches.epoch),
                         cached: None,
                         dependencies: matches.dependencies.as_slice().into(),
-                        rules: matched.clone(),
-                        pseudos: matched_pseudos.clone(),
+                        rules: shared,
+                        pseudos: matched_pseudos.as_slice().into(),
                         columns,
-                    }));
+                    });
                     (matched, matched_pseudos, columns)
                 };
                 let (mut matched, mut matched_pseudos) = (matched, matched_pseudos);
@@ -4414,10 +4561,13 @@ pub(crate) fn cascade(
             styles[id] = cached.style.clone();
             custom[id] = vars;
             style_flags[id] = cached.flags;
-            lengths[id] = Lengths {
-                viewport: [width, height],
-                ..cached.lengths
-            };
+            lengths.set(
+                id,
+                Lengths {
+                    viewport: [width, height],
+                    ..cached.lengths
+                },
+            );
             if id == 0 || node.tag == "html" {
                 root = cached.lengths.font;
             }
@@ -5405,30 +5555,23 @@ pub(crate) fn cascade(
         }
         styles[id] = style;
         custom[id] = vars;
-        lengths[id] = units;
+        lengths.set(id, units);
     }
     style_cache.inheritable = inheritable;
     if context.is_some_and(|context| context.required.is_some()) {
         return;
     }
-    if order.iter().any(|&id| {
-        [
-            Prop::COUNTER_RESET,
-            Prop::COUNTER_INCREMENT,
-            Prop::COUNTER_SET,
-        ]
-        .into_iter()
-        .any(|prop| styles[id].contains(prop))
-            || pseudos.get(&id).is_some_and(|pseudos| {
-                pseudos.iter().any(|pseudo| {
-                    pseudo
-                        .get(Prop::CONTENT)
-                        .is_some_and(|content| content.contains("counter"))
-                        || pseudo.contains(Prop::COUNTER_INCREMENT)
-                        || pseudo.contains(Prop::COUNTER_RESET)
-                })
+    if style_flags.iter().any(|&flags| flags & COUNTED != 0)
+        || pseudos.values().any(|pseudos| {
+            pseudos.iter().any(|pseudo| {
+                pseudo
+                    .get(Prop::CONTENT)
+                    .is_some_and(|content| content.contains("counter"))
+                    || pseudo.contains(Prop::COUNTER_INCREMENT)
+                    || pseudo.contains(Prop::COUNTER_RESET)
             })
-    }) {
+        })
+    {
         let list = |value: Option<&str>, default: i64| -> Vec<(String, i64)> {
             let parts = components(value.unwrap_or("none"), ' ');
             let mut list: Vec<(String, i64)> = Vec::new();
@@ -5635,11 +5778,10 @@ pub(crate) fn cascade(
             Prop::PADDING_LEFT,
         ],
     ];
-    for &table in &order {
-        if doc.nodes[table].tag != "table"
-            || styles[table]
-                .get(Prop::BORDER_COLLAPSE)
-                .is_none_or(|value| value != "collapse")
+    for &table in &walk.tables {
+        if styles[table]
+            .get(Prop::BORDER_COLLAPSE)
+            .is_none_or(|value| value != "collapse")
             || styles[table]
                 .get(Prop::DISPLAY)
                 .is_none_or(|value| value != "grid")

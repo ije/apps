@@ -434,8 +434,8 @@ fn first_line(
     text_system: &renderer::TextSystem,
 ) -> (SharedString, Vec<renderer::TextRun>) {
     let mut text = data.text.to_string();
-    let Some((base, pseudo, mode)) = &data.first_line else {
-        return (text.into(), data.runs.clone());
+    let Some((base, pseudo, mode)) = data.first_line.as_deref() else {
+        return (text.into(), data.runs.to_vec());
     };
     let len = text.find('\n').unwrap_or(text.len());
     let mut first = text[..len].to_owned();
@@ -505,10 +505,10 @@ impl From<InlineText> for renderer::Child {
         let sized = data.runs.iter().any(|run| run.font_size.is_some())
             || data
                 .first_line
-                .as_ref()
+                .as_deref()
                 .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
         if data.first_line.is_none() && !sized {
-            return renderer::text(data.text.to_string(), Some(data.runs.clone()))
+            return renderer::text(data.text.to_string(), Some(data.runs.to_vec()))
                 .hooks(text)
                 .into();
         }

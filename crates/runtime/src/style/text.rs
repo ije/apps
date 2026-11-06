@@ -47,14 +47,14 @@ pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Opt
 #[derive(Clone)]
 pub(crate) struct InlineText {
     pub text: Rc<str>,
-    pub runs: Vec<renderer::TextRun>,
-    pub ranges: Vec<(usize, std::ops::Range<usize>)>,
-    pub backgrounds: Vec<(usize, u32)>,
-    pub cursors: Vec<(usize, renderer::CursorStyle)>,
-    pub shadows: Vec<(f32, f32, f32, u32)>,
-    pub first_line: Option<(renderer::TextRun, renderer::TextRun, Option<String>)>,
+    pub runs: Box<[renderer::TextRun]>,
+    pub ranges: Box<[(usize, std::ops::Range<usize>)]>,
+    pub backgrounds: Box<[(usize, u32)]>,
+    pub cursors: Box<[(usize, renderer::CursorStyle)]>,
+    pub shadows: Box<[(f32, f32, f32, u32)]>,
+    pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     /// The line height of the text up to each end offset, which sizes its inline boxes in a row.
-    pub line_heights: Vec<(usize, LineHeight)>,
+    pub line_heights: Box<[(usize, LineHeight)]>,
 }
 
 /// A computed `line-height`. A number scales with the font size of the text that inherits it.
@@ -783,20 +783,20 @@ pub(crate) fn inline_text(
         });
     Some(InlineText {
         text: text.into(),
-        runs,
-        ranges,
-        backgrounds,
-        cursors,
-        shadows,
-        line_heights,
+        runs: runs.into(),
+        ranges: ranges.into(),
+        backgrounds: backgrounds.into(),
+        cursors: cursors.into(),
+        shadows: shadows.into(),
+        line_heights: line_heights.into(),
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
-            (
+            Box::new((
                 text_run(parent, &styles.lengths[id], 0),
                 pseudo_run(line),
                 line.get(Prop::TEXT_TRANSFORM)
                     .filter(|mode| Some(*mode) != parent.get(Prop::TEXT_TRANSFORM))
                     .map(str::to_owned),
-            )
+            ))
         }),
     })
 }

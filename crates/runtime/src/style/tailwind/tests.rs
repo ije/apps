@@ -427,7 +427,7 @@ fn configs_are_kept_per_theme() {
     ));
     let shadow = Rc::new(super::Stylesheet::parse("@import 'tailwindcss';"));
     let doc = Document::parse("<p class='bg-brand p-3'></p>");
-    let order: Vec<_> = (0..doc.nodes.len()).collect();
+    let order: Vec<_> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
     let mut compiler = super::Compiler::default();
     for _ in 0..3 {
         for sheet in [&document, &shadow] {

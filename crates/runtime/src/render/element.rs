@@ -25,7 +25,7 @@ pub(super) struct Build<'a> {
     pub(super) ancestors: Rc<[usize]>,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
-    pub(super) inline_text: &'a RefCell<HashMap<usize, Option<Rc<style::InlineText>>>>,
+    pub(super) inline_text: &'a RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>>,
     /// The parent's `perspective` distance and `perspective-origin`.
     pub(super) perspective: Option<(f32, String)>,
     /// The in-flow children (`false`) and list items (`true`) of a parent, with their indexes.
@@ -408,6 +408,9 @@ pub(super) type Margins = (
     rustc_hash::FxHashMap<usize, Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>>,
     rustc_hash::FxHashMap<usize, ([f32; 2], [f32; 2], bool)>,
 );
+
+/// The collapsed margins of a parent's children, with the geometry revision, width and open sides they came from.
+pub(super) type Walked = ((u64, u32, [bool; 2]), Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>);
 
 thread_local! {
     /// The lowest stack address that building boxes may reach: a quarter of the stack stays
@@ -1455,6 +1458,14 @@ fn create(
             word_spacing: px(0.),
             font_size: None,
         };
+        if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
+            let mut sizer = renderer::text(shown.clone(), Some(vec![run.clone()]))
+                .min_w(px(0.))
+                .min_h(px(line_height))
+                .flex_shrink_0();
+            sizer.style().visibility = renderer::Visibility::Hidden;
+            el = el.child(sizer);
+        }
         // WARNING: the box that clips the text scrolls with the field's handle, so the field itself does not track it.
         let handle = view
             .host
@@ -2038,13 +2049,16 @@ fn create(
             text,
             pixel_ratio,
             auto[0] || percent,
+            None,
         );
         if auto[0] {
             el = el.w(px(width + chrome[0]));
         } else if percent {
             el = el.child(super::input::natural_width(px(width)));
         }
-        if auto[1] {
+        if auto[1]
+            && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content"))
+        {
             el = el.min_h(px(height + chrome[1]));
         }
     }
@@ -4747,6 +4761,7 @@ pub(super) fn text_field(node: &crate::dom::Node) -> bool {
 }
 
 /// Content width and height of a text field like WebKit. The width is 0 unless `width` is set.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn field_size(
     doc: &Document,
     id: usize,
@@ -4755,9 +4770,57 @@ pub(super) fn field_size(
     text: &renderer::TextSystem,
     pixel_ratio: f32,
     width: bool,
+    wrap_width: Option<f32>,
 ) -> [f32; 2] {
     let node = &doc.nodes[id];
     let textarea = node.tag == "textarea";
+    if style.get(Prop::FIELD_SIZING) == Some("content") {
+        let value = node.shown_text(
+            node.current_value()
+                .map_or_else(|| doc.text(id), str::to_owned),
+        );
+        let shown = if value.is_empty() {
+            node.attrs.get("placeholder").cloned().unwrap_or_default()
+        } else {
+            value
+        };
+        let run = style::text_run(style, units, shown.len());
+        let lines = text
+            .shape_text(
+                shown.into(),
+                px(units.font.em),
+                &[run],
+                wrap_width
+                    .filter(|_| {
+                        textarea && !matches!(style.get(Prop::WHITE_SPACE), Some("pre" | "nowrap"))
+                    })
+                    .map(px),
+                None,
+                style::word_break(style),
+            )
+            .unwrap_or_default();
+        return [
+            if width {
+                lines
+                    .iter()
+                    .map(|line| f32::from(line.unwrapped_layout.width))
+                    .fold(0., f32::max)
+                    + 1.
+            } else {
+                0.
+            },
+            if textarea {
+                lines
+                    .iter()
+                    .map(|line| 1 + line.wrap_boundaries.len())
+                    .sum::<usize>()
+                    .max(1) as f32
+                    * units.font.lh
+            } else {
+                units.font.lh
+            },
+        ];
+    }
     let count = |name, default| {
         node.attrs
             .get(name)
@@ -4768,83 +4831,49 @@ pub(super) fn field_size(
     let width = width.then(|| {
         let face = style::font(style);
         let em = px(units.font.em);
-        if style
-            .get(Prop::FIELD_SIZING)
-            .is_some_and(|v| v == "content")
+        // `size` or `cols` characters, in device pixels like Chrome. Fonts with a bad average use
+        // the width of `0`. Others use the width of `x` (the x-height for system fonts), and
+        // inputs add the ascent minus that width.
+        let family = style
+            .get(Prop::FONT_FAMILY)
+            .and_then(|value| value.split(',').next())
+            .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+            .unwrap_or_default();
+        let id = text.resolve_font(&face);
+        let scale = pixel_ratio;
+        let (char_width, extra) = if "|american typewriter|arial hebrew|chalkboard|cochin|\
+            corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|helvetica|hoefler text|\
+            inaimathi|kai|lucida grande|marker felt|monaco|mshtakan|new peninim mt|osaka|\
+            raanana|stheiti|symbol|times|apple braille|apple ligothic|apple lisung|\
+            apple symbols|applegothic|applemyungjo|#gungseo|#headlinea|#pcmyungjo|#pilgi|"
+            .contains(&format!("|{family}|"))
         {
-            // The box fits its text, or the placeholder while empty, plus the caret.
-            let value = node.shown_text(
-                node.current_value()
-                    .map_or_else(|| doc.text(id), str::to_owned),
-            );
-            let shown = if value.is_empty() {
-                node.attrs.get("placeholder").cloned().unwrap_or_default()
-            } else {
-                value
-            };
-            shown
-                .split('\n')
-                .map(|line| {
-                    let run = renderer::TextRun {
-                        len: line.len(),
-                        font: face.clone(),
-                        color: renderer::black(),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                        letter_spacing: px(0.),
-                        word_spacing: px(0.),
-                        font_size: None,
-                    };
-                    f32::from(text.shape_line(line, em, &[run], None).width)
-                })
-                .fold(0., f32::max)
-                + 1.
+            let zero = text
+                .ch_advance(id, em)
+                .map_or(units.font.em / 2., f32::from);
+            (zero * scale, 0.)
         } else {
-            // `size` or `cols` characters, in device pixels like Chrome. Fonts with a bad average use
-            // the width of `0`. Others use the width of `x` (the x-height for system fonts), and
-            // inputs add the ascent minus that width.
-            let family = style
-                .get(Prop::FONT_FAMILY)
-                .and_then(|value| value.split(',').next())
-                .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
-                .unwrap_or_default();
-            let id = text.resolve_font(&face);
-            let scale = pixel_ratio;
-            let (char_width, extra) = if "|american typewriter|arial hebrew|chalkboard|cochin|\
-                corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|helvetica|hoefler text|\
-                inaimathi|kai|lucida grande|marker felt|monaco|mshtakan|new peninim mt|osaka|\
-                raanana|stheiti|symbol|times|apple braille|apple ligothic|apple lisung|\
-                apple symbols|applegothic|applemyungjo|#gungseo|#headlinea|#pcmyungjo|#pilgi|"
-                .contains(&format!("|{family}|"))
-            {
-                let zero = text
-                    .ch_advance(id, em)
-                    .map_or(units.font.em / 2., f32::from);
-                (zero * scale, 0.)
+            let average = if face.family.as_ref() == ".SystemUIFont" {
+                (f32::from(text.x_height(id, em)) * scale).round()
             } else {
-                let average = if face.family.as_ref() == ".SystemUIFont" {
-                    (f32::from(text.x_height(id, em)) * scale).round()
-                } else {
-                    text.advance(id, em, 'x')
-                        .map_or(units.font.em / 2., |size| f32::from(size.width))
-                        * scale
-                };
-                let ascent = f32::from(text.line_metrics(id, em * scale)[0]);
-                (average, if textarea { 0. } else { ascent - average })
+                text.advance(id, em, 'x')
+                    .map_or(units.font.em / 2., |size| f32::from(size.width))
+                    * scale
             };
-            if textarea {
-                // Chrome always leaves room for a vertical scrollbar.
-                let bar = match style.get(Prop::SCROLLBAR_WIDTH) {
-                    _ if style.get(Prop::OVERFLOW_Y).is_some_and(|v| v == "hidden") => 0.,
-                    Some("none") => 0.,
-                    Some("thin") => 14.,
-                    _ => 16.,
-                };
-                (char_width * count("cols", 20)).ceil() / scale + bar
-            } else {
-                (char_width * count("size", 20) + extra).ceil() / scale
-            }
+            let ascent = f32::from(text.line_metrics(id, em * scale)[0]);
+            (average, if textarea { 0. } else { ascent - average })
+        };
+        if textarea {
+            // Chrome always leaves room for a vertical scrollbar.
+            let bar = match style.get(Prop::SCROLLBAR_WIDTH) {
+                _ if style.get(Prop::OVERFLOW_Y).is_some_and(|v| v == "hidden") => 0.,
+                Some("none") => 0.,
+                Some("thin") => 14.,
+                _ => 16.,
+            };
+            (char_width * count("cols", 20)).ceil() / scale + bar
+        } else {
+            (char_width * count("size", 20) + extra).ceil() / scale
         }
     });
     [
@@ -4881,13 +4910,26 @@ pub(super) fn margins(
     };
     let walked = build.margins.borrow().0.get(&parent).cloned();
     let walked = walked.unwrap_or_else(|| {
+        let collapses = container(build, parent);
+        let open = [0, 2].map(|side| collapses && through(build, parent, side, width));
+        // WARNING: animated values aren't in the revisions. Fonts, the viewport and container units change these
+        // margins without a new revision, so `render_page` clears the kept walks with its measurements.
+        let key = (build.info[parent].revision, width.to_bits(), open);
+        let animated = build.info[parent].flags & cull::ANIMATED != 0;
+        if let Some((old, used)) = build.view.walked.borrow().get(&parent)
+            && *old == key
+            && !animated
+        {
+            build.margins.borrow_mut().0.insert(parent, used.clone());
+            return used.clone();
+        }
         let mut used = rustc_hash::FxHashMap::default();
-        if container(build, parent) {
+        if collapses {
             let children = flow(build, parent);
             let value = |set: [f32; 2]| set[0] + set[1];
             let mut pending = [0f32; 2];
             let mut emitted = 0.;
-            let mut leading = through(build, parent, 0, width);
+            let mut leading = open[0];
             for &child in &children {
                 if !block(build, child) {
                     (leading, pending, emitted) = (false, [0.; 2], 0.);
@@ -4917,7 +4959,7 @@ pub(super) fn margins(
                 }
                 used.insert(child, sides);
             }
-            if through(build, parent, 2, width) {
+            if open[1] {
                 for child in children.into_iter().rev() {
                     let empty = block(build, child) && adjoining(build, child, width).2;
                     let Some(sides) = used.get_mut(&child) else {
@@ -4934,6 +4976,9 @@ pub(super) fn margins(
         }
         let used = Rc::new(used);
         build.margins.borrow_mut().0.insert(parent, used.clone());
+        if !animated {
+            build.view.walked.borrow_mut().insert(parent, (key, used.clone()));
+        }
         used
     });
     if let Some(&[top, bottom]) = walked.get(&id) {

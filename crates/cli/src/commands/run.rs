@@ -163,6 +163,9 @@ pub fn run(
                         .arg("--")
                         .arg(entry);
                 }
+                // WARNING: without it the runtime starts itself again, see `malloc.rs`.
+                #[cfg(target_os = "macos")]
+                cmd.env("MallocSpaceEfficient", "1");
                 child = Some(
                     cmd.args(args)
                         .env("APPS_JSC_LIBRARY", &library)

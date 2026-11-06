@@ -871,6 +871,8 @@ impl Main {
                 if main.api.busy.get() == busy {
                     main.quiet.set(false);
                     main.api.shrink();
+                    #[cfg(target_os = "macos")]
+                    crate::malloc::flush();
                 } else {
                     main.shrink_when_quiet();
                 }

@@ -312,6 +312,13 @@ impl Host {
                         {
                             state.invalidate();
                         }
+                        if doc.nodes[id].children.is_empty()
+                            && let Some(current) = doc.nodes.edit(id)
+                        {
+                            current.text = value.into();
+                            current.stylesheet = None;
+                            return Ok(true);
+                        }
                         doc.nodes[id].text = value.into();
                         doc.nodes[id].stylesheet = None;
                         for child in std::mem::take(&mut doc.nodes[id].children) {
@@ -426,13 +433,20 @@ impl Host {
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.invalidate();
                         }
-                        let current = &mut doc.nodes[id];
-                        match value {
-                            Some(value) => current.attrs.set(key, value),
-                            None => drop(current.attrs.remove(key)),
-                        }
-                        if key == "style" {
-                            current.inline = None;
+                        // WARNING: kept walks of the tree read these attributes, so they count as tree changes.
+                        let current = if matches!(key, "slot" | "name" | "contenteditable") {
+                            doc.nodes.get_mut(id)
+                        } else {
+                            doc.nodes.edit(id)
+                        };
+                        if let Some(current) = current {
+                            match value {
+                                Some(value) => current.attrs.set(key, value),
+                                None => drop(current.attrs.remove(key)),
+                            }
+                            if key == "style" {
+                                current.inline = None;
+                            }
                         }
                         true
                     }
@@ -483,7 +497,9 @@ impl Host {
                         {
                             state.invalidate();
                         }
-                        doc.nodes[id].value = value;
+                        if let Some(current) = doc.nodes.edit(id) {
+                            current.value = value;
+                        }
                         true
                     }
                     8 => {
@@ -502,8 +518,9 @@ impl Host {
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.invalidate();
                         }
-                        let node = &mut doc.nodes[id];
-                        node.state = node.state & !mask | bits;
+                        if let Some(node) = doc.nodes.edit(id) {
+                            node.state = node.state & !mask | bits;
+                        }
                         true
                     }
                     9 => {

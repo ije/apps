@@ -36,6 +36,12 @@ To enable the two features, add `jsExecute` and `httpImport` in `features` optio
 
 > The limitation applies only to the `BrowserWindow` class, `WebContentsView` respects the webview sandboxing.
 
+## Memory
+
+By default macOS malloc keeps freed memory in the process footprint: about 40% of small blocks and all blocks of 48 KB or more. Only `MallocSpaceEfficient=1` changes that, and malloc reads it before any app code runs. So `apps run` sets the variable, `apps build` puts it in `LSEnvironment`, and a process started without it starts itself again once, which takes about 10 ms. The runtime then removes it, so `process.env` and child processes don't see it.
+
+That mode makes malloc slower, so on macOS the runtime has a global allocator that keeps freed blocks of up to 512 bytes per thread, at most 64 KB per size, and gives them back when the thread is quiet. A Rust app can't define its own `#[global_allocator]`.
+
 ## Node Integration
 
 - Can import nodejs internal modules from `node:child_process`, `node:fs`, etc

@@ -107,14 +107,14 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    families: Option<std::thread::JoinHandle<Vec<String>>>,
     /// Faces at a point size, by font and size bits.
     sized: HashMap<(FontId, u32), CTFont>,
     /// The font of each shaped run's face, kept alive so its address stays unique.
     natives: HashMap<usize, (CTFont, FontId)>,
 }
 
-fn font_families() -> Vec<String> {
+/// The installed font families, listed once for all windows.
+static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     unsafe extern "C" {
         fn CTFontManagerCopyAvailableFontFamilyNames() -> CFArrayRef;
     }
@@ -122,10 +122,17 @@ fn font_families() -> Vec<String> {
     let families: CFArray<CFString> =
         unsafe { CFArray::wrap_under_create_rule(CTFontManagerCopyAvailableFontFamilyNames()) };
     families.iter().map(|name| name.to_string()).collect()
-}
+});
 
 impl TextSystem {
     pub fn new() -> Self {
+        // WARNING: listing the font families takes about 20 ms, so it starts here, off the first frame's path.
+        static LISTING: std::sync::Once = std::sync::Once::new();
+        LISTING.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("font families".into())
+                .spawn(|| std::sync::LazyLock::force(&FAMILIES).len());
+        });
         Self(RefCell::new(AppleTextSystemState {
             memory_source: MemSource::empty(),
             system_source: SystemSource::new(),
@@ -136,11 +143,6 @@ impl TextSystem {
             postscript_names_by_font_id: HashMap::default(),
             sized: HashMap::default(),
             natives: HashMap::default(),
-            // WARNING: listing the font families takes about 20 ms, so it starts here, off the first frame's path.
-            families: std::thread::Builder::new()
-                .name("font families".into())
-                .spawn(font_families)
-                .ok(),
         }))
     }
 
@@ -149,10 +151,7 @@ impl TextSystem {
     }
 
     pub fn all_font_names(&self) -> Vec<String> {
-        let prefetched = self.0.borrow_mut().families.take();
-        let mut names = prefetched
-            .and_then(|thread| thread.join().ok())
-            .unwrap_or_else(font_families);
+        let mut names = FAMILIES.clone();
         if let Ok(fonts_in_memory) = self.0.borrow().memory_source.all_families() {
             names.extend(fonts_in_memory);
         }

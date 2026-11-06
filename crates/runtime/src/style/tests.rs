@@ -377,10 +377,10 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     );
     assert_eq!(inline.runs[1].color, ink(0x111111ff));
     assert_eq!(
-        inline.shadows,
-        vec![(0., 0., 3., 0x111111ff), (1., 2., 0., 0xff0000ff)]
+        *inline.shadows,
+        [(0., 0., 3., 0x111111ff), (1., 2., 0., 0xff0000ff)]
     );
-    let (base, pseudo, mode) = inline.first_line.as_ref().unwrap();
+    let (base, pseudo, mode) = inline.first_line.as_deref().unwrap();
     assert_eq!(mode, &None);
     let runs = restyle(&inline.runs, 0..inline.text.len(), base, pseudo);
     let colors: Vec<_> = runs.iter().map(|run| run.color).collect();
@@ -2793,4 +2793,22 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
     doc.nodes[f].state = 0;
     let exited = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert!(!exited.values[f].contains(Prop::WIDTH) && !exited.backdrops.contains_key(&f));
+}
+
+#[test]
+fn node_lengths_share_equal_values() {
+    let mut lengths = super::NodeLengths::default();
+    let base = Lengths::new(16., 800., 600.);
+    lengths.reset(4, base);
+    lengths.set(1, Lengths::new(20., 800., 600.));
+    lengths.set(2, base);
+    lengths.set(3, Lengths::new(20., 800., 600.));
+    assert_eq!(lengths[0], base);
+    assert_eq!(lengths[1].font.em, 20.);
+    assert_eq!(lengths[2], base);
+    assert_eq!(lengths[3], lengths[1]);
+    lengths.resize(6);
+    assert_eq!(lengths[5], base);
+    assert!(lengths.get(6).is_none());
+    assert_eq!(lengths.list_len(), 2);
 }

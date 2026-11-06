@@ -602,8 +602,9 @@ pub(crate) fn intrinsic(
         content = [width, width, height];
     } else if super::element::text_field(node) {
         // A percentage width is `auto` for the max-content size, like in Chrome.
-        let [width, height] =
-            super::element::field_size(doc, id, style, units, text, measured.pixel_ratio, true);
+        let [width, height] = super::element::field_size(
+            doc, id, style, units, text, measured.pixel_ratio, true, available,
+        );
         content = [width, width, height];
     } else if let Some(inline) = style::inline_text(doc, styles, id) {
         let wrap = !style

@@ -115,6 +115,8 @@ pub struct Nodes {
     list: Vec<Node>,
     revisions: Vec<u64>,
     latest: u64,
+    /// The revision of the last access that could change a node's parent or children, see [`Nodes::edit`].
+    tree: u64,
 }
 
 impl Nodes {
@@ -125,17 +127,20 @@ impl Nodes {
         self.revisions.truncate(len);
         self.revisions.shrink_to_fit();
         self.latest = stamp();
+        self.tree = self.latest;
     }
 
     pub fn push(&mut self, node: Node) {
         self.list.push(node);
         self.latest = stamp();
+        self.tree = self.latest;
         self.revisions.push(self.latest);
     }
 
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Node> {
         let node = self.list.get_mut(id)?;
         self.latest = stamp();
+        self.tree = self.latest;
         self.revisions[id] = self.latest;
         Some(node)
     }
@@ -143,7 +148,31 @@ impl Nodes {
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Node> {
         self.revisions.fill_with(stamp);
         self.latest = stamp();
+        self.tree = self.latest;
         self.list.iter_mut()
+    }
+
+    /// A mutable access that keeps the tree revision, for hot writes of text, attributes and states.
+    // WARNING: walks of the whole tree are kept until the tree revision changes, so the node's `parent` and
+    // `children` must stay. All other mutable accesses count as tree changes.
+    pub(crate) fn edit(&mut self, id: usize) -> Option<&mut Node> {
+        let node = self.list.get_mut(id)?;
+        self.latest = stamp();
+        self.revisions[id] = self.latest;
+        Some(node)
+    }
+
+    /// Swaps a node for another that a pass needs for a while, and returns it. The tree revision stays.
+    // WARNING: the pass must put the node back before anything else reads the tree.
+    pub(crate) fn swap(&mut self, id: usize, node: Node) -> Node {
+        self.latest = stamp();
+        self.revisions[id] = self.latest;
+        std::mem::replace(&mut self.list[id], node)
+    }
+
+    /// The revision of the last change of any node's parent or children.
+    pub(crate) fn tree(&self) -> u64 {
+        self.tree
     }
 
     /// Swaps in the children a frame lays out, like slotted shadow trees, and returns the old ones.
@@ -152,13 +181,14 @@ impl Nodes {
         std::mem::replace(&mut self.list[id].children, children)
     }
 
-    /// Puts back the revisions of nodes that a pass only swapped out and back, and the newest revision.
+    /// Puts back the revisions of nodes that a pass only swapped out and back, and the newest revisions.
     // WARNING: only for passes that change no other node, so nothing misses a real change.
-    pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64) {
+    pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64, tree: u64) {
         for &(id, revision) in revisions {
             self.revisions[id] = revision;
         }
         self.latest = latest;
+        self.tree = tree;
     }
 
     /// The newest revision of any node, so it changes whenever a node does.
@@ -191,6 +221,7 @@ impl std::ops::Index<usize> for Nodes {
 impl std::ops::IndexMut<usize> for Nodes {
     fn index_mut(&mut self, id: usize) -> &mut Node {
         self.latest = stamp();
+        self.tree = self.latest;
         self.revisions[id] = self.latest;
         &mut self.list[id]
     }
@@ -199,10 +230,12 @@ impl std::ops::IndexMut<usize> for Nodes {
 impl From<Vec<Node>> for Nodes {
     fn from(list: Vec<Node>) -> Self {
         let revisions = list.iter().map(|_| stamp()).collect();
+        let latest = stamp();
         Self {
             list,
             revisions,
-            latest: stamp(),
+            latest,
+            tree: latest,
         }
     }
 }
@@ -2763,6 +2796,26 @@ mod tests {
         let source = doc.serialize(svg);
         let tree = resvg::usvg::Tree::from_str(&source, &Default::default()).unwrap();
         assert_eq!(tree.root().children().len(), 2);
+    }
+
+    #[test]
+    fn only_edits_keep_the_tree_revision() {
+        let mut doc = Document::parse("<p>a</p>");
+        let (tree, latest) = (doc.nodes.tree(), doc.nodes.latest());
+        doc.nodes.edit(1).unwrap().state = 1;
+        assert_eq!(doc.nodes.tree(), tree);
+        assert_ne!(doc.nodes.latest(), latest);
+        let old = doc.nodes.swap(0, Node::default());
+        doc.nodes.swap(0, old);
+        assert_eq!(doc.nodes.tree(), tree);
+        doc.nodes[1].state = 2;
+        assert_ne!(doc.nodes.tree(), tree);
+        let tree = doc.nodes.tree();
+        doc.nodes.get_mut(1).unwrap().state = 3;
+        assert_ne!(doc.nodes.tree(), tree);
+        let tree = doc.nodes.tree();
+        doc.nodes.iter_mut().for_each(|node| node.state = 0);
+        assert_ne!(doc.nodes.tree(), tree);
     }
 
     #[test]

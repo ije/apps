@@ -77,6 +77,8 @@ pub(crate) struct PageState {
     /// By element, what its kept boxes were built from, and the frame they hold for: viewport size,
     /// scale, font loads and the top layer.
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
+    /// The collapsed margins of each parent's children, kept while its subtree's geometry stays.
+    walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
     /// The entries of `kept` that this build replaced, to undo when the window never gets the build.
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
     layout_queued: Cell<bool>,
@@ -324,6 +326,7 @@ impl PageView {
             caret: RefCell::default(),
             hud: RefCell::default(),
             kept: RefCell::default(),
+            walked: RefCell::default(),
             #[cfg(target_os = "macos")]
             canvas: Default::default(),
             kept_frame: RefCell::default(),
@@ -562,25 +565,26 @@ impl PageView {
             });
         let mut visible = std::mem::take(&mut dom.cull.visible);
         if !same {
+            walk(&doc, dom, &styles);
             let mut shown = std::mem::take(&mut visible);
             visible.clear();
             visible.resize(doc.nodes.len(), false);
-            let mut pending = vec![0];
-            while let Some(node) = pending.pop() {
+            for &(node, parent) in dom.cull.walk.nodes.iter() {
+                let node = node as usize;
+                if parent != u32::MAX && !visible[parent as usize] {
+                    continue;
+                }
                 let style = &styles.values[node];
-                if !match dom.layout_nodes.get(node).and_then(Option::as_ref) {
+                visible[node] = !match dom.layout_nodes.get(node).and_then(Option::as_ref) {
                     Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
                     _ => style
                         .get(Prop::DISPLAY)
                         .is_some_and(|value| value == "none"),
-                } {
-                    visible[node] = true;
-                    pending.extend(&doc.nodes[node].children);
-                }
+                };
             }
             // Table rows and row groups are flattened out of the tree above; they show when their cells do.
-            for node in 0..visible.len() {
-                if visible[node] && matches!(doc.nodes[node].tag.as_str(), "td" | "th") {
+            for &node in &dom.cull.cells {
+                if visible[node] {
                     let mut parent = doc.nodes[node].parent;
                     while let Some(id) = parent.filter(|&id| {
                         !visible[id]
@@ -657,7 +661,7 @@ impl PageView {
         let compositing = !animated.is_empty()
             && composited.len() == animated.len()
             && dom.motion.pseudos.is_empty();
-        animate(&self.0, dom, next, now, compositing, events, window, cx);
+        animate(&self.0, dom, next, now, compositing, window, cx);
         // WARNING: animated values replace `styles.values` and `styles.pseudos` only while this frame is built;
         // `restore` and `restore_pseudos` put the cascade back.
         let mut restore = Vec::new();
@@ -690,6 +694,9 @@ impl PageView {
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
         self.kept
+            .borrow_mut()
+            .retain(|&id, _| visible.get(id) == Some(&true));
+        self.walked
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
         self.fields
@@ -837,12 +844,8 @@ impl PageView {
             }
         } else {
             dom.cull.inputs.clear();
-            let mut order = Vec::new();
-            let mut pending = vec![0];
-            while let Some(id) = pending.pop() {
-                order.push(id);
-                pending.extend(&doc.nodes[id].children);
-            }
+            walk(&doc, dom, &styles);
+            let walk = std::mem::take(&mut dom.cull.walk);
             // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
             // A new viewport size is left to `cull::VIEWPORT`, as for kept styles, so a resize that restyles colors
             // keeps culling.
@@ -885,206 +888,174 @@ impl PageView {
                 info[*id].flags =
                     own_flags(&doc.nodes[*id].tag, style, *id) & (cull::MOVED | cull::BLOCKED);
             }
-            for id in order.into_iter().rev() {
+            for &(id, _) in walk.nodes.iter().rev() {
+                let id = id as usize;
                 let node = &doc.nodes[id];
                 let style = &styles.values[id];
                 let revision = doc.nodes.revision(id);
                 let old = dom.layout_nodes[id].as_ref();
-                let same = old.is_some_and(|old| old.seen == revision);
-                // WARNING: a form control's value and checked state draw like its text.
-                let form = |old: &crate::dom::Node| {
-                    old.value != node.value
-                        || (old.state ^ node.state) & (crate::dom::CHECKED | crate::dom::DIRTY) != 0
+                let (shape, attrs) = match old {
+                    Some(old) if old.seen == revision => {
+                        debug_assert!(
+                            (old.shape, old.attrs) == cull::content(node),
+                            "node {id} changed without a new revision"
+                        );
+                        (old.shape, old.attrs)
+                    }
+                    _ => cull::content(node),
                 };
-                let edited = old.is_some_and(|old| {
-                    !same
-                        && (old.node.text != node.text
-                            || old.node.attrs != node.attrs
-                            || form(&old.node))
-                });
-                debug_assert!(
-                    !same
-                        || old.is_some_and(|old| old.node.tag == node.tag
-                            && old.node.text == node.text
-                            && old.node.attrs == node.attrs),
-                    "node {id} changed without a new revision"
-                );
-                let restyled = old.is_none_or(|old| {
-                    !Rc::ptr_eq(&old.style, style) || !same && old.node.tag != node.tag
-                });
-                let own = restyled || edited;
+                let restyled =
+                    old.is_none_or(|old| !Rc::ptr_eq(&old.style, style) || old.shape != shape);
+                let own = restyled || old.is_some_and(|old| old.attrs != attrs);
                 let reshaped = old.is_none_or(|old| {
-                    !same
-                        && (old.node.tag != node.tag
-                            || old.node.text != node.text
-                            || form(&old.node)
-                            || old.node.attrs != node.attrs
-                                && !cull::cosmetic_attrs(&old.node.attrs, &node.attrs))
+                    old.shape != shape
                         || !Rc::ptr_eq(&old.style, style)
                             && (old.units != units(&styles.lengths[id])
                                 || !cull::cosmetic(&old.style, style))
                 });
-                let flags = match old {
-                    Some(old) if !restyled => old.flags,
-                    _ => own_flags(&node.tag, style, id),
-                };
-                let flowed = || {
-                    node.children
-                        .iter()
-                        .copied()
-                        .filter(|&child| info[child].flags & cull::OUT == 0)
-                };
-                let children = || {
-                    flowed().map(|child| {
+                let (flags, marks) = match old {
+                    Some(old) if !restyled => (old.flags, old.marks),
+                    _ => {
+                        let flags = own_flags(&node.tag, style, id);
+                        // WARNING: these boxes build from native state, which no revision tracks, so the window never
+                        // keeps them.
+                        let volatile = matches!(
+                            node.tag.as_str(),
+                            "img"
+                                | "video"
+                                | "audio"
+                                | "canvas"
+                                | "iframe"
+                                | "webview"
+                                | "embed"
+                                | "object"
+                                | "input"
+                                | "textarea"
+                                | "select"
+                                | "option"
+                                | "optgroup"
+                                | "progress"
+                                | "meter"
+                        ) || node.tag == "button"
+                            && control::kind("button", None, false, style)
+                                .is_some_and(|(_, boxed)| boxed);
+                        // These build from their siblings or counters, see `cull::FRAMED`.
+                        let pseudos = styles.pseudos.get(&id);
+                        let framed = matches!(
+                            node.tag.as_str(),
+                            "br" | "fieldset"
+                                | "legend"
+                                | "details"
+                                | "summary"
+                                | "dialog"
+                                | "li"
+                                | "table"
+                                | "caption"
+                                | "tr"
+                                | "td"
+                                | "th"
+                                | "thead"
+                                | "tbody"
+                                | "tfoot"
+                                | "colgroup"
+                                | "col"
+                                | "q"
+                                | "slot"
+                        ) || pseudos.is_some_and(|pair| {
+                            pair.iter().any(|pseudo| {
+                                pseudo.get(Prop::CONTENT).is_some_and(|value| {
+                                    value.contains("counter") || value.contains("quote")
+                                })
+                            })
+                        });
+                        let heighted =
+                            pseudos.is_some_and(|pair| pair.iter().any(cull::reads_height));
+                        let input = node.tag == "svg"
+                            || matches!(
+                                style.get(Prop::POSITION),
+                                Some("absolute" | "fixed" | "sticky")
+                            )
+                            || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid"));
                         (
-                            child,
-                            dom.layout_nodes[child]
-                                .as_ref()
-                                .map_or(0, |node| node.revision),
+                            flags,
+                            u16::from(volatile) * cull::VOLATILE
+                                | u16::from(framed) * cull::FRAMED
+                                | u16::from(heighted) * cull::HEIGHTED
+                                | u16::from(input) * cull::INPUT,
                         )
-                    })
+                    }
                 };
                 // WARNING: boxes out of the flow don't move this box, but it links them, so they renew its revision
                 // and not its geometry. A kept box would hide them.
-                let out = node
-                    .children
-                    .iter()
-                    .filter(|&&child| info[child].flags & cull::OUT != 0)
-                    .fold(0, |sum: u64, &child| {
-                        sum.wrapping_add(
-                            dom.layout_nodes[child].as_ref().map_or(0, |node| node.revision),
-                        )
-                    });
+                let (mut list, mut kids) =
+                    (rustc_hash::FxHasher::default(), rustc_hash::FxHasher::default());
+                let (mut out, mut moved, mut below) = (0u64, 0u64, 0u16);
+                for &child in &node.children {
+                    let child_info = &info[child];
+                    below |= child_info.flags;
+                    if child_info.flags & cull::OUT != 0 {
+                        out = out.wrapping_add(child_info.subtree);
+                    } else {
+                        std::hash::Hasher::write_usize(&mut list, child);
+                        std::hash::Hasher::write_usize(&mut kids, child);
+                        std::hash::Hasher::write_u64(&mut kids, child_info.subtree);
+                        moved = moved.max(child_info.revision);
+                    }
+                }
+                let (list, kids) =
+                    (std::hash::Hasher::finish(&list), std::hash::Hasher::finish(&kids));
                 let mut relisted = false;
-                if own
-                    || old.is_some_and(|old| {
-                        old.out != out || !old.children.iter().copied().eq(children())
-                    })
-                {
-                    relisted = old.is_none_or(|old| {
-                        !old.children.iter().map(|&(child, _)| child).eq(flowed())
-                    });
+                if own || old.is_some_and(|old| old.out != out || old.kids != kids) {
+                    relisted = old.is_none_or(|old| old.list != list);
                     // WARNING: the geometry revision ignores paint-only changes, so culled spacers survive them.
                     let geometry = old
-                        .filter(|old| {
-                            !reshaped
-                                && !relisted
-                                && flowed().all(|child| info[child].revision <= old.geometry)
-                        })
+                        .filter(|old| !reshaped && !relisted && moved <= old.geometry)
                         .map(|old| old.geometry);
-                    let children = children().collect();
                     dom.layout_revision += 1;
-                    dom.layout_nodes[id] = Some(Box::new(crate::dom::LayoutNode {
-                        node: node.clone(),
+                    dom.layout_nodes[id] = Some(crate::dom::LayoutNode {
+                        shape,
+                        attrs,
                         seen: revision,
                         style: style.clone(),
                         units: units(&styles.lengths[id]),
-                        children,
+                        list,
+                        kids,
                         out,
                         revision: dom.layout_revision,
                         geometry: geometry.unwrap_or(dom.layout_revision),
                         flags,
-                    }));
+                        marks,
+                    });
                     changed.push(id);
                 } else if let Some(old) = &mut dom.layout_nodes[id] {
                     old.seen = revision;
                 }
-                // WARNING: these boxes build from native state, which no revision tracks, so the window never
-                // keeps them.
-                let volatile = matches!(
-                    node.tag.as_str(),
-                    "img"
-                        | "video"
-                        | "audio"
-                        | "canvas"
-                        | "iframe"
-                        | "webview"
-                        | "embed"
-                        | "object"
-                        | "input"
-                        | "textarea"
-                        | "select"
-                        | "option"
-                        | "optgroup"
-                        | "progress"
-                        | "meter"
-                ) || node.tag == "button"
-                    && control::kind("button", None, false, style).is_some_and(|(_, boxed)| boxed);
-                // These build from their siblings or counters, see `cull::FRAMED`.
-                let framed = matches!(
-                    node.tag.as_str(),
-                    "br" | "fieldset"
-                        | "legend"
-                        | "details"
-                        | "summary"
-                        | "dialog"
-                        | "li"
-                        | "table"
-                        | "caption"
-                        | "tr"
-                        | "td"
-                        | "th"
-                        | "thead"
-                        | "tbody"
-                        | "tfoot"
-                        | "colgroup"
-                        | "col"
-                        | "q"
-                        | "slot"
-                ) || styles.pseudos.get(&id).is_some_and(|pair| {
-                    pair.iter().any(|pseudo| {
-                        pseudo.get(Prop::CONTENT).is_some_and(|value| {
-                            value.contains("counter") || value.contains("quote")
-                        })
-                    })
-                });
-                if flags & cull::HIDDEN == 0
-                    && (node.tag == "svg"
-                        || matches!(
-                            style.get(Prop::POSITION),
-                            Some("absolute" | "fixed" | "sticky")
-                        )
-                        || matches!(style.get(Prop::DISPLAY), Some("grid" | "inline-grid")))
-                {
+                if flags & cull::HIDDEN == 0 && marks & cull::INPUT != 0 {
                     dom.cull.inputs.push(id);
                 }
+                let layout = dom.layout_nodes[id].as_ref();
                 info[id] = cull::Info {
-                    revision: dom.layout_nodes[id]
-                        .as_ref()
-                        .map_or(0, |node| node.geometry),
-                    subtree: dom.layout_nodes[id]
-                        .as_ref()
-                        .map_or(0, |node| node.revision),
+                    revision: layout.map_or(0, |node| node.geometry),
+                    subtree: layout.map_or(0, |node| node.revision),
                     flags: if flags & cull::HIDDEN != 0 {
                         flags
                     } else {
-                        node.children.iter().fold(
-                            info[id].flags
-                                | flags
-                                | (u16::from(reshaped) * cull::CHANGED)
-                                | (u16::from(relisted) * cull::RELISTED)
-                                | (u16::from(volatile) * cull::VOLATILE)
-                                | (u16::from(framed) * cull::FRAMED)
-                                | (u16::from(
-                                    styles.pseudos.get(&id).is_some_and(|pair| {
-                                        pair.iter().any(cull::reads_height)
-                                    }),
-                                ) * cull::HEIGHTED)
-                                | (u16::from(dom.focus == Some(id))
-                                    * (cull::BLOCKED | cull::VOLATILE)),
-                            |flags, &child| {
-                                flags
-                                    | info[child].flags
-                                        & (cull::BLOCKED
-                                            | cull::VIEWPORT
-                                            | cull::VOLATILE
-                                            | cull::FRAMED
-                                            | cull::HEIGHTED)
-                            },
-                        )
+                        info[id].flags
+                            | flags
+                            | (u16::from(reshaped) * cull::CHANGED)
+                            | (u16::from(relisted) * cull::RELISTED)
+                            | (marks & !cull::INPUT)
+                            | (u16::from(dom.focus == Some(id)) * (cull::BLOCKED | cull::VOLATILE))
+                            | below
+                                & (cull::BLOCKED
+                                    | cull::VIEWPORT
+                                    | cull::VOLATILE
+                                    | cull::FRAMED
+                                    | cull::HEIGHTED)
                     },
                 };
             }
+            dom.cull.walk = walk;
         }
         self.spun.borrow_mut().clear();
         // A drawn frame takes promoted layers back, see `composite`.
@@ -1147,6 +1118,7 @@ impl PageView {
         if dom.container_pass && dom.style_cache.units || dom.cull.frame != frame {
             dom.measurements.sizes.clear();
             dom.grids.clear();
+            self.walked.borrow_mut().clear();
         }
         let mut stale = false;
         let mut around = rustc_hash::FxHashSet::default();
@@ -1579,6 +1551,15 @@ impl PageView {
         if repass {
             window.rebuild();
         }
+        if !events.is_empty() {
+            if self.reflowing.get() {
+                let view = self.0.clone();
+                cx.defer(move |cx| animation_events(&view, events, cx));
+            } else {
+                animation_events(&self.0, events, cx);
+                window.redraw();
+            }
+        }
         let id = self.id;
         if !window.redrawing() && !self.reflowing.get() && !repass {
             queue_layout(self.0.clone(), window);
@@ -1655,16 +1636,13 @@ fn composites(a: &style::Style, b: &style::Style) -> bool {
     a.iter().filter(rest).eq(b.iter().filter(rest))
 }
 
-/// Wakes the view for the next animation change, with an opacity-only frame while `composite`,
-/// and sends the animation events.
-#[allow(clippy::too_many_arguments)]
+/// Wakes the view for the next animation change, with an opacity-only frame while `composite`.
 fn animate(
     view: &Rc<PageState>,
     dom: &mut crate::dom::State,
     next: Option<std::time::Instant>,
     now: std::time::Instant,
     composite: bool,
-    events: Vec<(usize, &'static str, String, f64)>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1699,35 +1677,37 @@ fn animate(
         }
         None => dom.motion.wake = None,
     }
-    if !events.is_empty() {
-        let runtime = view.runtime.clone();
-        let id = view.id;
-        cx.defer(move |cx| {
-            let renderer = runtime
-                .borrow()
-                .views
-                .get(&id)
-                .and_then(|view| view.renderer.clone());
-            for (node, kind, name, elapsed) in events {
-                // Pseudo-element animations are named like `::before\0spin`.
-                let (pseudo, name) = name.split_once('\0').unwrap_or(("", &name));
-                let data = if kind.starts_with("animation") {
-                    serde_json::json!({"animationName": name, "elapsedTime": elapsed, "pseudoElement": pseudo})
-                } else {
-                    serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
-                };
-                if let Some(renderer) = &renderer
-                    && let Err(error) = renderer.eval(
-                        &format!("__appsDispatch('{kind}',[{node}],{data})"),
-                        "apps:animation",
-                    )
-                {
-                    eprintln!("apps: {error}");
-                }
-            }
-            Desktop::drive(runtime, cx);
-        });
+}
+
+// WARNING: animation handlers can hide or remove a popup, so run them before its final frame is painted.
+fn animation_events(
+    view: &Rc<PageState>,
+    events: Vec<(usize, &'static str, String, f64)>,
+    cx: &mut App,
+) {
+    let runtime = view.runtime.clone();
+    let renderer = runtime
+        .borrow()
+        .views
+        .get(&view.id)
+        .and_then(|view| view.renderer.clone());
+    for (node, kind, name, elapsed) in events {
+        let (pseudo, name) = name.split_once('\0').unwrap_or(("", &name));
+        let data = if kind.starts_with("animation") {
+            serde_json::json!({"animationName": name, "elapsedTime": elapsed, "pseudoElement": pseudo})
+        } else {
+            serde_json::json!({"propertyName": name, "elapsedTime": elapsed})
+        };
+        if let Some(renderer) = &renderer
+            && let Err(error) = renderer.eval(
+                &format!("__appsDispatch('{kind}',[{node}],{data})"),
+                "apps:animation",
+            )
+        {
+            eprintln!("apps: {error}");
+        }
     }
+    Desktop::drive(runtime, cx);
 }
 
 /// An animation frame that only changes the opacity and transform of boxes with keyed layers: it
@@ -1771,6 +1751,14 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
         false,
         &mut events,
     );
+    if !events.is_empty() {
+        animate(&view, dom, next, now, false, window, cx);
+        dom.animating
+            .extend(animated.into_iter().map(|(id, style, _)| (id, style)));
+        drop(host);
+        animation_events(&view, events, cx);
+        return window.refresh();
+    }
     *view.parked.borrow_mut() = dom
         .motion
         .parked
@@ -1902,7 +1890,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
         }
         _ => next.filter(|_| patched),
     };
-    animate(&view, dom, next, now, true, events, window, cx);
+    animate(&view, dom, next, now, true, window, cx);
     drop(host);
     // WARNING: like a drawn frame, the time ends before the frame goes to the GPU.
     if patched && !promoted && crate::desktop::mcp::profiling() {
@@ -1967,6 +1955,25 @@ fn clips<'a>(
             }
         }
     })
+}
+
+/// Brings the walk of the composed tree up to date. The composed children must be swapped in.
+fn walk(doc: &crate::dom::Document, dom: &mut crate::dom::State, styles: &style::ComputedStyles) {
+    if dom
+        .cull
+        .walk
+        .update(doc, &styles.children, Some(&dom.style_walk))
+    {
+        dom.cull.cells.clear();
+        dom.cull.cells.extend(
+            dom.cull
+                .walk
+                .nodes
+                .iter()
+                .map(|&(id, _)| id as usize)
+                .filter(|&id| matches!(doc.nodes[id].tag.as_str(), "td" | "th")),
+        );
+    }
 }
 
 /// Drops the cached images of nodes that are not displayed. Canvases keep their pixels.
