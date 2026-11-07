@@ -725,7 +725,7 @@ impl Window {
                 || round_corners(mask)
                     .iter()
                     .any(|corner| corner.intersects(&reach))
-                || self.scene.paints_over(index, reach)
+                || self.scene.paints_over(index, reach, |_| false)
         }) || region[2] > 2048
             || region[3] > 2048
         {

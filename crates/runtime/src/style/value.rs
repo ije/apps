@@ -202,13 +202,44 @@ fn tokenized(value: &str, separator: char) -> Vec<&str> {
     parts
 }
 
+type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 16], Vec<renderer::BoxShadow>)>;
+
+thread_local! {
+    // WARNING: boxes that build again parse the same long shadow lists, like Tailwind's ring and shadow layers.
+    static SHADOWS: std::cell::RefCell<ShadowMemo> = Default::default();
+}
+
 impl Lengths {
     pub fn shadows(&self, value: &str, inset: bool) -> Vec<renderer::BoxShadow> {
-        let mut shadows = Vec::new();
         if value == "none" {
+            return Vec::new();
+        }
+        let [font, root] = [self.font, self.root].map(|units| {
+            [units.em, units.ch, units.ex, units.cap, units.ic, units.lh].map(f32::to_bits)
+        });
+        let [vw, vh] = self.viewport.map(f32::to_bits);
+        let [cw, ch] = self
+            .container
+            .map_or([u32::MAX; 2], |size| size.map(f32::to_bits));
+        let mut units = [0; 16];
+        units[..6].copy_from_slice(&font);
+        units[6..12].copy_from_slice(&root);
+        units[12..].copy_from_slice(&[vw, vh, cw, ch]);
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            (value, inset, units).hash(&mut hasher);
+            hasher.finish()
+        };
+        if let Some(shadows) = SHADOWS.with_borrow(|memo| {
+            memo.get(&hash)
+                .filter(|(old, flag, bits, _)| **old == *value && *flag == inset && *bits == units)
+                .map(|(.., shadows)| shadows.clone())
+        }) {
             return shadows;
         }
-        for shadow in components(value, ',').into_iter().rev() {
+        let mut shadows = Vec::new();
+        'parse: for shadow in components(value, ',').into_iter().rev() {
             let mut lengths = Vec::new();
             let mut ink = (0, 255);
             let parts = components(shadow, ' ');
@@ -221,11 +252,13 @@ impl Lengths {
                 } else if let Some(value) = self.resolve(part, self.viewport[0]) {
                     lengths.push(value);
                 } else {
-                    return Vec::new();
+                    shadows.clear();
+                    break 'parse;
                 }
             }
             if !(2..=4).contains(&lengths.len()) {
-                return Vec::new();
+                shadows.clear();
+                break 'parse;
             }
             shadows.push(renderer::BoxShadow {
                 color: renderer::rgba((ink.0 << 8) | u32::from(ink.1)),
@@ -236,6 +269,12 @@ impl Lengths {
                 inset,
             });
         }
+        SHADOWS.with_borrow_mut(|memo| {
+            if memo.len() >= 1024 {
+                memo.clear();
+            }
+            memo.insert(hash, (value.into(), inset, units, shadows.clone()));
+        });
         shadows
     }
 }

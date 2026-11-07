@@ -39,6 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use glass::available as supports_glass;
 pub(crate) use text::TextSystem;
 pub(crate) use window::Window;
 pub use window::WindowControl;

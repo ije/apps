@@ -64,6 +64,10 @@ pub(crate) struct Cull {
     pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) visible: Vec<bool>,
     pub(crate) walk: crate::dom::Walk,
+    /// The parent of each node in `walk`, or `u32::MAX`.
+    pub(crate) parents: Vec<u32>,
+    /// Nodes whose info holds paint animation flags from a frame since the last info pass.
+    pub(crate) painted: Vec<usize>,
     pub(crate) cells: Vec<usize>,
     pub(crate) inputs: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
@@ -77,6 +81,7 @@ impl Cull {
         self.placed.truncate(len);
         self.placed.shrink_to_fit();
         self.walk = Default::default();
+        self.parents = Vec::new();
         self.cells = Vec::new();
         if self.info.len() > len {
             self.info.truncate(len);

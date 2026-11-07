@@ -272,7 +272,12 @@ impl Scene {
             .is_some()
     }
 
-    pub(crate) fn paints_over(&self, index: usize, reach: Bounds<ScaledPixels>) -> bool {
+    pub(crate) fn paints_over(
+        &self,
+        index: usize,
+        reach: Bounds<ScaledPixels>,
+        skip: impl Fn(usize) -> bool,
+    ) -> bool {
         let window = &self.layers[0];
         let Some(own) = window.effects.iter().find(|effect| effect.layer == index) else {
             return true;
@@ -305,8 +310,8 @@ impl Scene {
                 .iter()
                 .any(|sprite| over(sprite.order, sprite.bounds, sprite.content_mask.bounds))
             || window.effects.iter().any(|effect| {
-                effect.layer > index
-                    && effect.order >= own.order
+                (effect.order, effect.layer) > (own.order, index)
+                    && !skip(effect.layer)
                     && effect
                         .bounds
                         .intersect(&effect.content_mask.bounds)
@@ -680,5 +685,57 @@ impl std::fmt::Debug for RenderImage {
 impl PartialEq for RenderImage {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_glass_can_overlap_but_cannot_cover_gpu_overlays() {
+        let bounds = |[x, y, width, height]: [f32; 4]| {
+            Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                Size::new(ScaledPixels(width), ScaledPixels(height)),
+            )
+        };
+        let pill = bounds([12., 12., 236., 52.]);
+        let close = bounds([10., 10., 18., 18.]);
+        let mask = ContentMask {
+            bounds: bounds([0., 0., 260., 76.]),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        for (layer, bounds) in [(1, pill), (2, close)] {
+            scene.layers[0].effects.push(EffectPrimitive {
+                order: layer as u32,
+                layer,
+                bounds,
+                content_mask: mask,
+            });
+        }
+        assert!(scene.paints_over(1, pill, |_| false));
+        assert!(!scene.paints_over(2, close, |_| false));
+        assert!(!scene.paints_over(1, pill, |layer| layer == 2));
+
+        scene.layers[0].quads.push(Quad {
+            order: 3,
+            bounds: close,
+            content_mask: mask,
+            ..Default::default()
+        });
+        assert!(scene.paints_over(1, pill, |layer| layer == 2));
+        assert!(scene.paints_over(2, close, |_| false));
+
+        scene.layers[0].quads.clear();
+        scene.layers[0].effects.push(EffectPrimitive {
+            order: 3,
+            layer: 3,
+            bounds: close,
+            content_mask: mask,
+        });
+        assert!(scene.paints_over(1, pill, |layer| layer == 2));
+        assert!(scene.paints_over(2, close, |_| false));
     }
 }

@@ -177,6 +177,11 @@ pub(crate) struct SelectorCache {
     revision: u32,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<u32>)>,
+    // WARNING: `dirty` marks the nodes whose matches may have changed since a style pass last read them, and
+    // `dependents` lists, per node, the nodes whose matches read it (with stale entries, as a superset).
+    // An incremental pass styles only dirty nodes, so every recorded dependency must reach `dependents`.
+    pub(crate) dirty: Vec<bool>,
+    dependents: Vec<(u32, Vec<u32>)>,
 }
 
 impl SelectorCache {
@@ -184,6 +189,43 @@ impl SelectorCache {
         if let Some(snapshot) = self.nodes.get_mut(id) {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
+            self.mark(id);
+        }
+    }
+
+    pub(crate) fn mark(&mut self, id: usize) {
+        if let Some(dirty) = self.dirty.get_mut(id) {
+            *dirty = true;
+        }
+        if let Some((_, dependents)) = self.dependents.get(id) {
+            for &node in dependents {
+                if let Some(dirty) = self.dirty.get_mut(node as usize) {
+                    *dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Records that `id` read the nodes in `dependencies`, which must be sorted.
+    pub(crate) fn register(&mut self, id: usize) {
+        let mut last = usize::MAX;
+        for &(dependency, _) in &self.dependencies {
+            let node = dependency as usize / KINDS;
+            if node == id || node == last {
+                continue;
+            }
+            last = node;
+            let Some((compacted, list)) = self.dependents.get_mut(node) else {
+                continue;
+            };
+            if list.last() != Some(&(id as u32)) {
+                list.push(id as u32);
+                if list.len() >= 16.max(*compacted as usize * 2) {
+                    list.sort_unstable();
+                    list.dedup();
+                    *compacted = list.len() as u32;
+                }
+            }
         }
     }
 
@@ -196,6 +238,10 @@ impl SelectorCache {
         self.nodes.shrink_to_fit();
         self.seen.truncate(len);
         self.seen.shrink_to_fit();
+        self.dirty.truncate(len);
+        self.dirty.fill(true);
+        self.dependents.truncate(len);
+        self.dependents.shrink_to_fit();
     }
 
     pub fn update(&mut self, doc: &Document, order: &[(u32, u32)]) {
@@ -210,6 +256,10 @@ impl SelectorCache {
             self.nodes.resize(doc.nodes.len(), Snapshot::default());
             self.seen.resize(doc.nodes.len(), 0);
         }
+        self.dirty
+            .resize(doc.nodes.len().max(self.dirty.len()), true);
+        self.dependents
+            .resize_with(doc.nodes.len().max(self.dependents.len()), Default::default);
         let mut changes = Vec::new();
         let mut retagged = Vec::new();
         for &(id, _) in order {
@@ -317,6 +367,9 @@ impl SelectorCache {
                     changes.push((parent * KINDS + 2) as u32);
                 }
             }
+        }
+        for &change in &changes {
+            self.mark(change as usize / KINDS);
         }
         if !changes.is_empty() {
             self.epoch += 1;

@@ -3003,6 +3003,7 @@ pub(crate) fn styles(
             .collect(),
         previous: state.computed.clone().or_else(|| state.previous.take()),
         top_layer: !state.top_layer.is_empty(),
+        incremental: state.shadows.is_empty(),
         ..Default::default()
     };
     if !state.shadows.is_empty() {
@@ -3752,6 +3753,84 @@ mod tests {
             &first,
             &host.borrow().dom[&1].computed.as_ref().unwrap().values[p]
         ));
+    }
+
+    #[test]
+    fn incremental_styles_match_full_passes() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    "<html><head><style>
+                    html{font-size:16px} .on{color:red} .dark .leaf{color:blue} .a+.b{color:green}
+                    .box:has(.on){background-color:yellow} li:nth-child(2n){color:purple} p:empty{color:teal}
+                    .rem{padding-left:2rem} .em{padding-top:2em} .vars{color:var(--c,gray)} .x::before{content:'a'}
+                    .s::selection{color:white} .h:hover{color:orange} .none{display:none} [data-k=v]{color:navy}
+                    </style></head><body><div id=root class=box><span id=leaf class=leaf>x</span>
+                    <i class=a id=a></i><i class=b></i><ul id=list><li>1</li><li>2</li><li>3</li></ul>
+                    <p id=p>t</p><div id=sized class=em><b class=rem>r</b><b class=em>e</b></div>
+                    <div id=vars class=vars><span class=vars>v</span></div><div id=hover class='h s'>h</div>
+                    <div id=k>k</div></div></body></html>",
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let hover = host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").is_some_and(|id| id == "hover"))
+            .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!("for(const id of ['root','leaf','a','list','p','sized','vars','hover','k'])globalThis[id]=document.getElementById(id);{read}"), "test")
+            .unwrap();
+        for step in [
+            "leaf.classList.add('on')",
+            "root.classList.add('dark')",
+            "a.classList.remove('a')",
+            "a.classList.add('a')",
+            "leaf.classList.remove('on')",
+            "list.prepend(document.createElement('li'))",
+            "list.firstChild.remove()",
+            "p.firstChild.data=''",
+            "document.documentElement.style.fontSize='20px'",
+            "sized.style.fontSize='30px'",
+            "vars.style.setProperty('--c','red')",
+            "vars.firstChild.style.setProperty('--c','blue')",
+            "leaf.classList.add('x')",
+            "hover.classList.remove('s')",
+            "hover.classList.add('none')",
+            "hover.classList.remove('none')",
+            "k.dataset.k='v'",
+            "list.append(sized)",
+            "root.prepend(list)",
+            "root.removeChild(p)",
+            "root.append(p)",
+            "document.documentElement.style.fontSize=''",
+        ] {
+            engine.eval(&format!("{step};{read}"), "test").unwrap();
+        }
+        for ids in [vec![hover], vec![]] {
+            host.borrow_mut()
+                .call(Role::Renderer(1), "dom.hover", json!([ids]))
+                .unwrap();
+            engine.eval(read, "test").unwrap();
+        }
+        assert!(host.borrow().dom[&1].style_cache.incremental >= 20);
     }
 
     #[test]

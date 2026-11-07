@@ -30,3 +30,14 @@ pub use text::{
 };
 pub use tree::Tree;
 pub use window::*;
+
+pub fn supports_glass() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        platform::supports_glass()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}

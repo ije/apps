@@ -3,6 +3,7 @@
   "productName": "Liquid Glass",
   "private": true,
   "main": "main.js",
+  "preload": "preload.js",
   "scripts": {
     "dev": "apps run --watch",
     "build": "apps build"

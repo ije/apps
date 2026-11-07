@@ -824,6 +824,155 @@ fn arbitrary_values_keep_modifiers_and_type_hints() {
 }
 
 #[test]
+fn glass_tint_uses_tailwind_colors_modifiers_and_variants() {
+    assert_generated(
+        "",
+        &[
+            (
+                "glass-tint-blue-500",
+                ".glass-tint-blue-500{-macos-glass-tint-color:var(--color-blue-500);}",
+            ),
+            (
+                "glass-tint-slate-950/50",
+                ".glass-tint-slate-950\\/50{-macos-glass-tint-color:color-mix(in oklab, var(--color-slate-950) 50%, transparent);}",
+            ),
+            (
+                "glass-tint-[#123456]",
+                ".glass-tint-\\[\\#123456\\]{-macos-glass-tint-color:#123456;}",
+            ),
+            (
+                "glass-tint-(--brand)/(--alpha)",
+                ".glass-tint-\\(--brand\\)\\/\\(--alpha\\){-macos-glass-tint-color:color-mix(in oklab, var(--brand) var(--alpha), transparent);}",
+            ),
+            (
+                "hover:glass-tint-red-600",
+                "@media (hover: hover){.hover\\:glass-tint-red-600:hover{-macos-glass-tint-color:var(--color-red-600);}}",
+            ),
+            (
+                "supports-glass:glass-tint-blue-500",
+                "@media (-macos-glass){.supports-glass\\:glass-tint-blue-500{-macos-glass-tint-color:var(--color-blue-500);}}",
+            ),
+            ("glass-tint-blue", ""),
+            ("glass-tint-[length:2px]", ""),
+            ("glass-tint-blue-500/101", ""),
+            ("-glass-tint-blue-500", ""),
+        ],
+    );
+    assert_generated(
+        "@theme { --color-*:initial; --color-brand:#123456; } @theme inline { --color-inline:var(--brand); }",
+        &[
+            ("glass-tint-blue-500", ""),
+            (
+                "glass-tint-brand",
+                ".glass-tint-brand{-macos-glass-tint-color:var(--color-brand);}",
+            ),
+            (
+                "glass-tint-inline/25",
+                ".glass-tint-inline\\/25{-macos-glass-tint-color:color-mix(in oklab, var(--brand) 25%, transparent);}",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn glass_tint_tracks_runtime_theme_overrides_and_apply() {
+    let mut doc = Document::parse(
+        "<html><style>@import 'tailwindcss';
+        @theme { --color-brand:#123456; --color-blue-500:#112233; }
+        @theme inline { --color-inline:var(--brand); }
+        :root{--brand:#345678}
+        .night{--color-blue-500:#abcdef;--color-brand:#abcdef;--brand:#fedcba}
+        .applied{@apply bg-brand/50 glass-tint-brand/50}
+        </style><body>
+        <p id=shade class='bg-blue-500 glass-tint-blue-500'></p>
+        <p id=custom class='bg-brand glass-tint-brand'></p>
+        <p id=inline class='bg-inline glass-tint-inline'></p>
+        <p id=applied class=applied></p>
+        <p id=hover class='bg-blue-500 hover:bg-brand glass-tint-blue-500 hover:glass-tint-brand'></p>
+        </body></html>",
+    );
+    let root = id(&doc, "html");
+    let hovered = id(&doc, "#hover");
+    let nodes =
+        ["#shade", "#custom", "#inline", "#applied", "#hover"].map(|selector| id(&doc, selector));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for night in [false, true, false] {
+        doc.nodes[root]
+            .attrs
+            .set("class", if night { "night" } else { "" });
+        doc.nodes[hovered].state = if night { crate::dom::HOVER } else { 0 };
+        let styles = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(styles.values, fresh.values);
+        for node in nodes {
+            assert_eq!(
+                styles.values[node].get(Prop::MACOS_GLASS_TINT_COLOR),
+                styles.values[node].get(Prop::BACKGROUND_COLOR)
+            );
+        }
+        for (node, expected) in nodes.into_iter().zip([
+            if night { "#abcdef" } else { "#112233" },
+            if night { "#abcdef" } else { "#123456" },
+            if night { "#fedcba" } else { "#345678" },
+        ]) {
+            assert_eq!(
+                styles.values[node].get(Prop::MACOS_GLASS_TINT_COLOR),
+                Some(expected)
+            );
+        }
+        let applied = &styles.values[nodes[3]];
+        assert_eq!(
+            super::super::color(applied.get(Prop::MACOS_GLASS_TINT_COLOR).unwrap()),
+            Some((if night { 0xabcdef } else { 0x123456 }, 128))
+        );
+        cache.finish();
+    }
+}
+
+#[test]
+fn supports_glass_variants_keep_runtime_conditions_and_stack() {
+    assert_generated(
+        "",
+        &[
+            (
+                "supports-glass:flex",
+                "@media (-macos-glass){.supports-glass\\:flex{display:flex;}}",
+            ),
+            (
+                "not-supports-glass:flex",
+                "@media not (-macos-glass){.not-supports-glass\\:flex{display:flex;}}",
+            ),
+            (
+                "supports-glass:hover:flex",
+                "@media (-macos-glass){@media (hover: hover){.supports-glass\\:hover\\:flex:hover{display:flex;}}}",
+            ),
+            (
+                "md:hover:not-supports-glass:flex",
+                "@media (width >= 48rem){@media (hover: hover){@media not (-macos-glass){.md\\:hover\\:not-supports-glass\\:flex:hover{display:flex;}}}}",
+            ),
+            (
+                "supports-[glass]:flex",
+                "@supports (glass: var(--tw)){.supports-\\[glass\\]\\:flex{display:flex;}}",
+            ),
+            (
+                "not-supports-[glass]:flex",
+                "@supports not (glass: var(--tw)){.not-supports-\\[glass\\]\\:flex{display:flex;}}",
+            ),
+            ("supports-glass/named:flex", ""),
+        ],
+    );
+}
+
+#[test]
 fn not_inverts_every_variant_kind() {
     assert_generated(
         "",

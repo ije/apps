@@ -384,6 +384,9 @@ pub(super) type Margins = (
     rustc_hash::FxHashMap<usize, ([f32; 2], [f32; 2], bool)>,
 );
 
+/// The geometry revision and width an `adjoining` result was made with.
+pub(super) type Adjoined = ((u64, u32), ([f32; 2], [f32; 2], bool));
+
 pub(super) type Walked = (
     (u64, u32, [bool; 2]),
     Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>,
@@ -752,7 +755,7 @@ fn create(
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
         || cfg!(target_os = "macos")
-            && matches!(style.get(Prop::APP_GLASS), Some("regular" | "clear"))
+            && matches!(style.get(Prop::MACOS_GLASS), Some("regular" | "clear"))
         || opacity < 1. && !node.children.is_empty()
         || composited)
         .then_some(opacity);
@@ -5287,6 +5290,16 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
     if let Some(&sets) = build.margins.borrow().1.get(&id) {
         return sets;
     }
+    // WARNING: like the kept walks, this keys on the geometry revision, which animated values don't move.
+    let key = (build.info[id].revision, width.to_bits());
+    let animated = build.info[id].flags & cull::ANIMATED != 0;
+    if !animated
+        && let Some(&(old, sets)) = build.view.adjoined.borrow().get(&id)
+        && old == key
+    {
+        build.margins.borrow_mut().1.insert(id, sets);
+        return sets;
+    }
     let (style, units) = (&build.styles.values[id], build.styles.lengths[id]);
     let own = |prop: Prop| {
         let value = style
@@ -5299,8 +5312,8 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
     let children = flow(build, id);
     // WARNING: this recurses into first and last children, so margins stop collapsing past the stack budget.
     let marker = 0u8;
-    let blocks =
-        container(build, id) && &raw const marker as usize >= STACK_LIMIT.with(|limit| *limit);
+    let deep = (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit);
+    let blocks = container(build, id) && !deep;
     let [first, last] =
         [0, 2].map(|side| margin_collapses_through(build, id, side, width) && blocks);
     for (open, set, order) in [(first, &mut top, false), (last, &mut bottom, true)] {
@@ -5348,6 +5361,13 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
         .borrow_mut()
         .1
         .insert(id, (top, bottom, empty));
+    if !animated && !deep {
+        build
+            .view
+            .adjoined
+            .borrow_mut()
+            .insert(id, (key, (top, bottom, empty)));
+    }
     (top, bottom, empty)
 }
 

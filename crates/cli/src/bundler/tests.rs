@@ -1482,7 +1482,7 @@ fn liquid_glass_import_survives_nested_css_without_a_package() {
     let path = dir.path().join("index.html");
     fs::write(
         &path,
-        "<link rel='stylesheet' href='./style.css'><button class='glass glass-interactive glass-tint-blue px-4'></button>",
+        "<link rel='stylesheet' href='./style.css'><button class='glass glass-interactive glass-tint-blue-500 px-4'></button>",
     )
     .unwrap();
     let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
@@ -1493,8 +1493,14 @@ fn liquid_glass_import_survives_nested_css_without_a_package() {
         .pop()
         .unwrap();
     assert_eq!(
-        style.get("-apps-glass").map(String::as_str),
+        style.get("-macos-glass").map(String::as_str),
         cfg!(target_os = "macos").then_some("regular")
+    );
+    assert_eq!(
+        style
+            .get("-macos-glass-tint-color")
+            .and_then(|value| apps_runtime::style::color(value)),
+        apps_runtime::style::color("oklch(62.3% 0.214 259.815)")
     );
     assert_eq!(
         apps_runtime::style::length(&style["padding-left"], 0., 16., 800., 600.),

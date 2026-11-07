@@ -5,7 +5,7 @@ use objc2::{
     runtime::{AnyClass, AnyObject, Bool, ClassBuilder, MessageReceiver, Sel},
     sel,
 };
-use objc2_app_kit::{NSColor, NSView, NSViewLayerContentsPlacement};
+use objc2_app_kit::{NSColor, NSView, NSViewLayerContentsPlacement, NSWindowOrderingMode};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 use std::{ffi::CStr, ptr, sync::OnceLock};
@@ -30,7 +30,8 @@ pub(crate) struct GlassView {
 }
 
 pub(crate) fn available() -> bool {
-    AnyClass::get(c"NSGlassEffectView").is_some()
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| AnyClass::get(c"NSGlassEffectView").is_some())
 }
 
 fn content_class() -> &'static AnyClass {
@@ -100,6 +101,11 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
         return;
     };
     CATransaction::setDisableActions(true);
+    let restack = views.len() != surfaces.len()
+        || views
+            .iter()
+            .zip(&surfaces)
+            .any(|(native, surface)| native.surface.key != surface.key);
     views.retain(|native| {
         let keep = surfaces
             .iter()
@@ -109,7 +115,7 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
         }
         keep
     });
-    for surface in surfaces {
+    for (position, surface) in surfaces.into_iter().enumerate() {
         let index = views
             .iter()
             .position(|native| native.surface.key == surface.key);
@@ -133,7 +139,8 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
             views.push(GlassView { view, content, surface: surface.clone() });
             views.len() - 1
         });
-        let native = &mut views[index];
+        views.swap(position, index);
+        let native = &mut views[position];
         let [x, y, width, height] = surface.bounds;
         let y = if parent.isFlipped() {
             y
@@ -178,5 +185,14 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
             }
         }
         native.surface = surface;
+    }
+    if restack {
+        for native in views {
+            parent.addSubview_positioned_relativeTo(
+                &native.view,
+                NSWindowOrderingMode::Above,
+                None,
+            );
+        }
     }
 }

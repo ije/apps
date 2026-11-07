@@ -119,9 +119,169 @@ fn sf_symbols_import_survives_serialization_and_cssom_removal() {
 }
 
 #[test]
+fn glass_variants_follow_native_support_and_cached_states() {
+    let supported = renderer::supports_glass();
+    let mut doc = Document::parse(
+        "<style>@import 'tailwindcss';</style><button class='supports-glass:w-[31px] not-supports-glass:w-[47px] h-[11px] md:supports-glass:hover:h-[33px] md:not-supports-glass:hover:h-[49px]'></button>",
+    );
+    let button = element(&doc, "button");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (width, hovered) in [(800., false), (800., true), (600., true), (800., false)] {
+        doc.nodes[button].state = if hovered { crate::dom::HOVER } else { 0 };
+        let cached = compute_styles(&doc, width, 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            width,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        let style = &cached.values[button];
+        assert_eq!(
+            style.get(Prop::WIDTH),
+            Some(if supported { "31px" } else { "47px" })
+        );
+        assert_eq!(
+            style.get(Prop::HEIGHT),
+            Some(if hovered && width >= 768. {
+                if supported { "33px" } else { "49px" }
+            } else {
+                "11px"
+            })
+        );
+    }
+}
+
+#[test]
+fn glass_capability_remains_a_runtime_condition_in_bundles() {
+    let sheet = Stylesheet::parse(
+        "@media (-macos-glass){div{color:#112233}}@media not (-macos-glass){div{color:#445566}}",
+    );
+    let bytes = postcard::to_allocvec(&sheet).unwrap();
+    let sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
+    assert!(
+        matches!(&*sheet.0[0], Rule::Media(queries, _) if matches!(queries.as_slice(), [MediaQuery::Feature(name, op, value)] if name == "-macos-glass" && op.is_empty() && value.is_empty()))
+    );
+    let mut doc = Document::parse("<style></style><div></div>");
+    let style = element(&doc, "style");
+    let div = element(&doc, "div");
+    doc.nodes[style].stylesheet = Some(Rc::new(sheet));
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    assert_eq!(
+        computed.values[div].get(Prop::COLOR),
+        Some(if renderer::supports_glass() {
+            "#112233"
+        } else {
+            "#445566"
+        })
+    );
+}
+
+#[test]
+fn glass_properties_are_known_declarations() {
+    for (name, value, prop) in [
+        ("-macos-glass", "regular", Prop::MACOS_GLASS),
+        (
+            "-macos-glass-interactive",
+            "true",
+            Prop::MACOS_GLASS_INTERACTIVE,
+        ),
+        (
+            "-macos-glass-tint-color",
+            "#123456",
+            Prop::MACOS_GLASS_TINT_COLOR,
+        ),
+        ("-apps-sf-symbol", "\"folder\"", Prop::APP_SF_SYMBOL),
+    ] {
+        assert_eq!(Prop::find(name), Some(prop));
+        assert_eq!(supports(name, value), Some(true));
+        assert_eq!(
+            declare(&format!("{name}:{value}")),
+            vec![[name.to_owned(), value.to_owned(), String::new()]]
+        );
+    }
+    assert!(declare("unknown-property: red").is_empty());
+}
+
+#[test]
+fn glass_tints_follow_theme_changes_and_color_utilities() {
+    let mut doc = Document::parse(
+        r#"<style>
+            @import 'tailwindcss';
+            @import 'liquid-glass';
+            @theme { --color-brand: #123456; }
+            @theme inline { --color-accent: var(--accent); }
+            .theme { --accent: #112233; color: #fedcba; }
+            .theme.dark { --color-brand: #abcdef; --accent: #654321; }
+            #applied { @apply glass-tint-brand/50; }
+        </style><section class=theme>
+            <button id=brand class='glass glass-tint-brand'></button>
+            <button id=alpha class='glass-tint-brand/50'></button>
+            <button id=inline class='glass-tint-accent'></button>
+            <button id=current class='glass-tint-current/50'></button>
+            <button id=applied></button>
+            <button id=variant class='glass-tint-[#123abc] hover:glass-tint-brand'></button>
+            <button id=legacy class='glass-tint-blue'></button>
+        </section>"#,
+    );
+    let host = element(&doc, "section");
+    let variant = element(&doc, "#variant");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for dark in [false, true, false] {
+        doc.nodes[host]
+            .attrs
+            .set("class", if dark { "theme dark" } else { "theme" });
+        doc.nodes[variant].state = if dark { crate::dom::HOVER } else { 0 };
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        let brand = if dark { 0xabcdef } else { 0x123456 };
+        for (selector, expected) in [
+            ("#brand", (brand, 255)),
+            ("#alpha", (brand, 128)),
+            ("#inline", (if dark { 0x654321 } else { 0x112233 }, 255)),
+            ("#current", (0xfedcba, 128)),
+            ("#applied", (brand, 128)),
+            ("#variant", (if dark { brand } else { 0x123abc }, 255)),
+        ] {
+            assert_eq!(
+                cached.values[element(&doc, selector)]
+                    .get(Prop::MACOS_GLASS_TINT_COLOR)
+                    .and_then(color),
+                Some(expected),
+                "{selector}, dark={dark}"
+            );
+        }
+        assert!(!cached.values[element(&doc, "#legacy")].contains(Prop::MACOS_GLASS_TINT_COLOR));
+    }
+}
+
+#[test]
 fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
     for imports in [
         "",
+        "@import 'tailwindcss';",
         "@import 'liquid-glass';",
         "@import 'liquid-glass'; @import 'tailwindcss';",
         "@import 'tailwindcss'; @import 'liquid-glass';",
@@ -129,7 +289,7 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
         "@import 'tailwindcss';</style><style>@import 'liquid-glass';",
     ] {
         let doc = Document::parse(&format!(
-            "<style>{imports}</style><button class='glass glass-interactive glass-tint-blue'><span>Save</span></button><div class=glass-clear></div><button id=utility class='glass bg-white rounded-lg'></button>"
+            "<style>{imports}</style><button class='glass glass-interactive glass-tint-blue-500'><span>Save</span></button><div class=glass-clear></div><button id=utility class='glass bg-white rounded-lg'></button>"
         ));
         let values = compute_styles(
             &doc,
@@ -141,25 +301,27 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
             None,
         )
         .values;
-        let active = cfg!(target_os = "macos") && !imports.is_empty();
+        let active = cfg!(target_os = "macos") && imports.contains("liquid-glass");
         let button = &values[element(&doc, "button")];
-        assert_eq!(button.get(Prop::APP_GLASS), active.then_some("regular"));
+        assert_eq!(button.get(Prop::MACOS_GLASS), active.then_some("regular"));
         assert_eq!(
-            button.get(Prop::APP_GLASS_INTERACTIVE),
+            button.get(Prop::MACOS_GLASS_INTERACTIVE),
             active.then_some("true")
         );
         assert_eq!(
-            button.get(Prop::APP_GLASS_TINT_COLOR),
-            active.then_some("#007aff")
+            button.get(Prop::MACOS_GLASS_TINT_COLOR).and_then(color),
+            imports
+                .contains("tailwindcss")
+                .then(|| color("oklch(62.3% 0.214 259.815)").unwrap())
         );
         assert_eq!(
-            values[element(&doc, "div")].get(Prop::APP_GLASS),
+            values[element(&doc, "div")].get(Prop::MACOS_GLASS),
             active.then_some("clear")
         );
         for prop in [
-            Prop::APP_GLASS,
-            Prop::APP_GLASS_INTERACTIVE,
-            Prop::APP_GLASS_TINT_COLOR,
+            Prop::MACOS_GLASS,
+            Prop::MACOS_GLASS_INTERACTIVE,
+            Prop::MACOS_GLASS_TINT_COLOR,
         ] {
             assert!(!values[element(&doc, "span")].contains(prop));
         }
@@ -167,7 +329,7 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
             assert_eq!(button.get(Prop::APPEARANCE), Some("none"));
             assert_eq!(button.get(Prop::BACKGROUND_COLOR), Some("transparent"));
             assert_eq!(button.get(Prop::BORDER_TOP_WIDTH), Some("0"));
-            assert_eq!(button.get(Prop::BORDER_TOP_LEFT_RADIUS), Some("9999px"));
+            assert_eq!(button.get(Prop::BORDER_TOP_LEFT_RADIUS).unwrap_or("0"), "0");
         }
         if imports.contains("tailwindcss") {
             let utility = &values[element(&doc, "#utility")];
@@ -180,7 +342,7 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
 #[test]
 fn liquid_glass_classes_follow_cascade_and_cached_changes() {
     let mut doc = Document::parse(
-        "<style>@import 'liquid-glass';@import 'tailwindcss';#override{-apps-glass:clear;-apps-glass-tint-color:var(--tint);background-color:red}</style><button id=changing></button><button id=override class='glass glass-tint-blue' style='--tint:#123456'></button><button id=utility class='glass rounded-lg bg-white'></button>",
+        "<style>@import 'liquid-glass';@import 'tailwindcss';#override{-macos-glass:clear;-macos-glass-tint-color:var(--tint);background-color:red}</style><button id=changing></button><button id=override class='glass glass-tint-blue-500' style='--tint:#123456'></button><button id=utility class='glass rounded-lg bg-white'></button>",
     );
     let changing = element(&doc, "#changing");
     let overridden = element(&doc, "#override");
@@ -189,7 +351,7 @@ fn liquid_glass_classes_follow_cascade_and_cached_changes() {
     let mut cache = StyleCache::default();
     for (class, effect, tint) in [
         (
-            "glass glass-interactive glass-tint-blue",
+            "glass glass-interactive glass-tint-blue-500",
             Some("regular"),
             "#123456",
         ),
@@ -212,19 +374,19 @@ fn liquid_glass_classes_follow_cascade_and_cached_changes() {
         );
         assert_eq!(cached.values, fresh.values);
         assert_eq!(
-            cached.values[changing].get(Prop::APP_GLASS),
+            cached.values[changing].get(Prop::MACOS_GLASS),
             effect.filter(|_| cfg!(target_os = "macos"))
         );
         assert_eq!(
-            cached.values[changing].get(Prop::APP_GLASS_INTERACTIVE),
+            cached.values[changing].get(Prop::MACOS_GLASS_INTERACTIVE),
             (cfg!(target_os = "macos") && class.contains("interactive")).then_some("true")
         );
         assert_eq!(
-            cached.values[overridden].get(Prop::APP_GLASS),
+            cached.values[overridden].get(Prop::MACOS_GLASS),
             Some("clear")
         );
         assert_eq!(
-            cached.values[overridden].get(Prop::APP_GLASS_TINT_COLOR),
+            cached.values[overridden].get(Prop::MACOS_GLASS_TINT_COLOR),
             Some(tint)
         );
         assert_eq!(
@@ -255,7 +417,7 @@ fn liquid_glass_import_survives_serialization_and_cssom_removal() {
     let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
     sheet.bind_parents().unwrap();
     assert!(matches!(&*sheet.0[0], Rule::LiquidGlass(children) if !children.is_empty()));
-    let mut doc = Document::parse("<style></style><div class='glass glass-tint-blue'></div>");
+    let mut doc = Document::parse("<style></style><div class='glass glass-tint-blue-500'></div>");
     let style = element(&doc, "style");
     let glass = element(&doc, "div");
     doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
@@ -263,14 +425,14 @@ fn liquid_glass_import_survives_serialization_and_cssom_removal() {
     let mut cache = StyleCache::default();
     let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(
-        before.values[glass].get(Prop::APP_GLASS),
+        before.values[glass].get(Prop::MACOS_GLASS),
         cfg!(target_os = "macos").then_some("regular")
     );
     sheet.edit(&[0], Edit::Delete).unwrap();
     doc.nodes[style].stylesheet = Some(Rc::new(sheet));
     let after = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert!(!after.values[glass].contains(Prop::APP_GLASS));
-    assert!(!after.values[glass].contains(Prop::APP_GLASS_TINT_COLOR));
+    assert!(!after.values[glass].contains(Prop::MACOS_GLASS));
+    assert!(!after.values[glass].contains(Prop::MACOS_GLASS_TINT_COLOR));
 }
 
 #[test]

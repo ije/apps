@@ -57,6 +57,7 @@ pub(crate) struct PageState {
     hud: RefCell<Option<hud::Hud>>,
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Reuse>>,
     walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
+    adjoined: RefCell<rustc_hash::FxHashMap<usize, element::Adjoined>>,
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
     layout_queued: Cell<bool>,
     #[cfg(target_os = "macos")]
@@ -290,6 +291,7 @@ impl PageView {
             hud: RefCell::default(),
             kept: RefCell::default(),
             walked: RefCell::default(),
+            adjoined: RefCell::default(),
             #[cfg(target_os = "macos")]
             canvas: Default::default(),
             kept_frame: RefCell::default(),
@@ -532,13 +534,11 @@ impl PageView {
             .collect();
         let seen = (doc.nodes.latest(), dom.focus);
         // WARNING: `cull.seen` holds the styles only between frames, so animated values swap in and out of them without a copy.
-        let same = dom
-            .cull
-            .seen
-            .take()
-            .is_some_and(|(latest, focus, computed)| {
-                (latest, focus) == seen && Rc::ptr_eq(&computed, &styles)
-            });
+        let last = dom.cull.seen.take();
+        let walked = dom.cull.walk.nodes.clone();
+        let same = last.as_ref().is_some_and(|(latest, focus, computed)| {
+            (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
+        });
         let mut visible = std::mem::take(&mut dom.cull.visible);
         if !same {
             walk(&doc, dom, &styles);
@@ -672,6 +672,9 @@ impl PageView {
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
         self.walked
+            .borrow_mut()
+            .retain(|&id, _| visible.get(id) == Some(&true));
+        self.adjoined
             .borrow_mut()
             .retain(|&id, _| visible.get(id) == Some(&true));
         self.fields
@@ -810,19 +813,90 @@ impl PageView {
                     .is_some_and(|info| info.flags & flags == flags)
             });
         let settled = unchanged && !dom.container_pass;
+        const PER_FRAME: u16 = cull::CHANGED
+            | cull::CHILDREN_CHANGED
+            | cull::GEOMETRY_CHANGED
+            | cull::COMPOSITED
+            | cull::TRANSFORMED
+            | cull::ANIMATED;
         if unchanged {
             for info in &mut info {
-                info.flags &= !(cull::CHANGED
-                    | cull::CHILDREN_CHANGED
-                    | cull::GEOMETRY_CHANGED
-                    | cull::COMPOSITED
-                    | cull::TRANSFORMED
-                    | cull::ANIMATED);
+                info.flags &= !PER_FRAME;
             }
+            dom.cull.painted.extend(paint.iter().map(|(id, _)| *id));
+            dom.cull.painted.sort_unstable();
+            dom.cull.painted.dedup();
         } else {
-            dom.cull.inputs.clear();
             walk(&doc, dom, &styles);
             let walk = std::mem::take(&mut dom.cull.walk);
+            // WARNING: with the viewport and last frame's styles kept, only nodes with a new revision, style, focus or
+            // paint animation and their ancestors can get other info, so the rest keep theirs. A new walk keeps this
+            // only without composed children, where a node's revision moves with its children.
+            let mut marked = Vec::new();
+            let rewalked = !Rc::ptr_eq(&walk.nodes, &walked);
+            if let Some((latest, focus, computed)) = last.as_ref().filter(|(.., computed)| {
+                (!rewalked || styles.children.is_empty() && computed.children.is_empty())
+                    && dom.cull.frame == frame
+                    && info.len() == doc.nodes.len()
+                    && dom.cull.parents.len() == doc.nodes.len()
+            }) {
+                if rewalked {
+                    let mut present = vec![false; doc.nodes.len()];
+                    for &(id, _) in walk.nodes.iter() {
+                        present[id as usize] = true;
+                    }
+                    for &(id, _) in walked.iter() {
+                        if present.get(id as usize) == Some(&false) {
+                            info[id as usize] = cull::Info::default();
+                        }
+                    }
+                }
+                marked.resize(doc.nodes.len(), false);
+                let parents = &dom.cull.parents;
+                let mut mark = |mut id: usize| {
+                    while !marked[id] {
+                        marked[id] = true;
+                        match parents[id] {
+                            u32::MAX => break,
+                            parent => id = parent as usize,
+                        }
+                    }
+                };
+                for id in 0..doc.nodes.len() {
+                    if doc.nodes.revision(id) > *latest
+                        || !computed
+                            .values
+                            .get(id)
+                            .is_some_and(|old| Rc::ptr_eq(old, &styles.values[id]))
+                    {
+                        mark(id);
+                    }
+                }
+                for id in [*focus, dom.focus]
+                    .into_iter()
+                    .flatten()
+                    .chain(dom.cull.painted.iter().copied())
+                    .chain(paint.iter().map(|(id, _)| *id))
+                {
+                    if id < doc.nodes.len() {
+                        mark(id);
+                    }
+                }
+                for (info, &marked) in info.iter_mut().zip(&marked) {
+                    if marked {
+                        *info = cull::Info::default();
+                    } else {
+                        info.flags &= !PER_FRAME;
+                    }
+                }
+                dom.cull.inputs.retain(|&id| marked.get(id) == Some(&false));
+            } else {
+                dom.cull.inputs.clear();
+                info.clear();
+                info.resize(doc.nodes.len(), cull::Info::default());
+            }
+            dom.cull.painted.clear();
+            dom.cull.painted.extend(paint.iter().map(|(id, _)| *id));
             // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed.
             // A new viewport size is left to `cull::READS_VIEWPORT`, as for kept styles, so a resize that restyles colors
             // keeps culling.
@@ -839,8 +913,6 @@ impl PageView {
                 );
                 std::hash::Hasher::finish(&hasher)
             };
-            info.clear();
-            info.resize(doc.nodes.len(), cull::Info::default());
             // WARNING: lengths are cached with their style, so the style and the tag kind decide the flags within a frame.
             let mut memo = rustc_hash::FxHashMap::default();
             let mut own_flags = |tag: &str, style: &Rc<style::Style>, id: usize| {
@@ -867,6 +939,9 @@ impl PageView {
             }
             for &(id, _) in walk.nodes.iter().rev() {
                 let id = id as usize;
+                if marked.get(id) == Some(&false) {
+                    continue;
+                }
                 let node = &doc.nodes[id];
                 let style = &styles.values[id];
                 let revision = doc.nodes.revision(id);
@@ -1118,6 +1193,7 @@ impl PageView {
             dom.measurements.sizes.clear();
             dom.grids.clear();
             self.walked.borrow_mut().clear();
+            self.adjoined.borrow_mut().clear();
         }
         let mut stale = false;
         let mut around = rustc_hash::FxHashSet::default();
@@ -1957,6 +2033,12 @@ fn walk(doc: &crate::dom::Document, dom: &mut crate::dom::State, styles: &style:
         .walk
         .update(doc, &styles.children, Some(&dom.style_walk))
     {
+        let parents = &mut dom.cull.parents;
+        parents.clear();
+        parents.resize(doc.nodes.len(), u32::MAX);
+        for &(id, parent) in dom.cull.walk.nodes.iter() {
+            parents[id as usize] = parent;
+        }
         dom.cull.cells.clear();
         dom.cull.cells.extend(
             dom.cull

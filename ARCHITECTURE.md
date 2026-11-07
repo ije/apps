@@ -88,6 +88,8 @@ A module has a namespace object only where code needs one: `import *` used as a 
 
 Boxes are kept across frames. A box keeps its identity (element id, or position in the nearest box with an id). Each frame the view describes only what changed and links unchanged subtrees with `Child::Kept`, so they are not built, measured or laid out again. A changed box drops the layout caches of itself and its ancestors only, and taffy skips the rest. Measured leaves (text) keep their state while it compares equal.
 
+Styles are incremental too. The selector cache records which nodes each node's matches read, so a DOM change marks only the nodes that could match differently. A style pass starts from the last output and styles those nodes, the children of nodes whose output changed, and every node after a new root font size. Pages with shadow trees, CSS counters or tables, and passes after a new viewport or stylesheet, style every node. Debug builds check each incremental pass against a full one. The per-frame cull info works the same way: only nodes with a new revision, style or focus, and their ancestors, are visited again.
+
 Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` below it and paints them around its children. Code that draws more than a box (text, effects, sticky and fixed offsets) runs as `Hooks` around the box each frame.
 
 | Platform | Window | Renderer | Text |

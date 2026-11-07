@@ -389,6 +389,7 @@ const ORDER: &[&str] = &[
     "border-bottom-color",
     "border-left-color",
     "background-color",
+    "-macos-glass-tint-color",
     "background-image",
     "--tw-gradient-position",
     "--tw-gradient-stops",
@@ -2423,6 +2424,9 @@ impl Config {
                 ))
             }
             "supports" => {
+                if value == "glass" {
+                    return Some(((rank, value.into()), template("@media (-macos-glass)")));
+                }
                 let raw = if value.starts_with(['[', '(']) {
                     self.arbitrary(value)?
                 } else if named_value(value) {
@@ -3111,6 +3115,7 @@ impl Config {
                     | "aspect"
                     | "text"
                     | "bg"
+                    | "glass-tint"
                     | "bg-linear"
                     | "bg-radial"
                     | "bg-conic"
@@ -4266,10 +4271,11 @@ impl Config {
                 }
                 Body::new(&[("stroke", self.color(value, modifier)?)])
             }
-            "fill" | "accent" | "caret" => {
+            "fill" | "accent" | "caret" | "glass-tint" => {
                 let property = match root {
                     "fill" => "fill",
                     "accent" => "accent-color",
+                    "glass-tint" => "-macos-glass-tint-color",
                     _ => "caret-color",
                 };
                 Body::new(&[(property, self.color(value?, modifier)?)])

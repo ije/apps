@@ -615,9 +615,20 @@ impl Renderer {
         }
         let had_glass = !self.glass.is_empty();
         let scale = self.layer.contentsScale();
-        let mut glass = Vec::new();
+        let mut glass: Vec<NativeGlass> = Vec::new();
         if super::glass::available() {
-            for primitive in &scene.layers[0].effects {
+            let mut candidates: Vec<_> = scene.layers[0]
+                .effects
+                .iter()
+                .filter(|primitive| {
+                    scene.layers[primitive.layer]
+                        .effect
+                        .as_ref()
+                        .is_some_and(|effect| effect.glass.is_some())
+                })
+                .collect();
+            candidates.sort_unstable_by_key(|primitive| (primitive.order, primitive.layer));
+            for primitive in candidates.into_iter().rev() {
                 let index = primitive.layer;
                 let layer = &scene.layers[index];
                 let Some(effect) = &layer.effect else {
@@ -639,7 +650,9 @@ impl Renderer {
                     || bounds != config.bounds
                     || bounds.intersect(&mask.bounds) != bounds
                     || mask.corner_radii != Default::default()
-                    || scene.paints_over(index, bounds)
+                    || scene.paints_over(index, bounds, |layer| {
+                        glass.iter().any(|native| native.index == layer)
+                    })
                     || bounds.size.width.0 > 4096.
                     || bounds.size.height.0 > 4096.
                 {
@@ -684,6 +697,7 @@ impl Renderer {
                 });
             }
         }
+        glass.reverse();
         self.glass = glass;
         let native_capture = capture && !self.glass.is_empty();
         let native_transaction = had_glass || !self.glass.is_empty();

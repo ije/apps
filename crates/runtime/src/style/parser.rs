@@ -228,7 +228,7 @@ impl<'i> AtRuleParser<'i> for Rules {
             if url == "liquid-glass" {
                 input.expect_exhausted()?;
                 return Ok(Item::Rule(Rule::LiquidGlass(
-                    Stylesheet::parse(include_str!("liquid_glass.css"))
+                    Stylesheet::parse(include_str!("tailwind/liquid-glass.css"))
                         .0
                         .into_iter()
                         .map(Rc::unwrap_or_clone)
@@ -953,7 +953,15 @@ impl NodeLengths {
         self.ids.get(id).map(|&index| &self.list[index as usize])
     }
 
-    #[cfg(test)]
+    /// Gives nodes past the old end, and `id` with `unset`, the lengths `reset` started with.
+    pub(crate) fn grow(&mut self, count: usize) {
+        self.ids.resize(count, 0);
+    }
+
+    pub(crate) fn unset(&mut self, id: usize) {
+        self.ids[id] = 0;
+    }
+
     pub(crate) fn list_len(&self) -> usize {
         self.list.len()
     }

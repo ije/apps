@@ -27,9 +27,9 @@ macro_rules! props {
 }
 
 props! {
-    APP_GLASS "-apps-glass",
-    APP_GLASS_INTERACTIVE "-apps-glass-interactive",
-    APP_GLASS_TINT_COLOR "-apps-glass-tint-color",
+    MACOS_GLASS "-macos-glass",
+    MACOS_GLASS_INTERACTIVE "-macos-glass-interactive",
+    MACOS_GLASS_TINT_COLOR "-macos-glass-tint-color",
     APP_SF_SYMBOL "-apps-sf-symbol",
     MOZ_OSX_FONT_SMOOTHING "-moz-osx-font-smoothing" inherited,
     WEBKIT_APP_REGION "-webkit-app-region",

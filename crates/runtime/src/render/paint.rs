@@ -665,7 +665,7 @@ impl DomBox {
                 color_matrix,
             });
         let glass = style
-            .get(Prop::APP_GLASS)
+            .get(Prop::MACOS_GLASS)
             .filter(|kind| {
                 cfg!(target_os = "macos")
                     && shown
@@ -684,12 +684,12 @@ impl DomBox {
                     bounds,
                     corner_radius: radius,
                     tint: style
-                        .get(Prop::APP_GLASS_TINT_COLOR)
+                        .get(Prop::MACOS_GLASS_TINT_COLOR)
                         .and_then(style::color)
                         .filter(|(_, alpha)| *alpha > 0)
                         .map(|(color, alpha)| renderer::rgba(color << 8 | u32::from(alpha))),
                     clear: kind == "clear",
-                    interactive: style.get(Prop::APP_GLASS_INTERACTIVE) == Some("true")
+                    interactive: style.get(Prop::MACOS_GLASS_INTERACTIVE) == Some("true")
                         && style.get(Prop::POINTER_EVENTS) != Some("none")
                         && doc
                             .nodes

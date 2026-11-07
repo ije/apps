@@ -731,6 +731,12 @@ pub(crate) struct StyleCache {
     scheme: Option<Rc<str>>,
     pub(crate) spare: Option<SpareStyles>,
     walks: FxHashMap<usize, Rc<TreeWalk>>,
+    // WARNING: an incremental pass starts from the last stored output, so `full` (set where all cached styles
+    // go) and `styled` (the document walk of that output) must describe it.
+    full: bool,
+    styled: Option<Rc<Vec<(u32, u32)>>>,
+    #[cfg(debug_assertions)]
+    pub(crate) incremental: u64,
 }
 
 #[derive(Default)]
@@ -775,7 +781,7 @@ impl StyleCache {
             for &(id, _) in walk.walk.nodes.iter() {
                 let id = id as usize;
                 match doc.nodes[id].tag.as_str() {
-                    "meta" | "style" | "link" => walk.special.push(id),
+                    "meta" | "style" | "link" | "html" => walk.special.push(id),
                     "table" => walk.tables.push(id),
                     _ => {}
                 }
@@ -829,6 +835,7 @@ impl StyleCache {
             .any(|id| sizes.get(id) != self.containers.get(id))
         {
             self.units = true;
+            self.full = true;
             self.sized.clear();
             self.values.clear();
             self.queries.clear();
@@ -882,6 +889,7 @@ impl StyleCache {
                 if let Some(Some(node)) = scope.nodes.get_mut(id) {
                     node.cached = None;
                 }
+                scope.matches.mark(id);
             }
         }
         true
@@ -1068,8 +1076,10 @@ impl StyleCache {
             .retain(|_, (from, _)| Rc::strong_count(from) > 1);
         self.derived.clear();
         self.cssom.retain(|_, (used, ..)| *used >= pass);
+        // WARNING: incremental passes don't visit clean nodes, so values that nodes still hold stay.
         if self.values.len() > 4096 {
-            self.values.retain(|_, value| value.used.get() == pass);
+            self.values
+                .retain(|_, value| value.used.get() == pass || Rc::strong_count(value) > 1);
         }
         self.states = self
             .scopes
@@ -1125,10 +1135,10 @@ enum MediaQuery {
 
 // WARNING: keep sorted; `@supports`, `CSS.supports()`, `el.style` and the devtools lint all read this, so list only what @pierre/apps applies.
 const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
-    ("-apps-glass", "none|regular|clear"),
-    ("-apps-glass-interactive", "false|true"),
-    ("-apps-glass-tint-color", "<color>"),
     ("-apps-sf-symbol", "none|<string>|<custom-ident>"),
+    ("-macos-glass", "none|regular|clear"),
+    ("-macos-glass-interactive", "false|true"),
+    ("-macos-glass-tint-color", "<color>"),
     ("-moz-osx-font-smoothing", "auto|grayscale"),
     ("-webkit-app-region", "none|drag|no-drag"),
     (
@@ -1663,10 +1673,10 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
 
 // WARNING: keep sorted.
 const INITIAL: &[(&str, &str)] = &[
-    ("-apps-glass", "none"),
-    ("-apps-glass-interactive", "false"),
-    ("-apps-glass-tint-color", "transparent"),
     ("-apps-sf-symbol", "none"),
+    ("-macos-glass", "none"),
+    ("-macos-glass-interactive", "false"),
+    ("-macos-glass-tint-color", "transparent"),
     ("accent-color", "auto"),
     ("align-content", "normal"),
     ("align-items", "normal"),
@@ -2716,7 +2726,7 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
             Some(value) => (value.trim_end(), "important"),
             None => (value.as_str(), ""),
         };
-        let known = name.starts_with("--") || Prop::names().binary_search(&name.as_str()).is_ok();
+        let known = name.starts_with("--") || Prop::find(&name).is_some_and(Prop::is_known);
         if !known || supports(&name, value) == Some(false) {
             continue;
         }
@@ -2870,6 +2880,7 @@ impl MediaQuery {
             _ => None,
         };
         let actual = match name {
+            "-macos-glass" => return op.is_empty().then(renderer::supports_glass),
             "orientation" => {
                 return keyword(
                     &["portrait", "landscape"],
@@ -3367,6 +3378,8 @@ pub(crate) struct StyleContext {
     pub aliases: HashMap<String, String>,
     pub inserted: Vec<(Rc<Stylesheet>, bool)>,
     pub previous: Option<Rc<ComputedStyles>>,
+    /// The page has no shadow trees, so a pass may restyle only the nodes that changed since `previous`.
+    pub incremental: bool,
 }
 
 struct TreeWalk {
@@ -3421,6 +3434,7 @@ pub(crate) struct ComputedStyles {
     pub list_items: FxHashMap<usize, i64>,
     pub registry: Rc<Registry>,
     pub authored: FxHashMap<usize, Rc<Style>>,
+    counted: bool,
 }
 
 pub(crate) type Shadowed = Rc<Vec<(Rc<str>, Vec<Declared>)>>;
@@ -3477,12 +3491,8 @@ pub(crate) fn compute_styles(
         ..Default::default()
     };
     out.values.clear();
-    out.values.resize(count, Rc::default());
     out.vars.clear();
-    out.vars.resize(count, Vars::default());
     out.flags.clear();
-    out.flags.resize(count, 0);
-    out.lengths.reset(count, Lengths::new(16., width, height));
     out.user_select.clear();
     out.user_select.resize(count, (UserSelect::None, 0));
     cascade(
@@ -3554,6 +3564,25 @@ pub(crate) fn cascade(
     };
     let walk = style_cache.walk(doc, root);
     let order = walk.walk.nodes.as_slice();
+    // WARNING: an incremental pass starts from `previous` and styles only dirty nodes, the children of nodes
+    // whose output changed, and everything after a new root font. So it needs the scope, sheets, viewport and
+    // caches of that pass, and passes with their own outputs (counters, tables) stay full.
+    let stored = root == 0
+        && context.is_some_and(|context| context.required.is_none() && context.animated.is_empty());
+    let previous = context
+        .and_then(|context| context.previous.as_deref())
+        .filter(|previous| {
+            previous.values.len() <= doc.nodes.len()
+                && !previous.counted
+                && previous.lengths.list_len() <= 4096
+        });
+    let mut fast = stored
+        && out.values.is_empty()
+        && context.is_some_and(|context| context.incremental)
+        && previous.is_some()
+        && !style_cache.full
+        && style_cache.styled.is_some()
+        && walk.tables.is_empty();
     let mut sheets = Vec::new();
     let mut scheme = None;
     // WARNING: the page sets a fullscreen state together with the top layer, so other pages skip this scan.
@@ -3638,6 +3667,7 @@ pub(crate) fn cascade(
         || style_cache.reduced_motion != reduced_motion
         || style_cache.native_theme != native_theme
     {
+        fast = false;
         let resized = style_cache.metrics == metrics
             && style_cache.reduced_motion == reduced_motion
             && style_cache.native_theme == native_theme;
@@ -3751,9 +3781,9 @@ pub(crate) fn cascade(
             }
         }
         if !css.is_empty() {
-            let sheet = symbols
-                .sheet
-                .get_or_insert_with(|| Rc::new(Stylesheet::parse(include_str!("sf_symbols.css"))));
+            let sheet = symbols.sheet.get_or_insert_with(|| {
+                Rc::new(Stylesheet::parse(include_str!("tailwind/sf-symbols.css")))
+            });
             if let Some(rule) = Rc::make_mut(sheet).0.last_mut()
                 && let Rule::Layer(_, children) = Rc::make_mut(rule)
             {
@@ -3773,6 +3803,7 @@ pub(crate) fn cascade(
     if let Some(update) = &tailwind
         && !(update.replaced.is_empty() && update.added.is_empty())
     {
+        fast = false;
         let mut added = Collect {
             width,
             height,
@@ -4079,6 +4110,7 @@ pub(crate) fn cascade(
         }
         (None, None) => usize::MAX,
     };
+    fast &= exact.is_some();
     let scope = if scope != usize::MAX {
         scope
     } else {
@@ -4156,6 +4188,7 @@ pub(crate) fn cascade(
                 .map(|(&prop, value)| (prop, value.clone())),
         );
         if registry != *style_cache.registry {
+            fast = false;
             style_cache.registry = Rc::new(registry);
             style_cache.values.clear();
             style_cache.inheritable.clear();
@@ -4167,6 +4200,7 @@ pub(crate) fn cascade(
         }
     }
     if root == 0 && scheme != style_cache.scheme {
+        fast = false;
         style_cache.scheme = scheme.clone();
         style_cache.values.clear();
         for scope in &mut style_cache.scopes {
@@ -4177,6 +4211,29 @@ pub(crate) fn cascade(
     }
     let registry = style_cache.registry.clone();
     out.registry = registry.clone();
+    if out.values.is_empty() {
+        let count = doc.nodes.len();
+        match previous.filter(|_| fast) {
+            Some(previous) => {
+                out.values.clone_from(&previous.values);
+                out.vars.clone_from(&previous.vars);
+                out.flags.clone_from(&previous.flags);
+                out.lengths.clone_from(&previous.lengths);
+                out.lengths.grow(count);
+                out.pseudos.clone_from(&previous.pseudos);
+                out.text_pseudos.clone_from(&previous.text_pseudos);
+                out.backdrops.clone_from(&previous.backdrops);
+                out.scrollbars.clone_from(&previous.scrollbars);
+                out.selections.clone_from(&previous.selections);
+                out.animations.clone_from(&previous.animations);
+                out.starting.clone_from(&previous.starting);
+            }
+            None => out.lengths.reset(count, Lengths::new(16., width, height)),
+        }
+        out.values.resize(count, Rc::default());
+        out.vars.resize(count, Vars::default());
+        out.flags.resize(count, 0);
+    }
     let mut inheritable = std::mem::take(&mut style_cache.inheritable);
     let filtered = registry.values().any(|(_, inherits, _)| !inherits);
     let mut inherit = |vars: &Vars| -> Vars {
@@ -4230,13 +4287,87 @@ pub(crate) fn cascade(
         starting: starts,
         list_items,
         authored,
+        counted,
         ..
-    } = out;
+    } = &mut *out;
+    macro_rules! unstyle {
+        ($id:expr) => {
+            pseudos.remove(&$id);
+            text_pseudos.remove(&$id);
+            backdrops.remove(&$id);
+            scrollbars.remove(&$id);
+            selections.remove(&$id);
+            animations.remove(&$id);
+            starts.remove(&$id);
+        };
+    }
+    // WARNING: `changed` marks nodes whose output differs from `previous` in what children read: style, custom
+    // properties, font units and `::selection`.
+    let mut changed = Vec::new();
+    let html: Vec<usize> = walk
+        .special
+        .iter()
+        .copied()
+        .filter(|&id| doc.nodes[id].tag == "html")
+        .collect();
+    if fast {
+        changed.resize(doc.nodes.len(), false);
+        if let Some(old) = style_cache
+            .styled
+            .as_ref()
+            .filter(|old| !Rc::ptr_eq(old, &walk.walk.nodes))
+        {
+            let mut present = vec![false; doc.nodes.len()];
+            for &(id, _) in order {
+                present[id as usize] = true;
+            }
+            for &(id, _) in old.iter() {
+                let id = id as usize;
+                if present.get(id) == Some(&false) {
+                    styles[id] = Rc::default();
+                    custom[id] = Vars::default();
+                    style_flags[id] = 0;
+                    lengths.unset(id);
+                    unstyle!(id);
+                }
+            }
+        }
+    }
+    let mut all = false;
     let mut root = FontUnits::new(16.);
     let mut font_metrics = HashMap::new();
     let mut passed_on = FxHashMap::default();
-    for &(id, _) in order {
+    macro_rules! settle {
+        ($id:expr) => {
+            if let Some(previous) = previous.filter(|_| fast) {
+                let id = $id;
+                let font = previous.lengths.get(id).map(|old| old.font);
+                changed[id] = !(previous
+                    .values
+                    .get(id)
+                    .is_some_and(|old| Rc::ptr_eq(old, &styles[id]))
+                    && previous
+                        .vars
+                        .get(id)
+                        .is_some_and(|old| Rc::ptr_eq(old, &custom[id]))
+                    && font == Some(lengths[id].font)
+                    && previous.selections.get(&id) == selections.get(&id));
+                all |= (id == 0 || html.contains(&id)) && font != Some(root);
+            }
+        };
+    }
+    for &(id, up) in order {
         let id = id as usize;
+        if fast {
+            if !all && !matches.dirty[id] && (up == u32::MAX || !changed[up as usize]) {
+                if id == 0 || html.contains(&id) {
+                    root = lengths[id].font;
+                }
+                continue;
+            }
+            matches.dirty[id] = false;
+            unstyle!(id);
+        }
         if context
             .and_then(|context| context.required.as_ref())
             .is_some_and(|required| !required.contains(&id))
@@ -4411,6 +4542,7 @@ pub(crate) fn cascade(
                     }
                     matches.dependencies.sort_unstable();
                     matches.dependencies.dedup();
+                    matches.register(id);
                     if scoped.lists.len() > 65536 {
                         scoped.lists.clear();
                     }
@@ -4634,6 +4766,7 @@ pub(crate) fn cascade(
             if node.tag == "apps-shadow-root" {
                 *host_declarations = cached.host.clone();
             }
+            settle!(id);
             continue;
         }
         let key = key.unwrap();
@@ -5617,8 +5750,19 @@ pub(crate) fn cascade(
         styles[id] = style;
         custom[id] = vars;
         lengths.set(id, units);
+        settle!(id);
     }
     style_cache.inheritable = inheritable;
+    if stored {
+        if !fast {
+            matches.dirty.fill(false);
+        }
+        style_cache.full = false;
+        // WARNING: shadow passes write nodes outside this walk, so their outputs can't start an incremental pass.
+        style_cache.styled = context
+            .is_some_and(|context| context.incremental)
+            .then(|| walk.walk.nodes.clone());
+    }
     if context.is_some_and(|context| context.required.is_some()) {
         return;
     }
@@ -5633,6 +5777,7 @@ pub(crate) fn cascade(
             })
         })
     {
+        *counted = true;
         let list = |value: Option<&str>, default: i64| -> Vec<(String, i64)> {
             let parts = components(value.unwrap_or("none"), ' ');
             let mut list: Vec<(String, i64)> = Vec::new();
@@ -6072,6 +6217,34 @@ pub(crate) fn cascade(
         style_cache
             .tables
             .insert(table, (style_cache.pass, inputs, [width, height], adjusted));
+    }
+    // WARNING: debug builds check each incremental pass against a full one.
+    #[cfg(debug_assertions)]
+    if fast {
+        style_cache.incremental += 1;
+        style_cache.full = true;
+        let full = compute_styles(doc, width, height, text_system, cache, style_cache, context);
+        for id in 0..doc.nodes.len() {
+            let same = [
+                *full.values[id] == *out.values[id],
+                full.vars[id] == out.vars[id],
+                full.flags[id] == out.flags[id],
+                full.lengths[id] == out.lengths[id],
+                full.pseudos.get(&id) == out.pseudos.get(&id),
+                full.text_pseudos.get(&id) == out.text_pseudos.get(&id),
+                full.backdrops.get(&id) == out.backdrops.get(&id),
+                full.scrollbars.get(&id) == out.scrollbars.get(&id),
+                full.selections.get(&id) == out.selections.get(&id),
+                format!("{:?}", full.animations.get(&id))
+                    == format!("{:?}", out.animations.get(&id)),
+                full.starting.get(&id) == out.starting.get(&id),
+            ];
+            assert!(
+                same.iter().all(|same| *same),
+                "incremental style of node {id} <{}> differs from a full pass: {same:?}",
+                doc.nodes[id].tag
+            );
+        }
     }
 }
 

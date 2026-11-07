@@ -88,16 +88,45 @@ On macOS, import the built-in Liquid Glass styles to use native glass behind HTM
 ```
 
 ```html
-<button class="glass glass-interactive glass-tint-blue flex items-center gap-2 px-4 py-2">
+<button class="glass glass-interactive glass-tint-blue-500 rounded-full flex items-center gap-2 px-4 py-2">
   <span class="sf-icon-folder size-5" aria-hidden="true"></span>
   Open
 </button>
 ```
 
-Tailwind is optional. JSX uses `className`. `glass-clear` selects clear glass. `rounded-*` utilities control the corner radius.
+The base glass classes work without Tailwind. JSX uses `className`. `glass-clear` selects clear glass.
+Glass does not set a corner radius. Use `rounded`, `rounded-xl`, or `rounded-full`, or set `border-radius` in CSS.
+The CSS properties are `-macos-glass`, `-macos-glass-interactive`, and `-macos-glass-tint-color`.
+
+With Tailwind, `glass-tint-*` uses the same colors as `bg-*`: palette shades, theme colors, arbitrary colors, and opacity modifiers.
+For example, use `glass-tint-blue-500`, `glass-tint-blue-500/50`, or `glass-tint-[#123456]`.
+
+```css
+@theme {
+  --color-brand: #2563eb;
+}
+
+.dark {
+  --color-brand: #60a5fa;
+}
+```
+
+Use `glass-tint-brand` to follow that theme color. Changes to `--color-brand` update the tint.
+Tint utilities also support `@theme inline`, `@apply`, and variants such as `hover:glass-tint-brand` and `dark:glass-tint-blue-300`.
+
+With Tailwind, use `supports-glass:` and `not-supports-glass:` for native glass and fallback styles:
+
+```html
+<button class="glass px-4 py-2 supports-glass:text-white not-supports-glass:bg-white not-supports-glass:text-black">
+  Open
+</button>
+```
+
+These variants check native Liquid Glass availability on the running OS. They work with other variants, such as `not-supports-glass:hover:bg-gray-100`.
+The check is independent of the glass import and does not test whether an individual element can use glass.
 
 The effect needs macOS 26 or later. Native interaction feedback needs macOS 27 or later.
-This first version supports controls with uniform corners, without transforms, filters, clipping, or content above them.
+This first version supports controls with uniform corners, without transforms, filters, clipping, or non-glass content above them. Native glass controls can overlap each other.
 
 Other targets ignore the import. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
 
