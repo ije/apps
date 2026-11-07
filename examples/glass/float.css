@@ -1,0 +1,118 @@
+@import "liquid-glass";
+@import "sf-symbols";
+
+:root {
+  color-scheme: light dark;
+  color: light-dark(#1d1d1f, #f5f5f7);
+  font-family: system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: transparent;
+}
+
+#float {
+  position: relative;
+  width: 260px;
+  height: 76px;
+  user-select: none;
+}
+
+.float-pill {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  width: 236px;
+  height: 52px;
+  display: grid;
+  grid-template-columns: 44px 1fr 44px;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 26px;
+}
+
+.device-icon {
+  width: 20px;
+  height: 36px;
+  justify-self: center;
+}
+
+.device-label { text-align: center; }
+
+h1 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 17px;
+  letter-spacing: -0.1px;
+}
+
+#device-state {
+  margin: 0;
+  color: light-dark(#6e6e73, #8e8e93);
+  font-size: 12px;
+  line-height: 15px;
+}
+
+.battery {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  justify-self: center;
+  width: 36px;
+  height: 36px;
+  font-size: 12px;
+  font-weight: 500;
+  color: light-dark(#6e6e73, #8e8e93);
+}
+
+.battery svg {
+  position: absolute;
+  inset: 0;
+  width: 36px;
+  height: 36px;
+  fill: none;
+  stroke-width: 6px;
+}
+
+.battery-track { stroke: light-dark(#b0b0b5, #525256); }
+
+.battery-level {
+  stroke: light-dark(#248a3d, #32d74b);
+  stroke-linecap: round;
+}
+
+#close {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  appearance: none;
+  -macos-glass-tint-color: light-dark(#e5e5e750, #52525650);
+  color: inherit;
+  cursor: pointer;
+  visibility: hidden;
+}
+
+#close .sf-icon-xmark {
+  width: 8px;
+  height: 8px;
+}
+
+#float:hover #close,
+#float:focus-within #close { visibility: visible; }
+
+#close:focus-visible {
+  outline: 1px solid #79b4ff;
+}

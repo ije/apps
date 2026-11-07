@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Magic Mouse</title>
+    <link rel="stylesheet" href="./float.css">
+  </head>
+  <body>
+    <main id="float">
+      <section class="glass-clear float-pill" aria-label="Magic Mouse connection">
+        <span class="sf-icon-magicmouse-fill device-icon" aria-hidden="true"></span>
+        <div class="device-label">
+          <h1>Magic Mouse</h1>
+          <p id="device-state" role="status" aria-live="polite">Off</p>
+        </div>
+        <div class="battery" aria-label="Battery 13 percent">
+          <svg viewBox="0 0 56 56" aria-hidden="true">
+            <circle class="battery-track" cx="28" cy="28" r="24" />
+            <path class="battery-level" d="M28 4 A24 24 0 0 1 45.5 11.57" />
+          </svg>
+          <span>13</span>
+        </div>
+      </section>
+      <button id="close" class="glass glass-interactive" type="button" aria-label="Close notification">
+        <span class="sf-icon-xmark" aria-hidden="true"></span>
+      </button>
+    </main>
+    <script type="module" src="./float.js"></script>
+  </body>
+</html>
