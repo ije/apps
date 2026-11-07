@@ -31,3 +31,13 @@ assert(counter instanceof addon.Counter && counter.increment() === 1 && counter.
 assert(addon.state() === 1, 'context instance data');
 globalThis.napiPromise = false;
 addon.promise(42).then(value => { globalThis.napiPromise = value === 42; });
+const node8 = addon.node8({ b: 1, 2: 2, [Symbol('s')]: 3, __proto__: { inherited: 1 } }, function (name) { return this.b + ':' + name; });
+assert(node8.major === 24 && node8.noLoop === 1 && node8.detached === 1 && node8.mismatch === 1 && node8.memory === 1, 'Node-API 8 helpers');
+assert(node8.keys.length === 2 && node8.keys[0] === 2 && node8.keys[1] === 'b', 'all property names');
+assert(node8.words === -(2n ** 64n + 1n), 'bigint words');
+assert(node8.called === '1:fixture', 'make callback');
+assert(node8.status === 6 && node8.message === 'A number was expected', 'last error info');
+globalThis.threadsafeValues = [];
+globalThis.threadsafeStart = addon.threadsafeCount();
+addon.threadsafe(value => threadsafeValues.push(value));
+addon.work();

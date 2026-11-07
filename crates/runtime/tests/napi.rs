@@ -85,6 +85,52 @@ fn native_addons_values_callbacks_and_contexts() {
         );
         engine.eval("moved=null", "test").unwrap();
         assert!(collect("addon.externalCount()-externals===1"));
+        let wait = |done: &str| {
+            (0..1000).any(|_| {
+                engine.tick().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                engine.eval(done, "test").unwrap() == "true"
+            })
+        };
+        assert!(
+            wait("addon.threadsafeCount()-threadsafeStart===2&&addon.workState().completed===8"),
+            "Thread-safe functions or async work did not finish"
+        );
+        assert_eq!(
+            engine
+                .eval("threadsafeValues.filter(value=>value>=0).join()", "test")
+                .unwrap(),
+            std::iter::once(0)
+                .chain(0..=50)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "(({cancelled,most})=>cancelled+':'+(most>=2&&most<=4))(addon.workState())",
+                    "test"
+                )
+                .unwrap(),
+            "1:true",
+            "Async work must run on at most 4 threads"
+        );
+        engine.eval("globalThis.process?.on('uncaughtException',error=>globalThis.finalizerError=error.message);for(let i=0;i<1000;i++){addon.throwing();addon.garbage()}", "test").unwrap();
+        engine.collect_garbage();
+        assert_eq!(
+            engine.eval("addon.stable()", "test").unwrap(),
+            "true",
+            "A Node-API call ran finalizers"
+        );
+        assert!(collect(
+            "typeof process==='undefined'||globalThis.finalizerError==='finalizer failed'"
+        ));
+        assert_eq!(
+            engine.eval("addon.add(1,1)", "test").unwrap(),
+            "3",
+            "A finalizer exception leaked into a later call"
+        );
         assert!(
             engine
                 .eval("__appsLoadAddon('missing.node')", "test")

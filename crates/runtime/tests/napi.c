@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 typedef void *napi_env;
 typedef void *napi_value;
@@ -60,6 +62,39 @@ extern napi_status napi_get_dataview_info(napi_env, napi_value, size_t *, void *
 extern napi_status napi_get_value_int64(napi_env, napi_value, int64_t *);
 extern napi_status napi_get_global(napi_env, napi_value *);
 extern napi_status napi_create_external_buffer(napi_env, size_t, void *, napi_finalize, void *, napi_value *);
+
+typedef void *napi_threadsafe_function;
+typedef void *napi_async_work;
+typedef void *napi_async_cleanup_hook_handle;
+typedef struct { uint32_t major, minor, patch; const char *release; } napi_node_version;
+typedef struct { const char *error_message; void *engine_reserved; uint32_t engine_error_code; napi_status error_code; } napi_extended_error_info;
+extern napi_status napi_create_threadsafe_function(napi_env, napi_value, napi_value, napi_value, size_t, size_t, void *, napi_finalize, void *, void (*)(napi_env, napi_value, void *, void *), napi_threadsafe_function *);
+extern napi_status napi_call_threadsafe_function(napi_threadsafe_function, void *, int);
+extern napi_status napi_acquire_threadsafe_function(napi_threadsafe_function);
+extern napi_status napi_release_threadsafe_function(napi_threadsafe_function, int);
+extern napi_status napi_create_async_work(napi_env, napi_value, napi_value, void (*)(napi_env, void *), void (*)(napi_env, napi_status, void *), void *, napi_async_work *);
+extern napi_status napi_queue_async_work(napi_env, napi_async_work);
+extern napi_status napi_cancel_async_work(napi_env, napi_async_work);
+extern napi_status napi_delete_async_work(napi_env, napi_async_work);
+extern napi_status napi_reject_deferred(napi_env, void *, napi_value);
+extern napi_status napi_get_node_version(napi_env, const napi_node_version **);
+extern napi_status napi_get_uv_event_loop(napi_env, void **);
+extern napi_status napi_get_all_property_names(napi_env, napi_value, int, int, int, napi_value *);
+extern napi_status napi_detach_arraybuffer(napi_env, napi_value);
+extern napi_status napi_is_detached_arraybuffer(napi_env, napi_value, bool *);
+extern napi_status napi_create_bigint_words(napi_env, int, size_t, const uint64_t *, napi_value *);
+extern napi_status napi_async_init(napi_env, napi_value, napi_value, void **);
+extern napi_status napi_async_destroy(napi_env, void *);
+extern napi_status napi_make_callback(napi_env, void *, napi_value, napi_value, size_t, const napi_value *, napi_value *);
+extern napi_status napi_open_callback_scope(napi_env, napi_value, void *, void **);
+extern napi_status napi_close_callback_scope(napi_env, void *);
+extern napi_status napi_add_async_cleanup_hook(napi_env, void (*)(napi_async_cleanup_hook_handle, void *), void *, napi_async_cleanup_hook_handle *);
+extern napi_status napi_remove_async_cleanup_hook(napi_async_cleanup_hook_handle);
+extern napi_status napi_adjust_external_memory(napi_env, int64_t, int64_t *);
+extern napi_status napi_get_last_error_info(napi_env, const napi_extended_error_info **);
+extern napi_status napi_throw_error(napi_env, const char *, const char *);
+extern napi_status napi_create_arraybuffer(napi_env, size_t, void **, napi_value *);
+extern napi_status napi_get_boolean(napi_env, bool, napi_value *);
 
 #define OK(call) do { if ((call) != 0) { napi_throw_type_error(env, "ERR_FIXTURE", #call); return NULL; } } while (0)
 
@@ -272,10 +307,165 @@ static napi_value date_status(napi_env env, napi_callback_info info) {
   OK(napi_create_double(env, status, &result)); return result;
 }
 
+static void put(napi_env env, napi_value object, const char *name, double number) {
+  napi_value value;
+  if (napi_create_double(env, number, &value) == 0) napi_set_named_property(env, object, name, value);
+}
+static void cleanup_hook(napi_async_cleanup_hook_handle handle, void *arg) { (void)arg; napi_remove_async_cleanup_hook(handle); }
+static napi_value node8(napi_env env, napi_callback_info info) {
+  napi_value args[2], result, value, name, buffer;
+  size_t count = 2;
+  OK(napi_get_cb_info(env, info, &count, args, NULL, NULL));
+  OK(napi_create_object(env, &result));
+  const napi_node_version *version;
+  OK(napi_get_node_version(env, &version));
+  put(env, result, "major", version->major);
+  void *loop = &loop;
+  put(env, result, "noLoop", napi_get_uv_event_loop(env, &loop) != 0 && loop == NULL);
+  OK(napi_get_all_property_names(env, args[0], 1, 2 | 16, 0, &value));
+  OK(napi_set_named_property(env, result, "keys", value));
+  bool before, after;
+  OK(napi_create_arraybuffer(env, 8, NULL, &buffer));
+  OK(napi_is_detached_arraybuffer(env, buffer, &before));
+  OK(napi_detach_arraybuffer(env, buffer));
+  OK(napi_is_detached_arraybuffer(env, buffer, &after));
+  put(env, result, "detached", !before && after && napi_detach_arraybuffer(env, args[0]) == 19);
+  uint64_t words[2] = {1, 1};
+  OK(napi_create_bigint_words(env, 1, 2, words, &value));
+  OK(napi_set_named_property(env, result, "words", value));
+  void *context, *scope;
+  OK(napi_create_string_utf8(env, "fixture", SIZE_MAX, &name));
+  OK(napi_async_init(env, NULL, name, &context));
+  OK(napi_open_callback_scope(env, args[0], context, &scope));
+  OK(napi_make_callback(env, context, args[0], args[1], 1, &name, &value));
+  OK(napi_close_callback_scope(env, scope));
+  put(env, result, "mismatch", napi_close_callback_scope(env, scope) == 14);
+  OK(napi_async_destroy(env, context));
+  OK(napi_set_named_property(env, result, "called", value));
+  int64_t memory, released;
+  OK(napi_adjust_external_memory(env, 4096, &memory));
+  OK(napi_adjust_external_memory(env, -4096, &released));
+  put(env, result, "memory", memory == 4096 && released == 0);
+  napi_async_cleanup_hook_handle handle;
+  OK(napi_add_async_cleanup_hook(env, cleanup_hook, NULL, &handle));
+  OK(napi_remove_async_cleanup_hook(handle));
+  double number;
+  const napi_extended_error_info *error;
+  int status = napi_get_value_double(env, name, &number);
+  OK(napi_get_last_error_info(env, &error));
+  OK(napi_create_string_utf8(env, error->error_message, SIZE_MAX, &value));
+  OK(napi_set_named_property(env, result, "message", value));
+  put(env, result, "status", status);
+  return result;
+}
+
+static unsigned threadsafe_finalized = 0;
+static void threadsafe_finalize(napi_env env, void *data, void *hint) { (void)env; (void)data; (void)hint; threadsafe_finalized++; }
+static void threadsafe_call(napi_env env, napi_value callback, void *context, void *data) {
+  (void)context;
+  if (!env) return;
+  napi_value value, global;
+  if (napi_create_double(env, (double)(intptr_t)data, &value) == 0 && napi_get_global(env, &global) == 0) napi_call_function(env, global, callback, 1, &value, NULL);
+}
+static void *threadsafe_producer(void *function) {
+  for (intptr_t i = 1; i <= 50; i++) napi_call_threadsafe_function(function, (void *)i, 1);
+  napi_release_threadsafe_function(function, 0);
+  return NULL;
+}
+static void *threadsafe_spinner(void *function) {
+  while (napi_call_threadsafe_function(function, (void *)-1, 0) != 16) usleep(100);
+  return NULL;
+}
+static void *threadsafe_aborter(void *function) {
+  usleep(2000);
+  napi_release_threadsafe_function(function, 1);
+  return NULL;
+}
+static napi_value threadsafe(napi_env env, napi_callback_info info) {
+  napi_value callback, name;
+  size_t count = 1;
+  napi_threadsafe_function bounded, aborted;
+  pthread_t thread;
+  OK(napi_get_cb_info(env, info, &count, &callback, NULL, NULL));
+  OK(napi_create_string_utf8(env, "fixture", SIZE_MAX, &name));
+  OK(napi_create_threadsafe_function(env, callback, NULL, name, 2, 1, NULL, threadsafe_finalize, NULL, threadsafe_call, &bounded));
+  OK(napi_call_threadsafe_function(bounded, (void *)0, 0));
+  OK(napi_call_threadsafe_function(bounded, (void *)0, 0));
+  OK(napi_call_threadsafe_function(bounded, (void *)0, 0) != 15);
+  OK(napi_call_threadsafe_function(bounded, (void *)0, 1) != 21);
+  OK(pthread_create(&thread, NULL, threadsafe_producer, bounded));
+  pthread_detach(thread);
+  OK(napi_create_threadsafe_function(env, callback, NULL, name, 0, 2, NULL, threadsafe_finalize, NULL, threadsafe_call, &aborted));
+  OK(pthread_create(&thread, NULL, threadsafe_spinner, aborted));
+  pthread_detach(thread);
+  OK(pthread_create(&thread, NULL, threadsafe_aborter, aborted));
+  pthread_detach(thread);
+  return NULL;
+}
+static napi_value threadsafe_count(napi_env env, napi_callback_info info) {
+  (void)info; napi_value result; OK(napi_create_double(env, threadsafe_finalized, &result)); return result;
+}
+
+static pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
+static int running = 0, most = 0, completed = 0, cancelled = 0;
+static napi_async_work works[8];
+static void work_execute(napi_env env, void *data) {
+  (void)env; (void)data;
+  pthread_mutex_lock(&work_lock); if (++running > most) most = running; pthread_mutex_unlock(&work_lock);
+  usleep(30000);
+  pthread_mutex_lock(&work_lock); running--; pthread_mutex_unlock(&work_lock);
+}
+static void work_complete(napi_env env, napi_status status, void *data) {
+  if (status == 11) cancelled++;
+  completed++;
+  napi_delete_async_work(env, works[(intptr_t)data]);
+}
+static napi_value work(napi_env env, napi_callback_info info) {
+  (void)info;
+  napi_value name;
+  most = completed = cancelled = 0;
+  OK(napi_create_string_utf8(env, "fixture", SIZE_MAX, &name));
+  for (intptr_t i = 0; i < 8; i++) {
+    OK(napi_create_async_work(env, NULL, name, work_execute, work_complete, (void *)i, &works[i]));
+    OK(napi_queue_async_work(env, works[i]));
+  }
+  OK(napi_cancel_async_work(env, works[7]));
+  return NULL;
+}
+static napi_value work_state(napi_env env, napi_callback_info info) {
+  (void)info; napi_value result;
+  OK(napi_create_object(env, &result));
+  put(env, result, "completed", completed); put(env, result, "most", most); put(env, result, "cancelled", cancelled);
+  return result;
+}
+
+static void throwing_release(napi_env env, void *data, void *hint) { (void)data; (void)hint; napi_throw_error(env, NULL, "finalizer failed"); }
+static napi_value throwing(napi_env env, napi_callback_info info) {
+  (void)info; napi_value object;
+  OK(napi_create_object(env, &object));
+  OK(napi_add_finalizer(env, object, NULL, throwing_release, NULL, NULL));
+  return object;
+}
+static napi_value stable(napi_env env, napi_callback_info info) {
+  (void)info; unsigned before = finalized; napi_value value; const napi_extended_error_info *error;
+  for (int i = 0; i < 1000; i++) { OK(napi_create_object(env, &value)); OK(napi_get_last_error_info(env, &error)); }
+  OK(napi_get_boolean(env, finalized == before, &value));
+  return value;
+}
+
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   int *count = calloc(1, sizeof(int));
   OK(napi_set_instance_data(env, count, release, NULL));
+  napi_async_cleanup_hook_handle handle;
+  OK(napi_add_async_cleanup_hook(env, cleanup_hook, NULL, &handle));
   napi_property_descriptor methods[] = {
+    {"node8", NULL, node8, NULL, NULL, NULL, 7, NULL},
+    {"threadsafe", NULL, threadsafe, NULL, NULL, NULL, 7, NULL},
+    {"threadsafeCount", NULL, threadsafe_count, NULL, NULL, NULL, 7, NULL},
+    {"work", NULL, work, NULL, NULL, NULL, 7, NULL},
+    {"workState", NULL, work_state, NULL, NULL, NULL, 7, NULL},
+    {"throwing", NULL, throwing, NULL, NULL, NULL, 7, NULL},
+    {"stable", NULL, stable, NULL, NULL, NULL, 7, NULL},
     {"garbage", NULL, garbage, NULL, NULL, NULL, 7, NULL},
     {"finalizerCount", NULL, finalizer_count, NULL, NULL, NULL, 7, NULL},
     {"externalBuffer", NULL, external_buffer, NULL, NULL, NULL, 7, NULL},

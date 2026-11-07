@@ -229,9 +229,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
     let display = style.get(Prop::DISPLAY).unwrap_or("inline");
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
-    let moved = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
-        .into_iter()
-        .any(|name| style.get(name).is_some_and(|value| value != "none"))
+    let moved = super::effects::establishes(style).transformed
         || style
             .get(Prop::WRITING_MODE)
             .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"));

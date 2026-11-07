@@ -13,7 +13,6 @@ use crate::style::Prop;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{
@@ -381,6 +380,7 @@ pub struct State {
     pub painted: Vec<u64>,
     pub(crate) paint_count: u64,
     pub(crate) inline_text: rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>,
+    // WARNING: the last revision from the process-wide counter in `render`, so 0 means the state never drew.
     pub(crate) layout_revision: u64,
     style_epoch: u64,
     layout_epoch: u64,
@@ -399,6 +399,7 @@ pub struct State {
     pub frame_requested: bool,
     pub(crate) wheel: bool,
     pub canvases: HashMap<usize, crate::render::canvas::Canvas>,
+    pub(crate) sources: std::cell::RefCell<HashMap<usize, CanvasSource>>,
     pub images: HashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
     pub(crate) hosts: HashMap<usize, usize>,
@@ -428,7 +429,7 @@ pub struct State {
     pub font_aliases: HashMap<String, String>,
     pub(crate) fonts: HashMap<String, Option<String>>,
     pub(crate) font_loads: u32,
-    pub(crate) font_text: Option<u64>,
+    pub(crate) font_text: (u64, Vec<u64>),
     pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
@@ -648,30 +649,63 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
     Ok(canvas)
 }
 
-fn source_pixels(state: &State, id: usize) -> Option<Cow<'_, resvg::tiny_skia::Pixmap>> {
-    if let Some(canvas) = state.canvases.get(&id) {
-        return Some(Cow::Borrowed(&canvas.pixels));
-    }
-    if let Some(image) = state.images.get(&id) {
-        return pixmap(image).map(Cow::Owned);
-    }
-    let (source, [width, height]) = state.svg_images.get(&id)?;
-    let image = crate::render::canvas::svg(source, width.ceil() as u32, height.ceil() as u32, None);
-    pixmap(&*image.ok()?).map(Cow::Owned)
-}
+// WARNING: keyed by the image id, or by the SVG source address and drawn size. The entry holds the SVG source, so
+// its address cannot be reused for another source while the key is kept.
+pub(crate) type CanvasSource = (
+    (u64, usize, [u32; 2]),
+    Option<Rc<str>>,
+    Rc<resvg::tiny_skia::Pixmap>,
+);
 
-fn pixmap(image: &renderer::RenderImage) -> Option<resvg::tiny_skia::Pixmap> {
-    let size = image.size();
-    let mut pixels = resvg::tiny_skia::Pixmap::new(size.width.into(), size.height.into())?;
-    for (out, pixel) in pixels
-        .pixels_mut()
-        .iter_mut()
-        .zip(image.bytes().as_chunks::<4>().0)
-    {
-        *out = resvg::tiny_skia::ColorU8::from_rgba(pixel[2], pixel[1], pixel[0], pixel[3])
-            .premultiply();
+// WARNING: images keep their premultiplied pixels for later draws, up to 64 MB in all, until the image or the
+// drawn SVG size changes or the node goes. A changed source is not kept at once, so videos and SVGs drawn at
+// changing sizes keep nothing.
+fn source_pixels(
+    state: &State,
+    id: usize,
+    size: Option<[u32; 2]>,
+) -> Option<crate::render::canvas::Source<'_>> {
+    use crate::render::canvas::{self, Source};
+    if let Some(canvas) = state.canvases.get(&id) {
+        return Some(Source::Pixels(&canvas.pixels));
     }
-    Some(pixels)
+    let image = state.images.get(&id);
+    let svg = state.svg_images.get(&id).filter(|_| image.is_none());
+    let size = svg.map_or([0; 2], |(_, natural)| {
+        size.unwrap_or(natural.map(|side| side.ceil() as u32))
+    });
+    let key = (
+        image.map_or(0, |image| image.id),
+        svg.map_or(0, |(source, _)| Rc::as_ptr(source) as *const u8 as usize),
+        size,
+    );
+    let mut cache = state.sources.try_borrow_mut().ok()?;
+    let fresh = match cache.get(&id) {
+        Some((old, _, pixels)) if *old == key => return Some(Source::Shared(pixels.clone())),
+        Some(_) => {
+            cache.remove(&id);
+            false
+        }
+        None => true,
+    };
+    let pixels = Rc::new(match (image, svg) {
+        (Some(image), _) => canvas::pixmap(image)?,
+        (_, Some((source, _))) => {
+            canvas::svg_pixels(&canvas::svg_tree(source).ok()?, size[0], size[1], None).ok()?
+        }
+        _ => return None,
+    });
+    if fresh {
+        let kept: usize = cache.values().map(|(.., pixels)| pixels.data().len()).sum();
+        if kept + pixels.data().len() > 64 << 20 {
+            cache.clear();
+        }
+        cache.insert(
+            id,
+            (key, svg.map(|(source, _)| source.clone()), pixels.clone()),
+        );
+    }
+    Some(Source::Shared(pixels))
 }
 
 pub(crate) fn show_frame(
@@ -781,6 +815,7 @@ pub fn call(
             | "dom.source"
             | "dom.reserve"
             | "dom.matches"
+            | "dom.closest"
             | "dom.mediaMatches"
             | "dom.assignedNodes"
             | "dom.queryWithin"
@@ -917,6 +952,10 @@ pub fn call(
             return Ok(Value::Null);
         }
         if op == "dom.cssControl" {
+            let time = args[2].as_f64().unwrap_or(0.);
+            if !time.is_finite() {
+                return Ok(json!(false));
+            }
             let system = state.text_system.clone();
             let styles = styles(
                 doc,
@@ -928,7 +967,7 @@ pub fn call(
             return Ok(json!(state.motion.css_control(
                 args[0].as_u64().unwrap_or(0) as u32,
                 args[1].as_str().unwrap_or_default(),
-                args[2].as_f64().unwrap_or(0.),
+                time,
                 &styles,
             )));
         }
@@ -1203,6 +1242,7 @@ pub fn call(
                     state.svg_boxes.remove(&id);
                     state.svg_trees.remove(&id);
                     state.svg_images.remove(&id);
+                    state.sources.get_mut().remove(&id);
                     state.decoding.remove(&id);
                     if let Some(root) = state.shadows.remove(&id) {
                         state.hosts.remove(&root);
@@ -1210,6 +1250,10 @@ pub fn call(
                     state.hosts.remove(&id);
                     state.motion.forget(id);
                     state.anchors.remove(&id);
+                    state.blocks.remove(&id);
+                    state.containers.remove(&id);
+                    state.flexed_grids.remove(&id);
+                    state.grid_widest.remove(&id);
                     if state.focus == Some(id) {
                         state.focus = None;
                     }
@@ -1447,17 +1491,36 @@ pub fn call(
                 Ok(json!(nodes))
             }
             "dom.tree" => Ok(tree(doc, id, true)),
+            // WARNING: only the text of a `<style>` keeps its sheet as text; a `<link>` sheet is not text.
             "dom.source" => {
-                Ok(json!(doc.nodes[id].stylesheet.as_ref().map_or_else(
-                    || doc.nodes[id].text.clone(),
-                    |sheet| sheet.source()
-                )))
+                let node = &doc.nodes[id];
+                Ok(json!(match &node.stylesheet {
+                    Some(sheet) if node.tag == "#text" => sheet.source(),
+                    _ => node.text.clone(),
+                }))
             }
             "dom.matches" => Ok(json!(
                 Selector::try_parse(args[1].as_str().context("Expected selector")?)?
                     .iter()
                     .any(|s| s.matches_cached(doc, id, Some(id), &mut SelectorCache::default()))
             )),
+            "dom.closest" => {
+                let selectors =
+                    Selector::try_parse(args[1].as_str().context("Expected selector")?)?;
+                let mut memo = SelectorCache::default();
+                let mut current = Some(id);
+                while let Some(node) = current.filter(|&node| !doc.nodes[node].tag.starts_with('#'))
+                {
+                    if selectors
+                        .iter()
+                        .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                    {
+                        return Ok(json!(node));
+                    }
+                    current = doc.nodes[node].parent;
+                }
+                Ok(Value::Null)
+            }
             "dom.queryWithin" => {
                 let selectors =
                     Selector::try_parse(args[1].as_str().context("Expected selector")?)?;
@@ -1484,22 +1547,10 @@ pub fn call(
             "dom.html" => {
                 let source = args[1].as_str().context("Expected HTML")?;
                 let tag = doc.nodes[id].tag.as_str();
-                let mut svg = tag == "svg";
-                let mut up = doc.nodes[id].parent;
-                while let Some(node) = up.filter(|_| !svg) {
-                    if doc.nodes[node].tag.eq_ignore_ascii_case("foreignobject") {
-                        break;
-                    }
-                    svg = doc.nodes[node].tag == "svg";
-                    up = doc.nodes[node].parent;
-                }
+                // WARNING: only pages know namespaces, so they pass the context tag, `svg` for any SVG element outside an HTML integration point.
                 let parsed = match args[2].as_str() {
                     _ if tag == "#document" => Document::parse(source),
                     Some(context) => Document::fragment(source, context),
-                    None if svg && !matches!(tag, "foreignObject" | "desc" | "title") => {
-                        Document::fragment(source, "svg")
-                    }
-                    None if svg => Document::fragment(source, "body"),
                     // WARNING: template contents and shadow roots are the only fragments with markup, and template rules keep `<tr>` rows that Lit renders.
                     None if tag.starts_with('#') => Document::fragment(source, "template"),
                     None => Document::fragment(source, tag),
@@ -1850,11 +1901,11 @@ pub fn call(
             }
             "dom.canvas" => {
                 if let Some(ops) = crate::jsc::payload::slice(&args[1]) {
-                    let ops: Vec<f32> = ops?
-                        .as_chunks::<4>()
+                    let ops: Vec<f64> = ops?
+                        .as_chunks::<8>()
                         .0
                         .iter()
-                        .map(|bytes| f32::from_ne_bytes(*bytes))
+                        .map(|bytes| f64::from_ne_bytes(*bytes))
                         .collect();
                     let data = args
                         .as_array()
@@ -1878,7 +1929,7 @@ pub fn call(
                         &ops,
                         args[2].as_str().unwrap_or(""),
                         &data,
-                        &|source| source_pixels(state, source),
+                        &|(source, size)| source_pixels(state, source, Some(size)),
                         state
                             .text_system
                             .as_deref()
@@ -1902,6 +1953,7 @@ pub fn call(
                             .map(|canvas| canvas.image),
                     );
                     state.retired.extend(state.images.remove(&id));
+                    state.sources.get_mut().remove(&id);
                 }
                 // WARNING: offscreen drawing changes nothing on the page, so it must not cost page frames.
                 state.dirty |= doc.nodes[id].tag == "canvas";
@@ -1909,7 +1961,7 @@ pub fn call(
             }
             "dom.canvasURL" => {
                 use base64::Engine as _;
-                let bytes = match source_pixels(state, id) {
+                let bytes = match source_pixels(state, id, None) {
                     Some(pixels) => pixels.encode_png()?,
                     None => new_canvas(&doc.nodes[id])?.pixels.encode_png()?,
                 };
@@ -1923,9 +1975,11 @@ pub fn call(
                 })
             }
             "dom.canvasPixels" => {
-                let pixels = match source_pixels(state, id) {
+                let pixels = match source_pixels(state, id, None) {
                     Some(pixels) => pixels,
-                    None => Cow::Owned(new_canvas(&doc.nodes[id])?.pixels),
+                    None => crate::render::canvas::Source::Shared(Rc::new(
+                        new_canvas(&doc.nodes[id])?.pixels,
+                    )),
                 };
                 let x = args[1].as_i64().unwrap_or(0);
                 let y = args[2].as_i64().unwrap_or(0);
@@ -1981,8 +2035,8 @@ pub fn call(
                     }
                     None => {
                         let mut taken = new_canvas(&doc.nodes[id])?;
-                        if let Some(pixels) = source_pixels(state, id) {
-                            taken.pixels = pixels.into_owned();
+                        if let Some(pixels) = source_pixels(state, id, None) {
+                            taken.pixels = (*pixels).clone();
                         }
                         taken
                     }
@@ -2565,9 +2619,8 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     };
     while let Some(id) = pending.pop() {
         let node = &doc.nodes[id];
-        let inline = node.inline.as_ref().map(|inline| inline.source());
         // WARNING: script and style sources can be large, so pages read them with `dom.source` when needed.
-        let lazy = node.stylesheet.is_some()
+        let lazy = node.stylesheet.is_some() && node.tag == "#text"
             || !node.text.is_empty()
                 && node.parent.is_some_and(|parent| {
                     matches!(doc.nodes[parent].tag.as_str(), "script" | "style")
@@ -2577,13 +2630,10 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
             json!(node.parent),
             json!(node.tag),
             if lazy { Value::Null } else { json!(node.text) },
-            json!(node.attrs.iter().count() + usize::from(inline.is_some())),
+            json!(node.attrs.iter().count()),
         ]);
         for (key, value) in &node.attrs {
             list.extend([json!(key), json!(value)]);
-        }
-        if let Some(inline) = inline {
-            list.extend([json!("style"), json!(inline)]);
         }
         pending.extend(node.children.iter().rev());
     }
@@ -2728,11 +2778,8 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
                         .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
                 });
             let position = style.get(Prop::POSITION).unwrap_or("static");
-            // WARNING: like CSSOM `offsetParent`, a transformed or filtered box contains its positioned descendants too.
-            let positioned = position != "static"
-                || [Prop::TRANSFORM, Prop::FILTER]
-                    .into_iter()
-                    .any(|prop| style.get(prop).is_some_and(|value| value != "none"));
+            // WARNING: like CSSOM `offsetParent`, any box that contains its absolute descendants counts.
+            let positioned = crate::render::effects::establishes(style).absolute;
             (if clip { MIRROR_CLIP } else { 0 })
                 | if positioned { MIRROR_POSITIONED } else { 0 }
                 | if position == "fixed" { MIRROR_FIXED } else { 0 }

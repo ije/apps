@@ -35,7 +35,7 @@ pub enum Realm {
 struct Builder {
     realm: Realm,
     production: bool,
-    modules: Vec<Value>,
+    modules: Vec<Module>,
     lines: Vec<Option<Rc<str>>>,
     ids: BBTreeMap<PathBuf, usize>,
     graph: Graph,
@@ -61,6 +61,7 @@ struct Shared {
     loaders: Option<Rc<Loaders>>,
     env: Value,
     process_entries: RefCell<BTreeSet<PathBuf>>,
+    names: RefCell<HashMap<String, PathBuf>>,
 }
 
 struct Loaders {
@@ -165,6 +166,89 @@ const ELECTRON: &[&str] = &[
     "ClipboardItem",
 ];
 
+const BUILTINS: &str = include_str!("builtins.txt");
+// WARNING: these are built in by their package name, never with `node:`, and only in main.
+const PACKAGES: &[&str] = &["@pierre/apps", "electron", "node-pty", "ws", "undici"];
+
+#[derive(Default)]
+struct Module {
+    code: String,
+    deps: Vec<usize>,
+    imports: Vec<Import>,
+    exports: Vec<(String, Export)>,
+    stars: Vec<usize>,
+    live: BTreeSet<String>,
+    imported: Vec<usize>,
+    required: Vec<usize>,
+    file: Option<String>,
+    resolved: serde_json::Map<String, Value>,
+    map: Option<Value>,
+    url: Option<String>,
+    commonjs: bool,
+    linked: bool,
+    preload: bool,
+    pure: bool,
+    asynchronous: u8,
+}
+
+struct Import {
+    dep: usize,
+    local: Option<String>,
+    name: String,
+}
+
+enum Export {
+    Local(String),
+    Reexport(usize, String),
+}
+
+impl Export {
+    fn code(&self) -> String {
+        match self {
+            Export::Local(name) => name.clone(),
+            Export::Reexport(dep, name) => namespace_access(*dep, name),
+        }
+    }
+}
+
+impl Import {
+    fn json(&self) -> Value {
+        json!({"id": self.dep, "local": self.local, "name": self.name})
+    }
+}
+
+impl Module {
+    fn line(&self, id: usize) -> Result<String> {
+        let mut module = json!({
+            "id": id,
+            "deps": self.deps,
+            "code": self.code,
+            "imports": self.imports.iter().map(Import::json).collect::<Vec<_>>(),
+            "exports": self.exports.iter().map(|(name, export)| json!({"name": name, "value": export.code()})).collect::<Vec<_>>(),
+            "stars": self.stars,
+            "commonjs": self.commonjs,
+            "linked": self.linked,
+            "async": self.asynchronous,
+        });
+        if self.preload {
+            module["preload"] = true.into();
+        }
+        if let Some(file) = &self.file {
+            module["file"] = file.as_str().into();
+        }
+        if !self.resolved.is_empty() {
+            module["resolved"] = self.resolved.clone().into();
+        }
+        if let Some(map) = &self.map {
+            module["map"] = map.clone();
+        }
+        if let Some(url) = &self.url {
+            module["url"] = url.as_str().into();
+        }
+        Ok(format!("$appsDefine({});\n", ascii_json(&module)?))
+    }
+}
+
 fn namespace_access(dep: usize, name: &str) -> String {
     let identifier = name.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '$')
         && name
@@ -174,6 +258,38 @@ fn namespace_access(dep: usize, name: &str) -> String {
         "*" => format!("$appsN{dep}"),
         _ if identifier => format!("$appsN{dep}.{name}"),
         _ => format!("$appsN{dep}[{}]", json!(name)),
+    }
+}
+
+fn namespace_read<'a>(
+    ast: &AstBuilder<'a>,
+    allocator: &'a Allocator,
+    span: Span,
+    dep: usize,
+    name: &str,
+) -> Expression<'a> {
+    let namespace =
+        Expression::new_identifier(span, allocator.alloc_str(&format!("$appsN{dep}")), ast);
+    if name == "*" {
+        return namespace;
+    }
+    let property = allocator.alloc_str(name);
+    if namespace_access(dep, name).contains('[') {
+        Expression::new_computed_member_expression(
+            span,
+            namespace,
+            Expression::new_string_literal(span, property, None, ast),
+            false,
+            ast,
+        )
+    } else {
+        Expression::new_static_member_expression(
+            span,
+            namespace,
+            IdentifierName::new(span, property, ast),
+            false,
+            ast,
+        )
     }
 }
 
@@ -191,46 +307,18 @@ impl<'a> Imports<'a, '_> {
             .get(&self.scoping.get_reference(reference).symbol_id()?)
     }
 
-    fn access(&self, span: Span, (dep, name): &(usize, String)) -> Expression<'a> {
-        let namespace = Expression::new_identifier(
-            span,
-            self.allocator.alloc_str(&format!("$appsN{dep}")),
-            &self.ast,
-        );
-        if name == "*" {
-            return namespace;
-        }
-        let property = self.allocator.alloc_str(name);
-        if namespace_access(*dep, name).contains('[') {
-            Expression::new_computed_member_expression(
-                span,
-                namespace,
-                Expression::new_string_literal(span, property, None, &self.ast),
-                false,
-                &self.ast,
-            )
-        } else {
-            Expression::new_static_member_expression(
-                span,
-                namespace,
-                IdentifierName::new(span, property, &self.ast),
-                false,
-                &self.ast,
-            )
-        }
-    }
-
     // WARNING: `(0, ns.f)` keeps `this` undefined when an imported function is called.
     fn callee(&self, expression: &mut Expression<'a>) {
         if let Expression::Identifier(ident) = expression
-            && let Some(binding) = self.binding(ident).filter(|(_, name)| name != "*").cloned()
+            && let Some((dep, name)) = self.binding(ident).filter(|(_, name)| name != "*").cloned()
         {
             let span = ident.span;
             let zero =
                 Expression::new_numeric_literal(span, 0., None, NumberBase::Decimal, &self.ast);
+            let read = namespace_read(&self.ast, self.allocator, span, dep, &name);
             *expression = Expression::new_sequence_expression(
                 span,
-                ArenaVec::from_array_in([zero, self.access(span, &binding)], &self.ast),
+                ArenaVec::from_array_in([zero, read], &self.ast),
                 &self.ast,
             );
         }
@@ -240,9 +328,9 @@ impl<'a> Imports<'a, '_> {
 impl<'a> VisitMut<'a> for Imports<'a, '_> {
     fn visit_expression(&mut self, expression: &mut Expression<'a>) {
         if let Expression::Identifier(ident) = expression
-            && let Some(binding) = self.binding(ident).cloned()
+            && let Some((dep, name)) = self.binding(ident).cloned()
         {
-            *expression = self.access(ident.span, &binding);
+            *expression = namespace_read(&self.ast, self.allocator, ident.span, dep, &name);
             return;
         }
         walk_mut::walk_expression(self, expression);
@@ -372,14 +460,7 @@ impl<'a> Slots<'a, '_> {
             );
         }
         self.namespaces.insert(origin);
-        let source = namespace_access(origin, &name);
-        Parser::new(
-            self.allocator,
-            self.allocator.alloc_str(&source),
-            SourceType::cjs(),
-        )
-        .parse_expression()
-        .expect("namespace access is an expression")
+        namespace_read(&self.ast, self.allocator, span, origin, &name)
     }
 
     // WARNING: like other bundlers, a called import gets `this` undefined, also through a namespace. It must not see the slots.
@@ -429,13 +510,13 @@ impl<'a> VisitMut<'a> for Slots<'a, '_> {
 }
 
 // Modules in import cycles can read each other's exports before their bodies end, so they keep namespaces.
-fn in_cycles(modules: &[Value]) -> Vec<bool> {
+fn in_cycles(modules: &[Module]) -> Vec<bool> {
     let edges = |id: usize| -> Vec<usize> {
-        ["deps", "stars", "required"]
-            .iter()
-            .flat_map(|field| modules[id][*field].as_array().into_iter().flatten())
-            .filter_map(Value::as_u64)
-            .map(|dep| dep as usize)
+        let module = &modules[id];
+        [&module.deps, &module.stars, &module.required]
+            .into_iter()
+            .flatten()
+            .copied()
             .collect()
     };
     let mut cyclic = vec![false; modules.len()];
@@ -490,31 +571,88 @@ fn in_cycles(modules: &[Value]) -> Vec<bool> {
     cyclic
 }
 
-// The root bindings that a function can write after the module's body ended, so importers must read them live.
-fn late_writes(code: &str) -> Result<BTreeSet<String>> {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, code, SourceType::cjs()).parse();
-    ensure!(
-        parsed.diagnostics.is_empty(),
-        "Invalid JavaScript in a module: {:?}",
-        parsed.diagnostics
-    );
-    let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
-    let scoping = semantic.scoping();
-    let root = scoping.root_scope_id();
-    Ok(scoping
-        .symbol_ids()
-        .filter(|&symbol| scoping.symbol_scope_id(symbol) == root)
-        .filter(|&symbol| {
-            scoping.get_resolved_references(symbol).any(|reference| {
-                reference.is_write()
-                    && scoping
-                        .scope_ancestors(reference.scope_id())
-                        .any(|scope| scope != root && scoping.scope_flags(scope).is_function())
-            })
-        })
-        .map(|symbol| scoping.symbol_name(symbol).to_owned())
-        .collect())
+// WARNING: root bindings that code can write after the module's body ended must be read live by importers. A write is
+// early only while the body runs: in the root statements, their blocks and loops, class static blocks, static fields
+// and computed keys. Functions, methods, accessors and instance fields run later.
+struct Writes<'b> {
+    scoping: &'b oxc_semantic::Scoping,
+    late: bool,
+    live: BTreeSet<String>,
+}
+
+impl Writes<'_> {
+    fn later(&mut self, late: bool, visit: impl FnOnce(&mut Self)) {
+        let outer = self.late;
+        self.late |= late;
+        visit(self);
+        self.late = outer;
+    }
+}
+
+impl<'a> Visit<'a> for Writes<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        self.later(true, |this| walk::walk_function(this, function, flags));
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.later(true, |this| {
+            walk::walk_arrow_function_expression(this, arrow)
+        });
+    }
+
+    fn visit_class_element(&mut self, element: &ClassElement<'a>) {
+        // WARNING: oxc gives field initializers no scope, so only the AST tells an instance field from a static one.
+        let late = match element {
+            ClassElement::StaticBlock(_) => false,
+            ClassElement::PropertyDefinition(property) => !property.r#static,
+            ClassElement::AccessorProperty(property) => !property.r#static,
+            _ => true,
+        };
+        match element {
+            ClassElement::PropertyDefinition(property) => {
+                self.visit_decorators(&property.decorators);
+                self.visit_property_key(&property.key);
+                if let Some(value) = &property.value {
+                    self.later(late, |this| this.visit_expression(value));
+                }
+            }
+            ClassElement::AccessorProperty(property) => {
+                self.visit_decorators(&property.decorators);
+                self.visit_property_key(&property.key);
+                if let Some(value) = &property.value {
+                    self.later(late, |this| this.visit_expression(value));
+                }
+            }
+            ClassElement::MethodDefinition(method) => {
+                self.visit_decorators(&method.decorators);
+                self.visit_property_key(&method.key);
+                self.later(true, |this| {
+                    this.visit_function(&method.value, oxc_semantic::ScopeFlags::Function)
+                });
+            }
+            element => self.later(late, |this| walk::walk_class_element(this, element)),
+        }
+    }
+
+    fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+        if let Some(reference) = ident.reference_id.get()
+            && let reference = self.scoping.get_reference(reference)
+            && reference.is_write()
+            && let Some(symbol) = reference.symbol_id()
+            && self.scoping.symbol_scope_id(symbol) == self.scoping.root_scope_id()
+            && (self.late
+                || self
+                    .scoping
+                    .scope_ancestors(reference.scope_id())
+                    .any(|scope| {
+                        let flags = self.scoping.scope_flags(scope);
+                        flags.is_function() || flags.is_arrow()
+                    }))
+        {
+            self.live
+                .insert(self.scoping.symbol_name(symbol).to_owned());
+        }
+    }
 }
 
 struct Uses(Vec<(usize, Option<String>)>);
@@ -752,7 +890,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     let url = if is_remote(self.path) {
                         self.path.to_string_lossy().trim_end_matches('#').to_owned()
                     } else if self.builder.production {
-                        let relative = app_relative(&self.builder.shared.root, self.path);
+                        let relative = self.builder.app_name(self.path)?;
                         let mut url = String::from("apps:///");
                         for &byte in relative.as_os_str().as_encoded_bytes() {
                             match byte {
@@ -944,7 +1082,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 if let Ok((path, None)) = self.builder.locate(base, specifier, true)
                     && !path.as_os_str().as_encoded_bytes().starts_with(b"apps:")
                 {
-                    let path = self.builder.runtime_path(&path);
+                    let path = self.builder.runtime_path(&path)?;
                     self.resolved.insert(specifier.to_owned(), path.into());
                 }
             }
@@ -1198,16 +1336,29 @@ impl Builder {
         self.visit(path, inline)
     }
 
-    fn runtime_path(&self, path: &Path) -> String {
+    fn runtime_path(&self, path: &Path) -> Result<String> {
         if !self.production {
-            return std::path::absolute(path)
+            return Ok(std::path::absolute(path)
                 .unwrap_or_else(|_| path.to_owned())
                 .to_string_lossy()
-                .into_owned();
+                .into_owned());
         }
-        app_relative(&self.shared.root, path)
-            .to_string_lossy()
-            .replace('\\', "/")
+        Ok(self.app_name(path)?.to_string_lossy().replace('\\', "/"))
+    }
+
+    // WARNING: names key `require.cache`, `import.meta.url` and `__filename`, so two files must never share one.
+    fn app_name(&self, path: &Path) -> Result<PathBuf> {
+        let relative = app_relative(&self.shared.root, path);
+        let name = relative.to_string_lossy().replace('\\', "/");
+        let mut names = self.shared.names.borrow_mut();
+        let previous = names.entry(name.clone()).or_insert_with(|| path.to_owned());
+        ensure!(
+            previous == path,
+            "Output name collision at {name}: {} and {}",
+            previous.display(),
+            path.display()
+        );
+        Ok(relative)
     }
 
     fn locate(
@@ -1216,67 +1367,30 @@ impl Builder {
         specifier: &str,
         require: bool,
     ) -> Result<(PathBuf, Option<String>)> {
+        // WARNING: like Node, a built-in module without `node:` is built in unless it needs the prefix, and pages take a
+        // package of the same name first.
+        let builtin = |name: &str| {
+            BUILTINS
+                .lines()
+                .find(|line| line.split(' ').next() == Some(name))
+                .filter(|_| !PACKAGES.contains(&name))
+        };
         let normalized;
-        let specifier = if matches!(
-            specifier,
-            "fs" | "fs/promises"
-                | "async_hooks"
-                | "diagnostics_channel"
-                | "tls"
-                | "v8"
-                | "path"
-                | "path/posix"
-                | "path/win32"
-                | "os"
-                | "events"
-                | "child_process"
-                | "buffer"
-                | "stream"
-                | "stream/promises"
-                | "stream/web"
-                | "stream/consumers"
-                | "crypto"
-                | "url"
-                | "util"
-                | "util/types"
-                | "string_decoder"
-                | "worker_threads"
-                | "module"
-                | "net"
-                | "http"
-                | "https"
-                | "timers"
-                | "timers/promises"
-                | "process"
-                | "assert"
-                | "assert/strict"
-                | "zlib"
-                | "readline"
-                | "readline/promises"
-                | "tty"
-                | "dns"
-                | "dns/promises"
-                | "querystring"
-                | "perf_hooks"
-                | "constants"
-                | "sys"
-        ) && (self.realm != Realm::Renderer
-            || !base.ancestors().any(|directory| {
-                directory
-                    .join("node_modules")
-                    .join(specifier.split('/').next().unwrap())
-                    .is_dir()
-            })) {
+        let specifier = if !specifier.starts_with("node:")
+            && builtin(specifier).is_some()
+            && (self.realm != Realm::Renderer
+                || !base.ancestors().any(|directory| {
+                    directory
+                        .join("node_modules")
+                        .join(specifier.split('/').next().unwrap())
+                        .is_dir()
+                })) {
             normalized = format!("node:{specifier}");
             normalized.as_str()
         } else {
             specifier
         };
-        if matches!(
-            specifier,
-            "@pierre/apps" | "electron" | "node-pty" | "ws" | "undici"
-        ) || specifier.starts_with("node:")
-        {
+        if PACKAGES.contains(&specifier) || specifier.starts_with("node:") {
             ensure!(
                 self.realm != Realm::Renderer,
                 "{specifier} is unavailable in page scripts. Use a preload script."
@@ -1291,942 +1405,18 @@ impl Builder {
             if self.ids.contains_key(&path) {
                 return Ok((path, None));
             }
-            let (object, names) = match specifier {
-                "@pierre/apps" | "electron" => ("globalThis.__apps", ELECTRON.to_vec()),
-                "undici" => (
-                    "globalThis.__apps.undici",
-                    vec![
-                        "Agent",
-                        "Dispatcher",
-                        "Pool",
-                        "Client",
-                        "request",
-                        "fetch",
-                        "getGlobalDispatcher",
-                        "setGlobalDispatcher",
-                        "Headers",
-                        "Request",
-                        "Response",
-                        "FormData",
-                        "WebSocket",
-                    ],
-                ),
-                "ws" => (
-                    "globalThis.__apps.ws",
-                    vec![
-                        "WebSocket",
-                        "WebSocketServer",
-                        "Server",
-                        "OPEN",
-                        "CLOSED",
-                        "CONNECTING",
-                        "CLOSING",
-                    ],
-                ),
-                // WARNING: `__apps.net` is Electron's net, so node's net comes from the built-in modules.
-                "node:net" => (
-                    "globalThis.__apps.module.createRequire()('net')",
-                    vec![
-                        "Socket",
-                        "Server",
-                        "BlockList",
-                        "SocketAddress",
-                        "connect",
-                        "createConnection",
-                        "createServer",
-                        "isIP",
-                        "isIPv4",
-                        "isIPv6",
-                        "getDefaultAutoSelectFamily",
-                        "setDefaultAutoSelectFamily",
-                        "getDefaultAutoSelectFamilyAttemptTimeout",
-                        "setDefaultAutoSelectFamilyAttemptTimeout",
-                    ],
-                ),
-                "node:https" => (
-                    "globalThis.__apps.https",
-                    vec![
-                        "Agent",
-                        "Server",
-                        "createServer",
-                        "get",
-                        "globalAgent",
-                        "request",
-                    ],
-                ),
-                "node:http" => (
-                    "globalThis.__apps.http",
-                    vec![
-                        "Server",
-                        "createServer",
-                        "request",
-                        "get",
-                        "STATUS_CODES",
-                        "METHODS",
-                        "Agent",
-                        "globalAgent",
-                        "ClientRequest",
-                        "IncomingMessage",
-                        "OutgoingMessage",
-                        "ServerResponse",
-                        "validateHeaderName",
-                        "validateHeaderValue",
-                        "maxHeaderSize",
-                    ],
-                ),
-                "node-pty" => ("globalThis.__apps.pty", vec!["spawn"]),
-                "node:buffer" => (
-                    "globalThis.__apps.buffer",
-                    vec![
-                        "Buffer",
-                        "Blob",
-                        "File",
-                        "atob",
-                        "btoa",
-                        "constants",
-                        "kMaxLength",
-                        "kStringMaxLength",
-                        "isUtf8",
-                        "isAscii",
-                        "INSPECT_MAX_BYTES",
-                        "transcode",
-                    ],
-                ),
-                "node:stream" => (
-                    "globalThis.__apps.stream",
-                    vec![
-                        "Readable",
-                        "Writable",
-                        "Duplex",
-                        "Transform",
-                        "PassThrough",
-                        "Stream",
-                        "pipeline",
-                        "finished",
-                        "addAbortSignal",
-                        "promises",
-                        "consumers",
-                        "compose",
-                        "duplexPair",
-                        "isErrored",
-                        "isReadable",
-                        "getDefaultHighWaterMark",
-                        "setDefaultHighWaterMark",
-                    ],
-                ),
-                "node:stream/promises" => (
-                    "globalThis.__apps.stream.promises",
-                    vec!["pipeline", "finished"],
-                ),
-                "node:stream/consumers" => (
-                    "globalThis.__apps.stream.consumers",
-                    vec!["arrayBuffer", "blob", "buffer", "json", "text"],
-                ),
-                "node:stream/web" => (
-                    "globalThis.__apps.module.createRequire()('stream/web')",
-                    vec![
-                        "ReadableStream",
-                        "WritableStream",
-                        "TransformStream",
-                        "ByteLengthQueuingStrategy",
-                        "CountQueuingStrategy",
-                        "TextEncoderStream",
-                        "TextDecoderStream",
-                        "CompressionStream",
-                        "DecompressionStream",
-                        "ReadableStreamDefaultReader",
-                        "ReadableStreamBYOBReader",
-                        "ReadableStreamBYOBRequest",
-                        "ReadableStreamDefaultController",
-                        "ReadableByteStreamController",
-                        "WritableStreamDefaultWriter",
-                        "WritableStreamDefaultController",
-                        "TransformStreamDefaultController",
-                    ],
-                ),
-                "node:util" | "node:sys" => (
-                    "globalThis.__apps.util",
-                    vec![
-                        "promisify",
-                        "callbackify",
-                        "inspect",
-                        "format",
-                        "formatWithOptions",
-                        "inherits",
-                        "isDeepStrictEqual",
-                        "deprecate",
-                        "debuglog",
-                        "debug",
-                        "parseArgs",
-                        "stripVTControlCharacters",
-                        "styleText",
-                        "aborted",
-                        "getSystemErrorName",
-                        "types",
-                        "TextEncoder",
-                        "TextDecoder",
-                        "getSystemErrorMessage",
-                        "getSystemErrorMap",
-                        "toUSVString",
-                        "transferableAbortSignal",
-                        "transferableAbortController",
-                        "MIMEType",
-                        "MIMEParams",
-                    ],
-                ),
-                "node:util/types" => (
-                    "globalThis.__apps.util.types",
-                    vec![
-                        "isAnyArrayBuffer",
-                        "isArrayBuffer",
-                        "isArrayBufferView",
-                        "isAsyncFunction",
-                        "isBoxedPrimitive",
-                        "isDataView",
-                        "isDate",
-                        "isGeneratorFunction",
-                        "isGeneratorObject",
-                        "isMap",
-                        "isNativeError",
-                        "isPromise",
-                        "isRegExp",
-                        "isSet",
-                        "isSharedArrayBuffer",
-                        "isTypedArray",
-                        "isUint8Array",
-                        "isWeakMap",
-                        "isWeakSet",
-                        "isCryptoKey",
-                        "isMapIterator",
-                        "isSetIterator",
-                        "isModuleNamespaceObject",
-                        "isNumberObject",
-                        "isStringObject",
-                        "isBooleanObject",
-                        "isBigIntObject",
-                        "isSymbolObject",
-                        "isUint8ClampedArray",
-                        "isUint16Array",
-                        "isUint32Array",
-                        "isInt8Array",
-                        "isInt16Array",
-                        "isInt32Array",
-                        "isFloat32Array",
-                        "isFloat64Array",
-                        "isBigInt64Array",
-                        "isBigUint64Array",
-                        "isKeyObject",
-                        "isExternal",
-                        "isProxy",
-                        "isArgumentsObject",
-                        "isFloat16Array",
-                    ],
-                ),
-                "node:url" => (
-                    "globalThis.__apps.url",
-                    vec![
-                        "URL",
-                        "URLSearchParams",
-                        "fileURLToPath",
-                        "pathToFileURL",
-                        "format",
-                        "urlToHttpOptions",
-                        "domainToASCII",
-                        "domainToUnicode",
-                    ],
-                ),
-                "node:string_decoder" => {
-                    ("globalThis.__apps.string_decoder", vec!["StringDecoder"])
+            let (object, names) = if matches!(specifier, "electron" | "@pierre/apps") {
+                ("globalThis.__apps", ELECTRON.to_vec())
+            } else {
+                let line = match specifier.strip_prefix("node:") {
+                    Some(name) => builtin(name).or_else(|| builtin(specifier)),
+                    None => BUILTINS
+                        .lines()
+                        .find(|line| line.split(' ').next() == Some(specifier)),
                 }
-                "node:crypto" => (
-                    "globalThis.__apps.crypto",
-                    vec![
-                        "createHash",
-                        "createHmac",
-                        "hash",
-                        "getHashes",
-                        "getCiphers",
-                        "createCipheriv",
-                        "createDecipheriv",
-                        "pbkdf2",
-                        "pbkdf2Sync",
-                        "randomBytes",
-                        "randomFill",
-                        "randomFillSync",
-                        "randomInt",
-                        "randomUUID",
-                        "getRandomValues",
-                        "timingSafeEqual",
-                        "webcrypto",
-                        "subtle",
-                        "constants",
-                        "getCurves",
-                        "KeyObject",
-                        "Sign",
-                        "Verify",
-                        "createSecretKey",
-                        "createPublicKey",
-                        "createPrivateKey",
-                        "createSign",
-                        "createVerify",
-                        "sign",
-                        "verify",
-                        "generateKeyPair",
-                        "generateKeyPairSync",
-                        "generateKey",
-                        "generateKeySync",
-                        "hkdf",
-                        "hkdfSync",
-                        "scrypt",
-                        "scryptSync",
-                    ],
-                ),
-                "node:worker_threads" => (
-                    "globalThis.__apps.worker_threads",
-                    vec![
-                        "Worker",
-                        "MessageChannel",
-                        "MessagePort",
-                        "isMainThread",
-                        "parentPort",
-                        "workerData",
-                        "threadId",
-                        "BroadcastChannel",
-                        "SHARE_ENV",
-                        "receiveMessageOnPort",
-                    ],
-                ),
-                "node:module" => (
-                    "globalThis.__apps.module",
-                    vec!["createRequire", "builtinModules", "isBuiltin"],
-                ),
-                "node:timers" => (
-                    "globalThis.__apps.timers",
-                    vec![
-                        "setTimeout",
-                        "clearTimeout",
-                        "setInterval",
-                        "clearInterval",
-                        "setImmediate",
-                        "clearImmediate",
-                        "promises",
-                    ],
-                ),
-                "node:timers/promises" => (
-                    "globalThis.__apps.timers.promises",
-                    vec!["setTimeout", "setImmediate", "setInterval", "scheduler"],
-                ),
-                "node:process" => (
-                    "globalThis.__apps.process",
-                    vec![
-                        "resourceUsage",
-                        "abort",
-                        "constrainedMemory",
-                        "availableMemory",
-                        "getActiveResourcesInfo",
-                        "features",
-                        "config",
-                        "allowedNodeEnvironmentFlags",
-                        "debugPort",
-                        "report",
-                        "sourceMapsEnabled",
-                        "setSourceMapsEnabled",
-                        "hasUncaughtExceptionCaptureCallback",
-                        "setUncaughtExceptionCaptureCallback",
-                        "loadEnvFile",
-                        "stdin",
-                        "getBuiltinModule",
-                        "platform",
-                        "arch",
-                        "pid",
-                        "ppid",
-                        "title",
-                        "type",
-                        "version",
-                        "versions",
-                        "release",
-                        "argv",
-                        "argv0",
-                        "execArgv",
-                        "execPath",
-                        "env",
-                        "cwd",
-                        "chdir",
-                        "nextTick",
-                        "exit",
-                        "on",
-                        "once",
-                        "off",
-                        "emit",
-                        "kill",
-                        "hrtime",
-                        "uptime",
-                        "memoryUsage",
-                        "cpuUsage",
-                        "umask",
-                        "emitWarning",
-                        "stdout",
-                        "stderr",
-                        "exitCode",
-                        "getuid",
-                        "geteuid",
-                        "getgid",
-                        "getegid",
-                    ],
-                ),
-                "node:sqlite" => (
-                    "globalThis.__apps.sqlite",
-                    vec![
-                        "DatabaseSync",
-                        "StatementSync",
-                        "Database",
-                        "Statement",
-                        "backup",
-                        "constants",
-                    ],
-                ),
-                "node:events" => (
-                    "globalThis.__apps.events",
-                    vec![
-                        "EventEmitter",
-                        "once",
-                        "on",
-                        "errorMonitor",
-                        "getEventListeners",
-                        "setMaxListeners",
-                        "defaultMaxListeners",
-                        "captureRejections",
-                        "captureRejectionSymbol",
-                        "getMaxListeners",
-                        "addAbortListener",
-                    ],
-                ),
-                "node:ffi" => (
-                    "globalThis.__apps.ffi",
-                    vec![
-                        "DynamicLibrary",
-                        "suffix",
-                        "types",
-                        "dlopen",
-                        "dlclose",
-                        "dlsym",
-                        "getRawPointer",
-                        "toString",
-                        "toBuffer",
-                        "toArrayBuffer",
-                        "exportString",
-                        "exportBuffer",
-                        "exportArrayBuffer",
-                        "exportArrayBufferView",
-                        "getCurrentEventLoop",
-                        "getInt8",
-                        "getUint8",
-                        "getInt16",
-                        "getUint16",
-                        "getInt32",
-                        "getUint32",
-                        "getInt64",
-                        "getUint64",
-                        "getFloat32",
-                        "getFloat64",
-                        "setInt8",
-                        "setUint8",
-                        "setInt16",
-                        "setUint16",
-                        "setInt32",
-                        "setUint32",
-                        "setInt64",
-                        "setUint64",
-                        "setFloat32",
-                        "setFloat64",
-                    ],
-                ),
-                "node:child_process" => (
-                    "globalThis.__apps.child_process",
-                    vec![
-                        "spawn",
-                        "ChildProcess",
-                        "execFile",
-                        "exec",
-                        "spawnSync",
-                        "execFileSync",
-                        "execSync",
-                    ],
-                ),
-                "node:fs" => (
-                    "globalThis.__apps.fs",
-                    vec![
-                        "constants",
-                        "promises",
-                        "Stats",
-                        "Dirent",
-                        "readFile",
-                        "writeFile",
-                        "appendFile",
-                        "mkdir",
-                        "readdir",
-                        "stat",
-                        "lstat",
-                        "fstat",
-                        "rename",
-                        "copyFile",
-                        "cp",
-                        "realpath",
-                        "readlink",
-                        "symlink",
-                        "link",
-                        "chmod",
-                        "chown",
-                        "lchown",
-                        "utimes",
-                        "lutimes",
-                        "truncate",
-                        "access",
-                        "unlink",
-                        "rm",
-                        "rmdir",
-                        "mkdtemp",
-                        "open",
-                        "opendir",
-                        "close",
-                        "fsync",
-                        "ftruncate",
-                        "readFileSync",
-                        "writeFileSync",
-                        "appendFileSync",
-                        "mkdirSync",
-                        "readdirSync",
-                        "statSync",
-                        "lstatSync",
-                        "fstatSync",
-                        "renameSync",
-                        "copyFileSync",
-                        "cpSync",
-                        "realpathSync",
-                        "readlinkSync",
-                        "symlinkSync",
-                        "linkSync",
-                        "chmodSync",
-                        "chownSync",
-                        "lchownSync",
-                        "utimesSync",
-                        "lutimesSync",
-                        "truncateSync",
-                        "accessSync",
-                        "unlinkSync",
-                        "rmSync",
-                        "rmdirSync",
-                        "mkdtempSync",
-                        "openSync",
-                        "opendirSync",
-                        "closeSync",
-                        "fsyncSync",
-                        "ftruncateSync",
-                        "existsSync",
-                        "read",
-                        "readSync",
-                        "write",
-                        "writeSync",
-                        "watch",
-                        "watchFile",
-                        "unwatchFile",
-                        "createReadStream",
-                        "createWriteStream",
-                        "ReadStream",
-                        "WriteStream",
-                        "Dir",
-                        "openAsBlob",
-                        "fchmod",
-                        "fchmodSync",
-                        "fchown",
-                        "fchownSync",
-                        "futimes",
-                        "futimesSync",
-                        "fdatasync",
-                        "fdatasyncSync",
-                        "statfs",
-                        "statfsSync",
-                        "readv",
-                        "readvSync",
-                        "writev",
-                        "writevSync",
-                        "glob",
-                        "globSync",
-                    ],
-                ),
-                "node:fs/promises" => (
-                    "globalThis.__apps.fs.promises",
-                    vec![
-                        "constants",
-                        "readFile",
-                        "writeFile",
-                        "appendFile",
-                        "mkdir",
-                        "readdir",
-                        "stat",
-                        "lstat",
-                        "rename",
-                        "copyFile",
-                        "cp",
-                        "realpath",
-                        "readlink",
-                        "symlink",
-                        "link",
-                        "chmod",
-                        "chown",
-                        "lchown",
-                        "utimes",
-                        "lutimes",
-                        "truncate",
-                        "access",
-                        "unlink",
-                        "rm",
-                        "rmdir",
-                        "mkdtemp",
-                        "open",
-                        "opendir",
-                        "watch",
-                        "statfs",
-                        "glob",
-                    ],
-                ),
-                "node:os" => (
-                    "globalThis.__apps.os",
-                    vec![
-                        "EOL",
-                        "devNull",
-                        "platform",
-                        "arch",
-                        "machine",
-                        "release",
-                        "version",
-                        "type",
-                        "homedir",
-                        "tmpdir",
-                        "hostname",
-                        "endianness",
-                        "availableParallelism",
-                        "cpus",
-                        "totalmem",
-                        "freemem",
-                        "uptime",
-                        "loadavg",
-                        "networkInterfaces",
-                        "userInfo",
-                        "constants",
-                        "getPriority",
-                        "setPriority",
-                    ],
-                ),
-                "node:path" => (
-                    "globalThis.__apps.path",
-                    vec![
-                        "sep",
-                        "delimiter",
-                        "normalize",
-                        "isAbsolute",
-                        "join",
-                        "resolve",
-                        "basename",
-                        "dirname",
-                        "extname",
-                        "relative",
-                        "parse",
-                        "format",
-                        "toNamespacedPath",
-                        "posix",
-                        "win32",
-                    ],
-                ),
-                "node:path/posix" => (
-                    "globalThis.__apps.path.posix",
-                    vec![
-                        "sep",
-                        "delimiter",
-                        "normalize",
-                        "isAbsolute",
-                        "join",
-                        "resolve",
-                        "basename",
-                        "dirname",
-                        "extname",
-                        "relative",
-                        "parse",
-                        "format",
-                        "toNamespacedPath",
-                        "posix",
-                        "win32",
-                    ],
-                ),
-                "node:path/win32" => (
-                    "globalThis.__apps.path.win32",
-                    vec![
-                        "sep",
-                        "delimiter",
-                        "normalize",
-                        "isAbsolute",
-                        "join",
-                        "resolve",
-                        "basename",
-                        "dirname",
-                        "extname",
-                        "relative",
-                        "parse",
-                        "format",
-                        "toNamespacedPath",
-                        "posix",
-                        "win32",
-                    ],
-                ),
-                "node:assert" => (
-                    "globalThis.__apps.assert",
-                    vec![
-                        "AssertionError",
-                        "ok",
-                        "equal",
-                        "notEqual",
-                        "strictEqual",
-                        "notStrictEqual",
-                        "deepEqual",
-                        "notDeepEqual",
-                        "deepStrictEqual",
-                        "notDeepStrictEqual",
-                        "throws",
-                        "doesNotThrow",
-                        "rejects",
-                        "doesNotReject",
-                        "match",
-                        "doesNotMatch",
-                        "fail",
-                        "ifError",
-                        "strict",
-                    ],
-                ),
-                "node:assert/strict" => (
-                    "globalThis.__apps.assert.strict",
-                    vec![
-                        "AssertionError",
-                        "ok",
-                        "equal",
-                        "notEqual",
-                        "strictEqual",
-                        "notStrictEqual",
-                        "deepEqual",
-                        "notDeepEqual",
-                        "deepStrictEqual",
-                        "notDeepStrictEqual",
-                        "throws",
-                        "doesNotThrow",
-                        "rejects",
-                        "doesNotReject",
-                        "match",
-                        "doesNotMatch",
-                        "fail",
-                        "ifError",
-                        "strict",
-                    ],
-                ),
-                "node:zlib" => (
-                    "globalThis.__apps.zlib",
-                    vec![
-                        "constants",
-                        "gzip",
-                        "gzipSync",
-                        "createGzip",
-                        "Gzip",
-                        "gunzip",
-                        "gunzipSync",
-                        "createGunzip",
-                        "Gunzip",
-                        "deflate",
-                        "deflateSync",
-                        "createDeflate",
-                        "Deflate",
-                        "inflate",
-                        "inflateSync",
-                        "createInflate",
-                        "Inflate",
-                        "deflateRaw",
-                        "deflateRawSync",
-                        "createDeflateRaw",
-                        "DeflateRaw",
-                        "inflateRaw",
-                        "inflateRawSync",
-                        "createInflateRaw",
-                        "InflateRaw",
-                        "unzip",
-                        "unzipSync",
-                        "createUnzip",
-                        "Unzip",
-                        "crc32",
-                    ],
-                ),
-                "node:readline" => (
-                    "globalThis.__apps.readline",
-                    vec![
-                        "Interface",
-                        "createInterface",
-                        "clearLine",
-                        "clearScreenDown",
-                        "cursorTo",
-                        "moveCursor",
-                        "emitKeypressEvents",
-                        "promises",
-                    ],
-                ),
-                "node:readline/promises" => (
-                    "globalThis.__apps.readline.promises",
-                    vec!["Interface", "Readline", "createInterface"],
-                ),
-                "node:tty" => (
-                    "globalThis.__apps.tty",
-                    vec!["isatty", "ReadStream", "WriteStream"],
-                ),
-                "node:dns" | "node:dns/promises" => {
-                    let mut names = vec![
-                        "lookup",
-                        "Resolver",
-                        "getServers",
-                        "setServers",
-                        "getDefaultResultOrder",
-                        "setDefaultResultOrder",
-                        "resolve",
-                        "reverse",
-                        "resolve4",
-                        "resolve6",
-                        "resolveAny",
-                        "resolveCaa",
-                        "resolveCname",
-                        "resolveMx",
-                        "resolveNaptr",
-                        "resolveNs",
-                        "resolvePtr",
-                        "resolveSoa",
-                        "resolveSrv",
-                        "resolveTlsa",
-                        "resolveTxt",
-                        "NODATA",
-                        "FORMERR",
-                        "SERVFAIL",
-                        "NOTFOUND",
-                        "NOTIMP",
-                        "REFUSED",
-                        "BADQUERY",
-                        "BADNAME",
-                        "BADFAMILY",
-                        "BADRESP",
-                        "CONNREFUSED",
-                        "TIMEOUT",
-                        "EOF",
-                        "FILE",
-                        "NOMEM",
-                        "DESTRUCTION",
-                        "BADSTR",
-                        "BADFLAGS",
-                        "NONAME",
-                        "BADHINTS",
-                        "NOTINITIALIZED",
-                        "LOADIPHLPAPI",
-                        "ADDRGETNETWORKPARAMS",
-                        "CANCELLED",
-                    ];
-                    if specifier == "node:dns" {
-                        names.extend(["promises", "ADDRCONFIG", "V4MAPPED", "ALL"]);
-                        ("globalThis.__apps.dns", names)
-                    } else {
-                        ("globalThis.__apps.dns.promises", names)
-                    }
-                }
-                "node:querystring" => (
-                    "globalThis.__apps.querystring",
-                    vec![
-                        "parse",
-                        "stringify",
-                        "escape",
-                        "unescape",
-                        "decode",
-                        "encode",
-                        "unescapeBuffer",
-                    ],
-                ),
-                "node:perf_hooks" => (
-                    "globalThis.__apps.perf_hooks",
-                    vec![
-                        "performance",
-                        "PerformanceEntry",
-                        "PerformanceMark",
-                        "PerformanceMeasure",
-                        "PerformanceObserver",
-                        "PerformanceObserverEntryList",
-                        "createHistogram",
-                        "monitorEventLoopDelay",
-                    ],
-                ),
-                "node:constants" => ("globalThis.__apps.constants", vec![]),
-                "node:async_hooks" => (
-                    "globalThis.__apps.async_hooks",
-                    vec![
-                        "AsyncLocalStorage",
-                        "AsyncResource",
-                        "createHook",
-                        "executionAsyncId",
-                        "triggerAsyncId",
-                        "executionAsyncResource",
-                    ],
-                ),
-                "node:diagnostics_channel" => (
-                    "globalThis.__apps.diagnostics_channel",
-                    vec![
-                        "Channel",
-                        "channel",
-                        "hasSubscribers",
-                        "subscribe",
-                        "unsubscribe",
-                        "tracingChannel",
-                    ],
-                ),
-                "node:v8" => (
-                    "globalThis.__apps.v8",
-                    vec![
-                        "getHeapStatistics",
-                        "getHeapSnapshot",
-                        "writeHeapSnapshot",
-                        "setFlagsFromString",
-                        "serialize",
-                        "deserialize",
-                    ],
-                ),
-                "node:sea" => (
-                    "globalThis.__apps.sea",
-                    vec![
-                        "isSea",
-                        "getAsset",
-                        "getAssetAsBlob",
-                        "getRawAsset",
-                        "getAssetKeys",
-                    ],
-                ),
-                "node:tls" => (
-                    "globalThis.__apps.tls",
-                    vec![
-                        "TLSSocket",
-                        "Server",
-                        "connect",
-                        "createServer",
-                        "createSecureContext",
-                        "rootCertificates",
-                        "getCACertificates",
-                        "setDefaultCACertificates",
-                        "getCiphers",
-                        "checkServerIdentity",
-                        "DEFAULT_MIN_VERSION",
-                        "DEFAULT_MAX_VERSION",
-                        "DEFAULT_ECDH_CURVE",
-                        "CLIENT_RENEG_LIMIT",
-                        "CLIENT_RENEG_WINDOW",
-                    ],
-                ),
-                _ => bail!("Unsupported built-in module: {specifier}"),
+                .with_context(|| format!("Unsupported built-in module: {specifier}"))?;
+                let mut parts = line.split(' ').skip(1);
+                (parts.next().unwrap_or_default(), parts.collect())
             };
             // WARNING: Node's require(esm) returns the 'module.exports' export, so CommonJS gets the module object itself.
             let source = format!(
@@ -2504,14 +1694,18 @@ impl Builder {
         self.ids.insert(key, id);
         if self.lines.len() <= id {
             self.lines.resize(id + 1, None);
-            self.modules.resize(id + 1, Value::Null);
+            self.modules.resize_with(id + 1, Module::default);
         }
         if self.realm == Realm::Renderer && self.shared.preload.as_ref() == Some(&path) {
-            let module = json!({"id":id,"preload":true,"code":"","deps":[],"imports":[],"exports":[],"stars":[],"commonjs":false,"linked":true,"async":0});
+            let module = Module {
+                preload: true,
+                linked: true,
+                ..Module::default()
+            };
             if self.production {
                 self.modules[id] = module;
             } else {
-                self.lines[id] = Some(format!("$appsDefine({});\n", ascii_json(&module)?).into());
+                self.lines[id] = Some(module.line(id)?.into());
             }
             return Ok(id);
         }
@@ -2528,11 +1722,18 @@ impl Builder {
             );
             self.files.borrow_mut().insert(path.clone());
             let name = native_specifier(&path)?;
-            let module = json!({"id": id, "code": format!("module.exports=globalThis.__appsLoadAddon({});", serde_json::to_string(&name)?), "deps": [], "imports": [], "exports": [], "stars": [], "commonjs": true});
+            let module = Module {
+                code: format!(
+                    "module.exports=globalThis.__appsLoadAddon({});",
+                    json!(name)
+                ),
+                commonjs: true,
+                ..Module::default()
+            };
             if self.production {
                 self.modules[id] = module;
             } else {
-                self.lines[id] = Some(format!("$appsDefine({});\n", ascii_json(&module)?).into());
+                self.lines[id] = Some(module.line(id)?.into());
             }
             return Ok(id);
         }
@@ -2805,7 +2006,11 @@ impl Builder {
                     let dep = self.resolve(base, specifier, false)?;
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
-                    imports.push(json!({"id":dep,"local":null,"name":"*"}));
+                    imports.push(Import {
+                        dep,
+                        local: None,
+                        name: "*".into(),
+                    });
                     let source = specifier.to_owned();
                     for specifier in import.unbox().specifiers.into_iter().flatten() {
                         let symbol = specifier.local().symbol_id();
@@ -2830,7 +2035,11 @@ impl Builder {
                             ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => "*".into(),
                         };
                         bindings.insert(symbol, (dep, name.clone()));
-                        imports.push(json!({"id":dep,"local":local,"name":name}));
+                        imports.push(Import {
+                            dep,
+                            local: Some(local),
+                            name,
+                        });
                     }
                 }
                 Statement::ExportDeclaration(export) => {
@@ -2861,7 +2070,7 @@ impl Builder {
                         _ => bail!("Unsupported export in {}", path.display()),
                     };
                     for name in names {
-                        exports.push(json!({"name":name,"value":name}));
+                        exports.push((name.clone(), Export::Local(name)));
                     }
                     body.push(Statement::from(declaration));
                 }
@@ -2874,7 +2083,10 @@ impl Builder {
                         {
                             aliases.push((exports.len(), symbol));
                         }
-                        exports.push(json!({"name":specifier.exported.name().as_str(),"value":specifier.local.name().as_str()}));
+                        exports.push((
+                            specifier.exported.name().to_string(),
+                            Export::Local(specifier.local.name().to_string()),
+                        ));
                     }
                 }
                 Statement::ExportFromDeclaration(export) => {
@@ -2887,18 +2099,25 @@ impl Builder {
                     let dep = self.resolve(base, specifier, false)?;
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
-                    imports.push(json!({"id":dep,"local":null,"name":"*"}));
+                    imports.push(Import {
+                        dep,
+                        local: None,
+                        name: "*".into(),
+                    });
                     for specifier in &export.specifiers {
                         let local = format!("$appsRe{}", imports.len());
-                        let name = specifier.local.name();
-                        imports.push(json!({"id":dep,"local":local,"name":name.as_str()}));
+                        let name = specifier.local.name().to_string();
                         let value = if linked {
-                            namespace_access(dep, &name)
+                            Export::Reexport(dep, name.clone())
                         } else {
-                            local
+                            Export::Local(local.clone())
                         };
-                        exports
-                            .push(json!({"name":specifier.exported.name().as_str(),"value":value}));
+                        imports.push(Import {
+                            dep,
+                            local: Some(local),
+                            name,
+                        });
+                        exports.push((specifier.exported.name().to_string(), value));
                     }
                 }
                 Statement::ExportAllDeclaration(export) => {
@@ -2913,13 +2132,17 @@ impl Builder {
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
                     if let Some(name) = &export.exported {
                         let local = format!("$appsRe{}", imports.len());
-                        imports.push(json!({"id":dep,"local":local,"name":"*"}));
                         let value = if linked {
-                            namespace_access(dep, "*")
+                            Export::Reexport(dep, "*".into())
                         } else {
-                            local
+                            Export::Local(local.clone())
                         };
-                        exports.push(json!({"name":name.name().as_str(),"value":value}));
+                        imports.push(Import {
+                            dep,
+                            local: Some(local),
+                            name: "*".into(),
+                        });
+                        exports.push((name.name().to_string(), value));
                     } else {
                         stars.push(dep);
                     }
@@ -2932,7 +2155,10 @@ impl Builder {
                                 function.id =
                                     Some(BindingIdentifier::new(span, "$appsDefault", &ast));
                             }
-                            exports.push(json!({"name":"default","value":function.id.as_ref().unwrap().name.as_str()}));
+                            exports.push((
+                                "default".into(),
+                                Export::Local(function.id.as_ref().unwrap().name.to_string()),
+                            ));
                             body.push(Statement::FunctionDeclaration(function));
                             continue;
                         }
@@ -2940,13 +2166,16 @@ impl Builder {
                             if class.id.is_none() {
                                 class.id = Some(BindingIdentifier::new(span, "$appsDefault", &ast));
                             }
-                            exports.push(json!({"name":"default","value":class.id.as_ref().unwrap().name.as_str()}));
+                            exports.push((
+                                "default".into(),
+                                Export::Local(class.id.as_ref().unwrap().name.to_string()),
+                            ));
                             body.push(Statement::ClassDeclaration(class));
                             continue;
                         }
                         declaration => declaration.into_expression(),
                     };
-                    exports.push(json!({"name":"default","value":"$appsDefault"}));
+                    exports.push(("default".into(), Export::Local("$appsDefault".into())));
                     body.push(Statement::new_variable_declaration(
                         span,
                         VariableDeclarationKind::Const,
@@ -2998,12 +2227,22 @@ impl Builder {
             }
             for (index, symbol) in aliases {
                 if let Some((dep, name)) = bindings.get(&symbol) {
-                    exports[index]["value"] = namespace_access(*dep, name).into();
+                    exports[index].1 = Export::Reexport(*dep, name.clone());
                 }
             }
         }
         program.body = body;
         program.hashbang = None;
+        let mut live = BTreeSet::new();
+        if self.production && linked {
+            let mut writes = Writes {
+                scoping: &transformed.scoping,
+                late: false,
+                live: BTreeSet::new(),
+            };
+            writes.visit_program(&program);
+            live = writes.live;
+        }
         let output = Codegen::new()
             .with_options(CodegenOptions {
                 ascii_only: true,
@@ -3014,19 +2253,30 @@ impl Builder {
         let mut deps = Vec::new();
         for dep in imports
             .iter()
-            .filter_map(|item| item["id"].as_u64())
-            .chain(stars.iter().map(|&dep| dep as u64))
+            .map(|import| import.dep)
+            .chain(stars.iter().copied())
         {
             if !deps.contains(&dep) {
                 deps.push(dep);
             }
         }
-        let mut module = json!({"id":id,"deps":deps,"code":output.code,"imports":imports,"exports":exports,"stars":stars,"commonjs":commonjs,"linked":linked,"async":asynchronous});
+        let mut module = Module {
+            code: output.code,
+            deps,
+            imports,
+            exports,
+            stars,
+            live,
+            imported,
+            required,
+            commonjs,
+            linked,
+            asynchronous,
+            ..Module::default()
+        };
         if commonjs {
-            module["file"] = self.runtime_path(&path).into();
-            if !resolved.is_empty() {
-                module["resolved"] = resolved.into();
-            }
+            module.file = Some(self.runtime_path(&path)?);
+            module.resolved = resolved;
         }
         if let Some(map) = output.map {
             let map = match loaded.as_ref().and_then(|(_, map)| map.as_deref()) {
@@ -3044,14 +2294,14 @@ impl Builder {
             let mut map: Value = serde_json::from_str(&map)?;
             // WARNING: The runtime adds one line before the module body.
             map["mappings"] = format!(";{}", map["mappings"].as_str().unwrap()).into();
-            module["map"] = map;
-            module["url"] = if is_remote(&path) {
-                Value::String(path.to_string_lossy().trim_end_matches('#').into())
+            module.map = Some(map);
+            module.url = Some(if is_remote(&path) {
+                path.to_string_lossy().trim_end_matches('#').into()
             } else {
                 url::Url::from_file_path(std::path::absolute(&path)?)
-                    .map(|url| Value::String(url.into()))
-                    .unwrap_or_else(|_| Value::String(path.to_string_lossy().into()))
-            };
+                    .map(String::from)
+                    .unwrap_or_else(|_| path.to_string_lossy().into())
+            });
         }
         let requests = std::mem::replace(&mut self.requests, outer);
         if self.production {
@@ -3060,8 +2310,7 @@ impl Builder {
                 .ancestors()
                 .skip(1)
                 .find_map(|root| Some((root, manifests.get(&root.join("package.json"))?)));
-            module["pure"] = match package.map(|(root, manifest)| (root, &manifest["sideEffects"]))
-            {
+            module.pure = match package.map(|(root, manifest)| (root, &manifest["sideEffects"])) {
                 Some((_, Value::Bool(false))) => true,
                 Some((root, Value::Array(patterns))) => {
                     let relative = path
@@ -3078,14 +2327,11 @@ impl Builder {
                     })
                 }
                 _ => false,
-            }
-            .into();
+            };
             drop(manifests);
-            module["imported"] = json!(imported);
-            module["required"] = json!(required);
             self.modules[id] = module;
         } else {
-            let line: Rc<str> = format!("$appsDefine({});\n", ascii_json(&module)?).into();
+            let line: Rc<str> = module.line(id)?.into();
             if cacheable && let Some(stamp) = stamp {
                 self.graph.modules.insert(
                     id,
@@ -3102,27 +2348,35 @@ impl Builder {
     }
 }
 
+// WARNING: files outside the app, like packages in a parent node_modules, keep their path from the app folder, so two
+// files never share a name. Only a file on another Windows drive gets its drive as the first folder.
 fn app_relative(root: &Path, path: &Path) -> PathBuf {
-    if let Some(relative) = path.strip_prefix(root).ok().or_else(|| {
-        path.ancestors()
-            .find(|directory| directory.ends_with("node_modules"))
-            .and_then(Path::parent)
-            .and_then(|base| path.strip_prefix(base).ok())
-    }) {
-        return relative.to_owned();
-    }
-    // WARNING: other files outside the app, like linked workspace packages, keep their path from the app folder, so
-    // their names stay unique.
-    match root
+    let common = root
         .ancestors()
-        .find(|directory| path.starts_with(directory))
+        .find(|directory| path.starts_with(directory));
+    let mut relative: PathBuf = root
+        .components()
+        .skip(common.map_or(0, |common| common.components().count()))
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .map(|_| std::path::Component::ParentDir)
+        .collect();
+    for component in path
+        .strip_prefix(common.unwrap_or(Path::new("")))
+        .unwrap_or(path)
+        .components()
     {
-        Some(common) => (0..root.components().count() - common.components().count())
-            .map(|_| Path::new(".."))
-            .collect::<PathBuf>()
-            .join(path.strip_prefix(common).unwrap_or(path)),
-        None => path.file_name().map(PathBuf::from).unwrap_or_default(),
+        match component {
+            std::path::Component::Prefix(prefix) => relative.push(
+                prefix
+                    .as_os_str()
+                    .to_string_lossy()
+                    .replace([':', '\\', '/', '?'], ""),
+            ),
+            std::path::Component::Normal(name) => relative.push(name),
+            _ => {}
+        }
     }
+    relative
 }
 
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
@@ -3433,13 +2687,19 @@ fn bundle(
             builder.ids.insert(path, id);
             if builder.lines.len() <= id {
                 builder.lines.resize(id + 1, None);
-                builder.modules.resize(id + 1, Value::Null);
+                builder.modules.resize_with(id + 1, Module::default);
             }
             if production {
-                builder.modules[id] = json!({"id":id,"deps":[],"code":code,"imports":[],"exports":[],"stars":[],"commonjs":false,"linked":true,"async":0,"pure":false});
+                builder.modules[id] = Module {
+                    code,
+                    linked: true,
+                    ..Module::default()
+                };
             } else {
-                builder.lines[id] =
-                    Some(format!("$appsDefine({{id:{id},factory:function*(){{yield;{code}}}}});\n").into());
+                builder.lines[id] = Some(
+                    format!("$appsDefine({{id:{id},factory:function*(){{yield;{code}}}}});\n")
+                        .into(),
+                );
             }
             Ok(id)
         })
@@ -3457,23 +2717,21 @@ fn bundle(
         let mut available: Vec<BTreeSet<String>> = modules
             .iter()
             .map(|module| {
-                module["exports"]
-                    .as_array()
-                    .unwrap()
+                module
+                    .exports
                     .iter()
-                    .map(|export| export["name"].as_str().unwrap().to_owned())
+                    .map(|(name, _)| name.clone())
                     .collect()
             })
             .collect();
         let mut dynamic_stars: Vec<_> = modules
             .iter()
-            .map(|module| module["commonjs"] == true || module["preload"] == true)
+            .map(|module| module.commonjs || module.preload)
             .collect();
         loop {
             let mut changed = false;
             for (id, module) in modules.iter().enumerate() {
-                for star in module["stars"].as_array().unwrap() {
-                    let target = star.as_u64().unwrap() as usize;
+                for &target in &module.stars {
                     if dynamic_stars[target] && !dynamic_stars[id] {
                         dynamic_stars[id] = true;
                         changed = true;
@@ -3491,15 +2749,15 @@ fn bundle(
             }
         }
         for module in modules.iter() {
-            for import in module["imports"].as_array().unwrap() {
-                let target = import["id"].as_u64().unwrap() as usize;
-                let name = import["name"].as_str().unwrap();
+            for import in &module.imports {
                 ensure!(
-                    import["local"].is_null()
-                        || name == "*"
-                        || dynamic_stars[target]
-                        || available[target].contains(name),
-                    "Missing export {name} from {target}"
+                    import.local.is_none()
+                        || import.name == "*"
+                        || dynamic_stars[import.dep]
+                        || available[import.dep].contains(&import.name),
+                    "Missing export {} from {}",
+                    import.name,
+                    import.dep
                 );
             }
         }
@@ -3508,24 +2766,21 @@ fn bundle(
         let flat: Vec<bool> = (0..modules.len())
             .map(|id| {
                 let module = &modules[id];
-                module["linked"] == true
-                    && module["commonjs"] != true
-                    && module["preload"] != true
-                    && module["async"] == 0
+                module.linked
+                    && !module.commonjs
+                    && !module.preload
+                    && module.asynchronous == 0
                     && !dynamic_stars[id]
                     && !cyclic[id]
             })
             .collect();
-        let export_values: Vec<HashMap<&str, &str>> = modules
+        let export_values: Vec<HashMap<&str, &Export>> = modules
             .iter()
             .map(|module| {
-                module["exports"]
-                    .as_array()
-                    .unwrap()
+                module
+                    .exports
                     .iter()
-                    .filter_map(|export| {
-                        Some((export["name"].as_str()?, export["value"].as_str()?))
-                    })
+                    .map(|(name, export)| (name.as_str(), export))
                     .collect()
             })
             .collect();
@@ -3535,41 +2790,24 @@ fn bundle(
             for _ in 0..256 {
                 let module = &modules[dep];
                 through.push(dep);
-                if module["linked"] != true
-                    || module["commonjs"] == true
-                    || module["preload"] == true
-                {
+                if !module.linked || module.commonjs || module.preload {
                     break;
                 }
-                if let Some(value) = export_values[dep].get(name.as_str()) {
-                    let Some((target, rest)) = value.strip_prefix("$appsN").and_then(|value| {
-                        let digits = value
-                            .find(|c: char| !c.is_ascii_digit())
-                            .unwrap_or(value.len());
-                        Some((value[..digits].parse::<usize>().ok()?, &value[digits..]))
-                    }) else {
-                        break;
-                    };
-                    let next = if let Some(field) = rest.strip_prefix('.') {
-                        field.to_owned()
-                    } else if let Some(key) =
-                        rest.strip_prefix('[').and_then(|key| key.strip_suffix(']'))
-                    {
-                        serde_json::from_str::<String>(key).unwrap_or_default()
-                    } else {
-                        break;
-                    };
-                    (dep, name) = (target, next);
+                if let Some(export) = export_values[dep].get(name.as_str()) {
+                    match export {
+                        Export::Reexport(target, field) if field != "*" => {
+                            (dep, name) = (*target, field.clone())
+                        }
+                        _ => break,
+                    }
                 } else if name != "default"
                     && !dynamic_stars[dep]
-                    && let Some(star) = module["stars"]
-                        .as_array()
-                        .unwrap()
+                    && let Some(&star) = module
+                        .stars
                         .iter()
-                        .filter_map(Value::as_u64)
-                        .find(|&star| available[star as usize].contains(&name))
+                        .find(|&&star| available[star].contains(&name))
                 {
-                    dep = star as usize;
+                    dep = star;
                 } else {
                     break;
                 }
@@ -3596,14 +2834,13 @@ fn bundle(
             let mut stack = vec![(root, 0)];
             while let Some((id, next)) = stack.last_mut() {
                 let module = &modules[*id];
-                let imports = module["imports"].as_array().unwrap();
-                let target = imports
+                let target = module
+                    .imports
                     .get(*next)
-                    .map(|import| &import["id"])
-                    .or_else(|| module["stars"].get(*next - imports.len()));
+                    .map(|import| import.dep)
+                    .or_else(|| module.stars.get(*next - module.imports.len()).copied());
                 if let Some(target) = target {
                     *next += 1;
-                    let target = target.as_u64().unwrap() as usize;
                     if !seen[target] {
                         seen[target] = true;
                         stack.push((target, 0));
@@ -3617,47 +2854,49 @@ fn bundle(
         while let Some(id) = queue.pop_front() {
             pending[id] = false;
             let module = &modules[id];
-            let exports = module["exports"].as_array().unwrap();
-            let mut source = if module["commonjs"] == true {
+            let mut source = if module.commonjs {
                 format!(
                     "$appsFactory=function(exports,require,module,__filename,__dirname,$appsRequire,$appsImport){{\n{}\n}};",
-                    module["code"].as_str().unwrap()
+                    module.code
                 )
             } else {
-                let getters = exports
+                let getters = module
+                    .exports
                     .iter()
-                    .filter(|export| needed[id].contains(export["name"].as_str().unwrap()))
-                    .map(|export| {
+                    .filter(|(name, _)| needed[id].contains(name))
+                    .map(|(name, export)| {
                         format!(
                             "[{}]:{{enumerable:true,get:()=>({})}}",
-                            export["name"],
-                            export["value"].as_str().unwrap()
+                            json!(name),
+                            export.code()
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                let params = if module["linked"] == true {
-                    let deps = module["deps"].as_array().into_iter().flatten();
-                    deps.fold(String::from(",$appsImport,$appsRequire"), |params, dep| {
-                        params + ",$appsN" + &dep.to_string()
-                    })
+                let params = if module.linked {
+                    module
+                        .deps
+                        .iter()
+                        .fold(String::from(",$appsImport,$appsRequire"), |params, dep| {
+                            params + ",$appsN" + &dep.to_string()
+                        })
                 } else {
                     String::new()
                 };
                 format!(
                     "$appsFactory=function*($out,$appsBind{params}){{'use strict';$appsBind($out,{{{getters}}});yield;\n{}\n}};",
-                    module["code"].as_str().unwrap()
+                    module.code
                 )
             };
-            if module["async"] == 2 {
+            if module.asynchronous == 2 {
                 source = source.replacen("=function*(", "=async function*(", 1);
             }
             let allocator = Allocator::default();
             let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
             ensure!(
                 parsed.diagnostics.is_empty(),
-                "Invalid JavaScript in module {id} ({}): {:?}",
-                module["url"],
+                "Invalid JavaScript in module {id} ({:?}): {:?}",
+                module.url,
                 parsed.diagnostics
             );
             let result =
@@ -3667,9 +2906,8 @@ fn bundle(
             let eval = references.contains_key("eval");
             used_imports[id].clear();
             let mut requests = Vec::new();
-            let linked = module["linked"] == true;
             let mut uses = Uses(Vec::new());
-            if linked {
+            if module.linked {
                 uses.visit_program(&parsed.program);
                 for (target, name) in &uses.0 {
                     match name {
@@ -3686,38 +2924,37 @@ fn bundle(
                     }
                 }
             }
-            uses_of[id] = std::mem::take(&mut uses.0);
-            let uses = Uses(std::mem::take(&mut uses_of[id]));
-            for import in module["imports"].as_array().unwrap() {
-                let Some(local) = import["local"].as_str() else {
+            for import in &module.imports {
+                let Some(local) = &import.local else {
                     continue;
                 };
-                let target = import["id"].as_u64().unwrap() as usize;
-                let name = import["name"].as_str().unwrap();
-                if linked {
+                if module.linked {
                     if uses.0.iter().any(|(dep, used)| {
-                        *dep == target
-                            && (name == "*" || used.as_deref().is_none_or(|used| used == name))
+                        *dep == import.dep
+                            && (import.name == "*"
+                                || used.as_deref().is_none_or(|used| used == import.name))
                     }) {
-                        used_imports[id].insert(local.to_owned());
+                        used_imports[id].insert(local.clone());
                     }
-                } else if eval || references.contains_key(local) {
-                    used_imports[id].insert(local.to_owned());
-                    if name == "*" {
-                        whole[target] = true;
-                        requests
-                            .extend(available[target].iter().map(|name| (target, name.clone())));
+                } else if eval || references.contains_key(local.as_str()) {
+                    used_imports[id].insert(local.clone());
+                    if import.name == "*" {
+                        whole[import.dep] = true;
+                        requests.extend(
+                            available[import.dep]
+                                .iter()
+                                .map(|name| (import.dep, name.clone())),
+                        );
                     } else {
-                        requests.push((target, name.to_owned()));
+                        requests.push((import.dep, import.name.clone()));
                     }
                 }
             }
-            for star in module["stars"].as_array().unwrap() {
-                let target = star.as_u64().unwrap() as usize;
+            for &target in &module.stars {
                 for name in &needed[id] {
                     if name != "default"
                         && available[target].contains(name)
-                        && !exports.iter().any(|export| export["name"] == *name)
+                        && !export_values[id].contains_key(name.as_str())
                     {
                         requests.push((target, name.clone()));
                     }
@@ -3730,6 +2967,10 @@ fn bundle(
                 }
             }
             uses_of[id] = uses.0;
+            // WARNING: a flat module is printed after linking, so here its minified code only tells what it reads.
+            if flat[id] {
+                continue;
+            }
             let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.first()
             else {
                 bail!("Missing module factory: {id}");
@@ -3764,17 +3005,11 @@ fn bundle(
             }
         }
         let runs_imports = |id: usize| {
-            through.contains(&id)
-                && modules[id]["deps"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_u64)
-                    .any(|dep| modules[dep as usize]["pure"] != true)
+            through.contains(&id) && modules[id].deps.iter().any(|&dep| !modules[dep].pure)
         };
         let pruned: Vec<_> = (0..modules.len())
             .map(|id| {
-                modules[id]["pure"] == true
+                modules[id].pure
                     && needed[id].is_empty()
                     && !runs_imports(id)
                     && !whole[id]
@@ -3783,15 +3018,6 @@ fn bundle(
                     && !builder.dynamic.contains(&id)
             })
             .collect();
-        let ids = |module: &Value, field: &str| {
-            module[field]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_u64)
-                .map(|id| id as usize)
-                .collect::<Vec<_>>()
-        };
         let flat: Vec<bool> = (0..modules.len())
             .map(|id| flat[id] && !pruned[id])
             .collect();
@@ -3801,7 +3027,7 @@ fn bundle(
         }
         for (id, module) in modules.iter().enumerate() {
             if !pruned[id] && !flat[id] {
-                for dep in ids(module, "deps").into_iter().chain(ids(module, "stars")) {
+                for &dep in module.deps.iter().chain(&module.stars) {
                     namespaced[dep] = true;
                 }
             }
@@ -3809,34 +3035,35 @@ fn bundle(
         let mut slots: HashMap<(usize, String), (usize, bool)> = HashMap::new();
         let mut tails = vec![String::new(); modules.len()];
         for id in (0..modules.len()).filter(|&id| flat[id]) {
-            let late = late_writes(modules[id]["code"].as_str().unwrap())?;
             for name in &needed[id] {
                 if origin(id, name) != (id, name.clone()) {
                     continue;
                 }
-                let Some(value) = export_values[id].get(name.as_str()) else {
+                let Some(export) = export_values[id].get(name.as_str()) else {
                     continue;
                 };
                 let slot = slots.len();
-                let live = late.contains(*value);
+                let live =
+                    matches!(export, Export::Local(local) if modules[id].live.contains(local));
                 slots.insert((id, name.clone()), (slot, live));
                 let _ = write!(
                     tails[id],
-                    "$appsS[{slot}]={}{value};",
-                    if live { "()=>" } else { "" }
+                    "$appsS[{slot}]={}{};",
+                    if live { "()=>" } else { "" },
+                    export.code()
                 );
             }
         }
         let mut arguments: Vec<Vec<Option<usize>>> = vec![Vec::new(); modules.len()];
         for id in (0..modules.len()).filter(|&id| flat[id]) {
             let module = &modules[id];
-            let source = format!("{}\n;{}", module["code"].as_str().unwrap(), tails[id]);
+            let source = format!("{}\n;{}", module.code, tails[id]);
             let allocator = Allocator::default();
             let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
             ensure!(
                 parsed.diagnostics.is_empty(),
-                "Invalid JavaScript in module {id} ({}): {:?}",
-                module["url"],
+                "Invalid JavaScript in module {id} ({:?}): {:?}",
+                module.url,
                 parsed.diagnostics
             );
             let mut linker = Slots {
@@ -3852,24 +3079,32 @@ fn bundle(
                 params + ",$appsN" + &dep.to_string()
             });
             let declared = linker.namespaces.into_iter().collect::<Vec<_>>();
-            let body = Codegen::new().build(&parsed.program).code;
-            let source = format!(
-                "$appsFactory=function($appsS,$appsImport,$appsRequire{params}){{'use strict';\n{body}\n}};"
-            );
-            let allocator = Allocator::default();
-            let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
-            ensure!(
-                parsed.diagnostics.is_empty(),
-                "Invalid linked JavaScript in module {id} ({}): {:?}",
-                module["url"],
-                parsed.diagnostics
-            );
-            let result =
-                Minifier::new(MinifierOptions::default()).minify(&allocator, &mut parsed.program);
+            // WARNING: the linked body moves into the factory as AST, so it is not printed and parsed again.
+            let factory = allocator.alloc_str(&format!(
+                "$appsFactory=function($appsS,$appsImport,$appsRequire{params}){{'use strict';}};"
+            ));
+            let mut program = Parser::new(&allocator, factory, SourceType::cjs())
+                .parse()
+                .program;
+            let Some(Statement::ExpressionStatement(statement)) = program.body.first_mut() else {
+                bail!("Missing module factory: {id}");
+            };
+            let Expression::AssignmentExpression(assignment) = &mut statement.expression else {
+                bail!("Invalid module factory: {id}");
+            };
+            let Expression::FunctionExpression(function) = &mut assignment.right else {
+                bail!("Invalid module factory: {id}");
+            };
+            function
+                .body
+                .as_mut()
+                .context("Missing module factory body")?
+                .statements = parsed.program.body;
+            let result = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
             // WARNING: the linker also saw reads in dead code, of modules that may be pruned, so only what the
             // minifier kept gets an argument. Parameters stay in place, so the others get nothing.
             let mut kept = Uses(Vec::new());
-            kept.visit_program(&parsed.program);
+            kept.visit_program(&program);
             let kept: BTreeSet<usize> = kept.0.into_iter().map(|(dep, _)| dep).collect();
             for &dep in &kept {
                 namespaced[dep] = true;
@@ -3881,8 +3116,7 @@ fn bundle(
             while arguments[id].last() == Some(&None) {
                 arguments[id].pop();
             }
-            let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.first()
-            else {
+            let Some(Statement::ExpressionStatement(statement)) = program.body.first() else {
                 bail!("Missing module factory: {id}");
             };
             let Expression::AssignmentExpression(assignment) = &statement.expression else {
@@ -3903,7 +3137,7 @@ fn bundle(
         // WARNING: an import that skips a pruned barrel still needs its origin to run, in the barrel's place.
         let linked_deps = |id: usize| -> Vec<usize> {
             let mut deps = Vec::new();
-            for dep in ids(&modules[id], "deps") {
+            for &dep in &modules[id].deps {
                 if pruned[dep] {
                     deps.extend(uses_of[id].iter().filter_map(|(target, name)| {
                         if *target != dep {
@@ -3928,13 +3162,16 @@ fn bundle(
             let deps: Vec<_> = if flat[id] {
                 linked_deps(id).into_iter().map(Some).collect()
             } else {
-                ids(module, "deps")
-                    .into_iter()
-                    .map(|dep| (!pruned[dep]).then_some(dep))
+                module
+                    .deps
+                    .iter()
+                    .map(|&dep| (!pruned[dep]).then_some(dep))
                     .collect()
             };
-            let stars: Vec<_> = ids(module, "stars")
-                .into_iter()
+            let stars: Vec<_> = module
+                .stars
+                .iter()
+                .copied()
                 .filter(|&star| !pruned[star] && !flat[id])
                 .collect();
             if !deps.is_empty() {
@@ -3964,32 +3201,38 @@ fn bundle(
             if !stars.is_empty() {
                 let _ = write!(line, ",stars:{}", json!(stars));
             }
-            if module["preload"] == true {
+            if module.preload {
                 line.push_str(",preload:1");
             }
-            if module["commonjs"] == true {
+            if module.commonjs {
                 line.push_str(",commonjs:1");
-                for field in ["file", "resolved"] {
-                    if !module[field].is_null() {
-                        let _ = write!(line, ",{field}:{}", ascii_json(&module[field])?);
-                    }
+                if let Some(file) = &module.file {
+                    let _ = write!(line, ",file:{}", ascii_json(&json!(file))?);
+                }
+                if !module.resolved.is_empty() {
+                    let _ = write!(
+                        line,
+                        ",resolved:{}",
+                        ascii_json(&Value::Object(module.resolved.clone()))?
+                    );
                 }
             }
-            if module["async"] != 0 {
-                let _ = write!(line, ",async:{}", module["async"]);
+            if module.asynchronous != 0 {
+                let _ = write!(line, ",async:{}", module.asynchronous);
             }
             let mut factory = std::mem::take(&mut factories[id]);
-            if module["linked"] == false && module["commonjs"] == false {
-                let imports: Vec<_> = module["imports"]
-                    .as_array()
-                    .unwrap()
+            if !module.linked && !module.commonjs {
+                let imports: Vec<_> = module
+                    .imports
                     .iter()
                     .filter(|import| {
-                        import["local"]
-                            .as_str()
+                        import
+                            .local
+                            .as_ref()
                             .is_some_and(|local| used_imports[id].contains(local))
-                            && !pruned[import["id"].as_u64().unwrap() as usize]
+                            && !pruned[import.dep]
                     })
+                    .map(Import::json)
                     .collect();
                 let _ = write!(
                     line,
@@ -3997,22 +3240,20 @@ fn bundle(
                     ascii_json(&json!(imports))?
                 );
                 factory = format!("function($scope){{with($scope)return {factory}}}");
-            } else if realm == Realm::Renderer
-                && builder.shared.preload.is_some()
-                && module["linked"] == true
+            } else if realm == Realm::Renderer && builder.shared.preload.is_some() && module.linked
             {
-                let imports: Vec<_> = module["imports"]
-                    .as_array()
-                    .unwrap()
+                let imports: Vec<_> = module
+                    .imports
                     .iter()
                     .filter(|import| {
-                        let target = import["id"].as_u64().unwrap() as usize;
-                        dynamic_stars[target]
-                            && !pruned[target]
-                            && import["local"]
-                                .as_str()
+                        dynamic_stars[import.dep]
+                            && !pruned[import.dep]
+                            && import
+                                .local
+                                .as_ref()
                                 .is_some_and(|local| used_imports[id].contains(local))
                     })
+                    .map(Import::json)
                     .collect();
                 if !imports.is_empty() {
                     let _ = write!(line, ",imports:{}", ascii_json(&json!(imports))?);
@@ -4047,16 +3288,8 @@ fn bundle(
                 if flat[id] {
                     stack.extend(linked_deps(id));
                 }
-                stack.extend(
-                    ids(&modules[id], "deps")
-                        .into_iter()
-                        .chain(ids(&modules[id], "required")),
-                );
-                groups.extend(
-                    ids(&modules[id], "imported")
-                        .into_iter()
-                        .map(|target| vec![target]),
-                );
+                stack.extend(modules[id].deps.iter().chain(&modules[id].required));
+                groups.extend(modules[id].imported.iter().map(|&target| vec![target]));
             }
             if chunks.is_empty() || !members.is_empty() {
                 members.sort_unstable();
@@ -4142,10 +3375,18 @@ fn collect_files(
     if !native.is_empty() {
         files.insert("native.json".into(), serde_json::to_string(&native)?);
     }
-    let assets: std::collections::BTreeMap<_, _> = sources
-        .iter()
-        .filter_map(|path| Some((asset_name(root, path)?, path.clone())))
-        .collect();
+    let mut assets = std::collections::BTreeMap::new();
+    for path in sources.iter() {
+        if let Some(name) = asset_name(root, path)
+            && let Some(previous) = assets.insert(name.clone(), path.clone())
+        {
+            bail!(
+                "Asset output collision at {name}: {} and {}",
+                previous.display(),
+                path.display()
+            );
+        }
+    }
     if !assets.is_empty() {
         files.insert("assets.json".into(), serde_json::to_string(&assets)?);
     }
@@ -4439,6 +3680,8 @@ fn asset(
     if let Some(base) = remote_base(directory) {
         return base.join(reference).ok().map(String::from);
     }
+    // WARNING: like browsers, `\` is `/`, so `\x.png` is in the app folder too.
+    let reference = reference.replace('\\', "/");
     if reference.starts_with("//") {
         return None;
     }
@@ -4740,16 +3983,26 @@ fn html(
 }
 
 fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
-    // WARNING: like a web server root, `/x` is the app folder, and a path from it cannot leave it.
+    // WARNING: like browsers, `\` is `/`. Like a web server root, `/x` is the app folder, and a path from it or an
+    // absolute path, like `C:/x` on Windows, cannot leave it.
+    let reference = reference.replace('\\', "/");
+    let rooted = !matches!(
+        Path::new(&reference).components().next(),
+        Some(
+            std::path::Component::Normal(_)
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir
+        )
+    );
     let path = match reference.strip_prefix('/') {
         Some(rest) => root.join(rest),
-        None => directory.join(reference),
+        None => directory.join(&reference),
     };
     let path = path
         .canonicalize()
         .with_context(|| format!("Cannot find {reference} from {}", directory.display()))?;
     ensure!(
-        !reference.starts_with('/') || path.starts_with(root),
+        !rooted || path.starts_with(root),
         "{reference} is outside the app folder"
     );
     Ok(path)

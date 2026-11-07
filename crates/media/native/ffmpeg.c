@@ -350,7 +350,9 @@ int apps_ffmpeg_pixels(AppsMedia *m, uint8_t *pixels) {
 
 int apps_ffmpeg_seek(AppsMedia *m, double time) {
   int64_t start = m->format->start_time == AV_NOPTS_VALUE ? 0 : m->format->start_time;
-  int64_t target = (int64_t)(time * AV_TIME_BASE) + start;
+  // WARNING: a double outside the int64_t range is undefined behavior when converted, and so is a signed overflow.
+  int64_t target = (int64_t)(fmin(fmax(time, 0), 1e9) * AV_TIME_BASE);
+  target = start > INT64_MAX - target ? INT64_MAX : target + start;
   int status = avformat_seek_file(m->format, -1, INT64_MIN, target, target, 0);
   if (status < 0) status = avformat_seek_file(m->format, -1, INT64_MIN, target, INT64_MAX, 0);
   clear(&m->video);

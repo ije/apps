@@ -191,44 +191,20 @@ impl State {
                 let wake = crate::host::Waker::current();
                 let task = crate::web::network()?.spawn(async move {
                     let result = async {
-                        let (socket, response) = if renderer {
-                            let hostname = url
-                                .host_str()
-                                .context("Missing WebSocket host")?
-                                .trim_matches(['[', ']']);
-                            let addresses: Vec<_> = tokio::net::lookup_host((
-                                hostname,
-                                url.port_or_known_default()
-                                    .context("Missing WebSocket port")?,
-                            ))
-                            .await?
-                            .collect();
-                            ensure!(
-                                !addresses.is_empty()
-                                    && (crate::web::own_server(&url)
-                                        || !addresses.iter().any(|address| {
-                                            crate::web::private_address(address.ip())
-                                        })),
-                                "Pages cannot access private networks"
-                            );
-                            let stream =
-                                tokio::net::TcpStream::connect(addresses.as_slice()).await?;
-                            tokio_tungstenite::client_async_tls_with_config(
-                                request,
-                                stream,
-                                Some(limits()),
-                                Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
-                            )
-                            .await?
-                        } else {
-                            tokio_tungstenite::connect_async_tls_with_config(
-                                request,
-                                Some(limits()),
-                                false,
-                                Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
-                            )
-                            .await?
-                        };
+                        let stream = crate::web::connect(
+                            url.host_str().context("Missing WebSocket host")?,
+                            url.port_or_known_default()
+                                .context("Missing WebSocket port")?,
+                            renderer,
+                        )
+                        .await?;
+                        let (socket, response) = tokio_tungstenite::client_async_tls_with_config(
+                            request,
+                            stream,
+                            Some(limits()),
+                            Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
+                        )
+                        .await?;
                         let protocol = response
                             .headers()
                             .get("sec-websocket-protocol")

@@ -11,10 +11,7 @@ pub(crate) mod worker;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http_body_util::BodyExt;
-use hyper_util::client::legacy::{
-    Client,
-    connect::{HttpConnector, dns::Name},
-};
+use hyper_util::client::legacy::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -109,14 +106,11 @@ pub(crate) fn tls() -> Arc<rustls::ClientConfig> {
 }
 
 pub fn download(url: &str) -> Result<Vec<u8>> {
-    let mut http = HttpConnector::new_with_resolver(Dns(false));
-    http.enforce_http(false);
-    http.set_connect_timeout(Some(Duration::from_secs(30)));
     let client: Client<_, http_body_util::Empty<bytes::Bytes>> = Client::builder(
         hyper_util::rt::TokioExecutor::new(),
     )
     .build(hyper_rustls::HttpsConnector::new(
-        http,
+        Connector(false),
         tls(),
         false,
         Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
@@ -157,22 +151,27 @@ pub(crate) fn base64(bytes: &[u8]) -> Value {
     crate::jsc::payload::write(bytes::Bytes::copy_from_slice(bytes))
 }
 
-static LISTENING: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+static LISTENING: std::sync::Mutex<Vec<std::net::SocketAddr>> = std::sync::Mutex::new(Vec::new());
 
-pub(crate) struct Listening(u16);
+pub(crate) struct Listening(std::net::SocketAddr);
 
 impl Listening {
-    pub(crate) fn new(port: u16) -> Self {
-        LISTENING.lock().unwrap().push(port);
-        Self(port)
+    pub(crate) fn new(address: std::net::SocketAddr) -> Self {
+        LISTENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(address);
+        Self(address)
     }
 }
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        let mut ports = LISTENING.lock().unwrap();
-        if let Some(index) = ports.iter().position(|&port| port == self.0) {
-            ports.swap_remove(index);
+        let mut addresses = LISTENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = addresses.iter().position(|&address| address == self.0) {
+            addresses.swap_remove(index);
         }
     }
 }
@@ -183,22 +182,64 @@ pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// WARNING: pages can't reach private networks, but they may reach loopback ports that this app listens on, so a page
-// can call the app's own server.
-pub(crate) fn own_server(url: &Url) -> bool {
-    if LOCAL_NETWORK.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
+// WARNING: pages can't reach private networks, except a loopback address and port that one of this app's servers is
+// bound to, so a page can call the app's own server but not another process on another loopback address. Every page
+// connection, redirects included, resolves the host first and checks each address, so DNS can't point it elsewhere.
+pub(crate) async fn connect(
+    host: &str,
+    port: u16,
+    restricted: bool,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let mut addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+        .await?
+        .collect();
+    if restricted && !LOCAL_NETWORK.load(std::sync::atomic::Ordering::Relaxed) {
+        let listening = LISTENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        addresses.retain(|address| {
+            !private_address(address.ip())
+                || address.ip().is_loopback()
+                    && listening.iter().any(|bound| {
+                        bound.port() == address.port()
+                            && (bound.ip() == address.ip()
+                                || bound.ip().is_unspecified()
+                                    && bound.is_ipv4() == address.is_ipv4())
+                    })
+        });
+        if addresses.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Pages cannot access private networks",
+            ));
+        }
     }
-    let loopback = match url.host() {
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
+    use futures_util::future::{Either, select};
+    let ipv6 = addresses
+        .first()
+        .ok_or(std::io::ErrorKind::NotFound)?
+        .is_ipv6();
+    let (preferred, other): (Vec<_>, Vec<_>) = addresses
+        .into_iter()
+        .partition(|address| address.is_ipv6() == ipv6);
+    // WARNING: like hyper's connector, the other address family starts after 300 ms, so a broken IPv6 route can't
+    // stall the connection.
+    let mut first = std::pin::pin!(tokio::net::TcpStream::connect(preferred.as_slice()));
+    let stream = match tokio::time::timeout(Duration::from_millis(300), &mut first).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) if other.is_empty() => return Err(error),
+        Ok(Err(_)) => tokio::net::TcpStream::connect(other.as_slice()).await?,
+        Err(_) if other.is_empty() => first.await?,
+        Err(_) => {
+            let second = std::pin::pin!(tokio::net::TcpStream::connect(other.as_slice()));
+            match select(first, second).await {
+                Either::Left((Ok(stream), _)) | Either::Right((Ok(stream), _)) => stream,
+                Either::Left((Err(_), rest)) | Either::Right((Err(_), rest)) => rest.await?,
+            }
+        }
     };
-    loopback
-        && url
-            .port_or_known_default()
-            .is_some_and(|port| LISTENING.lock().unwrap().contains(&port))
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
@@ -239,15 +280,15 @@ pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
 }
 
 type Agent = Client<
-    hyper_rustls::HttpsConnector<HttpConnector<Dns>>,
+    hyper_rustls::HttpsConnector<Connector>,
     http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, std::io::Error>,
 >;
 
 #[derive(Clone)]
-struct Dns(bool);
+struct Connector(bool);
 
-impl tower_service::Service<Name> for Dns {
-    type Response = std::vec::IntoIter<std::net::SocketAddr>;
+impl tower_service::Service<hyper::Uri> for Connector {
+    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
     type Error = std::io::Error;
     type Future = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Self::Response>> + Send>>;
 
@@ -258,23 +299,22 @@ impl tower_service::Service<Name> for Dns {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, name: Name) -> Self::Future {
-        let public = self.0;
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let restricted = self.0;
         Box::pin(async move {
-            let addresses: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            if public
-                && !LOCAL_NETWORK.load(std::sync::atomic::Ordering::Relaxed)
-                && (addresses.is_empty()
-                    || addresses
-                        .iter()
-                        .any(|address| private_address(address.ip())))
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Pages cannot access private networks",
-                ));
-            }
-            Ok(addresses.into_iter())
+            let host = uri.host().ok_or(std::io::ErrorKind::InvalidInput)?;
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
+            let stream =
+                tokio::time::timeout(Duration::from_secs(30), connect(host, port, restricted))
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+            Ok(hyper_util::rt::TokioIo::new(stream))
         })
     }
 }
@@ -304,7 +344,6 @@ pub struct State {
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
     agent: Option<Agent>,
-    local: Option<Agent>,
 }
 
 impl State {
@@ -457,23 +496,19 @@ impl State {
                 let redirect = args[0]["redirect"].as_str().unwrap_or("follow").to_owned();
                 let network = network()?;
                 let renderer = self.renderer;
-                let agent = |restricted| {
-                    let mut http = HttpConnector::new_with_resolver(Dns(restricted));
-                    http.enforce_http(false);
-                    http.set_nodelay(true);
-                    http.set_connect_timeout(Some(Duration::from_secs(30)));
-                    Client::builder(hyper_util::rt::TokioExecutor::new())
-                        .pool_timer(hyper_util::rt::TokioTimer::new())
-                        .build(hyper_rustls::HttpsConnector::new(
-                            http,
-                            tls(),
-                            false,
-                            Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
-                        ))
-                };
-                let local = (renderer && own_server(&url))
-                    .then(|| self.local.get_or_insert_with(|| agent(false)).clone());
-                let agent = self.agent.get_or_insert_with(|| agent(renderer)).clone();
+                let agent = self
+                    .agent
+                    .get_or_insert_with(|| {
+                        Client::builder(hyper_util::rt::TokioExecutor::new())
+                            .pool_timer(hyper_util::rt::TokioTimer::new())
+                            .build(hyper_rustls::HttpsConnector::new(
+                                Connector(renderer),
+                                tls(),
+                                false,
+                                Arc::new(hyper_rustls::DefaultServerNameResolver::default()),
+                            ))
+                    })
+                    .clone();
                 let (events_tx, events) = mpsc::channel(64);
                 let (demand, mut demand_rx) = mpsc::channel(1);
                 let (upload, upload_rx) = mpsc::channel::<Option<bytes::Bytes>>(16);
@@ -484,14 +519,6 @@ impl State {
                         if upload_rx.is_some() { for _ in 0..16 { if events_tx.send(json!({"kind":"upload"}).into()).await.is_err() { return Ok(()); } } wake.wake(); }
                         let mut redirects = 0;
                         let response = loop {
-                            if renderer {
-                                let ip = match url.host() {
-                                    Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
-                                    Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
-                                    _ => None,
-                                };
-                                ensure!(own_server(&url) || !ip.is_some_and(private_address), "Pages cannot access private networks");
-                            }
                             let mut request = hyper::Request::builder().method(method.as_bytes()).uri(url.as_str());
                             for (name, value) in &headers { request = request.header(name, value); }
                             let has = |name: &str| headers.iter().any(|(key, _)| key.eq_ignore_ascii_case(name));
@@ -507,7 +534,7 @@ impl State {
                                     Some((Ok::<_, std::io::Error>(hyper::body::Frame::data(chunk)), (receiver, sender)))
                                 })).boxed_unsync()
                             } else { http_body_util::Full::new(body.clone()).map_err(|never| match never {}).boxed_unsync() };
-                            let response = match &local { Some(local) if own_server(&url) => local, _ => &agent }.request(request.body(request_body)?).await?;
+                            let response = agent.request(request.body(request_body)?).await?;
                             let status = response.status().as_u16();
                             if !matches!(status, 301 | 302 | 303 | 307 | 308) { break response; }
                             ensure!(redirect != "error", "Redirect is not allowed");

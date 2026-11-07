@@ -1373,3 +1373,46 @@ fn custom_utilities_never_expand_forever() {
         ],
     );
 }
+
+#[test]
+fn fanned_out_utilities_expand_once_and_stay_bounded() {
+    let mut author = String::new();
+    for level in 0..=12 {
+        for name in ["a", "b", "c"] {
+            let body = if level == 12 {
+                "color: red;".to_owned()
+            } else {
+                let next = level + 1;
+                format!("@apply a{next} b{next} c{next};")
+            };
+            let _ = write!(author, "@utility {name}{level} {{ {body} }}");
+        }
+    }
+    let start = std::time::Instant::now();
+    let css = generated(&author, &["a0", "a10"]);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(css[0], "");
+    assert_eq!(css[1].matches("color:red;").count(), 9);
+}
+
+#[test]
+fn inserts_at_one_spot_keep_the_generated_sheets() {
+    let mut doc = Document::parse("<p class='w-[000px] w-[999px]'></p>");
+    let p = id(&doc, "p");
+    let order: Vec<(u32, u32)> = (0..doc.nodes.len() as u32)
+        .map(|id| (id, u32::MAX))
+        .collect();
+    let base = Rc::new(super::Stylesheet::parse("@import 'tailwindcss/utilities';"));
+    let mut compiler = super::Compiler::default();
+    compiler.update(&mut vec![base.clone()], &doc, &order);
+    for step in 1..=40 {
+        doc.nodes[p]
+            .attrs
+            .set("class", &format!("w-[000px] w-[999px] w-[{step:03}px]"));
+        let update = compiler
+            .update(&mut vec![base.clone()], &doc, &order)
+            .unwrap();
+        assert!(update.replaced.is_empty(), "step {step}");
+        assert_eq!(update.rules.len(), 1, "step {step}");
+    }
+}

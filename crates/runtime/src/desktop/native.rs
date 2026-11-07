@@ -24,9 +24,14 @@ pub(crate) fn theme_state() -> u32 {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn observe() {
+    // WARNING: native events arrive on any thread, so they wake the main side through its own waker.
+    static WAKER: std::sync::OnceLock<crate::host::Waker> = std::sync::OnceLock::new();
     extern "C" fn wake() {
-        crate::host::Waker::current().wake();
+        if let Some(waker) = WAKER.get() {
+            waker.wake();
+        }
     }
+    let _ = WAKER.set(crate::host::Waker::current());
     unsafe { apps_theme_observe(wake) };
 }
 
@@ -225,6 +230,10 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "tray.getIgnoreDoubleClick" => {}
         "menu.popup" => {
             validate_menu(&arguments["template"])?;
+            ensure!(
+                arguments["request"].as_u64().is_some_and(|id| id > 0),
+                "Expected menu popup id"
+            );
             for name in ["x", "y"] {
                 ensure!(
                     arguments

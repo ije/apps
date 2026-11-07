@@ -13,9 +13,17 @@ mod window;
 use crate::{Bounds, CursorStyle, Pixels, WindowOptions, app::Callbacks, point, px, size};
 use anyhow::Result;
 use core_foundation::string::CFStringRef;
-use dispatch2::{
-    DispatchObject as _, DispatchQueue, DispatchRetained, DispatchSource, DispatchTime,
+use core_foundation_sys::{
+    base::{CFRelease, kCFAllocatorDefault},
+    date::CFAbsoluteTimeGetCurrent,
+    runloop::{
+        CFRunLoopAddSource, CFRunLoopAddTimer, CFRunLoopGetMain, CFRunLoopSourceContext,
+        CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopTimerContext,
+        CFRunLoopTimerCreate, CFRunLoopTimerRef, CFRunLoopTimerSetTolerance, CFRunLoopWakeUp,
+        kCFRunLoopCommonModes,
+    },
 };
+use dispatch2::DispatchQueue;
 use objc2::{
     Encode, Encoding, MainThreadMarker, RefEncode, class, msg_send,
     rc::{Retained, autoreleasepool},
@@ -148,15 +156,45 @@ impl<T> Sendable<T> {
     }
 }
 
+// WARNING: the main thread's work runs from a run loop source in the common modes, and not from the
+// main dispatch queue, which AppKit doesn't serve in a loop nested in one of its blocks. So menus,
+// popups and modal panels that a main script opens don't stop windows, IPC and timers.
+fn main_source() -> CFRunLoopSourceRef {
+    static SOURCE: OnceLock<usize> = OnceLock::new();
+    *SOURCE.get_or_init(|| {
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: run_main,
+        };
+        // SAFETY: the source lives for the whole process, and run loop calls are thread safe.
+        unsafe {
+            let source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &mut context);
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+            source as usize
+        }
+    }) as CFRunLoopSourceRef
+}
+
 pub(crate) fn native_post(f: Task) {
     MAIN.push(f);
     if !MAIN_QUEUED.swap(true, Ordering::AcqRel) {
-        // SAFETY: `run_main` ignores its context.
-        unsafe { DispatchQueue::main().exec_async_f(std::ptr::null_mut(), run_main) };
+        // SAFETY: the source is valid, and signaling it is thread safe.
+        unsafe {
+            CFRunLoopSourceSignal(main_source());
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
     }
 }
 
-extern "C" fn run_main(_: *mut c_void) {
+extern "C" fn run_main(_: *const c_void) {
     MAIN_QUEUED.store(false, Ordering::Release);
     while let Some(task) = MAIN.pop() {
         autoreleasepool(|_| task());
@@ -428,6 +466,7 @@ impl Platform {
 
     pub fn run(&self, on_launch: Box<dyn FnOnce()>) {
         LAUNCH.with_borrow_mut(|launch| *launch = Some(on_launch));
+        main_source();
         let marker = MainThreadMarker::new().expect("the app must start on the main thread");
         let app = NSApplication::sharedApplication(marker);
         // SAFETY: the delegate is a fresh instance of a registered NSResponder subclass.
@@ -521,33 +560,36 @@ pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
-    // WARNING: `dispatch_after` lets a timer fire a tenth of its delay late (300 ms for a 3 s
-    // `setTimeout`), so a timer source with a 1 ms leeway runs it.
-    // SAFETY: a timer source, which needs no handle or mask, on the main queue of this thread.
-    let source = unsafe {
-        DispatchSource::new(
-            &raw const dispatch2::_dispatch_source_type_timer as _,
-            0,
-            0,
-            Some(DispatchQueue::main()),
-        )
-    };
-    let when = DispatchTime::NOW.time(delay.as_nanos().min(i64::MAX as u128) as i64);
-    source.set_timer(when, DispatchTime::FOREVER.0, 1_000_000);
+    // WARNING: a run loop timer in the common modes fires in nested loops too, like `native_post`.
+    // `dispatch_after` would also fire a tenth of its delay late (300 ms for a 3 s `setTimeout`).
     let f: Box<dyn FnOnce()> = Box::new(f);
-    let context = Box::into_raw(Box::new((f, source.clone()))) as *mut c_void;
-    // SAFETY: `fire` takes back the box on its one event, on the main queue of this thread.
-    unsafe { source.set_context(context) };
-    source.set_event_handler_f(fire);
-    source.resume();
+    let mut context = CFRunLoopTimerContext {
+        version: 0,
+        info: Box::into_raw(Box::new(f)) as *mut c_void,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    // SAFETY: a one-shot timer on this thread's run loop, which keeps it until it fires.
+    unsafe {
+        let timer = CFRunLoopTimerCreate(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + delay.as_secs_f64(),
+            0.,
+            0,
+            0,
+            fire,
+            &mut context,
+        );
+        CFRunLoopTimerSetTolerance(timer, 0.001);
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        CFRelease(timer as _);
+    }
 }
 
-extern "C" fn fire(context: *mut c_void) {
-    // SAFETY: the context is the box made by `run_after`, and the source fires once.
-    let (f, source) = *unsafe {
-        Box::from_raw(context as *mut (Box<dyn FnOnce()>, DispatchRetained<DispatchSource>))
-    };
-    source.cancel();
+extern "C" fn fire(_: CFRunLoopTimerRef, context: *mut c_void) {
+    // SAFETY: the context is the box made by `native_after`, and a one-shot timer fires once.
+    let f = unsafe { Box::from_raw(context as *mut Box<dyn FnOnce()>) };
     f();
 }
 

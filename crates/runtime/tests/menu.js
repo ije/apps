@@ -104,4 +104,13 @@
   events.push({ type: 'tray', id: secondId, event: 'right-click' });
   shell.poll();
   assert(!actions.includes('stale'), 'Discard events for destroyed trays');
+
+  const seen = [], context = Menu.buildFromTemplate([{ label: 'Pick', click: () => seen.push('pick') }]);
+  context.on('menu-will-show', () => seen.push('show')).on('menu-will-close', () => seen.push('close'));
+  context.popup({ x: 1, y: 2, callback: () => seen.push('callback') });
+  const request = calls.at(-1)[1];
+  assert(calls.at(-1)[0] === 'native.menu.popup' && request.request > 0 && request.x === 1 && seen.join() === 'show' && shell.pending(), 'Menu.popup returns before the menu closes');
+  events.push({ type: 'menu', id: request.template[0].click }, { type: 'popup', id: request.request }, { type: 'menu', id: request.template[0].click });
+  shell.poll();
+  assert(seen.join() === 'show,pick,close,callback', 'Popup clicks, close and callback reach their menu once');
 })();

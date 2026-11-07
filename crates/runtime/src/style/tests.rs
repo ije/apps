@@ -3334,3 +3334,311 @@ fn node_lengths_share_equal_values() {
     assert!(lengths.get(6).is_none());
     assert_eq!(lengths.list_len(), 2);
 }
+
+fn incremental(
+    doc: &Document,
+    cache: &mut StyleCache,
+    last: &mut Option<Rc<ComputedStyles>>,
+    viewport: [f32; 2],
+) -> Rc<ComputedStyles> {
+    let context = StyleContext {
+        previous: last.clone(),
+        incremental: true,
+        ..Default::default()
+    };
+    let out = Rc::new(compute_styles(
+        doc,
+        viewport[0],
+        viewport[1],
+        None,
+        &mut HashMap::new(),
+        cache,
+        Some(&context),
+    ));
+    cache.finish();
+    *last = Some(out.clone());
+    out
+}
+
+#[test]
+fn new_containers_restyle_the_descendants_that_query_them() {
+    let mut doc = Document::parse(
+        "<style>.wrap.on{container-type:inline-size}.inner.on{container:card/inline-size}
+        @container (max-width:300px){.item{color:red}}@container card (min-width:100px){.named{width:7px}}</style>
+        <div class=wrap><section class=inner><div><p class='item named'>x</p></div></section></div>",
+    );
+    let [wrap, inner, item] = [".wrap", ".inner", ".item"].map(|selector| element(&doc, selector));
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let color = |out: &ComputedStyles| out.values[item].get(Prop::COLOR).map(str::to_owned);
+    let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert_ne!(color(&out).as_deref(), Some("red"));
+    doc.nodes[wrap].attrs.set("class", "wrap on");
+    incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert!(cache.set_containers(&HashMap::from([(wrap, [200., 50.])]), &doc));
+    let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert_eq!(color(&out).as_deref(), Some("red"));
+    assert!(!out.values[item].contains(Prop::WIDTH));
+    doc.nodes[inner].attrs.set("class", "inner on");
+    incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    let sizes = HashMap::from([(wrap, [200., 50.]), (inner, [150., 40.])]);
+    cache.set_containers(&sizes, &doc);
+    let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert_eq!(color(&out).as_deref(), Some("red"));
+    assert_eq!(out.values[item].get(Prop::WIDTH), Some("7px"));
+    let mut fresh = StyleCache {
+        containers: sizes,
+        ..Default::default()
+    };
+    let reference = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut fresh,
+        None,
+    );
+    assert_eq!(out.values, reference.values);
+    doc.nodes[wrap].attrs.set("class", "wrap");
+    doc.nodes[inner].attrs.set("class", "inner");
+    let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert_ne!(color(&out).as_deref(), Some("red"));
+    assert!(!out.values[item].contains(Prop::WIDTH));
+}
+
+#[test]
+fn absolute_parent_sizes_turn_off_the_monospace_quirk_for_cached_children() {
+    let mut doc = Document::parse("<div id=d><code>x</code></div>");
+    let [div, code] = ["#d", "code"].map(|selector| element(&doc, selector));
+    let mut cache = StyleCache::default();
+    let first = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert_eq!(first.lengths[code].font.em, 13.);
+    doc.nodes[div].inline = Some(Declarations::parse("font-size:16px"));
+    let out = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert_eq!(out.lengths[code].font.em, 16.);
+    assert_eq!(out.values[code].get(Prop::FONT_SIZE), Some("16px"));
+}
+
+#[test]
+fn filtered_custom_property_lists_are_released() {
+    let mut doc = Document::parse(
+        "<style>@property --q{syntax:'*';inherits:false}</style><div id=box><p><span>x</span></p></div>",
+    );
+    let (block, span) = (element(&doc, "#box"), element(&doc, "span"));
+    let mut cache = StyleCache::default();
+    for step in 0..20 {
+        doc.nodes[block].inline = Some(Declarations::parse(&format!("--p:{step};--q:{step}")));
+        let out = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut cache,
+            None,
+        );
+        assert_eq!(out.vars[span].len(), 1);
+        cache.finish();
+    }
+    cache.trim(doc.nodes.len());
+    compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    cache.finish();
+    assert!(cache.inheritable.len() <= 4, "{}", cache.inheritable.len());
+}
+
+#[test]
+fn text_and_scrollbar_properties_inherit_like_css() {
+    let doc = Document::parse(
+        "<pre style='font-variant-ligatures:none;font-kerning:none;scrollbar-color:red blue;text-align-last:center;text-wrap-mode:nowrap;white-space-collapse:preserve;-webkit-text-stroke-width:1px;writing-mode:vertical-rl;caption-side:bottom;width:9px'><span>a != b</span></pre>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let span = &computed[element(&doc, "span")];
+    for (name, value) in [
+        ("font-variant-ligatures", "none"),
+        ("font-kerning", "none"),
+        ("scrollbar-color", "red blue"),
+        ("text-align-last", "center"),
+        ("text-wrap-mode", "nowrap"),
+        ("white-space-collapse", "preserve"),
+        ("-webkit-text-stroke-width", "1px"),
+        ("writing-mode", "vertical-rl"),
+        ("caption-side", "bottom"),
+    ] {
+        assert_eq!(span.get(name).map(String::as_str), Some(value), "{name}");
+    }
+    assert!(!span.contains_key("width"));
+}
+
+#[test]
+fn cascade_origins_layers_and_revert_follow_the_spec_order() {
+    let names: Vec<_> = (0..1100).map(|index| format!("l{index}")).collect();
+    let doc = Document::parse(&format!(
+        "<style>@layer {};@layer l1099{{#deep{{color:red}}}}@layer l1050{{#deep{{color:blue}}}}
+        @layer a.b.c{{#nest{{color:red}}}}@layer a.b.c.d{{#nest{{color:blue}}}}
+        p{{color:blue!important}}#rev{{color:revert}}#user{{color:red}}</style>
+        <p style='color:red!important'>a</p><i id=rev>b</i><i id=user>c</i><b id=deep>d</b><b id=nest>e</b>",
+        names.join(",")
+    ));
+    let user = Rc::new(Stylesheet::parse(
+        "p{color:green!important}#rev,#user{color:orange}",
+    ));
+    let context = StyleContext {
+        inserted: vec![(user, true)],
+        ..Default::default()
+    };
+    let out = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        Some(&context),
+    );
+    let color = |selector| {
+        out.values[element(&doc, selector)]
+            .get(Prop::COLOR)
+            .map(str::to_owned)
+    };
+    assert_eq!(color("p").as_deref(), Some("green"));
+    assert_eq!(color("#rev").as_deref(), Some("orange"));
+    assert_eq!(color("#user").as_deref(), Some("red"));
+    assert_eq!(color("#deep").as_deref(), Some("red"));
+    assert_eq!(color("#nest").as_deref(), Some("red"));
+}
+
+#[test]
+fn inline_styles_intern_only_custom_property_names() {
+    let mut doc = Document::parse(
+        "<div id=a><p style='color:var(--late-h2o-name,blue);x-unknown-h2o-property:1'>x</p></div>",
+    );
+    let [a, p] = ["#a", "p"].map(|selector| element(&doc, selector));
+    let mut cache = StyleCache::default();
+    let out = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert_eq!(out.values[p].get(Prop::COLOR), Some("blue"));
+    assert!(Prop::find("x-unknown-h2o-property").is_none());
+    doc.nodes[a].inline = Some(Declarations::parse(
+        "--late-h2o-name:red;--other-h2o-name:1",
+    ));
+    let out = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert_eq!(out.values[p].get(Prop::COLOR), Some("red"));
+}
+
+#[test]
+fn unstored_passes_keep_the_next_stored_pass_full() {
+    let doc = Document::parse("<style>@media (max-width:500px){p{color:red}}</style><p>x</p>");
+    let p = element(&doc, "p");
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    let animated = StyleContext {
+        animated: HashMap::from([(0, Style::new())]),
+        ..Default::default()
+    };
+    compute_styles(
+        &doc,
+        400.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        Some(&animated),
+    );
+    let out = incremental(&doc, &mut cache, &mut last, [400., 600.]);
+    assert_eq!(out.values[p].get(Prop::COLOR), Some("red"));
+}
+
+#[test]
+fn collapsed_borders_follow_column_spans_and_reuse_cached_tables() {
+    let mut doc = Document::parse(
+        "<style>table{border-collapse:collapse}td{border:2px solid}.wide{border-top:8px solid}</style>
+        <table><tr><td colspan=2>a</td><td>b</td></tr><tr><td>c</td><td class=wide>d</td><td>e</td></tr></table>",
+    );
+    let mut cache = StyleCache::default();
+    let first = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    cache.finish();
+    let cells: Vec<usize> = (0..doc.nodes.len())
+        .filter(|&id| doc.nodes[id].tag == "td")
+        .collect();
+    let bottom = |out: &ComputedStyles, cell: usize| {
+        out.values[cell]
+            .get(Prop::BORDER_BOTTOM_WIDTH)
+            .map(str::to_owned)
+    };
+    assert_eq!(bottom(&first, cells[0]).as_deref(), Some("8px"));
+    assert_eq!(bottom(&first, cells[1]).as_deref(), Some("2px"));
+    let again = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert!(
+        cells
+            .iter()
+            .all(|&cell| Rc::ptr_eq(&first.values[cell], &again.values[cell]))
+    );
+    doc.nodes[cells[2]]
+        .attrs
+        .set("colspan", "18446744073709551615");
+    let wide = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        None,
+    );
+    assert_eq!(bottom(&wide, cells[0]).as_deref(), Some("2px"));
+}

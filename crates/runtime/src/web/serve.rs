@@ -83,7 +83,7 @@ impl State {
                 // WARNING: `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
                 let listener = Arc::new(Mutex::new(Some((
                     listener,
-                    crate::web::Listening::new(address.port()),
+                    crate::web::Listening::new(address),
                 ))));
                 let (stop, stopping) = watch::channel(false);
                 let accepting = listener.clone();

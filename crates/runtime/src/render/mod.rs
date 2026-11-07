@@ -59,17 +59,24 @@ pub(crate) struct PageState {
     walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
     adjoined: RefCell<rustc_hash::FxHashMap<usize, element::Adjoined>>,
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
+    // WARNING: boxes whose block disagreed with the size they were built in, in this pass and since the last
+    // pass without such a box.
+    mismatched: RefCell<[Mismatches; 2]>,
     layout_queued: Cell<bool>,
     #[cfg(target_os = "macos")]
     canvas: std::cell::Cell<(u32, u8)>,
 }
 
 type Clips = Vec<(usize, [bool; 2])>;
+type Mismatches = rustc_hash::FxHashSet<(usize, [u32; 4])>;
 type CompositedTransform = (
     renderer::Bounds<renderer::Pixels>,
     Option<(f32, [f32; 2])>,
     effects::Matrix,
 );
+
+// WARNING: layout revisions are unique across pages and reloads, so a kept box never matches a node of another page.
+static LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 thread_local! {
     static SCRIPTS: Cell<Option<(*mut App, Option<*mut Window>)>> = const { Cell::new(None) };
@@ -295,6 +302,7 @@ impl PageView {
             #[cfg(target_os = "macos")]
             canvas: Default::default(),
             kept_frame: RefCell::default(),
+            mismatched: RefCell::default(),
             layout_queued: Cell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
@@ -497,6 +505,32 @@ impl PageView {
         let mut doc = std::mem::take(&mut page.doc);
         let state = &mut *host;
         let dom = state.dom.entry(self.id).or_default();
+        // WARNING: a reload or navigation brings a new `dom::State`, whose nodes reuse the old page's ids, so nothing
+        // kept by node id may outlive it. A state stamps its first layout revision in its first frame.
+        if dom.layout_revision == 0 {
+            self.kept.take();
+            self.kept_frame.take();
+            self.walked.take();
+            self.adjoined.take();
+            self.svgs.take();
+            self.fields.take();
+            self.decoding.take();
+            self.flat.take();
+            self.parked.take();
+            self.caret.take();
+            self.mismatched.take();
+            self.browsers.borrow_mut().retain(|&id, _| id == usize::MAX);
+            self.frames.borrow_mut().retain(|&id, _| id == usize::MAX);
+        }
+        {
+            // WARNING: a box draws again once per mismatch until a pass has none, so sizes that flip between
+            // passes can't draw forever either.
+            let [current, seen] = &mut *self.mismatched.borrow_mut();
+            if current.is_empty() || seen.len() > 1024 {
+                seen.clear();
+            }
+            seen.extend(current.drain());
+        }
         for image in dom.retired.drain(..) {
             window.drop_image(image);
         }
@@ -664,25 +698,52 @@ impl PageView {
             }
         }
         let relaid = !restore.is_empty();
+        // WARNING: entries by node id go with their node: here when it is hidden or gone, and in `dom.release` when
+        // it is freed. Kept boxes don't build, so the entries of shown nodes stay from the frame that built them.
+        let shown = |id: usize| visible.get(id) == Some(&true);
         drop_hidden_images(dom, &visible, &styles, |image| window.drop_image(image));
-        self.svgs
-            .borrow_mut()
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        self.kept
-            .borrow_mut()
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        self.walked
-            .borrow_mut()
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        self.adjoined
-            .borrow_mut()
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        self.fields
-            .borrow_mut()
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        self.decoding
-            .borrow_mut()
-            .retain(|_, (id, _)| visible.get(*id) == Some(&true));
+        self.svgs.borrow_mut().retain(|&id, _| shown(id));
+        self.kept.borrow_mut().retain(|&id, _| shown(id));
+        self.walked.borrow_mut().retain(|&id, _| shown(id));
+        self.adjoined.borrow_mut().retain(|&id, _| shown(id));
+        self.fields.borrow_mut().retain(|&id, _| shown(id));
+        self.decoding.borrow_mut().retain(|_, (id, _)| shown(*id));
+        dom.containers.retain(|&id, _| shown(id));
+        dom.flexed_grids.retain(|&id, _| shown(id));
+        dom.grid_widest.retain(|&id, _| shown(id));
+        dom.anchors.retain(|&id, _| shown(id));
+        if !same {
+            // WARNING: a box that no longer scrolls drops its handle, so sticky boxes and scripts don't see its old
+            // offset. Hidden boxes keep their offset, and fields scroll their text with a handle.
+            let unscrolled: Vec<usize> = dom
+                .scroll
+                .keys()
+                .copied()
+                .filter(|&id| {
+                    shown(id)
+                        && id != 0
+                        && !matches!(doc.nodes[id].tag.as_str(), "html" | "body")
+                        && !element::text_field(&doc.nodes[id])
+                        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                            .into_iter()
+                            .all(|prop| {
+                                styles.values[id]
+                                    .get(prop)
+                                    .is_none_or(|value| matches!(value, "visible" | "clip"))
+                            })
+                })
+                .collect();
+            if !unscrolled.is_empty() {
+                // WARNING: pages read offsets from the layout mirror, which only handles write, so these write zeros first.
+                for &id in &unscrolled {
+                    dom.scroll.insert(id, Default::default());
+                }
+                dom.sync_scroll();
+                for id in unscrolled {
+                    dom.scroll.remove(&id);
+                }
+            }
+        }
         // WARNING: iframe bounds are set where they are laid out, see `paint.rs`.
         let tagged = self.tagged.borrow();
         let frame_nodes = || tagged.2.iter().copied().filter(|&id| visible[id]);
@@ -1085,7 +1146,8 @@ impl PageView {
                     let geometry = old
                         .filter(|old| !reshaped && !relisted && moved <= old.geometry)
                         .map(|old| old.geometry);
-                    dom.layout_revision += 1;
+                    dom.layout_revision =
+                        LAYOUT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     dom.layout_nodes[id] = Some(crate::dom::LayoutNode {
                         shape,
                         attrs,
@@ -1171,6 +1233,12 @@ impl PageView {
                 }
                 restore.push((id, std::mem::replace(&mut values[id], style)));
             }
+        }
+        // WARNING: a box that no longer contains positioned boxes drops its rect, so they don't keep its old place.
+        // This reads the animated styles, as building does.
+        if !same || !restore.is_empty() {
+            dom.blocks
+                .retain(|&id, _| shown(id) && effects::establishes(&styles.values[id]).absolute);
         }
         recolored.extend(&dom.recolored);
         for &id in &recolored {
@@ -1408,13 +1476,6 @@ impl PageView {
                     && doc.nodes[id].tag != "html"
             })
             .collect();
-        // WARNING: kept containers don't build, so their sizes stay from the frame that built them.
-        dom.containers
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        dom.flexed_grids
-            .retain(|&id, _| visible.get(id) == Some(&true));
-        dom.grid_widest
-            .retain(|&id, _| visible.get(id) == Some(&true));
         dom.measurements.pixel_ratio = window.scale_factor();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
@@ -1438,6 +1499,7 @@ impl PageView {
         let mut inputs = rustc_hash::FxHashMap::<usize, u64>::default();
         {
             let host = self.host.borrow();
+            let mut made = rustc_hash::FxHashMap::default();
             if let Some(dom) = host.dom.get(&self.id) {
                 for &id in &dom.cull.inputs {
                     if visible.get(id) != Some(&true) {
@@ -1445,7 +1507,7 @@ impl PageView {
                     }
                     // WARNING: ancestors XOR these, so each must mix its id. With a plain XOR, an even number of equal
                     // grids that change the same way cancel out and their ancestors stay kept.
-                    let own = (element::own_inputs(&doc, &styles, dom, &ids, id)
+                    let own = (element::own_inputs(&doc, &styles, dom, &ids, &mut made, id)
                         ^ (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
                     .wrapping_mul(0xff51_afd7_ed55_8ccd)
                     .rotate_left(31);

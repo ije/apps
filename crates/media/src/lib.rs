@@ -2,7 +2,11 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::{c_char, c_int, c_void},
     fmt::Write as _,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::*, fence},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -161,106 +165,213 @@ mod missing {
 #[cfg(not(ffmpeg))]
 use missing::*;
 
+// WARNING: the audio callback reads these, so it never waits for a lock that a decoder or page thread holds.
+static PLAYING: [AtomicPtr<Sound>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
+// WARNING: odd while the audio callback reads `PLAYING`, so a removed sound is freed only after that read ends.
+static MIXING: AtomicU64 = AtomicU64::new(0);
+
+fn ticks(at: Instant) -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    at.saturating_duration_since(*BASE.get_or_init(Instant::now))
+        .as_nanos() as u64
+}
+
+// WARNING: only the decoder writes samples and only the audio callback reads them, through a ring of atomic samples,
+// so neither waits for the other.
+struct Sound {
+    ring: OnceLock<(Box<[AtomicU32]>, usize)>,
+    write: AtomicUsize,
+    read: AtomicUsize,
+    // WARNING: samples before `skip` were dropped by a seek. Only the callback moves `read` past them.
+    skip: AtomicUsize,
+    gain: AtomicU32,
+    // WARNING: a sequence lock of the position the callback started to play and its `ticks`.
+    played: [AtomicU64; 3],
+    clock: Mutex<Clock>,
+}
+
 struct Clock {
     time: f64,
     at: Instant,
     running: bool,
     speed: f64,
+    marks: VecDeque<(usize, f64, f64)>,
 }
 
-impl Clock {
-    fn now(&self) -> f64 {
-        self.time
-            + if self.running {
-                self.at.elapsed().as_secs_f64() * self.speed
-            } else {
-                0.
-            }
-    }
-
-    fn run(&mut self, running: bool) {
-        self.set(self.now());
-        self.running = running;
-    }
-
-    fn set(&mut self, time: f64) {
-        self.time = time;
-        self.at = Instant::now();
-    }
-}
-
-struct Chunk {
-    time: f64,
-    step: f64,
-    samples: Vec<f32>,
-    read: usize,
-}
-
-struct Audio {
-    chunks: VecDeque<Chunk>,
-    queued: usize,
-    gain: f32,
-    clock: Clock,
-}
-
-impl Audio {
-    fn mix(&mut self, out: &mut [f32], channels: usize, now: Instant) {
-        let mut written = 0;
-        while written < out.len()
-            && let Some(chunk) = self.chunks.front_mut()
-        {
-            if written == 0 {
-                self.clock.time = chunk.time + (chunk.read / channels) as f64 * chunk.step;
-                self.clock.at = now;
-            }
-            let count = (chunk.samples.len() - chunk.read).min(out.len() - written);
-            for (out, sample) in out[written..written + count]
-                .iter_mut()
-                .zip(&chunk.samples[chunk.read..chunk.read + count])
-            {
-                *out += sample * self.gain;
-            }
-            chunk.read += count;
-            written += count;
-            if chunk.read == chunk.samples.len() {
-                self.chunks.pop_front();
-            }
+impl Sound {
+    fn new() -> Self {
+        Self {
+            ring: OnceLock::new(),
+            write: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+            skip: AtomicUsize::new(0),
+            gain: AtomicU32::new(1f32.to_bits()),
+            played: Default::default(),
+            clock: Mutex::new(Clock {
+                time: 0.,
+                at: Instant::now(),
+                running: false,
+                speed: 1.,
+                marks: VecDeque::new(),
+            }),
         }
-        self.queued -= written;
     }
 
-    fn clear(&mut self) {
-        self.chunks.clear();
-        self.queued = 0;
+    fn queued(&self) -> usize {
+        self.write.load(Acquire) - self.read.load(Acquire).max(self.skip.load(Acquire))
     }
 
-    fn skip(&mut self, channels: usize) {
-        let now = self.clock.now();
-        while let Some(chunk) = self.chunks.front()
-            && chunk.time + (chunk.samples.len() / channels) as f64 * chunk.step <= now
-        {
-            self.queued -= chunk.samples.len() - chunk.read;
-            self.chunks.pop_front();
+    // WARNING: runs on the audio callback: no locks, allocations or frees.
+    fn mix(&self, out: &mut [f32], now: u64) {
+        let Some((ring, _)) = self.ring.get() else {
+            return;
+        };
+        let read = self.read.load(Relaxed).max(self.skip.load(Acquire));
+        let count = (self.write.load(Acquire) - read).min(out.len());
+        if count > 0 {
+            let sequence = self.played[0].load(Relaxed);
+            self.played[0].store(sequence + 1, Relaxed);
+            fence(Release);
+            self.played[1].store(read as u64, Relaxed);
+            self.played[2].store(now, Relaxed);
+            self.played[0].store(sequence + 2, Release);
         }
+        let gain = f32::from_bits(self.gain.load(Relaxed));
+        for (index, out) in out[..count].iter_mut().enumerate() {
+            *out += f32::from_bits(ring[(read + index) & (ring.len() - 1)].load(Relaxed)) * gain;
+        }
+        self.read.store(read + count, Release);
+    }
+
+    fn played(&self) -> Option<(usize, u64)> {
+        for _ in 0..64 {
+            let sequence = self.played[0].load(Acquire);
+            let (position, at) = (self.played[1].load(Relaxed), self.played[2].load(Relaxed));
+            fence(Acquire);
+            if sequence & 1 == 0 && self.played[0].load(Relaxed) == sequence {
+                return (sequence > 0).then_some((position as usize, at));
+            }
+            std::hint::spin_loop();
+        }
+        None
+    }
+
+    fn now(&self, clock: &Clock) -> f64 {
+        if !clock.running {
+            return clock.time;
+        }
+        if let Some((position, at)) = self.played()
+            && at >= ticks(clock.at)
+            && position >= self.skip.load(Acquire)
+            && let Some((_, channels)) = self.ring.get()
+            && let Some(&(start, time, step)) = clock
+                .marks
+                .iter()
+                .rev()
+                .find(|(start, ..)| *start <= position)
+        {
+            let elapsed = ticks(Instant::now()).saturating_sub(at) as f64 / 1e9;
+            return time + ((position - start) / channels) as f64 * step + elapsed * clock.speed;
+        }
+        clock.time + clock.at.elapsed().as_secs_f64() * clock.speed
+    }
+
+    fn time(&self) -> (f64, bool) {
+        let clock = lock(&self.clock);
+        (self.now(&clock), clock.running)
+    }
+
+    fn set(&self, time: Option<f64>, running: Option<bool>, speed: Option<f64>) {
+        let mut clock = lock(&self.clock);
+        clock.time = time.unwrap_or_else(|| self.now(&clock));
+        clock.at = Instant::now();
+        clock.running = running.unwrap_or(clock.running);
+        clock.speed = speed.unwrap_or(clock.speed);
+    }
+
+    // WARNING: the caller holds the player's state lock, so the decoder can't queue samples of the old position.
+    fn flush(&self) {
+        lock(&self.clock).marks.clear();
+        self.skip.store(self.write.load(Acquire), Release);
+    }
+
+    fn push(&self, samples: &[f32], time: f64, step: f64) -> usize {
+        let Some((ring, channels)) = self.ring.get() else {
+            return samples.len();
+        };
+        let write = self.write.load(Relaxed);
+        let free = ring.len() - (write - self.read.load(Acquire).max(self.skip.load(Acquire)));
+        let count = samples.len().min(free / channels * channels);
+        if count == 0 {
+            return 0;
+        }
+        for (index, sample) in samples[..count].iter().enumerate() {
+            ring[(write + index) & (ring.len() - 1)].store(sample.to_bits(), Relaxed);
+        }
+        // WARNING: the clock maps the position the callback last played to a time, so its run stays.
+        let keep = self
+            .played()
+            .map_or(self.read.load(Acquire), |(position, _)| position)
+            .max(self.skip.load(Acquire));
+        let mut clock = lock(&self.clock);
+        while clock.marks.get(1).is_some_and(|(start, ..)| *start <= keep) {
+            clock.marks.pop_front();
+        }
+        clock.marks.push_back((write, time, step));
+        drop(clock);
+        self.write.store(write + count, Release);
+        count
+    }
+
+    // WARNING: without an audio output nothing plays the samples, so the decoder drops the runs that the clock passed.
+    fn drop_played(&self) {
+        let Some((_, channels)) = self.ring.get() else {
+            return;
+        };
+        let clock = lock(&self.clock);
+        let now = self.now(&clock);
+        let write = self.write.load(Acquire);
+        let mut read = self.read.load(Relaxed).max(self.skip.load(Acquire));
+        for (index, &(start, time, step)) in clock.marks.iter().enumerate() {
+            let end = clock.marks.get(index + 1).map_or(write, |(next, ..)| *next);
+            if end > read && time + ((end - start) / channels) as f64 * step > now {
+                break;
+            }
+            read = read.max(end);
+        }
+        self.read.store(read, Release);
     }
 }
 
 struct Mixer {
     rate: u32,
     channels: usize,
-    playing: Arc<Mutex<Vec<Arc<Mutex<Audio>>>>>,
+    // WARNING: sounds taken out of `PLAYING` while the callback read it are freed only after that read, by its `MIXING` value.
+    retired: Mutex<Vec<(Arc<Sound>, u64)>>,
     control: mpsc::Sender<bool>,
 }
 
 impl Mixer {
-    fn set(&self, audio: &Arc<Mutex<Audio>>, on: bool) {
-        let mut playing = lock(&self.playing);
-        let idle = playing.is_empty();
-        playing.retain(|other| !Arc::ptr_eq(other, audio));
-        if on {
-            playing.push(audio.clone());
+    fn set(&self, sound: &Arc<Sound>, on: bool) {
+        let mut retired = lock(&self.retired);
+        let idle = PLAYING.iter().all(|slot| slot.load(Relaxed).is_null());
+        let pointer = Arc::as_ptr(sound).cast_mut();
+        match PLAYING.iter().find(|slot| slot.load(Relaxed) == pointer) {
+            Some(slot) if !on => {
+                slot.store(std::ptr::null_mut(), SeqCst);
+                retired.push((unsafe { Arc::from_raw(pointer) }, MIXING.load(SeqCst)));
+            }
+            // WARNING: past 64 playing elements, the others play no sound.
+            None if on => {
+                if let Some(slot) = PLAYING.iter().find(|slot| slot.load(Relaxed).is_null()) {
+                    slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst);
+                }
+            }
+            _ => {}
         }
-        if idle != playing.is_empty() {
+        let mixing = MIXING.load(SeqCst);
+        retired.retain(|(_, at)| at % 2 == 1 && *at == mixing);
+        if idle != PLAYING.iter().all(|slot| slot.load(Relaxed).is_null()) {
             let _ = self.control.send(idle);
         }
     }
@@ -271,10 +382,10 @@ fn mixer() -> Option<&'static Mixer> {
     MIXER
         .get_or_init(|| {
             use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+            // WARNING: sets the time base here, so the audio callback never waits to set it.
+            ticks(Instant::now());
             let (ready, config) = mpsc::channel();
             let (control, commands) = mpsc::channel::<bool>();
-            let playing = Arc::new(Mutex::new(Vec::<Arc<Mutex<Audio>>>::new()));
-            let tracks = playing.clone();
             // WARNING: cpal streams are not `Send` on every platform, so one thread owns the stream for the app's life.
             std::thread::Builder::new()
                 .name("apps-audio".into())
@@ -290,10 +401,15 @@ fn mixer() -> Option<&'static Mixer> {
                         let format = config.sample_format();
                         let mix = move |out: &mut [f32]| {
                             out.fill(0.);
-                            let now = Instant::now();
-                            for audio in lock(&tracks).iter() {
-                                lock(audio).mix(out, channels, now);
+                            let now = ticks(Instant::now());
+                            MIXING.fetch_add(1, SeqCst);
+                            for slot in &PLAYING {
+                                let sound = slot.load(SeqCst);
+                                if !sound.is_null() {
+                                    unsafe { &*sound }.mix(out, now);
+                                }
                             }
+                            MIXING.fetch_add(1, SeqCst);
                         };
                         let error = |error| eprintln!("apps: audio output: {error}");
                         let config = config.config();
@@ -343,7 +459,7 @@ fn mixer() -> Option<&'static Mixer> {
             Some(Mixer {
                 rate,
                 channels,
-                playing,
+                retired: Mutex::default(),
                 control,
             })
         })
@@ -363,26 +479,43 @@ struct State {
     show: bool,
     woken: bool,
     events: Vec<String>,
+    duration: Option<f64>,
 }
 
 struct Shared {
     state: Mutex<State>,
     signal: Condvar,
-    audio: Arc<Mutex<Audio>>,
+    sound: Arc<Sound>,
 }
 
 impl Shared {
     fn update(&self, state: &State) {
         let running = state.playing && state.ready && !state.closed;
-        let mut audio = lock(&self.audio);
-        if audio.clock.running != running {
-            audio.clock.run(running);
-            drop(audio);
+        if lock(&self.sound.clock).running != running {
+            self.sound.set(None, Some(running), None);
             if let Some(mixer) = mixer() {
-                mixer.set(&self.audio, running);
+                mixer.set(&self.sound, running);
             }
         }
     }
+}
+
+// WARNING: event strings go into the JSON array of `apps_media_poll`, so text must be escaped as JSON.
+fn json(text: &str) -> String {
+    let mut json = String::with_capacity(text.len() + 2);
+    json.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => json.push_str("\\\""),
+            '\\' => json.push_str("\\\\"),
+            character if character < ' ' => {
+                let _ = write!(json, "\\u{:04x}", character as u32);
+            }
+            character => json.push(character),
+        }
+    }
+    json.push('"');
+    json
 }
 
 struct Player {
@@ -414,9 +547,10 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         let mut state = lock(&shared.state);
         state.ready = false;
         shared.update(&state);
-        state.events.push(format!("\"error\",3,{message:?}"));
+        state.events.push(format!("\"error\",3,{}", json(&message)));
         waker.wake();
     };
+    let sound = &shared.sound;
     let mut info = Info::default();
     let mut error = [0 as c_char; 256];
     let (path, data, size) = match &source {
@@ -439,11 +573,12 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     if media.is_null() {
         let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
         return event(format!(
-            "\"error\",4,{:?}",
-            format!("Cannot open the media: {message}")
+            "\"error\",4,{}",
+            json(&format!("Cannot open the media: {message}"))
         ));
     }
     let duration = info.duration;
+    lock(&shared.state).duration = Some(duration);
     event(format!(
         "\"meta\",{},{},{},{}",
         if duration.is_finite() {
@@ -456,11 +591,17 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         info.audio
     ));
     let (has_video, has_audio) = (info.width > 0, info.audio != 0);
+    if has_audio {
+        let length = ((rate as usize * channels) as f64 * AHEAD) as usize;
+        let ring = (0..length.next_power_of_two()).map(|_| AtomicU32::new(0));
+        sound.ring.get_or_init(|| (ring.collect(), channels));
+    }
     let samples_per_second = (rate as usize * channels).max(1) as f64;
     let (mut video_done, mut audio_done) = (!has_video, !has_audio);
     let (mut speed, mut generation) = (1., 0);
     let (mut audio_end, mut last_frame) = (0., -1. / 30.);
     let (mut target, mut loaded) = (Some(0.), false);
+    let (mut pending, mut pending_time, mut pending_step) = (Vec::<f32>::new(), 0., 0.);
     let mut skipped = None;
     // WARNING: a blocked track waits behind the other track's full packet queue until that track decodes, so it counts as ready.
     let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);
@@ -477,18 +618,23 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             (video_done, audio_done) = (!has_video, !has_audio);
             (audio_end, last_frame, target, skipped) = (time, time - 1. / 30., Some(time), None);
             (blocked, converted) = (0, f64::NEG_INFINITY);
+            pending.clear();
             continue;
         }
         if let Some(value) = state.speed.take() {
             speed = value;
             unsafe { apps_ffmpeg_speed(media, value) };
         }
-        let mut audio = lock(&shared.audio);
         if output.is_none() {
-            audio.skip(channels);
+            sound.drop_played();
         }
-        let buffered = audio.queued as f64 / samples_per_second;
-        drop(audio);
+        if !pending.is_empty() && state.generation == generation {
+            let taken = sound.push(&pending, pending_time, pending_step);
+            pending.drain(..taken);
+            pending_time += (taken / channels) as f64 * pending_step;
+        }
+        let queued = sound.queued() as f64 / samples_per_second;
+        let buffered = queued + pending.len() as f64 / samples_per_second;
         let ready = (video_done || !state.frames.is_empty() || blocked & 1 != 0)
             && (audio_done || buffered >= AHEAD / 2. || blocked & 2 != 0);
         if target.is_some() && ready && state.generation == generation {
@@ -503,7 +649,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             waker.wake();
         }
         let want = (c_int::from(!video_done && state.frames.len() < FRAMES)
-            | c_int::from(!audio_done && buffered < AHEAD) << 1)
+            | c_int::from(!audio_done && buffered < AHEAD && pending.is_empty()) << 1)
             & !blocked;
         // WARNING: paused elements decode only up to their first frame, so play starts at once and idle pages use no CPU.
         if want != 0 && (state.playing || target.is_some()) {
@@ -542,10 +688,8 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     }
                     skipped = None;
                     // WARNING: a frame is not converted when the next one is due too, but one is every 0.1 s, so slow decoding still shows frames.
-                    let audio = lock(&shared.audio);
-                    let late = audio.clock.running && next <= audio.clock.now();
-                    drop(audio);
-                    if late && time - converted < 0.1 {
+                    let (now, running) = sound.time();
+                    if running && next <= now && time - converted < 0.1 {
                         continue;
                     }
                     let (width, height) = (width as u32, height as u32);
@@ -596,14 +740,11 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     audio_end = time + (samples.len() / channels) as f64 * step;
                     let state = lock(&shared.state);
                     if state.generation == generation && !samples.is_empty() {
-                        let mut audio = lock(&shared.audio);
-                        audio.queued += samples.len();
-                        audio.chunks.push_back(Chunk {
-                            time,
-                            step,
-                            samples: samples.to_vec(),
-                            read: 0,
-                        });
+                        // WARNING: FFmpeg reuses the sample buffer, so what doesn't fit in the ring waits in a copy.
+                        let taken = sound.push(samples, time, step);
+                        pending.extend_from_slice(&samples[taken..]);
+                        (pending_time, pending_step) =
+                            (time + (taken / channels) as f64 * step, step);
                     }
                 }
                 3 => {}
@@ -622,13 +763,15 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         let mut wait = None::<f64>;
         let mut until = |seconds: f64| wait = Some(wait.map_or(seconds, |wait| wait.min(seconds)));
         if state.playing && state.ready {
-            let now = lock(&shared.audio).clock.now();
+            let (now, _) = sound.time();
             if video_done && audio_done && state.frames.is_empty() && buffered == 0. {
                 state.playing = false;
                 shared.update(&state);
-                lock(&shared.audio)
-                    .clock
-                    .set(if duration.is_finite() { duration } else { now });
+                sound.set(
+                    Some(if duration.is_finite() { duration } else { now }),
+                    None,
+                    None,
+                );
                 state.events.push("\"ended\"".into());
                 waker.wake();
                 continue;
@@ -643,9 +786,9 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                 }
             }
             if !audio_done && blocked & 2 == 0 {
-                until((buffered - AHEAD / 2.).max(0.005));
+                until((queued - AHEAD / 2.).max(0.005));
             } else if buffered > 0. {
-                until(buffered + 0.005);
+                until(queued + 0.005);
             } else if video_done && state.frames.is_empty() {
                 until(0.005);
             }
@@ -667,7 +810,10 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             Some(wait) => {
                 shared
                     .signal
-                    .wait_timeout(state, Duration::from_secs_f64(wait))
+                    .wait_timeout(
+                        state,
+                        Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX),
+                    )
                     .unwrap_or_else(PoisonError::into_inner)
                     .0
             }
@@ -741,17 +887,7 @@ pub unsafe extern "C" fn apps_media_open(
     let shared = Arc::new(Shared {
         state: Mutex::default(),
         signal: Condvar::new(),
-        audio: Arc::new(Mutex::new(Audio {
-            chunks: VecDeque::new(),
-            queued: 0,
-            gain: 1.,
-            clock: Clock {
-                time: 0.,
-                at: Instant::now(),
-                running: false,
-                speed: 1.,
-            },
-        })),
+        sound: Arc::new(Sound::new()),
     });
     let waker = Waker((host().waker)());
     let player = shared.clone();
@@ -761,7 +897,7 @@ pub unsafe extern "C" fn apps_media_open(
     {
         lock(&shared.state)
             .events
-            .push(format!("\"error\",4,{:?}", error.to_string()));
+            .push(format!("\"error\",4,{}", json(&error.to_string())));
     }
     media.players.insert(
         id,
@@ -788,31 +924,44 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
         PLAY => state.playing = true,
         PAUSE => state.playing = false,
         SEEK => {
-            let time = if value.is_finite() { value.max(0.) } else { 0. };
+            // WARNING: like browsers, a seek past the end goes to the end. FFmpeg converts the time to an integer.
+            let end = state
+                .duration
+                .filter(|duration| *duration >= 0.)
+                .unwrap_or(f64::INFINITY)
+                .min(1e9);
+            let time = if value.is_finite() {
+                value.max(0.).min(end)
+            } else {
+                0.
+            };
             state.generation += 1;
             state.seek = Some(time);
             state.ready = false;
             let State { frames, spare, .. } = &mut *state;
             spare.extend(frames.drain(..));
             state.woken = false;
-            let mut audio = lock(&shared.audio);
-            audio.clear();
-            audio.clock.set(time);
+            shared.sound.flush();
+            shared.sound.set(Some(time), None, None);
         }
         VOLUME | MUTED => {
             if op == VOLUME {
-                player.volume = value.clamp(0., 1.) as f32;
+                player.volume = if value >= 0. {
+                    value.min(1.) as f32
+                } else {
+                    0.
+                };
             } else {
                 player.muted = value != 0.;
             }
-            lock(&shared.audio).gain = if player.muted { 0. } else { player.volume };
+            let gain = if player.muted { 0. } else { player.volume };
+            shared.sound.gain.store(gain.to_bits(), Relaxed);
         }
+        // WARNING: like Chromium, rates stay in 1/16 to 16, so the resampler rate stays an integer.
         SPEED if value > 0. && value.is_finite() => {
+            let value = value.clamp(1. / 16., 16.);
             state.speed = Some(value);
-            let mut audio = lock(&shared.audio);
-            let running = audio.clock.running;
-            audio.clock.run(running);
-            audio.clock.speed = value;
+            shared.sound.set(None, None, Some(value));
         }
         _ => {}
     }
@@ -837,7 +986,7 @@ pub unsafe extern "C" fn apps_media_time(media: *mut c_void, id: u64) -> f64 {
     media
         .players
         .get(&id)
-        .map_or(0., |player| lock(&player.shared.audio).clock.now())
+        .map_or(0., |player| player.shared.sound.time().0)
 }
 
 /// Writes the events since the last poll as a JSON array of `[id, kind, ...values]`. Kind `frame` means
@@ -856,7 +1005,7 @@ pub unsafe extern "C" fn apps_media_poll(media: *mut c_void, out: *mut c_void, a
         }
         if player.video
             && let Some(head) = state.frames.front()
-            && (state.show || head.time <= lock(&player.shared.audio).clock.now())
+            && (state.show || head.time <= player.shared.sound.time().0)
         {
             let _ = write!(json, "[{id},\"frame\"],");
         }
@@ -880,7 +1029,7 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
         return false;
     };
     let mut state = lock(&player.shared.state);
-    let now = lock(&player.shared.audio).clock.now();
+    let now = player.shared.sound.time().0;
     let mut shown = None;
     while let Some(head) = state.frames.front()
         && (state.show || head.time <= now)
@@ -931,6 +1080,77 @@ pub unsafe extern "C" fn apps_media_recycle(
         let mut state = lock(&player.shared.state);
         if state.spare.len() < FRAMES {
             state.spare.push(pixels);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_escape_text_as_json() {
+        let text = json("a\"b\\c\n\u{1b}é\u{2028}");
+        assert_eq!(text, "\"a\\\"b\\\\c\\u000a\\u001bé\u{2028}\"");
+        assert!(text.starts_with('"') && text.ends_with('"'));
+    }
+
+    #[test]
+    fn sounds_queue_play_and_flush_in_whole_frames() {
+        let sound = Sound::new();
+        sound
+            .ring
+            .get_or_init(|| ((0..8).map(|_| AtomicU32::new(0)).collect(), 2));
+        assert_eq!(sound.push(&[1.; 6], 1., 0.5), 6);
+        assert_eq!(sound.push(&[2.; 6], 2.5, 0.5), 2);
+        assert_eq!(sound.queued(), 8);
+        sound.set(None, Some(true), None);
+        let mut out = [0.; 4];
+        sound.mix(&mut out, ticks(Instant::now()));
+        assert_eq!(out, [1.; 4]);
+        let (now, running) = sound.time();
+        assert!(running && (1. ..1.25).contains(&now), "{now}");
+        assert_eq!(sound.push(&[3.; 6], 2.5, 0.5), 4);
+        sound.flush();
+        assert_eq!(sound.queued(), 0);
+        let mut out = [0.; 4];
+        sound.mix(&mut out, ticks(Instant::now()));
+        assert_eq!(out, [0.; 4]);
+        assert_eq!(sound.push(&[4.; 2], 7., 0.5), 2);
+        sound.set(Some(7.), None, None);
+        sound.mix(&mut out, ticks(Instant::now()));
+        assert_eq!(out, [4., 4., 0., 0.]);
+        assert!((7. ..7.25).contains(&sound.time().0));
+    }
+
+    #[test]
+    fn seeks_stay_in_the_media() {
+        let mut media = Media::default();
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            signal: Condvar::new(),
+            sound: Arc::new(Sound::new()),
+        });
+        media.players.insert(
+            1,
+            Player {
+                shared: shared.clone(),
+                video: false,
+                volume: 1.,
+                muted: false,
+            },
+        );
+        for (duration, value, expected) in [
+            (None, 1e300, 1e9),
+            (Some(2.5), 1e300, 2.5),
+            (Some(f64::INFINITY), -1., 0.),
+            (Some(f64::NAN), 3., 3.),
+            (Some(2.5), f64::NAN, 0.),
+        ] {
+            lock(&shared.state).duration = duration;
+            unsafe { apps_media_control((&raw mut media).cast(), 1, SEEK, value) };
+            assert_eq!(lock(&shared.state).seek, Some(expected));
+            assert_eq!(shared.sound.time().0, expected);
         }
     }
 }

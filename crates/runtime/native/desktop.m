@@ -14,6 +14,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <os/lock.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -192,19 +193,22 @@ static NSData *AppsSecretLookup(OSStatus *status) {
     return *status == errSecSuccess ? secret : nil;
 }
 
-static NSMutableArray *AppsNativeEvents(void) {
-    static NSMutableArray *events;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ events = [NSMutableArray new]; });
-    return events;
-}
+// WARNING: events come from any thread and the main script takes them with `poll`, so they wait under a lock and not
+// on the main dispatch queue, which AppKit doesn't serve while a popup or modal panel runs in one of its blocks.
+static os_unfair_lock AppsEventsLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray *AppsEvents;
 static void AppsNativeEmit(NSDictionary *event) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSMutableArray *events = AppsNativeEvents();
-        if (events.count >= 4096) [events removeObjectAtIndex:0];
-        [events addObject:event];
-        if (AppsWake) AppsWake();
-    });
+    os_unfair_lock_lock(&AppsEventsLock);
+    if (!AppsEvents) AppsEvents = [NSMutableArray new];
+    if (AppsEvents.count >= 4096) [AppsEvents removeObjectAtIndex:0];
+    [AppsEvents addObject:event];
+    os_unfair_lock_unlock(&AppsEventsLock);
+    if (AppsWake) AppsWake();
+}
+// WARNING: popups run a nested loop, so they open after the script that asked returns, like Electron's.
+static void AppsLater(dispatch_block_t block) {
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, block);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 @interface AppsNative : NSObject <UNUserNotificationCenterDelegate>
@@ -499,7 +503,12 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     id result = [NSNull null];
     if (![NSThread isMainThread]) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
     if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."] || [op hasPrefix:@"tray."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
-    if ([op isEqualToString:@"poll"]) { result = [AppsNativeEvents() copy]; [AppsNativeEvents() removeAllObjects]; }
+    if ([op isEqualToString:@"poll"]) {
+        os_unfair_lock_lock(&AppsEventsLock);
+        result = AppsEvents ?: @[];
+        AppsEvents = nil;
+        os_unfair_lock_unlock(&AppsEventsLock);
+    }
     else if ([op isEqualToString:@"app.singleInstance"]) {
         AppsNative *owner = AppsNativeOwner();
         if (owner.lockFD >= 0) result = @YES;
@@ -578,7 +587,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         } else if ([op isEqual:@"tray.popup"]) {
             NSMenu *menu = args[@"template"] == NSNull.null ? tray.contextMenu : AppsMenu(args[@"template"]);
             NSUInteger generation = ++tray.popupGeneration;
-            dispatch_async(dispatch_get_main_queue(), ^{
+            AppsLater(^{
                 if (tray.item && tray.popupGeneration == generation) [tray showMenu:menu];
                 AppsNativeEmit(@{ @"type": @"tray", @"id": identifier, @"request": args[@"request"] });
             });
@@ -609,7 +618,11 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSView *view = NSApp.keyWindow.contentView;
         NSPoint point = args[@"x"] && args[@"y"] ? NSMakePoint([args[@"x"] doubleValue], [args[@"y"] doubleValue]) : [view convertPoint:NSApp.keyWindow.mouseLocationOutsideOfEventStream fromView:nil];
         if (view && !view.isFlipped && args[@"y"]) point.y = view.bounds.size.height - point.y;
-        [menu popUpMenuPositioningItem:nil atLocation:point inView:view];
+        NSNumber *request = args[@"request"];
+        AppsLater(^{
+            [menu popUpMenuPositioningItem:nil atLocation:point inView:view];
+            AppsNativeEmit(@{ @"type": @"popup", @"id": request });
+        });
     } else if ([op isEqualToString:@"shortcut.register"]) {
         NSArray *accelerator = AppsAccelerator(args[@"accelerator"]);
         if (!accelerator) return strdup("{\"error\":\"Unsupported shortcut accelerator\"}");
@@ -894,7 +907,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         } else result = @{ @"openAtLogin": @NO, @"status": @"not-found" };
     }
     else if ([op hasPrefix:@"dialog."]) {
-        // WARNING: async dialogs must not run a modal loop: the app stays borrowed and the main queue stops while it runs.
+        // WARNING: async dialogs must not run a modal loop, which would hold the main script until the dialog closes.
         NSNumber *request = args[@"async"];
         void (^emit)(NSDictionary *) = ^(NSDictionary *value) { AppsNativeEmit(@{ @"type": @"reply", @"id": request, @"value": value }); };
         if ([op isEqualToString:@"dialog.open"] || [op isEqualToString:@"dialog.save"]) {

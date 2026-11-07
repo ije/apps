@@ -40,14 +40,14 @@ fn page_networks_are_public_except_own_servers() {
         )
         .unwrap();
     main.eval(&format!("globalThis.result='';fetch('http://127.0.0.1:{port}').then(r=>r.text()).then(v=>result=v)"), "test").unwrap();
-    renderer.eval(&format!(r#"globalThis.allowed=0;globalThis.blocked=0;for(const host of ['127.0.0.1','localhost'])fetch(`http://${{host}}:{port}`).then(r=>r.text()).then(v=>{{if(v!=='ok')throw Error(v);allowed++}});for(const url of ['http://[::ffff:127.0.0.1]:{port}','http://127.0.0.1:1','http://localhost:1'])fetch(url).then(()=>{{throw Error('private fetch allowed')}},e=>{{if(!String(e).includes('private networks'))throw e;blocked++}});const socket=new WebSocket('ws://127.0.0.1:1');socket.onerror=()=>blocked++"#), "test").unwrap();
+    renderer.eval(&format!(r#"globalThis.allowed=0;globalThis.blocked=0;for(const host of ['127.0.0.1','localhost'])fetch(`http://${{host}}:{port}`).then(r=>r.text()).then(v=>{{if(v!=='ok')throw Error(v);allowed++}});for(const url of ['http://[::ffff:127.0.0.1]:{port}','http://[::1]:{port}','http://127.0.0.1:1','http://localhost:1'])fetch(url).then(()=>{{throw Error('private fetch allowed')}},e=>{{if(!String(e).includes('private networks'))throw e;blocked++}});const socket=new WebSocket('ws://127.0.0.1:1');socket.onerror=()=>blocked++"#), "test").unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         main.tick().unwrap();
         renderer.tick().unwrap();
         if main.eval("result", "test").unwrap() == "ok"
             && renderer.eval("allowed", "test").unwrap() == "2"
-            && renderer.eval("blocked", "test").unwrap() == "4"
+            && renderer.eval("blocked", "test").unwrap() == "5"
         {
             break;
         }
@@ -55,8 +55,92 @@ fn page_networks_are_public_except_own_servers() {
     }
     assert_eq!(main.eval("result", "test").unwrap(), "ok");
     assert_eq!(renderer.eval("allowed", "test").unwrap(), "2");
-    assert_eq!(renderer.eval("blocked", "test").unwrap(), "4");
+    assert_eq!(renderer.eval("blocked", "test").unwrap(), "5");
     main.eval("server.stop()", "test").unwrap();
+}
+
+#[test]
+fn modules_that_throw_while_loading_stay_failed() {
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    let mut files = bbtree::unsync::BBTreeMap::new();
+    files.insert("app.js".to_owned(), r#"
+$appsDefine({id:1,code:"throw new Error('boom')",exports:[]});
+$appsDefine({id:0,deps:[1],code:"globalThis.first=true",exports:[]});
+$appsDefine({id:2,deps:[1],code:"globalThis.second=true",exports:[]});
+$appsDefine({id:3,code:"globalThis.imports=[];const load=()=>$appsImport(4).then(()=>'loaded',error=>error.message);load().then(result=>{imports.push(result);return load()}).then(result=>imports.push(result))",exports:[]});
+$appsDefine({id:4,code:"throw new Error('dynamic')",exports:[]});
+return [[3,0,2]];
+"#.to_owned());
+    let error = engine
+        .eval_page(&apps_runtime::bundle::script_source(&files, true), "app.js")
+        .unwrap_err();
+    assert!(error.to_string().contains("boom"), "{error}");
+    files.insert(
+        "app.js".to_owned(),
+        "$appsDefine({id:9,code:'globalThis.ninth=9',exports:[]});return [[9]];".to_owned(),
+    );
+    let page = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    page.load_bundle(&files, "app.js").unwrap();
+    assert!(
+        page.sources()["app.js"].contains("globalThis.ninth"),
+        "A runtime helper replaced the devtools source of app.js"
+    );
+    engine.tick().unwrap();
+    assert_eq!(
+        engine
+            .eval(
+                "[globalThis.first,globalThis.second,imports].join()",
+                "test"
+            )
+            .unwrap(),
+        ",,dynamic,dynamic",
+        "A failed module counted as loaded"
+    );
+}
+
+#[test]
+fn timers_scale_with_many_pending_and_count_only_referenced() {
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    engine.eval("globalThis.idle=[];for(let i=0;i<100000;i++)idle.push(setTimeout(()=>{},3600000).unref());for(let i=0;i<100000;i+=2)clearTimeout(idle[i]);globalThis.order=[];for(let i=0;i<5;i++)setTimeout(()=>order.push(i),1);globalThis.chain=0;const next=()=>{if(++chain<200)setTimeout(next,1)};setTimeout(next,1)", "test").unwrap();
+    let (mut busy, until) = (Duration::ZERO, Instant::now() + Duration::from_secs(10));
+    while engine.eval("chain", "test").unwrap() != "200" && Instant::now() < until {
+        let started = Instant::now();
+        let delay = engine.tick().unwrap();
+        busy += started.elapsed();
+        std::thread::sleep(Duration::from_millis(delay.clamp(0, 2) as u64));
+    }
+    assert_eq!(
+        engine.eval("chain+':'+order.join()", "test").unwrap(),
+        "200:0,1,2,3,4"
+    );
+    assert!(
+        busy < Duration::from_millis(100),
+        "Due timers scanned every pending timer: {busy:?}"
+    );
+    assert_eq!(
+        engine.eval("__appsAlive()", "test").unwrap(),
+        "false",
+        "Unreferenced timers kept the loop alive"
+    );
+    assert_eq!(
+        engine.eval("idle[1].ref();__appsAlive()", "test").unwrap(),
+        "true"
+    );
 }
 
 #[test]

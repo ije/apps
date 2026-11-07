@@ -168,6 +168,17 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             let iv = bytes(&args[1])?;
             let aad = bytes(&args[2])?;
             let mut data = bytes(&args[3])?;
+            // WARNING: ring reads the tag from the last 16 bytes, so a separate tag must be exactly that long, or a short
+            // tag would authenticate a truncated message.
+            if op == "decrypt" && !args[4].is_null() {
+                let tag = bytes(&args[4])?;
+                ensure!(
+                    tag.len() == 16,
+                    "Invalid authentication tag length: {}",
+                    tag.len()
+                );
+                data.extend_from_slice(&tag);
+            }
             let algorithm = match key.len() {
                 16 => &aead::AES_128_GCM,
                 32 => &aead::AES_256_GCM,

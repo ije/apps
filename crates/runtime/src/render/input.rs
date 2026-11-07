@@ -354,7 +354,12 @@ fn password<'a>(
 
 impl PageView {
     fn before_input(&self, kind: &str, event: &renderer::KeyDownEvent) -> bool {
-        if !crate::desktop::link::INPUT_LISTENERS.load(std::sync::atomic::Ordering::Relaxed) {
+        // WARNING: a key waits for main only while main listens to this window's `before-input-event`.
+        if !self
+            .runtime
+            .try_borrow()
+            .is_ok_and(|app| app.views.get(&self.id).is_some_and(|view| view.input))
+        {
             return false;
         }
         let Some(link) = self.host.borrow().link.clone() else {
@@ -431,9 +436,10 @@ impl renderer::View for PageView {
                             && ((modifiers.platform && modifiers.alt)
                                 || (modifiers.control && modifiers.shift))))
                 {
-                    self.host
-                        .borrow_mut()
-                        .command(serde_json::json!({"op":"window","args":["devtools",id]}));
+                    self.host.borrow_mut().command(
+                        crate::desktop::link::Target::Window(id),
+                        serde_json::json!({"op":"window","args":["devtools",id]}),
+                    );
                     self.drive(cx);
                     cx.stop_propagation();
                     return;

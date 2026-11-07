@@ -135,7 +135,7 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
             let () = msg_send![&*content, setWantsLayer: Bool::YES];
             let () = msg_send![&*content, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];
             let () = msg_send![&*view, setContentView: &*content];
-            parent.addSubview(&view);
+            parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
             views.push(GlassView { view, content, surface: surface.clone() });
             views.len() - 1
         });
@@ -186,11 +186,13 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
         }
         native.surface = surface;
     }
+    // WARNING: the renderer doesn't know where web views paint, and they sit above the GPU frame, so glass views
+    // stay below every other subview in paint order. Web views are added on top later.
     if restack {
-        for native in views {
+        for native in views.iter().rev() {
             parent.addSubview_positioned_relativeTo(
                 &native.view,
-                NSWindowOrderingMode::Above,
+                NSWindowOrderingMode::Below,
                 None,
             );
         }

@@ -58,6 +58,7 @@ pub(super) fn own_inputs(
     styles: &ComputedStyles,
     dom: &crate::dom::State,
     ids: &super::effects::Ids,
+    made: &mut rustc_hash::FxHashMap<*const style::Style, super::effects::Establishes>,
     id: usize,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -121,29 +122,84 @@ pub(super) fn own_inputs(
             }
         }
     }
-    if !styles.values[id]
-        .get(Prop::POSITION)
-        .is_some_and(|value| matches!(value, "absolute" | "fixed" | "sticky"))
-    {
+    let position = styles.values[id].get(Prop::POSITION).unwrap_or("static");
+    if !matches!(position, "absolute" | "fixed" | "sticky") {
         return hasher.finish();
     }
-    let mut ancestor = doc.nodes[id].parent;
-    if let Some(parent) = ancestor {
+    if let Some(parent) = doc.nodes[id].parent {
         Rc::as_ptr(&styles.values[parent]).hash(&mut hasher);
     }
-    while let Some(block) = ancestor {
+    // WARNING: `create` resolves the same block and scroller, from the same ancestors in the flat tree.
+    let ancestors = std::iter::successors(crate::dom::flat_parent(doc, dom, styles, id), |&node| {
+        crate::dom::flat_parent(doc, dom, styles, node)
+    });
+    if position == "sticky" {
+        let scroller = scroller(doc, styles, ancestors, &dom.scroll);
+        (
+            scroller,
+            Rc::as_ptr(&styles.values[scroller]),
+            dom.scroll.contains_key(&scroller),
+        )
+            .hash(&mut hasher);
+    } else if let Some(block) = positioner(position, ancestors, |node| {
+        *made
+            .entry(Rc::as_ptr(&styles.values[node]))
+            .or_insert_with(|| super::effects::establishes(&styles.values[node]))
+    }) {
+        block.hash(&mut hasher);
         if let Some(bounds) = dom.blocks.get(&block) {
-            (block, f32::from(bounds.size.width).to_bits()).hash(&mut hasher);
-            f32::from(bounds.size.height).to_bits().hash(&mut hasher);
+            [bounds.size.width, bounds.size.height]
+                .map(|value| f32::from(value).to_bits())
+                .hash(&mut hasher);
         }
-        ancestor = doc.nodes[block]
-            .parent
-            .or_else(|| dom.hosts.get(&block).copied());
     }
     for value in styles.lengths[id].viewport {
         value.to_bits().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+// WARNING: an absolute box without such an ancestor takes the document, a fixed one the viewport (`None`).
+pub(super) fn positioner(
+    position: &str,
+    mut ancestors: impl Iterator<Item = usize>,
+    mut made: impl FnMut(usize) -> super::effects::Establishes,
+) -> Option<usize> {
+    let fixed = match position {
+        "absolute" => false,
+        "fixed" => true,
+        _ => return None,
+    };
+    ancestors
+        .find(|&ancestor| {
+            let made = made(ancestor);
+            if fixed { made.fixed } else { made.absolute }
+        })
+        .or((!fixed).then_some(0))
+}
+
+// WARNING: a sticky box sticks in its nearest scroll container by style, not in any box with a handle, since
+// scripts make handles for any box. `<html>` and `<body>` scroll the page unless they have their own handle.
+pub(super) fn scroller(
+    doc: &Document,
+    styles: &ComputedStyles,
+    mut ancestors: impl Iterator<Item = usize>,
+    handles: &std::collections::HashMap<usize, renderer::ScrollHandle>,
+) -> usize {
+    ancestors
+        .find(|&ancestor| {
+            ancestor != 0
+                && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|prop| {
+                        styles.values[ancestor]
+                            .get(prop)
+                            .is_some_and(|value| matches!(value, "auto" | "scroll" | "hidden"))
+                    })
+                && (!matches!(doc.nodes[ancestor].tag.as_str(), "html" | "body")
+                    || handles.contains_key(&ancestor))
+        })
+        .unwrap_or(0)
 }
 
 type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
@@ -598,25 +654,10 @@ fn create(
     // WARNING: a box whose opacity animates keeps one stacking context and effect layer at every
     // value, so animation frames only patch the layer's opacity.
     let composited = info[id].flags & cull::COMPOSITED != 0;
-    let stacking = id == 0
-        || composited
-        || style
-            .get(Prop::ISOLATION)
-            .is_some_and(|value| value == "isolate")
-        || style
-            .get(Prop::POSITION)
-            .is_some_and(|value| matches!(value, "fixed" | "sticky"))
-        || layered && order.is_some()
-        || style
-            .get(Prop::TRANSFORM)
-            .is_some_and(|value| value != "none")
-        || [Prop::FILTER, Prop::CLIP_PATH]
-            .into_iter()
-            .any(|key| style.get(key).is_some_and(|value| value != "none"))
-        || style
-            .get(Prop::OPACITY)
-            .and_then(|value| value.parse::<f32>().ok())
-            .is_some_and(|value| value < 1.);
+    let made = super::effects::establishes(style);
+    // WARNING: the renderer paints a z-indexed box in its nearest stacking ancestor, so every box that paints
+    // through a layer must be one, or such boxes escape its transform, opacity or clip.
+    let stacking = id == 0 || composited || made.stacking || layered && order.is_some();
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
         inputs,
@@ -683,38 +724,10 @@ fn create(
     {
         parent = doc.nodes[ancestor].parent;
     }
-    let contains = |style: &style::Style, fixed: bool| {
-        !fixed
-            && style
-                .get(Prop::POSITION)
-                .is_some_and(|value| value != "static")
-            || [
-                Prop::TRANSFORM,
-                Prop::FILTER,
-                Prop::PERSPECTIVE,
-                Prop::BACKDROP_FILTER,
-            ]
-            .into_iter()
-            .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
-            || style.get(Prop::CONTAIN).is_some_and(|value| {
-                ["paint", "layout", "strict", "content"]
-                    .iter()
-                    .any(|kind| value.contains(kind))
-            })
-            || style
-                .get(Prop::WILL_CHANGE)
-                .is_some_and(|value| value.contains("transform"))
-    };
-    let positioner = matches!(position, "absolute" | "fixed")
-        .then(|| {
-            ancestors
-                .iter()
-                .rev()
-                .copied()
-                .find(|&ancestor| contains(&styles.values[ancestor], position == "fixed"))
-                .or((position == "absolute" && id != 0).then_some(0))
-        })
-        .flatten();
+    let positioner = positioner(position, ancestors.iter().rev().copied(), |ancestor| {
+        super::effects::establishes(&styles.values[ancestor])
+    })
+    .filter(|_| id != 0);
     let block_size = if position == "fixed" && positioner.is_none() {
         Some(units.viewport)
     } else {
@@ -724,12 +737,19 @@ fn create(
                 if block == 0 {
                     return Some(units.viewport);
                 }
-                if let Some(&size) = blocks.borrow().get(&block) {
-                    return Some(size);
+                // WARNING: the block's last layout comes before the estimate of its build, which can miss its
+                // min and max sizes. Prepaint draws again when they differ, so an estimate first would draw
+                // again in every frame.
+                if let Some(bounds) = view
+                    .host
+                    .borrow()
+                    .dom
+                    .get(&view.id)
+                    .and_then(|dom| dom.blocks.get(&block))
+                {
+                    return Some([f32::from(bounds.size.width), f32::from(bounds.size.height)]);
                 }
-                let host = view.host.borrow();
-                let bounds = host.dom.get(&view.id)?.blocks.get(&block)?.size;
-                Some([f32::from(bounds.width), f32::from(bounds.height)])
+                blocks.borrow().get(&block).copied()
             })
     };
     let containing = block_size.unwrap_or(containing);
@@ -738,27 +758,8 @@ fn create(
         return renderer::node().hidden().into();
     }
     let opacity = super::effects::opacity(style);
-    let effect_layer = ([
-        Prop::FILTER,
-        Prop::CLIP_PATH,
-        Prop::MASK_IMAGE,
-        Prop::WEBKIT_MASK_IMAGE,
-        Prop::BACKDROP_FILTER,
-        Prop::WEBKIT_BACKDROP_FILTER,
-    ]
-    .into_iter()
-    .any(|name| style.get(name).is_some_and(|value| value != "none"))
-        || style
-            .get(Prop::MIX_BLEND_MODE)
-            .is_some_and(|value| value != "normal")
-        || style
-            .get(Prop::ISOLATION)
-            .is_some_and(|value| value == "isolate")
-        || cfg!(target_os = "macos")
-            && matches!(style.get(Prop::MACOS_GLASS), Some("regular" | "clear"))
-        || opacity < 1. && !node.children.is_empty()
-        || composited)
-        .then_some(opacity);
+    let effect_layer =
+        (made.layer || opacity < 1. && !node.children.is_empty() || composited).then_some(opacity);
     let selection_colors = style::selection_colors(style, styles.selections.get(&id));
     let face = style::font(style);
     let line_height = match style::line_height(style) {
@@ -3926,7 +3927,7 @@ fn create(
             if auto && !flexed {
                 el = el.h(px(rows + padding[0] + padding[2] + borders[0] + borders[2]));
             }
-            if !flexed && contains(style, false) {
+            if !flexed && made.absolute {
                 blocks.borrow_mut().insert(
                     id,
                     [
@@ -4633,16 +4634,14 @@ fn create(
                         }
                 })
             };
-            ancestors.iter().rev().copied().find_map(|parent| {
-                let scroll = host.dom.get(&view.id)?.scroll.get(&parent)?.clone();
-                let block = ancestors
+            let scrolls = &host.dom.get(&view.id)?.scroll;
+            let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls);
+            Some(super::paint::Sticky {
+                scroll: scrolls.get(&parent)?.clone(),
+                border: insets(parent, false),
+                block: ancestors
                     .last()
-                    .map(|&parent| (parent, insets(parent, true)));
-                Some(super::paint::Sticky {
-                    scroll,
-                    border: insets(parent, false),
-                    block,
-                })
+                    .map(|&parent| (parent, insets(parent, true))),
             })
         })
         .flatten();
@@ -4694,7 +4693,7 @@ fn create(
     let element = el.hooks(DomBox {
         placed: Default::default(),
         anchor,
-        block: contains(style, false).then_some(borders),
+        block: made.absolute.then_some(borders),
         container: positioner.filter(|&block| position == "fixed" || Some(block) != parent),
         sized: positioner
             .filter(|&block| block != 0 && Some(block) != parent)

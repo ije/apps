@@ -243,8 +243,8 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
                     node.text.clear();
                 }
                 let node = &mut doc.nodes[id];
-                if let Some(source) = node.attrs.remove("style") {
-                    node.inline = Some(Declarations::parse(&source));
+                if let Some(source) = node.attrs.get("style") {
+                    node.inline = Some(Declarations::parse(source));
                 }
             }
             bundle.pages.insert(name.clone(), doc);
@@ -770,6 +770,7 @@ mod tests {
             }
             @media print, (max-height:200px) { .label { margin:4px; } }
             @supports (display:unsupported) { #card { height:999px; } }
+            [style*=height] > .label { margin-left:2px; }
         </style></head><body><div id="card" class="card active" style="height:30px !important; @apply p-4;"><span class="label">你好 &amp; hello</span></div></body></html>"#;
         let dir = tempfile::tempdir().unwrap();
         let files = BBTreeMap::from([
@@ -789,7 +790,7 @@ mod tests {
             .unwrap();
         assert!(doc.nodes[sheet].text.is_empty());
         assert!(doc.nodes[sheet].stylesheet.is_some());
-        assert!(!doc.nodes[card].attrs.contains_key("style"));
+        assert!(doc.nodes[card].attrs.contains_key("style"));
         assert!(doc.nodes[card].inline.is_some());
         assert!(doc.text(card).contains("你好 & hello"));
         for (width, height) in [(400., 600.), (800., 600.), (800., 100.)] {

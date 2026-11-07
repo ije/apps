@@ -105,7 +105,7 @@ impl BrowserWindow {
         app.0.next_id.set(id + 1);
         app.0
             .link
-            .create_window(json!({"op":"window","args":["create",id,options]}));
+            .create_window(id, json!({"op":"window","args":["create",id,options]}));
         Ok(Self {
             app: app.clone(),
             id,
@@ -118,7 +118,8 @@ impl BrowserWindow {
             self.app.0.pages.contains(path),
             "Page {path:?} is not bundled"
         );
-        self.app.0.link.page(ToPage::Command(
+        self.app.0.link.page(ToPage::Window(
+            self.id,
             json!({"op":"window","args":["loadFile", self.id, format!("apps:///{path}")]}),
         ));
         Ok(())

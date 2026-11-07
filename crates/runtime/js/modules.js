@@ -173,11 +173,6 @@ const load = (id, ancestors = new Set()) => {
   }
   const visiting = new Set(ancestors).add(id);
   const pending = [];
-  for (const dependency of module.definition.deps) {
-    if (dependency === null) continue;
-    const result = load(dependency, visiting);
-    if (result instanceof Promise) pending.push(result);
-  }
   const execute = () => {
     for (const item of module.definition.imports ?? []) {
       if (item.local && item.name !== '*' && !Object.hasOwn(namespaceOf(modules.get(item.id)), item.name)) throw Error(`Missing export ${item.name} from ${item.id}`);
@@ -194,8 +189,18 @@ const load = (id, ancestors = new Set()) => {
     if (module.definition.async) return result.then(() => { module.state = 2; });
     module.state = 2;
   };
-  const result = pending.length ? Promise.all(pending).then(execute) : execute();
-  if (result instanceof Promise) module.promise = result.catch(error => { module.state = 3; module.error = error; throw error; });
+  const failed = error => { module.state = 3; module.error = error; throw error; };
+  let result;
+  // WARNING: a module that throws while it loads keeps the error, so a later import or entry fails instead of seeing it loaded.
+  try {
+    for (const dependency of module.definition.deps) {
+      if (dependency === null) continue;
+      const loading = load(dependency, visiting);
+      if (loading instanceof Promise) pending.push(loading);
+    }
+    result = pending.length ? Promise.all(pending).then(execute) : execute();
+  } catch (error) { failed(error); }
+  if (result instanceof Promise) module.promise = result.catch(failed);
   return module.promise;
 };
 return (body, execute) => {

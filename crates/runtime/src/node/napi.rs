@@ -6,16 +6,21 @@ use anyhow::{Context, Result, ensure};
 use libloading::Library;
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{CStr, c_char},
     ptr,
     rc::{Rc, Weak},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    },
 };
 
 type Status = std::result::Result<(), i32>;
 type Callback = unsafe extern "C" fn(*const State, *const Info) -> Ptr;
 type Finalize = unsafe extern "C" fn(*const State, Ptr, Ptr);
 type Cleanup = unsafe extern "C" fn(Ptr);
+type AsyncCleanupHook = unsafe extern "C" fn(Ptr, Ptr);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,15 +108,19 @@ pub(crate) struct State {
     holders: RefCell<HashMap<u64, (usize, u8)>>,
     finalized: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     cleanup: RefCell<Vec<(Cleanup, Ptr)>>,
+    async_cleanup: RefCell<Vec<usize>>,
     instance: Cell<Ptr>,
     instance_finalizer: Cell<Option<Finalizer>>,
     pending: Cell<Ptr>,
     error: Cell<ErrorInfo>,
     modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
-    ready: std::sync::Arc<std::sync::Mutex<Vec<Ready>>>,
+    ready: Arc<Mutex<Vec<Ready>>>,
     active: Cell<usize>,
     threadsafe: Cell<usize>,
-    threadsafe_live: RefCell<HashSet<usize>>,
+    // WARNING: this map holds the JavaScript thread's reference to each live thread-safe function.
+    threadsafe_live: RefCell<HashMap<usize, Arc<Threadsafe>>>,
+    external: Cell<i64>,
+    callback_scopes: Cell<usize>,
 }
 thread_local! { static FUNCTIONS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
 thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
@@ -188,6 +197,7 @@ impl State {
             holders: RefCell::default(),
             finalized: Default::default(),
             cleanup: RefCell::default(),
+            async_cleanup: RefCell::default(),
             instance: Cell::new(ptr::null_mut()),
             instance_finalizer: Cell::new(None),
             pending: Cell::new(ptr::null_mut()),
@@ -202,6 +212,8 @@ impl State {
             active: Cell::new(0),
             threadsafe: Cell::new(0),
             threadsafe_live: RefCell::default(),
+            external: Cell::new(0),
+            callback_scopes: Cell::new(0),
         });
         CONTEXTS.with(|contexts| {
             contexts
@@ -242,7 +254,6 @@ impl State {
         kind: u8,
         finalizer: Option<Finalizer>,
     ) -> std::result::Result<u64, i32> {
-        self.sweep();
         let (id, holder) = self.holder();
         let mut exception = ptr::null_mut();
         let holder = unsafe {
@@ -278,6 +289,7 @@ impl State {
         (id, Box::into_raw(Box::new(holder)))
     }
 
+    // WARNING: finalizers call into the addon and may run JavaScript, so only `tick` runs them, never a Node-API call.
     pub(crate) fn sweep(&self) {
         // WARNING: Finalizers can load addons, which pushes to `environments`.
         let environments = self.environments.borrow().clone();
@@ -329,16 +341,9 @@ impl State {
                 }
             }
             if let Some(finalizer) = finalizer {
-                self.scopes.borrow_mut().push(Box::new(Scope {
-                    values: Vec::new(),
-                    kept: HashSet::new(),
-                    escaped: false,
-                    escapable: false,
-                }));
-                unsafe {
-                    (finalizer.callback)(self, finalizer.data, finalizer.hint);
-                }
-                self.pop();
+                self.scoped(|| unsafe {
+                    (finalizer.callback)(self, finalizer.data, finalizer.hint)
+                });
             }
         }
     }
@@ -374,13 +379,23 @@ impl State {
         value
     }
 
+    // WARNING: callbacks that the runtime starts (finalizers, async work, thread-safe calls) have no JavaScript caller to
+    // throw to, so their exceptions go to `uncaughtException`, and are cleared even when that throws.
+    fn report(&self) {
+        let exception = self.take_exception();
+        if !exception.is_null() && self.js("report", &[exception]).is_err() {
+            self.take_exception();
+        }
+    }
+
     fn js(&self, name: &str, args: &[Ptr]) -> std::result::Result<Ptr, i32> {
         check(args.iter().all(|arg| !arg.is_null()), 1)?;
+        let helper = *self.helpers.get(name).ok_or(9)?;
         let mut exception = ptr::null_mut();
         let result = unsafe {
             (self.api.invoke)(
                 self.ctx,
-                self.helpers[name],
+                helper,
                 ptr::null_mut(),
                 args.len(),
                 args.as_ptr(),
@@ -480,12 +495,27 @@ impl State {
             environment.close();
         }
         loop {
+            let hook = self.async_cleanup.borrow_mut().pop();
+            let Some(handle) = hook else { break };
+            let cleanup = handle as *const AsyncCleanup;
+            unsafe { ((*cleanup).hook)(handle as Ptr, (*cleanup).arg) };
+        }
+        loop {
             let hook = self.cleanup.borrow_mut().pop();
             let Some((callback, data)) = hook else { break };
             unsafe {
                 callback(data);
             }
         }
+        let live = std::mem::take(&mut *self.threadsafe_live.borrow_mut());
+        for function in live.values() {
+            function.close();
+            self.end_threadsafe(function);
+        }
+        self.ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         loop {
             let key = self.wrap_finalizers.borrow().keys().next().copied();
             let Some(key) = key else { break };
@@ -748,13 +778,39 @@ macro_rules! api {
             if raw.is_null() { return 1; }
             let $env = unsafe { &*raw };
             if $env.thread != std::thread::current().id() { return 23; }
-            $env.sweep();
             let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Status { unsafe { $body } })).unwrap_or(Err(9)).err().unwrap_or(0);
-            if stringify!($name) != "napi_get_last_error_info" { $env.error.set(ErrorInfo { message: if status == 0 { ptr::null() } else { c"Node-API call failed".as_ptr() }, reserved: ptr::null_mut(), engine_code: 0, code: status }); }
+            if stringify!($name) != "napi_get_last_error_info" { $env.error.set(ErrorInfo { message: MESSAGES.get(status as usize).copied().flatten().map_or(ptr::null(), CStr::as_ptr), reserved: ptr::null_mut(), engine_code: 0, code: status }); }
             status
         }
     };
 }
+
+const MESSAGES: [Option<&CStr>; 24] = [
+    None,
+    Some(c"Invalid argument"),
+    Some(c"An object was expected"),
+    Some(c"A string was expected"),
+    Some(c"A string or symbol was expected"),
+    Some(c"A function was expected"),
+    Some(c"A number was expected"),
+    Some(c"A boolean was expected"),
+    Some(c"An array was expected"),
+    Some(c"Unknown failure"),
+    Some(c"An exception is pending"),
+    Some(c"The async work item was cancelled"),
+    Some(c"napi_escape_handle already called on scope"),
+    Some(c"Invalid handle scope usage"),
+    Some(c"Invalid callback scope usage"),
+    Some(c"Thread-safe function queue is full"),
+    Some(c"Thread-safe function handle is closing"),
+    Some(c"A bigint was expected"),
+    Some(c"A date was expected"),
+    Some(c"An arraybuffer was expected"),
+    Some(c"A detachable arraybuffer was expected"),
+    Some(c"Main thread would deadlock"),
+    Some(c"External buffers are not allowed"),
+    Some(c"Cannot run JavaScript"),
+];
 
 api!(napi_get_last_error_info(env, result: *mut *const ErrorInfo) {
     check(!result.is_null(), 1)?;
@@ -2157,10 +2213,15 @@ macro_rules! raw_api {
 }
 
 api!(napi_adjust_external_memory(env, change: i64, result: *mut i64) {
-    let _ = env;
-    if !result.is_null() {
-        *result = change.max(0);
+    check(!result.is_null(), 1)?;
+    // WARNING: JSC cannot see addon memory, so objects that own it would wait for an unrelated GC. JSC takes no decreases.
+    if change > 0
+        && let Some(report) = env.api.extra_memory
+    {
+        report(env.ctx, change as usize);
     }
+    env.external.set(env.external.get().saturating_add(change).max(0));
+    *result = env.external.get();
     Ok(())
 });
 api!(napi_coerce_to_bool(env, value: Ptr, result: *mut Ptr) {
@@ -2250,15 +2311,166 @@ raw_api!(napi_module_register(module: *const LegacyModule) {
     0
 });
 
+#[repr(C)]
+struct NodeVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+    release: *const c_char,
+}
+struct Version(NodeVersion);
+unsafe impl Sync for Version {}
+static NODE_VERSION: Version = Version(NodeVersion {
+    major: 24,
+    minor: 0,
+    patch: 0,
+    release: c"node".as_ptr(),
+});
+
+api!(napi_get_node_version(env, result: *mut *const NodeVersion) {
+    let _ = env;
+    check(!result.is_null(), 1)?;
+    *result = &NODE_VERSION.0;
+    Ok(())
+});
+api!(napi_get_uv_event_loop(env, result: *mut Ptr) {
+    let _ = env;
+    check(!result.is_null(), 1)?;
+    // WARNING: there is no libuv loop, and a fake pointer would crash the addon later, so this always fails.
+    *result = ptr::null_mut();
+    Err(9)
+});
+api!(napi_async_init(env, _resource: Ptr, name: Ptr, result: *mut Ptr) {
+    let _ = env;
+    check(!name.is_null() && !result.is_null(), 1)?;
+    *result = ptr::NonNull::<u8>::dangling().as_ptr().cast();
+    Ok(())
+});
+api!(napi_async_destroy(env, context: Ptr) {
+    let _ = env;
+    check(!context.is_null(), 1)
+});
+api!(napi_make_callback(
+    env,
+    _context: Ptr,
+    this: Ptr,
+    function: Ptr,
+    argc: usize,
+    argv: *const Ptr,
+    result: *mut Ptr,
+) {
+    check(!this.is_null(), 1)?;
+    let status = napi_call_function(env, this, function, argc, argv, result);
+    check(status == 0, status)
+});
+api!(napi_open_callback_scope(env, _resource: Ptr, _context: Ptr, result: *mut Ptr) {
+    check(!result.is_null(), 1)?;
+    env.callback_scopes.set(env.callback_scopes.get() + 1);
+    *result = ptr::NonNull::<u8>::dangling().as_ptr().cast();
+    Ok(())
+});
+api!(napi_close_callback_scope(env, scope: Ptr) {
+    check(!scope.is_null(), 1)?;
+    check(env.callback_scopes.get() > 0, 14)?;
+    env.callback_scopes.set(env.callback_scopes.get() - 1);
+    Ok(())
+});
+api!(napi_get_all_property_names(
+    env,
+    object: Ptr,
+    mode: u32,
+    filter: u32,
+    conversion: u32,
+    result: *mut Ptr,
+) {
+    env.object(object)?;
+    check(mode <= 1 && conversion <= 1, 1)?;
+    env.value(
+        result,
+        env.js(
+            "all_keys",
+            &[
+                object,
+                env.boolean(mode == 1),
+                env.number(filter as f64),
+                env.boolean(conversion == 1),
+            ],
+        )?,
+    )
+});
+api!(napi_detach_arraybuffer(env, value: Ptr) {
+    check(!value.is_null(), 1)?;
+    check((env.api.typed_kind)(env.ctx, value, ptr::null_mut()) == 9, 19)?;
+    check((env.api.to_boolean)(env.ctx, env.js("detach", &[value])?), 20)
+});
+api!(napi_is_detached_arraybuffer(env, value: Ptr, result: *mut bool) {
+    check(!value.is_null() && !result.is_null(), 1)?;
+    *result = (env.api.typed_kind)(env.ctx, value, ptr::null_mut()) == 9
+        && (env.api.to_boolean)(env.ctx, env.js("get", &[value, env.text("detached")])?);
+    Ok(())
+});
+api!(napi_create_bigint_words(
+    env,
+    sign: i32,
+    count: usize,
+    words: *const u64,
+    result: *mut Ptr,
+) {
+    check(!result.is_null() && (count == 0 || !words.is_null()) && count <= i32::MAX as usize, 1)?;
+    let words = if count == 0 { &[][..] } else { std::slice::from_raw_parts(words, count) };
+    let mut hex = String::with_capacity(3 + 16 * count);
+    hex.push_str("0x0");
+    for word in words.iter().rev() {
+        hex.push_str(&format!("{word:016x}"));
+    }
+    env.value(result, env.js("bigint_hex", &[env.text(&hex), env.boolean(sign != 0)])?)
+});
+
+struct AsyncCleanup {
+    owner: Weak<State>,
+    thread: std::thread::ThreadId,
+    hook: AsyncCleanupHook,
+    arg: Ptr,
+}
+api!(napi_add_async_cleanup_hook(env, hook: Option<AsyncCleanupHook>, arg: Ptr, handle: *mut Ptr) {
+    let hook = hook.ok_or(1)?;
+    let cleanup = Box::into_raw(Box::new(AsyncCleanup {
+        owner: env.owner.clone(),
+        thread: env.thread,
+        hook,
+        arg,
+    }));
+    env.async_cleanup.borrow_mut().push(cleanup as usize);
+    if !handle.is_null() {
+        *handle = cleanup.cast();
+    }
+    Ok(())
+});
+raw_api!(napi_remove_async_cleanup_hook(handle: Ptr) {
+    if handle.is_null() || unsafe { (*handle.cast::<AsyncCleanup>()).thread } != std::thread::current().id() {
+        return 1;
+    }
+    let cleanup = unsafe { Box::from_raw(handle.cast::<AsyncCleanup>()) };
+    if let Some(env) = cleanup.owner.upgrade() {
+        env.async_cleanup.borrow_mut().retain(|other| *other != handle as usize);
+    }
+    0
+});
+
 type AsyncExecute = unsafe extern "C" fn(*const State, Ptr);
 type AsyncComplete = unsafe extern "C" fn(*const State, i32, Ptr);
 type CallJs = unsafe extern "C" fn(*const State, Ptr, Ptr, Ptr);
+
+const IDLE: u8 = 0;
+const QUEUED: u8 = 1;
+const RUNNING: u8 = 2;
+const CANCELLED: u8 = 3;
 
 struct AsyncWork {
     execute: AsyncExecute,
     complete: Option<AsyncComplete>,
     data: Ptr,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 api!(napi_create_async_work(
     env,
@@ -2275,7 +2487,7 @@ api!(napi_create_async_work(
         execute: execute.ok_or(1)?,
         complete,
         data,
-        cancelled: Default::default(),
+        state: Arc::new(AtomicU8::new(IDLE)),
     }))
     .cast();
     Ok(())
@@ -2289,54 +2501,77 @@ api!(napi_delete_async_work(env, work: Ptr) {
 api!(napi_queue_async_work(env, work: Ptr) {
     check(!work.is_null(), 1)?;
     let item = &*work.cast::<AsyncWork>();
+    check(item.state.compare_exchange(IDLE, QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok(), 1)?;
+    let (execute, data, state) = (item.execute, item.data as usize, item.state.clone());
+    let (ready, wake, raw, work) = (env.ready.clone(), crate::host::Waker::current(), ptr::from_ref(env) as usize, work as usize);
+    crate::node::blocking(move || {
+        let run = state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if run {
+            // WARNING: `execute` runs off the JS thread and may not call JavaScript, as Node-API documents.
+            unsafe { execute(raw as *const State, data as Ptr) };
+        }
+        ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Ready::Work(work, if run { 0 } else { 11 }));
+        wake.wake();
+    })
+    .map_err(|_| {
+        item.state.store(IDLE, Ordering::Release);
+        9
+    })?;
     env.active.set(env.active.get() + 1);
-    let (execute, data, cancelled) = (item.execute, item.data as usize, item.cancelled.clone());
-    let (ready, wake, raw, work) = (env.ready.clone(), crate::host::Waker::current(), std::ptr::from_ref(env) as usize, work as usize);
-    std::thread::Builder::new()
-        .name("apps-napi".into())
-        .spawn(move || {
-            let stopped = cancelled.load(std::sync::atomic::Ordering::Acquire);
-            if !stopped {
-                // WARNING: `execute` runs off the JS thread and may not call JavaScript, as Node-API documents.
-                unsafe { execute(raw as *const State, data as Ptr) };
-            }
-            ready.lock().unwrap().push(Ready::Work(work, if stopped { 11 } else { 0 }));
-            wake.wake();
-        })
-        .map_err(|_| 9)?;
     Ok(())
 });
 api!(napi_cancel_async_work(env, work: Ptr) {
     let _ = env;
     check(!work.is_null(), 1)?;
-    (*work.cast::<AsyncWork>()).cancelled.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
+    check((*work.cast::<AsyncWork>()).state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok(), 9)
 });
 
 struct Threadsafe {
-    env: usize,
+    thread: std::thread::ThreadId,
     function: usize,
     call: Option<CallJs>,
     context: usize,
     finalize: Option<Finalize>,
     finalize_data: usize,
-    queue: std::sync::Mutex<std::collections::VecDeque<usize>>,
-    threads: std::sync::atomic::AtomicUsize,
-    closing: std::sync::atomic::AtomicBool,
-    referenced: std::sync::atomic::AtomicBool,
-    ready: std::sync::Arc<std::sync::Mutex<Vec<Ready>>>,
+    max_queue: usize,
+    queue: Mutex<VecDeque<usize>>,
+    space: Condvar,
+    threads: AtomicUsize,
+    closing: AtomicBool,
+    finalized: AtomicBool,
+    referenced: AtomicBool,
+    ready: Arc<Mutex<Vec<Ready>>>,
     wake: crate::host::Waker,
 }
-pub(crate) enum Ready {
+impl Threadsafe {
+    // WARNING: the flag changes under the queue lock, so a blocked caller can't miss the wakeup.
+    fn close(&self) {
+        let _queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
+        self.space.notify_all();
+    }
+    fn schedule(self: Arc<Self>) {
+        let (ready, wake) = (self.ready.clone(), self.wake.clone());
+        ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Ready::Threadsafe(self));
+        wake.wake();
+    }
+}
+enum Ready {
     Work(usize, i32),
-    Threadsafe(usize),
+    Threadsafe(Arc<Threadsafe>),
 }
 api!(napi_create_threadsafe_function(
     env,
     function: Ptr,
     _resource: Ptr,
     _name: Ptr,
-    _max_queue: usize,
+    max_queue: usize,
     threads: usize,
     finalize_data: Ptr,
     finalize: Option<Finalize>,
@@ -2347,25 +2582,35 @@ api!(napi_create_threadsafe_function(
     check(!result.is_null() && threads > 0, 1)?;
     check(!function.is_null() || call.is_some(), 1)?;
     if !function.is_null() {
+        check(env.kind(function)? == 7, 5)?;
         (env.api.protect)(env.ctx, function);
     }
     env.threadsafe.set(env.threadsafe.get() + 1);
-    *result = Box::into_raw(Box::new(Threadsafe {
-        env: std::ptr::from_ref(env) as usize,
+    let function = Arc::new(Threadsafe {
+        thread: env.thread,
         function: function as usize,
         call,
         context: context as usize,
         finalize,
         finalize_data: finalize_data as usize,
-        queue: Default::default(),
+        max_queue,
+        queue: Mutex::default(),
+        space: Condvar::new(),
         threads: threads.into(),
         closing: false.into(),
+        finalized: false.into(),
         referenced: true.into(),
         ready: env.ready.clone(),
         wake: crate::host::Waker::current(),
-    }))
-    .cast();
-    env.threadsafe_live.borrow_mut().insert(*result as usize);
+    });
+    // WARNING: each acquiring thread owns a reference, and `threadsafe_live` owns the JavaScript thread's, so a thread
+    // that calls after another one aborted still reaches live memory.
+    let raw = Arc::as_ptr(&function);
+    for _ in 0..threads {
+        Arc::increment_strong_count(raw);
+    }
+    env.threadsafe_live.borrow_mut().insert(raw as usize, function);
+    *result = raw.cast_mut().cast();
     Ok(())
 });
 raw_api!(napi_get_threadsafe_function_context(function: *const Threadsafe, result: *mut Ptr) {
@@ -2375,138 +2620,189 @@ raw_api!(napi_get_threadsafe_function_context(function: *const Threadsafe, resul
     unsafe { *result = (*function).context as Ptr };
     0
 });
-raw_api!(napi_call_threadsafe_function(function: *const Threadsafe, data: Ptr, _mode: i32) {
+raw_api!(napi_call_threadsafe_function(function: *const Threadsafe, data: Ptr, mode: i32) {
     if function.is_null() {
         return 1;
     }
-    let function = unsafe { &*function };
-    if function.closing.load(std::sync::atomic::Ordering::Acquire) {
-        return 16;
+    let tsfn = unsafe { &*function };
+    let mut queue = tsfn.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if tsfn.closing.load(Ordering::Acquire) {
+            return 16;
+        }
+        if tsfn.max_queue == 0 || queue.len() < tsfn.max_queue {
+            break;
+        }
+        if mode == 0 {
+            return 15;
+        }
+        if tsfn.thread == std::thread::current().id() {
+            return 21;
+        }
+        queue = tsfn.space.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
-    function.queue.lock().unwrap().push_back(data as usize);
-    function.ready.lock().unwrap().push(Ready::Threadsafe(std::ptr::from_ref(function) as usize));
-    function.wake.wake();
+    queue.push_back(data as usize);
+    drop(queue);
+    unsafe {
+        Arc::increment_strong_count(function);
+        Arc::from_raw(function).schedule();
+    }
     0
 });
 raw_api!(napi_acquire_threadsafe_function(function: *const Threadsafe) {
     if function.is_null() {
         return 1;
     }
-    let function = unsafe { &*function };
-    if function.closing.load(std::sync::atomic::Ordering::Acquire) {
+    let tsfn = unsafe { &*function };
+    if tsfn.closing.load(Ordering::Acquire) {
         return 16;
     }
-    function.threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if tsfn.threads.try_update(Ordering::AcqRel, Ordering::Acquire, |count| (count > 0).then_some(count + 1)).is_err() {
+        return 1;
+    }
+    unsafe { Arc::increment_strong_count(function) };
     0
 });
 raw_api!(napi_release_threadsafe_function(function: *const Threadsafe, mode: i32) {
     if function.is_null() {
         return 1;
     }
-    let function = unsafe { &*function };
-    let left = function.threads.fetch_sub(1, std::sync::atomic::Ordering::AcqRel).saturating_sub(1);
+    let released = unsafe { &*function }.threads.try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
+    let Ok(previous) = released else {
+        return 1;
+    };
+    // WARNING: this takes over the caller's reference, so the function stays alive until this call returns.
+    let tsfn = unsafe { Arc::from_raw(function) };
     if mode == 1 {
-        function.closing.store(true, std::sync::atomic::Ordering::Release);
+        tsfn.close();
     }
-    if left == 0 || mode == 1 {
-        function.ready.lock().unwrap().push(Ready::Threadsafe(std::ptr::from_ref(function) as usize));
-        function.wake.wake();
+    if previous == 1 || mode == 1 {
+        tsfn.schedule();
     }
     0
 });
 api!(napi_unref_threadsafe_function(env, function: Ptr) {
     check(!function.is_null(), 1)?;
-    if (*function.cast::<Threadsafe>()).referenced.swap(false, std::sync::atomic::Ordering::AcqRel) {
+    if (*function.cast::<Threadsafe>()).referenced.swap(false, Ordering::AcqRel) {
         env.threadsafe.set(env.threadsafe.get().saturating_sub(1));
     }
     Ok(())
 });
 api!(napi_ref_threadsafe_function(env, function: Ptr) {
     check(!function.is_null(), 1)?;
-    if !(*function.cast::<Threadsafe>()).referenced.swap(true, std::sync::atomic::Ordering::AcqRel) {
+    if !(*function.cast::<Threadsafe>()).referenced.swap(true, Ordering::AcqRel) {
         env.threadsafe.set(env.threadsafe.get() + 1);
     }
     Ok(())
 });
 
 impl State {
+    fn scoped(&self, run: impl FnOnce()) {
+        let depth = self.scopes.borrow().len();
+        self.scopes.borrow_mut().push(Box::new(Scope {
+            kept: HashSet::new(),
+            values: Vec::new(),
+            escaped: false,
+            escapable: false,
+        }));
+        run();
+        self.report();
+        while self.scopes.borrow().len() > depth {
+            self.pop();
+        }
+    }
+
     pub(crate) fn drain(self: &Rc<Self>) {
         for environment in self.environments.borrow().clone() {
             environment.drain();
         }
-        let items = std::mem::take(&mut *self.ready.lock().unwrap());
+        let items = std::mem::take(
+            &mut *self
+                .ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         for item in items {
-            let depth = self.scopes.borrow().len();
-            self.scopes.borrow_mut().push(Box::new(Scope {
-                kept: HashSet::new(),
-                values: Vec::new(),
-                escaped: false,
-                escapable: false,
-            }));
             match item {
                 Ready::Work(work, status) => {
                     self.active.set(self.active.get().saturating_sub(1));
                     let (complete, data) = unsafe {
                         let work = &*(work as *const AsyncWork);
+                        work.state.store(IDLE, Ordering::Release);
                         (work.complete, work.data)
                     };
                     if let Some(complete) = complete {
-                        unsafe { complete(Rc::as_ptr(self), status, data) };
+                        self.scoped(|| unsafe { complete(Rc::as_ptr(self), status, data) });
                     }
                 }
-                Ready::Threadsafe(pointer) => self.run_threadsafe(pointer),
-            }
-            let exception = self.take_exception();
-            if !exception.is_null() {
-                let _ = self.js("report", &[exception]);
-            }
-            while self.scopes.borrow().len() > depth {
-                self.pop();
+                Ready::Threadsafe(function) => self.run_threadsafe(&function),
             }
         }
     }
 
-    fn run_threadsafe(self: &Rc<Self>, pointer: usize) {
-        use std::sync::atomic::Ordering;
+    fn run_threadsafe(&self, function: &Threadsafe) {
         // WARNING: one function can have several entries here, so a later one may name a function that already ended.
-        if !self.threadsafe_live.borrow().contains(&pointer) {
+        if function.finalized.load(Ordering::Acquire) {
             return;
         }
-        let function = unsafe { &*(pointer as *const Threadsafe) };
-        loop {
-            let Some(data) = function.queue.lock().unwrap().pop_front() else {
-                break;
-            };
-            let env = function.env as *const State;
+        while !function.closing.load(Ordering::Acquire) {
+            let next = function
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let Some(data) = next else { break };
+            function.space.notify_one();
             let target = function.function as Ptr;
-            unsafe {
+            self.scoped(|| unsafe {
                 match function.call {
-                    Some(call) => call(env, target, function.context as Ptr, data as Ptr),
+                    Some(call) => call(self, target, function.context as Ptr, data as Ptr),
                     None => {
                         let _ = self.js("call", &[target, self.undefined()]);
                     }
                 }
-            }
+            });
         }
         if function.threads.load(Ordering::Acquire) == 0 || function.closing.load(Ordering::Acquire)
         {
-            self.threadsafe_live.borrow_mut().remove(&pointer);
-            if function.referenced.load(Ordering::Acquire) {
-                self.threadsafe.set(self.threadsafe.get().saturating_sub(1));
-            }
-            if let Some(finalize) = function.finalize {
+            let live = self
+                .threadsafe_live
+                .borrow_mut()
+                .remove(&(ptr::from_ref(function) as usize));
+            self.scoped(|| self.end_threadsafe(function));
+            drop(live);
+        }
+    }
+
+    // WARNING: like Node, values still queued at the end go to the call callback without an environment, so it can free them.
+    fn end_threadsafe(&self, function: &Threadsafe) {
+        function.finalized.store(true, Ordering::Release);
+        if function.referenced.load(Ordering::Acquire) {
+            self.threadsafe.set(self.threadsafe.get().saturating_sub(1));
+        }
+        if let Some(finalize) = function.finalize {
+            unsafe { finalize(self, function.finalize_data as Ptr, function.context as Ptr) };
+        }
+        let rest = std::mem::take(
+            &mut *function
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some(call) = function.call {
+            for data in rest {
                 unsafe {
-                    finalize(
-                        function.env as *const State,
-                        function.finalize_data as Ptr,
+                    call(
+                        ptr::null(),
+                        ptr::null_mut(),
                         function.context as Ptr,
+                        data as Ptr,
                     )
                 };
             }
-            if function.function != 0 {
-                unsafe { (self.api.unprotect)(self.ctx, function.function as Ptr) };
-            }
-            drop(unsafe { Box::from_raw(pointer as *mut Threadsafe) });
+        }
+        if function.function != 0 {
+            unsafe { (self.api.unprotect)(self.ctx, function.function as Ptr) };
         }
     }
 

@@ -320,13 +320,15 @@ impl State {
                 let options = &args[0];
                 let runtime = crate::web::network()?;
                 let _guard = runtime.enter();
-                let (listener, address) = if let Some(path) = options["path"].as_str() {
+                let (listener, address, bound) = if let Some(path) = options["path"].as_str() {
                     #[cfg(unix)]
                     {
                         match tokio::net::UnixListener::bind(path) {
-                            Ok(listener) => {
-                                (Listener::Unix(listener, path.into()), json!({"path":path}))
-                            }
+                            Ok(listener) => (
+                                Listener::Unix(listener, path.into()),
+                                json!({"path":path}),
+                                None,
+                            ),
                             Err(error) => {
                                 return Ok(
                                     json!({"error":failure((error, "listen", json!({"address":path})))}),
@@ -355,6 +357,7 @@ impl State {
                     (
                         Listener::Tcp(tokio::net::TcpListener::from_std(listener)?),
                         json!({"address":address.ip().to_string(),"family":if address.is_ipv4(){"IPv4"}else{"IPv6"},"port":address.port()}),
+                        Some(crate::web::Listening::new(address)),
                     )
                 };
                 let listener = Arc::new(Mutex::new(Some(listener)));
@@ -393,9 +396,7 @@ impl State {
                         events,
                         listener,
                         task,
-                        _port: address["port"]
-                            .as_u64()
-                            .map(|port| crate::web::Listening::new(port as u16)),
+                        _port: bound,
                     },
                 );
                 Ok(json!({"id":self.next_id,"address":address}))

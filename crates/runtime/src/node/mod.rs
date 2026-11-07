@@ -205,12 +205,61 @@ pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
 }
 
-type Job = (
-    u64,
-    String,
-    crate::jsc::payload::Payload,
-    crate::host::Waker,
-);
+type Job = Box<dyn FnOnce() + Send>;
+struct Pool {
+    jobs: std::collections::VecDeque<Job>,
+    idle: usize,
+    threads: usize,
+}
+static POOL: Mutex<Pool> = Mutex::new(Pool {
+    jobs: std::collections::VecDeque::new(),
+    idle: 0,
+    threads: 0,
+});
+static READY: std::sync::Condvar = std::sync::Condvar::new();
+
+// WARNING: like libuv, all contexts share up to 4 threads for blocking work (fs, dns, zlib, crypto, Node-API async
+// work), so a slow job delays the jobs queued behind it.
+pub(crate) fn blocking(job: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    let mut pool = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pool.jobs.push_back(Box::new(job));
+    if pool.idle < pool.jobs.len() && pool.threads < 4 {
+        let spawned = std::thread::Builder::new()
+            .name("apps-pool".into())
+            .spawn(|| {
+                let mut pool = POOL
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    if let Some(job) = pool.jobs.pop_front() {
+                        drop(pool);
+                        job();
+                        pool = POOL
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    } else {
+                        pool.idle += 1;
+                        pool = READY
+                            .wait(pool)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        pool.idle -= 1;
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => pool.threads += 1,
+            Err(error) if pool.threads == 0 => {
+                pool.jobs.pop_back();
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    READY.notify_one();
+    Ok(())
+}
 
 pub(crate) struct State {
     files: Arc<Files>,
@@ -220,8 +269,6 @@ pub(crate) struct State {
     watchers: HashMap<u64, notify::RecommendedWatcher>,
     hashers: HashMap<u64, Hasher>,
     codecs: HashMap<u64, (Codec, bool)>,
-    tasks: Option<mpsc::Sender<Job>>,
-    pool: Option<mpsc::Sender<Job>>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -234,8 +281,6 @@ impl Default for State {
             watchers: HashMap::new(),
             hashers: HashMap::new(),
             codecs: HashMap::new(),
-            tasks: None,
-            pool: None,
         }
     }
 }
@@ -254,60 +299,28 @@ impl State {
                 Ok(json!(events))
             }
             "async" => {
-                let task = |files: &Files,
-                            id: u64,
-                            op: &str,
-                            args: crate::jsc::payload::Payload| {
-                    crate::jsc::payload::Payload::capture(args.buffers, || {
-                        match files.call(op, &args.value) {
+                self.next += 1;
+                let id = self.next;
+                let op = args[0].as_str().context("Expected operation")?.to_owned();
+                let payload = crate::jsc::payload::Payload::snapshot(args[1].take());
+                let (files, sender, wake) = (
+                    self.files.clone(),
+                    self.sender.clone(),
+                    crate::host::Waker::current(),
+                );
+                blocking(move || {
+                    let result = crate::jsc::payload::Payload::capture(payload.buffers, || {
+                        match files.call(&op, &payload.value) {
                             Ok(value) => json!({"id":id,"value":value}),
                             Err(error) => {
                                 json!({"id":id,"error":error.to_string(),"code":error.downcast_ref::<std::io::Error>().map(code)})
                             }
                         }
-                    })
-                };
-                self.next += 1;
-                let id = self.next;
-                let op = args[0].as_str().context("Expected operation")?.to_owned();
-                let payload = crate::jsc::payload::Payload::snapshot(args[1].take());
-                let slow = matches!(
-                    op.as_str(),
-                    "lookup" | "resolve" | "zlib" | "pbkdf2" | "scrypt" | "hkdf"
-                );
-                let queue = if slow {
-                    &mut self.pool
-                } else {
-                    &mut self.tasks
-                };
-                let jobs = match queue {
-                    Some(jobs) => jobs,
-                    None => {
-                        let (jobs, receiver) = mpsc::channel::<Job>();
-                        let receiver = Arc::new(Mutex::new(receiver));
-                        let workers =
-                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
-                        for _ in 0..workers {
-                            let (files, sender, receiver) =
-                                (self.files.clone(), self.sender.clone(), receiver.clone());
-                            std::thread::Builder::new()
-                                .name(if slow { "apps-node" } else { "apps-files" }.into())
-                                .spawn(move || {
-                                    while let Ok(Ok((id, op, args, wake))) =
-                                        receiver.lock().map(|receiver| receiver.recv())
-                                    {
-                                        if sender.send(task(&files, id, &op, args)).is_err() {
-                                            break;
-                                        }
-                                        wake.wake();
-                                    }
-                                })?;
-                        }
-                        queue.insert(jobs)
+                    });
+                    if sender.send(result).is_ok() {
+                        wake.wake();
                     }
-                };
-                jobs.send((id, op, payload, crate::host::Waker::current()))
-                    .context("Node task queue is closed")?;
+                })?;
                 Ok(json!(id))
             }
             "watch" => {

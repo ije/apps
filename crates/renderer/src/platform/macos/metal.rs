@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
-use objc2::{Message, rc::Retained, runtime::ProtocolObject};
+use objc2::{MainThreadMarker, Message, rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSArray, NSNumber, NSRange, NSString, NSValue, ns_string};
 use objc2_metal::{
@@ -30,6 +30,10 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
@@ -91,6 +95,17 @@ impl BufferPool {
 
 pub(crate) struct Present(Option<super::Sendable<Box<dyn FnOnce()>>>);
 
+impl Present {
+    fn new(present: impl FnOnce() + 'static) -> Self {
+        Self(Some(super::Sendable::new(Box::new(present))))
+    }
+
+    // WARNING: drops the drawables without showing them, so their layers can hand them out again.
+    fn discard(mut self) {
+        self.0 = None;
+    }
+}
+
 impl Drop for Present {
     fn drop(&mut self) {
         if let Some(present) = self.0.take() {
@@ -116,6 +131,7 @@ pub(crate) struct Renderer {
     promoted: Vec<Promoted>,
     glass: Vec<NativeGlass>,
     glass_update: bool,
+    glass_stale: bool,
     caret: Option<(
         Retained<CALayer>,
         Bounds<ScaledPixels>,
@@ -123,6 +139,8 @@ pub(crate) struct Renderer {
         std::time::Instant,
     )>,
     restacked: bool,
+    committed: u64,
+    completed: Arc<AtomicU64>,
 }
 
 type Rendered = (
@@ -314,8 +332,11 @@ impl Renderer {
             promoted: Vec::new(),
             glass: Vec::new(),
             glass_update: false,
+            glass_stale: false,
             caret: None,
             restacked: false,
+            committed: 0,
+            completed: Arc::default(),
         })
     }
 
@@ -554,18 +575,47 @@ impl Renderer {
         self.present.take()
     }
 
+    // WARNING: glass views and the frame must change in one Core Animation transaction of the main thread. While
+    // AppKit waits for a resize frame, they go back with it, so they show in AppKit's transaction.
     pub fn take_glass_update(
         &mut self,
-    ) -> Option<(Vec<super::glass::GlassSurface>, Option<Present>)> {
-        mem::take(&mut self.glass_update).then(|| {
-            (
-                self.glass
-                    .iter()
-                    .map(|glass| glass.surface.clone())
-                    .collect(),
-                self.present.take(),
-            )
-        })
+        apply: impl FnOnce(Vec<super::glass::GlassSurface>) + Send + 'static,
+    ) -> Option<Present> {
+        if !mem::take(&mut self.glass_update) {
+            return None;
+        }
+        self.glass_stale = false;
+        let surfaces = super::Sendable::new(
+            self.glass
+                .iter()
+                .map(|glass| glass.surface.clone())
+                .collect::<Vec<_>>(),
+        );
+        let frame = self.present.take().and_then(|mut present| present.0.take());
+        let update = Present::new(move || {
+            let run = move || {
+                apply(surfaces.take());
+                if let Some(frame) = frame {
+                    frame.take()();
+                }
+            };
+            if MainThreadMarker::new().is_some() {
+                run();
+            } else {
+                super::native_post(Box::new(run));
+            }
+        });
+        if self.presents_with_transaction {
+            self.present = Some(update);
+            return None;
+        }
+        Some(update)
+    }
+
+    // WARNING: the glass views of a dropped frame never showed, so the next frame updates them even without glass.
+    pub fn discard(&mut self, present: Present) {
+        present.discard();
+        self.glass_stale = true;
     }
 
     pub fn set_presents_with_transaction(&mut self, on: bool) {
@@ -577,8 +627,16 @@ impl Renderer {
         self.layer.setOpaque(!transparent);
     }
 
+    // WARNING: frames often stop for a moment, so this frees only tiles that no frame reads anymore. Buffers,
+    // layer textures and spare atlas pages wait for `release`, or each burst of frames would make them again.
     pub fn trim(&mut self) {
-        self.pool.retain(|(_, _, idle)| *idle == 0);
+        if self.completed.load(Ordering::Acquire) == self.committed {
+            self.atlas.free_retired(|| {});
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.atlas.release_images();
         // WARNING: command buffers of one queue complete in order, so an empty one waits for the frames in flight.
         self.atlas.free_retired(|| {
             if let Some(commands) = self.queue.commandBuffer() {
@@ -589,14 +647,12 @@ impl Renderer {
         let textures = &mut *self.atlas.backend.borrow_mut();
         textures.mono.trim(|texture| texture.packer.is_empty());
         textures.poly.trim(|texture| texture.packer.is_empty());
-        POOL.with(|pool| pool.borrow_mut().resize(MIN_INSTANCE_BUFFER_SIZE));
-    }
-
-    pub fn release(&mut self) {
-        self.atlas.release_images();
-        self.trim();
         self.pool.clear();
-        POOL.with(|pool| pool.borrow_mut().buffers.clear());
+        POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.resize(MIN_INSTANCE_BUFFER_SIZE);
+            pool.buffers.clear();
+        });
         // WARNING: the layer frees its spare drawables only when their size changes. It keeps showing its
         // last frame, and the next frame sets the size back.
         self.layer.setDrawableSize(CGSize::new(1., 1.));
@@ -676,7 +732,9 @@ impl Renderer {
                         sublayer.setFramebufferOnly(false);
                         sublayer.setOpaque(false);
                         sublayer.setPresentsWithTransaction(true);
-                        sublayer.setMaximumDrawableCount(2);
+                        // WARNING: as many as the window layer, so a frame shown but not yet committed by the
+                        // main thread doesn't make the next frame wait for a drawable of this layer.
+                        sublayer.setMaximumDrawableCount(3);
                         sublayer.setAllowsNextDrawableTimeout(false);
                         sublayer
                     }
@@ -700,7 +758,8 @@ impl Renderer {
         glass.reverse();
         self.glass = glass;
         let native_capture = capture && !self.glass.is_empty();
-        let native_transaction = had_glass || !self.glass.is_empty();
+        self.glass_stale |= had_glass || !self.glass.is_empty();
+        let native_transaction = self.glass_stale;
         if capture && !native_capture {
             self.demote();
         }
@@ -734,7 +793,7 @@ impl Renderer {
                 }
             };
             if resizing || native_transaction {
-                self.present = Some(Present(Some(super::Sendable::new(Box::new(present)))));
+                self.present = Some(Present::new(present));
             } else {
                 present();
             }
@@ -919,7 +978,10 @@ impl Renderer {
         // the pool in a task of the thread that drew.
         let done = Cell::new(Some(SendBuffer(writer.finish())));
         let thread = super::app_thread();
+        self.committed += 1;
+        let (frame, completed) = (self.committed, self.completed.clone());
         let block = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            completed.fetch_max(frame, Ordering::Release);
             if let Some(buffer) = done.take() {
                 super::post(
                     thread,
@@ -1279,10 +1341,9 @@ impl AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let texture_size =
-                    page_size(size).map(|side| DevicePixels(side.0.min(MAX_TEXTURE_SIZE as i32)));
+                let texture_size = page_size(size);
                 let descriptor = MTLTextureDescriptor::new();
-                // SAFETY: both sides are within 1..=16384.
+                // SAFETY: the atlas keeps both sides within 1..=16384.
                 unsafe {
                     descriptor.setWidth(texture_size.width.0 as usize);
                     descriptor.setHeight(texture_size.height.0 as usize);
@@ -1378,6 +1439,10 @@ impl AtlasBackend for AtlasTextures {
                 );
         }
         Ok(tile)
+    }
+
+    fn max_side(&self) -> i32 {
+        MAX_TEXTURE_SIZE as i32
     }
 
     fn remove(&mut self, tile: AtlasTile) {

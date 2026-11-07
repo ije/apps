@@ -68,32 +68,48 @@ pub(crate) fn load(
             (family, sources(&src), src, range)
         })
         .collect();
-    let revision = doc.nodes.latest();
-    let mut chars: Option<Vec<u64>> = None;
-    let mut order: Vec<_> = faces
+    let ranges: Vec<_> = faces
         .iter()
-        .enumerate()
-        .map(|(index, (_, sources, _, range))| {
+        .map(|(_, sources, _, range)| {
             let pending = sources
                 .iter()
                 .filter(|(kind, _)| *kind == "url")
                 .map(|(_, url)| state.fonts.get(url))
                 .find(|tried| tried.is_none_or(Option::is_some));
-            let Some(range) = range.as_ref().filter(|_| pending == Some(None)) else {
+            range.as_ref().filter(|_| pending == Some(None))
+        })
+        .collect();
+    // WARNING: the characters of the page text are kept while a `unicode-range` face waits, and only text nodes
+    // changed since the last scan are read again. Removed text stays counted.
+    let revision = doc.nodes.latest();
+    let scanned = ranges.iter().any(Option::is_some) && state.font_text.0 != revision;
+    if ranges.iter().all(Option::is_none) {
+        state.font_text = Default::default();
+    } else if scanned {
+        let (last, chars) = &mut state.font_text;
+        if chars.is_empty() {
+            (*last, *chars) = (0, vec![0; 0x110000 / 64]);
+        }
+        for (id, node) in doc.nodes.iter().enumerate() {
+            if node.tag == "#text" && doc.nodes.revision(id) > *last {
+                for code in node.text.chars().map(|code| code as usize) {
+                    chars[code / 64] |= 1 << (code % 64);
+                }
+            }
+        }
+        *last = revision;
+    }
+    let chars = &state.font_text.1;
+    let mut order: Vec<_> = ranges
+        .into_iter()
+        .enumerate()
+        .map(|(index, range)| {
+            let Some(range) = range else {
                 return (usize::MAX, index);
             };
-            if state.font_text == Some(revision) {
+            if !scanned {
                 return (0, index);
             }
-            let chars = chars.get_or_insert_with(|| {
-                let mut chars = vec![0u64; 0x110000 / 64];
-                for node in doc.nodes.iter().filter(|node| node.tag == "#text") {
-                    for code in node.text.chars().map(|code| code as usize) {
-                        chars[code / 64] |= 1 << (code % 64);
-                    }
-                }
-                chars
-            });
             let used = range
                 .split(',')
                 .filter_map(|range| {
@@ -124,9 +140,6 @@ pub(crate) fn load(
             (used, index)
         })
         .collect();
-    if chars.is_some() {
-        state.font_text = Some(revision);
-    }
     order.sort_by_key(|&(used, _)| std::cmp::Reverse(used));
     let mut statuses = vec!["unloaded"; faces.len()];
     for (_, index) in order.into_iter().filter(|&(used, _)| used > 0) {
@@ -275,13 +288,22 @@ mod tests {
         )]));
         assert_eq!(&*font.family, "H2O Test");
         assert!(!load(&mut doc, &mut state).0);
+        assert_eq!(state.font_text.1.len(), 0x110000 / 64);
         let text = doc
             .nodes
             .iter()
             .position(|node| node.tag == "#text" && node.text.contains('B'))
             .unwrap();
+        let revision = doc.nodes.revision(text);
+        doc.nodes[text].text = "Ж".into();
+        let (latest, tree) = (doc.nodes.latest(), doc.nodes.tree());
+        doc.nodes.restore(&[(text, revision)], latest, tree);
+        let (added, faces) = load(&mut doc, &mut state);
+        assert!(!added && faces[3].3 == "unloaded");
         doc.nodes[text].text = "Ж".into();
         let (added, faces) = load(&mut doc, &mut state);
         assert!(added && faces[3].3 == "loaded");
+        load(&mut doc, &mut state);
+        assert!(state.font_text.1.is_empty());
     }
 }

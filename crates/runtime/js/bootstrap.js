@@ -91,22 +91,47 @@
       write('log', [line('┌', '┬', '┐'), cells(header), line('├', '┼', '┤'), ...rows.map(row => cells(header.map(name => row[name] ?? ''))), line('└', '┴', '┘')].join('\n'));
     },
   });
-  // WARNING: `next` is never later than the earliest timer, and it is exact unless `stale`, so ticks skip the timer scan until one is due. Timers use the monotonic `clock`, because the wall clock can jump.
-  const timers = new Map();
-  let timerID = 0, next = Infinity, stale = false, nesting = 0;
-  const earliest = () => { if (stale) { stale = false; next = Infinity; for (const timer of timers.values()) if (timer.at < next) next = timer.at; } return next; };
+  // WARNING: `heap` orders timers by (at, id). A timer object never changes its `at`: a refresh or an interval run schedules a
+  // new object, and a heap entry is live only while `timers` maps its id to it. Timers use the monotonic `clock`, because the wall clock can jump.
+  const timers = new Map(), heap = [];
+  let timerID = 0, refs = 0, nesting = 0, limit = 0;
+  const before = (a, b) => a.at < b.at || (a.at === b.at && a.id < b.id);
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      let i = 0;
+      for (let child = 1; child < heap.length; child = 2 * i + 1) {
+        if (child + 1 < heap.length && before(heap[child + 1], heap[child])) child++;
+        if (!before(heap[child], last)) break;
+        heap[i] = heap[child]; i = child;
+      }
+      heap[i] = last;
+    }
+    return top;
+  };
+  // WARNING: cleared timers stay in the heap until they reach the top, so it is rebuilt once they are most of it.
+  const compact = () => { if (heap.length > 64 && heap.length > 2 * timers.size) { heap.length = 0; for (const timer of [...timers.values()].sort((a, b) => a.at - b.at || a.id - b.id)) heap.push(timer); } };
+  const schedule = timer => {
+    timers.set(timer.id, timer);
+    let i = heap.push(timer) - 1;
+    while (i > 0) { const parent = (i - 1) >> 1; if (!before(timer, heap[parent])) break; heap[i] = heap[parent]; i = parent; }
+    heap[i] = timer;
+    compact();
+  };
+  const earliest = () => { while (heap.length && timers.get(heap[0].id) !== heap[0]) pop(); return heap.length ? heap[0].at : Infinity; };
+  const remove = id => { const timer = timers.get(id); if (!timer) return; timers.delete(id); if (timer.ref) refs--; compact(); };
   class Timeout {
     #id;
     constructor(id) { this.#id = id; }
-    ref() { const timer = timers.get(this.#id); if (timer) timer.ref = true; return this; }
-    unref() { const timer = timers.get(this.#id); if (timer) timer.ref = false; return this; }
+    ref() { const timer = timers.get(this.#id); if (timer && !timer.ref) { timer.ref = true; refs++; } return this; }
+    unref() { const timer = timers.get(this.#id); if (timer?.ref) { timer.ref = false; refs--; } return this; }
     hasRef() { return timers.get(this.#id)?.ref ?? false; }
-    refresh() { const timer = timers.get(this.#id); if (timer) { timer.at = clock() + timer.delay; stale = true; } return this; }
+    refresh() { const timer = timers.get(this.#id); if (timer) schedule({ ...timer, at: clock() + timer.delay }); return this; }
     close() { clearTimeout(this.#id); return this; }
     [Symbol.toPrimitive]() { return this.#id; }
     [Symbol.dispose]() { clearTimeout(this.#id); }
   }
-  globalThis.setTimeout = (fn, delay = 0, ...args) => {
+  const start = (fn, delay, args, interval) => {
     if (typeof fn !== 'function') throw new TypeError('Expected a timer function');
     const id = ++timerID;
     delay = Number(delay);
@@ -114,20 +139,16 @@
     // WARNING: like browsers, pages clamp timers nested more than 5 levels deep to 4 ms.
     if (nodeRole && delay < 1) delay = 1;
     else if (!nodeRole && nesting > 5 && delay < 4) delay = 4;
-    const at = clock() + delay;
-    timers.set(id, { fn, args, delay, at, ref: true, level: nesting + 1 });
-    if (at < next) next = at;
+    refs++;
+    schedule({ id, fn, args, delay, at: clock() + delay, ref: true, level: nesting + 1, interval: interval ? Math.max(1, delay) : 0 });
     return nodeRole ? new Timeout(id) : id;
   };
-  globalThis.clearTimeout = id => { if (timers.get(+id)?.at === next) stale = true; timers.delete(+id); };
-  globalThis.setInterval = (fn, delay = 0, ...args) => {
-    const id = setTimeout(fn, delay, ...args);
-    timers.get(+id).interval = Math.max(1, timers.get(+id).delay);
-    return id;
-  };
+  globalThis.setTimeout = (fn, delay = 0, ...args) => start(fn, delay, args, false);
+  globalThis.clearTimeout = id => remove(+id);
+  globalThis.setInterval = (fn, delay = 0, ...args) => start(fn, delay, args, true);
   globalThis.clearInterval = clearTimeout;
   // WARNING: internal tasks (IndexedDB events) are not timers, so they skip the timer clamps and reset the nesting level.
-  const task = fn => { const id = ++timerID, at = clock(); timers.set(id, { fn, args: [], delay: 0, at, ref: true, level: 0 }); if (at < next) next = at; };
+  const task = fn => { refs++; schedule({ id: ++timerID, fn, args: [], delay: 0, at: clock(), ref: true, level: 0, interval: 0 }); };
   const resolved = Promise.resolve();
   // WARNING: errors that `fail` throws in main are thrown by the next tick, like a failed timer.
   globalThis.queueMicrotask = fn => {
@@ -136,7 +157,7 @@
   };
   // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs; __appsTick returns -2 after each one, so the engine drains microtasks and calls it again.
   const ticks = [], immediates = new Map();
-  let phase = 0, now = 0, due = [], checks = [];
+  let phase = 0, now = 0, checks = [];
   const fail = error => { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } };
   const runTicks = () => {
     for (let i = 0; i < ticks.length; i++) { const [fn, args] = ticks[i]; try { fn(...args); } catch (error) { ticks.splice(0, i + 1); i = -1; fail(error); } }
@@ -174,15 +195,14 @@
     if (moduleErrors.length) throw moduleErrors.shift();
     if (ticks.length) { runTicks(); return -2; }
     if (phase === 0) {
-      phase = 1; now = clock();
-      if (now >= earliest()) { stale = true; due = [...timers].filter(([, timer]) => timer.at <= now).sort((a, b) => a[1].at - b[1].at); }
+      phase = 1; now = clock(); limit = timerID;
     }
-    while (phase === 1 && due.length) {
-      const [id, timer] = due.shift();
-      if (timers.get(id) !== timer || timer.at > now) continue;
+    // WARNING: timers that start in this phase have larger ids and are never earlier than `now`, so they wait for the next phase.
+    if (phase === 1 && earliest() <= now && heap[0].id <= limit) {
+      const timer = pop();
       nesting = timer.level;
-      if (timer.interval) { if (!nodeRole && timer.level++ > 5 && timer.interval < 4) timer.interval = 4; timer.at = clock() + timer.interval; }
-      else timers.delete(id);
+      if (timer.interval) { const interval = !nodeRole && timer.level > 5 && timer.interval < 4 ? 4 : timer.interval; schedule({ ...timer, interval, level: timer.level + 1, at: clock() + interval }); }
+      else remove(timer.id);
       try { timer.fn(...timer.args); } catch (error) { fail(error); } finally { nesting = 0; }
       runTicks();
       return -2;
@@ -228,8 +248,7 @@
     return moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
   globalThis.__appsAlive = () => {
-    for (const timer of timers.values()) if (timer.ref) return true;
-    return ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
+    return refs > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   };
   if (typeof role === 'object' && 'renderer' in role) {
     globalThis.__appsDOM = call;
@@ -314,7 +333,7 @@
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
   delete globalThis.__appsBrowser;
-  nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter);
+  nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter, role !== 'main');
   delete globalThis.__appsNativeShell;
   // WARNING: process.version reports the Node.js API level that the node: modules follow, and versions.electron the Electron release that uses it.
   const nodeVersion = '24.0.0', electronVersion = '40.0.0';
@@ -517,7 +536,10 @@
       this.emit('did-fail-load', event(), failure.errno, failure.code, url, true, info.pid, 1);
       return Promise.reject(failure);
     }
-    on(name, listener) { if (name === 'before-input-event') call('dom.listenInput'); return super.on(name, listener); }
+    // WARNING: a window waits for main on its keys only while main listens to its `before-input-event`.
+    #input = false;
+    #listen() { const on = this.listenerCount('before-input-event') > 0; if (on !== this.#input && !this.isDestroyed()) { this.#input = on; call('window', 'input', pages.get(this).win, on); } return this; }
+    static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
     getType() { return 'window'; }
     get session() { return browsers.session.defaultSession; }
     get mainFrame() { return frameOf(this); }
@@ -625,6 +647,8 @@
     else quit();
   };
   hooks.contents = id => windows.get(id)?.webContents ?? null;
+  // WARNING: results go to the page as data for a fixed page function, never as code.
+  const deliver = (win, name, ...args) => { if (!win.isDestroyed()) call('window', 'deliver', win.id, name, args); };
   // WARNING: pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
   // A `<webview>` is a WebContentsView that main keeps over the element, and its events go to the element.
   const webviews = new Map();
@@ -639,25 +663,25 @@
       win.contentView.addChildView(view);
       const emit = guest.emit;
       guest.emit = (name, ...args) => {
-        if (webviewEvents[name] && !contents.isDestroyed()) contents.executeJavaScript(`__appsWebviewEvent(${guest.id},${JSON.stringify(name)},${JSON.stringify(webviewEvents[name](...args))})`).catch(() => {});
+        if (webviewEvents[name]) deliver(win, 'webviewEvent', guest.id, name, webviewEvents[name](...args));
         return emit.call(guest, name, ...args);
       };
       const drop = () => { if (webviews.delete(guest.id) && !guest.isDestroyed()) guest.close(); };
-      webviews.set(guest.id, { view, guest, drop });
+      webviews.set(guest.id, { view, guest, drop, win });
       contents.once('did-start-loading', drop);
       win.once('closed', drop);
       contents.emit('did-attach-webview', event(), guest);
       if (data.src) guest.loadURL(data.src).catch(() => {});
       return guest.id;
     }
-    if (!entry) return null;
+    if (entry?.win !== win) return null;
     const { view, guest, drop } = entry;
     if (op === 'bounds') { view.setBounds(data.bounds); view.setVisible(data.visible); return null; }
     if (op === 'detach') { contents.off('did-start-loading', drop); win.off('closed', drop); win.contentView.removeChildView(view); drop(); return null; }
     if (op === 'call') {
       const result = guest[data.method](...data.args);
       if (typeof result?.then !== 'function') return result ?? null;
-      const reply = (value, error) => { if (!contents.isDestroyed()) contents.executeJavaScript(`__appsWebviewReply(${data.reply},${JSON.stringify(value ?? null)},${JSON.stringify(error ?? null)})`).catch(() => {}); };
+      const reply = (value, error) => deliver(win, 'webviewReply', data.reply ?? null, value ?? null, error ?? null);
       result.then(value => reply(value), error => reply(null, String(error?.message ?? error)));
     }
     return null;
@@ -703,7 +727,7 @@
         return stat.isFile() && stat.size <= 64 * 1024 * 1024 ? [{ name: path.split('/').at(-1), lastModified: stat.mtimeMs, data: __apps.fs.readFileSync(path).toString('base64') }] : [];
       });
     } catch (error) { hooks.report(error); }
-    if (!win.isDestroyed()) win.webContents.executeJavaScript(`__appsFilesPicked(${id},${JSON.stringify(files)})`).catch(() => {});
+    deliver(win, 'filesPicked', id, files);
   };
   const num = (value, name) => { if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`Expected a number for ${name}`); return value; };
   const int = (value, name) => Math.round(num(value, name));
@@ -951,7 +975,7 @@
   });
   Object.defineProperty(app, 'name', { get: () => name, set: app.setName, enumerable: true });
   Object.defineProperty(app, 'hasWindows', { get: () => windows.size > 0, enumerable: true });
-  nativeShell.bindApp(app, info.appName, () => BrowserWindow.getFocusedWindow());
+  nativeShell.bindApp?.(app, info.appName, () => BrowserWindow.getFocusedWindow());
   if (role === 'main' && workers.api.isMainThread) globalThis.__appsStart = options => {
     if (!options || typeof options !== 'object') return;
     const handlers = [['ready', 'ready'], ['activate', 'activate'], ['windowClose', 'window-close']];
@@ -1014,7 +1038,7 @@
     else if (name === 'loaded' || name === 'failed') { win?.webContents._event(name, data); if (name === 'loaded') win?.emit('ready-to-show'); }
     else if (name === 'context-menu') win?.webContents.emit('context-menu', event(), { ...data, frame: frameOf(win.webContents) });
     else if (name === 'input-event') win?.webContents.emit('input-event', event(), data);
-    else if (name === 'file-picker') pickFiles(win, data);
+    else if (name === 'file-picker') { if (win) pickFiles(win, data); }
     else if (name === 'activate') app.emit('activate', event(), !!data);
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
@@ -1129,5 +1153,7 @@
   const webFrame = Object.freeze({ getZoomFactor: () => 1, getZoomLevel: () => 0, setZoomFactor() {}, setZoomLevel() {}, setVisualZoomLevelLimits() {}, insertCSS: () => '', removeInsertedCSS() {} });
   process.getBuiltinModule = name => isBuiltin(name) ? builtins[String(name).replace(/^node:/, '')] : undefined;
   if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
-  globalThis.__apps = Object.freeze({ app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, nativeImage: electron.nativeImage, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
+  // WARNING: like Electron, preloads don't get the main process modules: windows, app and native state belong to main.
+  const main = role === 'main' ? { app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer } : {};
+  globalThis.__apps = Object.freeze({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
 })();

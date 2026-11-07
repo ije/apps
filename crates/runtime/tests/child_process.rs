@@ -132,6 +132,84 @@ fn child_process_output_stdin_errors_and_signals() {
 
 #[cfg(unix)]
 #[test]
+fn file_flags_and_copies_never_lose_data() {
+    run(r#"
+        const { fs, path, os } = __apps;
+        const assert = (condition, message) => { if (!condition) throw Error(message); };
+        const code = action => { try { action(); } catch (error) { return error.code; } };
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apps-flags-')), file = path.join(dir, 'data'), text = () => fs.readFileSync(file, 'utf8');
+        fs.writeFileSync(file, 'hello world');
+        fs.writeFileSync(file, 'HE', { flag: 'r+' });
+        assert(text() === 'HEllo world', 'r+ overwrites without truncating: ' + text());
+        assert(code(() => fs.writeFileSync(file, 'x', { flag: 'r' })) === 'EBADF' && text() === 'HEllo world', 'r never writes');
+        assert(code(() => fs.writeFileSync(path.join(dir, 'missing'), 'x', { flag: 'r+' })) === 'ENOENT', 'r+ needs a file');
+        fs.appendFileSync(file, '!', { flag: 'as' });
+        const fd = fs.openSync(file, 'rs+');
+        fs.writeSync(fd, 'h', 0);
+        fs.closeSync(fd);
+        assert(text() === 'hEllo world!', 'as and rs+: ' + text());
+        assert(code(() => fs.openSync(file, 'rw')) === 'ERR_INVALID_ARG_VALUE', 'invalid flags');
+        fs.copyFileSync(file, file);
+        fs.linkSync(file, path.join(dir, 'link'));
+        fs.copyFileSync(path.join(dir, 'link'), file);
+        await fs.promises.copyFile(file, file);
+        assert(text() === 'hEllo world!', 'copying a file onto itself emptied it');
+        assert(code(() => fs.copyFileSync(file, file, fs.constants.COPYFILE_EXCL)) === 'EEXIST', 'COPYFILE_EXCL');
+        assert(code(() => fs.cpSync(file, file)) === 'ERR_FS_CP_EINVAL', 'cp onto itself');
+        fs.mkdirSync(path.join(dir, 'tree'));
+        fs.writeFileSync(path.join(dir, 'tree', 'leaf'), 'leaf');
+        let failure;
+        await fs.promises.cp(path.join(dir, 'tree'), path.join(dir, 'tree', 'inner'), { recursive: true }).catch(error => { failure = error; });
+        assert(failure?.code === 'ERR_FS_CP_EINVAL' && !fs.existsSync(path.join(dir, 'tree', 'inner')), 'cp into itself');
+        assert(text() === 'hEllo world!', 'cp changed the source');
+        fs.rmSync(dir, { recursive: true });
+    "#);
+}
+
+#[test]
+fn gcm_tags_must_be_complete() {
+    run(r#"
+        const { crypto } = __apps;
+        const assert = (condition, message) => { if (!condition) throw Error(message); };
+        const code = action => { try { action(); } catch (error) { return error.code; } };
+        const key = crypto.randomBytes(32), iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+        const sealed = Buffer.concat([cipher.update('attack at dawn'), cipher.final()]), tag = cipher.getAuthTag();
+        const decipher = () => crypto.createDecipheriv('aes-256-gcm', key, iv);
+        const copy = Buffer.from(tag), opened = decipher().setAuthTag(copy);
+        copy.fill(0);
+        assert(Buffer.concat([opened.update(sealed), opened.final()]).toString() === 'attack at dawn', 'GCM round trip with a copied tag');
+        assert(code(() => decipher().setAuthTag(tag.subarray(0, 12))) === 'ERR_CRYPTO_INVALID_AUTH_TAG', 'short tag');
+        const truncated = decipher();
+        truncated.update(sealed.subarray(0, -4));
+        assert(code(() => truncated.setAuthTag(Buffer.concat([sealed.subarray(-4), tag])).final()) === 'ERR_CRYPTO_INVALID_AUTH_TAG', 'a long tag authenticated a truncated message');
+        assert(code(() => crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 8 })) === 'ERR_CRYPTO_INVALID_AUTH_TAG', 'short authTagLength');
+        const short = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 12 });
+        short.update('x'); short.final();
+        assert(short.getAuthTag().length === 12, 'cipher authTagLength');
+    "#);
+}
+
+#[test]
+fn piped_sources_wait_for_every_destination() {
+    run(r#"
+        const { Readable, Writable } = __apps.stream;
+        const assert = (condition, message) => { if (!condition) throw Error(message); };
+        let produced = 0, release = null;
+        const writes = { fast: 0, slow: 0 };
+        const source = new Readable({ highWaterMark: 1, read() { this.push(produced < 20 ? Buffer.from([produced++]) : null); } });
+        const fast = new Writable({ highWaterMark: 1, write(chunk, encoding, callback) { writes.fast++; setTimeout(callback, 1); } });
+        const slow = new Writable({ highWaterMark: 1, write(chunk, encoding, callback) { writes.slow++; release = callback; } });
+        source.pipe(fast);
+        source.pipe(slow);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assert(produced <= 4 && writes.fast <= 3, `A fast destination resumed the source while a slow one waited: ${produced} ${writes.fast}`);
+        for (let i = 0; i < 200 && writes.slow < 20; i++) { const next = release; release = null; next?.(); await new Promise(resolve => setTimeout(resolve, 2)); }
+        assert(writes.slow === 20 && writes.fast === 20, `Every chunk reached both destinations: ${writes.slow} ${writes.fast}`);
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
 fn child_process_streams_large_output_without_blocking_timers() {
     run(r#"
         const { spawn } = __apps.child_process;

@@ -491,12 +491,15 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     createWriteStream(o) { return files.createWriteStream(null, { ...o, fd: this }); }
     [Symbol.asyncDispose]() { return this.close(); }
   }
+  const flags = new Set(['r', 'rs', 'sr', 'r+', 'rs+', 'sr+', 'w', 'wx', 'xw', 'w+', 'wx+', 'xw+', 'a', 'ax', 'xa', 'as', 'sa', 'a+', 'ax+', 'xa+', 'as+', 'sa+']);
+  const flag = value => { if (value == null || Number.isInteger(value) || flags.has(value)) return value; throw Object.assign(new TypeError(`The argument 'flags' is invalid. Received ${inspect(value)}`), { code: 'ERR_INVALID_ARG_VALUE' }); };
   const prepare = (name, args) => {
     args = [...args];
+    if (name === 'open') args[1] = flag(args[1]);
     if (typeof args[0] !== 'number') args[0] = pathArg(args[0]);
     if (['rename', 'copyFile', 'symlink', 'link'].includes(name)) args[1] = pathArg(args[1]);
     if (['readFile', 'readdir', 'mkdir', 'rm', 'rmdir'].includes(name)) args[1] = options(args[1]);
-    if (name === 'writeFile' || name === 'appendFile') { args[2] = options(args[2]); if (typeof args[1] !== 'string' && !ArrayBuffer.isView(args[1])) throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + ' Received ' + received(args[1])), { code: 'ERR_INVALID_ARG_TYPE' }); args[1] = typeof args[1] === 'string' && (!args[2].encoding || utf8.test(args[2].encoding)) ? args[1] : view(args[1], args[2].encoding); }
+    if (name === 'writeFile' || name === 'appendFile') { args[2] = options(args[2]); flag(args[2].flag); if (typeof args[1] !== 'string' && !ArrayBuffer.isView(args[1])) throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + ' Received ' + received(args[1])), { code: 'ERR_INVALID_ARG_TYPE' }); args[1] = typeof args[1] === 'string' && (!args[2].encoding || utf8.test(args[2].encoding)) ? args[1] : view(args[1], args[2].encoding); }
     if (name === 'utimes' || name === 'lutimes' || name === 'futimes') { args[1] = seconds(args[1]); args[2] = seconds(args[2]); }
     if (name === 'truncate' || name === 'ftruncate') args[1] ??= 0;
     if (name === 'chmod' || name === 'fchmod') { const mode = typeof args[1] === 'string' && /^[0-7]+$/.test(args[1]) ? parseInt(args[1], 8) : args[1]; if (!Number.isInteger(mode) || mode < 0 || mode > 0xFFFFFFFF) throw Object.assign(new TypeError(`The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received ${inspect(args[1])}`), { code: 'ERR_INVALID_ARG_VALUE' }); args[1] = mode; }
@@ -614,13 +617,21 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   files.opendirSync = (value, o) => new Dir(pathArg(value), files.readdirSync(value, { ...options(o), withFileTypes: true }));
   files.promises.opendir = async (value, o) => new Dir(pathArg(value), await files.promises.readdir(value, { ...options(o), withFileTypes: true }));
   files.opendir = (value, o, callback) => { if (typeof o === 'function') { callback = o; o = {}; } files.promises.opendir(value, o).then(dir => callback(null, dir), callback); };
-  const copy = function* (from, to, o) {
+  const invalidCopy = (message, to) => Object.assign(new Error(`Invalid src or dest: cp returned EINVAL (${message}) ${to}`), { name: 'SystemError', code: 'ERR_FS_CP_EINVAL', errno: 22, syscall: 'cp', path: to, info: { code: 'EINVAL', message, path: to, syscall: 'cp', errno: 22 } });
+  const copy = function* (from, to, o, nested) {
     if (o.filter && !(yield ['filter', from, to])) return;
     const source = yield [o.dereference ? 'stat' : 'lstat', from];
+    if (!nested) {
+      // WARNING: like Node, copying onto the source or into itself fails before anything is written.
+      const target = (yield ['exists', to]) ? yield [o.dereference ? 'stat' : 'lstat', to] : null;
+      if (target?.ino && target.dev && target.ino === source.ino && target.dev === source.dev) throw invalidCopy('src and dest cannot be the same', to);
+      const parts = path.resolve(from).split(path.sep), inside = path.resolve(to).split(path.sep);
+      if (source.isDirectory() && parts.every((part, i) => inside[i] === part)) throw invalidCopy(`cannot copy ${from} to a subdirectory of self ${to}`, to);
+    }
     if (source.isDirectory()) {
       if (!o.recursive) throw Object.assign(new Error(`Recursive option not enabled, cannot copy a directory: ${from}/`), { code: 'ERR_FS_EISDIR' });
       yield ['mkdir', to, { recursive: true }];
-      for (const name of yield ['readdir', from]) yield* copy(path.join(from, name), path.join(to, name), o);
+      for (const name of yield ['readdir', from]) yield* copy(path.join(from, name), path.join(to, name), o, true);
       return;
     }
     if (yield ['exists', to]) {

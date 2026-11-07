@@ -1,5 +1,5 @@
 use crate::{
-    DevicePixels, Point, Size,
+    Bounds, DevicePixels, Size,
     scene::{AtlasTextureKind, AtlasTile},
     text::RenderGlyphParams,
 };
@@ -11,6 +11,8 @@ use std::{
 };
 
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
+// WARNING: a glyph rasters at most this many device pixels on a side. A bigger one rasters smaller and stretches.
+pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 const MAX_AGE: u32 = 60;
 // WARNING: removed tiles are freed this many frames later, when no frame in flight reads them.
 // WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
@@ -45,11 +47,12 @@ pub(crate) trait AtlasBackend {
         bytes: &[u8],
     ) -> Result<AtlasTile>;
     fn remove(&mut self, tile: AtlasTile);
+    fn max_side(&self) -> i32;
 }
 
 struct Entry {
     tile: Option<AtlasTile>,
-    origin: Point<DevicePixels>,
+    bounds: Bounds<DevicePixels>,
     used: Cell<u32>,
 }
 
@@ -61,7 +64,8 @@ pub(crate) struct Atlas<B> {
     pub(crate) backend: RefCell<B>,
 }
 
-pub(crate) type Raster<B> = (Point<DevicePixels>, Size<DevicePixels>, B);
+// WARNING: the bounds say where the tile shows. A stretched glyph shows bigger than its pixels.
+pub(crate) type Raster<B> = (Bounds<DevicePixels>, Size<DevicePixels>, B);
 
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
 
@@ -84,31 +88,41 @@ impl<B: AtlasBackend> Atlas<B> {
         &self,
         key: &AtlasKey,
         build: &mut Build<'_>,
-    ) -> Result<Option<(AtlasTile, Point<DevicePixels>)>> {
+    ) -> Option<(AtlasTile, Bounds<DevicePixels>)> {
         if let Some(entry) = self.tiles.borrow().get(key) {
             entry.used.set(self.frame.get());
-            return Ok(entry.tile.map(|tile| (tile, entry.origin)));
+            return entry.tile.map(|tile| (tile, entry.bounds));
         }
-        let (tile, origin) = match build()? {
-            Some((origin, size, bytes)) => {
-                let tile = self.backend.borrow_mut().insert(key.kind(), size, &bytes)?;
-                if let AtlasKey::Glyph(_) = key {
+        // WARNING: a tile that fails or is too big stays as an empty entry, or each frame would build it again
+        // and the backend could keep a texture for it each time.
+        let (tile, bounds) = match build() {
+            Ok(Some((bounds, size, bytes))) => {
+                let max = self.backend.borrow().max_side();
+                let tile = if size.width.0 <= max && size.height.0 <= max {
+                    self.backend
+                        .borrow_mut()
+                        .insert(key.kind(), size, &bytes)
+                        .ok()
+                } else {
+                    None
+                };
+                if let (Some(tile), AtlasKey::Glyph(_)) = (tile, key) {
                     self.glyph_pixels
                         .set(self.glyph_pixels.get() + pixels(&tile));
                 }
-                (Some(tile), origin)
+                (tile, bounds)
             }
-            None => (None, Point::default()),
+            _ => (None, Bounds::default()),
         };
         self.tiles.borrow_mut().insert(
             key.clone(),
             Entry {
                 tile,
-                origin,
+                bounds,
                 used: Cell::new(self.frame.get()),
             },
         );
-        Ok(tile.map(|tile| (tile, origin)))
+        tile.map(|tile| (tile, bounds))
     }
 
     pub fn remove(&self, key: &AtlasKey) {
@@ -321,6 +335,15 @@ mod tests {
         freed: Vec<AtlasTile>,
     }
 
+    fn raster(width: i32, height: i32) -> Option<Raster<Cow<'static, [u8]>>> {
+        let size = Size::new(DevicePixels(width), DevicePixels(height));
+        Some((
+            Bounds::new(Default::default(), size),
+            size,
+            Cow::Borrowed(&[]),
+        ))
+    }
+
     impl AtlasBackend for Fake {
         fn insert(
             &mut self,
@@ -355,6 +378,10 @@ mod tests {
             })
         }
 
+        fn max_side(&self) -> i32 {
+            16384
+        }
+
         fn remove(&mut self, tile: AtlasTile) {
             self.freed.push(tile);
             let index = tile.texture_id.index as usize;
@@ -372,14 +399,7 @@ mod tests {
         let atlas = Atlas::new(Fake::default());
         let insert = |id, width, height| {
             atlas
-                .get_or_insert_with(&AtlasKey::Image(id), &mut || {
-                    Ok(Some((
-                        Point::default(),
-                        Size::new(DevicePixels(width), DevicePixels(height)),
-                        Cow::Borrowed(&[][..]),
-                    )))
-                })
-                .unwrap()
+                .get_or_insert_with(&AtlasKey::Image(id), &mut || Ok(raster(width, height)))
                 .unwrap()
                 .0
         };
@@ -420,14 +440,7 @@ mod tests {
         let atlas = Atlas::new(Fake::default());
         let insert = |id| {
             atlas
-                .get_or_insert_with(&AtlasKey::Image(id), &mut || {
-                    Ok(Some((
-                        Point::default(),
-                        Size::new(DevicePixels(8), DevicePixels(8)),
-                        Cow::Borrowed(&[][..]),
-                    )))
-                })
-                .unwrap()
+                .get_or_insert_with(&AtlasKey::Image(id), &mut || Ok(raster(8, 8)))
                 .unwrap()
                 .0
         };
@@ -447,17 +460,13 @@ mod tests {
     #[test]
     fn replaced_frames_reuse_textures_after_frames_in_flight() {
         let atlas = Atlas::new(Fake::default());
-        let size = Size::new(DevicePixels(1920), DevicePixels(1080));
         let mut inserted = Vec::new();
         for frame in 0..30u64 {
             if frame > 0 {
                 atlas.remove(&AtlasKey::Image(frame - 1));
             }
             let tile = atlas
-                .get_or_insert_with(&AtlasKey::Image(frame), &mut || {
-                    Ok(Some((Point::default(), size, Cow::Borrowed(&[]))))
-                })
-                .unwrap()
+                .get_or_insert_with(&AtlasKey::Image(frame), &mut || Ok(raster(1920, 1080)))
                 .unwrap()
                 .0;
             inserted.push(tile);
@@ -467,12 +476,8 @@ mod tests {
             assert_eq!(&backend.freed[..], &inserted[..backend.freed.len()]);
         }
         assert!(atlas.backend.borrow().made <= IN_FLIGHT as usize + 2);
-        let glyph = Size::new(DevicePixels(10), DevicePixels(10));
         let tile = atlas
-            .get_or_insert_with(&AtlasKey::Image(1000), &mut || {
-                Ok(Some((Point::default(), glyph, Cow::Borrowed(&[]))))
-            })
-            .unwrap()
+            .get_or_insert_with(&AtlasKey::Image(1000), &mut || Ok(raster(10, 10)))
             .unwrap()
             .0;
         let backend = atlas.backend.borrow();
@@ -480,6 +485,33 @@ mod tests {
         assert_eq!(
             texture.size,
             Size::new(DevicePixels(1024), DevicePixels(1024))
+        );
+    }
+
+    #[test]
+    fn failed_and_oversized_tiles_build_once_and_make_no_texture() {
+        let atlas = Atlas::new(Fake::default());
+        let builds = Cell::new(0);
+        for _ in 0..3 {
+            let tile = atlas.get_or_insert_with(&AtlasKey::Image(1), &mut || {
+                builds.set(builds.get() + 1);
+                Ok(raster(16385, 10))
+            });
+            assert!(tile.is_none());
+            let tile = atlas.get_or_insert_with(&AtlasKey::Image(2), &mut || {
+                builds.set(builds.get() + 1);
+                Err(anyhow::anyhow!("no pixels"))
+            });
+            assert!(tile.is_none());
+            atlas.finish_frame();
+        }
+        assert_eq!(builds.get(), 2);
+        assert_eq!(atlas.backend.borrow().made, 0);
+        atlas.remove(&AtlasKey::Image(1));
+        assert!(
+            atlas
+                .get_or_insert_with(&AtlasKey::Image(1), &mut || Ok(raster(16384, 10)))
+                .is_some()
         );
     }
 }

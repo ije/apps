@@ -1,3 +1,4 @@
+use crate::desktop::link::Target;
 use crate::dom::{Document, Node};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -137,13 +138,16 @@ impl Host {
         Ok(())
     }
 
-    pub(crate) fn command(&mut self, command: Value) {
-        use crate::desktop::link::{ToMain, ToPage, native_command};
-        match &self.link {
-            Some(link) if native_command(&command) => link.main(ToMain::Native(command)),
-            Some(link) if command["args"][0] == "create" => link.create_window(command),
-            Some(link) => link.page(ToPage::Command(command)),
-            None => self.commands.push(command),
+    pub(crate) fn command(&mut self, target: Target, command: Value) {
+        use crate::desktop::link::{ToMain, ToPage};
+        let Some(link) = &self.link else {
+            return self.commands.push(command);
+        };
+        match target {
+            Target::Main => link.main(ToMain::Native(command)),
+            Target::All => link.page(ToPage::All(command)),
+            Target::Window(id) if command["args"][0] == "create" => link.create_window(id, command),
+            Target::Window(id) => link.page(ToPage::Window(id, command)),
         }
     }
 
@@ -419,10 +423,7 @@ impl Host {
                     4 | 5 => {
                         let (id, key) = (node(doc, a)?, parts[0]);
                         let value = (code == 4).then_some(parts[1]);
-                        let current = &doc.nodes[id];
-                        if !(key == "style" && current.inline.is_some())
-                            && current.attrs.get(key).map(String::as_str) == value
-                        {
+                        if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
                             return Ok(false);
                         }
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
@@ -665,12 +666,18 @@ impl Host {
                     url.starts_with("apps:///") || url.starts_with("file:///"),
                     "Pages can only navigate to bundled or local files"
                 );
-                self.command(json!({"op":"window", "args":["loadFile",id,url,"page"]}));
+                self.command(
+                    Target::Window(id),
+                    json!({"op":"window", "args":["loadFile",id,url,"page"]}),
+                );
                 return Ok(Value::Null);
             }
             if op == "dom.fullscreen" {
                 ensure!(self.pages.contains_key(&id), "Window is closed");
-                self.command(json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}));
+                self.command(
+                    Target::Window(id),
+                    json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}),
+                );
                 return Ok(Value::Null);
             }
             if op == "dom.executed" {
@@ -678,7 +685,10 @@ impl Host {
                     args[0].is_u64() && args[1].is_string(),
                     "Invalid script result"
                 );
-                self.command(json!({"op":"window", "args":["executed",id,args[0],args[1]]}));
+                self.command(
+                    Target::Window(id),
+                    json!({"op":"window", "args":["executed",id,args[0],args[1]]}),
+                );
                 return Ok(Value::Null);
             }
             let page = self.pages.get_mut(&id).context("Window is closed")?;
@@ -964,15 +974,26 @@ impl Host {
                 if self.packaged && op == "window" && args[0] == "devtools" {
                     return Ok(Value::Null);
                 }
-                if op == "window" {
-                    crate::desktop::validate(args)?;
-                }
-                if op == "quit"
-                    && let Some(link) = &self.link
-                {
-                    link.quit(args[0].as_i64().unwrap_or(0) as i32);
-                }
-                self.command(json!({"op": op, "args": args}));
+                let target = match op {
+                    "quit" => {
+                        if let Some(link) = &self.link {
+                            link.quit(args[0].as_i64().unwrap_or(0) as i32);
+                            return Ok(Value::Null);
+                        }
+                        Target::Main
+                    }
+                    "focus" => Target::Main,
+                    _ => {
+                        crate::desktop::validate(args)?;
+                        let id = args[1].as_u64().context("Expected a window id")?;
+                        if crate::desktop::link::native_action(args[0].as_str().unwrap_or("")) {
+                            Target::Main
+                        } else {
+                            Target::Window(id)
+                        }
+                    }
+                };
+                self.command(target, json!({"op": op, "args": args}));
                 Ok(Value::Null)
             }
             _ => bail!("Unsupported host operation: {op}"),

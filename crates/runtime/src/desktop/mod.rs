@@ -33,6 +33,7 @@ pub(crate) struct View {
     pub(crate) title: Option<String>,
     pub(crate) preload: Option<Rc<JsContext>>,
     pub(crate) renderer: Option<Rc<JsContext>>,
+    pub(crate) input: bool,
     fullscreen: Option<[bool; 2]>,
 }
 
@@ -247,6 +248,11 @@ impl Desktop {
                 main.receive();
             }
             let messages = self.queue.take();
+            // WARNING: the main side quits the app, so pages only stop once their commands ran.
+            if messages.is_empty() && self.link.quitting() {
+                self.quit = true;
+                return Ok(());
+            }
             if messages.is_empty() {
                 // WARNING: titles walk the document, so windowed apps sync them once per drive.
                 if runtime.is_none() {
@@ -258,7 +264,7 @@ impl Desktop {
                 continue;
             }
             for message in messages {
-                let command = match message {
+                let (id, command) = match message {
                     ToPage::Bridge(id, message) => {
                         if let Some(preload) = self.views.get(&id).and_then(|v| v.preload.clone()) {
                             let deliver = || preload.deliver(message);
@@ -271,30 +277,19 @@ impl Desktop {
                         }
                         continue;
                     }
-                    ToPage::Command(command) => command,
+                    ToPage::All(command) => {
+                        if command["op"] == "theme" {
+                            self.host.borrow_mut().sync_theme();
+                        } else if command["op"] == "logs" && !self.devtools.is_empty() {
+                            self.main_logs
+                                .extend(command["args"].as_array().into_iter().flatten().cloned());
+                        }
+                        continue;
+                    }
+                    ToPage::Window(id, command) => (id, command),
                 };
                 let args = &command["args"];
-                if command["op"] == "theme" {
-                    self.host.borrow_mut().sync_theme();
-                    continue;
-                }
-                if command["op"] == "logs" {
-                    if !self.devtools.is_empty() {
-                        self.main_logs
-                            .extend(args.as_array().into_iter().flatten().cloned());
-                    }
-                    continue;
-                }
-                if command["op"] == "quit" {
-                    self.link.quit(args[0].as_i64().unwrap_or(0) as i32);
-                    self.quit = true;
-                    if let Some(cx) = cx.as_deref_mut() {
-                        cx.quit();
-                    }
-                    return Ok(());
-                }
                 let action = args[0].as_str().context("Missing window action")?;
-                let id = args[1].as_u64().context("Missing window id")?;
                 if action != "create" && !self.views.contains_key(&id) {
                     continue;
                 }
@@ -444,6 +439,7 @@ impl Desktop {
                                 title: None,
                                 preload: None,
                                 renderer: None,
+                                input: false,
                                 fullscreen: None,
                             },
                         );
@@ -703,6 +699,35 @@ impl Desktop {
                         let event = serde_json::json!({"request":request,"url":location});
                         self.link
                             .event(format!("__appsEvent('loaded',{id},{event})"), "apps:loaded");
+                    }
+                    "input" => {
+                        if let Some(view) = self.views.get_mut(&id) {
+                            view.input = args[2] == true;
+                        }
+                    }
+                    "deliver" => {
+                        let name = match args[2].as_str() {
+                            Some("webviewEvent") => "__appsWebviewEvent",
+                            Some("webviewReply") => "__appsWebviewReply",
+                            Some("filesPicked") => "__appsFilesPicked",
+                            _ => continue,
+                        };
+                        if let Some(renderer) = self.views[&id].renderer.clone() {
+                            let values = args[3]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(serde_json::Value::to_string)
+                                .collect::<Vec<_>>();
+                            let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+                            let run = || renderer.call(name, &values);
+                            if let Err(error) = match cx.as_deref_mut() {
+                                Some(cx) => crate::render::scripted(cx, None, run),
+                                None => run(),
+                            } {
+                                eprintln!("apps: page script: {error:#}");
+                            }
+                        }
                     }
                     "edit" => {
                         if let Some(renderer) = self.views[&id].renderer.clone() {
@@ -1363,7 +1388,7 @@ impl Desktop {
                     .filter(|_| !terminate.link().quitting())
                 {
                     None => true,
-                    Some(engine) => match engine.eval("__appsEvent('before-quit')", "apps:quit") {
+                    Some(_) => match terminate.eval("__appsEvent('before-quit')", "apps:quit") {
                         Err(error) => {
                             eprintln!("apps: {error}");
                             true
@@ -1431,8 +1456,8 @@ impl Desktop {
             }));
             #[cfg(target_os = "macos")]
             native::observe();
-            if let Some(engine) = &main.engine
-                && let Err(error) = engine.eval("__appsEvent('ready')", "apps:ready")
+            if main.engine.is_some()
+                && let Err(error) = main.eval("__appsEvent('ready')", "apps:ready")
             {
                 eprintln!("apps: {error}");
                 link.fail();
@@ -1445,7 +1470,8 @@ impl Desktop {
             let first = main.first_window();
             if devtools {
                 match first {
-                    Some(id) => link.page(ToPage::Command(
+                    Some(id) => link.page(ToPage::Window(
+                        id,
                         serde_json::json!({"op":"window","args":["devtools",id]}),
                     )),
                     None => link.main(ToMain::OpenTools),
@@ -1454,7 +1480,8 @@ impl Desktop {
             // WARNING: the first main menu costs AppKit 20-30 ms, so the default menu waits for the first frame.
             #[cfg(target_os = "macos")]
             match first {
-                Some(id) => link.page(ToPage::Command(
+                Some(id) => link.page(ToPage::Window(
+                    id,
                     serde_json::json!({"op":"window","args":["menuAfterFrame",id]}),
                 )),
                 None => link.event("__appsInitMenu()".into(), "apps:menu"),
@@ -1698,6 +1725,14 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             ) && (args[3].is_null() || args[3].is_string()),
             "Invalid edit command"
         ),
+        "input" => ensure!(args[2].is_boolean(), "Expected a boolean"),
+        "deliver" => ensure!(
+            matches!(
+                args[2].as_str(),
+                Some("webviewEvent" | "webviewReply" | "filesPicked")
+            ) && args[3].is_array(),
+            "Invalid page delivery"
+        ),
         "executed" => bail!("Unsupported window action: executed"),
         _ => {}
     }
@@ -1767,17 +1802,19 @@ mod tests {
         }
 
         fn command(&self, command: serde_json::Value) {
-            if link::native_command(&command) {
+            let args = &command["args"];
+            if link::native_action(args[0].as_str().unwrap()) {
                 self.link.main(ToMain::Native(command));
             } else {
-                self.link.page(ToPage::Command(command));
+                let id = args[1].as_u64().unwrap();
+                self.link.page(ToPage::Window(id, command));
             }
         }
 
         fn commands(&self) -> Vec<serde_json::Value> {
             let mut commands = self.link.native_commands();
             for message in self.queue.take() {
-                if let ToPage::Command(command) = &message {
+                if let ToPage::Window(_, command) = &message {
                     commands.push(command["args"].clone());
                 }
                 self.link.page(message);
@@ -2598,5 +2635,84 @@ mod tests {
             desktop.js().eval("log.join('|')", "test").unwrap(),
             "created:2:new-window:300|true,deny,,foreground-tab,true|true,_blank,,foreground-tab,true|created:3:foreground-tab:320"
         );
+    }
+
+    #[test]
+    fn keys_wait_for_main_only_while_it_listens() {
+        let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();globalThis.contents=win.webContents;globalThis.f=e=>e.preventDefault();win.load('<body></body>')})";
+        let mut desktop = app(code, &[], std::path::PathBuf::new());
+        let mut input = |script: &str| {
+            desktop.js().eval(script, "test").unwrap();
+            desktop.pump(None, None).unwrap();
+            desktop.views[&1].input
+        };
+        assert!(!input("contents.on('other',f)"));
+        for method in [
+            "on",
+            "once",
+            "addListener",
+            "prependListener",
+            "prependOnceListener",
+        ] {
+            assert!(
+                input(&format!("contents.{method}('before-input-event',f)")),
+                "{method}"
+            );
+            assert!(!input("contents.off('before-input-event',f)"), "{method}");
+        }
+        assert!(input("contents.on('before-input-event',f)"));
+        assert!(!input("contents.removeAllListeners('before-input-event')"));
+        assert!(input("contents.once('before-input-event',f)"));
+        assert!(!input(
+            "if(!__appsBeforeInput(1,{type:'keyDown'}))throw Error('not prevented')"
+        ));
+    }
+
+    #[test]
+    fn closed_windows_never_reach_main() {
+        let page =
+            "<script type='preload'>globalThis.send=()=>__apps.ipcRenderer.send('late')</script>";
+        let code = "globalThis.late=[];__apps.ipcMain.on('late',e=>late.push(e.sender===null));__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.loadFile('apps:///page.html')})";
+        let mut desktop = app(code, &[("page.html", page)], std::path::PathBuf::new());
+        let preload = desktop.views[&1].preload.clone().unwrap();
+        preload.eval("send()", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        desktop.js().tick().unwrap();
+        desktop.js().eval("win.close()", "test").unwrap();
+        // WARNING: main closes the window before its page hears of it, and the preload sends once more meanwhile.
+        desktop.main.as_ref().unwrap().receive();
+        preload.eval("send()", "test").unwrap();
+        desktop.pump(None, None).unwrap();
+        desktop.js().tick().unwrap();
+        assert_eq!(desktop.js().eval("late.join()", "test").unwrap(), "false");
+        assert!(!desktop.views.contains_key(&1));
+    }
+
+    #[test]
+    fn main_answers_pages_with_data_for_fixed_functions() {
+        let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();win.load('<body></body>')})";
+        let mut desktop = app(code, &[], std::path::PathBuf::new());
+        let renderer = desktop.views[&1].renderer.clone().unwrap();
+        renderer
+            .eval(
+                "globalThis.__appsFilesPicked=(...args)=>{globalThis.picked=args}",
+                "test",
+            )
+            .unwrap();
+        let files = serde_json::json!([7, [{"name":"a\");evil(\"","data":""}]]);
+        desktop
+            .command(serde_json::json!({"op":"window","args":["deliver",1,"filesPicked",files]}));
+        desktop.pump(None, None).unwrap();
+        assert_eq!(
+            renderer.eval("JSON.stringify(picked)", "test").unwrap(),
+            files.to_string()
+        );
+        for args in [
+            serde_json::json!(["deliver", 1, "eval", []]),
+            serde_json::json!(["deliver", 1, "filesPicked", "[7]"]),
+            serde_json::json!(["input", 1, 1]),
+        ] {
+            assert!(validate(&args).is_err(), "{args}");
+        }
     }
 }

@@ -2055,58 +2055,30 @@ fn node_file_roundtrip() {
 fn node_builtin_exports_match_runtime_objects() {
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("app.ts");
-    let modules = [
-        "assert",
-        "assert/strict",
-        "buffer",
-        "child_process",
-        "constants",
-        "crypto",
-        "dns",
-        "dns/promises",
-        "events",
-        "fs",
-        "fs/promises",
-        "http",
-        "https",
-        "module",
-        "net",
-        "os",
-        "path",
-        "path/posix",
-        "path/win32",
-        "perf_hooks",
-        "process",
-        "querystring",
-        "readline",
-        "readline/promises",
-        "stream",
-        "stream/consumers",
-        "stream/promises",
-        "stream/web",
-        "sqlite",
-        "string_decoder",
-        "sys",
-        "timers",
-        "timers/promises",
-        "tty",
-        "url",
-        "util",
-        "util/types",
-        "worker_threads",
-        "zlib",
-    ];
+    let modules: Vec<_> = BUILTINS
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .map(|name| {
+            if name.starts_with("node:") || PACKAGES.contains(&name) {
+                name.to_owned()
+            } else {
+                format!("node:{name}")
+            }
+        })
+        .collect();
+    assert!(modules.len() > 40 && modules.contains(&"node:fs".to_owned()));
     let mut source = String::new();
     for (index, name) in modules.iter().enumerate() {
-        source += &format!("import * as m{index} from 'node:{name}';");
+        source += &format!("import * as m{index} from '{name}';");
     }
     // WARNING: both directions: every listed export exists at runtime, and every runtime name can be imported by name.
     source += "const require=__apps.module.createRequire(),problems=[];";
     for (index, name) in modules.iter().enumerate() {
         source += &format!(
-            "{{const object=require('node:{name}'),names=Object.keys(m{index}).filter(key=>key!=='default'&&key!=='module.exports');if(object!==m{index}.default)problems.push('{name}: default');for(const key of names)if(!(key in object))problems.push('{name}: missing '+key);if('{name}'!=='constants')for(const key of Object.keys(object))if(!key.startsWith('_')&&!names.includes(key))problems.push('{name}: not importable '+key);}}"
+            "{{const object=require('{name}'),names=Object.keys(m{index}).filter(key=>key!=='default'&&key!=='module.exports');if(object!==m{index}.default)problems.push('{name}: default');for(const key of names)if(!(key in object))problems.push('{name}: missing '+key);if('{name}'!=='node:constants')for(const key of Object.keys(object))if(!key.startsWith('_')&&!names.includes(key))problems.push('{name}: not importable '+key);}}"
         );
     }
+    source += "import {on, emit} from 'process';import {readFileSync} from 'fs';if(typeof on!=='function'||typeof emit!=='function'||typeof readFileSync!=='function')problems.push('named imports');";
     source += "globalThis.result=problems.join(', ')||'ok';";
     fs::write(&entry, source).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
@@ -2764,6 +2736,41 @@ fn stylesheets_cannot_close_style_or_read_other_files() {
 }
 
 #[test]
+fn backslash_paths_are_root_relative_and_stay_in_the_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app");
+    fs::create_dir_all(app.join("img")).unwrap();
+    fs::write(dir.path().join("outside.css"), "p { color: red }").unwrap();
+    fs::write(dir.path().join("outside.png"), "png").unwrap();
+    fs::write(app.join("img/a.png"), "png").unwrap();
+    fs::write(app.join("style.css"), "p { color: #123456 }").unwrap();
+    let entry = app.join("main.js");
+    fs::write(&entry, "console.log(import.meta.resolve('./index.html'));").unwrap();
+    fs::write(
+        app.join("index.html"),
+        r"<link rel='stylesheet' href='\style.css'><img src='\img\a.png'><img src='\..\outside.png'>",
+    )
+    .unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    let page = &files["page-0.html"];
+    assert!(linked_css(page).contains("#123456"), "{page}");
+    assert!(page.contains("src=\"apps:///assets/"), "{page}");
+    assert!(page.contains(r"\..\outside.png"), "{page}");
+    for html in [
+        r"<link rel='stylesheet' href='\..\outside.css'>",
+        r"<script type='module' src='\..\outside.css'></script>",
+        "<style>@import '/../outside.css';</style>",
+    ] {
+        fs::write(app.join("index.html"), html).unwrap();
+        let error = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside the app folder"),
+            "{html}: {error:#}"
+        );
+    }
+}
+
+#[test]
 fn worker_cycles_and_repeated_workers_share_script_files() {
     let dir = tempfile::tempdir().unwrap();
     let spawn = |name: &str| format!("new Worker(new URL('./{name}', import.meta.url));");
@@ -3220,6 +3227,111 @@ globalThis.later = import('./later.js').then(ns => { globalThis.result += '|' + 
             format!(
                 "0|2|2|ready|VALUE|DEFAULT|STARRED|{production}|a,b,setB|2|3|Module|AB|NAMED|VIA_ESM|stars>barrel|LATER|LATER_DEFAULT|false"
             ),
+            "production={production}"
+        );
+    }
+}
+
+#[test]
+fn production_names_of_nested_packages_stay_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let write = |name: &str, source: &[u8]| {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    };
+    for (folder, label) in [
+        ("node_modules/x", "outer"),
+        ("node_modules/a/node_modules/x", "inner"),
+        ("node_modules/.pnpm/x@2/node_modules/x", "pnpm"),
+    ] {
+        write(&format!("{folder}/package.json"), br#"{"name":"x"}"#);
+        write(
+            &format!("{folder}/index.js"),
+            format!("globalThis.runs.push('{label}');exports.file=__filename;").as_bytes(),
+        );
+        write(
+            &format!("{folder}/url.mjs"),
+            b"export default import.meta.url;",
+        );
+        write(&format!("{folder}/logo.png"), label.as_bytes());
+    }
+    for name in ["a", "b", "c"] {
+        write(
+            &format!("node_modules/{name}/package.json"),
+            format!(r#"{{"name":"{name}"}}"#).as_bytes(),
+        );
+        write(
+            &format!("node_modules/{name}/index.js"),
+            b"exports.get=()=>require('x');exports.url=require('x/url.mjs');exports.logo=require('x/logo.png');",
+        );
+    }
+    write(
+        "node_modules/c/index.js",
+        b"exports.get=()=>require('../.pnpm/x@2/node_modules/x/index.js');",
+    );
+    write(
+        "src/app.js",
+        b"globalThis.runs = []; import a from 'a'; import b from 'b'; import c from 'c';
+const files = [a.get(), b.get(), c.get(), a.get(), b.get(), c.get()].map(x => x.file);
+globalThis.result = [globalThis.runs.join(), new Set(files).size, a.url !== b.url, a.logo !== b.logo].join('|');",
+    );
+    let entry = root.join("src/app.js");
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+    assert!(files["app.js"].contains("../node_modules/a/node_modules/x/index.js"));
+    let engine = apps_runtime::jsc::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+        Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    engine.load_bundle(&files, "app.js").unwrap();
+    assert_eq!(
+        engine.eval("result", "test").unwrap(),
+        "inner,outer,pnpm|3|true|true"
+    );
+    assert_eq!(
+        app_relative(
+            Path::new("/repo/app/src"),
+            Path::new("/repo/app/node_modules/.pnpm/x@1/node_modules/x/index.js")
+        ),
+        Path::new("../node_modules/.pnpm/x@1/node_modules/x/index.js")
+    );
+}
+
+#[test]
+fn production_slots_stay_live_for_writes_after_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("ids.js"),
+        "export let nextId = 0; export class Node { id = nextId++; }
+export let early = 0; class Setup { static { early++; } static field = early++; [early++]() {} }
+for (let i = 0; i < 3; i++) early++;
+export let viaGetter = 0; export const object = { get x() { return viaGetter++; } };
+export let viaMethod = 0; export class Counter { bump() { viaMethod++; } }",
+    )
+    .unwrap();
+    let entry = dir.path().join("app.js");
+    fs::write(
+        &entry,
+        "import { nextId, Node, early, viaGetter, object, viaMethod, Counter } from './ids.js';
+new Node(); new Node(); object.x; new Counter().bump();
+globalThis.result = [nextId, early, viaGetter, viaMethod].join();",
+    )
+    .unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        let engine = apps_runtime::jsc::JsContext::new(
+            apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.load_bundle(&files, "app.js").unwrap();
+        assert_eq!(
+            engine.eval("result", "test").unwrap(),
+            "2,6,1,1",
             "production={production}"
         );
     }
@@ -3733,4 +3845,56 @@ fn rust_main_bundles_pages_from_the_package_root() -> Result<()> {
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None)?;
     assert_eq!(files.keys().collect::<Vec<_>>(), ["package.json"]);
     Ok(())
+}
+
+// WARNING: builtins.txt is made from the runtime's own module objects. After a runtime module changes its exports, run
+// `APPS_UPDATE_BUILTINS=1 cargo test -p apps builtin_table` to write it again.
+#[test]
+fn builtin_table_matches_the_runtime() {
+    let engine = apps_runtime::jsc::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+        Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    let table = engine
+        .eval(
+            r#"(() => {
+  const require = __apps.module.createRequire(), lines = [], packages = [['node-pty', 'pty'], ['undici', 'undici'], ['ws', 'ws']];
+  const reserved = new Set('default break case catch class const continue debugger delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public await arguments eval'.split(' '));
+  const names = value => {
+    const all = Object.keys(value);
+    if (typeof value === 'object') for (let proto = Object.getPrototypeOf(value); proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto))
+      for (const name of Object.getOwnPropertyNames(proto)) if (name !== 'constructor' && typeof Object.getOwnPropertyDescriptor(proto, name).value === 'function') all.push(name);
+    return [...new Set(all)].filter(name => /^[A-Za-z$][\w$]*$/.test(name) && !name.startsWith('_') && !reserved.has(name));
+  };
+  const object = (key, value) => {
+    if (__apps[key] === value) return 'globalThis.__apps.' + key;
+    const slash = key.lastIndexOf('/');
+    if (slash > 0) { const base = key.slice(0, slash), sub = key.slice(slash + 1); if (require(base)[sub] === value) return object(base, require(base)) + '.' + sub; }
+    const other = Object.keys(__apps).find(name => __apps[name] === value);
+    return other ? 'globalThis.__apps.' + other : `globalThis.__apps.module.createRequire()(${JSON.stringify(key)})`;
+  };
+  for (const name of [...__apps.module.builtinModules].sort()) {
+    const key = name.replace(/^node:/, ''), value = require(name);
+    if (!packages.some(([name]) => name === key)) lines.push([name, object(key, value), ...(key === 'constants' ? [] : names(value))].join(' '));
+  }
+  for (const [name, key] of packages) lines.push([name, 'globalThis.__apps.' + key, ...names(__apps[key])].join(' '));
+  return lines.join('\n') + '\n';
+})()"#,
+            "builtins",
+        )
+        .unwrap();
+    if std::env::var_os("APPS_UPDATE_BUILTINS").is_some() {
+        fs::write(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bundler/builtins.txt"),
+            &table,
+        )
+        .unwrap();
+    } else {
+        assert!(
+            table == BUILTINS,
+            "The runtime's built-in modules changed. Run APPS_UPDATE_BUILTINS=1 cargo test -p apps builtin_table"
+        );
+    }
 }

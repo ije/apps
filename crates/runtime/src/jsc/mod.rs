@@ -30,7 +30,7 @@ pub struct JavaScriptCore {
     shrunk: std::cell::Cell<std::time::Instant>,
     pub(crate) idle: std::cell::Cell<bool>,
     inspectable: Option<unsafe extern "C" fn(Ptr, bool)>,
-    extra_memory: Option<unsafe extern "C" fn(Ptr, usize)>,
+    pub(crate) extra_memory: Option<unsafe extern "C" fn(Ptr, usize)>,
     set_name: Option<unsafe extern "C" fn(Ptr, Ptr)>,
     context_group: unsafe extern "C" fn(Ptr) -> Ptr,
     execution_limit:
@@ -678,6 +678,67 @@ fn well_formed(json: &mut str) {
     }
 }
 
+const MAIN: u8 = 1;
+const PRELOAD: u8 = 2;
+const PAGE: u8 = 4;
+const NODE: u8 = MAIN | PRELOAD;
+const ALL: u8 = NODE | PAGE;
+
+// WARNING: deny by default: a host operation that no row names is unavailable. The first row that matches
+// wins, and a name that ends with `.` matches a prefix. Modules keep their own checks as a backstop.
+const ACCESS: &[(&str, u8)] = &[
+    ("log", ALL),
+    ("bridge.dispatch", ALL),
+    ("bridge.expose", PRELOAD),
+    ("bridge.preload", PRELOAD),
+    ("bridge.file", PRELOAD),
+    ("bridge.exposures", PAGE),
+    ("dom.", PAGE),
+    ("gpu.", PAGE),
+    ("media.", PAGE),
+    ("web.serve.", MAIN),
+    ("web.tcp.", NODE),
+    ("web.", ALL),
+    ("native.clipboard.", NODE),
+    ("native.shell.", NODE),
+    ("native.image", NODE),
+    ("native.", MAIN),
+    ("browser.", MAIN),
+    ("node.", NODE),
+    ("pty.", NODE),
+    ("child.", NODE),
+    ("sqlite.", NODE),
+    ("process.", NODE),
+    ("info", NODE),
+    ("cwd", NODE),
+    ("chdir", NODE),
+    ("app.", MAIN),
+    ("window", MAIN),
+    ("quit", MAIN),
+    ("focus", MAIN),
+];
+
+fn access(role: Role, op: &str) -> Result<()> {
+    let roles = ACCESS
+        .iter()
+        .find(|(name, _)| {
+            if name.ends_with('.') {
+                op.starts_with(name)
+            } else {
+                op == *name
+            }
+        })
+        .map_or(0, |&(_, roles)| roles);
+    match role {
+        Role::Main if roles & MAIN != 0 => Ok(()),
+        Role::Preload(_) if roles & PRELOAD != 0 => Ok(()),
+        Role::Renderer(_) if roles & PAGE != 0 => Ok(()),
+        Role::Renderer(_) => bail!("{op} is unavailable in page scripts"),
+        _ if roles == MAIN => bail!("{op} is only available in the main context"),
+        _ => bail!("Unsupported host operation: {op}"),
+    }
+}
+
 // WARNING: host calls: `native(op, ...args)` takes primitive and binary arguments directly, and
 // `native(0, op, json, buffers?)` takes the rest as JSON. Results come back as JavaScript values,
 // and failures throw an `Error` with the I/O `code`.
@@ -724,6 +785,7 @@ unsafe extern "C" fn call(
                 .filter(|op| !op.is_empty())
                 .context("Invalid host operation")?
         };
+        access(binding.2, op)?;
         let run = |buffers, action: &mut dyn FnMut() -> Result<Value>| -> Result<Ptr> {
             let mut failure = None;
             let payload = crate::jsc::payload::Payload::capture(buffers, || {
@@ -948,13 +1010,12 @@ fn dispatch(
             .call(op, values);
     }
     if let Some(op) = op.strip_prefix("native.") {
+        // WARNING: native state and its events belong to the process, so a preload gets only what Electron's gets.
         anyhow::ensure!(
-            !op.starts_with("tray.") || matches!(role, Role::Main),
-            "Tray requires the main process"
-        );
-        anyhow::ensure!(
-            !matches!(role, Role::Renderer(_)),
-            "Native desktop APIs require a preload bridge"
+            matches!(role, Role::Main)
+                || matches!(role, Role::Preload(_))
+                    && (op.starts_with("clipboard.") || op.starts_with("shell.") || op == "image"),
+            "Native desktop APIs require the main process"
         );
         let result = match NATIVE.get() {
             Some(native) => native(op, &values[0]),
@@ -963,7 +1024,10 @@ fn dispatch(
         if op == "theme.set" {
             let mut host = host.borrow_mut();
             host.sync_theme();
-            host.command(serde_json::json!({"op":"theme"}));
+            host.command(
+                crate::desktop::link::Target::All,
+                serde_json::json!({"op":"theme"}),
+            );
         }
         return Ok(result);
     }
@@ -1121,9 +1185,6 @@ fn dispatch(
         host.try_borrow_mut()
             .context("Host is busy")?
             .media(id, op, &args)
-    } else if op == "dom.listenInput" {
-        crate::desktop::link::INPUT_LISTENERS.store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.contextMenu") = (role, op) {
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
             link.event(
@@ -1133,14 +1194,71 @@ fn dispatch(
         }
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.filePicker") = (role, op) {
+        let picker = &values[0];
+        anyhow::ensure!(
+            picker["id"].is_u64()
+                && picker["multiple"].is_boolean()
+                && picker["directory"].is_boolean()
+                && picker["accept"].is_string(),
+            "Invalid file picker"
+        );
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
+            let picker = serde_json::json!({"id":picker["id"],"multiple":picker["multiple"],"directory":picker["directory"],"accept":picker["accept"]});
             link.event(
-                format!("__appsEvent('file-picker',{id},{})", values[0]),
+                format!("__appsEvent('file-picker',{id},{picker})"),
                 "apps:file-picker",
             );
         }
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.open") = (role, op) {
+        // WARNING: main runs these with page data, so only these shapes and `<webview>` methods pass.
+        let data = &values[3];
+        let valid = match (values[0].as_str(), values[1].as_str()) {
+            (Some("open"), _) => (1..5).all(|index| values[index].is_string()),
+            (Some("closed" | "close"), _) => values[1].is_u64(),
+            (Some("webview"), Some("attach")) => {
+                values[2].is_null() && data["src"].is_string() && data["partition"].is_string()
+            }
+            (Some("webview"), Some("bounds")) => {
+                values[2].is_u64()
+                    && ["x", "y", "width", "height"]
+                        .iter()
+                        .all(|key| data["bounds"][key].is_number())
+                    && data["visible"].is_boolean()
+            }
+            (Some("webview"), Some("detach")) => values[2].is_u64(),
+            (Some("webview"), Some("call")) => {
+                values[2].is_u64()
+                    && data["args"].is_array()
+                    && (data["reply"].is_null() || data["reply"].is_u64())
+                    && matches!(
+                        data["method"].as_str(),
+                        Some(
+                            "loadURL"
+                                | "getURL"
+                                | "getTitle"
+                                | "isLoading"
+                                | "canGoBack"
+                                | "canGoForward"
+                                | "goBack"
+                                | "goForward"
+                                | "reload"
+                                | "stop"
+                                | "focus"
+                                | "openDevTools"
+                                | "setZoomFactor"
+                                | "getZoomFactor"
+                                | "setZoomLevel"
+                                | "getZoomLevel"
+                                | "executeJavaScript"
+                                | "insertCSS"
+                                | "getUserAgent"
+                        )
+                    )
+            }
+            _ => false,
+        };
+        anyhow::ensure!(valid, "Invalid window request");
         let link = host.try_borrow().context("Host is busy")?.link.clone();
         Ok(link
             .context("The main process is unavailable")?
@@ -1512,6 +1630,9 @@ struct Interrupt {
     limit: unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr),
 }
 
+// WARNING: bundles run one entry script per call of this source, so callers loop until it returns `false`.
+pub(crate) const NEXT: &str = "this.__appsNext?.()";
+
 pub struct JsContext {
     api: Rc<JavaScriptCore>,
     ctx: Ptr,
@@ -1811,7 +1932,9 @@ impl JsContext {
     }
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
+        // WARNING: runtime helpers like `NEXT` run under the URL of the script they continue, so they never replace its source.
         if self.devtools
+            && source != NEXT
             && (matches!(url, "app.js" | "apps:page" | "apps:preload") || !url.starts_with("apps:"))
         {
             self.sources.borrow_mut().insert(url.into(), source.into());
@@ -1964,7 +2087,7 @@ impl JsContext {
         self.install(files)?;
         self.eval_page(&crate::bundle::script_source(files, true), entry)
             .context("Cannot execute the app bundle")?;
-        while self.eval_page("this.__appsNext?.()", entry)? == "true" {}
+        while self.eval_page(NEXT, entry)? == "true" {}
         Ok(())
     }
 
@@ -2234,21 +2357,22 @@ mod tests {
     fn runaway_page_scripts_stop_but_main_keeps_running() {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
+        // WARNING: the stop list is global, so this page has an id no other test uses.
         host.borrow_mut().pages.insert(
-            1,
+            900,
             crate::host::Page {
                 doc: crate::dom::Document::parse("<body></body>"),
                 dirty: false,
             },
         );
         let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
-        let page = JsContext::new(api.clone(), host, Role::Renderer(1)).unwrap();
+        let page = JsContext::new(api.clone(), host, Role::Renderer(900)).unwrap();
         unsafe {
             (api.execution_limit.unwrap())(api.group, 0.2, Some(page_limit), ptr::null_mut())
         };
-        stop_page(1);
+        stop_page(900);
         assert!(page.eval("while(true){}", "test").is_err());
-        page_stopped(1);
+        page_stopped(900);
         assert_eq!(page.eval("1+1", "test").unwrap(), "2");
         let started = std::time::Instant::now();
         assert_eq!(
@@ -2444,5 +2568,96 @@ mod tests {
             preload.eval("document.body.tagName", "test").unwrap(),
             "BODY"
         );
+    }
+
+    #[test]
+    fn contexts_reach_only_their_host_operations() {
+        for (role, op, allowed) in [
+            (Role::Main, "native.poll", true),
+            (Role::Main, "dom.batch", false),
+            (Role::Main, "unknown", false),
+            (Role::Preload(1), "native.poll", false),
+            (Role::Preload(1), "native.menu.popup", false),
+            (Role::Preload(1), "native.shortcut.register", false),
+            (Role::Preload(1), "native.theme.set", false),
+            (Role::Preload(1), "native.clipboard.readText", true),
+            (Role::Preload(1), "native.shell.openExternal", true),
+            (Role::Preload(1), "native.image", true),
+            (Role::Preload(1), "window", false),
+            (Role::Preload(1), "app.path", false),
+            (Role::Preload(1), "browser.create", false),
+            (Role::Preload(1), "web.serve.listen", false),
+            (Role::Preload(1), "node.fs.read", true),
+            (Role::Preload(1), "info", true),
+            (Role::Renderer(1), "native.clipboard.readText", false),
+            (Role::Renderer(1), "node.fs.read", false),
+            (Role::Renderer(1), "web.tcp.connect", false),
+            (Role::Renderer(1), "web.fetch", true),
+            (Role::Renderer(1), "infox", false),
+        ] {
+            assert_eq!(access(role, op).is_ok(), allowed, "{role:?} {op}");
+        }
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body></body>"),
+                dirty: false,
+            },
+        );
+        let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
+        assert_eq!(
+            preload
+                .eval(
+                    "['app','BrowserWindow','webContents','session','dialog','Menu','Tray','globalShortcut','nativeTheme','screen','systemPreferences','powerMonitor','powerSaveBlocker','safeStorage','Notification'].filter(name=>__apps[name]!==undefined).join()",
+                    "test"
+                )
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            preload
+                .eval(
+                    "['clipboard','shell','nativeImage','contextBridge','ipcRenderer','webUtils','webFrame'].filter(name=>!__apps[name]).join()",
+                    "test"
+                )
+                .unwrap(),
+            ""
+        );
+        let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
+        let binding = HOSTS.with(|hosts| hosts.borrow()[&(page.ctx as usize)].clone());
+        let open = |args| {
+            dispatch(&binding, page.ctx, "dom.open", args)
+                .unwrap_err()
+                .to_string()
+        };
+        for args in [
+            serde_json::json!(["webview", "call", 1, {"method":"constructor","args":[]}]),
+            serde_json::json!(["webview", "call", 1, {"method":"getURL","args":[],"reply":"1)"}]),
+            serde_json::json!(["webview", "call", "1", {"method":"getURL","args":[]}]),
+            serde_json::json!(["closed", "1"]),
+        ] {
+            assert_eq!(open(args.clone()), "Invalid window request", "{args}");
+        }
+        assert_eq!(
+            open(serde_json::json!(["webview", "call", 1, {"method":"getURL","args":[]}])),
+            "The main process is unavailable"
+        );
+        let picker = |picker| {
+            dispatch(
+                &binding,
+                page.ctx,
+                "dom.filePicker",
+                serde_json::json!([picker]),
+            )
+            .is_ok()
+        };
+        assert!(!picker(
+            serde_json::json!({"id":"1);evil(","multiple":false,"directory":false,"accept":""})
+        ));
+        assert!(picker(
+            serde_json::json!({"id":1,"multiple":false,"directory":false,"accept":""})
+        ));
     }
 }

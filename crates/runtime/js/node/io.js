@@ -168,15 +168,21 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     }
     copy() { if (this.#done || this.#secret) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' }); return new Hash(this.#algorithm, null, { chunks: this.#chunks, size: this.#size, id: this.#id }); }
   }
+  const invalidTag = length => Object.assign(new TypeError(`Invalid authentication tag length: ${length}`), { code: 'ERR_CRYPTO_INVALID_AUTH_TAG' });
+  const invalidState = name => Object.assign(new Error(`Invalid state for operation ${name}`), { code: 'ERR_CRYPTO_INVALID_STATE' });
   class Cipher extends stream.Transform {
-    #decrypt; #key; #iv; #chunks = []; #aad = new Uint8Array(0); #tag = null; #done = false; #pad = new Uint8Array(0); #size = 0; #decoder = null;
-    constructor(decrypt, algorithm, key, iv) {
+    #decrypt; #key; #iv; #chunks = []; #aad = new Uint8Array(0); #tag = null; #tagLength = 16; #done = false; #pad = new Uint8Array(0); #size = 0; #decoder = null;
+    constructor(decrypt, algorithm, key, iv, options) {
       super();
       const bits = /^aes-(128|256)-gcm$/i.exec(algorithm)?.[1];
       if (!bits) throw Object.assign(new Error('Unknown cipher'), { code: 'ERR_CRYPTO_UNKNOWN_CIPHER' });
       this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv);
       if (this.#key.length * 8 !== Number(bits)) throw Object.assign(new RangeError('Invalid key length'), { code: 'ERR_CRYPTO_INVALID_KEYLEN' });
       if (this.#iv.length !== 12) throw Object.assign(new TypeError('Invalid initialization vector'), { code: 'ERR_CRYPTO_INVALID_IV' });
+      // WARNING: ring verifies only 16-byte GCM tags, so a decipher rejects the shorter tags that Node also takes.
+      const length = options?.authTagLength;
+      if (length !== undefined && !(Number.isInteger(length) && (decrypt ? length === 16 : length === 4 || length === 8 || length >= 12 && length <= 16))) throw invalidTag(length);
+      this.#tagLength = length ?? 16;
     }
     _transform(chunk, encoding, callback) { callback(null, this.update(chunk, encoding)); }
     _flush(callback) { try { callback(null, this.final()); } catch (error) { callback(error); } }
@@ -199,7 +205,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       this.#chunks = []; this.#pad = new Uint8Array(0);
       if (this.#decrypt) {
         if (!this.#tag) throw new Error('Unsupported state or unable to authenticate data');
-        try { call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, Buffer.concat([data, this.#tag])); }
+        try { call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, data, this.#tag); }
         catch { throw new Error('Unsupported state or unable to authenticate data'); }
         return tail;
       }
@@ -208,8 +214,14 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       return tail;
     }
     setAAD(data) { this.#aad = input(data); return this; }
-    getAuthTag() { if (this.#decrypt || !this.#tag) throw new Error('Invalid state for operation getAuthTag'); return Buffer.from(this.#tag); }
-    setAuthTag(tag) { if (!this.#decrypt) throw new Error('Invalid state for operation setAuthTag'); this.#tag = input(tag); return this; }
+    getAuthTag() { if (this.#decrypt || !this.#tag) throw invalidState('getAuthTag'); return Buffer.from(this.#tag.subarray(0, this.#tagLength)); }
+    setAuthTag(tag) {
+      if (!this.#decrypt || this.#tag || this.#done) throw invalidState('setAuthTag');
+      tag = input(tag);
+      if (tag.length !== this.#tagLength) throw invalidTag(tag.length);
+      this.#tag = Buffer.from(tag);
+      return this;
+    }
     setAutoPadding() { return this; }
   }
   const fail = (code, message, Type = Error) => { throw Object.assign(new Type(message), { code }); };
@@ -420,8 +432,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     scrypt: (password, salt, length, o, callback) => { if (typeof o === 'function') [o, callback] = [{}, o]; asyncCall('scrypt', ...scrypt(password, salt, length, o)).then(result => callback(null, output(result)), error => callback(scryptError(error))); },
     timingSafeEqual: (a, b) => { a = input(a); b = input(b); if (a.length !== b.length) throw Object.assign(new RangeError('Input buffers must have the same byte length'), { code: 'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH' }); return call('web.crypto.equal', a, b); },
     constants: { RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6 },
-    createCipheriv: (algorithm, secret, iv) => new Cipher(false, algorithm, secret, iv),
-    createDecipheriv: (algorithm, secret, iv) => new Cipher(true, algorithm, secret, iv),
+    createCipheriv: (algorithm, secret, iv, options) => new Cipher(false, algorithm, secret, iv, options),
+    createDecipheriv: (algorithm, secret, iv, options) => new Cipher(true, algorithm, secret, iv, options),
     pbkdf2Sync: (...args) => output(sync('pbkdf2', ...pbkdf2(...args))),
     pbkdf2: (password, salt, iterations, length, name, callback) => { asyncCall('pbkdf2', ...pbkdf2(password, salt, iterations, length, name)).then(result => callback(null, output(result)), callback); },
     randomFillSync: fill,

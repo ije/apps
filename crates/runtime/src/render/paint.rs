@@ -229,12 +229,26 @@ impl Hooks for DomBox {
                 })
             }
         {
-            // WARNING: the box was sized in last frame's block, so a block that changed size draws again.
-            if self.sized.is_some_and(|[width, height]| {
-                (f32::from(block.size.width) - width).abs() > 0.5
-                    || (f32::from(block.size.height) - height).abs() > 0.5
-            }) {
-                window.redraw();
+            // WARNING: the box was sized in last frame's block, so a block that changed size draws again, but once
+            // per mismatch: a size that the next pass builds the same way would draw again in every frame.
+            if let Some([width, height]) = self.sized
+                && ((f32::from(block.size.width) - width).abs() > 0.5
+                    || (f32::from(block.size.height) - height).abs() > 0.5)
+            {
+                let key = (
+                    self.id,
+                    [
+                        width,
+                        height,
+                        block.size.width.into(),
+                        block.size.height.into(),
+                    ]
+                    .map(f32::to_bits),
+                );
+                let [current, seen] = &mut *self.view.mismatched.borrow_mut();
+                if current.insert(key) && !seen.contains(&key) {
+                    window.redraw();
+                }
             }
             let [top, right, bottom, left] = self.inset;
             let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);

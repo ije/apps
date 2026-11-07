@@ -66,6 +66,58 @@ fn stat(meta: &fs::Metadata) -> Value {
 // WARNING: handles start here, so smaller descriptors are the ones that this process inherited, like fd 3 from a parent.
 const FIRST_HANDLE: u64 = 1 << 20;
 
+#[cfg(unix)]
+const SYNC: i32 = libc::O_SYNC;
+#[cfg(not(unix))]
+const SYNC: i32 = 0;
+
+// WARNING: Node's flags map to open(2) flags first, so `r` opens read-only and `r+` never creates or truncates.
+fn open_options(flag: &Value, fallback: &str, mode: &Value) -> Result<OpenOptions> {
+    use libc::{
+        O_APPEND as A, O_CREAT as C, O_EXCL as X, O_RDONLY, O_RDWR, O_TRUNC as T, O_WRONLY,
+    };
+    let flags = match flag {
+        Value::Number(number) => number.as_i64().context("Expected file flags")? as i32,
+        _ => match flag.as_str().unwrap_or(fallback) {
+            "r" => O_RDONLY,
+            "rs" | "sr" => O_RDONLY | SYNC,
+            "r+" => O_RDWR,
+            "rs+" | "sr+" => O_RDWR | SYNC,
+            "w" => T | C | O_WRONLY,
+            "wx" | "xw" => T | C | O_WRONLY | X,
+            "w+" => T | C | O_RDWR,
+            "wx+" | "xw+" => T | C | O_RDWR | X,
+            "a" => A | C | O_WRONLY,
+            "ax" | "xa" => A | C | O_WRONLY | X,
+            "as" | "sa" => A | C | O_WRONLY | SYNC,
+            "a+" => A | C | O_RDWR,
+            "ax+" | "xa+" => A | C | O_RDWR | X,
+            "as+" | "sa+" => A | C | O_RDWR | SYNC,
+            flag => bail!("Unsupported file flag: {flag}"),
+        },
+    };
+    let mut options = OpenOptions::new();
+    let access = flags & (O_RDONLY | O_WRONLY | O_RDWR);
+    options.read(access != O_WRONLY).write(access != O_RDONLY);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .custom_flags(flags & !libc::O_ACCMODE)
+            .mode(mode.as_u64().unwrap_or(0o666) as u32);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        options
+            .append(flags & A != 0)
+            .create(flags & C != 0)
+            .truncate(flags & T != 0)
+            .create_new(flags & X != 0);
+    }
+    Ok(options)
+}
+
 #[derive(Default)]
 pub(super) struct Files(Mutex<(u64, HashMap<u64, Arc<File>>)>);
 
@@ -136,26 +188,13 @@ impl Files {
                     (&*self.file(&args[0])?).write_all(bytes(&args[1])?)?;
                     return Ok(Value::Null);
                 }
-                let mut options = OpenOptions::new();
-                options
-                    .write(true)
-                    .create(true)
-                    .append(op == "appendFile")
-                    .truncate(op != "appendFile");
-                let flag =
-                    args[2]["flag"]
-                        .as_str()
-                        .unwrap_or(if op == "appendFile" { "a" } else { "w" });
-                options.create_new(flag.contains('x'));
-                if flag.starts_with('a') {
-                    options.append(true).truncate(false);
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(args[2]["mode"].as_u64().unwrap_or(0o666) as u32);
-                }
-                options.open(path()?)?.write_all(bytes(&args[1])?)?;
+                open_options(
+                    &args[2]["flag"],
+                    if op == "appendFile" { "a" } else { "w" },
+                    &args[2]["mode"],
+                )?
+                .open(path()?)?
+                .write_all(bytes(&args[1])?)?;
                 Ok(Value::Null)
             }
             "mkdir" => {
@@ -237,11 +276,27 @@ impl Files {
                 Ok(Value::Null)
             }
             "copyFile" => {
-                let target = args[1].as_str().context("Expected destination")?;
+                let (source, target) = (path()?, args[1].as_str().context("Expected destination")?);
                 if args[2].as_u64().unwrap_or(0) & 1 != 0 && fs::symlink_metadata(target).is_ok() {
                     return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
                 }
-                fs::copy(path()?, target)?;
+                // WARNING: fs::copy truncates the target first, so copying a file onto itself or onto a hard link of it
+                // would empty it. Like libuv, such a copy does nothing.
+                #[cfg(unix)]
+                let same = {
+                    use std::os::unix::fs::MetadataExt;
+                    let source = fs::metadata(&source)?;
+                    fs::metadata(target).is_ok_and(|target| {
+                        target.dev() == source.dev() && target.ino() == source.ino()
+                    })
+                };
+                #[cfg(not(unix))]
+                let same = fs::canonicalize(target).is_ok_and(|target| {
+                    fs::canonicalize(&source).is_ok_and(|source| source == target)
+                });
+                if !same {
+                    fs::copy(source, target)?;
+                }
                 Ok(Value::Null)
             }
             "link" => {
@@ -448,39 +503,7 @@ impl Files {
                 bail!("Cannot create temporary directory")
             }
             "open" => {
-                let flag = args[1].as_str().unwrap_or("r");
-                let mut options = OpenOptions::new();
-                if let Some(flags) = args[1].as_i64() {
-                    let flags = flags as i32;
-                    options
-                        .read(flags & 3 != libc::O_WRONLY)
-                        .write(flags & 3 != libc::O_RDONLY)
-                        .create(flags & libc::O_CREAT != 0)
-                        .truncate(flags & libc::O_TRUNC != 0)
-                        .append(flags & libc::O_APPEND != 0)
-                        .create_new(flags & libc::O_EXCL != 0);
-                } else {
-                    ensure!(
-                        matches!(
-                            flag,
-                            "r" | "r+" | "w" | "w+" | "wx" | "wx+" | "a" | "a+" | "ax" | "ax+"
-                        ),
-                        "Unsupported file flag: {flag}"
-                    );
-                    options
-                        .read(flag.starts_with('r') || flag.contains('+'))
-                        .write(!flag.starts_with('r') || flag.contains('+'))
-                        .create(flag.starts_with('w') || flag.starts_with('a'))
-                        .truncate(flag.starts_with('w'))
-                        .append(flag.starts_with('a'))
-                        .create_new(flag.contains('x'));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(args[2].as_u64().unwrap_or(0o666) as u32);
-                }
-                let file = Arc::new(options.open(path()?)?);
+                let file = Arc::new(open_options(&args[1], "r", &args[2])?.open(path()?)?);
                 let mut files = self.0.lock().unwrap();
                 files.0 = files.0.max(FIRST_HANDLE) + 1;
                 let id = files.0;

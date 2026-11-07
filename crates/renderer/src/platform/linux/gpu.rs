@@ -1106,8 +1106,7 @@ impl AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let max = self.gpu.device.limits().max_texture_dimension_2d as i32;
-                let texture_size = page_size(size).map(|side| DevicePixels(side.0.min(max)));
+                let texture_size = page_size(size);
                 let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: None,
                     size: wgpu::Extent3d {
@@ -1218,6 +1217,10 @@ impl AtlasBackend for AtlasTextures {
             },
         );
         Ok(tile)
+    }
+
+    fn max_side(&self) -> i32 {
+        self.gpu.device.limits().max_texture_dimension_2d as i32
     }
 
     fn remove(&mut self, tile: AtlasTile) {

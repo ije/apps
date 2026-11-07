@@ -785,6 +785,19 @@ fn open_native(
     })
 }
 
+fn on_main(native: &NativeRef, f: impl FnOnce(&NSWindow, &Shared)) {
+    let window = native.0;
+    // SAFETY: `native` keeps the window, and so its state, alive.
+    let Some(state) = (unsafe { get_state(&*window) }) else {
+        return;
+    };
+    if state.try_borrow().is_ok_and(|state| state.closed) {
+        return;
+    }
+    // SAFETY: the object is an NSWindow.
+    f(unsafe { &*window.cast::<NSWindow>() }, &state);
+}
+
 fn set_title(window: *mut AnyObject, state: &Shared, title: &str) {
     // SAFETY: plain AppKit calls on a live window.
     unsafe {
@@ -832,6 +845,14 @@ pub struct WindowControl {
 unsafe impl Send for WindowControl {}
 unsafe impl Sync for WindowControl {}
 
+// WARNING: a frame that the main thread has to show keeps its drawables. Only the newest one waits, and a newer
+// frame drops it unseen, so a busy main thread never makes the render thread wait for a drawable.
+#[derive(Default)]
+struct Waiting {
+    present: Mutex<Option<Present>>,
+    queued: AtomicBool,
+}
+
 pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
@@ -839,6 +860,7 @@ pub(crate) struct Window {
     atlas: Rc<MetalAtlas>,
     frames: Arc<Mutex<Frames>>,
     quiet: std::cell::Cell<Option<crate::app::Timer>>,
+    waiting: Arc<Waiting>,
     transparent: bool,
 }
 
@@ -873,6 +895,7 @@ impl Window {
             atlas,
             frames: opened.frames,
             quiet: std::cell::Cell::new(None),
+            waiting: Arc::default(),
             transparent: options.transparent,
         })
     }
@@ -939,15 +962,44 @@ impl Window {
     pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         self.quiet.take();
         let mut renderer = self.renderer.borrow_mut();
+        let waiting = &self.waiting;
+        let stale = waiting
+            .present
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(stale) = stale {
+            renderer.discard(stale);
+        }
         let result = renderer.draw(scene, capture);
-        if let Some((surfaces, present)) = renderer.take_glass_update() {
-            let surfaces = Sendable::new(surfaces);
-            self.control.later(move |_, state| {
-                let mut state = state.borrow_mut();
-                let parent = unsafe { state.native_view.cast::<NSView>().as_ref() };
-                super::glass::update(&mut state.glass, parent, surfaces.take());
-                drop(present);
-            });
+        let native = self.control.native.clone();
+        let update = renderer.take_glass_update(move |surfaces| {
+            on_main(&native, |_, state| {
+                // WARNING: a caller up the stack can hold the state, and the next update brings the views up to date.
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    // SAFETY: the window retains its view.
+                    let parent = unsafe { state.native_view.cast::<NSView>().as_ref() };
+                    super::glass::update(&mut state.glass, parent, surfaces);
+                }
+            })
+        });
+        if let Some(update) = update {
+            *waiting
+                .present
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(update);
+            if !waiting.queued.swap(true, Ordering::AcqRel) {
+                let waiting = waiting.clone();
+                native_post(Box::new(move || {
+                    waiting.queued.store(false, Ordering::Release);
+                    let present = waiting
+                        .present
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    drop(present);
+                }));
+            }
         }
         result
     }
@@ -1033,18 +1085,7 @@ impl WindowControl {
 
     fn later(&self, f: impl FnOnce(&NSWindow, &Shared) + Send + 'static) {
         let native = self.native.clone();
-        native_post(Box::new(move || {
-            let window = native.0;
-            // SAFETY: `native` keeps the window, and so its state, alive.
-            let Some(state) = (unsafe { get_state(&*window) }) else {
-                return;
-            };
-            if state.try_borrow().is_ok_and(|state| state.closed) {
-                return;
-            }
-            // SAFETY: the object is an NSWindow.
-            f(unsafe { &*window.cast::<NSWindow>() }, &state);
-        }));
+        native_post(Box::new(move || on_main(&native, f)));
     }
 
     pub fn change(&self, change: WindowChange) {
@@ -1608,6 +1649,26 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &AnyObject, _: Sel, event: *mut AnyObject) -> Bool {
+    // WARNING: AppKit offers key equivalents to every view of the window. The web views of `<webview>`,
+    // `<iframe>` and `WebContentsView` are subviews of this one, so their keys stay with them while one has focus.
+    // SAFETY: plain AppKit calls on this view, its window and its subviews.
+    unsafe {
+        let window: *mut AnyObject = msg_send![this, window];
+        let responder: *mut AnyObject = if window.is_null() {
+            ptr::null_mut()
+        } else {
+            msg_send![window, firstResponder]
+        };
+        if !responder.is_null() && !ptr::eq(responder, this) {
+            let view: Bool = msg_send![responder, isKindOfClass: class!(NSView)];
+            if view.as_bool() {
+                let inside: Bool = msg_send![responder, isDescendantOf: this];
+                if inside.as_bool() {
+                    return msg_send![super(this, class!(NSView)), performKeyEquivalent: event];
+                }
+            }
+        }
+    }
     handle_key_event(this, event, true)
 }
 
@@ -1820,6 +1881,17 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
     match &input {
         PlatformInput::MouseDown(_) => {
             drop(lock);
+            // WARNING: this view takes key focus back from a web view, also for presses that glass views forward.
+            // SAFETY: plain AppKit calls on this view and its window.
+            unsafe {
+                let window: *mut AnyObject = msg_send![this, window];
+                if !window.is_null() {
+                    let responder: *mut AnyObject = msg_send![window, firstResponder];
+                    if !ptr::eq(responder, this) {
+                        let _: Bool = msg_send![window, makeFirstResponder: this];
+                    }
+                }
+            }
             input_context_handles(this, event);
         }
         PlatformInput::MouseMove(

@@ -86,6 +86,7 @@ pub struct Node {
     pub children: Vec<usize>,
     pub parent: Option<usize>,
     pub(crate) stylesheet: Option<Rc<crate::style::Stylesheet>>,
+    // WARNING: the `style` attribute stays in `attrs`; this is its parse, kept only while the attribute is unchanged, so every write of `style` must clear it.
     pub(crate) inline: Option<crate::style::Declarations>,
     #[serde(skip)]
     pub(crate) state: u16,
@@ -2055,8 +2056,8 @@ impl Document {
                 continue;
             }
             match &node.stylesheet {
-                Some(sheet) => text.push_str(&sheet.source()),
-                None => text.push_str(&node.text),
+                Some(sheet) if node.tag == "#text" => text.push_str(&sheet.source()),
+                _ => text.push_str(&node.text),
             }
             pending.extend(node.children.iter().rev());
         }
@@ -2159,15 +2160,7 @@ impl Document {
                 if mark && !node.attrs.contains_key("id") {
                     result.push_str(&format!(" id=\"apps-{id}\""));
                 }
-                let extra = match replaced {
-                    Some(replaced) => replaced,
-                    None => node
-                        .inline
-                        .as_ref()
-                        .map(|inline| vec![("style", inline.source())])
-                        .unwrap_or_default(),
-                };
-                for (name, value) in extra {
+                for (name, value) in replaced.unwrap_or_default() {
                     if !value.is_empty() {
                         result.push(' ');
                         result.push_str(name);

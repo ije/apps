@@ -11,7 +11,7 @@ use std::{
     rc::{Rc, Weak},
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -44,8 +44,17 @@ pub(crate) enum ToMain {
     OpenTools,
 }
 
+// WARNING: every message names where it goes, so routing never reads command fields.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Target {
+    Window(u64),
+    All,
+    Main,
+}
+
 pub(crate) enum ToPage {
-    Command(Value),
+    Window(u64, Value),
+    All(Value),
     Bridge(u64, Payload),
 }
 
@@ -94,8 +103,10 @@ impl PageQueue {
 struct Queues {
     main: Mutex<VecDeque<ToMain>>,
     page: Arc<PageQueue>,
-    pages: Mutex<HashMap<u64, Arc<PageQueue>>>,
-    per_window: AtomicBool,
+    // WARNING: `None` while all windows share `page`. Pushes hold this lock, so none can land in the shared
+    // queue after `set_per_window` took it.
+    pages: Mutex<Option<HashMap<u64, Arc<PageQueue>>>>,
+    created: AtomicU64,
     wake_main: OnceLock<Wake>,
     quit: AtomicBool,
     exit_code: AtomicI32,
@@ -110,7 +121,7 @@ impl Link {
             main: Mutex::default(),
             page: Arc::default(),
             pages: Mutex::default(),
-            per_window: AtomicBool::new(false),
+            created: AtomicU64::new(0),
             wake_main: OnceLock::new(),
             quit: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
@@ -131,47 +142,33 @@ impl Link {
         self.0.page.clone()
     }
 
-    fn queue_of(&self, window: Option<u64>) -> Option<Arc<PageQueue>> {
-        if !self.0.per_window.load(Ordering::Acquire) {
-            return Some(self.0.page.clone());
+    fn pages(&self) -> std::sync::MutexGuard<'_, Option<HashMap<u64, Arc<PageQueue>>>> {
+        self.0.pages.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn queue_of(&self, window: u64) -> Option<Arc<PageQueue>> {
+        match &*self.pages() {
+            None => Some(self.0.page.clone()),
+            Some(pages) => pages.get(&window).cloned(),
         }
-        self.0
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&window?)
-            .cloned()
     }
 
     pub(crate) fn set_per_window(&self) {
-        let waiting = self.0.page.take();
-        self.0.per_window.store(true, Ordering::Release);
-        for message in waiting {
-            if let ToPage::Command(command) = &message
-                && command["args"][0] == "create"
-                && let Some(id) = command["args"][1].as_u64()
+        let mut pages = self.pages();
+        let created = self.0.created.load(Ordering::Acquire);
+        let mut queues = HashMap::<u64, Arc<PageQueue>>::new();
+        for message in self.0.page.take() {
+            if let ToPage::Window(id, _) | ToPage::Bridge(id, _) = message
+                && id <= created
             {
-                self.0
-                    .pages
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(id, Arc::default());
+                queues.entry(id).or_default().push(message);
             }
-            self.page(message);
         }
+        *pages = Some(queues);
     }
 
-    pub(crate) fn create_window(&self, command: Value) {
-        let Some(id) = command["args"][1].as_u64() else {
-            return;
-        };
-        if self.0.per_window.load(Ordering::Acquire) {
-            self.0
-                .pages
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(id, Arc::default());
-        }
+    pub(crate) fn create_window(&self, id: u64, command: Value) {
+        self.0.created.fetch_max(id, Ordering::AcqRel);
         let options = &command["args"][2];
         if let Some(parent) = options["parent"].as_u64() {
             // WARNING: only the main side knows the native window of another window, so it joins
@@ -180,26 +177,28 @@ impl Link {
                 "parent", id, parent, options["modal"] == true, options["show"] != false,
             ]})));
         }
-        self.page(ToPage::Command(command));
+        match &mut *self.pages() {
+            Some(pages) => pages
+                .entry(id)
+                .or_default()
+                .push(ToPage::Window(id, command)),
+            None => self.0.page.push(ToPage::Window(id, command)),
+        }
         self.main(ToMain::Spawn(id));
     }
 
     pub(crate) fn wake_page(&self, window: Option<u64>) {
-        if let Some(queue) = self.queue_of(window) {
-            queue.wake();
+        match (&*self.pages(), window) {
+            (None, _) => self.0.page.wake(),
+            (Some(pages), Some(id)) => pages.get(&id).into_iter().for_each(|queue| queue.wake()),
+            (Some(_), None) => {}
         }
     }
 
     pub(crate) fn wake_pages(&self) {
-        self.0.page.wake();
-        for queue in self
-            .0
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-        {
-            queue.wake();
+        match &*self.pages() {
+            None => self.0.page.wake(),
+            Some(pages) => pages.values().for_each(|queue| queue.wake()),
         }
     }
 
@@ -217,36 +216,32 @@ impl Link {
     }
 
     pub(crate) fn page(&self, message: ToPage) {
-        let window = match &message {
-            ToPage::Bridge(id, _) => Some(*id),
-            ToPage::Command(command) => command["args"][1].as_u64(),
+        let pages = self.pages();
+        let Some(pages) = &*pages else {
+            return self.0.page.push(message);
         };
-        if let Some(queue) = self.queue_of(window) {
-            queue.push(message);
-        }
-    }
-
-    pub(crate) fn page_all(&self, command: Value) {
-        if !self.0.per_window.load(Ordering::Acquire) {
-            return self.0.page.push(ToPage::Command(command));
-        }
-        for queue in self
-            .0
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-        {
-            queue.push(ToPage::Command(command.clone()));
+        match message {
+            ToPage::All(command) => {
+                for queue in pages.values() {
+                    queue.push(ToPage::All(command.clone()));
+                }
+            }
+            ToPage::Window(id, _) | ToPage::Bridge(id, _) => match pages.get(&id) {
+                Some(queue) => queue.push(message),
+                // WARNING: a window that closed drops its messages, but one that never opened is a routing bug.
+                None => debug_assert!(
+                    matches!(message, ToPage::Bridge(..))
+                        || id <= self.0.created.load(Ordering::Acquire),
+                    "No window {id} for a page command"
+                ),
+            },
         }
     }
 
     fn forget_page(&self, window: u64) {
-        self.0
-            .pages
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&window);
+        if let Some(pages) = &mut *self.pages() {
+            pages.remove(&window);
+        }
     }
 
     pub(crate) fn main_pending(&self) -> bool {
@@ -299,16 +294,14 @@ impl Link {
     pub(crate) fn ask(&self, message: impl FnOnce(Answer) -> ToMain) -> Result<Payload> {
         let (answer, reply) = mpsc::sync_channel(1);
         self.main(message(answer));
-        // WARNING: without a render thread both sides share this thread, so the main side runs here.
+        // WARNING: without a render thread both sides share this thread, so the main side runs here, even
+        // under a main script, or the wait below would never end.
         if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
-            main.receive();
+            main.receive_with(true);
         }
         reply.recv().context("The main process is unavailable")?
     }
 }
-
-pub(crate) static INPUT_LISTENERS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 thread_local! { static MAIN: RefCell<Weak<Main>> = RefCell::default(); }
 
@@ -318,45 +311,41 @@ pub(crate) fn drive_main() {
     }
 }
 
-pub(crate) fn native_command(command: &Value) -> bool {
-    command["op"] == "focus"
-        || command["op"] == "window"
-            && matches!(
-                command["args"][0].as_str(),
-                Some(
-                    "close"
-                        | "show"
-                        | "title"
-                        | "bounds"
-                        | "center"
-                        | "minimize"
-                        | "maximize"
-                        | "unmaximize"
-                        | "restore"
-                        | "fullscreen"
-                        | "focus"
-                        | "blur"
-                        | "hide"
-                        | "showInactive"
-                        | "limits"
-                        | "resizable"
-                        | "minimizable"
-                        | "maximizable"
-                        | "closable"
-                        | "movable"
-                        | "alwaysOnTop"
-                        | "buttons"
-                        | "buttonPosition"
-                        | "opacity"
-                        | "shadow"
-                        | "ignoreMouse"
-                        | "workspaces"
-                        | "contentProtection"
-                        | "focusable"
-                        | "aspectRatio"
-                        | "parent"
-                )
-            )
+pub(crate) fn native_action(action: &str) -> bool {
+    matches!(
+        action,
+        "close"
+            | "show"
+            | "title"
+            | "bounds"
+            | "center"
+            | "minimize"
+            | "maximize"
+            | "unmaximize"
+            | "restore"
+            | "fullscreen"
+            | "focus"
+            | "blur"
+            | "hide"
+            | "showInactive"
+            | "limits"
+            | "resizable"
+            | "minimizable"
+            | "maximizable"
+            | "closable"
+            | "movable"
+            | "alwaysOnTop"
+            | "buttons"
+            | "buttonPosition"
+            | "opacity"
+            | "shadow"
+            | "ignoreMouse"
+            | "workspaces"
+            | "contentProtection"
+            | "focusable"
+            | "aspectRatio"
+            | "parent"
+    )
 }
 
 pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value {
@@ -433,6 +422,13 @@ impl Main {
     }
 
     pub(crate) fn receive(&self) -> bool {
+        self.receive_with(!self.driving.get())
+    }
+
+    // WARNING: AppKit runs nested loops under main scripts, like for a sync dialog or a popup. Messages that
+    // would run a script then wait until the outer one returns, and the others still run, so pages that wait
+    // for native work get it.
+    pub(crate) fn receive_with(&self, scripts: bool) -> bool {
         let messages = std::mem::take(
             &mut *self
                 .link
@@ -442,7 +438,33 @@ impl Main {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         let busy = !messages.is_empty();
+        let mut later = VecDeque::new();
         for message in messages {
+            let sender = match &message {
+                ToMain::Bridge(message) | ToMain::Sync(message, _) => {
+                    message.value["sender"]["preload"].as_u64()
+                }
+                ToMain::Input(id, ..) | ToMain::Open(id, ..) => Some(*id),
+                _ => None,
+            };
+            // WARNING: like Electron, what a window sent after it closed is dropped, so main never sees a message without a sender.
+            if sender.is_some_and(|id| !self.opened.borrow().contains(&id)) {
+                continue;
+            }
+            if !scripts
+                && self.engine.is_some()
+                && matches!(
+                    message,
+                    ToMain::Event(..)
+                        | ToMain::Bridge(_)
+                        | ToMain::Sync(..)
+                        | ToMain::Input(..)
+                        | ToMain::Open(..)
+                )
+            {
+                later.push_back(message);
+                continue;
+            }
             match (message, &self.engine) {
                 (ToMain::Event(source, url), Some(engine)) => {
                     if let Err(error) = engine.eval(&source, url) {
@@ -473,7 +495,7 @@ impl Main {
                 (ToMain::Spawn(id), _) => {
                     self.opened.borrow_mut().insert(id);
                     if let (Some(spawner), Some(queue)) =
-                        (&*self.spawner.borrow(), self.link.queue_of(Some(id)))
+                        (&*self.spawner.borrow(), self.link.queue_of(id))
                     {
                         spawner(id, queue);
                     }
@@ -503,23 +525,37 @@ impl Main {
                 ) => {}
             }
         }
-        let mut host = self.host.borrow_mut();
-        for (browser, parent) in host.browsers.take_attaches() {
-            match self
-                .windows
-                .borrow()
-                .get(&parent)
-                .and_then(|(_, control)| control.raw_window_handle().ok())
-            {
-                Some(window) => {
-                    if let Err(error) = host.browsers.attach(browser, &NativeHandle(window)) {
-                        eprintln!("apps: {error:#}");
+        if !later.is_empty() {
+            let mut queue = self
+                .link
+                .0
+                .main
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            later.append(&mut queue);
+            *queue = later;
+        }
+        // WARNING: a nested loop can run this inside a host call of the main script, so attaches wait for that call.
+        if let Ok(mut host) = self.host.try_borrow_mut() {
+            for (browser, parent) in host.browsers.take_attaches() {
+                let window = self
+                    .windows
+                    .borrow()
+                    .get(&parent)
+                    .and_then(|(_, control)| control.raw_window_handle().ok());
+                match window {
+                    Some(window) => {
+                        if let Err(error) = host.browsers.attach(browser, &NativeHandle(window)) {
+                            eprintln!("apps: {error:#}");
+                        }
                     }
+                    None => host.browsers.defer_attach(browser, parent),
                 }
-                None => host.browsers.defer_attach(browser, parent),
             }
         }
-        drop(host);
+        if !scripts {
+            return busy;
+        }
         let changed = std::mem::take(&mut *self.changed.borrow_mut());
         if let Some(engine) = &self.engine {
             for id in changed {
@@ -580,6 +616,10 @@ impl Main {
             return;
         };
         if action == "close" {
+            // WARNING: a nested loop can run this inside a host call of the main script, so it waits for that call.
+            if self.host.try_borrow_mut().is_err() {
+                return self.link.main(ToMain::Native(command));
+            }
             // WARNING: a page that runs a long script takes its time to go, so the window hides now
             // and the script stops at its next tick.
             // WARNING: on Windows a hide calls `window_event` at once, so the borrow must end first.
@@ -591,10 +631,12 @@ impl Main {
                 .borrow_mut()
                 .retain(|waiting| waiting["args"][1].as_u64() != Some(id));
             crate::jsc::stop_page(id);
-            if let Err(error) = self.host.borrow_mut().browsers.close_window(id) {
+            if let Ok(mut host) = self.host.try_borrow_mut()
+                && let Err(error) = host.browsers.close_window(id)
+            {
                 eprintln!("apps: {error:#}");
             }
-            self.link.page(ToPage::Command(command));
+            self.link.page(ToPage::Window(id, command));
             self.link.forget_page(id);
             self.link
                 .event(format!("__appsEvent('closed',{id})"), "apps:closed");
@@ -605,11 +647,24 @@ impl Main {
             }
             return;
         }
-        let windows = self.windows.borrow();
-        let Some((_, window)) = windows.get(&id) else {
-            drop(windows);
-            self.waiting.borrow_mut().push(command);
-            return;
+        // WARNING: AppKit can run a nested loop in these calls, which runs main tasks, so no borrow lasts across them.
+        let (window, parent) = {
+            let windows = self.windows.borrow();
+            let Some((_, window)) = windows.get(&id) else {
+                drop(windows);
+                self.waiting.borrow_mut().push(command);
+                return;
+            };
+            let parent = args[2]
+                .as_u64()
+                .filter(|_| action == "parent")
+                .map(|parent| {
+                    (
+                        parent,
+                        windows.get(&parent).map(|(_, control)| control.clone()),
+                    )
+                });
+            (window.clone(), parent)
         };
         let number = |index: usize| px(args[index].as_f64().unwrap_or(0.) as f32);
         let on = args[2] == true;
@@ -656,16 +711,14 @@ impl Main {
             "aspectRatio" => WindowChange::AspectRatio(number(2).0, size(number(3), number(4))),
             "parent" => {
                 // WARNING: windows start on their own threads, so the parent can arrive after its child.
-                if args[2].as_u64().is_some_and(|parent| {
-                    !windows.contains_key(&parent) && self.opened.borrow().contains(&parent)
-                }) {
+                if let Some((parent, None)) = &parent
+                    && self.opened.borrow().contains(parent)
+                {
                     self.waiting.borrow_mut().push(command);
                     return;
                 }
                 window.change(WindowChange::Parent(
-                    args[2]
-                        .as_u64()
-                        .and_then(|parent| windows.get(&parent)?.1.raw_window_handle().ok()),
+                    parent.and_then(|(_, control)| control?.raw_window_handle().ok()),
                     args[3] == true,
                 ));
                 if args[4] != true {
@@ -739,11 +792,20 @@ impl Main {
         let _ = jobs.send(job);
     }
 
+    // WARNING: a script that main runs outside a turn counts as one, so a nested loop under it runs no other script.
+    pub(crate) fn eval(&self, source: &str, url: &str) -> Result<String> {
+        let engine = self.engine.as_ref().context("Missing the main script")?;
+        let driving = self.driving.replace(true);
+        let result = engine.eval(source, url);
+        self.driving.set(driving);
+        result
+    }
+
     pub(crate) fn drive(self: &Rc<Self>) {
-        // WARNING: AppKit runs nested loops under main scripts, like for a dialog. Those turns
-        // only take messages, so a page that waits for an answer gets it.
+        // WARNING: AppKit runs nested loops under main scripts, like for a dialog. Those turns only take
+        // messages that run no script, see `receive_with`.
         if self.driving.replace(true) {
-            self.receive();
+            self.receive_with(false);
             return;
         }
         crate::host::idle(false);
@@ -788,18 +850,18 @@ impl Main {
             let mut host = self.host.borrow_mut();
             host.sync_theme();
             if std::mem::take(&mut host.theme_changed) {
-                self.link.page_all(json!({"op":"theme"}));
+                self.link.page(ToPage::All(json!({"op":"theme"})));
             }
         }
         let start = Instant::now();
-        while self.receive() && start.elapsed() < Duration::from_millis(4) {}
+        while self.receive_with(true) && start.elapsed() < Duration::from_millis(4) {}
         let mut delay = i64::MAX;
         if let Some(engine) = &self.engine {
             let next = engine.tick()?;
             if next >= 0 {
                 delay = next;
             }
-            self.receive();
+            self.receive_with(true);
             let logs: Vec<_> = self.host.borrow_mut().logs.drain(..).collect();
             if let Some(tools) = &*self.tools.borrow() {
                 for command in tools.commands() {
@@ -816,7 +878,8 @@ impl Main {
             }
             if !logs.is_empty() {
                 super::mcp::logs(&logs);
-                self.link.page_all(json!({"op":"logs","args":logs}));
+                self.link
+                    .page(ToPage::All(json!({"op":"logs","args":logs})));
             }
         }
         // WARNING: a call without a window comes here, also in an app without a main script.
@@ -854,5 +917,91 @@ impl Main {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::Role;
+
+    #[test]
+    fn commands_route_by_target_before_and_after_windows_get_threads() {
+        let link = Link::new();
+        link.create_window(1, json!({"op":"window","args":["create",1,{}]}));
+        link.page(ToPage::Bridge(1, json!("early").into()));
+        link.page(ToPage::Bridge(9, json!("nobody").into()));
+        link.set_per_window();
+        link.create_window(2, json!({"op":"window","args":["create",2,{}]}));
+        let mut host = Host {
+            link: Some(link.clone()),
+            ..Host::default()
+        };
+        host.command(Target::All, json!({"op":"theme"}));
+        host.command(
+            Target::Window(2),
+            json!({"op":"window","args":["zoom",2,2]}),
+        );
+        let kinds = |id| {
+            link.queue_of(id)
+                .unwrap()
+                .take()
+                .into_iter()
+                .map(|message| match message {
+                    ToPage::Window(window, command) => format!("{window}:{}", command["args"][0]),
+                    ToPage::All(command) => format!("all:{}", command["op"]),
+                    ToPage::Bridge(window, payload) => format!("{window}:{}", payload.value),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(kinds(1), r#"1:"create",1:"early",all:"theme""#);
+        assert_eq!(kinds(2), r#"2:"create",all:"theme",2:"zoom""#);
+        assert!(link.queue_of(9).is_none());
+        host.call(Role::Main, "quit", json!([3])).unwrap();
+        assert!(link.quitting() && link.exit_code() == 3);
+        assert!(link.queue_of(1).unwrap().take().is_empty());
+    }
+
+    #[test]
+    fn nested_loops_defer_main_scripts_and_closed_windows_lose_their_messages() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+        engine
+            .eval(
+                "globalThis.runs=[];globalThis.__appsWindowOpen=id=>{runs.push('open'+id);return 'null'}",
+                "test",
+            )
+            .unwrap();
+        let link = Link::new();
+        let main = Main::new(Some(engine), host, link.clone(), api);
+        link.main(ToMain::Spawn(901));
+        link.event("runs.push('event')".into(), "test");
+        link.main(ToMain::Spawn(902));
+        main.driving.set(true);
+        main.receive();
+        let runs = || {
+            main.engine
+                .as_ref()
+                .unwrap()
+                .eval("runs.join()", "test")
+                .unwrap()
+        };
+        assert!(main.opened.borrow().contains(&902) && link.main_pending());
+        assert_eq!(runs(), "");
+        main.driving.set(false);
+        main.receive();
+        assert_eq!(runs(), "event");
+        // WARNING: closing stops the page id for the whole process, so it is one no other test uses.
+        main.native(json!({"op":"window","args":["close",901]}));
+        crate::jsc::page_stopped(901);
+        for id in [901, 902] {
+            let (answer, reply) = mpsc::sync_channel(1);
+            link.main(ToMain::Open(id, json!(["open", "", "", "", ""]), answer));
+            main.receive();
+            assert_eq!(reply.try_recv().is_ok(), id == 902);
+        }
+        assert_eq!(runs(), "event,open902");
     }
 }

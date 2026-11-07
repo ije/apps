@@ -1783,13 +1783,13 @@ impl Window {
                 0
             },
         };
-        let Some((tile, raster)) = self.glyph_tile(params) else {
+        let Some((tile, shown)) = self.glyph_tile(params) else {
             return;
         };
         let bounds = Bounds {
             origin: quantized.map(|value| ScaledPixels(value.trunc()))
-                + raster.map(ScaledPixels::from),
-            size: tile.bounds.size.map(ScaledPixels::from),
+                + shown.origin.map(ScaledPixels::from),
+            size: shown.size.map(ScaledPixels::from),
         };
         self.scene.insert(Primitive::Mono(MonochromeSprite {
             order: 0,
@@ -1821,7 +1821,7 @@ impl Window {
             is_emoji: true,
             dilation: 0,
         };
-        let Some((tile, raster)) = self.glyph_tile(params) else {
+        let Some((tile, shown)) = self.glyph_tile(params) else {
             return;
         };
         self.scene.insert(Primitive::Poly(PolychromeSprite {
@@ -1831,8 +1831,8 @@ impl Window {
             opacity: self.opacity,
             pad: 0,
             bounds: Bounds {
-                origin: origin + raster.map(ScaledPixels::from),
-                size: tile.bounds.size.map(ScaledPixels::from),
+                origin: origin + shown.origin.map(ScaledPixels::from),
+                size: shown.size.map(ScaledPixels::from),
             },
             content_mask: self.snapped_content_mask(),
             corner_radii: Radii::default(),
@@ -1842,31 +1842,28 @@ impl Window {
     fn glyph_tile(
         &self,
         params: RenderGlyphParams,
-    ) -> Option<(crate::scene::AtlasTile, Point<DevicePixels>)> {
+    ) -> Option<(crate::scene::AtlasTile, Bounds<DevicePixels>)> {
         let text = &self.text_system;
         self.platform
             .atlas()
             .get_or_insert_with(&AtlasKey::Glyph(params), &mut || {
                 Ok(text
-                    .rasterize_glyph(&params)?
-                    .map(|(origin, size, bytes)| (origin, size, Cow::Owned(bytes))))
+                    .rasterize_glyph(&params, crate::atlas::MAX_GLYPH_SIDE)?
+                    .map(|(shown, size, bytes)| (shown, size, Cow::Owned(bytes))))
             })
-            .ok()
-            .flatten()
     }
 
     fn image_tile(&self, image: &RenderImage) -> Option<crate::scene::AtlasTile> {
         self.platform
             .atlas()
             .get_or_insert_with(&AtlasKey::Image(image.id), &mut || {
+                let size = image.size();
                 Ok(Some((
-                    Point::default(),
-                    image.size(),
+                    Bounds::new(Point::default(), size),
+                    size,
                     Cow::Borrowed(image.bytes()),
                 )))
             })
-            .ok()
-            .flatten()
             .map(|(tile, _)| tile)
     }
 
@@ -1887,26 +1884,25 @@ impl Window {
                 (width * scale).ceil() as u16,
                 (height * scale).ceil() as u16,
             ];
-            let image = self.symbols.get(name, size);
+            let image = self.symbols.get(name, size, self.frames_drawn);
             for id in self.symbols.retired.drain(..) {
                 self.platform.atlas().remove(&AtlasKey::Symbol(id));
             }
             let Some(image) = image else { return };
-            let tile = self
-                .platform
-                .atlas()
-                .get_or_insert_with(&AtlasKey::Symbol(image.id), &mut || {
-                    Ok(Some((
-                        Point::default(),
-                        crate::size(
+            let tile =
+                self.platform
+                    .atlas()
+                    .get_or_insert_with(&AtlasKey::Symbol(image.id), &mut || {
+                        let size = crate::size(
                             DevicePixels(i32::from(image.size[0])),
                             DevicePixels(i32::from(image.size[1])),
-                        ),
-                        Cow::Borrowed(&image.bytes),
-                    )))
-                })
-                .ok()
-                .flatten();
+                        );
+                        Ok(Some((
+                            Bounds::new(Point::default(), size),
+                            size,
+                            Cow::Borrowed(&image.bytes),
+                        )))
+                    });
             if let Some((tile, _)) = tile {
                 self.scene.insert(Primitive::Mono(MonochromeSprite {
                     order: 0,

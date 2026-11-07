@@ -59,7 +59,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
         "apps:node",
     )?;
     engine.eval_page(std::str::from_utf8(&source)?, "apps:node")?;
-    while engine.eval_page("this.__appsNext?.()", "apps:node")? == "true" {}
+    while engine.eval_page(crate::jsc::NEXT, "apps:node")? == "true" {}
     let code = loop {
         let delay = engine.tick()?;
         // WARNING: like in Node, the process ends when only unreferenced handles are left.

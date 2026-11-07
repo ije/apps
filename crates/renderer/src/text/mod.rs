@@ -428,13 +428,30 @@ impl TextSystem {
     pub(crate) fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
+        max: i32,
     ) -> Result<Option<crate::atlas::Raster<Vec<u8>>>> {
-        let bounds = self.platform.glyph_raster_bounds(params)?;
+        let mut params = *params;
+        let mut bounds = self.platform.glyph_raster_bounds(&params)?;
+        let side = bounds.size.width.0.max(bounds.size.height.0);
+        let stretch = side as f32 / max as f32;
+        if stretch > 1. {
+            params.scale_factor /= stretch;
+            params.subpixel_variant = crate::point(0, 0);
+            bounds = self.platform.glyph_raster_bounds(&params)?;
+        }
         if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
             return Ok(None);
         }
-        let (size, bytes) = self.platform.rasterize_glyph(params, bounds)?;
-        Ok(Some((bounds.origin, size, bytes)))
+        let (size, bytes) = self.platform.rasterize_glyph(&params, bounds)?;
+        let shown = if stretch > 1. {
+            let scale = |value: crate::DevicePixels| {
+                crate::DevicePixels((value.0 as f32 * stretch).round() as i32)
+            };
+            Bounds::new(bounds.origin.map(scale), size.map(scale))
+        } else {
+            Bounds::new(bounds.origin, size)
+        };
+        Ok(Some((shown, size, bytes)))
     }
 
     pub fn glyph_bounds(
@@ -486,17 +503,21 @@ impl TextSystem {
         Size<crate::DevicePixels>,
         Vec<u8>,
     )> {
-        self.rasterize_glyph(&RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant: crate::point(subpixel, 0),
-            scale_factor,
-            is_emoji,
-            dilation: 0,
-        })
+        self.rasterize_glyph(
+            &RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size,
+                subpixel_variant: crate::point(subpixel, 0),
+                scale_factor,
+                is_emoji,
+                dilation: 0,
+            },
+            i32::MAX,
+        )
         .ok()
         .flatten()
+        .map(|(bounds, size, bytes)| (bounds.origin, size, bytes))
     }
 
     pub(crate) fn finish_frame(&self) {
@@ -706,5 +727,55 @@ impl DecorationRun {
             && self.underline == run.underline
             && self.strikethrough == run.strikethrough
             && self.background_color == run.background_color
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_glyphs_raster_small_and_stretch_to_their_size() {
+        let text = TextSystem::new();
+        let font_id = text.resolve_font(&font("Helvetica"));
+        let glyph_id = text.platform.glyph_for_char(font_id, 'W').unwrap();
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(10000.),
+            subpixel_variant: crate::point(2, 0),
+            scale_factor: 2.,
+            is_emoji: false,
+            dilation: 0,
+        };
+        let full = text.platform.glyph_raster_bounds(&params).unwrap();
+        assert!(full.size.width.0 > 16384);
+        let max = crate::atlas::MAX_GLYPH_SIDE;
+        let (shown, size, bytes) = text.rasterize_glyph(&params, max).unwrap().unwrap();
+        assert!(size.width.0.max(size.height.0) <= max + 4);
+        assert_eq!(bytes.len(), (size.width.0 * size.height.0) as usize);
+        assert!(bytes.iter().any(|alpha| *alpha > 0));
+        let stretch = full.size.width.0.max(full.size.height.0) / max + 1;
+        for (shown, full) in [
+            (shown.origin.x, full.origin.x),
+            (shown.origin.y, full.origin.y),
+            (shown.size.width, full.size.width),
+            (shown.size.height, full.size.height),
+        ] {
+            assert!(
+                (shown.0 - full.0).abs() <= 3 * stretch,
+                "{shown:?} vs {full:?}"
+            );
+        }
+        let small = RenderGlyphParams {
+            font_size: px(16.),
+            ..params
+        };
+        let (shown, size, _) = text.rasterize_glyph(&small, max).unwrap().unwrap();
+        assert_eq!(shown.size, size);
+        assert_eq!(
+            shown.origin,
+            text.platform.glyph_raster_bounds(&small).unwrap().origin
+        );
     }
 }

@@ -69,6 +69,19 @@ pub(crate) struct State {
     packaged: bool,
     disabled: u32,
     scripts: Arc<HashMap<String, bytes::Bytes>>,
+    channels: Vec<u64>,
+}
+
+// WARNING: a preload context ends without its thread ending, so its subscribers leave with its state.
+impl Drop for State {
+    fn drop(&mut self) {
+        if !self.channels.is_empty() {
+            CHANNELS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|id, _| !self.channels.contains(id));
+        }
+    }
 }
 
 impl State {
@@ -134,6 +147,7 @@ impl State {
                         thread: std::thread::current().id(),
                     },
                 );
+                self.channels.push(id);
                 Ok(json!(id))
             }
             "channel.subscribe" => {
@@ -232,7 +246,7 @@ impl State {
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
-                        while engine.eval_page("this.__appsNext?.()", "apps:worker")? == "true" {}
+                        while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
                             // WARNING: a native worker ends when only unreferenced timers are left, like in Node, so it checks before each wait.
@@ -329,5 +343,21 @@ impl State {
             }
             _ => bail!("Unsupported worker operation: {op}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dropped_contexts_remove_their_channel_subscribers() {
+        let mut state = super::State::default();
+        let id = state
+            .call("channel.open", &mut serde_json::Value::Null)
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(super::CHANNELS.lock().unwrap().contains_key(&id));
+        drop(state);
+        assert!(!super::CHANNELS.lock().unwrap().contains_key(&id));
     }
 }

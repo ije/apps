@@ -33,17 +33,19 @@ pub(crate) struct Cache {
 }
 
 impl Cache {
-    pub fn get(&mut self, name: &str, size: [u16; 2]) -> Option<Rc<Symbol>> {
-        self.clock += 1;
+    // WARNING: an entry that the current frame used is never dropped, so the cache can grow past its limits for
+    // one frame. Otherwise a frame with more symbols than fit would rasterize each one again in every frame.
+    pub fn get(&mut self, name: &str, size: [u16; 2], frame: u64) -> Option<Rc<Symbol>> {
         if let Some(entry) = self
             .images
             .get_mut(name)
             .and_then(|entries| entries.iter_mut().find(|entry| entry.size == size))
         {
-            entry.used = self.clock;
+            entry.used = frame;
             return entry.image.clone();
         }
-        let image = super::native_sync(|| rasterize(name, size)).map(|bytes| {
+        self.clock += 1;
+        let image = rasterize(name, size).map(|bytes| {
             Rc::new(Symbol {
                 id: self.clock,
                 size,
@@ -61,6 +63,7 @@ impl Cache {
                         .enumerate()
                         .map(move |(index, entry)| (name, index, entry.used))
                 })
+                .filter(|entry| entry.2 != frame)
                 .min_by_key(|entry| entry.2)
                 .map(|(name, index, _)| (name.clone(), index))
             else {
@@ -78,7 +81,7 @@ impl Cache {
         }
         self.images.entry(name.to_owned()).or_default().push(Entry {
             size,
-            used: self.clock,
+            used: frame,
             image: image.clone(),
         });
         self.bytes += bytes;
@@ -87,6 +90,7 @@ impl Cache {
     }
 }
 
+// WARNING: this runs on the render thread. NSImage draws on any thread into a graphics context of that thread.
 fn rasterize(name: &str, [width, height]: [u16; 2]) -> Option<Vec<u8>> {
     if width == 0 || height == 0 {
         return None;
@@ -156,7 +160,7 @@ fn rasterize(name: &str, [width, height]: [u16; 2]) -> Option<Vec<u8>> {
         for y in 0..usize::from(height) {
             let row =
                 std::slice::from_raw_parts(pixels.add(y * stride as usize), usize::from(width) * 4);
-            alpha.extend(row.chunks_exact(4).map(|pixel| pixel[3]));
+            alpha.extend(row.as_chunks::<4>().0.iter().map(|pixel| pixel[3]));
         }
         Some(alpha)
     })
@@ -168,8 +172,8 @@ mod tests {
     fn system_symbols_have_pixels_and_unknown_names_are_empty() {
         let pixels = super::rasterize("folder", [64, 64]).unwrap();
         assert_eq!(pixels.len(), 64 * 64);
-        assert!(pixels.iter().any(|alpha| *alpha == 255));
-        assert!(pixels.iter().any(|alpha| *alpha == 0));
+        assert!(pixels.contains(&255));
+        assert!(pixels.contains(&0));
         let arrow = super::rasterize("arrow.up", [64, 64]).unwrap();
         let top: u32 = arrow[..32 * 64].iter().map(|alpha| u32::from(*alpha)).sum();
         let bottom: u32 = arrow[32 * 64..].iter().map(|alpha| u32::from(*alpha)).sum();
@@ -179,5 +183,44 @@ mod tests {
         );
         assert!(super::rasterize("apps.unknown.symbol.name", [64, 64]).is_none());
         assert!(super::rasterize("folder", [0, 64]).is_none());
+    }
+
+    #[test]
+    fn threads_rasterize_the_same_pixels() {
+        let names = ["folder", "arrow.up", "star.fill", "gearshape"];
+        let expected: Vec<_> = names
+            .iter()
+            .map(|name| super::rasterize(name, [48, 40]).unwrap())
+            .collect();
+        let expected = &expected;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        for (name, pixels) in names.iter().zip(expected) {
+                            assert_eq!(super::rasterize(name, [48, 40]).as_ref(), Some(pixels));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_frame_keeps_every_symbol_it_used() {
+        let mut cache = super::Cache::default();
+        let sizes = 8..8 + super::MAX_ENTRIES as u16 + 40;
+        for _ in 0..2 {
+            for side in sizes.clone() {
+                assert!(cache.get("circle", [side, side], 1).is_some());
+            }
+        }
+        assert_eq!(cache.clock, sizes.len() as u64);
+        assert!(cache.retired.is_empty());
+        cache.get("circle", [8, 8], 2);
+        cache.get("square", [8, 8], 2);
+        assert_eq!(cache.entries, super::MAX_ENTRIES);
+        assert!(cache.get("circle", [8, 8], 3).is_some());
+        assert_eq!(cache.clock, sizes.len() as u64 + 1);
     }
 }

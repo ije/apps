@@ -391,6 +391,13 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
       if(copy.getContext('2d').getImageData(7,7,1,1).data[1]!==255)throw Error('drawImage failed');
       if(!canvas.toDataURL().startsWith('data:image/png;base64,iVBOR'))throw Error('PNG encoding failed');
       canvas.width=8;if(ctx.getImageData(0,0,1,1).data[3]!==0)throw Error('Canvas resize did not clear pixels');
+      ctx.translate(-1e8,0);ctx.fillRect(1e8+3,0,1,1);ctx.resetTransform();
+      const row=ctx.getImageData(0,0,8,1).data;if(row[2*4+3]||row[3*4+3]!==255||row[4*4+3])throw Error('Far coordinates lost precision');
+      ctx.fillStyle='#ff0000';ctx.fillRect(2,4,1,1);
+      if(ctx.getImageData(2.7,4.2,1.9,1.5).data[0]!==255||ctx.getImageData(3,5,-1,-1).data[0]!==255)throw Error('getImageData arguments are longs');
+      for(const size of [[0,1],[0.5,1],[1,-0.2]]){let threw=null;try{ctx.getImageData(0,0,...size);}catch(error){threw=error.name;}if(threw!=='IndexSizeError')throw Error('Empty getImageData: '+threw);}
+      ctx.beginPath();ctx.moveTo(0,6);ctx.lineTo(NaN,7);ctx.lineTo(1e300,7);ctx.lineTo(8,6);ctx.lineTo(8,8);ctx.lineTo(0,8);ctx.fill();
+      if(ctx.getImageData(5,7,1,1).data[0]!==255)throw Error('A non-finite point dropped the path');
     "#, "test").unwrap();
 }
 
@@ -1179,6 +1186,25 @@ fn create_image_bitmap_takes_all_sources() {
         reader.clearRect(0, 0, 2, 2); reader.drawImage(shown, 0, 0);
         same([...reader.getImageData(1, 0, 1, 1).data], [0, 0, 0, 0], 'bitmaprenderer clears');
         try { renderer.transferFromImageBitmap({}); throw Error('object'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn huge_svg_images_draw_at_their_canvas_size() {
+    let (.., result) = offscreen_page(
+        r#"
+        const huge = new Image(); huge.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30000" height="30000"><rect width="15000" height="30000" fill="red"/><rect x="15000" width="15000" height="30000" fill="blue"/></svg>');
+        await huge.decode();
+        same([huge.naturalWidth, huge.naturalHeight], [30000, 30000], 'natural size');
+        const target = new OffscreenCanvas(10, 10), drawing = target.getContext('2d');
+        drawing.drawImage(huge, 0, 0, 10, 10);
+        same([...drawing.getImageData(2, 5, 1, 1).data, ...drawing.getImageData(7, 5, 1, 1).data], [255, 0, 0, 255, 0, 0, 255, 255], 'whole');
+        drawing.drawImage(huge, 15000, 0, 15000, 30000, 0, 0, 10, 10);
+        same([...drawing.getImageData(2, 5, 1, 1).data], [0, 0, 255, 255], 'part');
+        drawing.drawImage(huge, 0, 0, 10, 10); drawing.drawImage(huge, 0, 0, 10, 10);
+        same([...drawing.getImageData(2, 5, 1, 1).data], [255, 0, 0, 255], 'again');
     "#,
     );
     assert_eq!(result, "ok");
@@ -2902,5 +2928,185 @@ fn web_animations_sample_commit_finish_and_replace() {
     assert_eq!(
         engine.eval("JSON.stringify([events.sort(), one.replaceState, two.playState, b.getAnimations().length, getComputedStyle(b).opacity])", "test").unwrap(),
         r#"[["AbortError","finish 20","finished true","pending true null","ready false number","remove"],"removed","finished",1,"0.4"]"#
+    );
+}
+
+#[test]
+fn custom_element_reactions_wait_for_the_call_and_report_errors() {
+    let (_, engine) = checked_page(
+        "<html><body><div id='box'></div><x-bad id='bad'></x-bad></body></html>",
+        r#"
+        globalThis.log = []; globalThis.errors = [];
+        addEventListener('error', event => { errors.push(event.message); event.preventDefault(); });
+        customElements.define('x-throw', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); throw new Error('boom ' + this.id); } });
+        const box = document.getElementById('box'), a = document.createElement('x-throw'), b = document.createElement('x-throw');
+        a.id = 'a'; b.id = 'b';
+        box.append(a, b);
+        check('a throwing callback does not stop the insertion', () => b.parentNode === box && log.join() === 'in:a,in:b');
+        check('callback errors are reported', () => errors.join() === 'boom a,boom b');
+        globalThis.defined = false;
+        customElements.whenDefined('x-bad').then(() => defined = true);
+        customElements.define('x-bad', class extends HTMLElement { constructor() { super(); throw new Error('constructor'); } connectedCallback() { log.push('bad'); } });
+        check('a throwing upgrade is reported and fails for good', () => errors.at(-1) === 'constructor' && !log.includes('bad'));
+        const bad = document.getElementById('bad'); box.append(bad);
+        check('a failed element does not upgrade again', () => errors.length === 3 && !log.includes('bad'));
+        const observer = new MutationObserver(() => {}); observer.observe(box, { childList: true, attributes: true, subtree: true });
+        customElements.define('x-writer', class extends HTMLElement { static observedAttributes = ['data-on']; connectedCallback() { log.push('connected'); this.setAttribute('data-on', '1'); } attributeChangedCallback(name, old, value) { log.push(name + '=' + value); } });
+        log.length = 0; box.append(document.createElement('x-writer'));
+        check('records keep the browser order', () => observer.takeRecords().map(record => record.type).join() === 'childList,attributes');
+        check('callbacks run in queue order', () => log.join() === 'connected,data-on=1');
+        log.length = 0; box.innerHTML = '<x-writer data-on="2"></x-writer>';
+        check('parsed elements upgrade with their attributes', () => log.join() === 'data-on=2,connected,data-on=1');
+        const clone = box.firstChild.cloneNode();
+        check('clones upgrade after their attributes are copied', () => clone instanceof customElements.get('x-writer') && clone.getAttribute('data-on') === '1');
+        "#,
+    );
+    engine.tick().unwrap();
+    assert_eq!(engine.eval("String(defined)", "test").unwrap(), "true");
+}
+
+#[test]
+fn svg_fragments_parse_in_their_context() {
+    checked_page(
+        "<html><body><svg id='s'><g id='g'></g></svg></body></html>",
+        r#"
+        const NS = 'http://www.w3.org/2000/svg', g = document.getElementById('g');
+        g.insertAdjacentHTML('beforeend', '<rect width="5" height="5"/><circle r="2"/><linearGradient id=lg></linearGradient><div>html</div>');
+        check('self-closing tags close', () => g.children.length === 4 && g.children[0].localName === 'rect' && !g.children[0].firstChild && g.children[1].localName === 'circle');
+        check('SVG tag names keep their case', () => g.children[2].localName === 'linearGradient' && g.querySelector('linearGradient')?.id === 'lg');
+        check('fragment children are SVG elements', () => g.children[0] instanceof SVGElement && g.children[0].namespaceURI === NS && typeof g.children[0].getBBox === 'function');
+        check('breakout tags stay HTML', () => g.children[3] instanceof HTMLElement && !(g.children[3] instanceof SVGElement));
+        const detached = document.createElementNS(NS, 'g'); detached.innerHTML = '<rect viewbox="0 0 1 1"/><circle/>';
+        check('innerHTML of a detached SVG element', () => detached.children.length === 2 && detached.firstChild instanceof SVGElement && detached.firstChild.getAttribute('viewBox') === '0 0 1 1');
+        const range = document.createRange(); range.selectNodeContents(g);
+        const fragment = range.createContextualFragment('<path d="M0 0"/><text>t</text>');
+        check('contextual fragments in SVG', () => fragment.childNodes.length === 2 && fragment.firstChild instanceof SVGElement && fragment.lastChild.textContent === 't');
+        const object = document.createElementNS(NS, 'foreignObject'); object.innerHTML = '<p>x</p>';
+        check('HTML integration points parse HTML', () => object.firstChild instanceof HTMLElement && object.firstChild.localName === 'p');
+        "#,
+    );
+}
+
+#[test]
+fn bundled_link_sheets_are_not_text() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: apps_runtime::bundle::page(
+                "<html><head><link rel='stylesheet' href='a.css' apps-sheet='p { color: red }'></head><body><p>x</p></body></html>",
+            ),
+            dirty: false,
+        },
+    );
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    assert_eq!(
+        engine
+            .eval("[document.head.innerHTML, document.head.textContent, document.documentElement.textContent, document.querySelector('link').sheet?.cssRules.length].join('|')", "test")
+            .unwrap(),
+        "<link rel=\"stylesheet\" href=\"a.css\">||x|1"
+    );
+}
+
+#[test]
+fn indexes_follow_ids_labels_forms_and_bases() {
+    checked_page(
+        "<html><head><title> a  b </title></head><body><form id='f'><input id='in' name='r' type='radio'><label for='in'>one</label></form><label>two <input id='nested'></label><input form='f' id='out' name='r' type='radio'><template><i id='hidden'></i></template><a id='link' href='x/y'>l</a></body></html>",
+        r#"
+        const input = document.getElementById('in'), out = document.getElementById('out'), form = document.getElementById('f');
+        check('ids', () => input?.localName === 'input' && document.getElementById('hidden') === null && document.getElementById('none') === null);
+        const twin = document.createElement('b'); twin.id = 'in';
+        check('detached ids are not found', () => document.getElementById('in') === input);
+        document.body.prepend(twin);
+        check('the first element in tree order wins', () => document.getElementById('in') === twin);
+        twin.remove(); input.id = 'renamed';
+        check('id changes update the index', () => document.getElementById('in') === null && document.getElementById('renamed') === input);
+        input.id = 'in';
+        check('labels', () => input.labels.length === 1 && input.labels[0].textContent === 'one' && document.getElementById('nested').labels[0].textContent.startsWith('two'));
+        check('form elements include controls outside the form', () => form.elements.length === 2 && form.elements[1] === out && form.elements.r === input);
+        out.checked = true; input.checked = true;
+        check('radio groups follow the form owner', () => !out.checked);
+        check('closest', () => input.closest('form') === form && input.closest(':scope') === input && input.closest('p') === null && out.closest('body') === document.body);
+        check('closest throws on bad selectors', () => { try { input.closest('[['); return false; } catch (e) { return e.name === 'SyntaxError'; } });
+        check('title', () => document.title === 'a b');
+        const before = document.getElementById('link').href;
+        const base = document.createElement('base'); base.href = 'https://example.com/dir/'; document.head.append(base);
+        check('base changes resolve again', () => document.baseURI === 'https://example.com/dir/' && document.getElementById('link').href === 'https://example.com/dir/x/y');
+        base.remove();
+        check('removed bases stop applying', () => document.getElementById('link').href === before);
+        const div = document.createElement('div');
+        div.classList.remove('x'); div.classList.toggle('y', false); div.classList.add();
+        check('empty token sets add no class attribute', () => !div.hasAttribute('class'));
+        div.className = 'x'; div.classList.remove('x');
+        check('an existing class attribute stays', () => div.getAttribute('class') === '');
+        "#,
+    );
+}
+
+#[test]
+fn range_contents_walk_only_the_boundary_paths() {
+    checked_page(
+        "<html><body><div id='root'><p id='one'>abc<b>def</b></p><p id='two'>ghi</p><p id='three'><i>jkl</i>mno</p></div></body></html>",
+        r#"
+        const root = document.getElementById('root'), one = document.getElementById('one'), three = document.getElementById('three');
+        const range = document.createRange(); range.setStart(one.firstChild, 1); range.setEnd(three.lastChild, 2);
+        check('cloneContents', () => { const div = document.createElement('div'); div.append(range.cloneContents()); return div.innerHTML === '<p id="one">bc<b>def</b></p><p id="two">ghi</p><p id="three"><i>jkl</i>mn</p>'; });
+        check('toString', () => range.toString() === 'bcdefghijklmn');
+        range.deleteContents();
+        check('deleteContents', () => root.innerHTML === '<p id="one">a</p><p id="three">o</p>' && range.collapsed && range.startContainer === root && range.startOffset === 1);
+        const list = document.createElement('ul'); for (let i = 0; i < 3000; i++) list.append(document.createElement('li')); document.body.append(list);
+        const many = document.createRange(); many.setStart(list, 1000); many.setEnd(list, 2000);
+        check('cloneContents of siblings', () => many.cloneContents().childNodes.length === 1000);
+        many.deleteContents();
+        check('deleteContents of siblings', () => list.childNodes.length === 2000 && many.startOffset === 1000 && many.collapsed);
+        const garbage = []; for (let i = 0; i < 100; i++) { const r = document.createRange(); r.setStart(list.firstChild, 0); garbage.push(r); }
+        const far = document.createRange(); far.setStart(list, 5); far.setEnd(list, 6);
+        list.firstChild.remove();
+        check('ranges inside a removed node move to its parent', () => garbage.every(r => r.startContainer === list && r.startOffset === 0) && far.startOffset === 4 && far.endOffset === 5);
+        const copy = far.cloneRange(); list.prepend(document.createElement('li'));
+        check('clones are live too', () => copy.startOffset === 5 && copy.endOffset === 6);
+        "#,
+    );
+}
+
+#[test]
+fn busy_hosts_keep_page_writes() {
+    let (host, engine) = checked_page("<html><body></body></html>", "");
+    {
+        let _busy = host.borrow_mut();
+        engine
+            .eval("document.body.setAttribute('data-kept', '1')", "test")
+            .unwrap();
+    }
+    engine.tick().unwrap();
+    let host = host.borrow();
+    let doc = &host.pages[&1].doc;
+    let body = doc
+        .nodes
+        .iter()
+        .position(|node| node.tag == "body")
+        .unwrap();
+    assert_eq!(
+        doc.nodes[body].attrs.get("data-kept").map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
+fn web_animation_times_must_be_finite_and_may_be_huge() {
+    checked_page(
+        "<html><body><div id='a' style='opacity:0.5'></div></body></html>",
+        r#"
+        const a = document.getElementById('a');
+        const animation = a.animate({ opacity: [0, 1] }, { duration: 1000, delay: 1e300 });
+        const rejects = (set) => { try { set(); return false; } catch (error) { return error instanceof TypeError; } };
+        check('NaN time', () => rejects(() => { animation.currentTime = NaN; }));
+        check('infinite time', () => rejects(() => { animation.currentTime = Infinity; }));
+        check('infinite start', () => rejects(() => { animation.startTime = -Infinity; }));
+        check('NaN rate', () => rejects(() => { animation.playbackRate = NaN; }));
+        check('infinite pending rate', () => rejects(() => animation.updatePlaybackRate(Infinity)));
+        check('huge time', () => { animation.currentTime = 1e300; animation.pause(); animation.currentTime = -1e300; return getComputedStyle(a).opacity === '0.5'; });
+        check('huge start', () => { animation.startTime = 1e300; animation.play(); return getComputedStyle(a).opacity === '0.5'; });
+        "#,
     );
 }

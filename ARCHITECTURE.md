@@ -12,13 +12,16 @@
 | Main | AppKit, native windows, menus and web views, and the main side: the main script or the Rust startup callback |
 | Render | One for each `BrowserWindow`: its page scripts and preloads in their own JavaScriptCore VM and heap, its event loop, DOM, CSS, layout, paint and Metal. It takes display link ticks directly, so a busy main thread or another window stops no frames |
 | Handlers | The Rust handlers of `ipcRenderer.invoke()`, on a pool of up to 4 threads |
+| Blocking | Async `fs`, `dns.lookup()`, `zlib` and `crypto` work and Node-API async work of every context, on one pool of up to 4 threads, like libuv's |
 | Workers | Each JS worker, and any thread that Rust code starts. Rust threads reach pages with `AppHandle` |
 
 The main side and the pages share no JavaScript state. Each has its own `Host`, and they talk only through the queues in `crates/runtime/src/desktop/link.rs`. These are threads, not OS processes, so a crash in native code ends the whole app.
 
-A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard and opening a window. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key and the IME ranges, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question. A frame for a live resize gets 8 ms, because the window server moves the old frame until AppKit's transaction commits. A later frame shows after the commit, anchored to the top left, so a slow page lags only at the window's edge.
+A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard, opening a window, and a key while main listens to the window's `before-input-event`. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key and the IME ranges, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question. A frame for a live resize gets 8 ms, because the window server moves the old frame until AppKit's transaction commits. A later frame shows after the commit, anchored to the top left, so a slow page lags only at the window's edge.
 
 Window commands like `setBounds()`, `minimize()` and `close()` run on main and don't wait for the page. `close()` and quitting also stop a running page script, so a hung page can't hold them up.
+
+Main's work runs from a run loop source and timers in the common modes, so it goes on while a popup menu or a modal panel runs a nested loop. While a main script waits in such a loop, like `dialog.showMessageBoxSync()`, IPC and events that would run main scripts wait until it returns, and window commands and the native work of pages still run. `Menu.popup()` returns at once, as in Electron.
 
 Render threads exist on macOS. On Windows and Linux the main side and all pages run on the main thread, so a busy script delays page frames there.
 
@@ -78,7 +81,7 @@ A folder with `app.bundle` or `app.js` is a built app. It passes all of its argu
 
 ## Modules
 
-`apps build` links ES modules through one array of slots per bundle. A module is a plain function that writes its exports to its slots when its body ends, and importers read `slots[k]` directly. Re-exports and `export *` resolve at build time to the module that holds the binding, so barrels cost nothing at run time. A binding that a function writes later keeps a closure in its slot, which importers call.
+`apps build` links ES modules through one array of slots per bundle. A module is a plain function that writes its exports to its slots when its body ends, and importers read `slots[k]` directly. Re-exports and `export *` resolve at build time to the module that holds the binding, so barrels cost nothing at run time. A binding that code can write after the body ends, in a function, a method or an instance field, keeps a closure in its slot, which importers call.
 
 A module has a namespace object only where code needs one: `import *` used as a value, `import()`, `require()` and entries. Modules in import cycles, CommonJS, top-level await and modules that use `eval` keep the slower form, with a generator, a namespace and a getter per export. `apps run` uses that form for all modules, so it follows the standard.
 
@@ -88,7 +91,7 @@ A module has a namespace object only where code needs one: `import *` used as a 
 
 Boxes are kept across frames. A box keeps its identity (element id, or position in the nearest box with an id). Each frame the view describes only what changed and links unchanged subtrees with `Child::Kept`, so they are not built, measured or laid out again. A changed box drops the layout caches of itself and its ancestors only, and taffy skips the rest. Measured leaves (text) keep their state while it compares equal.
 
-Styles are incremental too. The selector cache records which nodes each node's matches read, so a DOM change marks only the nodes that could match differently. A style pass starts from the last output and styles those nodes, the children of nodes whose output changed, and every node after a new root font size. Pages with shadow trees, CSS counters or tables, and passes after a new viewport or stylesheet, style every node. Debug builds check each incremental pass against a full one. The per-frame cull info works the same way: only nodes with a new revision, style or focus, and their ancestors, are visited again.
+Styles are incremental too. The selector cache records which nodes each node's matches read, so a DOM change marks only the nodes that could match differently. A style pass starts from the last output and styles those nodes, the children of nodes whose output changed, and every node after a new root font size. Pages with shadow trees, CSS counters or tables, and passes after a new viewport or stylesheet, style every node. Debug builds check each incremental pass against a full one with an empty cache. The per-frame cull info works the same way: only nodes with a new revision, style or focus, and their ancestors, are visited again.
 
 Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` below it and paints them around its children. Code that draws more than a box (text, effects, sticky and fixed offsets) runs as `Hooks` around the box each frame.
 
@@ -103,12 +106,18 @@ AppKit puts that surface in an `NSGlassEffectView` above the page. The native ma
 
 The renderer reuses the native views and removes them when their boxes disappear. Idle windows release spare glass drawables.
 These frames need the main thread to update the native views and present their Metal surfaces together.
+Only the newest such frame waits for main, and a newer one drops it unseen, so a busy main thread skips frames but never stops the page.
+The renderer doesn't know where web views paint, so glass views always stay below them.
 Glass currently needs a top-level effect with uniform corners, no transforms or filters, and no clipping or content above it.
 
 Unsupported boxes keep their ordinary CSS appearance. Native glass does not appear in Metal readback, so `capturePage()` rejects these frames.
 
-`@import "sf-symbols"` adds macOS-only `sf-icon-*` classes for empty spans. Cache misses call AppKit on the main thread to rasterize symbols.
+`@import "sf-symbols"` adds macOS-only `sf-icon-*` classes for empty spans. Cache misses rasterize symbols with AppKit on the render thread.
 The renderer keeps a bounded alpha cache and draws the icons through its monochrome atlas. CSS color changes need no new bitmap.
+The cache keeps every symbol that the current frame uses, even past its bounds.
+
+The atlas keeps a tile that fails or is bigger than a GPU texture as an empty entry, so it is not built again each frame.
+A glyph bigger than 2048 device pixels on a side rasters at a smaller scale and stretches to its size.
 
 
 ## Offscreen Canvases

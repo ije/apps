@@ -1462,7 +1462,7 @@ const EDGES: &str =
 type Pairs = Vec<(String, String)>;
 type Nested = (Vec<String>, String, Pairs);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Body {
     declarations: Pairs,
     nested: Vec<Nested>,
@@ -1543,11 +1543,16 @@ struct Config {
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
     expanding: std::cell::RefCell<Vec<usize>>,
+    // WARNING: `@apply` fans out, so each utility expands once per value and modifier. A result that a cycle
+    // or the depth cap cut short depends on where the expansion started, so `cut` keeps it out.
+    #[allow(clippy::type_complexity)]
+    expanded: std::cell::RefCell<FxHashMap<(usize, Option<String>, Option<String>), Option<Body>>>,
+    cut: std::cell::Cell<bool>,
     import: Option<bool>,
     classes: FxHashMap<String, bool>,
     scanned: Vec<u64>,
     applied: Vec<(Rc<Stylesheet>, Rc<Stylesheet>)>,
-    sorted: Vec<(Sort, u32, Vec<Rule>)>,
+    sorted: Vec<(Sort, u64, Vec<Rule>)>,
     chunks: Vec<(u64, Rc<Stylesheet>)>,
     keys: FxHashMap<usize, u64>,
     header: Option<Rc<Stylesheet>>,
@@ -1729,9 +1734,6 @@ impl Config {
                     }
                 }
             }
-            if let Some(inline) = &node.inline {
-                used.push_str(&inline.source());
-            }
         }
         for sheet in sheets.iter_mut() {
             if let Some((_, applied)) = self
@@ -1795,7 +1797,8 @@ impl Config {
         if !fresh.is_empty() {
             fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             // WARNING: keys keep Tailwind's order with gaps; a utility without a gap renumbers them all,
-            // which rebuilds every scope.
+            // which rebuilds every scope. Keys have 56 bits, so a selector index fits below them in 64.
+            const KEYS: u64 = 1 << 56;
             let mut renumber = false;
             if fresh.len() <= 16 {
                 for (sort, rules) in fresh {
@@ -1803,10 +1806,7 @@ impl Config {
                     let low = position
                         .checked_sub(1)
                         .map_or(0, |previous| self.sorted[previous].1);
-                    let high = self
-                        .sorted
-                        .get(position)
-                        .map_or(u32::MAX, |(_, key, _)| *key);
+                    let high = self.sorted.get(position).map_or(KEYS, |(_, key, _)| *key);
                     let key = low + (high - low) / 2;
                     renumber |= key == low;
                     new.insert(key);
@@ -1821,17 +1821,17 @@ impl Config {
                         merged.push(old);
                     }
                     let low = merged.last().map_or(0, |(_, key, _)| *key);
-                    let high = sorted.peek().map_or(u32::MAX, |(_, key, _)| *key);
+                    let high = sorted.peek().map_or(KEYS, |(_, key, _)| *key);
                     let mut run = Vec::new();
                     while let Some(item) =
                         fresh.next_if(|item| sorted.peek().is_none_or(|old| item.0 < old.0))
                     {
                         run.push(item);
                     }
-                    let step = (high - low) / (run.len() as u32 + 1);
+                    let step = (high - low) / (run.len() as u64 + 1);
                     renumber |= step == 0;
                     for (index, (sort, rules)) in run.into_iter().enumerate() {
-                        let key = low + step * (index as u32 + 1);
+                        let key = low + step * (index as u64 + 1);
                         new.insert(key);
                         merged.push((sort, key, rules));
                     }
@@ -1840,9 +1840,9 @@ impl Config {
                 self.sorted = merged;
             }
             if renumber {
-                let step = u32::MAX / (self.sorted.len() as u32 + 1);
+                let step = KEYS / (self.sorted.len() as u64 + 1);
                 for (index, (_, key, _)) in self.sorted.iter_mut().enumerate() {
-                    *key = step * (index as u32 + 1);
+                    *key = step * (index as u64 + 1);
                 }
             }
             if renumber {
@@ -1856,7 +1856,7 @@ impl Config {
                 for rule in rules {
                     selectors(rule, &mut |list| {
                         self.keys
-                            .insert(Rc::as_ptr(list) as usize, u64::from(*key) << 8 | index);
+                            .insert(Rc::as_ptr(list) as usize, *key << 8 | index);
                         index = (index + 1).min(255);
                     });
                 }
@@ -1865,10 +1865,7 @@ impl Config {
                 replaced.extend(self.chunks.drain(..).map(|(_, sheet)| sheet));
                 for start in (0..self.sorted.len()).step_by(128) {
                     let end = (start + 128).min(self.sorted.len());
-                    let next = self
-                        .sorted
-                        .get(end)
-                        .map_or(u64::MAX, |(_, key, _)| u64::from(*key));
+                    let next = self.sorted.get(end).map_or(u64::MAX, |(_, key, _)| *key);
                     self.chunks.push((next, chunk(&self.sorted[start..end])));
                 }
             } else {
@@ -1878,25 +1875,17 @@ impl Config {
                         .checked_sub(1)
                         .map_or(0, |previous| self.chunks[previous].0);
                     let high = self.chunks[index].0;
-                    let start = self
-                        .sorted
-                        .partition_point(|(_, key, _)| u64::from(*key) < low);
-                    let end = self
-                        .sorted
-                        .partition_point(|(_, key, _)| u64::from(*key) < high);
+                    let start = self.sorted.partition_point(|(_, key, _)| *key < low);
+                    let end = self.sorted.partition_point(|(_, key, _)| *key < high);
                     let range = &self.sorted[start..end];
-                    if new
-                        .range(low as u32..)
-                        .next()
-                        .is_none_or(|key| u64::from(*key) >= high)
-                    {
+                    if new.range(low..).next().is_none_or(|key| *key >= high) {
                         index += 1;
                         continue;
                     }
                     let parts = if range.len() > 256 {
                         let middle = range.len() / 2;
                         vec![
-                            (u64::from(range[middle].1), chunk(&range[..middle])),
+                            (range[middle].1, chunk(&range[..middle])),
                             (high, chunk(&range[middle..])),
                         ]
                     } else {
@@ -2563,17 +2552,33 @@ impl Config {
                     None if name == class => None,
                     None => return None,
                 };
+                let key = (index, value.map(str::to_owned), modifier.map(str::to_owned));
+                if let Some(body) = self.expanded.borrow().get(&key) {
+                    return body.clone();
+                }
                 // WARNING: `@apply` compiles classes again, so a utility that applies itself, or a long
                 // chain of them, would never end.
                 let expanding = self.expanding.borrow().len();
                 if expanding > 16 || self.expanding.borrow().contains(&index) {
+                    self.cut.set(true);
                     return None;
                 }
+                let outer = self.cut.replace(false);
                 self.expanding.borrow_mut().push(index);
                 let mut resolved = false;
-                let body = self.expand(body, value, modifier, &mut resolved, 0);
+                let body = self
+                    .expand(body, value, modifier, &mut resolved, 0)
+                    .filter(|_| value.is_none() || resolved);
                 self.expanding.borrow_mut().truncate(expanding);
-                (value.is_none() || resolved).then_some(body?)
+                if !self.cut.get() {
+                    let mut expanded = self.expanded.borrow_mut();
+                    if expanded.len() >= 4096 {
+                        expanded.clear();
+                    }
+                    expanded.insert(key, body.clone());
+                }
+                self.cut.set(outer || self.cut.get());
+                body
             })
     }
 
@@ -2589,7 +2594,18 @@ impl Config {
             return None;
         }
         let mut body = Body::default();
+        // WARNING: utilities that apply several others multiply their size with each level, so it is capped.
+        let mut size = 0;
+        let weigh = |pairs: &Pairs| {
+            pairs
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+        };
         for (prelude, block) in statements(source) {
+            if size > 1 << 16 {
+                return None;
+            }
             let Some(inner) = block else {
                 if let Some(classes) = prelude.strip_prefix("@apply") {
                     let mut compiled: Vec<_> = classes
@@ -2598,6 +2614,7 @@ impl Config {
                         .collect();
                     compiled.sort_unstable_by(|a, b| a.sort.cmp(&b.sort));
                     for (at, selector, pairs) in compiled.into_iter().flat_map(|c| c.rules) {
+                        size += weigh(&pairs) + selector.len();
                         if at.is_empty() && selector == "&" {
                             body.declarations.extend(pairs);
                         } else {
@@ -2648,17 +2665,23 @@ impl Config {
                 (Vec::new(), format!("& {prelude}"))
             };
             if !inner.declarations.is_empty() {
+                size += weigh(&inner.declarations) + selector.len();
                 body.nested
                     .push((at.clone(), selector.clone(), inner.declarations));
             }
             for (nested, template, pairs) in inner.nested {
+                size +=
+                    weigh(&pairs) + template.len() + template.matches('&').count() * selector.len();
+                if size > 1 << 16 {
+                    return None;
+                }
                 let mut rules = at.clone();
                 rules.extend(nested);
                 body.nested
                     .push((rules, template.replace('&', &selector), pairs));
             }
         }
-        Some(body)
+        (size <= 1 << 16).then_some(body)
     }
 
     fn resolve(&self, arguments: &str, value: &str) -> Option<String> {
@@ -5083,7 +5106,7 @@ fn css(rules: &[Nested]) -> String {
     css
 }
 
-fn chunk(utilities: &[(Sort, u32, Vec<Rule>)]) -> Rc<Stylesheet> {
+fn chunk(utilities: &[(Sort, u64, Vec<Rule>)]) -> Rc<Stylesheet> {
     let rules = utilities
         .iter()
         .flat_map(|(.., rules)| rules.iter().cloned())

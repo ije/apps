@@ -20,11 +20,22 @@
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
   // WARNING: `stale` marks writes since the last layout, so the next geometry read lays the page out first, like a browser's forced reflow.
   let stale = false, version = 0;
+  // WARNING: counts the `<base>` and `<title>` records ever made, so pages without them never walk the tree for their base URL or title.
+  const rare = { base: 0, title: 0 };
+  let retrying = false;
   const flush = () => {
     if (!size) return;
     let errors;
-    try { errors = host('dom.batch', texts.join(''), codes, size); } catch (error) { errors = [error.message]; } finally { size = 0; texts.length = 0; }
-    if (errors) for (const error of errors) console.error('DOM: ' + error);
+    try { errors = host('dom.batch', texts.join(''), codes, size); }
+    catch (error) {
+      // WARNING: a busy host applied nothing, so the writes stay queued and go again later. Other failures mean the page is gone.
+      if (/Host is busy/.test(error?.message)) { if (!retrying) { retrying = true; setTimeout(() => { retrying = false; flush(); }); } return; }
+      errors = [error?.message];
+    }
+    size = 0; texts.length = 0;
+    if (!errors) return;
+    for (const error of errors) console.error('DOM: ' + error);
+    resync();
   };
   const drain = () => { scheduled = false; flush(); };
   // WARNING: queued strings are joined, so a part that ends in a lone high surrogate sends U+FFFD in its place, as it would alone; otherwise it pairs with the next part and the UTF-16 lengths stop matching.
@@ -63,17 +74,41 @@
     if (!names.has(tag)) { if (!/^[a-z0-9-]+$/i.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     if (!pool.length) pool = host('dom.reserve', reserve = Math.min(reserve * 2, 1024)).reverse();
     const id = pool.pop();
-    records[id] = new Record(id, tag, text); op(0, id, tag, text); return id;
+    records[id] = new Record(id, tag, text); op(0, id, tag, text); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
   };
   const load = list => {
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
-      if (end > i + 5) rec.attrs = new Attrs(list.slice(i + 5, end));
+      if (end > i + 5) { rec.attrs = new Attrs(list.slice(i + 5, end)); const id = rec.attrs.get('id'); if (id) idAdd(id, rec); }
+      if (rec.tag === 'base' || rec.tag === 'title') rare[rec.tag]++;
       i = end;
       if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; }
     }
   };
+  // WARNING: Rust skips a write that fails its checks, so after a failed batch the mirror reloads each tree it holds from Rust. Records stay the same objects, because wrappers point to them.
+  const resync = () => {
+    const lists = [], seen = new Set();
+    for (const rec of records) if (rec && !rec.up) try { lists.push(host('dom.tree', rec.id)); } catch {}
+    if (!lists.length) return;
+    for (const rec of records) if (rec?.kids.length) rec.kids = [];
+    ids.clear();
+    for (const list of lists) {
+      for (let i = 0; i < list.length;) {
+        const id = list[i], tag = list[i + 2], end = i + 5 + 2 * list[i + 4], up = i ? records[list[i + 1]] : null;
+        let rec = records[id];
+        if (rec?.tag !== tag) rec = records[id] = new Record(id, tag, list[i + 3]); else rec.text = list[i + 3];
+        if (rec.attrs) { rec.attrs = end > i + 5 ? new Attrs(list.slice(i + 5, end)) : noAttrs; const value = rec.attrs.get('id'); if (value) idAdd(value, rec); }
+        if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; seen.add(rec); }
+        i = end;
+      }
+    }
+    for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
+  };
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
+  // WARNING: an id maps to its record, or to a list of them when elements share it. Lookups check that a record is current and in the tree, so stale entries cost nothing.
+  const ids = new Map();
+  const idAdd = (id, rec) => { const at = ids.get(id); if (!at) ids.set(id, rec); else if (Array.isArray(at)) { if (!at.includes(rec)) at.push(rec); } else if (at !== rec) ids.set(id, [at, rec]); };
+  const idDrop = (id, rec) => { const at = ids.get(id); if (at === rec) ids.delete(id); else if (Array.isArray(at)) { const i = at.indexOf(rec); if (i >= 0) at.splice(i, 1); if (at.length === 1) ids.set(id, at[0]); } };
   const index = rec => { const kids = rec.up.kids; let i = rec.i; if (kids[i] !== rec) rec.i = i = kids[i + 1] === rec ? i + 1 : kids[i - 1] === rec ? i - 1 : kids.indexOf(rec); return i; };
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
@@ -83,7 +118,8 @@
   const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
   const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
-  const definitions=new Map(), definitionsWaiting=new Map();let constructing=null;
+  const definitions = new Map(), defined = new WeakMap(), definitionsWaiting = new Map();
+  let constructing = null;
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
   let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
   const selectionPending = new Set();
@@ -93,7 +129,7 @@
     selectionPending.add(target);
     setTimeout(() => { selectionPending.delete(target); target.dispatchEvent(new Event('selectionchange', { bubbles: target !== document })); }, 0);
   };
-  const XHTML = 'http://www.w3.org/1999/xhtml';
+  const XHTML = 'http://www.w3.org/1999/xhtml', SVG = 'http://www.w3.org/2000/svg';
   const listOf = (Type, items) => Object.setPrototypeOf(items, Type.prototype);
   const quote = value => '"' + String(value).replace(/["\\]/g, '\\$&') + '"';
   const assignedSlot = (node, parent = node.parentNode) => {
@@ -163,7 +199,7 @@
     return false;
   };
   const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button|file)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
-  const group = radio => { const name = radio.name, form = radio.form; return name ? [...radio.getRootNode().querySelectorAll('input')].filter(other => other.type === 'radio' && other.name === name && other.form === form) : [radio]; };
+  const group = radio => { const name = radio.name, form = radio.form, root = radio.getRootNode(); return name && root !== radio ? [...root.querySelectorAll('input[name=' + quote(name) + ']')].filter(other => other.type === 'radio' && other.form === form) : [radio]; };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
     layout();
@@ -223,21 +259,47 @@
     for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
     return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (voids.test(rec.tag) ? '' : '</' + rec.tag + '>');
   };
-  // WARNING: custom element callbacks run in shadow-including tree order after the change, like CEReactions. A connected element with a definition that is not upgraded yet upgrades instead.
-  const reactions = (root, name) => {
-    const stack = [root];
+  // WARNING: like CEReactions, custom element reactions queue per element while a DOM call runs and run when the outermost call returns, each in its own try/catch, so a throwing callback can't stop the change that queued it. A DOM call from a callback runs the reactions it queued when it returns.
+  const reactionQueue = [];
+  let reactionDepth = 0, reactionStart = 0;
+  const report = error => { const event = Object.assign(new Event('error', { cancelable: true }), { error, message: String(error?.message ?? error) }); dispatch(globalThis, event); if (!event.defaultPrevented) console.error(error); };
+  const enqueue = (node, reaction) => { (node._reactions ??= []).push(reaction); reactionQueue.push(node); if (!reactionDepth) { reactionDepth++; leave(); } };
+  const leave = () => {
+    if (--reactionDepth || reactionQueue.length <= reactionStart) return;
+    const start = reactionStart;
+    for (let i = start; i < reactionQueue.length; i++) {
+      const node = reactionQueue[i], list = node._reactions;
+      while (list.length) {
+        const reaction = list.shift();
+        reactionStart = reactionQueue.length;
+        try { if (typeof reaction === 'function') upgrade(node, reaction); else node[reaction[0]]?.(...reaction.slice(1)); } catch (error) { report(error); }
+      }
+    }
+    reactionQueue.length = reactionStart = start;
+  };
+  const scoped = fn => function (...args) { reactionDepth++; try { return fn.apply(this, args); } finally { leave(); } };
+  // WARNING: walks in shadow-including tree order. A defined element that is not upgraded queues its upgrade instead, unless it leaves the document; without `name` only upgrades queue, and `only` limits them to one tag.
+  const reactions = (root, name, only) => {
+    const stack = [root], leaving = name === 'disconnectedCallback';
     while (stack.length) {
-      const rec = stack.pop(), Type = name === 'connectedCallback' && definitions.get(rec.tag), node = Type ? of(rec) : rec.ref?.deref();
-      if (Type && !(node instanceof Type)) upgrade(node, Type);
-      else if (node) { if (name === 'connectedMoveCallback' && !node[name]) { node.disconnectedCallback?.(); node.connectedCallback?.(); } else node[name]?.(); }
+      const rec = stack.pop(), Type = (!only || rec.tag === only) && definitions.get(rec.tag), node = Type && (leaving ? rec.ref?.deref() : of(rec));
+      if (node && !node._failed) {
+        if (!(node instanceof Type)) { if (!leaving) enqueue(node, Type); }
+        else if (name === 'connectedMoveCallback' && typeof node[name] !== 'function') { enqueue(node, ['disconnectedCallback']); enqueue(node, ['connectedCallback']); }
+        else if (name && typeof node[name] === 'function') enqueue(node, [name]);
+      }
       if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]);
       if (rec.shadow) stack.push(rec.shadow);
     }
   };
+  // WARNING: an upgrade that throws leaves the element failed for good, as in browsers. Its callbacks go to the end of its own queue, which the running `leave` drains next.
   const upgrade = (node, Type) => {
-    constructing = { node }; try { new Type(); } catch (error) { console.error(error); return; } finally { constructing = null; }
-    for (const attr of Type.observedAttributes ?? []) if (node.hasAttribute(attr)) node.attributeChangedCallback?.(attr, null, node.getAttribute(attr));
-    if (node.isConnected) node.connectedCallback?.();
+    if (node instanceof Type || node._failed) return;
+    constructing = { node };
+    try { new Type(); } catch (error) { node._failed = true; node._reactions.length = 0; throw error; } finally { constructing = null; }
+    const observed = defined.get(Type)?.observed;
+    if (observed?.size) for (const [name, value] of node._m.attrs) if (observed.has(name)) node._reactions.push(['attributeChangedCallback', name, null, value]);
+    if (node.isConnected) node._reactions.push(['connectedCallback']);
   };
   const slotChanges = new Set();
   const queueSlot = slot => { if (!slotChanges.size) queueMicrotask(() => { const slots = [...slotChanges]; slotChanges.clear(); for (const slot of slots) dispatch(slot, new Event('slotchange', { bubbles: true })); }); slotChanges.add(slot); };
@@ -253,14 +315,43 @@
     if (self) test(rec);
     find(rec, test);
   };
-  // WARNING: ranges are live, so every mutation moves their boundary points; dead ranges leave the set when a walk meets them.
-  const ranges = new Set();
+  // WARNING: ranges are live, so mutations move their boundary points. Garbage ranges stay until a GC, so ranges are indexed by the records of their boundary containers and a mutation visits only the ranges at the nodes it touches. Dead ranges leave when a visit or a sweep meets them.
+  const anchors = new Map();
   let rangeSync = false;
-  const live = fn => { for (const ref of ranges) { const range = ref.deref(); if (!range) { ranges.delete(ref); continue; } if (fn(range) && selection?.ranges[0] === range && !rangeSync) { rangeSync = true; queueMicrotask(() => { rangeSync = false; if (selection.ranges[0]?.startContainer.isConnected) selection._setRange(selection.ranges[0], selection.direction, true); }); } } };
-  const moved = (range, side, test, node, offset) => { const key = side + 'Container', at = side + 'Offset'; if (!test(range[key], range[at])) return false; range[key] = node; range[at] = offset(range[at]); return true; };
-  const rangesRemove = (parent, child, index) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, node => child.contains(node), parent, () => index) || moved(range, side, (node, at) => node === parent && at > index, parent, at => at - 1)).includes(true)); };
-  const rangesInsert = (parent, index, count) => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, at) => node === parent && at > index, parent, at => at + count)).includes(true)); };
-  const rangesClear = node => { if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (other, at) => other === node ? at > 0 : node.contains(other), node, () => 0)).includes(true)); };
+  const place = (range, start, node, offset) => {
+    const old = start ? range._sc : range._ec;
+    if (start) { range._sc = node; range._so = offset; } else { range._ec = node; range._eo = offset; }
+    if (old === node) return;
+    const set = old !== range._sc && old !== range._ec && anchors.get(old._m);
+    if (set) { set.delete(range._ref); if (!set.size) anchors.delete(old._m); }
+    let own = anchors.get(node._m); if (!own) anchors.set(node._m, own = new Set()); own.add(range._ref);
+  };
+  const each = (rec, fn) => {
+    const set = anchors.get(rec);
+    if (!set) return;
+    for (const ref of set) {
+      const range = ref.deref();
+      if (!range) { set.delete(ref); continue; }
+      if (fn(range) && selection?.ranges[0] === range && !rangeSync) { rangeSync = true; queueMicrotask(() => { rangeSync = false; if (selection.ranges[0]?.startContainer.isConnected) selection._setRange(selection.ranges[0], selection.direction, true); }); }
+    }
+    if (!set.size) anchors.delete(rec);
+  };
+  // WARNING: visits the ranges at `root` and below it, through the index while it is short and through the subtree otherwise.
+  const inside = (root, fn) => {
+    if (anchors.size <= 32) { for (const rec of anchors.keys()) { let up = rec; while (up && up !== root) up = up.up; if (up) each(rec, range => fn(range, rec)); } return; }
+    const stack = [root];
+    while (stack.length) { const rec = stack.pop(); if (anchors.has(rec)) each(rec, range => fn(range, rec)); for (const kid of rec.kids) stack.push(kid); }
+  };
+  const shift = (range, rec, test, node, to) => {
+    let moved = false;
+    if (range._sc._m === rec && test(range._so)) { place(range, true, node, to(range._so)); moved = true; }
+    if (range._ec._m === rec && test(range._eo)) { place(range, false, node, to(range._eo)); moved = true; }
+    return moved;
+  };
+  const always = () => true;
+  const rangesRemove = (parent, child, index) => { if (!anchors.size) return; inside(child._m, (range, rec) => shift(range, rec, always, parent, () => index)); each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at - 1)); };
+  const rangesInsert = (parent, index, count) => { if (anchors.size) each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at + count)); };
+  const rangesClear = node => { if (anchors.size) inside(node._m, (range, rec) => shift(range, rec, rec === node._m ? at => at > 0 : always, node, () => 0)); };
   // WARNING: removing the focused element blurs it, and removing a pointer capture target releases the capture at the document, as in browsers.
   const forgetRemoved = () => {
     if (topLayer.length || dialogs.length) {
@@ -273,7 +364,7 @@
   };
   const ignore = () => {};
   // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it. A `replace` that inserts calls `removed` once the old children left both trees, so their disconnected callbacks run before re-inserted ones connect again.
-  const replaceAll = (node, replace) => {
+  const replaceAll = scoped((node, replace) => {
     const rec = node._m, observed = observers.size > 0;
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
     const connected = definitions.size > 0 && node.isConnected, old = rec.kids.length && (observed || connected) ? rec.kids.map(of) : [];
@@ -284,12 +375,12 @@
     forgetRemoved();
     if (shadows) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); slotsIn(node.getRootNode(), rec); }
     if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: node.childNodes });
-  };
+  });
   const convert = children => children.map(child => child instanceof Node ? child : document.createTextNode(String(child)));
   // WARNING: `before`, `after`, `prepend` and `replaceWith` move their nodes out before they insert them, so the reference is the first sibling that is not one of them.
   const viable = (node, nodes) => { while (node && nodes.includes(node)) node = node.nextSibling; return node; };
   // WARNING: like the DOM's "convert nodes into a node", several nodes leave their parents first and then insert with one record, which also lists a replaced node.
-  const insertNodes = (parent, nodes, before, replaced = null) => {
+  const insertNodes = scoped((parent, nodes, before, replaced = null) => {
     if (!observers.size || quiet || nodes.length < 2 && !replaced) {
       for (const node of nodes) parent.insertBefore(node, before);
       if (replaced && !nodes.includes(replaced) && replaced.parentNode === parent) parent.removeChild(replaced);
@@ -301,12 +392,21 @@
     quiet++;
     try { for (const node of nodes) parent.insertBefore(node, before); if (removed.length) parent.removeChild(replaced); } finally { quiet--; }
     if (nodes.length || removed.length) change({ type: 'childList', target: parent, addedNodes: listOf(NodeList, nodes), removedNodes: listOf(NodeList, removed), previousSibling, nextSibling: before });
-  };
-  const parseFragment = (source, context) => { const fragment = document.createDocumentFragment(); load(call('dom.html', fragment._id, String(source), context)); __appsImages(fragment); if (definitions.size) customElements.upgrade(fragment); return fragment; };
+  });
+  // WARNING: the parser knows only tag names, so an SVG context parses as `svg`, or as `body` when it is an HTML integration point. Without a context element the context is `body`.
+  const contextTag = node => !node ? 'body' : node.namespaceURI === SVG ? /^(foreignObject|desc|title)$/.test(node.localName) ? 'body' : 'svg' : node.localName === 'svg' ? 'body' : node.localName;
+  // WARNING: top-level elements of a fragment parsed for an SVG context are SVG unless they broke out of foreign content, so `wrap` reads `_svg` on their fragment.
+  const parseFragment = scoped((source, context) => {
+    const fragment = document.createDocumentFragment(), tag = contextTag(context);
+    if (tag === 'svg') fragment._svg = true;
+    load(call('dom.html', fragment._id, String(source), tag)); __appsImages(fragment);
+    if (definitions.size) reactions(fragment._m);
+    return fragment;
+  });
   const setHTML = (node, value, inert = false) => replaceAll(node, removed => {
-    const list = call('dom.html', node._id, String(value));
+    const list = node.nodeType === 1 ? call('dom.html', node._id, String(value), contextTag(node)) : call('dom.html', node._id, String(value));
     release(node); detach(node._m); load(list); removed();
-    if (!inert) { __appsImages(node); if (definitions.size) customElements.upgrade(node); }
+    if (!inert) { __appsImages(node); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
   });
   class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
   class NodeList extends List {}
@@ -331,8 +431,9 @@
     get length() { return tokens(this).length; }
     item(index) { return tokens(this)[index] ?? null; }
     contains(value) { return tokens(this).includes(String(value)); }
-    add(...values) { const list = tokens(this).slice(); for (const value of values.map(token)) if (!list.includes(value)) list.push(value); this.value = list.join(' '); }
-    remove(...values) { values = values.map(token); this.value = tokens(this).filter(value => !values.includes(value)).join(' '); }
+    // WARNING: like the DOM's update steps, an empty set doesn't add a missing attribute.
+    add(...values) { const list = tokens(this).slice(); for (const value of values.map(token)) if (!list.includes(value)) list.push(value); if (list.length || this._element.hasAttribute(this._name)) this.value = list.join(' '); }
+    remove(...values) { values = values.map(token); const list = tokens(this).filter(value => !values.includes(value)); if (list.length || this._element.hasAttribute(this._name)) this.value = list.join(' '); }
     toggle(value, force) { value = token(value); const add = force === undefined ? !this.contains(value) : !!force; if (add) this.add(value); else this.remove(value); return add; }
     replace(old, value) { old = token(old); value = token(value); const list = tokens(this).slice(), index = list.indexOf(old); if (index < 0) return false; list[index] = value; this.value = [...new Set(list)].join(' '); return true; }
     supports() { return true; }
@@ -378,7 +479,7 @@
       for (let up = rec; up; up = up.up ?? up.host) if (up === kid) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
       const observed = observers.size > 0 && !quiet, connected = definitions.size > 0 && child.isConnected, parented = !!kid.up;
       let removal = null;
-      if (kid.up && (observed || shadows || ranges.size)) {
+      if (kid.up && (observed || shadows || anchors.size)) {
         const from = of(kid.up);
         if (observed) removal = { type: 'childList', target: from, removedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling };
         if (from._shadow) signal(from, child);
@@ -426,7 +527,7 @@
     hasChildNodes() { return this._m.kids.length > 0; }
     contains(node) { for (let rec = node?._m; rec; rec = rec.up) if (rec === this._m) return true; return false; }
     getRootNode(options = {}) { let rec = this._m; while (rec.up ?? (options.composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
-    cloneNode(deep = false) { const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : document.createElementNS(this.namespaceURI, this.localName); if (this.attributes) for (const attr of this.attributes) cloned.setAttribute(attr.name, attr.value); if (deep) for (const child of this.childNodes) cloned.appendChild(child.cloneNode(true)); return cloned; }
+    cloneNode(deep = false) { const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this.localName); if (this.nodeType === 1) for (const [name, value] of this._m.attrs) cloned.setAttribute(name, value); if (deep) for (const child of this.childNodes) cloned.appendChild(child.cloneNode(true)); const Type = this.nodeType === 1 && definitions.get(cloned.localName); if (Type) enqueue(cloned, Type); return cloned; }
     isSameNode(other) { return this === other; }
     isEqualNode(other) { return other?.nodeType === this.nodeType && serialize(this._m) === serialize(other._m); }
     compareDocumentPosition(other) { if (this === other) return 0; const [a, b] = [this._m, other._m].map(rec => { const chain = []; for (; rec; rec = rec.up) chain.push(rec); return chain.reverse(); }); if (a[0] !== b[0]) return 1 | 32; let i = 0; while (a[i] && a[i] === b[i]) i++; if (i === a.length) return 4 | 16; if (i === b.length) return 2 | 8; return index(a[i]) < index(b[i]) ? 4 : 2; }
@@ -449,7 +550,7 @@
       if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError');
       count = Math.min(count >>> 0, value.length - offset);
       rec.text = value.slice(0, offset) + data + value.slice(offset + count); op(1, this._id, rec.text);
-      if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, at) => node === this && at > offset && at <= offset + count, this, () => offset) || moved(range, side, (node, at) => node === this && at > offset + count, this, at => at + data.length - count)).includes(true));
+      if (anchors.size) each(rec, range => shift(range, rec, at => at > offset && at <= offset + count, this, () => offset) | shift(range, rec, at => at > offset + count, this, at => at + data.length - count));
       if (observers.size) change({ type: 'characterData', target: this, oldValue: value });
     }
   }
@@ -462,7 +563,7 @@
       if (parent) {
         parent.insertBefore(other, this.nextSibling);
         const at = index(this._m);
-        if (ranges.size) live(range => ['start', 'end'].map(side => moved(range, side, (node, o) => node === this && o > offset, other, o => o - offset) || moved(range, side, (node, o) => node === parent && o === at + 1, parent, o => o + 1)).includes(true));
+        if (anchors.size) { each(this._m, range => shift(range, this._m, o => o > offset, other, o => o - offset)); each(parent._m, range => shift(range, parent._m, o => o === at + 1, parent, o => o + 1)); }
       }
       this.replaceData(offset, value.length - offset, '');
       return other;
@@ -577,7 +678,7 @@
   const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
   const datasetOwner = Symbol(), datasetHandler = { get: (target, name) => target[datasetOwner].getAttribute('data-' + cssName(name)) ?? undefined, set: (target, name, value) => { target[datasetOwner].setAttribute('data-' + cssName(name), value); return true; }, has: (target, name) => typeof name === 'string' && target[datasetOwner].hasAttribute('data-' + cssName(name)), deleteProperty: (target, name) => { target[datasetOwner].removeAttribute('data-' + cssName(name)); return true; }, ownKeys: target => target[datasetOwner].getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) };
   class Element extends Node {
-    constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??[...definitions].find(([,ctor])=>ctor===new.target)?.[0];if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; }
+    constructor(id, tag) { if(id===undefined){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??defined.get(new.target)?.name;if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; }
     get attributes() { const attrs = listOf(NamedNodeMap, Array.from(this._m.attrs, ([name, value]) => new Attr(this, name, value))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
     getAttributeNames() { return [...this._m.attrs.keys()]; }
     hasAttributes() { return this._m.attrs.size > 0; }
@@ -591,9 +692,9 @@
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, watched = this.constructor.observedAttributes?.includes(name), oldValue = attrs.get(name) ?? null; if (value !== oldValue || name === 'style') op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if(watched)this.attributeChangedCallback?.(name,oldValue,value); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover')) attributeChanged(this, name, oldValue, value); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (value !== oldValue) op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if (name === 'id' && value !== oldValue) { if (oldValue !== null) idDrop(oldValue, this._m); idAdd(value, this._m); } if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, value); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover')) attributeChanged(this, name, oldValue, value); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if(this.constructor.observedAttributes?.includes(name))this.attributeChangedCallback?.(name,oldValue,null); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (name === 'slot' || name === 'name' || name === 'open' || name === 'popover') attributeChanged(this, name, oldValue, null); }
+    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if (name === 'id') idDrop(oldValue, this._m); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, null); if (name === 'slot' || name === 'name' || name === 'open' || name === 'popover') attributeChanged(this, name, oldValue, null); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
     getAttributeNode(name) { name = attrName(this, name); return this._m.attrs.has(name) ? new Attr(this, name, this._m.attrs.get(name)) : null; }
@@ -603,11 +704,11 @@
     get innerHTML() { return this._m.kids.map(serialize).join('') || own(this._m); }
     set innerHTML(value) { setHTML(this, value); }
     get outerHTML() { return serialize(this._m); }
-    set outerHTML(value) { const parent = this.parentNode; if (!parent) return; if (parent.nodeType === 9) throw new DOMException('Cannot replace the document element', 'NoModificationAllowedError'); this.replaceWith(parseFragment(value, parent.nodeType === 1 ? parent.localName : 'body')); }
+    set outerHTML(value) { const parent = this.parentNode; if (!parent) return; if (parent.nodeType === 9) throw new DOMException('Cannot replace the document element', 'NoModificationAllowedError'); reactionDepth++; try { this.replaceWith(parseFragment(value, parent.nodeType === 1 ? parent : null)); } finally { leave(); } }
     get innerText() { return slot(this) < 0 ? this.textContent : call('dom.innerText', this._id); }
     set innerText(value) { const parts = String(value ?? '').split(/\r\n|\r|\n/); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); }); quiet++; try { parts.forEach((part, index) => { if (index) this.append(document.createElement('br')); if (part) this.append(part); }); } finally { quiet--; } if (observers.size && this._m.kids.length) change({ type: 'childList', target: this, addedNodes: this.childNodes }); }
     matches(selector) { return selectors('dom.matches', this._id, selector); }
-    closest(selector) { for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node; return null; }
+    closest(selector) { return wrap(selectors('dom.closest', this._id, selector)); }
     getBoundingClientRect() { const i = slot(this), m = geometry; return i < 0 ? new DOMRect() : new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]); }
     getClientRects() { return slot(this) < 0 ? listOf(DOMRectList, []) : listOf(DOMRectList, [this.getBoundingClientRect()]); }
     get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
@@ -666,8 +767,11 @@
     releasePointerCapture(id) { if (captures.get(id) === this) { captures.delete(id); dispatch(this, new PointerEvent('lostpointercapture', { pointerId: id, bubbles: true, composed: true })); } }
     insertAdjacentElement(position, node) { position = String(position).toLowerCase(); if (position === 'beforebegin' || position === 'afterend') { if (!this.parentNode) return null; if (position === 'beforebegin') this.before(node); else this.after(node); } else if (position === 'afterbegin') this.prepend(node); else if (position === 'beforeend') this.append(node); else throw new DOMException('Invalid insertion position', 'SyntaxError'); return node; }
     insertAdjacentText(position, text) { this.insertAdjacentElement(position, document.createTextNode(String(text))); }
-    insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.insertAdjacentElement(position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context.localName : 'body')); }
+    insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.insertAdjacentElement(position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context : null)); }
   }
+  // WARNING: these DOM calls are reaction scopes, see `leave`.
+  for (const [Type, names] of [[Node, ['insertBefore', 'removeChild', 'replaceChild', 'cloneNode']], [Element, ['setAttribute', 'removeAttribute', 'insertAdjacentHTML']]]) for (const name of names) { const fn = Type.prototype[name]; Type.prototype[name] = { [name](a, b) { reactionDepth++; try { return fn.call(this, a, b); } finally { leave(); } } }[name]; }
+  const attributeReaction = (node, name, oldValue, value) => { const Type = definitions.get(node._m.tag); if (Type && node instanceof Type && !node._failed && defined.get(Type).observed.has(name)) enqueue(node, ['attributeChangedCallback', name, oldValue, value]); };
   class HTMLElement extends Element {
     get offsetWidth() { return Math.round(metric(this, 2)); } get offsetHeight() { return Math.round(metric(this, 3)); }
     get offsetParent() {
@@ -681,7 +785,7 @@
     get offsetLeft() { return offset(this, 0); }
     get offsetTop() { return offset(this, 1); }
   }
-  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI='http://www.w3.org/2000/svg';this.nodeName=this.tagName=tag;}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
+  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI=SVG;this.nodeName=this.tagName=tag;}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
   class SVGSVGElement extends SVGElement {}
   for (const attr of ['title','name','type','placeholder','dir','lang','slot']) Object.defineProperty(Element.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
   for (const name of ['role','ariaAtomic','ariaAutoComplete','ariaBrailleLabel','ariaBrailleRoleDescription','ariaBusy','ariaChecked','ariaColCount','ariaColIndex','ariaColIndexText','ariaColSpan','ariaCurrent','ariaDescription','ariaDisabled','ariaExpanded','ariaHasPopup','ariaHidden','ariaInvalid','ariaKeyShortcuts','ariaLabel','ariaLevel','ariaLive','ariaModal','ariaMultiLine','ariaMultiSelectable','ariaOrientation','ariaPlaceholder','ariaPosInSet','ariaPressed','ariaReadOnly','ariaRelevant','ariaRequired','ariaRoleDescription','ariaRowCount','ariaRowIndex','ariaRowIndexText','ariaRowSpan','ariaSelected','ariaSetSize','ariaSort','ariaValueMax','ariaValueMin','ariaValueNow','ariaValueText']) {
@@ -751,7 +855,13 @@
     checkValidity() { if (!candidate(this) || validity(this).valid) return true; dispatch(this, new Event('invalid', { cancelable: true })); return false; },
     reportValidity() { if (this.checkValidity()) return true; this.focus(); return false; },
     get form() { return formOf(this); },
-    get labels() { const result = []; find(document._m, rec => { if (rec.tag === 'label' && labelControl(of(rec)) === this) result.push(of(rec)); return false; }); return listOf(NodeList, result); },
+    // WARNING: a label names its control by `for` or contains it, so only labels with this id and the ancestors are candidates.
+    get labels() {
+      const result = [], root = this.getRootNode(), id = this.getAttribute('id');
+      if (id && root.querySelectorAll) for (const label of root.querySelectorAll('label[for=' + quote(id) + ']')) if (labelControl(label) === this) result.push(label);
+      for (let rec = this._m.up; rec; rec = rec.up) if (rec.tag === 'label' && !rec.attrs.has('for') && labelControl(of(rec)) === this) result.push(of(rec));
+      return listOf(NodeList, result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1));
+    },
     get name() { return this.getAttribute('name') ?? ''; }, set name(value) { this.setAttribute('name', value); },
   };
   class HTMLInputElement extends HTMLElement {
@@ -866,7 +976,14 @@
     if (allowed && (submitter?.getAttribute('formmethod') ?? form.method) === 'dialog') form.closest('dialog')?.close(submitter?.value);
   };
   class HTMLFormElement extends HTMLElement {
-    get elements() { const id = this.id, result = []; find(document._m, rec => { if (listed.test(rec.tag) && !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && of(rec).form === this) result.push(of(rec)); return false; }); if (!this.isConnected || !id) find(this._m, rec => { if (listed.test(rec.tag) && !result.includes(of(rec)) && of(rec).form === this) result.push(of(rec)); return false; }); const list = listOf(HTMLFormControlsCollection, result); for (const control of result) for (const key of [control.id, control.getAttribute('name')]) if (key && !(key in list)) list[key] = control; return list; }
+    // WARNING: controls outside the form name it with their `form` attribute, so only the form's subtree and those controls are walked.
+    get elements() {
+      const id = this.getAttribute('id'), root = this.getRootNode(), result = [], control = rec => listed.test(rec.tag) && !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && of(rec).form === this;
+      find(this._m, rec => { if (control(rec)) result.push(of(rec)); return false; });
+      const outside = id && root !== this && root.querySelectorAll ? [...root.querySelectorAll('[form=' + quote(id) + ']')].filter(node => !this.contains(node) && control(node._m)) : [];
+      if (outside.length) { result.push(...outside); result.sort((a, b) => a.compareDocumentPosition(b) & 4 ? -1 : 1); }
+      const list = listOf(HTMLFormControlsCollection, result); for (const control of result) for (const key of [control.id, control.getAttribute('name')]) if (key && !(key in list)) list[key] = control; return list;
+    }
     get length() { return this.elements.length; }
     get method() { const value = (this.getAttribute('method') ?? '').toLowerCase(); return value === 'post' || value === 'dialog' ? value : 'get'; } set method(value) { this.setAttribute('method', value); }
     get action() { const value = this.getAttribute('action'); return value ? resolved(value) : document.URL; } set action(value) { this.setAttribute('action', value); }
@@ -1090,7 +1207,7 @@
     get complete() { return !this.src || !!this._complete; }
     setAttribute(name,value) { super.setAttribute(name,value); if (name === 'src') this._loadImage(); }
     _loadImage() {
-      const source = this.src, load = this._load = {}, current = () => this._load === load && this.src === source; this._complete = false;
+      const raw = this.getAttribute('src'), source = this.src, load = this._load = {}, current = () => this._load === load && this.getAttribute('src') === raw; this._complete = false;
       this._loading = (async () => {
         const data = await resource(source, 'Image');
         if (!current()) return;
@@ -1428,7 +1545,22 @@
     get fullscreenElement() { for (let node = fullscreens.at(-1); node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
     get styleSheets() { return styleSheetsOf(this); }
   }
-  const customElements={define(name,Type){if(!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name)||definitions.has(name)||[...definitions.values()].includes(Type))throw new DOMException('Invalid custom element definition','NotSupportedError');definitions.set(name,Type);this.upgrade(document);for(const resolve of definitionsWaiting.get(name)??[])resolve(Type);definitionsWaiting.delete(name);},get(name){return definitions.get(name);},getName(Type){return [...definitions].find(([,ctor])=>ctor===Type)?.[0]??null;},whenDefined(name){if(definitions.has(name))return Promise.resolve(definitions.get(name));return new Promise(resolve=>{const pending=definitionsWaiting.get(name)??[];pending.push(resolve);definitionsWaiting.set(name,pending);});},upgrade(root){const stack=[root._m];while(stack.length){const rec=stack.pop(),Type=definitions.get(rec.tag),node=Type&&of(rec);if(Type&&!(node instanceof Type))upgrade(node,Type);if(rec.tag!=='template')for(let i=rec.kids.length;i--;)stack.push(rec.kids[i]);if(rec.shadow)stack.push(rec.shadow);}}};
+  // WARNING: `define` resolves `whenDefined` before the upgrades it queued run, so a throwing upgrade can't leave it pending.
+  const customElements = {
+    define: scoped((name, Type) => {
+      if (typeof Type !== 'function') throw new TypeError('Expected a constructor');
+      if (!/^[a-z][a-z0-9._-]*-[a-z0-9._-]+$/.test(name) || definitions.has(name) || defined.has(Type)) throw new DOMException('Invalid custom element definition', 'NotSupportedError');
+      const observed = new Set(typeof Type.prototype.attributeChangedCallback === 'function' ? Array.from(Type.observedAttributes ?? [], String) : []);
+      definitions.set(name, Type); defined.set(Type, { name, observed });
+      reactions(document._m, undefined, name);
+      for (const resolve of definitionsWaiting.get(name) ?? []) resolve(Type);
+      definitionsWaiting.delete(name);
+    }),
+    get(name) { return definitions.get(name); },
+    getName(Type) { return defined.get(Type)?.name ?? null; },
+    whenDefined(name) { if (definitions.has(name)) return Promise.resolve(definitions.get(name)); return new Promise(resolve => { const pending = definitionsWaiting.get(name) ?? []; pending.push(resolve); definitionsWaiting.set(name, pending); }); },
+    upgrade: scoped(root => { if (definitions.size) reactions(root._m); }),
+  };
   const filterNode = (walker, node) => !(walker.whatToShow & (1 << (node.nodeType - 1))) ? 3 : walker.filter == null ? 1 : typeof walker.filter === 'function' ? walker.filter(node) : walker.filter.acceptNode(node);
   class TreeWalker {
     constructor(root, whatToShow = 0xffffffff, filter = null) { Object.assign(this, { root, whatToShow: whatToShow >>> 0, filter, currentNode: root }); }
@@ -1520,17 +1652,36 @@
     importNode(node, deep = false) { return node.cloneNode(deep); }
     adoptNode(node) { node.remove(); return node; }
     get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;(this.head??this.documentElement).append(style);sheet._owners.set(this,style);}}
-    getElementById(id) { id = String(id); return id ? find(this._m, rec => rec.attrs?.get('id') === id) : null; }
+    getElementById(id) {
+      id = String(id);
+      const at = id && ids.get(id), root = this._m;
+      if (!at) return null;
+      const inside = rec => { if (records[rec.id] !== rec || rec.attrs?.get('id') !== id) return false; for (let up = rec.up; up; up = up.up) { if (up === root) return true; if (up.tag === 'template') return false; } return false; };
+      if (!Array.isArray(at)) return inside(at) ? of(at) : null;
+      const found = at.filter(inside);
+      return found.length < 2 ? of(found[0]) : find(root, rec => rec.attrs?.get('id') === id);
+    }
     getElementsByName(name) { return this.querySelectorAll('[name=' + quote(name) + ']'); }
-    get body() { return find(this._m, rec => rec.tag === 'body'); } get head() { return find(this._m, rec => rec.tag === 'head'); } get documentElement() { return find(this._m, rec => rec.tag === 'html'); }
+    get body() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'body' || rec.tag === 'frameset')) : null; }
+    get head() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'head')) : null; }
+    get documentElement() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
     get activeElement() { let node = active; while (node && node.getRootNode() !== this) node = node.getRootNode().host ?? null; return node ?? this.body ?? this.documentElement; } get defaultView() { return globalThis; }
-    get baseURI() { const base = find(this._m, rec => rec.tag === 'base' && rec.attrs.has('href')); try { return base ? new URL(base.getAttribute('href'), location.href).href : location.href; } catch { return location.href; } }
+    get baseURI() {
+      const href = location.href;
+      if (!rare.base) return href;
+      if (this._baseAt !== version || this._baseFrom !== href) {
+        const base = find(this._m, rec => rec.tag === 'base' && rec.attrs.has('href'));
+        this._baseAt = version; this._baseFrom = href;
+        try { this._base = base ? new URL(base.getAttribute('href'), href).href : href; } catch { this._base = href; }
+      }
+      return this._base;
+    }
     get URL() { return location.href; } get documentURI() { return location.href; } get location() { return this === document ? location : null; }
     get characterSet() { return 'UTF-8'; } get contentType() { return 'text/html'; } get scrollingElement() { return this.documentElement; }
     get readyState() { return this === document ? readyState : 'complete'; } get currentScript() { return this === document ? currentScript : null; } get compatMode() { return (this._quirks ??= quirks(this.doctype)) ? 'BackCompat' : 'CSS1Compat'; } get doctype() { return of(this._m.kids.find(rec => rec.tag === '#doctype')); } get visibilityState() { return 'visible'; } get hidden() { return false; }
-    get title() { return (find(this._m, rec => rec.tag === 'title')?.textContent ?? '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
+    get title() { return (rare.title && find(this._m, rec => rec.tag === 'title')?.textContent || '').replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, ''); }
     set title(value) {
-      let title = find(this._m, rec => rec.tag === 'title');
+      let title = rare.title ? find(this._m, rec => rec.tag === 'title') : null;
       if (!title) {
         let head = this.head;
         if (!head) { head = this.createElement('head'); (this.documentElement ?? this).prepend(head); }
@@ -1563,7 +1714,7 @@
     append(...children) { insertNodes(this, convert(children), null); }
     prepend(...children) { const nodes = convert(children), before = viable(this.firstChild, nodes); insertNodes(this, nodes, before); }
     replaceChildren(...children) { const nodes = convert(children); replaceAll(this, removed => { release(this); detach(this._m); op(1, this._id, ''); removed(); quiet++; try { for (const node of nodes) this.insertBefore(node, null); } finally { quiet--; } }); }
-    moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); moving = true; try { this.insertBefore(node, child); } finally { moving = false; } }
+    moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); reactionDepth++; moving = true; try { this.insertBefore(node, child); } finally { moving = false; leave(); } }
     querySelector(selector) { return wrap(selectors('dom.queryWithin', this._id, selector, true)); }
     querySelectorAll(selector) { return listOf(NodeList, selectors('dom.queryWithin', this._id, selector).map(wrap)); }
     getElementsByTagName(name) { name = String(name); const lower = name.toLowerCase(), result = []; find(this._m, rec => { if (rec.tag[0] !== '#' && (name === '*' || rec.tag === lower || rec.tag === name)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); }
@@ -1575,66 +1726,101 @@
   class DOMParser {
     parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(call('dom.html',doc._id,String(source)));return doc;}
   }
-  const comparePoints=(a,start,b,end)=>{if(a===b)return Math.sign(start-end);if(a.contains(b)){let child=b;while(child.parentNode!==a)child=child.parentNode;return start<=a.childNodes.indexOf(child)?-1:1;}if(b.contains(a))return -comparePoints(b,end,a,start);return a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1;};
+  // WARNING: compares boundary points through records, so it costs the depth of the tree and builds no child lists.
+  const comparePoints = (a, start, b, end) => {
+    if (a === b) return Math.sign(start - end);
+    const ra = a._m, rb = b._m;
+    for (let child = rb; child.up; child = child.up) if (child.up === ra) return start <= index(child) ? -1 : 1;
+    for (let child = ra; child.up; child = child.up) if (child.up === rb) return index(child) < end ? -1 : 1;
+    return a.compareDocumentPosition(b) & 4 ? -1 : 1;
+  };
   const rangeNodes=range=>call('dom.rangeNodes',range.startContainer._id,range.startOffset,range.endContainer._id,range.endOffset).map(([id,start,end])=>({node:wrap(id),start,end}));
   const textPoint=(root,offset)=>{const [id,index]=call('dom.textPoint',root._id,offset);return [wrap(id),index];};
   const textOffset=(root,node,offset)=>call('dom.textOffset',root._id,node?._id,offset);
+  const characterData = node => node.nodeType === 3 || node.nodeType === 8;
   class Range {
-    constructor() { this.startContainer = this.endContainer = document; this.startOffset = this.endOffset = 0; ranges.add(new WeakRef(this)); }
-    get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
-    get commonAncestorContainer() { return path(this.startContainer).find(node => node.contains(this.endContainer)) ?? document; }
+    constructor() { this._ref = new WeakRef(this); this._sc = this._ec = document; this._so = this._eo = 0; }
+    get startContainer() { return this._sc; } get startOffset() { return this._so; } get endContainer() { return this._ec; } get endOffset() { return this._eo; }
+    get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+    get commonAncestorContainer() { const ends = new Set(); for (let rec = this._ec._m; rec; rec = rec.up) ends.add(rec); for (let rec = this._sc._m; rec; rec = rec.up) if (ends.has(rec)) return of(rec); return document; }
     setStart(node, offset) {
       offset = Number(offset) >>> 0;
-      if (offset > (node.nodeType === 3 || node.nodeType === 8 ? node.length : node.childNodes.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
-      if (node.getRootNode() !== this.endContainer.getRootNode() || comparePoints(node, offset, this.endContainer, this.endOffset) > 0) { this.endContainer = node; this.endOffset = offset; }
-      this.startContainer = node; this.startOffset = offset;
+      if (offset > (characterData(node) ? node.length : node._m.kids.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
+      if (node.getRootNode() !== this._ec.getRootNode() || comparePoints(node, offset, this._ec, this._eo) > 0) place(this, false, node, offset);
+      place(this, true, node, offset);
       if (selection?.ranges[0] === this) selection._setRange(this, selection.direction, true);
     }
     setEnd(node, offset) {
       offset = Number(offset) >>> 0;
-      if (offset > (node.nodeType === 3 || node.nodeType === 8 ? node.length : node.childNodes.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
-      if (node.getRootNode() !== this.startContainer.getRootNode() || comparePoints(node, offset, this.startContainer, this.startOffset) < 0) { this.startContainer = node; this.startOffset = offset; }
-      this.endContainer = node; this.endOffset = offset;
+      if (offset > (characterData(node) ? node.length : node._m.kids.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
+      if (node.getRootNode() !== this._sc.getRootNode() || comparePoints(node, offset, this._sc, this._so) < 0) place(this, true, node, offset);
+      place(this, false, node, offset);
       if (selection?.ranges[0] === this) selection._setRange(this, selection.direction, true);
     }
-    setStartBefore(node) { this.setStart(node.parentNode, node.parentNode.childNodes.indexOf(node)); } setStartAfter(node) { this.setStart(node.parentNode, node.parentNode.childNodes.indexOf(node) + 1); }
-    setEndBefore(node) { this.setEnd(node.parentNode, node.parentNode.childNodes.indexOf(node)); } setEndAfter(node) { this.setEnd(node.parentNode, node.parentNode.childNodes.indexOf(node) + 1); }
+    setStartBefore(node) { this.setStart(node.parentNode, index(node._m)); } setStartAfter(node) { this.setStart(node.parentNode, index(node._m) + 1); }
+    setEndBefore(node) { this.setEnd(node.parentNode, index(node._m)); } setEndAfter(node) { this.setEnd(node.parentNode, index(node._m) + 1); }
     selectNode(node) { this.setStartBefore(node); this.setEndAfter(node); }
-    selectNodeContents(node) { this.setStart(node, 0); this.setEnd(node, node.nodeType === 3 ? node.length : node.childNodes.length); }
-    collapse(start = false) { if (start) this.setEnd(this.startContainer, this.startOffset); else this.setStart(this.endContainer, this.endOffset); }
-    cloneRange() { const range = new Range(); Object.assign(range, this); return range; }
-    toString() { if (this.startContainer === this.endContainer && this.startContainer.nodeType === 3) return this.startContainer.data.slice(this.startOffset, this.endOffset); return this.cloneContents().textContent; }
-    cloneContents() {const fragment=document.createDocumentFragment(),range=this;const copy=(node,parent)=>{if(node.nodeType===3){const start=node===range.startContainer?range.startOffset:0,end=node===range.endContainer?range.endOffset:node.length;if(comparePoints(node,end,range.startContainer,range.startOffset)>0&&comparePoints(node,start,range.endContainer,range.endOffset)<0)parent.append(document.createTextNode(node.data.slice(start,end)));return;}for(const child of node.childNodes){const index=node.childNodes.indexOf(child);if(comparePoints(node,index,range.startContainer,range.startOffset)>=0&&comparePoints(node,index+1,range.endContainer,range.endOffset)<=0)parent.append(child.cloneNode(true));else if(comparePoints(node,index+1,range.startContainer,range.startOffset)>0&&comparePoints(node,index,range.endContainer,range.endOffset)<0){if(child.nodeType===3)copy(child,parent);else{const clone=child.cloneNode(false);copy(child,clone);parent.append(clone);}}}};if(!this.collapsed)copy(this.commonAncestorContainer,fragment);return fragment;}
+    selectNodeContents(node) { this.setStart(node, 0); this.setEnd(node, characterData(node) ? node.length : node._m.kids.length); }
+    collapse(start = false) { if (start) this.setEnd(this._sc, this._so); else this.setStart(this._ec, this._eo); }
+    cloneRange() { const range = new Range(); place(range, true, this._sc, this._so); place(range, false, this._ec, this._eo); return range; }
+    toString() { if (this._sc === this._ec && this._sc.nodeType === 3) return this._sc.data.slice(this._so, this._eo); return this.cloneContents().textContent; }
+    // WARNING: only the nodes on the paths to the two boundary points are partly in the range, so both walks visit those paths and the children between them, not the tree.
+    cloneContents() {
+      const fragment = document.createDocumentFragment();
+      if (this.collapsed) return fragment;
+      const sc = this._sc._m, ec = this._ec._m, so = this._so, eo = this._eo, starts = new Map(), ends = new Map();
+      for (let rec = sc; rec.up; rec = rec.up) starts.set(rec.up, rec);
+      for (let rec = ec; rec.up; rec = rec.up) ends.set(rec.up, rec);
+      const copy = (rec, parent) => {
+        if (rec.tag === '#text' || rec.tag === '#comment') { const text = own(rec).slice(rec === sc ? so : 0, rec === ec ? eo : undefined); parent.append(rec.tag === '#text' ? document.createTextNode(text) : document.createComment(text)); return; }
+        const first = rec === sc ? null : starts.get(rec), last = rec === ec ? null : ends.get(rec), kids = rec.kids;
+        const partial = kid => { if (kid.tag === '#text' || kid.tag === '#comment') copy(kid, parent); else { const clone = of(kid).cloneNode(false); copy(kid, clone); parent.append(clone); } };
+        if (first) partial(first);
+        for (let i = rec === sc ? so : first ? index(first) + 1 : 0, end = rec === ec ? eo : last ? index(last) : kids.length; i < end; i++) parent.append(of(kids[i]).cloneNode(true));
+        if (last && last !== first) partial(last);
+      };
+      copy(this.commonAncestorContainer._m, fragment);
+      return fragment;
+    }
     deleteContents() {
       if (this.collapsed) return;
-      const root = this.commonAncestorContainer, whole = [], stack = [root];
-      let container = this.startContainer, offset = this.startOffset;
-      if (!container.contains(this.endContainer)) {
-        let reference = container;
-        while (reference.parentNode && !reference.parentNode.contains(this.endContainer)) reference = reference.parentNode;
-        container = reference.parentNode; offset = container.childNodes.indexOf(reference) + 1;
+      const start = this._sc, end = this._ec, so = this._so, eo = this._eo;
+      if (start === end && characterData(start)) { start.deleteData(so, eo - so); return; }
+      const common = this.commonAncestorContainer._m, removed = [], tail = [];
+      let from = so, to = eo, reference = null;
+      if (start._m !== common) {
+        let rec = start._m;
+        for (let i = so; i < rec.kids.length; i++) removed.push(rec.kids[i]);
+        for (; rec.up !== common; rec = rec.up) for (let i = index(rec) + 1; i < rec.up.kids.length; i++) removed.push(rec.up.kids[i]);
+        reference = rec; from = index(rec) + 1;
       }
-      while (stack.length) {
-        const node = stack.pop();
-        if (node === root || !node.parentNode) { stack.push(...node.childNodes); continue; }
-        const parent = node.parentNode, index = parent.childNodes.indexOf(node);
-        if (comparePoints(parent,index,this.startContainer,this.startOffset) >= 0 && comparePoints(parent,index+1,this.endContainer,this.endOffset) <= 0) whole.push(node);
-        else stack.push(...node.childNodes);
+      if (end._m !== common) {
+        let rec = end._m;
+        tail.push(rec.kids.slice(0, eo));
+        for (; rec.up !== common; rec = rec.up) tail.push(rec.up.kids.slice(0, index(rec)));
+        to = index(rec);
       }
-      for (const {node,start,end} of rangeNodes(this)) if (!whole.some(parent => parent.contains(node))) node.deleteData(start,end-start);
-      for (const node of whole) { if (node.parentNode === container && container.childNodes.indexOf(node) < offset) offset--; node.remove(); }
-      this.setStart(container,offset); this.collapse(true);
+      for (let i = from; i < to; i++) removed.push(common.kids[i]);
+      for (let i = tail.length; i--;) removed.push(...tail[i]);
+      reactionDepth++;
+      try {
+        if (characterData(start)) start.deleteData(so, start.length - so);
+        for (const rec of removed) of(rec).remove();
+        if (characterData(end)) end.deleteData(0, eo);
+      } finally { leave(); }
+      if (reference) this.setStart(of(common), index(reference) + 1); else this.setStart(start, so);
+      this.collapse(true);
     }
     extractContents() { const result = this.cloneContents(); this.deleteContents(); return result; }
-    insertNode(node) { const start = this.startContainer; if (start.nodeType === 3) start.parentNode.insertBefore(node, start.splitText(this.startOffset)); else start.insertBefore(node, start.childNodes[this.startOffset] ?? null); }
+    insertNode(node) { const start = this._sc; if (start.nodeType === 3) start.parentNode.insertBefore(node, start.splitText(this._so)); else start.insertBefore(node, of(start._m.kids[this._so])); }
     surroundContents(node) { const contents = this.extractContents(); node.append(contents); this.insertNode(node); this.selectNode(node); }
-    createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node.localName : 'body'); }
+    createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node : null); }
     getBoundingClientRect() {const rects=this.getClientRects();if(!rects.length)return new DOMRect();const left=Math.min(...rects.map(rect=>rect.left)),top=Math.min(...rects.map(rect=>rect.top));return new DOMRect(left,top,Math.max(...rects.map(rect=>rect.right))-left,Math.max(...rects.map(rect=>rect.bottom))-top);}
     getClientRects() {return rangeNodes(this).flatMap(({node,start,end})=>call('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
     compareBoundaryPoints(how,range){return how===0?comparePoints(this.startContainer,this.startOffset,range.startContainer,range.startOffset):how===1?comparePoints(this.endContainer,this.endOffset,range.startContainer,range.startOffset):how===2?comparePoints(this.endContainer,this.endOffset,range.endContainer,range.endOffset):comparePoints(this.startContainer,this.startOffset,range.endContainer,range.endOffset);}
     isPointInRange(node,offset){return comparePoints(node,offset,this.startContainer,this.startOffset)>=0&&comparePoints(node,offset,this.endContainer,this.endOffset)<=0;}
     comparePoint(node,offset){return comparePoints(node,offset,this.startContainer,this.startOffset)<0?-1:comparePoints(node,offset,this.endContainer,this.endOffset)>0?1:0;}
-    intersectsNode(node){if(!node.parentNode)return true;const parent=node.parentNode,index=parent.childNodes.indexOf(node);return comparePoints(parent,index+1,this.startContainer,this.startOffset)>0&&comparePoints(parent,index,this.endContainer,this.endOffset)<0;}
+    intersectsNode(node){if(!node.parentNode)return true;const parent=node.parentNode,at=index(node._m);return comparePoints(parent,at+1,this._sc,this._so)>0&&comparePoints(parent,at,this._ec,this._eo)<0;}
     detach() {}
   }
   class StaticRange {
@@ -1686,7 +1872,7 @@
         for (let root = node.getRootNode(); root instanceof ShadowRoot && !roots.has(root); root = node.getRootNode()) {
           const host = root.host;
           node = host.parentNode;
-          offset = node.childNodes.indexOf(host) + (side === 'end' ? 1 : 0);
+          offset = index(host._m) + (side === 'end' ? 1 : 0);
         }
         points[side + 'Container'] = node;
         points[side + 'Offset'] = offset;
@@ -1707,7 +1893,7 @@
       this._setRange(range, order > 0 ? 'backward' : order < 0 ? 'forward' : 'none');
     }
     extend(node, offset = 0) { if (!this.rangeCount) throw new DOMException('Selection is empty', 'InvalidStateError'); this.setBaseAndExtent(this.anchorNode, this.anchorOffset, node, offset); }
-    containsNode(node, partial = false) { if (!this.rangeCount || node.getRootNode() !== this.anchorNode.getRootNode()) return false; const range = this.ranges[0], end = node.nodeType === 3 ? node.length : node.childNodes.length; return partial ? range.intersectsNode(node) : comparePoints(range.startContainer, range.startOffset, node, 0) <= 0 && comparePoints(range.endContainer, range.endOffset, node, end) >= 0; }
+    containsNode(node, partial = false) { if (!this.rangeCount || node.getRootNode() !== this.anchorNode.getRootNode()) return false; const range = this.ranges[0], end = characterData(node) ? node.length : node._m.kids.length; return partial ? range.intersectsNode(node) : comparePoints(range.startContainer, range.startOffset, node, 0) <= 0 && comparePoints(range.endContainer, range.endOffset, node, end) >= 0; }
     deleteFromDocument() { for (const range of this.ranges) range.deleteContents(); }
     toString() { return call('dom.selectionText', 0, this.ranges.flatMap(range => rangeNodes(range).map(({node,start,end}) => [node._id,start,end]))); }
   }
@@ -1729,13 +1915,15 @@
   }
   const resizeObservers = new Set();
   class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
+  // WARNING: these tags leave foreign content in the parser, so they are HTML at the top of a fragment parsed for an SVG context.
+  const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
     if (node || !rec) return node ?? null;
     const chain = [];
     for (; rec && !(node = rec.ref?.deref()); rec = rec.up) chain.push(rec);
     for (let i = chain.length; i--;) {
-      const { id, tag } = chain[i], above = node, svg = tag === 'svg' || above instanceof SVGElement && above.localName !== 'foreignObject';
+      const { id, tag, attrs } = chain[i], above = node, svg = tag === 'svg' || (above instanceof SVGElement ? !/^(foreignObject|desc|title)$/.test(above.localName) : !!above?._svg && !breakout.test(tag) && !(tag === 'font' && (attrs.has('color') || attrs.has('face') || attrs.has('size'))));
       const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag === '#text' ? Text : tag === '#comment' ? Comment : tag === '#doctype' ? DocumentType : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : htmlTypes.get(tag) ?? HTMLElement;
       node = new Type(id, tag); if (above) hold(above, node);
     }
@@ -1746,6 +1934,7 @@
     scheduled = false; flush();
     if (!force && performance.now() < sweepAt) return;
     sweepAt = performance.now() + 250;
+    for (const [rec, set] of anchors) { for (const ref of set) if (!ref.deref()) set.delete(ref); if (!set.size) anchors.delete(rec); }
     const dead = [];
     if (force) cursor = 0;
     // WARNING: timed sweeps check a slice of the wrappers and continue where the last one stopped, so their cost doesn't grow with the page.
@@ -1764,17 +1953,17 @@
     for (const root of roots) {
       const stack = [root], gone = [];
       while (stack.length) { const rec = stack.pop(); if (rec.ref?.deref()) { gone.length = 0; break; } gone.push(rec); for (const kid of rec.kids) stack.push(kid); if (rec.shadow) stack.push(rec.shadow); }
-      for (const rec of gone) if (records[rec.id] === rec) records[rec.id] = undefined;
+      for (const rec of gone) if (records[rec.id] === rec) { records[rec.id] = undefined; const id = rec.attrs?.get('id'); if (id) idDrop(id, rec); }
     }
   };
 
-  // WARNING: drawing queues `code, ...args` floats that `Canvas::draw` in `render/canvas.rs` runs with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.
+  // WARNING: drawing queues `code, ...args` as f64, so far coordinates stay exact, and `Canvas::draw` in `render/canvas.rs` runs them with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.
   class CanvasRenderingContext2D {
-    constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float32Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
+    constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float64Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
     _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDash: [], lineDashOffset: 0, globalCompositeOperation: 'source-over', letterSpacing: '0px', wordSpacing: '0px', imageSmoothingEnabled: true, imageSmoothingQuality: 'low', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto', direction: 'inherit', lang: 'inherit' }; this._stack = []; }
     _op(code, ...args) {
       const size = this._size;
-      if (size + args.length >= this._ops.length) { const grown = new Float32Array(this._ops.length * 2 + args.length); grown.set(this._ops); this._ops = grown; }
+      if (size + args.length >= this._ops.length) { const grown = new Float64Array(this._ops.length * 2 + args.length); grown.set(this._ops); this._ops = grown; }
       this._ops[size] = code; for (let i = 0; i < args.length; i++) this._ops[size + 1 + i] = args[i];
       this._size = size + 1 + args.length;
       if (!size) queueMicrotask(() => this._flush()); else if (this._size > 1 << 18) this._flush();
@@ -1795,8 +1984,9 @@
     createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient([x0, y0, x1, y1]); } createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); return new CanvasGradient([x0, y0, r0, x1, y1, r1]); }
     setLineDash(list) { list = Array.from(list, Number); if (!list.every(v => Number.isFinite(v) && v >= 0)) return; if (list.length % 2) list = [...list, ...list]; this._state.lineDash = list; const text = list.join(); this._texts.push(text); this._op(35, text.length); } getLineDash() { return [...this._state.lineDash]; }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
-    getImageData(x,y,width,height) { this._flush(); if (!width || !height) throw new DOMException('Image dimensions must be nonzero','IndexSizeError'); return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels',this.canvas._id,x,y,Math.abs(width),Math.abs(height))),Math.abs(width),Math.abs(height)); }
-    putImageData(data, x, y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._data.push(data.data.slice()); this._op(26, this._data.length - 1, x, y, data.width, data.height); }
+    // WARNING: the arguments are WebIDL `long`s, and a negative size extends the rectangle the other way.
+    getImageData(x, y, width, height) { this._flush(); x |= 0; y |= 0; width |= 0; height |= 0; if (!width || !height) throw new DOMException('Image dimensions must be nonzero', 'IndexSizeError'); if (width < 0) { x += width; width = -width; } if (height < 0) { y += height; height = -height; } return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels', this.canvas._id, x, y, width, height)), width, height); }
+    putImageData(data, x, y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._data.push(data.data.slice()); this._op(26, this._data.length - 1, x | 0, y | 0, data.width, data.height); }
     drawImage(image,...args) {
       if (!drawable(image)) throw new TypeError('Expected an image, canvas, video or bitmap');
       if (image instanceof HTMLVideoElement && image.readyState < 2) return;
@@ -2152,6 +2342,7 @@
     easings.set(value, true);
     return value;
   };
+  const finite = value => { const number = Number(value); if (!Number.isFinite(number)) throw new TypeError('The provided double value is non-finite'); return number; };
   const defaultTiming = { delay: 0, endDelay: 0, fill: 'auto', iterationStart: 0, iterations: 1, duration: 'auto', direction: 'normal', easing: 'linear' };
   const timingChoices = { fill: ['none', 'forwards', 'backwards', 'both', 'auto'], direction: ['normal', 'reverse', 'alternate', 'alternate-reverse'] };
   const timingOf = (input, base) => {
@@ -2308,7 +2499,7 @@
     }
     get startTime() { return this.#start; }
     set startTime(value) {
-      const time = value == null ? null : Number(value);
+      const time = value == null ? null : finite(value);
       if (this.#now() === null && time !== null) this.#hold = null;
       const previous = this.#current();
       this.#apply();
@@ -2320,16 +2511,16 @@
     get currentTime() { return this.#current(); }
     set currentTime(value) {
       if (value == null) { if (this.#current() !== null) throw new TypeError('The current time cannot be null'); return; }
-      const time = Number(value);
+      const time = finite(value);
       this.#seek(time);
       if (this.#pausing) { this.#hold = time; this.#apply(); this.#start = null; this.#pausing = false; this.#resolve(); }
       this.#update(true, false);
     }
     get playbackRate() { return this.#rate; }
-    set playbackRate(value) { this.#pendingRate = null; const time = this.#current(); this.#rate = Number(value); if (time !== null) this.currentTime = time; else this.#update(false, false); }
+    set playbackRate(value) { value = finite(value); this.#pendingRate = null; const time = this.#current(); this.#rate = value; if (time !== null) this.currentTime = time; else this.#update(false, false); }
     updatePlaybackRate(value) {
       const state = this.playState;
-      this.#pendingRate = Number(value);
+      this.#pendingRate = finite(value);
       if (this.pending) return;
       if (state === 'running') return this.#play(false);
       if (state === 'finished') {
@@ -2548,13 +2739,13 @@
   for (const Type of [CSSAnimation, CSSTransition]) Object.defineProperties(Type.prototype, {
     effect: { get() { return cssData.get(this).effect; }, set() {}, configurable: true },
     timeline: { get() { return documentTimeline; }, set() {}, configurable: true },
-    currentTime: { get() { return cssState(this).time; }, set(value) { if (value == null) throw new TypeError('The current time cannot be null'); cssControl(this, 'seek', Number(value)); }, configurable: true },
-    startTime: { get() { const data = cssState(this); return data.state === 'running' ? timelineNow() - data.time : null; }, set(value) { if (value != null) cssControl(this, 'seek', timelineNow() - Number(value)); }, configurable: true },
+    currentTime: { get() { return cssState(this).time; }, set(value) { if (value == null) throw new TypeError('The current time cannot be null'); cssControl(this, 'seek', finite(value)); }, configurable: true },
+    startTime: { get() { const data = cssState(this); return data.state === 'running' ? timelineNow() - data.time : null; }, set(value) { if (value != null) cssControl(this, 'seek', timelineNow() - finite(value)); }, configurable: true },
     playState: { get() { return cssState(this).state; }, configurable: true },
     pending: { get() { return false; }, configurable: true },
     ready: { get() { return cssData.get(this).ready ??= Promise.resolve(this); }, configurable: true },
     finished: { get() { return cssData.get(this).finished; }, configurable: true },
-    playbackRate: { get() { return 1; }, set(value) { if (Number(value) !== 1) throw new DOMException('CSS animations and transitions play at rate 1', 'NotSupportedError'); }, configurable: true },
+    playbackRate: { get() { return 1; }, set(value) { if (finite(value) !== 1) throw new DOMException('CSS animations and transitions play at rate 1', 'NotSupportedError'); }, configurable: true },
     replaceState: { get() { return 'active'; }, configurable: true },
     updatePlaybackRate: { value(value) { this.playbackRate = value; }, writable: true, configurable: true },
     reverse: { value() { throw new DOMException('CSS animations and transitions cannot play in reverse', 'NotSupportedError'); }, writable: true, configurable: true },

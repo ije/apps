@@ -628,9 +628,9 @@ pub(crate) fn clip(
                 .map(|&child| {
                     doc.serialize_svg(child, false, &|node| {
                         doc.nodes[node]
-                            .inline
-                            .as_ref()
-                            .map(|inline| vec![("style", inline.source())])
+                            .attrs
+                            .get("style")
+                            .map(|style| vec![("style", style.clone())])
                             .unwrap_or_default()
                     })
                 })
@@ -1274,6 +1274,124 @@ pub(super) fn opacity(style: &style::Style) -> f32 {
         .clamp(0., 1.)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Establishes {
+    pub(crate) stacking: bool,
+    pub(crate) absolute: bool,
+    pub(crate) fixed: bool,
+    pub(crate) layer: bool,
+    pub(crate) transformed: bool,
+}
+
+// WARNING: the one place that decides what a style makes its box, per CSS Positioned Layout, Transforms 2, Masking,
+// Compositing, Filter Effects, Containment and `will-change`: a stacking context, the containing block of absolute
+// and of fixed descendants, an effect layer, a transform. Building, culling and kept keys must agree on it.
+// `z-index` on flex and grid items depends on the parent, and an opacity layer on the children, so callers add those.
+pub(crate) fn establishes(style: &Style) -> Establishes {
+    let set = |props: &[Prop]| {
+        props
+            .iter()
+            .any(|&prop| style.get(prop).is_some_and(|value| value != "none"))
+    };
+    if style
+        .get(Prop::DISPLAY)
+        .is_some_and(|value| matches!(value, "contents" | "none"))
+    {
+        return Establishes::default();
+    }
+    let position = style.get(Prop::POSITION).unwrap_or("static");
+    let transformed = set(&[Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]);
+    let layer = set(&[
+        Prop::FILTER,
+        Prop::WEBKIT_FILTER,
+        Prop::CLIP_PATH,
+        Prop::WEBKIT_CLIP_PATH,
+        Prop::MASK_IMAGE,
+        Prop::WEBKIT_MASK_IMAGE,
+        Prop::BACKDROP_FILTER,
+        Prop::WEBKIT_BACKDROP_FILTER,
+    ]) || style
+        .get(Prop::MIX_BLEND_MODE)
+        .is_some_and(|value| value != "normal")
+        || style.get(Prop::ISOLATION) == Some("isolate")
+        || cfg!(target_os = "macos")
+            && matches!(style.get(Prop::MACOS_GLASS), Some("regular" | "clear"));
+    let contained = style.get(Prop::CONTAIN).is_some_and(|value| {
+        ["layout", "paint", "strict", "content"]
+            .iter()
+            .any(|kind| value.contains(kind))
+    }) || style
+        .get(Prop::CONTENT_VISIBILITY)
+        .is_some_and(|value| value != "visible");
+    // WARNING: a property in `will-change` acts as if any value that changes these was set.
+    let (mut wills, mut will_stack, mut will_position) = (false, false, false);
+    for name in style
+        .get(Prop::WILL_CHANGE)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+    {
+        let is = |names: &[&str]| {
+            names
+                .iter()
+                .any(|known| name.trim().eq_ignore_ascii_case(known))
+        };
+        wills |= is(&[
+            "transform",
+            "translate",
+            "rotate",
+            "scale",
+            "perspective",
+            "filter",
+            "-webkit-filter",
+            "backdrop-filter",
+            "-webkit-backdrop-filter",
+            "transform-style",
+            "contain",
+            "content-visibility",
+        ]);
+        will_position |= is(&["position"]);
+        will_stack |= is(&[
+            "opacity",
+            "clip-path",
+            "-webkit-clip-path",
+            "mask",
+            "mask-image",
+            "-webkit-mask",
+            "-webkit-mask-image",
+            "mix-blend-mode",
+            "isolation",
+        ]);
+    }
+    let fixed = transformed
+        || contained
+        || wills
+        || set(&[
+            Prop::PERSPECTIVE,
+            Prop::FILTER,
+            Prop::WEBKIT_FILTER,
+            Prop::BACKDROP_FILTER,
+            Prop::WEBKIT_BACKDROP_FILTER,
+        ])
+        || style.get(Prop::TRANSFORM_STYLE) == Some("preserve-3d");
+    Establishes {
+        stacking: fixed
+            || layer
+            || will_stack
+            || will_position
+            || matches!(position, "fixed" | "sticky")
+            || position != "static"
+                && style
+                    .get(Prop::Z_INDEX)
+                    .is_some_and(|value| value.parse::<i32>().is_ok())
+            || set(&[Prop::MASK, Prop::WEBKIT_MASK])
+            || opacity(style) < 1.,
+        absolute: fixed || will_position || position != "static",
+        fixed,
+        layer,
+        transformed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,5 +1589,68 @@ mod tests {
             panic!("url");
         };
         assert!(shapes.contains("<rect"));
+    }
+
+    #[test]
+    fn transforms_masks_blends_and_containment_establish_contexts_and_blocks() {
+        let of = |pairs: &[(&str, &str)]| establishes(&style(pairs));
+        for prop in ["translate", "rotate", "scale", "transform"] {
+            let value = if prop == "rotate" {
+                "5deg"
+            } else if prop == "transform" {
+                "scale(2)"
+            } else {
+                "2px"
+            };
+            let made = of(&[(prop, value)]);
+            assert!(
+                made.stacking && made.absolute && made.fixed && made.transformed,
+                "{prop}"
+            );
+            assert!(!of(&[(prop, "none")]).stacking, "{prop}");
+        }
+        for (prop, value) in [
+            ("mask-image", "linear-gradient(red,blue)"),
+            ("-webkit-mask-image", "url(a.png)"),
+            ("mask", "url(#m)"),
+            ("mix-blend-mode", "multiply"),
+            ("isolation", "isolate"),
+            ("clip-path", "circle()"),
+            ("opacity", "0.5"),
+            ("will-change", "opacity"),
+            ("position", "sticky"),
+        ] {
+            let made = of(&[(prop, value)]);
+            assert!(
+                made.stacking && made.absolute == (prop == "position") && !made.fixed,
+                "{prop}"
+            );
+        }
+        for (prop, value) in [
+            ("filter", "blur(2px)"),
+            ("backdrop-filter", "blur(2px)"),
+            ("perspective", "100px"),
+            ("contain", "paint"),
+            ("content-visibility", "auto"),
+            ("will-change", "opacity, Transform"),
+            ("transform-style", "preserve-3d"),
+        ] {
+            let made = of(&[(prop, value)]);
+            assert!(made.stacking && made.absolute && made.fixed, "{prop}");
+        }
+        let relative = of(&[("position", "relative")]);
+        assert!(relative.absolute && !relative.fixed && !relative.stacking);
+        assert!(of(&[("position", "relative"), ("z-index", "1")]).stacking);
+        assert!(!of(&[("position", "relative"), ("z-index", "auto")]).stacking);
+        assert!(of(&[("will-change", "position")]).absolute);
+        assert_eq!(
+            of(&[("contain", "size"), ("container-type", "inline-size")]),
+            Establishes::default()
+        );
+        assert_eq!(
+            of(&[("display", "contents"), ("transform", "scale(2)")]),
+            Establishes::default()
+        );
+        assert!(of(&[("-webkit-filter", "blur(1px)")]).layer && !of(&[("mask", "url(#m)")]).layer);
     }
 }

@@ -112,13 +112,42 @@ pub(super) fn css_background(
                                 size.as_str(),
                                 "" | "auto" | "auto auto" | "cover" | "contain"
                             );
+                            let (across, down) = (
+                                !matches!(repeat.trim(), "no-repeat" | "repeat-y"),
+                                !matches!(repeat.trim(), "no-repeat" | "repeat-x"),
+                            );
+                            // WARNING: small tiles on a big box would paint millions of images, so past 4096 tiles
+                            // a layer paints a bitmap of several tiles, at least 256 device pixels per repeating side.
+                            let count = |repeats: bool, extent: f32, side: f32| {
+                                if repeats { (extent / side).ceil() } else { 1. }
+                            };
+                            let many = tiled
+                                && count(across, width, tile_width)
+                                    * count(down, height, tile_height)
+                                    > 4096.;
+                            let group = |repeats: bool, side: f32| {
+                                if many && repeats {
+                                    (256. / (side * scale)).ceil().max(1.)
+                                } else {
+                                    1.
+                                }
+                            };
+                            let [nx, ny] = [group(across, tile_width), group(down, tile_height)];
                             let (width, height) = if tiled {
                                 (tile_width, tile_height)
                             } else {
                                 (width, height)
                             };
+                            let limit = super::canvas::RASTER_MAX as f32;
                             let raster = [width, height]
-                                .map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
+                                .map(|extent| (extent * scale).ceil().clamp(1., limit) as u32);
+                            let cell = [width * nx, height * ny]
+                                .map(|extent| (extent * scale).ceil().clamp(1., limit) as u32);
+                            let source = if nx * ny > 1. {
+                                format!("{source} {nx} {ny}")
+                            } else {
+                                source.clone()
+                            };
                             let key = (id, slot * 64 + index);
                             let decoded = |backgrounds: &Backgrounds| {
                                 backgrounds
@@ -136,7 +165,7 @@ pub(super) fn css_background(
                                 *old != source
                                     || !fixed(backgrounds, image)
                                         && [image.size().width, image.size().height].map(u32::from)
-                                            != raster
+                                            != cell
                             }) {
                                 // WARNING: files decode on workers like `<img>`. A decoded bitmap is taken
                                 // here, where a layer holds it at once, since `retire` drops unheld bitmaps.
@@ -257,6 +286,37 @@ pub(super) fn css_background(
                                         bitmap
                                     })
                                 };
+                                let image = match super::canvas::pixmap(&image)
+                                    .filter(|_| nx * ny > 1.)
+                                    .zip(resvg::tiny_skia::Pixmap::new(cell[0], cell[1]))
+                                {
+                                    Some((tile, mut pixels)) => {
+                                        use resvg::tiny_skia as skia;
+                                        let [w, h] = cell.map(|side| side as f32);
+                                        if let Some(rect) = skia::Rect::from_xywh(0., 0., w, h) {
+                                            pixels.fill_rect(
+                                                rect,
+                                                &skia::Paint {
+                                                    shader: skia::Pattern::new(
+                                                        tile.as_ref(),
+                                                        skia::SpreadMode::Repeat,
+                                                        skia::FilterQuality::Bilinear,
+                                                        1.,
+                                                        skia::Transform::from_scale(
+                                                            w / nx / tile.width() as f32,
+                                                            h / ny / tile.height() as f32,
+                                                        ),
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                                skia::Transform::identity(),
+                                                None,
+                                            );
+                                        }
+                                        super::canvas::render_image(&pixels)
+                                    }
+                                    None => image,
+                                };
                                 if let Some((_, old)) =
                                     backgrounds.insert(key, (source.clone(), image))
                                     && Arc::strong_count(&old) == 1
@@ -272,46 +332,52 @@ pub(super) fn css_background(
                                 return;
                             }
                             if tiled {
-                                let [left, top] =
-                                    [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
-                                let [right, bottom] = [
-                                    left + f32::from(bounds.size.width),
-                                    top + f32::from(bounds.size.height),
+                                // WARNING: only the tiles in the visible part of the box paint, found by index,
+                                // so a far position or a tiny tile never loops forever.
+                                let visible = window.content_mask().bounds.intersect(&bounds);
+                                let [width, height] = [width * nx, height * ny];
+                                let origin = [
+                                    f32::from(bounds.origin.x) + tile_x,
+                                    f32::from(bounds.origin.y) + tile_y,
                                 ];
-                                let (across, down) = (
-                                    !matches!(repeat.trim(), "no-repeat" | "repeat-y"),
-                                    !matches!(repeat.trim(), "no-repeat" | "repeat-x"),
-                                );
-                                let start = |repeats: bool, origin: f32, at: f32, side: f32| {
+                                let span = |repeats: bool, start: f32, side: f32, low, high| {
                                     if repeats {
-                                        origin + at.rem_euclid(side) - side
+                                        let [low, high]: [f32; 2] =
+                                            [f32::from(low), f32::from(high)];
+                                        ((low - start) / side).floor() as i64
+                                            ..((high - start) / side).ceil() as i64
                                     } else {
-                                        origin + at
+                                        0..1
                                     }
                                 };
-                                let mut y = start(down, top, tile_y, tile_height);
-                                while y < bottom {
-                                    let mut x = start(across, left, tile_x, tile_width);
-                                    while x < right {
+                                let columns =
+                                    span(across, origin[0], width, visible.left(), visible.right());
+                                let rows =
+                                    span(down, origin[1], height, visible.top(), visible.bottom());
+                                if columns
+                                    .end
+                                    .saturating_sub(columns.start)
+                                    .saturating_mul(rows.end.saturating_sub(rows.start))
+                                    > 1 << 16
+                                {
+                                    return;
+                                }
+                                for row in rows {
+                                    for column in columns.clone() {
                                         window.paint_image(
                                             bounds,
                                             renderer::Bounds::new(
-                                                renderer::point(px(x), px(y)),
-                                                renderer::size(px(tile_width), px(tile_height)),
+                                                renderer::point(
+                                                    px(origin[0] + column as f32 * width),
+                                                    px(origin[1] + row as f32 * height),
+                                                ),
+                                                renderer::size(px(width), px(height)),
                                             ),
                                             renderer::Corners::default(),
                                             image.clone(),
                                             false,
                                         );
-                                        if !across {
-                                            break;
-                                        }
-                                        x += tile_width;
                                     }
-                                    if !down {
-                                        break;
-                                    }
-                                    y += tile_height;
                                 }
                                 return;
                             }
@@ -389,8 +455,9 @@ pub(super) fn css_background(
                         None if tiled.is_some() => (cw, ch),
                         None => (width, height),
                     };
-                    let rw = (width * scale).ceil().clamp(1., 4096.) as u32;
-                    let rh = (height * scale).ceil().clamp(1., 4096.) as u32;
+                    let limit = super::canvas::RASTER_MAX as f32;
+                    let rw = (width * scale).ceil().clamp(1., limit) as u32;
+                    let rh = (height * scale).ceil().clamp(1., limit) as u32;
                     let [rw, rh] = match axis {
                         Some(1) => [3, rh],
                         Some(_) => [rw, 3],
@@ -479,14 +546,17 @@ pub(super) fn css_background(
                         && let Some([x, y]) = tiled
                     {
                         // WARNING: tiles sit on device pixels, so their edges never sample other atlas tiles.
-                        let start = |edge: renderer::Pixels, at: f32, side: f32| {
+                        // Only the visible ones paint, starting at the first whole tile that reaches it.
+                        let visible = window.content_mask().bounds.intersect(&bounds);
+                        let start = |edge, at: f32, side: f32, cell: f32, low| {
                             let at = f32::from(edge) + at - if at > 0. { side } else { 0. };
-                            px((at * scale).round() / scale)
+                            let at = (at * scale).round() / scale;
+                            px(at + cell * ((f32::from(low) - at) / cell).floor().max(0.))
                         };
-                        let mut top = start(bounds.top(), y, th);
-                        while top < bounds.bottom() {
-                            let mut left = start(bounds.left(), x, tw);
-                            while left < bounds.right() {
+                        let mut top = start(bounds.top(), y, th, ch, visible.top());
+                        while top < visible.bottom() {
+                            let mut left = start(bounds.left(), x, tw, cw, visible.left());
+                            while left < visible.right() {
                                 let target = renderer::Bounds::new(
                                     renderer::point(left, top),
                                     renderer::size(px(cw), px(ch)),

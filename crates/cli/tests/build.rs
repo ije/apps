@@ -141,13 +141,13 @@ fn bundles_electron_pages_and_rejects_unsupported_exports() {
     assert!(doc.serialize(0).contains("apps:///script-"));
     fs::write(
         &entry,
-        "import {app, autoUpdater} from 'electron'; app.quit();",
+        "import {app, crashReporter} from 'electron'; app.quit();",
     )
     .unwrap();
     let result = build();
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("electron.autoUpdater is not supported")
+        String::from_utf8_lossy(&result.stderr).contains("electron.crashReporter is not supported")
     );
 }
 

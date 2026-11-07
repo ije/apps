@@ -947,7 +947,7 @@ impl AtlasBackend for AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let texture_size = page_size(size).map(|side| DevicePixels(side.0.min(self.max)));
+                let texture_size = page_size(size);
                 let desc = D3D11_TEXTURE2D_DESC {
                     Width: texture_size.width.0 as u32,
                     Height: texture_size.height.0 as u32,
@@ -1020,6 +1020,10 @@ impl AtlasBackend for AtlasTextures {
             padding: 0,
             bounds,
         })
+    }
+
+    fn max_side(&self) -> i32 {
+        self.max
     }
 
     fn remove(&mut self, tile: AtlasTile) {
