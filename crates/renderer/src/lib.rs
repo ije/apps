@@ -21,7 +21,7 @@ pub use node::{
     AvailableSpace, Child, ElementId, Hooks, Node, NodeCx, ScrollHandle, canvas, img, layers, node,
     text,
 };
-pub use scene::{Backdrop, BlendMode, BorderStyle, PaintEffect, RenderImage, Scene};
+pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage, Scene};
 pub use style::*;
 pub use text::{
     DecorationStyle, Font, FontId, FontStyle, FontWeight, LineLayout, SUBPIXEL_VARIANTS_X,

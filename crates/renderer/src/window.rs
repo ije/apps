@@ -467,6 +467,40 @@ pub(crate) struct ScrollGesture {
     pub(crate) edge: Option<(ScrollHandle, Point<Pixels>)>,
 }
 
+pub const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(target_os = "macos")]
+struct Caret {
+    bounds: Bounds<ScaledPixels>,
+    color: Rgba,
+    since: std::time::Instant,
+    order: crate::scene::DrawOrder,
+    painted: bool,
+    overlay: bool,
+}
+
+fn round_corners(mask: &ContentMask<ScaledPixels>) -> [Bounds<ScaledPixels>; 4] {
+    let [x, y, right, bottom] = [
+        mask.rounded.origin.x,
+        mask.rounded.origin.y,
+        mask.rounded.origin.x + mask.rounded.size.width,
+        mask.rounded.origin.y + mask.rounded.size.height,
+    ];
+    let (rx, ry) = (&mask.corner_radii.x, &mask.corner_radii.y);
+    [
+        (x, y, rx.top_left, ry.top_left),
+        (right - rx.top_right, y, rx.top_right, ry.top_right),
+        (
+            right - rx.bottom_right,
+            bottom - ry.bottom_right,
+            rx.bottom_right,
+            ry.bottom_right,
+        ),
+        (x, bottom - ry.bottom_left, rx.bottom_left, ry.bottom_left),
+    ]
+    .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)))
+}
+
 pub struct Window {
     pub(crate) id: WindowId,
     pub(crate) platform: platform::Window,
@@ -492,6 +526,12 @@ pub struct Window {
     next_states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
     next_frame_callbacks: Vec<FrameCallback>,
     pub(crate) captures: Vec<CaptureCallback>,
+    #[cfg(target_os = "macos")]
+    caret: Option<Caret>,
+    #[cfg(target_os = "macos")]
+    caret_covered: bool,
+    #[cfg(target_os = "macos")]
+    symbols: platform::symbols::Cache,
     pub(crate) dirty: bool,
     redraw: [bool; 2],
     rebuild: bool,
@@ -547,6 +587,12 @@ impl Window {
             scroll_chain: None,
             gesture: ScrollGesture::default(),
             captures: Vec::new(),
+            #[cfg(target_os = "macos")]
+            caret: None,
+            #[cfg(target_os = "macos")]
+            caret_covered: false,
+            #[cfg(target_os = "macos")]
+            symbols: platform::symbols::Cache::default(),
             dirty: false,
             redraw: [false; 2],
             rebuild: false,
@@ -655,6 +701,7 @@ impl Window {
             || effect.clip.is_some()
             || effect.mask.is_some()
             || effect.backdrop.is_some()
+            || effect.glass.is_some()
             || transforms.is_some() != effect.transform.is_some()
         {
             return false;
@@ -673,28 +720,11 @@ impl Window {
         // WARNING: the compositor draws the layer over the window without its clip, so it must stay
         // inside the clip and nothing may paint over it there.
         let mask = &effect.content_mask;
-        let [x, y, right, bottom] = [
-            mask.rounded.origin.x,
-            mask.rounded.origin.y,
-            mask.rounded.origin.x + mask.rounded.size.width,
-            mask.rounded.origin.y + mask.rounded.size.height,
-        ];
-        let (rx, ry) = (&mask.corner_radii.x, &mask.corner_radii.y);
-        let corners = [
-            (x, y, rx.top_left, ry.top_left),
-            (right - rx.top_right, y, rx.top_right, ry.top_right),
-            (
-                right - rx.bottom_right,
-                bottom - ry.bottom_right,
-                rx.bottom_right,
-                ry.bottom_right,
-            ),
-            (x, bottom - ry.bottom_left, rx.bottom_left, ry.bottom_left),
-        ]
-        .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)));
         if reach.is_none_or(|reach| {
             mask.bounds.intersect(&reach) != reach
-                || corners.iter().any(|corner| corner.intersects(&reach))
+                || round_corners(mask)
+                    .iter()
+                    .any(|corner| corner.intersects(&reach))
                 || self.scene.paints_over(index, reach)
         }) || region[2] > 2048
             || region[3] > 2048
@@ -836,6 +866,51 @@ impl Window {
         self.dirty || !self.next_frame_callbacks.is_empty()
     }
 
+    // WARNING: a caret that blinks by drawing keeps about 126 MB of Metal driver memory alive and wakes the GPU twice
+    // a second. Core Animation can blink a box alone, but it draws over the window, so the box must be at the top
+    // level, clear of round corners, with nothing painted over it. Otherwise this returns false, and the caller
+    // draws the blink. `painted` says that the caller then paints the caret in this frame.
+    pub fn overlay_caret(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        color: Rgba,
+        since: std::time::Instant,
+        painted: bool,
+    ) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mask = self.snapped_content_mask();
+            let visible = self.snap_bounds(bounds).intersect(&mask.bounds);
+            if !self.scene.at_root()
+                || self.opacity < 1.
+                || !self.captures.is_empty()
+                || round_corners(&mask)
+                    .iter()
+                    .any(|corner| corner.intersects(&visible))
+            {
+                return false;
+            }
+            if visible.is_empty() {
+                return true;
+            }
+            let overlay = !self.caret_covered;
+            self.caret = Some(Caret {
+                bounds: visible,
+                color,
+                since,
+                order: self.scene.probe(visible),
+                painted: painted && !overlay,
+                overlay,
+            });
+            overlay
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (bounds, color, since, painted);
+            false
+        }
+    }
+
     pub(crate) fn draw(&mut self, cx: &mut App) {
         #[cfg(target_os = "macos")]
         self.platform.demote();
@@ -847,6 +922,10 @@ impl Window {
             self.drawing = true;
             self.next.clear();
             self.scene.clear();
+            #[cfg(target_os = "macos")]
+            {
+                self.caret = None;
+            }
             self.next_hitbox = 0;
             if self.redraw[1] {
                 // WARNING: the first pass moved its states out of `states`, so they go back for this one.
@@ -886,6 +965,24 @@ impl Window {
         }
         mem::swap(&mut self.rendered, &mut self.next);
         mem::swap(&mut self.states, &mut self.next_states);
+        #[cfg(target_os = "macos")]
+        {
+            let caret = self.caret.take();
+            let covered = caret.as_ref().is_some_and(|caret| {
+                self.scene
+                    .covers(caret.order + u32::from(caret.painted), caret.bounds)
+            });
+            // WARNING: this frame left a covered caret out, so the next one has to paint it.
+            if covered && caret.as_ref().is_some_and(|caret| caret.overlay) {
+                self.refresh();
+            }
+            self.caret_covered = covered;
+            self.platform.set_caret(
+                caret
+                    .filter(|caret| caret.overlay && !covered)
+                    .map(|caret| (caret.bounds, caret.color, caret.since)),
+            );
+        }
         self.scene.finish();
         let captures = mem::take(&mut self.captures);
         #[cfg(target_os = "macos")]
@@ -1541,6 +1638,14 @@ impl Window {
                     color_matrix,
                 },
             ),
+            glass: effect.glass.map(|glass| crate::scene::GlassState {
+                key: glass.key,
+                bounds: glass.bounds.scale(scale),
+                corner_radius: glass.corner_radius.0 * scale,
+                tint: glass.tint,
+                clear: glass.clear,
+                interactive: glass.interactive,
+            }),
             content_mask,
         };
         self.scene.push_effect(state, effect.key);
@@ -1763,6 +1868,58 @@ impl Window {
             .ok()
             .flatten()
             .map(|(tile, _)| tile)
+    }
+
+    pub fn paint_symbol(&mut self, name: &str, bounds: Bounds<Pixels>, color: Rgba) {
+        #[cfg(target_os = "macos")]
+        {
+            if bounds.is_empty() || color.a <= 0. {
+                return;
+            }
+            let bounds = self.snap_bounds(bounds);
+            let width = bounds.size.width.0;
+            let height = bounds.size.height.0;
+            if !width.is_finite() || !height.is_finite() || width <= 0. || height <= 0. {
+                return;
+            }
+            let scale = (1024. / width.max(height)).min(1.);
+            let size = [
+                (width * scale).ceil() as u16,
+                (height * scale).ceil() as u16,
+            ];
+            let image = self.symbols.get(name, size);
+            for id in self.symbols.retired.drain(..) {
+                self.platform.atlas().remove(&AtlasKey::Symbol(id));
+            }
+            let Some(image) = image else { return };
+            let tile = self
+                .platform
+                .atlas()
+                .get_or_insert_with(&AtlasKey::Symbol(image.id), &mut || {
+                    Ok(Some((
+                        Point::default(),
+                        crate::size(
+                            DevicePixels(i32::from(image.size[0])),
+                            DevicePixels(i32::from(image.size[1])),
+                        ),
+                        Cow::Borrowed(&image.bytes),
+                    )))
+                })
+                .ok()
+                .flatten();
+            if let Some((tile, _)) = tile {
+                self.scene.insert(Primitive::Mono(MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    tile,
+                    bounds,
+                    content_mask: self.snapped_content_mask(),
+                    color: color.opacity(self.opacity),
+                }));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (name, bounds, color);
     }
 
     pub fn paint_image(

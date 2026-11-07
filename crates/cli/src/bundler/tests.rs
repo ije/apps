@@ -1441,6 +1441,68 @@ fn cycles_reexports_and_missing_exports() {
 }
 
 #[test]
+fn sf_symbols_import_survives_nested_css_without_a_package() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("icons.css"), "@import 'sf-symbols';").unwrap();
+    fs::write(
+        dir.path().join("style.css"),
+        "@import './icons.css'; @import 'tailwindcss';",
+    )
+    .unwrap();
+    let path = dir.path().join("index.html");
+    fs::write(
+        &path,
+        "<link rel='stylesheet' href='./style.css'><span class='sf-icon-folder-fill size-16'></span>",
+    )
+    .unwrap();
+    let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+    assert!(linked_css(&source).contains("@import \"sf-symbols\";"));
+    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        style.get("-apps-sf-symbol").map(String::as_str),
+        cfg!(target_os = "macos").then_some("\"folder.fill\"")
+    );
+    assert_eq!(
+        apps_runtime::style::length(&style["width"], 0., 16., 800., 600.),
+        64.
+    );
+}
+
+#[test]
+fn liquid_glass_import_survives_nested_css_without_a_package() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("glass.css"), "@import 'liquid-glass';").unwrap();
+    fs::write(
+        dir.path().join("style.css"),
+        "@import './glass.css'; @import 'tailwindcss';",
+    )
+    .unwrap();
+    let path = dir.path().join("index.html");
+    fs::write(
+        &path,
+        "<link rel='stylesheet' href='./style.css'><button class='glass glass-interactive glass-tint-blue px-4'></button>",
+    )
+    .unwrap();
+    let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+    let css = linked_css(&source);
+    assert!(css.contains("@import \"liquid-glass\";"));
+    assert!(css.contains("@import \"tailwindcss\";"));
+    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        style.get("-apps-glass").map(String::as_str),
+        cfg!(target_os = "macos").then_some("regular")
+    );
+    assert_eq!(
+        apps_runtime::style::length(&style["padding-left"], 0., 16., 800., 600.),
+        16.
+    );
+}
+
+#[test]
 fn tailwind_import_survives_nested_css_without_a_package() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -3056,6 +3118,105 @@ fn watch_cache_reuses_modules_with_stable_ids() {
     .unwrap();
     assert_eq!(run(&third), "30:2:ts");
     assert_eq!(line(&first), line(&third));
+}
+
+#[test]
+fn production_slots_keep_module_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, source: &str| fs::write(dir.path().join(name), source).unwrap();
+    // A binding that a function writes after the body ended must stay live for importers.
+    write(
+        "live.js",
+        "export let count = 0; export function bump() { count++; } export let set = 1; set = 2; export var state; (function (s) { state = s; })('ready');",
+    );
+    // Reads follow a chain of barrels to the origin, and each barrel still runs its own side effects.
+    write(
+        "origin.js",
+        "export const value = 'VALUE'; export default 'DEFAULT'; export function self() { return this === undefined; }",
+    );
+    write(
+        "barrel.js",
+        "globalThis.order.push('barrel'); export { value, default as renamed } from './origin.js'; export * from './stars.js';",
+    );
+    write(
+        "stars.js",
+        "globalThis.order.push('stars'); export const starred = 'STARRED';",
+    );
+    // A namespace used as a value is a real object with live getters.
+    write(
+        "spread.js",
+        "export const a = 1; export let b = 2; export function setB() { b = 3; }",
+    );
+    // Modules in a cycle read each other's hoisted functions before their bodies end.
+    write(
+        "cycle-a.js",
+        "import { fromB } from './cycle-b.js'; export function fromA() { return 'A'; } export const seen = fromB();",
+    );
+    write(
+        "cycle-b.js",
+        "import { fromA } from './cycle-a.js'; export function fromB() { return fromA() + 'B'; }",
+    );
+    // CommonJS interop in both directions.
+    fs::create_dir_all(dir.path().join("node_modules/dep")).unwrap();
+    write(
+        "node_modules/dep/package.json",
+        r#"{"name":"dep","main":"index.js"}"#,
+    );
+    write(
+        "node_modules/dep/index.js",
+        "exports.named = 'NAMED'; exports.viaRequire = require('./required.mjs').viaEsm;",
+    );
+    write(
+        "node_modules/dep/required.mjs",
+        "export const viaEsm = 'VIA_ESM';",
+    );
+    // Dynamic import gets a namespace too.
+    write(
+        "later.js",
+        "export const later = 'LATER'; export default 'LATER_DEFAULT';",
+    );
+    write(
+        "app.js",
+        r#"import './setup.js';
+import { count, bump, set, state } from './live.js';
+import { value, renamed, starred } from './barrel.js';
+import * as origin from './origin.js';
+import * as spread from './spread.js';
+import { seen } from './cycle-a.js';
+import { named, viaRequire } from 'dep';
+const before = count; bump(); bump();
+const keys = Object.keys(spread).sort().join();
+const beforeB = spread.b; spread.setB();
+globalThis.result = [before, count, set, state, value, renamed, starred, origin.self(), keys, beforeB, spread.b, spread[Symbol.toStringTag], seen, named, viaRequire, globalThis.order.join('>')].join('|');
+globalThis.later = import('./later.js').then(ns => { globalThis.result += '|' + ns.later + '|' + ns.default + '|' + Object.isExtensible(ns); });
+"#,
+    );
+    write("setup.js", "globalThis.order = [];");
+    let entry = dir.path().join("app.js");
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        if production {
+            assert!(files["app.js"].contains(",flat:1"));
+            assert!(!files["app.js"].contains("get:()=>\"VALUE\""));
+        }
+        let engine = apps_runtime::jsc::JsContext::new(
+            apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.load_bundle(&files, "app.js").unwrap();
+        for _ in 0..4 {
+            engine.tick().unwrap();
+        }
+        assert_eq!(
+            engine.eval("result", "test").unwrap(),
+            format!(
+                "0|2|2|ready|VALUE|DEFAULT|STARRED|{production}|a,b,setB|2|3|Module|AB|NAMED|VIA_ESM|stars>barrel|LATER|LATER_DEFAULT|false"
+            ),
+            "production={production}"
+        );
+    }
 }
 
 #[test]

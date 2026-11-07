@@ -1,6 +1,6 @@
 use crate::{
     DevicePixels, Size,
-    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
+    atlas::{Atlas, AtlasBackend, Packer, TextureList, page_size},
     frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -1107,11 +1107,7 @@ impl AtlasTextures {
             Some(hit) => hit,
             None => {
                 let max = self.gpu.device.limits().max_texture_dimension_2d as i32;
-                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, max);
-                let texture_size = Size::new(
-                    DevicePixels(side(size.width.0)),
-                    DevicePixels(side(size.height.0)),
-                );
+                let texture_size = page_size(size).map(|side| DevicePixels(side.0.min(max)));
                 let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: None,
                     size: wgpu::Extent3d {

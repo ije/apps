@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Liquid Glass</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <main class="flex min-h-screen flex-col items-center justify-center gap-8 p-12">
+      <div class="text-center">
+        <h1 class="text-4xl font-semibold">Liquid Glass</h1>
+        <p class="mt-3">Native macOS material. HTML controls.</p>
+      </div>
+      <div class="flex gap-8">
+        <button id="plain" class="glass glass-interactive px-6 py-3 text-lg">Count 0</button>
+        <button id="tinted" class="glass glass-interactive glass-tint-blue px-6 py-3 text-lg">Blue</button>
+        <button id="clear" class="glass-clear glass-interactive rounded-xl px-6 py-3 text-lg">Clear</button>
+      </div>
+      <p class="flex items-center gap-2 text-sm">
+        <span class="sf-icon-info-circle size-4" aria-hidden="true"></span>
+        <span id="status">Click a button to test DOM events.</span>
+      </p>
+    </main>
+    <script type="module">
+      let count = 0;
+      document.querySelector('#plain').addEventListener('click', (event) => {
+        event.currentTarget.textContent = `Count ${++count}`;
+        document.querySelector('#status').textContent = `Clicked ${count} time${count === 1 ? '' : 's'}.`;
+      });
+      document.querySelector('#tinted').addEventListener('click', (event) => {
+        const green = event.currentTarget.classList.toggle('glass-tint-green');
+        event.currentTarget.classList.toggle('glass-tint-blue', !green);
+        event.currentTarget.textContent = green ? 'Green' : 'Blue';
+      });
+      document.querySelector('#clear').addEventListener('click', () => {
+        const button = document.querySelector('#plain');
+        button.classList.toggle('glass');
+        document.querySelector('#status').textContent = button.classList.contains('glass') ? 'Glass enabled.' : 'Glass removed.';
+      });
+    </script>
+  </body>
+</html>

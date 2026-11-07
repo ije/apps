@@ -16,10 +16,13 @@ fn redraw_when_decoded(
     decoding: Decoding,
 ) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
     move |window, _| {
-        if decoding
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
+        // WARNING: a later box using the same file can take the image in the frame that started the job. Then
+        // only this closure holds the slot, and the first box still has to paint.
+        if Arc::strong_count(&decoding) == 1
+            || decoding
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
         {
             window.refresh();
         } else {

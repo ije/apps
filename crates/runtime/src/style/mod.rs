@@ -723,6 +723,7 @@ pub(crate) struct StyleCache {
     pub(crate) units: bool,
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
+    symbols: SymbolStyles,
     registry: Rc<Registry>,
     #[allow(clippy::type_complexity)]
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Vars)>,
@@ -730,6 +731,13 @@ pub(crate) struct StyleCache {
     scheme: Option<Rc<str>>,
     pub(crate) spare: Option<SpareStyles>,
     walks: FxHashMap<usize, Rc<TreeWalk>>,
+}
+
+#[derive(Default)]
+struct SymbolStyles {
+    scanned: Vec<u64>,
+    classes: rustc_hash::FxHashSet<String>,
+    sheet: Option<Rc<Stylesheet>>,
 }
 
 type ContainerQuery = Rc<[(Option<String>, bool, MediaQuery)]>;
@@ -1101,6 +1109,8 @@ enum Rule {
     Container(Option<String>, bool, MediaQuery, Vec<Rule>),
     Property(String, String, bool, Option<String>),
     Starting(Vec<Rule>),
+    LiquidGlass(Vec<Rule>),
+    SfSymbols,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -1115,6 +1125,10 @@ enum MediaQuery {
 
 // WARNING: keep sorted; `@supports`, `CSS.supports()`, `el.style` and the devtools lint all read this, so list only what @pierre/apps applies.
 const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("-apps-glass", "none|regular|clear"),
+    ("-apps-glass-interactive", "false|true"),
+    ("-apps-glass-tint-color", "<color>"),
+    ("-apps-sf-symbol", "none|<string>|<custom-ident>"),
     ("-moz-osx-font-smoothing", "auto|grayscale"),
     ("-webkit-app-region", "none|drag|no-drag"),
     (
@@ -1649,6 +1663,10 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
 
 // WARNING: keep sorted.
 const INITIAL: &[(&str, &str)] = &[
+    ("-apps-glass", "none"),
+    ("-apps-glass-interactive", "false"),
+    ("-apps-glass-tint-color", "transparent"),
+    ("-apps-sf-symbol", "none"),
     ("accent-color", "auto"),
     ("align-content", "normal"),
     ("align-items", "normal"),
@@ -3058,6 +3076,7 @@ impl Rule {
             | Self::Layer(_, children)
             | Self::Supports(_, _, children)
             | Self::Starting(children)
+            | Self::LiquidGlass(children)
             | Self::Container(.., children) => {
                 for child in children {
                     child.bind_parent(parent)?;
@@ -3101,7 +3120,18 @@ impl Rule {
                     }
                 }
             }
-            Self::Variant(..) | Self::Utility(..) | Self::FontFace(_) | Self::Tailwind(_) => {}
+            Self::Variant(..)
+            | Self::Utility(..)
+            | Self::FontFace(_)
+            | Self::Tailwind(_)
+            | Self::SfSymbols => {}
+            Self::LiquidGlass(children) => {
+                if cfg!(target_os = "macos") {
+                    for rule in children {
+                        rule.collect(parent, layer, collected);
+                    }
+                }
+            }
             Self::Property(name, syntax, inherits, initial) => {
                 collected.properties.insert(
                     Prop::new(name),
@@ -3224,7 +3254,12 @@ impl Rule {
 
     fn plain(&self) -> bool {
         match self {
-            Self::Layer(..) | Self::Keyframes(..) | Self::Property(..) | Self::Theme(..) => false,
+            Self::Layer(..)
+            | Self::Keyframes(..)
+            | Self::Property(..)
+            | Self::Theme(..)
+            | Self::LiquidGlass(_)
+            | Self::SfSymbols => false,
             Self::Style(_, children)
             | Self::Media(_, children)
             | Self::Supports(_, _, children)
@@ -3285,6 +3320,8 @@ impl Rule {
             Self::Tailwind(Some(true)) => "@import 'tailwindcss';".into(),
             Self::Tailwind(Some(false)) => "@import 'tailwindcss/utilities';".into(),
             Self::Tailwind(None) => "@reference 'tailwindcss';".into(),
+            Self::LiquidGlass(_) => "@import 'liquid-glass';".into(),
+            Self::SfSymbols => "@import 'sf-symbols';".into(),
             Self::Keyframes(name, frames) => format!(
                 "@keyframes {name}{{{}}}",
                 frames
@@ -3671,6 +3708,66 @@ pub(crate) fn cascade(
         }
         let live: Vec<_> = style_cache.scopes.iter().map(|scope| scope.id).collect();
         style_cache.queries.retain(|key, _| live.contains(&key.0));
+    }
+    if cfg!(target_os = "macos")
+        && let Some(index) = sheets
+            .iter()
+            .position(|sheet| sheet.0.iter().any(|rule| matches!(**rule, Rule::SfSymbols)))
+    {
+        let symbols = &mut style_cache.symbols;
+        if symbols.scanned.len() < doc.nodes.len() {
+            symbols.scanned.resize(doc.nodes.len(), 0);
+        }
+        let mut css = String::new();
+        for &(id, _) in order {
+            let id = id as usize;
+            let revision = doc.nodes.revision(id);
+            if std::mem::replace(&mut symbols.scanned[id], revision) == revision {
+                continue;
+            }
+            let Some(classes) = doc.nodes[id].attrs.get("class") else {
+                continue;
+            };
+            for class in classes.split_ascii_whitespace() {
+                let Some(name) = class.strip_prefix("sf-icon-") else {
+                    continue;
+                };
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                    || name.split('-').any(str::is_empty)
+                    || symbols.classes.contains(class)
+                {
+                    continue;
+                }
+                symbols.classes.insert(class.to_owned());
+                use std::fmt::Write;
+                let _ = write!(
+                    css,
+                    ".{class}{{-apps-sf-symbol:\"{}\";display:inline-block;width:1em;height:1em;vertical-align:middle;flex-shrink:0}}",
+                    name.replace('-', ".")
+                );
+            }
+        }
+        if !css.is_empty() {
+            let sheet = symbols
+                .sheet
+                .get_or_insert_with(|| Rc::new(Stylesheet::parse(include_str!("sf_symbols.css"))));
+            if let Some(rule) = Rc::make_mut(sheet).0.last_mut()
+                && let Rule::Layer(_, children) = Rc::make_mut(rule)
+            {
+                children.extend(
+                    Stylesheet::parse(&css)
+                        .0
+                        .into_iter()
+                        .map(Rc::unwrap_or_clone),
+                );
+            }
+        }
+        if let Some(sheet) = &symbols.sheet {
+            sheets.insert(index, sheet.clone());
+        }
     }
     let tailwind = style_cache.tailwind.update(&mut sheets, doc, order);
     if let Some(update) = &tailwind
@@ -6741,6 +6838,8 @@ impl Rule {
             Self::Tailwind(Some(true)) => json!(["import", "tailwindcss"]),
             Self::Tailwind(Some(false)) => json!(["import", "tailwindcss/utilities"]),
             Self::Tailwind(None) => json!(["other", "@reference 'tailwindcss';"]),
+            Self::LiquidGlass(_) => json!(["import", "liquid-glass"]),
+            Self::SfSymbols => json!(["import", "sf-symbols"]),
             Self::Declarations(_) | Self::Theme(..) | Self::Variant(..) | Self::Utility(..) => {
                 json!(["other", self.source()])
             }

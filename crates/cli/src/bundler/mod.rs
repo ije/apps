@@ -302,6 +302,221 @@ impl<'a> VisitMut<'a> for Awaits<'a> {
     }
 }
 
+// A module's exports are slots in one array of the bundle: it writes them when its body ends, and importers read
+// `slots[k]`. So there is no generator, namespace object or getter per export, which took a quarter of the JS heap.
+struct Slots<'a, 'b> {
+    ast: AstBuilder<'a>,
+    allocator: &'a Allocator,
+    origin: &'b dyn Fn(usize, &str) -> (usize, String),
+    flat: &'b [bool],
+    slots: &'b HashMap<(usize, String), (usize, bool)>,
+    namespaces: BTreeSet<usize>,
+}
+
+impl<'a> Slots<'a, '_> {
+    fn import(expression: &Expression<'a>) -> Option<(usize, String)> {
+        let dep = |object: &Expression<'a>| match object {
+            Expression::Identifier(object) => object.name.strip_prefix("$appsN")?.parse().ok(),
+            _ => None,
+        };
+        match expression {
+            Expression::StaticMemberExpression(member) => {
+                Some((dep(&member.object)?, member.property.name.to_string()))
+            }
+            Expression::ComputedMemberExpression(member) => match &member.expression {
+                Expression::StringLiteral(key) => {
+                    Some((dep(&member.object)?, key.value.as_str()?.to_owned()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn read(&mut self, span: Span, dep: usize, name: &str) -> Expression<'a> {
+        let (origin, name) = (self.origin)(dep, name);
+        if let Some(&(slot, late)) = self.slots.get(&(origin, name.clone())) {
+            let read = Expression::new_computed_member_expression(
+                span,
+                Expression::new_identifier(span, "$appsS", &self.ast),
+                Expression::new_numeric_literal(
+                    span,
+                    slot as f64,
+                    None,
+                    NumberBase::Decimal,
+                    &self.ast,
+                ),
+                false,
+                &self.ast,
+            );
+            return if late {
+                Expression::new_call_expression(
+                    span,
+                    read,
+                    None,
+                    ArenaVec::new_in(&self.ast),
+                    false,
+                    &self.ast,
+                )
+            } else {
+                read
+            };
+        }
+        if self.flat[origin] {
+            // WARNING: `ns.missing` on a namespace reads undefined. A named import of it fails at build time.
+            return Expression::new_unary_expression(
+                span,
+                UnaryOperator::Void,
+                Expression::new_numeric_literal(span, 0., None, NumberBase::Decimal, &self.ast),
+                &self.ast,
+            );
+        }
+        self.namespaces.insert(origin);
+        let source = namespace_access(origin, &name);
+        Parser::new(
+            self.allocator,
+            self.allocator.alloc_str(&source),
+            SourceType::cjs(),
+        )
+        .parse_expression()
+        .expect("namespace access is an expression")
+    }
+
+    // WARNING: like other bundlers, a called import gets `this` undefined, also through a namespace. It must not see the slots.
+    fn callee(&mut self, expression: &mut Expression<'a>) {
+        if let Some((dep, name)) = Self::import(expression) {
+            let span = expression.span();
+            let read = self.read(span, dep, &name);
+            let zero =
+                Expression::new_numeric_literal(span, 0., None, NumberBase::Decimal, &self.ast);
+            *expression = Expression::new_sequence_expression(
+                span,
+                ArenaVec::from_array_in([zero, read], &self.ast),
+                &self.ast,
+            );
+        }
+    }
+}
+
+impl<'a> VisitMut<'a> for Slots<'a, '_> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        if let Some((dep, name)) = Self::import(expression) {
+            *expression = self.read(expression.span(), dep, &name);
+            return;
+        }
+        walk_mut::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &mut CallExpression<'a>) {
+        self.callee(&mut call.callee);
+        walk_mut::walk_call_expression(self, call);
+    }
+
+    fn visit_tagged_template_expression(&mut self, tagged: &mut TaggedTemplateExpression<'a>) {
+        self.callee(&mut tagged.tag);
+        walk_mut::walk_tagged_template_expression(self, tagged);
+    }
+
+    fn visit_identifier_reference(&mut self, ident: &mut IdentifierReference<'a>) {
+        if let Some(dep) = ident
+            .name
+            .strip_prefix("$appsN")
+            .and_then(|id| id.parse().ok())
+        {
+            self.namespaces.insert(dep);
+        }
+    }
+}
+
+// Modules in import cycles can read each other's exports before their bodies end, so they keep namespaces.
+fn in_cycles(modules: &[Value]) -> Vec<bool> {
+    let edges = |id: usize| -> Vec<usize> {
+        ["deps", "stars", "required"]
+            .iter()
+            .flat_map(|field| modules[id][*field].as_array().into_iter().flatten())
+            .filter_map(Value::as_u64)
+            .map(|dep| dep as usize)
+            .collect()
+    };
+    let mut cyclic = vec![false; modules.len()];
+    let (mut index, mut low, mut on) = (
+        vec![usize::MAX; modules.len()],
+        vec![0; modules.len()],
+        vec![false; modules.len()],
+    );
+    let (mut stack, mut next) = (Vec::new(), 0);
+    for root in 0..modules.len() {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work = vec![(root, edges(root), 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some((id, deps, at)) = work.last_mut() {
+            let id = *id;
+            if let Some(&dep) = deps.get(*at) {
+                *at += 1;
+                cyclic[id] |= dep == id;
+                if index[dep] == usize::MAX {
+                    index[dep] = next;
+                    low[dep] = next;
+                    next += 1;
+                    stack.push(dep);
+                    on[dep] = true;
+                    work.push((dep, edges(dep), 0));
+                } else if on[dep] {
+                    low[id] = low[id].min(index[dep]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some((parent, ..)) = work.last() {
+                low[*parent] = low[*parent].min(low[id]);
+            }
+            if low[id] == index[id] {
+                let top = stack.iter().rposition(|&item| item == id).unwrap();
+                let members = stack.split_off(top);
+                let many = members.len() > 1;
+                for member in members {
+                    on[member] = false;
+                    cyclic[member] |= many;
+                }
+            }
+        }
+    }
+    cyclic
+}
+
+// The root bindings that a function can write after the module's body ended, so importers must read them live.
+fn late_writes(code: &str) -> Result<BTreeSet<String>> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, code, SourceType::cjs()).parse();
+    ensure!(
+        parsed.diagnostics.is_empty(),
+        "Invalid JavaScript in a module: {:?}",
+        parsed.diagnostics
+    );
+    let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
+    let scoping = semantic.scoping();
+    let root = scoping.root_scope_id();
+    Ok(scoping
+        .symbol_ids()
+        .filter(|&symbol| scoping.symbol_scope_id(symbol) == root)
+        .filter(|&symbol| {
+            scoping.get_resolved_references(symbol).any(|reference| {
+                reference.is_write()
+                    && scoping
+                        .scope_ancestors(reference.scope_id())
+                        .any(|scope| scope != root && scoping.scope_flags(scope).is_function())
+            })
+        })
+        .map(|symbol| scoping.symbol_name(symbol).to_owned())
+        .collect())
+}
+
 struct Uses(Vec<(usize, Option<String>)>);
 
 impl<'a> Visit<'a> for Uses {
@@ -3289,6 +3504,80 @@ fn bundle(
             }
         }
 
+        let cyclic = in_cycles(modules);
+        let flat: Vec<bool> = (0..modules.len())
+            .map(|id| {
+                let module = &modules[id];
+                module["linked"] == true
+                    && module["commonjs"] != true
+                    && module["preload"] != true
+                    && module["async"] == 0
+                    && !dynamic_stars[id]
+                    && !cyclic[id]
+            })
+            .collect();
+        let export_values: Vec<HashMap<&str, &str>> = modules
+            .iter()
+            .map(|module| {
+                module["exports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|export| {
+                        Some((export["name"].as_str()?, export["value"].as_str()?))
+                    })
+                    .collect()
+            })
+            .collect();
+        // Follows re-exports and `export *` to the module that holds a binding, so barrels cost nothing at run time.
+        let walk = |dep: usize, name: &str, through: &mut Vec<usize>| -> (usize, String) {
+            let (mut dep, mut name) = (dep, name.to_owned());
+            for _ in 0..256 {
+                let module = &modules[dep];
+                through.push(dep);
+                if module["linked"] != true
+                    || module["commonjs"] == true
+                    || module["preload"] == true
+                {
+                    break;
+                }
+                if let Some(value) = export_values[dep].get(name.as_str()) {
+                    let Some((target, rest)) = value.strip_prefix("$appsN").and_then(|value| {
+                        let digits = value
+                            .find(|c: char| !c.is_ascii_digit())
+                            .unwrap_or(value.len());
+                        Some((value[..digits].parse::<usize>().ok()?, &value[digits..]))
+                    }) else {
+                        break;
+                    };
+                    let next = if let Some(field) = rest.strip_prefix('.') {
+                        field.to_owned()
+                    } else if let Some(key) =
+                        rest.strip_prefix('[').and_then(|key| key.strip_suffix(']'))
+                    {
+                        serde_json::from_str::<String>(key).unwrap_or_default()
+                    } else {
+                        break;
+                    };
+                    (dep, name) = (target, next);
+                } else if name != "default"
+                    && !dynamic_stars[dep]
+                    && let Some(star) = module["stars"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .find(|&star| available[star as usize].contains(&name))
+                {
+                    dep = star as usize;
+                } else {
+                    break;
+                }
+            }
+            (dep, name)
+        };
+        let origin = |dep: usize, name: &str| walk(dep, name, &mut Vec::new());
+        let mut uses_of: Vec<Vec<(usize, Option<String>)>> = vec![Vec::new(); modules.len()];
         let mut needed = vec![BTreeSet::new(); modules.len()];
         for &id in entries.iter().chain(&builder.dynamic) {
             needed[id] = available[id].clone();
@@ -3384,6 +3673,7 @@ fn bundle(
                 uses.visit_program(&parsed.program);
                 for (target, name) in &uses.0 {
                     match name {
+                        Some(name) if flat[id] => requests.push(origin(*target, name)),
                         Some(name) => requests.push((*target, name.clone())),
                         None => {
                             whole[*target] = true;
@@ -3396,6 +3686,8 @@ fn bundle(
                     }
                 }
             }
+            uses_of[id] = std::mem::take(&mut uses.0);
+            let uses = Uses(std::mem::take(&mut uses_of[id]));
             for import in module["imports"].as_array().unwrap() {
                 let Some(local) = import["local"].as_str() else {
                     continue;
@@ -3437,6 +3729,7 @@ fn bundle(
                     queue.push_back(target);
                 }
             }
+            uses_of[id] = uses.0;
             let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.first()
             else {
                 bail!("Missing module factory: {id}");
@@ -3458,10 +3751,32 @@ fn bundle(
         }
         // WARNING: a module that package.json marks free of side effects is dropped when nothing reads it, and so is
         // everything only it imports, like other bundlers. Its importers get `null` for its namespace.
+        // WARNING: reads skip a barrel, but a barrel that was read through still runs its imports with side effects.
+        let mut through = BTreeSet::new();
+        for id in (0..modules.len()).filter(|&id| flat[id]) {
+            for (target, name) in &uses_of[id] {
+                let mut path = Vec::new();
+                if let Some(name) = name {
+                    walk(*target, name, &mut path);
+                }
+                path.pop();
+                through.extend(path);
+            }
+        }
+        let runs_imports = |id: usize| {
+            through.contains(&id)
+                && modules[id]["deps"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_u64)
+                    .any(|dep| modules[dep as usize]["pure"] != true)
+        };
         let pruned: Vec<_> = (0..modules.len())
             .map(|id| {
                 modules[id]["pure"] == true
                     && needed[id].is_empty()
+                    && !runs_imports(id)
                     && !whole[id]
                     && !dynamic_stars[id]
                     && !entries.contains(&id)
@@ -3477,19 +3792,174 @@ fn bundle(
                 .map(|id| id as usize)
                 .collect::<Vec<_>>()
         };
+        let flat: Vec<bool> = (0..modules.len())
+            .map(|id| flat[id] && !pruned[id])
+            .collect();
+        let mut namespaced = whole.clone();
+        for &id in entries.iter().chain(&builder.dynamic) {
+            namespaced[id] = true;
+        }
+        for (id, module) in modules.iter().enumerate() {
+            if !pruned[id] && !flat[id] {
+                for dep in ids(module, "deps").into_iter().chain(ids(module, "stars")) {
+                    namespaced[dep] = true;
+                }
+            }
+        }
+        let mut slots: HashMap<(usize, String), (usize, bool)> = HashMap::new();
+        let mut tails = vec![String::new(); modules.len()];
+        for id in (0..modules.len()).filter(|&id| flat[id]) {
+            let late = late_writes(modules[id]["code"].as_str().unwrap())?;
+            for name in &needed[id] {
+                if origin(id, name) != (id, name.clone()) {
+                    continue;
+                }
+                let Some(value) = export_values[id].get(name.as_str()) else {
+                    continue;
+                };
+                let slot = slots.len();
+                let live = late.contains(*value);
+                slots.insert((id, name.clone()), (slot, live));
+                let _ = write!(
+                    tails[id],
+                    "$appsS[{slot}]={}{value};",
+                    if live { "()=>" } else { "" }
+                );
+            }
+        }
+        let mut arguments: Vec<Vec<Option<usize>>> = vec![Vec::new(); modules.len()];
+        for id in (0..modules.len()).filter(|&id| flat[id]) {
+            let module = &modules[id];
+            let source = format!("{}\n;{}", module["code"].as_str().unwrap(), tails[id]);
+            let allocator = Allocator::default();
+            let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
+            ensure!(
+                parsed.diagnostics.is_empty(),
+                "Invalid JavaScript in module {id} ({}): {:?}",
+                module["url"],
+                parsed.diagnostics
+            );
+            let mut linker = Slots {
+                ast: AstBuilder::new(&allocator),
+                allocator: &allocator,
+                origin: &origin,
+                flat: &flat,
+                slots: &slots,
+                namespaces: BTreeSet::new(),
+            };
+            linker.visit_program(&mut parsed.program);
+            let params = linker.namespaces.iter().fold(String::new(), |params, dep| {
+                params + ",$appsN" + &dep.to_string()
+            });
+            let declared = linker.namespaces.into_iter().collect::<Vec<_>>();
+            let body = Codegen::new().build(&parsed.program).code;
+            let source = format!(
+                "$appsFactory=function($appsS,$appsImport,$appsRequire{params}){{'use strict';\n{body}\n}};"
+            );
+            let allocator = Allocator::default();
+            let mut parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
+            ensure!(
+                parsed.diagnostics.is_empty(),
+                "Invalid linked JavaScript in module {id} ({}): {:?}",
+                module["url"],
+                parsed.diagnostics
+            );
+            let result =
+                Minifier::new(MinifierOptions::default()).minify(&allocator, &mut parsed.program);
+            // WARNING: the linker also saw reads in dead code, of modules that may be pruned, so only what the
+            // minifier kept gets an argument. Parameters stay in place, so the others get nothing.
+            let mut kept = Uses(Vec::new());
+            kept.visit_program(&parsed.program);
+            let kept: BTreeSet<usize> = kept.0.into_iter().map(|(dep, _)| dep).collect();
+            for &dep in &kept {
+                namespaced[dep] = true;
+            }
+            arguments[id] = declared
+                .iter()
+                .map(|dep| kept.contains(dep).then_some(*dep))
+                .collect::<Vec<_>>();
+            while arguments[id].last() == Some(&None) {
+                arguments[id].pop();
+            }
+            let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.first()
+            else {
+                bail!("Missing module factory: {id}");
+            };
+            let Expression::AssignmentExpression(assignment) = &statement.expression else {
+                bail!("Invalid module factory: {id}");
+            };
+            let mut codegen = Codegen::new()
+                .with_options(CodegenOptions {
+                    minify: true,
+                    ascii_only: true,
+                    comments: CommentOptions::disabled(),
+                    ..CodegenOptions::default()
+                })
+                .with_scoping(result.scoping)
+                .with_private_member_mappings(result.class_private_mappings);
+            codegen.print_expression(&assignment.right);
+            factories[id] = codegen.into_source_text();
+        }
+        // WARNING: an import that skips a pruned barrel still needs its origin to run, in the barrel's place.
+        let linked_deps = |id: usize| -> Vec<usize> {
+            let mut deps = Vec::new();
+            for dep in ids(&modules[id], "deps") {
+                if pruned[dep] {
+                    deps.extend(uses_of[id].iter().filter_map(|(target, name)| {
+                        if *target != dep {
+                            return None;
+                        }
+                        Some(origin(dep, name.as_deref()?).0)
+                    }));
+                } else {
+                    deps.push(dep);
+                }
+            }
+            deps.extend(uses_of[id].iter().filter_map(|(target, name)| {
+                Some(origin(*target, name.as_deref()?).0).filter(|&dep| !pruned[dep])
+            }));
+            let mut seen = BTreeSet::new();
+            deps.retain(|&dep| dep != id && !pruned[dep] && seen.insert(dep));
+            deps
+        };
         let mut compiled = vec![false; modules.len()];
         for (id, module) in modules.iter().enumerate().filter(|&(id, _)| !pruned[id]) {
             let mut line = format!("$appsDefine({{id:{id}");
-            let deps: Vec<_> = ids(module, "deps")
-                .into_iter()
-                .map(|dep| (!pruned[dep]).then_some(dep))
-                .collect();
+            let deps: Vec<_> = if flat[id] {
+                linked_deps(id).into_iter().map(Some).collect()
+            } else {
+                ids(module, "deps")
+                    .into_iter()
+                    .map(|dep| (!pruned[dep]).then_some(dep))
+                    .collect()
+            };
             let stars: Vec<_> = ids(module, "stars")
                 .into_iter()
-                .filter(|&star| !pruned[star])
+                .filter(|&star| !pruned[star] && !flat[id])
                 .collect();
             if !deps.is_empty() {
                 let _ = write!(line, ",deps:{}", json!(deps));
+            }
+            if flat[id] {
+                line.push_str(",flat:1");
+                if !arguments[id].is_empty() {
+                    let _ = write!(line, ",args:{}", json!(arguments[id]));
+                }
+                if namespaced[id] {
+                    let table: serde_json::Map<String, Value> = needed[id]
+                        .iter()
+                        .map(|name| {
+                            let (target, field) = origin(id, name);
+                            let value = match slots.get(&(target, field.clone())) {
+                                Some(&(slot, false)) => json!(slot),
+                                Some(&(slot, true)) => json!(-(slot as i64) - 1),
+                                None => json!([target, field]),
+                            };
+                            (name.clone(), value)
+                        })
+                        .collect();
+                    let _ = write!(line, ",slots:{}", ascii_json(&Value::Object(table))?);
+                }
             }
             if !stars.is_empty() {
                 let _ = write!(line, ",stars:{}", json!(stars));
@@ -3574,6 +4044,9 @@ fn bundle(
                 }
                 owner[id] = chunks.len();
                 members.push(id);
+                if flat[id] {
+                    stack.extend(linked_deps(id));
+                }
                 stack.extend(
                     ids(&modules[id], "deps")
                         .into_iter()
@@ -4422,7 +4895,7 @@ fn css(
             !name.contains('\\'),
             "Escaped CSS imports are not supported"
         );
-        if name == "tailwindcss"
+        if matches!(name, "liquid-glass" | "sf-symbols" | "tailwindcss")
             || name.strip_prefix("tailwindcss/").is_some_and(|part| {
                 matches!(
                     part.strip_suffix(".css").unwrap_or(part),

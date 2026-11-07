@@ -1,6 +1,6 @@
 use crate::{
-    DevicePixels, Size,
-    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
+    Bounds, DevicePixels, Rgba, ScaledPixels, Size,
+    atlas::{Atlas, AtlasBackend, Packer, TextureList, page_size},
     frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -14,12 +14,13 @@ use objc2_metal::{
     MTLCommandEncoder, MTLCommandQueue, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
-    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLSize,
-    MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect,
+    MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::{
-    CACurrentMediaTime, CAKeyframeAnimation, CAMediaTiming, CAMetalDrawable, CAMetalLayer,
-    CATransaction, CATransform3D, NSValueCATransform3DAdditions, kCAFillModeBoth,
+    CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming, CAMetalDrawable, CAMetalLayer,
+    CATransaction, CATransform3D, NSValueCATransform3DAdditions, kCAAnimationDiscrete,
+    kCAFillModeBoth,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -101,6 +102,7 @@ impl Drop for Present {
 pub(crate) struct Renderer {
     device: Device,
     layer: Retained<CAMetalLayer>,
+    size: CGSize,
     unified: bool,
     presents_with_transaction: bool,
     present: Option<Present>,
@@ -112,6 +114,14 @@ pub(crate) struct Renderer {
     targets: Vec<usize>,
     frame: RenderFrame,
     promoted: Vec<Promoted>,
+    glass: Vec<NativeGlass>,
+    glass_update: bool,
+    caret: Option<(
+        Retained<CALayer>,
+        Bounds<ScaledPixels>,
+        Rgba,
+        std::time::Instant,
+    )>,
     restacked: bool,
 }
 
@@ -125,6 +135,11 @@ struct Promoted {
     index: usize,
     sublayer: Retained<CAMetalLayer>,
     drawn: bool,
+}
+
+struct NativeGlass {
+    index: usize,
+    surface: super::glass::GlassSurface,
 }
 
 enum Blend {
@@ -141,6 +156,7 @@ struct Pipelines {
     poly: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     composites: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     blurs: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    copy: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
 
 impl Pipelines {
@@ -202,7 +218,49 @@ impl Pipelines {
             poly: pipeline("polychrome_sprite", Blend::Over)?,
             composites: pipeline("composite", Blend::Premultiplied)?,
             blurs: pipeline("blur", Blend::Replace)?,
+            copy: pipeline("copy", Blend::Replace)?,
         })
+    }
+
+    // WARNING: on Apple GPUs a blit encoder makes the driver hold about 84 MB more until drawing stops, on top of
+    // the 126 MB for render encoders, so copies are draws. `offset` goes from a target pixel to its source pixel.
+    fn copy(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        source: &ProtocolObject<dyn MTLTexture>,
+        offset: [i32; 2],
+        target: &ProtocolObject<dyn MTLTexture>,
+        [x, y, width, height]: [i32; 4],
+        load: MTLLoadAction,
+    ) -> Result<()> {
+        let descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: index zero is within the color attachment array.
+        let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(target));
+        attachment.setLoadAction(load);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let encoder = commands
+            .renderCommandEncoderWithDescriptor(&descriptor)
+            .context("creating render command encoder")?;
+        encoder.setRenderPipelineState(&self.copy);
+        encoder.setScissorRect(MTLScissorRect {
+            x: x as usize,
+            y: y as usize,
+            width: width as usize,
+            height: height as usize,
+        });
+        // SAFETY: Metal copies the offset before this returns, and the command buffer retains the texture.
+        unsafe {
+            encoder.setFragmentBytes_length_atIndex(
+                NonNull::from(&offset).cast::<c_void>(),
+                mem::size_of_val(&offset),
+                0,
+            );
+            encoder.setFragmentTexture_atIndex(Some(source), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+        encoder.endEncoding();
+        Ok(())
     }
 }
 
@@ -243,6 +301,7 @@ impl Renderer {
             pipelines: Pipelines::new(&device)?,
             device,
             layer,
+            size: CGSize::new(0., 0.),
             unified,
             presents_with_transaction: false,
             present: None,
@@ -253,6 +312,9 @@ impl Renderer {
             targets: Vec::new(),
             frame: RenderFrame::default(),
             promoted: Vec::new(),
+            glass: Vec::new(),
+            glass_update: false,
+            caret: None,
             restacked: false,
         })
     }
@@ -405,6 +467,75 @@ impl Renderer {
         self.restacked = true;
     }
 
+    pub fn set_caret(&mut self, caret: Option<(Bounds<ScaledPixels>, Rgba, std::time::Instant)>) {
+        if self
+            .caret
+            .as_ref()
+            .map(|(_, bounds, color, since)| (*bounds, *color, *since))
+            == caret
+        {
+            return;
+        }
+        CATransaction::setDisableActions(true);
+        self.restacked = true;
+        if let Some((layer, ..)) = self.caret.take() {
+            layer.removeFromSuperlayer();
+        }
+        let Some((bounds, color, since)) = caret else {
+            return;
+        };
+        let scale = self.layer.contentsScale();
+        let (x, y, w, h) = (
+            f64::from(bounds.origin.x.0) / scale,
+            f64::from(bounds.origin.y.0) / scale,
+            f64::from(bounds.size.width.0) / scale,
+            f64::from(bounds.size.height.0) / scale,
+        );
+        let layer = CALayer::new();
+        layer.setAnchorPoint(objc2_core_foundation::CGPoint::new(0., 0.));
+        layer.setBounds(objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(0., 0.),
+            CGSize::new(w, h),
+        ));
+        layer.setPosition(objc2_core_foundation::CGPoint::new(
+            x,
+            if self.layer.isGeometryFlipped() {
+                y
+            } else {
+                self.layer.bounds().size.height - y - h
+            },
+        ));
+        let srgb = objc2_core_graphics::CGColor::new_srgb(
+            f64::from(color.r),
+            f64::from(color.g),
+            f64::from(color.b),
+            f64::from(color.a),
+        );
+        layer.setBackgroundColor(Some(&srgb));
+        // WARNING: the timeline starts when the caret last moved, so the blink goes on from the frames that drew it.
+        let blink = crate::CARET_BLINK.as_secs_f64();
+        let animation = CAKeyframeAnimation::animationWithKeyPath(Some(ns_string!("opacity")));
+        let values = NSArray::from_retained_slice(&[NSNumber::new_f32(1.), NSNumber::new_f32(0.)]);
+        // SAFETY: an array of numbers is an array of objects, which is what this key path animates.
+        unsafe { animation.setValues(Some(&*Retained::as_ptr(&values).cast::<NSArray>())) };
+        animation.setKeyTimes(Some(&NSArray::from_retained_slice(&[
+            NSNumber::new_f64(0.),
+            NSNumber::new_f64(0.5),
+            NSNumber::new_f64(1.),
+        ])));
+        // SAFETY: constants of Core Animation.
+        animation.setCalculationMode(unsafe { kCAAnimationDiscrete });
+        animation.setDuration(blink * 2.);
+        animation.setRepeatCount(f32::INFINITY);
+        animation.setBeginTime(CACurrentMediaTime() - since.elapsed().as_secs_f64());
+        // SAFETY: constants of Core Animation.
+        animation.setFillMode(unsafe { kCAFillModeBoth });
+        animation.setRemovedOnCompletion(false);
+        layer.addAnimation_forKey(&animation, Some(ns_string!("opacity")));
+        self.layer.addSublayer(&layer);
+        self.caret = Some((layer, bounds, color, since));
+    }
+
     pub fn atlas(&self) -> &Rc<MetalAtlas> {
         &self.atlas
     }
@@ -415,14 +546,26 @@ impl Renderer {
 
     // WARNING: sets the size of the next drawables. Only the thread that draws changes it, so a frame always
     // fits its scene.
-    pub fn set_drawable_size(&self, size: CGSize) {
-        if self.layer.drawableSize() != size {
-            self.layer.setDrawableSize(size);
-        }
+    pub fn set_drawable_size(&mut self, size: CGSize) {
+        self.size = size;
     }
 
     pub fn take_present(&mut self) -> Option<Present> {
         self.present.take()
+    }
+
+    pub fn take_glass_update(
+        &mut self,
+    ) -> Option<(Vec<super::glass::GlassSurface>, Option<Present>)> {
+        mem::take(&mut self.glass_update).then(|| {
+            (
+                self.glass
+                    .iter()
+                    .map(|glass| glass.surface.clone())
+                    .collect(),
+                self.present.take(),
+            )
+        })
     }
 
     pub fn set_presents_with_transaction(&mut self, on: bool) {
@@ -449,18 +592,108 @@ impl Renderer {
         POOL.with(|pool| pool.borrow_mut().resize(MIN_INSTANCE_BUFFER_SIZE));
     }
 
+    pub fn release(&mut self) {
+        self.atlas.release_images();
+        self.trim();
+        self.pool.clear();
+        POOL.with(|pool| pool.borrow_mut().buffers.clear());
+        // WARNING: the layer frees its spare drawables only when their size changes. It keeps showing its
+        // last frame, and the next frame sets the size back.
+        self.layer.setDrawableSize(CGSize::new(1., 1.));
+        for glass in &self.glass {
+            glass.surface.layer.setDrawableSize(CGSize::new(1., 1.));
+        }
+    }
+
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
-        let size = self.layer.drawableSize();
+        let size = self.size;
         if size.width < 1. || size.height < 1. {
             return capture.then(|| Err(anyhow::anyhow!("The window has no size")));
         }
-        if capture {
+        if self.layer.drawableSize() != size {
+            self.layer.setDrawableSize(size);
+        }
+        let had_glass = !self.glass.is_empty();
+        let scale = self.layer.contentsScale();
+        let mut glass = Vec::new();
+        if super::glass::available() {
+            for primitive in &scene.layers[0].effects {
+                let index = primitive.layer;
+                let layer = &scene.layers[index];
+                let Some(effect) = &layer.effect else {
+                    continue;
+                };
+                let (Some(config), Some(bounds)) = (&effect.glass, layer.bounds) else {
+                    continue;
+                };
+                let mask = &effect.content_mask;
+                if effect.transform.is_some()
+                    || effect.opacity != 1.
+                    || effect.color_matrix.is_some()
+                    || effect.blur != 0.
+                    || effect.shadow.is_some()
+                    || effect.blend_mode != crate::BlendMode::Normal
+                    || effect.clip.is_some()
+                    || effect.mask.is_some()
+                    || effect.backdrop.is_some()
+                    || bounds != config.bounds
+                    || bounds.intersect(&mask.bounds) != bounds
+                    || mask.corner_radii != Default::default()
+                    || scene.paints_over(index, bounds)
+                    || bounds.size.width.0 > 4096.
+                    || bounds.size.height.0 > 4096.
+                {
+                    continue;
+                }
+                let region = crate::frame::region(bounds);
+                if region[2] <= 0 || region[3] <= 0 {
+                    continue;
+                }
+                let sublayer = match self
+                    .glass
+                    .iter()
+                    .position(|old| old.surface.key == config.key)
+                {
+                    Some(at) => self.glass.swap_remove(at).surface.layer,
+                    None => {
+                        let sublayer = CAMetalLayer::new();
+                        sublayer.setDevice(Some(&self.device));
+                        sublayer.setPixelFormat(FORMAT);
+                        sublayer.setColorspace(self.layer.colorspace().as_deref());
+                        sublayer.setFramebufferOnly(false);
+                        sublayer.setOpaque(false);
+                        sublayer.setPresentsWithTransaction(true);
+                        sublayer.setMaximumDrawableCount(2);
+                        sublayer.setAllowsNextDrawableTimeout(false);
+                        sublayer
+                    }
+                };
+                sublayer.setContentsScale(scale);
+                sublayer.setDrawableSize(CGSize::new(region[2] as f64, region[3] as f64));
+                glass.push(NativeGlass {
+                    index,
+                    surface: super::glass::GlassSurface {
+                        key: config.key,
+                        layer: sublayer,
+                        bounds: region.map(|value| f64::from(value) / scale),
+                        radius: f64::from(config.corner_radius) / scale,
+                        tint: config.tint,
+                        clear: config.clear,
+                        interactive: config.interactive,
+                    },
+                });
+            }
+        }
+        self.glass = glass;
+        let native_capture = capture && !self.glass.is_empty();
+        let native_transaction = had_glass || !self.glass.is_empty();
+        if capture && !native_capture {
             self.demote();
         }
         // WARNING: new or removed sublayers show in the Core Animation transaction, so the frame that
         // draws their layers elsewhere presents in it too.
         let resizing = self.presents_with_transaction;
-        let transact = resizing || mem::take(&mut self.restacked);
+        let transact = resizing || mem::take(&mut self.restacked) || native_transaction;
         self.layer.setPresentsWithTransaction(transact);
         let Some(drawable) = self.layer.nextDrawable() else {
             eprintln!("apps: no drawable for a {size:?} window");
@@ -475,7 +708,8 @@ impl Renderer {
                 return capture.then(|| Err(error));
             }
         };
-        let readback = capture.then(|| self.read_back(&commands, &texture, window));
+        let readback =
+            (capture && !native_capture).then(|| self.read_back(&commands, &texture, window));
         if transact {
             commands.commit();
             commands.waitUntilScheduled();
@@ -485,7 +719,7 @@ impl Renderer {
                     sublayer.present();
                 }
             };
-            if resizing {
+            if resizing || native_transaction {
                 self.present = Some(Present(Some(super::Sendable::new(Box::new(present)))));
             } else {
                 present();
@@ -497,20 +731,30 @@ impl Renderer {
             }
             commands.commit();
         }
-        readback.map(|buffer| {
-            let buffer = buffer?;
-            commands.waitUntilCompleted();
-            // SAFETY: the GPU finished writing the shared buffer.
-            let bgra = unsafe {
-                slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
-            };
-            let mut pixels = vec![0; bgra.len()];
-            for (rgba, &[b, g, r, a]) in pixels.as_chunks_mut().0.iter_mut().zip(bgra.as_chunks().0)
-            {
-                *rgba = [r, g, b, a];
-            }
-            Ok((window, pixels))
-        })
+        self.glass_update = native_transaction;
+        readback
+            .map(|buffer| {
+                let buffer = buffer?;
+                commands.waitUntilCompleted();
+                // SAFETY: the GPU finished writing the shared buffer.
+                let bgra = unsafe {
+                    slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
+                };
+                let mut pixels = vec![0; bgra.len()];
+                for (rgba, &[b, g, r, a]) in
+                    pixels.as_chunks_mut().0.iter_mut().zip(bgra.as_chunks().0)
+                {
+                    *rgba = [r, g, b, a];
+                }
+                Ok((window, pixels))
+            })
+            .or_else(|| {
+                native_capture.then(|| {
+                    Err(anyhow::anyhow!(
+                        "capturePage does not support native Liquid Glass"
+                    ))
+                })
+            })
     }
 
     fn read_back(
@@ -567,6 +811,10 @@ impl Renderer {
                 frame.content.push(promoted.index);
             }
         }
+        for glass in &self.glass {
+            frame.skip.push(glass.index);
+            frame.content.push(glass.index);
+        }
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         for (_, _, idle) in &mut self.pool {
             *idle = idle.saturating_add(1);
@@ -619,43 +867,37 @@ impl Renderer {
             .context("creating command buffer")?;
         let result = self.encode(&frame, &commands, drawable, &bindings);
         let mut sublayers = Vec::new();
-        if result.is_ok() && !frame.promoted.is_empty() {
-            let blit = commands
-                .blitCommandEncoder()
-                .context("creating blit command encoder")?;
+        if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
                 let Target::Layer(layer) = target else {
                     continue;
                 };
-                let Some(promoted) = self.promoted.iter_mut().find(|p| p.index == index) else {
+                let promoted = self.promoted.iter_mut().find(|p| p.index == index);
+                let native = self.glass.iter().find(|glass| glass.index == index);
+                let Some(output) = promoted
+                    .as_ref()
+                    .map(|p| &p.sublayer)
+                    .or_else(|| native.map(|glass| &glass.surface.layer))
+                else {
                     continue;
                 };
-                let Some(sublayer) = promoted.sublayer.nextDrawable() else {
+                let Some(sublayer) = output.nextDrawable() else {
                     continue;
                 };
                 let source = &self.pool[self.targets[frame.layers[layer].texture]].0;
-                // SAFETY: both textures hold the region, which starts at the layer target's origin.
-                unsafe {
-                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        source,
-                        0,
-                        0,
-                        MTLOrigin { x: 0, y: 0, z: 0 },
-                        MTLSize {
-                            width: region[2] as usize,
-                            height: region[3] as usize,
-                            depth: 1,
-                        },
-                        &sublayer.texture(),
-                        0,
-                        0,
-                        MTLOrigin { x: 0, y: 0, z: 0 },
-                    );
+                self.pipelines.copy(
+                    &commands,
+                    source,
+                    [0, 0],
+                    &sublayer.texture(),
+                    [0, 0, region[2], region[3]],
+                    MTLLoadAction::DontCare,
+                )?;
+                if let Some(promoted) = promoted {
+                    promoted.drawn = true;
                 }
-                promoted.drawn = true;
                 sublayers.push(sublayer);
             }
-            blit.endEncoding();
         }
         self.frame = frame;
         result?;
@@ -813,36 +1055,15 @@ impl Renderer {
                     end!();
                     current.1 = false;
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
-                    let blit = commands
-                        .blitCommandEncoder()
-                        .context("creating blit command encoder")?;
-                    // SAFETY: the region lies within both textures.
-                    unsafe {
-                        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                            texture(*src),
-                            0,
-                            0,
-                            MTLOrigin {
-                                x: (region[0] - from[0]) as usize,
-                                y: (region[1] - from[1]) as usize,
-                                z: 0,
-                            },
-                            MTLSize {
-                                width: region[2] as usize,
-                                height: region[3] as usize,
-                                depth: 1,
-                            },
-                            texture(*dst),
-                            0,
-                            0,
-                            MTLOrigin {
-                                x: (region[0] - to[0]) as usize,
-                                y: (region[1] - to[1]) as usize,
-                                z: 0,
-                            },
-                        );
-                    }
-                    blit.endEncoding();
+                    // WARNING: a pooled texture can hold other layers, so the rest of it is loaded.
+                    pipelines.copy(
+                        commands,
+                        texture(*src),
+                        [to[0] - from[0], to[1] - from[1]],
+                        texture(*dst),
+                        [region[0] - to[0], region[1] - to[1], region[2], region[3]],
+                        MTLLoadAction::Load,
+                    )?;
                 }
                 Command::Composite {
                     src,
@@ -1044,13 +1265,10 @@ impl AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, MAX_TEXTURE_SIZE as i32);
-                let texture_size = Size::new(
-                    DevicePixels(side(size.width.0)),
-                    DevicePixels(side(size.height.0)),
-                );
+                let texture_size =
+                    page_size(size).map(|side| DevicePixels(side.0.min(MAX_TEXTURE_SIZE as i32)));
                 let descriptor = MTLTextureDescriptor::new();
-                // SAFETY: both sides are within 1024..=16384.
+                // SAFETY: both sides are within 1..=16384.
                 unsafe {
                     descriptor.setWidth(texture_size.width.0 as usize);
                     descriptor.setHeight(texture_size.height.0 as usize);

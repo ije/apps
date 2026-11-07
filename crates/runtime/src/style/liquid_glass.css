@@ -1,0 +1,16 @@
+@layer theme,base,components,utilities;
+@layer components{
+.glass{-apps-glass:regular;appearance:none;background-color:transparent;border:0;border-radius:9999px}
+.glass-clear{-apps-glass:clear;appearance:none;background-color:transparent;border:0;border-radius:9999px}
+.glass-interactive{-apps-glass-interactive:true}
+.glass-tint-blue{-apps-glass-tint-color:#007aff}
+.glass-tint-red{-apps-glass-tint-color:#ff3b30}
+.glass-tint-green{-apps-glass-tint-color:#34c759}
+.glass-tint-orange{-apps-glass-tint-color:#ff9500}
+.glass-tint-yellow{-apps-glass-tint-color:#ffcc00}
+.glass-tint-purple{-apps-glass-tint-color:#af52de}
+.glass-tint-pink{-apps-glass-tint-color:#ff2d55}
+.glass-tint-teal{-apps-glass-tint-color:#30b0c7}
+.glass-tint-indigo{-apps-glass-tint-color:#5856d6}
+.glass-tint-gray{-apps-glass-tint-color:#8e8e93}
+}

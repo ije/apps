@@ -1058,3 +1058,13 @@ fragment float4 blur_fragment(BlurVertexOutput input [[stage_in]],
   float2 position = globals.viewport_origin + input.position.xy * blur.scale;
   return gaussian_sample(source, position, blur.direction, blur.sigma, blur.scale, blur.source_rect);
 }
+
+vertex float4 copy_vertex(uint vertex_id [[vertex_id]]) {
+  return float4(unit_vertex(vertex_id) * 2. - 1., 0., 1.);
+}
+
+fragment float4 copy_fragment(float4 position [[position]],
+                              constant int2 &offset [[buffer(0)]],
+                              texture2d<float> source [[texture(0)]]) {
+  return source.read(uint2(int2(position.xy) + offset));
+}

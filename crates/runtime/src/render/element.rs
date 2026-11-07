@@ -751,6 +751,8 @@ fn create(
         || style
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
+        || cfg!(target_os = "macos")
+            && matches!(style.get(Prop::APP_GLASS), Some("regular" | "clear"))
         || opacity < 1. && !node.children.is_empty()
         || composited)
         .then_some(opacity);
@@ -2616,6 +2618,28 @@ fn create(
     }
     if !inner_shadows.is_empty() {
         el = el.child(inset_shadows(inner_shadows, radius, borders));
+    }
+    if cfg!(target_os = "macos")
+        && node.tag == "span"
+        && node.children.iter().all(|&child| {
+            let child = &doc.nodes[child];
+            child.tag == "#comment" || child.tag == "#text" && child.text.trim().is_empty()
+        })
+        && let Some(symbol) = style
+            .get(Prop::APP_SF_SYMBOL)
+            .filter(|name| *name != "none")
+    {
+        let symbol = symbol.trim_matches(['\'', '"']).to_owned();
+        el = el.child(
+            renderer::canvas(
+                |_, _| (),
+                move |bounds, _, window| window.paint_symbol(&symbol, bounds, ink),
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        );
     }
     if image_child.is_some() || cropped.is_some() {
         let inset = |side: usize| px(borders[side] + padding[side]);

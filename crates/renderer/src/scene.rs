@@ -141,6 +141,43 @@ impl Scene {
         &mut self.layers[index]
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn at_root(&self) -> bool {
+        self.active.is_empty() && self.layers[0].stack.is_empty()
+    }
+
+    // The order a box at `bounds` takes now, one above all that overlaps it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn probe(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        self.layers[0].tree.insert(bounds)
+    }
+
+    // WARNING: text doesn't count. A glyph over a caret doesn't hide it, while a popup always paints a box.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn covers(&self, order: DrawOrder, reach: Bounds<ScaledPixels>) -> bool {
+        let window = &self.layers[0];
+        let over = |other: DrawOrder, bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>| {
+            other > order && bounds.intersect(&mask).intersects(&reach)
+        };
+        window.shadows.iter().any(|shadow| {
+            let bounds = shadow
+                .bounds
+                .dilate(ScaledPixels(shadow.blur_radius.0 * 3.));
+            over(shadow.order, bounds, shadow.content_mask.bounds)
+        }) || window
+            .quads
+            .iter()
+            .any(|quad| over(quad.order, quad.bounds, quad.content_mask.bounds))
+            || window
+                .poly
+                .iter()
+                .any(|sprite| over(sprite.order, sprite.bounds, sprite.content_mask.bounds))
+            || window
+                .effects
+                .iter()
+                .any(|effect| over(effect.order, effect.bounds, effect.content_mask.bounds))
+    }
+
     pub(crate) fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let layer = self.current();
         let order = layer.tree.insert(bounds);
@@ -171,6 +208,9 @@ impl Scene {
 
     pub(crate) fn push_effect(&mut self, effect: EffectState, key: Option<u64>) {
         let mut layer = self.spare.pop().unwrap_or_default();
+        if let Some(glass) = &effect.glass {
+            layer.bounds = Some(glass.bounds);
+        }
         layer.effect = Some(effect);
         if let Some(key) = key {
             self.keyed.push((key, self.layers.len()));
@@ -413,6 +453,7 @@ pub struct PaintEffect {
     pub clip: Option<(Bounds<Pixels>, Radii<Pixels>)>,
     pub mask: Option<(std::sync::Arc<RenderImage>, Bounds<Pixels>)>,
     pub backdrop: Option<Backdrop>,
+    pub glass: Option<Glass>,
     pub key: Option<u64>,
 }
 
@@ -428,9 +469,30 @@ impl Default for PaintEffect {
             clip: None,
             mask: None,
             backdrop: None,
+            glass: None,
             key: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Glass {
+    pub key: u64,
+    pub bounds: Bounds<Pixels>,
+    pub corner_radius: Pixels,
+    pub tint: Option<Rgba>,
+    pub clear: bool,
+    pub interactive: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GlassState {
+    pub key: u64,
+    pub bounds: Bounds<ScaledPixels>,
+    pub corner_radius: f32,
+    pub tint: Option<Rgba>,
+    pub clear: bool,
+    pub interactive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -460,6 +522,7 @@ pub(crate) struct EffectState {
     pub clip: Option<(Bounds<ScaledPixels>, Radii<ScaledPixels>)>,
     pub mask: Option<(AtlasTile, Bounds<ScaledPixels>)>,
     pub backdrop: Option<BackdropState>,
+    pub glass: Option<GlassState>,
     pub content_mask: ContentMask<ScaledPixels>,
 }
 

@@ -23,7 +23,7 @@ pub(super) fn paint_caret(
     color: renderer::Rgba,
     window: &mut Window,
 ) {
-    const BLINK: Duration = Duration::from_millis(500);
+    const BLINK: Duration = renderer::CARET_BLINK;
     if color.a == 0. || !window.is_window_active() {
         return;
     }
@@ -35,6 +35,11 @@ pub(super) fn paint_caret(
     let (_, since, wake) = caret.get_or_insert((key, now, None));
     // WARNING: a timer can fire just before its time, so the phase rounds up within 8 ms.
     let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
+    // WARNING: the first phase draws, so typing and scrolling move the caret in the same frame as the text.
+    if phase > 0 && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2)) {
+        *wake = None;
+        return;
+    }
     if wake.as_ref().is_none_or(|(old, _)| *old != phase) {
         let due = *since + BLINK * (phase + 1);
         *wake = Some((phase, window.timer(due - now, |window, _| window.refresh())));

@@ -22,6 +22,7 @@ pub struct JavaScriptCore {
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: Option<unsafe extern "C" fn(Ptr)>,
+    evaluate_no_copy: Option<unsafe extern "C" fn(Ptr, *const c_char, usize, Ptr, *mut Ptr) -> Ptr>,
     pub(crate) busy: std::cell::Cell<std::time::Duration>,
     busy_mark: std::cell::Cell<(std::time::Instant, std::time::Duration)>,
     burst: std::cell::Cell<bool>,
@@ -201,6 +202,10 @@ impl JavaScriptCore {
                     .get(b"JSContextGroupShrinkFootprint\0")
                     .ok()
                     .map(|s| *s),
+                evaluate_no_copy: library
+                    .get(b"JSEvaluateScriptLatin1NoCopy\0")
+                    .ok()
+                    .map(|s| *s),
                 busy: Default::default(),
                 busy_mark: std::cell::Cell::new((std::time::Instant::now(), Default::default())),
                 burst: Default::default(),
@@ -353,7 +358,10 @@ impl JavaScriptCore {
             .set(self.burst.get() || ran >= Duration::from_millis(100));
         if ran >= Duration::from_millis(20) {
             self.quiet.set(0);
-            return false;
+            // WARNING: an app whose timers run 20 ms or more in every second never has a quiet one, so the
+            // 5-minute collection takes any second that isn't busy.
+            return ran < Duration::from_millis(100)
+                && now.duration_since(self.shrunk.get()) >= Duration::from_secs(300);
         }
         self.quiet.set(self.quiet.get() + 1);
         self.burst.get() && self.quiet.get() >= 5
@@ -622,9 +630,8 @@ unsafe extern "C" fn chunk(
         .try_borrow()
         .ok()
         .and_then(|host| host.scripts.get(&name).cloned());
-    let Some(source) = source
-        .as_deref()
-        .and_then(|source| std::str::from_utf8(source).ok())
+    let Some(source) =
+        source.filter(|source| source.is_ascii() || std::str::from_utf8(source).is_ok())
     else {
         if !exception.is_null() {
             let message = api.string(&format!("Error: Missing bundled script: {name}"));
@@ -635,13 +642,22 @@ unsafe extern "C" fn chunk(
         }
         return ptr::null_mut();
     };
-    let script = api.string(source);
     let url = api.string(&format!("apps:///{name}"));
-    let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
-    unsafe {
-        (api.string_release)(script);
-        (api.string_release)(url);
-    }
+    // WARNING: `JSEvaluateScript` keeps its own copy of the source, as UTF-16 if it holds a NUL or any non-ASCII
+    // byte. JSC points at these bytes instead, so they are never released. Mapped pages stay clean, so they don't
+    // count in the footprint, and windows and workers share them.
+    let result = if let Some(evaluate) = api.evaluate_no_copy
+        && source.is_ascii()
+    {
+        let source = std::mem::ManuallyDrop::new(source);
+        unsafe { evaluate(ctx, source.as_ptr().cast(), source.len(), url, exception) }
+    } else {
+        let script = api.string(&String::from_utf8_lossy(&source));
+        let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
+        unsafe { (api.string_release)(script) };
+        result
+    };
+    unsafe { (api.string_release)(url) };
     result
 }
 
@@ -2026,6 +2042,30 @@ impl Drop for JsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_chunks_keep_nul_bytes_and_non_ascii_text() {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().scripts = std::sync::Arc::new(HashMap::from([
+            (
+                "script-1.js".to_owned(),
+                bytes::Bytes::from_static(
+                    b"globalThis.a = `x\0y`.length; globalThis.f = function f() { return 1 };",
+                ),
+            ),
+            (
+                "script-2.js".to_owned(),
+                bytes::Bytes::from("globalThis.b = '\u{4f60}\u{597d}';"),
+            ),
+        ]));
+        let main = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Main).unwrap();
+        let script = "__appsChunk('script-1.js'); __appsChunk('script-2.js'); \
+            [a, f.toString(), b.length, b.charCodeAt(0)].join('|')";
+        assert_eq!(
+            main.eval(script, "test").unwrap(),
+            "3|function f() { return 1 }|2|20320"
+        );
+    }
 
     #[test]
     fn dispatched_clicks_run_activation_behavior() {

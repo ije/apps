@@ -3,8 +3,10 @@
 
 mod display_link;
 mod events;
+mod glass;
 mod metal;
 mod open_type;
+pub(crate) mod symbols;
 mod text;
 mod window;
 

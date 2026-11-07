@@ -3,7 +3,17 @@
 const devtools = this.__appsDevtools ?? globalThis.__appsCompile !== undefined;
 const compile = this.__appsCompile ?? ((source) => (0, eval)(source));
 const chunk = this.__appsChunk ?? globalThis.__appsChunk;
-const definitions = new Map(), modules = new Map(), starredBy = new Map(), chunks = new Map(), loaded = new Set(), bind = Object.defineProperties;
+const definitions = new Map(), modules = new Map(), starredBy = new Map(), chunks = new Map(), loaded = new Set(), bind = Object.defineProperties, slots = [];
+// WARNING: a flat module has no namespace until code needs one as a value, so it stays out of the heap otherwise. Its entries are a slot, `~slot` for a live binding, or `[module, name]`.
+const namespaceOf = module => {
+  if (module.namespace) return module.namespace;
+  const namespace = Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' }), table = module.definition.slots;
+  for (const name in table) {
+    const slot = table[name];
+    bind(namespace, { [name]: { enumerable: true, get: typeof slot !== 'number' ? () => namespaceOf(modules.get(slot[0]))[slot[1]] : slot < 0 ? () => slots[~slot]() : () => slots[slot] } });
+  }
+  return module.namespace = Object.preventExtensions(namespace);
+};
 const define = definition => {
   if (definitions.has(definition.id)) throw Error('Duplicate module: ' + definition.id);
   definitions.set(definition.id, definition);
@@ -32,9 +42,9 @@ const refreshStars = id => {
     const target = modules.get(pending.pop());
     for (const parent of starredBy.get(target.definition.id) ?? []) {
       let changed = false;
-      for (const name of Object.keys(target.namespace)) {
+      for (const name of Object.keys(namespaceOf(target))) {
         if (name !== 'default' && name !== 'module.exports' && !Object.hasOwn(parent.namespace, name)) {
-          Object.defineProperty(parent.namespace, name, { enumerable: true, get: () => target.namespace[name] });
+          Object.defineProperty(parent.namespace, name, { enumerable: true, get: () => namespaceOf(target)[name] });
           changed = true;
         }
       }
@@ -51,12 +61,12 @@ const run = iterator => new Promise((resolve, reject) => {
   };
   step('next');
 });
-const $appsImport = id => Promise.resolve().then(() => load(id)).then(() => modules.get(id).namespace);
+const $appsImport = id => Promise.resolve().then(() => load(id)).then(() => namespaceOf(modules.get(id)));
 const $appsRequire = target => {
-  const result = load(target);
-  if (result instanceof Promise) throw Error('Cannot require an asynchronous module');
+  if (load(target) instanceof Promise) throw Error('Cannot require an asynchronous module');
   const commonjs = modules.get(target).commonjs;
   if (commonjs) return commonjs.exports;
+  const result = namespaceOf(modules.get(target));
   if (Object.hasOwn(result, 'module.exports')) return result['module.exports'];
   if (!Object.hasOwn(result, 'default')) return result;
   const names = Object.keys(result);
@@ -98,23 +108,23 @@ const setup = root => {
       has: (_, name) => name === 'default' || name === 'module.exports' || Object.hasOwn(Object(exported()), name),
       ownKeys: () => [...new Set(['default', 'module.exports', ...Object.keys(Object(exported()))])],
       getOwnPropertyDescriptor: (_, name) => name === 'default' || name === 'module.exports' || Object.hasOwn(Object(exported()), name) ? { enumerable: true, configurable: true } : undefined,
-    }) : Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' });
+    }) : definition.flat ? null : Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' });
     modules.set(id, module);
     fresh.push(module);
     if (!commonjs) for (const dep of definition.deps) if (dep !== null) pending.push(dep);
   }
   for (const module of fresh) {
     const { definition, namespace } = module, factory = definition.factory;
-    if (module.commonjs || definition.preload) continue;
+    if (module.commonjs || definition.preload || definition.flat) continue;
     if (definition.linked === false) {
       const scope = Object.create(null);
       scope.$appsImport = $appsImport;
       for (const item of definition.imports) {
         const target = modules.get(item.id);
-        if (item.local) Object.defineProperty(scope, item.local, { get: () => item.name === '*' ? target.namespace : target.namespace[item.name] });
+        if (item.local) Object.defineProperty(scope, item.local, { get: () => item.name === '*' ? namespaceOf(target) : namespaceOf(target)[item.name] });
       }
       module.iterator = factory(scope)(namespace, bind);
-    } else module.iterator = factory(namespace, bind, $appsImport, $appsRequire, ...definition.deps.map(id => modules.get(id)?.namespace));
+    } else module.iterator = factory(namespace, bind, $appsImport, $appsRequire, ...definition.deps.map(id => id === null ? undefined : namespaceOf(modules.get(id))));
     module.iterator.next();
     for (const id of definition.stars) {
       if (!starredBy.has(id)) starredBy.set(id, []);
@@ -129,9 +139,9 @@ const setup = root => {
   for (const module of fresh) {
     for (const item of module.definition.imports ?? []) {
       const target = modules.get(item.id);
-      if (item.local && item.name !== '*' && !target.dynamicStars && !Object.hasOwn(target.namespace, item.name)) throw Error(`Missing export ${item.name} from ${item.id}`);
+      if (item.local && item.name !== '*' && !target.dynamicStars && !Object.hasOwn(namespaceOf(target), item.name)) throw Error(`Missing export ${item.name} from ${item.id}`);
     }
-    if (!module.dynamicStars) Object.preventExtensions(module.namespace);
+    if (!module.dynamicStars && !module.definition.flat) Object.preventExtensions(module.namespace);
   }
 };
 const load = (id, ancestors = new Set()) => {
@@ -139,14 +149,14 @@ const load = (id, ancestors = new Set()) => {
   const module = modules.get(id);
   if (module.state === 3) throw module.error;
   if (module.state === 2 && module.commonjs?.filename !== undefined && cache[module.commonjs.filename] !== module.commonjs) module.state = 0;
-  if (module.state) return ancestors.has(id) ? module.namespace : module.promise ?? module.namespace;
+  if (module.state) return ancestors.has(id) ? undefined : module.promise;
   module.state = 1;
   if (module.definition.preload) {
     const publish = api => { for (const name of Object.keys(api)) Object.defineProperty(module.namespace, name, { enumerable: true, value: api[name] }); Object.preventExtensions(module.namespace); module.state = 2; refreshStars(id); };
     const result = globalThis.__appsImportPreload();
     if (result instanceof Promise) module.promise = result.then(publish);
     else publish(result);
-    return module.promise ?? module.namespace;
+    return module.promise;
   }
   if (module.commonjs) {
     const { definition } = module, filename = absolute(definition.file);
@@ -159,7 +169,7 @@ const load = (id, ancestors = new Set()) => {
     commonjs.loaded = true;
     module.state = 2;
     refreshStars(id);
-    return module.namespace;
+    return;
   }
   const visiting = new Set(ancestors).add(id);
   const pending = [];
@@ -170,7 +180,15 @@ const load = (id, ancestors = new Set()) => {
   }
   const execute = () => {
     for (const item of module.definition.imports ?? []) {
-      if (item.local && item.name !== '*' && !Object.hasOwn(modules.get(item.id).namespace, item.name)) throw Error(`Missing export ${item.name} from ${item.id}`);
+      if (item.local && item.name !== '*' && !Object.hasOwn(namespaceOf(modules.get(item.id)), item.name)) throw Error(`Missing export ${item.name} from ${item.id}`);
+    }
+    if (module.definition.flat) {
+      const { factory, args } = module.definition;
+      module.definition.factory = null;
+      if (args) factory(slots, $appsImport, $appsRequire, ...args.map(id => id === null ? undefined : namespaceOf(modules.get(id))));
+      else factory(slots, $appsImport, $appsRequire);
+      module.state = 2;
+      return;
     }
     const result = module.definition.async === 1 ? run(module.iterator) : module.iterator.next();
     if (module.definition.async) return result.then(() => { module.state = 2; });
@@ -178,7 +196,7 @@ const load = (id, ancestors = new Set()) => {
   };
   const result = pending.length ? Promise.all(pending).then(execute) : execute();
   if (result instanceof Promise) module.promise = result.catch(error => { module.state = 3; module.error = error; throw error; });
-  return module.promise ?? module.namespace;
+  return module.promise;
 };
 return (body, execute) => {
   const [entries = [0], chunked = {}] = body(define) ?? [];
@@ -189,7 +207,7 @@ return (body, execute) => {
     return;
   }
   const entry = id => {
-    const start = () => { if (id === entries[0]) globalThis.__appsStart?.(modules.get(id).namespace.default); };
+    const start = () => { if (id === entries[0]) globalThis.__appsStart?.(namespaceOf(modules.get(id)).default); };
     const result = load(id);
     if (result instanceof Promise) globalThis.__appsTrackModule(result.then(start));
     else start();

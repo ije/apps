@@ -776,7 +776,7 @@ impl Main {
             renderer::native::quit();
         }
         // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the
-        // VM is collected once, when JS has been quiet for a second.
+        // VM is collected like a page's, see `shrink_due`.
         if self.api.shrink_pending() && !self.quiet.replace(true) {
             self.shrink_when_quiet();
         }
@@ -841,11 +841,10 @@ impl Main {
     }
 
     fn shrink_when_quiet(self: &Rc<Self>) {
-        let busy = self.api.busy.get();
         let main = Rc::downgrade(self);
         renderer::native::after(Duration::from_secs(1), move || {
             if let Some(main) = main.upgrade() {
-                if main.api.busy.get() == busy {
+                if main.api.shrink_due() {
                     main.quiet.set(false);
                     main.api.shrink();
                     #[cfg(target_os = "macos")]

@@ -1,6 +1,279 @@
 use super::*;
 
 #[test]
+fn sf_symbols_import_is_opt_in_and_utilities_override_defaults() {
+    for imports in [
+        "",
+        "@import 'tailwindcss';",
+        "@import 'sf-symbols';",
+        "@import 'sf-symbols';</style><style>@import 'tailwindcss';",
+        "@import 'tailwindcss';</style><style>@import 'sf-symbols';",
+    ] {
+        let doc = Document::parse(&format!(
+            "<style>{imports}</style><div style='color:#123456'><span id=icon class='sf-icon-chevron-left'><b></b></span><span id=sized class='sf-icon-folder size-16'></span><span id=invalid class='sf-icon- sf-icon--folder'></span></div>"
+        ));
+        let values = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut StyleCache::default(),
+            None,
+        )
+        .values;
+        let active = cfg!(target_os = "macos") && imports.contains("sf-symbols");
+        let icon = &values[element(&doc, "#icon")];
+        assert_eq!(
+            icon.get(Prop::APP_SF_SYMBOL),
+            active.then_some("\"chevron.left\"")
+        );
+        assert_eq!(icon.get(Prop::COLOR), Some("#123456"));
+        assert!(!values[element(&doc, "b")].contains(Prop::APP_SF_SYMBOL));
+        assert!(!values[element(&doc, "#invalid")].contains(Prop::APP_SF_SYMBOL));
+        if active {
+            assert_eq!(icon.get(Prop::DISPLAY), Some("inline-block"));
+            assert_eq!(icon.get(Prop::WIDTH), Some("1em"));
+            assert_eq!(icon.get(Prop::HEIGHT), Some("1em"));
+            assert_eq!(icon.get(Prop::VERTICAL_ALIGN), Some("middle"));
+        }
+        if imports.contains("tailwindcss") {
+            let sized = &values[element(&doc, "#sized")];
+            assert_eq!(length(&sized["width"], 0., 16., 800., 600.), 64.);
+            assert_eq!(length(&sized["height"], 0., 16., 800., 600.), 64.);
+        }
+    }
+}
+
+#[test]
+fn sf_symbols_follow_dynamic_classes_cascade_and_disabled_imports() {
+    let mut doc = Document::parse(
+        "<style>@import 'sf-symbols';#override{-apps-sf-symbol:var(--symbol)}</style><span id=changing class=sf-icon-folder></span><span id=override class=sf-icon-trash style='--symbol:\"star.fill\"'></span>",
+    );
+    let sheet = element(&doc, "style");
+    let icon = element(&doc, "#changing");
+    let overridden = element(&doc, "#override");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (class, disabled, symbol) in [
+        ("sf-icon-folder", false, Some("\"folder\"")),
+        ("sf-icon-chevron-right", false, Some("\"chevron.right\"")),
+        ("sf-icon-chevron-right", true, None),
+        ("sf-icon-folder", false, Some("\"folder\"")),
+        ("", false, None),
+    ] {
+        doc.nodes[icon].attrs.set("class", class);
+        if disabled {
+            doc.nodes[sheet].attrs.set("disabled", "");
+        } else {
+            doc.nodes[sheet].attrs.remove("disabled");
+        }
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        assert_eq!(
+            cached.values[icon].get(Prop::APP_SF_SYMBOL),
+            symbol.filter(|_| cfg!(target_os = "macos"))
+        );
+        assert_eq!(
+            cached.values[overridden].get(Prop::APP_SF_SYMBOL),
+            (!disabled).then_some("\"star.fill\"")
+        );
+        let same = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        assert!(Rc::ptr_eq(&cached.values[icon], &same.values[icon]));
+    }
+}
+
+#[test]
+fn sf_symbols_import_survives_serialization_and_cssom_removal() {
+    let source = "@import 'sf-symbols';";
+    let sheet = Stylesheet::parse(source);
+    assert_eq!(sheet.source(), source);
+    assert_eq!(sheet.cssom(), serde_json::json!([["import", "sf-symbols"]]));
+    let bytes = postcard::to_allocvec(&sheet).unwrap();
+    let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
+    let mut doc = Document::parse("<style></style><span class=sf-icon-folder-fill></span>");
+    let style = element(&doc, "style");
+    let icon = element(&doc, "span");
+    doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        before.values[icon].get(Prop::APP_SF_SYMBOL),
+        cfg!(target_os = "macos").then_some("\"folder.fill\"")
+    );
+    sheet.edit(&[0], Edit::Delete).unwrap();
+    doc.nodes[style].stylesheet = Some(Rc::new(sheet));
+    let after = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert!(!after.values[icon].contains(Prop::APP_SF_SYMBOL));
+    assert!(!after.values[icon].contains(Prop::WIDTH));
+}
+
+#[test]
+fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
+    for imports in [
+        "",
+        "@import 'liquid-glass';",
+        "@import 'liquid-glass'; @import 'tailwindcss';",
+        "@import 'tailwindcss'; @import 'liquid-glass';",
+        "@import 'liquid-glass';</style><style>@import 'tailwindcss';",
+        "@import 'tailwindcss';</style><style>@import 'liquid-glass';",
+    ] {
+        let doc = Document::parse(&format!(
+            "<style>{imports}</style><button class='glass glass-interactive glass-tint-blue'><span>Save</span></button><div class=glass-clear></div><button id=utility class='glass bg-white rounded-lg'></button>"
+        ));
+        let values = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut StyleCache::default(),
+            None,
+        )
+        .values;
+        let active = cfg!(target_os = "macos") && !imports.is_empty();
+        let button = &values[element(&doc, "button")];
+        assert_eq!(button.get(Prop::APP_GLASS), active.then_some("regular"));
+        assert_eq!(
+            button.get(Prop::APP_GLASS_INTERACTIVE),
+            active.then_some("true")
+        );
+        assert_eq!(
+            button.get(Prop::APP_GLASS_TINT_COLOR),
+            active.then_some("#007aff")
+        );
+        assert_eq!(
+            values[element(&doc, "div")].get(Prop::APP_GLASS),
+            active.then_some("clear")
+        );
+        for prop in [
+            Prop::APP_GLASS,
+            Prop::APP_GLASS_INTERACTIVE,
+            Prop::APP_GLASS_TINT_COLOR,
+        ] {
+            assert!(!values[element(&doc, "span")].contains(prop));
+        }
+        if active {
+            assert_eq!(button.get(Prop::APPEARANCE), Some("none"));
+            assert_eq!(button.get(Prop::BACKGROUND_COLOR), Some("transparent"));
+            assert_eq!(button.get(Prop::BORDER_TOP_WIDTH), Some("0"));
+            assert_eq!(button.get(Prop::BORDER_TOP_LEFT_RADIUS), Some("9999px"));
+        }
+        if imports.contains("tailwindcss") {
+            let utility = &values[element(&doc, "#utility")];
+            assert_eq!(utility.get(Prop::BACKGROUND_COLOR), Some("#fff"));
+            assert_eq!(utility.get(Prop::BORDER_TOP_LEFT_RADIUS), Some("0.5rem"));
+        }
+    }
+}
+
+#[test]
+fn liquid_glass_classes_follow_cascade_and_cached_changes() {
+    let mut doc = Document::parse(
+        "<style>@import 'liquid-glass';@import 'tailwindcss';#override{-apps-glass:clear;-apps-glass-tint-color:var(--tint);background-color:red}</style><button id=changing></button><button id=override class='glass glass-tint-blue' style='--tint:#123456'></button><button id=utility class='glass rounded-lg bg-white'></button>",
+    );
+    let changing = element(&doc, "#changing");
+    let overridden = element(&doc, "#override");
+    let utility = element(&doc, "#utility");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (class, effect, tint) in [
+        (
+            "glass glass-interactive glass-tint-blue",
+            Some("regular"),
+            "#123456",
+        ),
+        ("glass-clear", Some("clear"), "#abcdef"),
+        ("", None, "#fedcba"),
+    ] {
+        doc.nodes[changing].attrs.set("class", class);
+        doc.nodes[overridden]
+            .attrs
+            .set("style", &format!("--tint:{tint}"));
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        assert_eq!(
+            cached.values[changing].get(Prop::APP_GLASS),
+            effect.filter(|_| cfg!(target_os = "macos"))
+        );
+        assert_eq!(
+            cached.values[changing].get(Prop::APP_GLASS_INTERACTIVE),
+            (cfg!(target_os = "macos") && class.contains("interactive")).then_some("true")
+        );
+        assert_eq!(
+            cached.values[overridden].get(Prop::APP_GLASS),
+            Some("clear")
+        );
+        assert_eq!(
+            cached.values[overridden].get(Prop::APP_GLASS_TINT_COLOR),
+            Some(tint)
+        );
+        assert_eq!(
+            cached.values[overridden].get(Prop::BACKGROUND_COLOR),
+            Some("red")
+        );
+        assert_eq!(
+            cached.values[utility].get(Prop::BACKGROUND_COLOR),
+            Some("#fff")
+        );
+        assert_eq!(
+            cached.values[utility].get(Prop::BORDER_TOP_LEFT_RADIUS),
+            Some("0.5rem")
+        );
+    }
+}
+
+#[test]
+fn liquid_glass_import_survives_serialization_and_cssom_removal() {
+    let source = "@import 'liquid-glass';";
+    let sheet = Stylesheet::parse(source);
+    assert_eq!(sheet.source(), source);
+    assert_eq!(
+        sheet.cssom(),
+        serde_json::json!([["import", "liquid-glass"]])
+    );
+    let bytes = postcard::to_allocvec(&sheet).unwrap();
+    let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
+    sheet.bind_parents().unwrap();
+    assert!(matches!(&*sheet.0[0], Rule::LiquidGlass(children) if !children.is_empty()));
+    let mut doc = Document::parse("<style></style><div class='glass glass-tint-blue'></div>");
+    let style = element(&doc, "style");
+    let glass = element(&doc, "div");
+    doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert_eq!(
+        before.values[glass].get(Prop::APP_GLASS),
+        cfg!(target_os = "macos").then_some("regular")
+    );
+    sheet.edit(&[0], Edit::Delete).unwrap();
+    doc.nodes[style].stylesheet = Some(Rc::new(sheet));
+    let after = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert!(!after.values[glass].contains(Prop::APP_GLASS));
+    assert!(!after.values[glass].contains(Prop::APP_GLASS_TINT_COLOR));
+}
+
+#[test]
 fn container_queries_parse_and_follow_container_sizes() {
     let css = "@container card (min-width: 400px) { .item { color: red } }
             @container (orientation: landscape) { .item { width: 1px } }

@@ -437,9 +437,9 @@ impl Callbacks {
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn trim(&self) {
+    pub fn release(&self) {
         #[cfg(target_os = "macos")]
-        self.queue(|window, _| window.platform.trim());
+        self.queue(|window, _| window.platform.release());
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]

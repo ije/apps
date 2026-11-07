@@ -16,17 +16,21 @@ const MAX_AGE: u32 = 60;
 // WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
 // one to read a tile, is done before the frame after the free paints. More drawables need more.
 const IN_FLIGHT: u32 = 2;
-pub(crate) const MIN_TEXTURE_SIDE: i32 = 1024;
+const MIN_TEXTURE_SIDE: i32 = 1024;
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub(crate) enum AtlasKey {
     Glyph(RenderGlyphParams),
     Image(u64),
+    #[cfg(target_os = "macos")]
+    Symbol(u64),
 }
 
 impl AtlasKey {
     fn kind(&self) -> AtlasTextureKind {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::Symbol(_) => AtlasTextureKind::Monochrome,
             Self::Glyph(params) if !params.is_emoji => AtlasTextureKind::Monochrome,
             _ => AtlasTextureKind::Polychrome,
         }
@@ -163,6 +167,21 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
+    // WARNING: images keep their pixels, so a frame that shows one again only uploads it. The scene reads the
+    // tiles of the last frame, so they stay.
+    #[cfg(target_os = "macos")]
+    pub fn release_images(&self) {
+        let frame = self.frame.get();
+        let mut retired = self.retired.borrow_mut();
+        self.tiles.borrow_mut().retain(|key, entry| {
+            if !matches!(key, AtlasKey::Image(_)) || frame.wrapping_sub(entry.used.get()) <= 1 {
+                return true;
+            }
+            retired.extend(entry.tile.map(|tile| (frame, tile)));
+            false
+        });
+    }
+
     #[cfg(not(target_os = "macos"))]
     pub fn clear(&self, reset: impl FnOnce(&mut B)) {
         self.tiles.borrow_mut().clear();
@@ -234,6 +253,17 @@ pub(crate) struct Packer {
     live: usize,
 }
 
+pub(crate) fn page_size(tile: Size<DevicePixels>) -> Size<DevicePixels> {
+    if tile.width.0 <= MIN_TEXTURE_SIDE && tile.height.0 <= MIN_TEXTURE_SIDE {
+        Size::new(
+            DevicePixels(MIN_TEXTURE_SIDE),
+            DevicePixels(MIN_TEXTURE_SIDE),
+        )
+    } else {
+        tile
+    }
+}
+
 impl Packer {
     pub fn new(size: Size<DevicePixels>) -> Self {
         Self {
@@ -254,9 +284,8 @@ impl Packer {
         &mut self,
         size: Size<DevicePixels>,
     ) -> Option<(crate::Bounds<DevicePixels>, u32)> {
-        if self.live == 0
-            && size.map(|side| DevicePixels(side.0.max(MIN_TEXTURE_SIDE))) != self.size
-        {
+        // WARNING: a page made for a big tile takes no small ones, or an icon keeps it after the big tile is gone.
+        if page_size(size) != self.size {
             return None;
         }
         let allocation = self
@@ -310,8 +339,7 @@ mod tests {
                 Some(hit) => hit,
                 None => {
                     self.made += 1;
-                    let side = size.map(|side| DevicePixels(side.0.max(MIN_TEXTURE_SIDE)));
-                    let index = self.list.push(|_| Packer::new(side));
+                    let index = self.list.push(|_| Packer::new(page_size(size)));
                     let tile = self.list.textures[index].as_mut().unwrap().allocate(size);
                     (index, tile.unwrap())
                 }
@@ -337,6 +365,83 @@ mod tests {
                 self.list.emptied(index, Packer::is_empty);
             }
         }
+    }
+
+    #[test]
+    fn small_tiles_stay_out_of_pages_made_for_big_ones() {
+        let atlas = Atlas::new(Fake::default());
+        let insert = |id, width, height| {
+            atlas
+                .get_or_insert_with(&AtlasKey::Image(id), &mut || {
+                    Ok(Some((
+                        Point::default(),
+                        Size::new(DevicePixels(width), DevicePixels(height)),
+                        Cow::Borrowed(&[][..]),
+                    )))
+                })
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let big = insert(1, 1686, 1024);
+        let icon = insert(2, 32, 32);
+        assert_ne!(big.texture_id.index, icon.texture_id.index);
+        assert_eq!(atlas.backend.borrow().made, 2);
+        for (id, width, height) in [(3, 1100, 37), (4, 1100, 1), (5, 37, 1100), (6, 16384, 3)] {
+            let tile = insert(id, width, height);
+            assert_eq!(
+                tile.bounds.size,
+                Size::new(DevicePixels(width), DevicePixels(height))
+            );
+            let backend = atlas.backend.borrow();
+            let page = backend.list.get(tile.texture_id.index as usize).unwrap();
+            assert_eq!(
+                page.size,
+                Size::new(DevicePixels(width), DevicePixels(height))
+            );
+        }
+        atlas.remove(&AtlasKey::Image(1));
+        atlas.finish_frame();
+        atlas.finish_frame();
+        atlas.finish_frame();
+        let backend = atlas.backend.borrow();
+        assert!(
+            backend
+                .list
+                .get(big.texture_id.index as usize)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quiet_release_keeps_the_tiles_of_the_last_frame() {
+        let atlas = Atlas::new(Fake::default());
+        let insert = |id| {
+            atlas
+                .get_or_insert_with(&AtlasKey::Image(id), &mut || {
+                    Ok(Some((
+                        Point::default(),
+                        Size::new(DevicePixels(8), DevicePixels(8)),
+                        Cow::Borrowed(&[][..]),
+                    )))
+                })
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        insert(1);
+        insert(2);
+        atlas.finish_frame();
+        let shown = insert(2);
+        atlas.finish_frame();
+        atlas.release_images();
+        atlas.free_retired(|| {});
+        let freed = &atlas.backend.borrow().freed;
+        assert_eq!(freed.len(), 1);
+        assert_ne!(freed[0].tile_id, shown.tile_id);
+        assert!(atlas.tiles.borrow().get(&AtlasKey::Image(1)).is_none());
     }
 
     #[test]

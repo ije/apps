@@ -1,0 +1,12 @@
+@import "tailwindcss";
+@import "liquid-glass"; /* macOS 26+ only */
+@import "sf-symbols"; /* macOS only */
+
+body {
+  margin: 0;
+  color: #172554;
+  font-family: system-ui, sans-serif;
+  background: linear-gradient(120deg, #fbcfe8, #c4b5fd 45%, #67e8f9);
+}
+
+button { cursor: pointer; }

@@ -42,7 +42,11 @@ By default macOS malloc keeps freed memory in the process footprint: about 40% o
 
 That mode makes malloc slower, so on macOS the runtime has a global allocator that keeps freed blocks of up to 512 bytes per thread, at most 64 KB per size, and gives them back when the thread is quiet. A Rust app can't define its own `#[global_allocator]`.
 
-JSC's GC timers don't fire on the generic event loop, so each VM collects itself. A thread that ran JS asks about once a second whether to collect: yes after a second that ran at least 100 ms of JS followed by 5 quiet seconds, or every 5 minutes when only a little ran. Apps have timers that never stop, so collecting more often uses more CPU at idle than the app itself. A collection also drops all compiled code, about 70% of a typical live heap, and functions compile again when they next run. A window thread waits while it draws more than a few frames a second, because the collection blocks drawing. On machines with 16 GB of RAM or more, JSC lets a heap grow to about 4x its live size before a full collection, so the runtime sets `heapGrowthMaxIncrease` to make that about 2x.
+JSC's GC timers don't fire on the generic event loop, so each VM collects itself. A thread that ran JS asks about once a second whether to collect: yes after a second that ran at least 100 ms of JS followed by 5 quiet seconds, or every 5 minutes at a second that ran less than 100 ms, because some apps' timers never leave a quiet second. Apps have timers that never stop, so collecting more often uses more CPU at idle than the app itself. A collection also drops all compiled code, about 70% of a typical live heap, and functions compile again when they next run. A window thread waits while it draws more than a few frames a second, because the collection blocks drawing. On machines with 16 GB of RAM or more, JSC lets a heap grow to about 4x its live size before a full collection, so the runtime sets `heapGrowthMaxIncrease` to make that about 2x.
+
+While a process draws with Metal, the driver on Apple GPUs holds about 126 MB for render encoders and 84 MB more for blit encoders, until about 1 second after the last frame, at any window size. So frames copy textures with draws and only `capturePage()` uses a blit. After the first 500 ms, Core Animation blinks a text caret, so a focused field draws no frames and the driver frees this memory. A caret in a box with an effect, under round clip corners or below a later box blinks by drawing.
+
+A window that draws no frames for 1 second, or that can't be seen, frees what only drawing needs: its spare drawables, layer textures, instance buffers and atlas images that the last frame didn't show. The window keeps showing its last frame, and images keep their pixels on the CPU, so the next frame only allocates and uploads again. An atlas image bigger than 1024 px on a side gets its own texture, so a small tile can't keep that texture alive after the image goes.
 
 ## Node Integration
 
@@ -68,9 +72,15 @@ The file starts with an 8-byte header, `APP\0` and the format version, followed 
 - `files`: `app.js`, script chunks (`script-*.js`), `package.json`, `native.json`, `assets.json` and packed `.node` addons
 - `pages`: the bundled HTML pages, already parsed, with their `<style>` and `style` attributes parsed too
 
-The runtime maps the file into memory. Script chunks and addons stay in the mapping until they are used, so the file must not change while the app runs, and a new build replaces it instead of rewriting it. `crates/runtime/src/bundle.rs` reads and writes the file.
+The runtime maps the file into memory. Script chunks and addons stay in the mapping. JavaScriptCore reads an ASCII chunk directly from it, so the source doesn't count in the footprint and windows and workers share it. So the file must not change while the app runs, and a new build replaces it instead of rewriting it. `crates/runtime/src/bundle.rs` reads and writes the file.
 
 A folder with `app.bundle` or `app.js` is a built app. It passes all of its arguments to `process.argv`, and it loads JavaScriptCore only from its own folder.
+
+## Modules
+
+`apps build` links ES modules through one array of slots per bundle. A module is a plain function that writes its exports to its slots when its body ends, and importers read `slots[k]` directly. Re-exports and `export *` resolve at build time to the module that holds the binding, so barrels cost nothing at run time. A binding that a function writes later keeps a closure in its slot, which importers call.
+
+A module has a namespace object only where code needs one: `import *` used as a value, `import()`, `require()` and entries. Modules in import cycles, CommonJS, top-level await and modules that use `eval` keep the slower form, with a generator, a namespace and a getter per export. `apps run` uses that form for all modules, so it follows the standard.
 
 ## Renderer
 
@@ -85,6 +95,18 @@ Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` be
 | macOS | AppKit | Metal, with layers tagged sRGB so wide-gamut displays show CSS colors like browsers. Shaders are compiled at build time when the Metal toolchain is installed | CoreText |
 | Windows | Win32 | Direct3D 11 with DirectComposition | DirectWrite |
 | Linux | X11 and Wayland | wgpu on Vulkan or OpenGL | cosmic-text |
+
+`@import "liquid-glass"` adds macOS-only CSS classes. A supported glass box keeps its foreground in a separate Metal surface.
+AppKit puts that surface in an `NSGlassEffectView` above the page. The native material supplies the highlights, refraction, and tint.
+
+The renderer reuses the native views and removes them when their boxes disappear. Idle windows release spare glass drawables.
+These frames need the main thread to update the native views and present their Metal surfaces together.
+Glass currently needs a top-level effect with uniform corners, no transforms or filters, and no clipping or content above it.
+
+Unsupported boxes keep their ordinary CSS appearance. Native glass does not appear in Metal readback, so `capturePage()` rejects these frames.
+
+`@import "sf-symbols"` adds macOS-only `sf-icon-*` classes for empty spans. Cache misses call AppKit on the main thread to rasterize symbols.
+The renderer keeps a bounded alpha cache and draws the icons through its monochrome atlas. CSS color changes need no new bitmap.
 
 
 ## Offscreen Canvases

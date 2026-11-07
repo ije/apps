@@ -664,6 +664,39 @@ impl DomBox {
                 blur,
                 color_matrix,
             });
+        let glass = style
+            .get(Prop::APP_GLASS)
+            .filter(|kind| {
+                cfg!(target_os = "macos")
+                    && shown
+                    && layers.is_empty()
+                    && clip.is_none()
+                    && matches!(*kind, "regular" | "clear")
+            })
+            .and_then(|kind| {
+                let radii = effects::radii(style, &units, || size).resolve(bounds.size);
+                let radius = radii.x.top_left;
+                if radii != renderer::Radii::from(radius) {
+                    return None;
+                }
+                Some(renderer::Glass {
+                    key: self.id as u64,
+                    bounds,
+                    corner_radius: radius,
+                    tint: style
+                        .get(Prop::APP_GLASS_TINT_COLOR)
+                        .and_then(style::color)
+                        .filter(|(_, alpha)| *alpha > 0)
+                        .map(|(color, alpha)| renderer::rgba(color << 8 | u32::from(alpha))),
+                    clear: kind == "clear",
+                    interactive: style.get(Prop::APP_GLASS_INTERACTIVE) == Some("true")
+                        && style.get(Prop::POINTER_EVENTS) != Some("none")
+                        && doc
+                            .nodes
+                            .get(self.id)
+                            .is_some_and(|node| !node.attrs.contains_key("disabled")),
+                })
+            });
         let outer = renderer::PaintEffect {
             transform,
             opacity: self.effects.unwrap_or(1.),
@@ -673,6 +706,7 @@ impl DomBox {
                 }),
             mask: mask.flatten(),
             backdrop,
+            glass,
             key: self.composited.then_some(self.id as u64),
             ..Default::default()
         };
@@ -691,6 +725,7 @@ impl DomBox {
             || outer.blend_mode != renderer::BlendMode::Normal
             || outer.mask.is_some()
             || outer.backdrop.is_some()
+            || outer.glass.is_some()
             || isolate
             || self.composited;
         if needed {

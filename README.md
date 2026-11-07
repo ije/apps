@@ -79,6 +79,34 @@ const server = import.meta.resolve('./server.ts'); // a script that `ELECTRON_RU
 
 `productName` names the app, `executableName` names its executable, and `env` gives the values of `import.meta.env`.
 
+On macOS, import the built-in Liquid Glass styles to use native glass behind HTML controls:
+
+```css
+@import "tailwindcss";
+@import "liquid-glass";
+@import "sf-symbols";
+```
+
+```html
+<button class="glass glass-interactive glass-tint-blue flex items-center gap-2 px-4 py-2">
+  <span class="sf-icon-folder size-5" aria-hidden="true"></span>
+  Open
+</button>
+```
+
+Tailwind is optional. JSX uses `className`. `glass-clear` selects clear glass. `rounded-*` utilities control the corner radius.
+
+The effect needs macOS 26 or later. Native interaction feedback needs macOS 27 or later.
+This first version supports controls with uniform corners, without transforms, filters, clipping, or content above them.
+
+Other targets ignore the import. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
+
+`@import "sf-symbols"` also works without Liquid Glass or Tailwind on macOS.
+An empty `<span>` with `sf-icon-folder` shows Apple's `folder` symbol. Hyphens separate name parts: `sf-icon-folder-fill` selects `folder.fill`.
+Icons inherit `color` and default to `1em` square. CSS width and height, including Tailwind `size-*`, set their bounds.
+
+These icons are monochrome. A symbol that the installed macOS version does not contain shows no image.
+
 Set `loaders` in `package.json` to import other file types. Each key is a file extension, and each value is a module path relative to `package.json` or a package name:
 
 ```json

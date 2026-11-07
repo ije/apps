@@ -353,6 +353,7 @@ impl Frames {
 }
 
 const RESIZE_WAIT: Duration = Duration::from_millis(8);
+const QUIET: Duration = Duration::from_secs(1);
 
 struct Tick {
     callbacks: Callbacks,
@@ -394,6 +395,7 @@ struct State {
     layer: Retained<CAMetalLayer>,
     mirror: Arc<Mutex<Mirror>>,
     frames: Arc<Mutex<Frames>>,
+    glass: Vec<super::glass::GlassView>,
     motion: Option<Arc<Mutex<Option<PlatformInput>>>>,
     cursor: CursorStyle,
     last_key_equivalent: Option<KeyDownEvent>,
@@ -703,6 +705,7 @@ fn open_native(
             layer,
             mirror: Arc::default(),
             frames: frames.clone(),
+            glass: Vec::new(),
             motion: None,
             cursor: CursorStyle::Arrow,
             last_key_equivalent: None,
@@ -835,6 +838,7 @@ pub(crate) struct Window {
     renderer: RefCell<Renderer>,
     atlas: Rc<MetalAtlas>,
     frames: Arc<Mutex<Frames>>,
+    quiet: std::cell::Cell<Option<crate::app::Timer>>,
     transparent: bool,
 }
 
@@ -868,6 +872,7 @@ impl Window {
             renderer: RefCell::new(renderer),
             atlas,
             frames: opened.frames,
+            quiet: std::cell::Cell::new(None),
             transparent: options.transparent,
         })
     }
@@ -900,17 +905,21 @@ impl Window {
             frames.wants = false;
             frames.sync();
         }
-        self.trim();
+        self.renderer.borrow_mut().trim();
+        let callbacks = self.callbacks;
+        self.quiet.set(Some(crate::app::timer(QUIET, move |_| {
+            callbacks.release();
+        })));
     }
 
-    pub(crate) fn trim(&self) {
-        self.renderer.borrow_mut().trim();
+    pub(crate) fn release(&self) {
+        self.renderer.borrow_mut().release();
     }
 
     pub(crate) fn set_drawable_size(&self, size: Size<Pixels>, scale: f32) {
         let pixels = size.to_device_pixels(scale);
         self.renderer
-            .borrow()
+            .borrow_mut()
             .set_drawable_size(CGSize::new(pixels.width.0 as f64, pixels.height.0 as f64));
     }
 
@@ -928,7 +937,19 @@ impl Window {
     }
 
     pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
-        self.renderer.borrow_mut().draw(scene, capture)
+        self.quiet.take();
+        let mut renderer = self.renderer.borrow_mut();
+        let result = renderer.draw(scene, capture);
+        if let Some((surfaces, present)) = renderer.take_glass_update() {
+            let surfaces = Sendable::new(surfaces);
+            self.control.later(move |_, state| {
+                let mut state = state.borrow_mut();
+                let parent = unsafe { state.native_view.cast::<NSView>().as_ref() };
+                super::glass::update(&mut state.glass, parent, surfaces.take());
+                drop(present);
+            });
+        }
+        result
     }
 
     pub fn promote(
@@ -947,6 +968,13 @@ impl Window {
 
     pub fn demote(&self) {
         self.renderer.borrow_mut().demote();
+    }
+
+    pub fn set_caret(
+        &self,
+        caret: Option<(Bounds<crate::ScaledPixels>, crate::Rgba, std::time::Instant)>,
+    ) {
+        self.renderer.borrow_mut().set_caret(caret);
     }
 
     pub fn is_active(&self) -> bool {
@@ -1868,7 +1896,7 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
     if let Ok(lock) = state.try_borrow() {
         lock.locate_frames();
         if !lock.is_visible() {
-            lock.callbacks.trim();
+            lock.callbacks.release();
         }
     }
     if let Ok(mut lock) = state.try_borrow_mut()

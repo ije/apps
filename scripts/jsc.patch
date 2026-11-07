@@ -168,10 +168,30 @@ index a530e481c..aee05f9ac 100644
      JSAPIGlobalObject(VM&, Structure*);
  
 diff --git a/Source/JavaScriptCore/API/JSBase.cpp b/Source/JavaScriptCore/API/JSBase.cpp
-index f96eb07c4..d3b545b68 100644
+index f96eb07c4..63fc8a795 100644
 --- a/Source/JavaScriptCore/API/JSBase.cpp
 +++ b/Source/JavaScriptCore/API/JSBase.cpp
-@@ -99,6 +99,7 @@ bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourc
+@@ -91,6 +91,19 @@ JSValueRef JSEvaluateScript(JSContextRef ctx, JSStringRef script, JSObjectRef th
+     return JSEvaluateScriptInternal(locker, ctx, thisObject, source, exception);
+ }
+ 
++// The bytes must be Latin-1 and must outlive the VM, because the source keeps pointing at them.
++extern "C" JS_EXPORT JSValueRef JSEvaluateScriptLatin1NoCopy(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, JSValueRef* exception);
++JSValueRef JSEvaluateScriptLatin1NoCopy(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, JSValueRef* exception)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    JSLockHolder locker(globalObject->vm());
++
++    auto sourceURL = sourceURLString ? URL({ }, sourceURLString->string()) : URL();
++    SourceCode source = makeSource(String(StringImpl::createWithoutCopying(std::span { script, length })), SourceOrigin { sourceURL }, SourceTaintedOrigin::Untainted, sourceURL.string(), TextPosition(OrdinalNumber::fromOneBasedInt(1), OrdinalNumber()));
++
++    return JSEvaluateScriptInternal(locker, ctx, nullptr, source, exception);
++}
++
+ bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourceURLString, int startingLineNumber, JSValueRef* exception)
+ {
+     if (!ctx) {
+@@ -99,6 +112,7 @@ bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourc
      }
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -179,7 +199,7 @@ index f96eb07c4..d3b545b68 100644
  
      startingLineNumber = std::max(1, startingLineNumber);
  
-@@ -133,7 +134,7 @@ void JSGarbageCollect(JSContextRef ctx)
+@@ -133,7 +147,7 @@ void JSGarbageCollect(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -188,7 +208,7 @@ index f96eb07c4..d3b545b68 100644
  
      vm.heap.reportAbandonedObjectGraph();
  }
-@@ -146,7 +147,7 @@ void JSReportExtraMemoryCost(JSContextRef ctx, size_t size)
+@@ -146,7 +160,7 @@ void JSReportExtraMemoryCost(JSContextRef ctx, size_t size)
      }
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -197,7 +217,7 @@ index f96eb07c4..d3b545b68 100644
  
      vm.heap.deprecatedReportExtraMemory(size);
  }
-@@ -161,6 +162,7 @@ void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx)
+@@ -161,6 +175,7 @@ void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -205,7 +225,7 @@ index f96eb07c4..d3b545b68 100644
  
      vm.heap.collectNow(Sync, CollectionScope::Full);
  }
-@@ -172,6 +174,7 @@ void JSSynchronousEdenCollectForDebugging(JSContextRef ctx)
+@@ -172,6 +187,7 @@ void JSSynchronousEdenCollectForDebugging(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -213,7 +233,7 @@ index f96eb07c4..d3b545b68 100644
  
      vm.heap.collectSync(CollectionScope::Eden);
  }
-@@ -201,7 +204,7 @@ JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx)
+@@ -201,7 +217,7 @@ JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -223,7 +243,7 @@ index f96eb07c4..d3b545b68 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b2619..b835675b3 100644
+index b8e3b2619..6ba9acb7c 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
 @@ -43,7 +43,9 @@

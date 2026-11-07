@@ -781,6 +781,7 @@ mod tests {
             clip: None,
             mask: None,
             backdrop: None,
+            glass: None,
             content_mask: mask,
         };
         scene.push_effect(state, Some(7));
@@ -803,6 +804,79 @@ mod tests {
                 .any(|composite| composite.opacity == 0.25)
         );
         frame
+    }
+
+    #[test]
+    fn glass_foregrounds_keep_the_border_box_and_draw_once() {
+        let bounds = |[x, y, w, h]: [f32; 4]| {
+            Bounds::new(
+                crate::point(ScaledPixels(x), ScaledPixels(y)),
+                Size::new(ScaledPixels(w), ScaledPixels(h)),
+            )
+        };
+        let border = bounds([20., 30., 160., 48.]);
+        let mask = ContentMask {
+            bounds: bounds([0., 0., 800., 600.]),
+            ..Default::default()
+        };
+        for has_content in [false, true] {
+            let mut scene = Scene::default();
+            scene.insert(Primitive::Quad(Quad {
+                bounds: mask.bounds,
+                content_mask: mask,
+                ..Default::default()
+            }));
+            scene.push_effect(
+                EffectState {
+                    transform: None,
+                    opacity: 1.,
+                    color_matrix: None,
+                    blur: 0.,
+                    shadow: None,
+                    blend_mode: Default::default(),
+                    clip: None,
+                    mask: None,
+                    backdrop: None,
+                    glass: Some(crate::scene::GlassState {
+                        key: 5,
+                        bounds: border,
+                        corner_radius: 24.,
+                        tint: None,
+                        clear: false,
+                        interactive: false,
+                    }),
+                    content_mask: mask,
+                },
+                None,
+            );
+            if has_content {
+                scene.insert(Primitive::Quad(Quad {
+                    bounds: bounds([36., 46., 80., 16.]),
+                    content_mask: mask,
+                    ..Default::default()
+                }));
+            }
+            scene.pop_effect();
+            scene.finish();
+            assert_eq!(scene.layers[1].bounds, Some(border));
+            assert_eq!(scene.layers[0].effects[0].bounds, border);
+            let mut frame = RenderFrame {
+                skip: vec![1],
+                content: vec![1],
+                ..Default::default()
+            };
+            frame.record(&scene, [800, 600], 16384, true);
+            let [(layer, target, region)] = frame.promoted[..] else {
+                panic!("one glass foreground")
+            };
+            assert_eq!((layer, region), (1, [20, 30, 160, 48]));
+            assert_eq!(frame.origin(target), [20, 30]);
+            assert_eq!(frame.quads.len(), 1 + usize::from(has_content));
+            assert!(frame.composites.is_empty());
+            assert!(frame.commands.iter().any(|command| {
+                matches!(command, Command::Pass(pass, true) if *pass == target)
+            }));
+        }
     }
 
     #[test]
@@ -839,6 +913,7 @@ mod tests {
                 clip: None,
                 mask: None,
                 backdrop: None,
+                glass: None,
                 content_mask: mask,
             };
             scene.push_effect(state, Some(9));
@@ -904,6 +979,7 @@ mod tests {
                     clip: None,
                     mask: None,
                     backdrop: None,
+                    glass: None,
                     content_mask: mask,
                 },
                 None,

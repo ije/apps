@@ -1,6 +1,6 @@
 use crate::{
     DevicePixels, Rgba, Size,
-    atlas::{Atlas, AtlasBackend, MIN_TEXTURE_SIDE, Packer, TextureList},
+    atlas::{Atlas, AtlasBackend, Packer, TextureList, page_size},
     frame::{Command, RenderFrame, Target, TextParams, bytes},
     scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
 };
@@ -947,11 +947,7 @@ impl AtlasBackend for AtlasTextures {
         let (index, (bounds, tile_id)) = match hit {
             Some(hit) => hit,
             None => {
-                let side = |value: i32| value.clamp(MIN_TEXTURE_SIDE, self.max);
-                let texture_size = Size::new(
-                    DevicePixels(side(size.width.0)),
-                    DevicePixels(side(size.height.0)),
-                );
+                let texture_size = page_size(size).map(|side| DevicePixels(side.0.min(self.max)));
                 let desc = D3D11_TEXTURE2D_DESC {
                     Width: texture_size.width.0 as u32,
                     Height: texture_size.height.0 as u32,

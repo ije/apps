@@ -57,6 +57,7 @@ objc2-quartz-core = { workspace = true, features = [
     "objc2-metal",
     "CAAnimation",
     "CABase",
+    "CALayer",
     "CAMediaTiming",
     "CATransaction",
     "CATransform3D",

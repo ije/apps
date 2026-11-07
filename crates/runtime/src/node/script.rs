@@ -19,6 +19,8 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             .with_context(|| format!("Cannot find the script {script}"))?
             .into(),
     };
+    // WARNING: a headless script never runs the app's main bundle, and this string is the only copy that stays.
+    drop(bundle.files.remove("app.js"));
     let (wake, wakes) = mpsc::channel();
     crate::host::Waker::install(move || {
         let _ = wake.send(());
