@@ -1,8 +1,4 @@
 use anyhow::{Context, Result, bail, ensure};
-use base64::{
-    Engine, alphabet,
-    engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
-};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use serde_json::{Value, json};
 use std::{
@@ -43,31 +39,6 @@ impl State {
             "time" => Ok(
                 json!({"version": crate::VERSION, "platform": if cfg!(target_os = "macos") { "MacIntel".to_owned() } else if cfg!(target_os = "windows") { "Win32".to_owned() } else { format!("Linux {}", std::env::consts::ARCH) }, "origin": self.epoch, "now": self.origin.elapsed().as_secs_f64() * 1000.}),
             ),
-            "base64.encode" => {
-                let text = args[0].as_str().context("Expected binary string")?;
-                let bytes = text
-                    .chars()
-                    .map(|c| u8::try_from(c as u32))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(json!(
-                    base64::engine::general_purpose::STANDARD.encode(bytes)
-                ))
-            }
-            "base64.decode" => {
-                let text = args[0].as_str().context("Expected Base64 string")?;
-                let input: Vec<_> = text
-                    .bytes()
-                    .filter(|b| !matches!(b, b'\t' | b'\n' | 0x0c | b'\r' | b' '))
-                    .collect();
-                let engine = GeneralPurpose::new(
-                    &alphabet::STANDARD,
-                    GeneralPurposeConfig::new()
-                        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
-                        .with_decode_allow_trailing_bits(true),
-                );
-                let bytes = engine.decode(input)?;
-                Ok(json!(bytes.into_iter().map(char::from).collect::<String>()))
-            }
             "compression.new" => {
                 let format = args[0].as_str().context("Expected compression format")?;
                 ensure!(

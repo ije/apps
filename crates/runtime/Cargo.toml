@@ -26,6 +26,7 @@ libloading = "0.8"
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 memmap2 = "0.9"
 md-5 = "0.10"
+memchr = "2"
 notify = "8.2"
 png = "0.17"
 portable-pty = "0.9"

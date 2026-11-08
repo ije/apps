@@ -391,13 +391,20 @@ impl State {
                         _ => bail!("Invalid URL component"),
                     }
                 }
-                Ok(json!({
-                    "href": url.as_str(), "origin": quirks::origin(&url),
-                    "protocol": quirks::protocol(&url), "username": url.username(),
-                    "password": quirks::password(&url), "host": quirks::host(&url),
-                    "hostname": quirks::hostname(&url), "port": quirks::port(&url),
-                    "pathname": url.path(), "search": quirks::search(&url), "hash": quirks::hash(&url)
-                }))
+                // WARNING: a flat array of strings becomes JavaScript values directly, without JSON.
+                Ok(json!([
+                    url.as_str(),
+                    quirks::origin(&url),
+                    quirks::protocol(&url),
+                    url.username(),
+                    quirks::password(&url),
+                    quirks::host(&url),
+                    quirks::hostname(&url),
+                    quirks::port(&url),
+                    url.path(),
+                    quirks::search(&url),
+                    quirks::hash(&url)
+                ]))
             }
             "params.parse" => Ok(json!(
                 url::form_urlencoded::parse(args[0].as_str().context("Expected query")?.as_bytes())
@@ -431,24 +438,6 @@ impl State {
                 Ok(crate::jsc::payload::write(
                     ring::digest::digest(algorithm, bytes).as_ref().to_vec(),
                 ))
-            }
-            "decode" => {
-                let bytes = crate::node::bytes(&args[0])?;
-                let mut offset = 0;
-                let mut end = bytes.len();
-                while let Err(error) = std::str::from_utf8(&bytes[offset..]) {
-                    offset += error.valid_up_to();
-                    if args[1] == true && error.error_len().is_none() {
-                        end = offset;
-                        break;
-                    }
-                    ensure!(args[2] != true, "Invalid UTF-8 data");
-                    offset += error.error_len().unwrap_or(bytes.len() - offset);
-                }
-                Ok(json!([
-                    String::from_utf8_lossy(&bytes[..end]),
-                    bytes.len() - end
-                ]))
             }
             "asset" => {
                 let url = Url::parse(args[0].as_str().context("Expected URL")?)?;

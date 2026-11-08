@@ -3771,6 +3771,16 @@ impl From<ComputedStyles> for SpareStyles {
     }
 }
 
+thread_local! {
+    // WARNING: unstyled and freed nodes share these, so the whole-arena copies and drops of a pass touch one object
+    // for them instead of one allocation each.
+    static EMPTY: (Rc<Style>, Vars) = Default::default();
+}
+
+pub(crate) fn empty() -> (Rc<Style>, Vars) {
+    EMPTY.with(Clone::clone)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
     blended: std::cell::Cell<Option<bool>>,
@@ -4635,8 +4645,9 @@ pub(crate) fn cascade(
             }
             None => out.lengths.reset(count, Lengths::new(16., width, height)),
         }
-        out.values.resize(count, Rc::default());
-        out.vars.resize(count, Vars::default());
+        let (style, vars) = empty();
+        out.values.resize(count, style);
+        out.vars.resize(count, vars);
         out.flags.resize(count, 0);
         out.containers.resize(count, None);
     }
@@ -4663,7 +4674,7 @@ pub(crate) fn cascade(
             .clone()
             .unwrap_or_else(|| vars.clone())
     };
-    let empty = Vars::default();
+    let (unstyled, empty) = empty();
     let matches = &mut style_cache.matches;
     matches.set_hosts(&shadows.hosts);
     matches.update(doc, order);
@@ -4753,8 +4764,8 @@ pub(crate) fn cascade(
             for &(id, _) in old.nodes.iter() {
                 let id = id as usize;
                 if placed.get(id).is_some_and(|&slot| slot != KEPT) {
-                    styles[id] = Rc::default();
-                    custom[id] = Vars::default();
+                    styles[id] = unstyled.clone();
+                    custom[id] = empty.clone();
                     style_flags[id] = 0;
                     lengths.unset(id);
                     containers[id] = None;

@@ -61,7 +61,9 @@
   const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._linked !== version) { if (!node.isConnected) return -1; node._linked = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
   // WARNING: client boxes are cached until the page writes or Rust counts a new layout in the mirror header.
-  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
+  // WARNING: while observers measure the last frame, the values come from its styles and are not kept for later reads.
+  // So observers check a target again after a new layout, not after a DOM change.
+  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   const offset = (node, axis) => {
     if (slot(node) < 0 || node === document.body) return 0;
     const start = node.getBoundingClientRect()[axis ? 'top' : 'left'], parent = node.offsetParent;
@@ -142,6 +144,11 @@
   const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
   const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
   const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
+  const watched = node => {
+    if (!observers.size || quiet) return false;
+    for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; }
+    return false;
+  };
   const change = record => {
     if (!observers.size || quiet) return;
     for (const ref of observers) {
@@ -369,12 +376,13 @@
   const ignore = () => {};
   // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it. A `replace` that inserts calls `removed` once the old children left both trees, so their disconnected callbacks run before re-inserted ones connect again.
   const replaceAll = scoped((node, replace) => {
-    const rec = node._m, observed = observers.size > 0;
+    const rec = node._m, observed = watched(node);
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
-    const connected = definitions.size > 0 && node.isConnected, old = rec.kids.length && (observed || connected) ? rec.kids.map(of) : [];
+    // WARNING: a wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
+    const kids = definitions.size > 0 && node.isConnected ? rec.kids.slice() : [], old = observed ? rec.kids.map(of) : [];
     if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); rangesClear(node); }
-    let pending = connected && old.length > 0;
-    const removed = () => { if (pending) { pending = false; for (const child of old) reactions(child._m, 'disconnectedCallback'); } };
+    let pending = kids.length > 0;
+    const removed = () => { if (pending) { pending = false; for (const kid of kids) reactions(kid, 'disconnectedCallback'); } };
     replace(removed); removed();
     forgetRemoved();
     if (shadows) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); slotsIn(node.getRootNode(), rec); }
@@ -470,6 +478,24 @@
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
       before ??= null;
       if (child.nodeType === 11) {
+        // WARNING: a wrapper keeps its subtree in the arena until a GC after it leaves, so children without one move as records.
+        // `wrap` infers a namespace from the parent, so SVG contexts, where moved children could change it, keep wrapping.
+        if (!(observers.size > 0 && !quiet) && !anchors.size && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && child._m.kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
+          const rec = this._m, ref = before?._m ?? null;
+          if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
+          for (let up = rec; up; up = up.up ?? up.host) if (up === child._m) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
+          const connected = definitions.size > 0 && this.isConnected, root = shadows ? this.getRootNode() : null;
+          for (const kid of child._m.kids.slice()) {
+            if (kid.ref?.deref() || kid.tag === 'link') { this.insertBefore(of(kid), before); continue; }
+            op(2, this._id, kid.id, ref ? ref.id : -1);
+            kid.up.kids.splice(index(kid), 1); kid.up = rec;
+            if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1;
+            if (connected) reactions(kid, 'connectedCallback');
+            if (root) slotsIn(root, kid, true);
+          }
+          forgetRemoved();
+          return child;
+        }
         const nodes = child._m.kids.map(of), observed = observers.size > 0 && !quiet;
         if (!nodes.length) return child;
         quiet++;
@@ -1229,7 +1255,7 @@
     decode() { if (!this._loading && this.src) this._loadImage(); return this._loading ?? Promise.resolve(); }
   }
   const resource = async (source, kind) => {
-    if (source.startsWith('data:')) { const comma = source.indexOf(','), payload = source.slice(comma + 1); return source.slice(0, comma).endsWith(';base64') ? Uint8Array.from(atob(payload), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(payload)); }
+    if (source.startsWith('data:')) { const comma = source.indexOf(','), payload = source.slice(comma + 1); return source.slice(0, comma).endsWith(';base64') ? Uint8Array.fromBase64(payload) : new TextEncoder().encode(decodeURIComponent(payload)); }
     if (/^(apps|file):$/.test(new URL(source, globalThis.location?.href).protocol)) return source;
     const response = await fetch(source); if (!response.ok) throw new Error(`${kind} request failed: ${response.status}`); return new Uint8Array(await response.arrayBuffer());
   };
@@ -1937,16 +1963,21 @@
     }
     return node;
   };
-  let sweepAt = 0, cursor = 0;
+  let sweepAt = 0, cursor = 0, canary = new WeakRef({});
   globalThis.__appsDomSweep = (force = false) => {
     scheduled = false; flush();
-    if (!force && performance.now() < sweepAt) return;
-    sweepAt = performance.now() + 250;
-    for (const [rec, set] of anchors) { for (const ref of set) if (!ref.deref()) set.delete(ref); if (!set.size) anchors.delete(rec); }
-    const dead = [];
-    if (force) cursor = 0;
+    // WARNING: removed trees without wrappers go at the next turn, so a page that rebuilds rows each frame doesn't fill the arena between timed sweeps.
+    // Wrappers die only in a GC, so the first sweep after one checks them all, and timed sweeps between GCs check a slice.
+    const collected = !canary.deref(), timed = force || collected || performance.now() >= sweepAt, dead = [];
+    if (!timed && !orphans.length) return;
+    if (collected) canary = new WeakRef({});
+    if (timed) {
+      sweepAt = performance.now() + 250;
+      for (const [rec, set] of anchors) { for (const ref of set) if (!ref.deref()) set.delete(ref); if (!set.size) anchors.delete(rec); }
+    }
+    if (force || collected) cursor = 0;
     // WARNING: timed sweeps check a slice of the wrappers and continue where the last one stopped, so their cost doesn't grow with the page.
-    for (let budget = force ? wrapped.length : 4096; budget-- && wrapped.length;) {
+    for (let budget = force || collected ? wrapped.length : timed ? 4096 : 0; budget-- && wrapped.length;) {
       if (cursor >= wrapped.length) cursor = 0;
       const rec = wrapped[cursor];
       if (rec.ref?.deref()) { cursor++; continue; }
@@ -2080,7 +2111,7 @@
     get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { if (this._offscreen) throw transferred(); this.setAttribute('height', Number(v) >>> 0); }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
     toDataURL(type='image/png') { if (type!=='image/png') throw new DOMException('Only PNG encoding is supported','NotSupportedError');this._context?._flush?.();return call('dom.canvasURL',this._id); }
-    toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.from(atob(data),c=>c.charCodeAt(0))],{type:'image/png'}))); }
+    toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.fromBase64(data)],{type:'image/png'}))); }
     getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); return canvasContext(this, type, options, CanvasRenderingContext2D); }
     transferControlToOffscreen() { if (this._contextType || this._offscreen) throw new DOMException('The canvas has a context or was already transferred', 'InvalidStateError'); this._offscreen = true; const offscreen = new OffscreenCanvas(0, 0); offscreen._node = this; return offscreen; }
   }
@@ -2859,7 +2890,7 @@
   globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
   // WARNING: like the focus fixup of browsers, a focused element that a frame shows inert, hidden or disabled loses focus. It reads that frame's flags, as a forced layout here would cost every frame.
-  globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
+  globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -3080,7 +3111,7 @@
   const fileType=name=>({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf','html':'text/html','htm':'text/html','css':'text/css','js':'text/javascript','csv':'text/csv','xml':'text/xml','zip':'application/zip','mp3':'audio/mpeg','wav':'audio/wav','mp4':'video/mp4','webm':'video/webm'})[name.split('.').at(-1).toLowerCase()]??'application/octet-stream';
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
-  globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.from(atob(data),char=>char.charCodeAt(0))],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
+  globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
   // WARNING: the clipboard answers only while a page script runs from the app's event loop, and it holds text only.
   class ClipboardItem {
     constructor(items) { this._items = { ...items }; this.types = Object.keys(this._items); this.presentationStyle = 'unspecified'; }

@@ -1,3 +1,21 @@
+diff --git a/Source/JavaScriptCore/API/APICallbackFunction.h b/Source/JavaScriptCore/API/APICallbackFunction.h
+index 2eec0af71..fa8825211 100644
+--- a/Source/JavaScriptCore/API/APICallbackFunction.h
++++ b/Source/JavaScriptCore/API/APICallbackFunction.h
+@@ -65,10 +65,9 @@ EncodedJSValue APICallbackFunction::callImpl(JSGlobalObject* globalObject, CallF
+ 
+     JSValueRef exception = nullptr;
+     JSValueRef result;
+-    {
+-        JSLock::DropAllLocks dropAllLocks(globalObject);
+-        result = uncheckedDowncast<T>(toJS(functionRef))->functionCallback()(execRef, functionRef, thisObjRef, argumentsSpan.size(), argumentsSpanData, &exception);
+-    }
++    // The callback keeps the lock, so the API calls it makes only count it up. JSLockHolder switches atom tables
++    // when another VM of this thread calls back into this one.
++    result = uncheckedDowncast<T>(toJS(functionRef))->functionCallback()(execRef, functionRef, thisObjRef, argumentsSpan.size(), argumentsSpanData, &exception);
+     if (exception) {
+         throwException(globalObject, scope, toJS(globalObject, exception));
+         return JSValue::encode(jsUndefined());
 diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
 index 81101c17f..beca22083 100644
 --- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
@@ -408,10 +426,10 @@ index b8e3b2619..6ba9acb7c 100644
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
 diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-index c009bb5a2..a770c32d8 100644
+index c009bb5a2..6a9280b88 100644
 --- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
 +++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-@@ -69,6 +69,47 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
+@@ -69,6 +69,99 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
  typedef bool
  (*JSShouldTerminateCallback) (JSContextRef ctx, void* context);
  
@@ -456,14 +474,72 @@ index c009bb5a2..a770c32d8 100644
 +*/
 +JS_EXPORT void JSGlobalContextDisconnectInspector(JSGlobalContextRef ctx, void* connection);
 +
++/*!
++@function
++@abstract Gets the characters of a string value without copying them. A rope is joined first.
++@param length Receives the length in code units.
++@param latin1 Receives true for 8-bit Latin-1 characters, false for UTF-16.
++@result The characters, or NULL if the value is not a string. They stay valid while the value is alive and no JavaScript runs.
++*/
++JS_EXPORT const void* JSValueGetStringCharacters(JSContextRef ctx, JSValueRef value, size_t* length, bool* latin1);
++
++/*!
++@function
++@abstract Makes a string value from Latin-1 characters, with one copy.
++@result The string, or NULL if it is too long.
++*/
++JS_EXPORT JSValueRef JSValueMakeStringLatin1(JSContextRef ctx, const unsigned char* characters, size_t length);
++
++/*!
++@function
++@abstract Makes a string value from UTF-16 code units, with one copy.
++@result The string, or NULL if it is too long.
++*/
++JS_EXPORT JSValueRef JSValueMakeStringUTF16(JSContextRef ctx, const unsigned short* characters, size_t length);
++
++/*!
++@function
++@abstract Makes a string value from UTF-8 bytes. Invalid sequences become U+FFFD. ASCII is copied once into an 8-bit string.
++@result The string, or NULL if it is too long.
++*/
++JS_EXPORT JSValueRef JSValueMakeStringUTF8(JSContextRef ctx, const char* bytes, size_t length);
++
++/*!
++@function
++@abstract Converts Latin-1 characters or UTF-16 code units to UTF-8 with SIMD.
++@param output Must have room for the whole UTF-8 text. Without it, the function returns the size of the text in UTF-8, counting 2 bytes for a lone surrogate.
++@result The bytes written, or 0 if the UTF-16 has a lone surrogate.
++*/
++JS_EXPORT size_t JSStringConvertCharactersToUTF8(const void* characters, size_t length, bool latin1, char* output);
++
++/*!
++@function
++@abstract Gets the bytes of an ArrayBuffer, a SharedArrayBuffer or a view without pinning them, so the buffer can still be transferred later.
++@result false if the value holds no bytes. The bytes stay valid while the value is alive and no JavaScript runs.
++*/
++JS_EXPORT bool JSValueGetBytes(JSContextRef ctx, JSValueRef value, void** bytes, size_t* length);
++
++/*!
++@function
++@abstract Makes a Uint8Array whose bytes the caller must fill, without zeroing them.
++@param bytes Receives the bytes, valid while the array is alive and no JavaScript runs.
++*/
++JS_EXPORT JSObjectRef JSObjectMakeUint8ArrayUninitialized(JSContextRef ctx, size_t length, void** bytes, JSValueRef* exception);
++
  /*!
  @function
  @abstract Sets the script execution time limit.
 diff --git a/Source/JavaScriptCore/API/JSTypedArray.cpp b/Source/JavaScriptCore/API/JSTypedArray.cpp
-index fb7313c36..7da81f65b 100644
+index fb7313c36..90150713e 100644
 --- a/Source/JavaScriptCore/API/JSTypedArray.cpp
 +++ b/Source/JavaScriptCore/API/JSTypedArray.cpp
-@@ -31,6 +31,7 @@
+@@ -26,11 +26,13 @@
+ 
+ #include "config.h"
+ #include "JSTypedArray.h"
++#include "JSContextRefPrivate.h"
+ 
+ #include "APICast.h"
  #include "APIUtils.h"
  #include "ClassInfo.h"
  #include "JSCInlines.h"
@@ -471,7 +547,7 @@ index fb7313c36..7da81f65b 100644
  #include "JSGenericTypedArrayViewInlines.h"
  #include "JSTypedArrays.h"
  #include "TypedArrayController.h"
-@@ -137,6 +138,7 @@ static JSObject* createTypedArray(JSGlobalObject* globalObject, JSTypedArrayType
+@@ -137,6 +139,7 @@ static JSObject* createTypedArray(JSGlobalObject* globalObject, JSTypedArrayType
  
  JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef, JSValueRef*)
  {
@@ -479,7 +555,7 @@ index fb7313c36..7da81f65b 100644
  
      JSGlobalObject* globalObject = toJS(ctx);
  
-@@ -154,6 +156,7 @@ JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef,
+@@ -154,6 +157,7 @@ JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef,
  
  JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType, size_t length, JSValueRef* exception)
  {
@@ -487,7 +563,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -172,6 +175,7 @@ JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType,
+@@ -172,6 +176,7 @@ JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType,
  
  JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArrayType arrayType, void* bytes, size_t length, JSTypedArrayBytesDeallocator destructor, void* destructorContext, JSValueRef* exception)
  {
@@ -495,7 +571,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -193,6 +197,7 @@ JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArray
+@@ -193,6 +198,7 @@ JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArray
  
  JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArrayType arrayType, JSObjectRef jsBufferRef, JSValueRef* exception)
  {
@@ -503,7 +579,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -220,6 +225,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArray
+@@ -220,6 +226,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArray
  
  JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JSTypedArrayType arrayType, JSObjectRef jsBufferRef, size_t offset, size_t length, JSValueRef* exception)
  {
@@ -511,7 +587,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -241,6 +247,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JST
+@@ -241,6 +248,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JST
  
  void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -519,7 +595,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
  
      JSObject* object = toJS(objectRef);
-@@ -256,8 +263,9 @@ void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSV
+@@ -256,8 +264,9 @@ void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSV
      return nullptr;
  }
  
@@ -530,7 +606,7 @@ index fb7313c36..7da81f65b 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -266,8 +274,9 @@ size_t JSObjectGetTypedArrayLength(JSContextRef, JSObjectRef objectRef, JSValueR
+@@ -266,8 +275,9 @@ size_t JSObjectGetTypedArrayLength(JSContextRef, JSObjectRef objectRef, JSValueR
      return 0;
  }
  
@@ -541,7 +617,7 @@ index fb7313c36..7da81f65b 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -276,8 +285,9 @@ size_t JSObjectGetTypedArrayByteLength(JSContextRef, JSObjectRef objectRef, JSVa
+@@ -276,8 +286,9 @@ size_t JSObjectGetTypedArrayByteLength(JSContextRef, JSObjectRef objectRef, JSVa
      return 0;
  }
  
@@ -552,7 +628,7 @@ index fb7313c36..7da81f65b 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -288,6 +298,7 @@ size_t JSObjectGetTypedArrayByteOffset(JSContextRef, JSObjectRef objectRef, JSVa
+@@ -288,6 +299,7 @@ size_t JSObjectGetTypedArrayByteOffset(JSContextRef, JSObjectRef objectRef, JSVa
  
  JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -560,7 +636,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      auto &vm = globalObject->vm();
      
-@@ -306,6 +317,7 @@ JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef,
+@@ -306,6 +318,7 @@ JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef,
  
  JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes, size_t byteLength, JSTypedArrayBytesDeallocator bytesDeallocator, void* deallocatorContext, JSValueRef* exception)
  {
@@ -568,7 +644,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -324,6 +336,7 @@ JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes
+@@ -324,6 +337,7 @@ JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes
  
  void* JSObjectGetArrayBufferBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -576,7 +652,7 @@ index fb7313c36..7da81f65b 100644
      JSGlobalObject* globalObject = toJS(ctx);
      JSObject* object = toJS(objectRef);
  
-@@ -349,8 +362,9 @@ inline static bool isLinkedBeforeTypedArrayLengthQuirk()
+@@ -349,8 +363,9 @@ inline static bool isLinkedBeforeTypedArrayLengthQuirk()
  inline static bool isLinkedBeforeTypedArrayLengthQuirk() { return false; }
  #endif
  
@@ -587,6 +663,147 @@ index fb7313c36..7da81f65b 100644
      JSObject* object = toJS(objectRef);
  
      if (!object) {
+@@ -368,3 +383,36 @@ size_t JSObjectGetArrayBufferByteLength(JSContextRef, JSObjectRef objectRef, JSV
+ }
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
++
++bool JSValueGetBytes(JSContextRef ctx, JSValueRef value, void** bytes, size_t* length)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    JSLockHolder locker(globalObject);
++    JSValue jsValue = toJS(globalObject, value);
++    if (!jsValue.isCell())
++        return false;
++    if (auto* view = dynamicDowncast<JSArrayBufferView>(jsValue.asCell())) {
++        *bytes = view->vector();
++        *length = view->isOutOfBounds() ? 0 : view->byteLength();
++        return true;
++    }
++    if (auto* buffer = dynamicDowncast<JSArrayBuffer>(jsValue.asCell())) {
++        *bytes = buffer->impl()->data();
++        *length = buffer->impl()->byteLength();
++        return true;
++    }
++    return false;
++}
++
++JSObjectRef JSObjectMakeUint8ArrayUninitialized(JSContextRef ctx, size_t length, void** bytes, JSValueRef* exception)
++{
++    JSLockHolder locker(toJS(ctx));
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
++    auto* array = JSUint8Array::createUninitialized(globalObject, globalObject->typedArrayStructure(TypeUint8, false), length);
++    if (handleExceptionIfNeeded(scope, ctx, exception) == ExceptionStatus::DidThrow || !array)
++        return nullptr;
++    *bytes = array->typedVector();
++    return toRef(array);
++}
+diff --git a/Source/JavaScriptCore/API/JSValueRef.cpp b/Source/JavaScriptCore/API/JSValueRef.cpp
+index cad190295..8cf9d0efd 100644
+--- a/Source/JavaScriptCore/API/JSValueRef.cpp
++++ b/Source/JavaScriptCore/API/JSValueRef.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include "config.h"
+ #include "JSValueRef.h"
++#include "JSContextRefPrivate.h"
+ 
+ #include "APICast.h"
+ #include "APIUtils.h"
+@@ -37,6 +38,7 @@
+ #include "LiteralParser.h"
+ #include "Protect.h"
+ #include <wtf/Assertions.h>
++#include <wtf/SIMDUTF.h>
+ #include <wtf/text/WTFString.h>
+ 
+ #if PLATFORM(MAC)
+@@ -817,4 +819,81 @@ void JSValueUnprotect(JSContextRef ctx, JSValueRef value)
+ 
+     JSValue jsValue = toJSForGC(globalObject, value);
+     gcUnprotect(jsValue);
+-}
+\ No newline at end of file
++}
++const void* JSValueGetStringCharacters(JSContextRef ctx, JSValueRef value, size_t* length, bool* latin1)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
++
++    JSValue jsValue = toJS(globalObject, value);
++    if (!jsValue.isString())
++        return nullptr;
++    const String& string = asString(jsValue)->value(globalObject).data;
++    if (handleExceptionIfNeeded(scope, ctx, nullptr) == ExceptionStatus::DidThrow)
++        return nullptr;
++    *length = string.length();
++    *latin1 = string.is8Bit() || string.isEmpty();
++    if (string.isEmpty())
++        return "";
++    return string.is8Bit() ? static_cast<const void*>(string.span8().data()) : static_cast<const void*>(string.span16().data());
++}
++
++JSValueRef JSValueMakeStringLatin1(JSContextRef ctx, const unsigned char* characters, size_t length)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    if (length > JSString::MaxLength)
++        return nullptr;
++    if (!length)
++        return toRef(globalObject, jsEmptyString(vm));
++    return toRef(globalObject, jsString(vm, String(unsafeMakeSpan(byteCast<Latin1Character>(characters), length))));
++}
++
++JSValueRef JSValueMakeStringUTF16(JSContextRef ctx, const unsigned short* characters, size_t length)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    if (length > JSString::MaxLength)
++        return nullptr;
++    if (!length)
++        return toRef(globalObject, jsEmptyString(vm));
++    return toRef(globalObject, jsString(vm, String(unsafeMakeSpan(reinterpret_cast<const char16_t*>(characters), length))));
++}
++
++JSValueRef JSValueMakeStringUTF8(JSContextRef ctx, const char* bytes, size_t length)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    if (length > JSString::MaxLength)
++        return nullptr;
++    if (!length)
++        return toRef(globalObject, jsEmptyString(vm));
++    if (simdutf::validate_ascii(bytes, length))
++        return toRef(globalObject, jsString(vm, String(unsafeMakeSpan(byteCast<Latin1Character>(bytes), length))));
++    String string;
++    if (simdutf::validate_utf8(bytes, length)) {
++        std::span<char16_t> characters;
++        if (auto impl = StringImpl::tryCreateUninitialized(simdutf::utf16_length_from_utf8(bytes, length), characters)) {
++            (void)simdutf::convert_valid_utf8_to_utf16le(bytes, length, characters.data());
++            string = WTF::move(impl);
++        }
++    } else
++        string = String::fromUTF8ReplacingInvalidSequences(unsafeMakeSpan(byteCast<char8_t>(bytes), length));
++    if (string.isNull())
++        return nullptr;
++    return toRef(globalObject, jsString(vm, WTF::move(string)));
++}
++
++size_t JSStringConvertCharactersToUTF8(const void* characters, size_t length, bool latin1, char* output)
++{
++    if (!output)
++        return latin1 ? simdutf::utf8_length_from_latin1(static_cast<const char*>(characters), length) : simdutf::utf8_length_from_utf16le(static_cast<const char16_t*>(characters), length);
++    if (latin1)
++        return simdutf::convert_latin1_to_utf8(static_cast<const char*>(characters), length, output);
++    return simdutf::convert_utf16le_to_utf8(static_cast<const char16_t*>(characters), length, output);
++}
 diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
 index 02389f1e1..045edddb0 100644
 --- a/Source/JavaScriptCore/CMakeLists.txt
@@ -628,6 +845,43 @@ index 8efc3dcab..7fdee2ca1 100644
  }
  
  void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
+diff --git a/Source/JavaScriptCore/runtime/JSLock.cpp b/Source/JavaScriptCore/runtime/JSLock.cpp
+index 0fa9323dc..fb69268bc 100644
+--- a/Source/JavaScriptCore/runtime/JSLock.cpp
++++ b/Source/JavaScriptCore/runtime/JSLock.cpp
+@@ -56,6 +56,11 @@ JSLockHolder::JSLockHolder(VM& vm)
+     : m_vm(&vm)
+ {
+     protect(m_vm->apiLock())->lock();
++    // A callback keeps its VM's lock, so another VM of this thread can call back into this one, which then only
++    // counts the lock up. Its atom table must still be current, or names find no properties.
++    auto& thread = Thread::currentSingleton();
++    if (thread.atomStringTable() != m_vm->atomStringTable())
++        m_previousAtomStringTable = thread.setCurrentAtomStringTable(m_vm->atomStringTable());
+ }
+ 
+ JSLockHolder::~JSLockHolder()
+@@ -63,6 +68,8 @@ JSLockHolder::~JSLockHolder()
+     RefPtr<JSLock> apiLock(&m_vm->apiLock());
+     m_vm = nullptr;
+     apiLock->unlock();
++    if (m_previousAtomStringTable)
++        Thread::currentSingleton().setCurrentAtomStringTable(m_previousAtomStringTable);
+ }
+ 
+ JSLock::JSLock(VM* vm)
+diff --git a/Source/JavaScriptCore/runtime/JSLock.h b/Source/JavaScriptCore/runtime/JSLock.h
+index 0c7028e26..f6086fc4f 100644
+--- a/Source/JavaScriptCore/runtime/JSLock.h
++++ b/Source/JavaScriptCore/runtime/JSLock.h
+@@ -68,6 +68,7 @@ public:
+ 
+ private:
+     RefPtr<VM> m_vm;
++    AtomStringTable* m_previousAtomStringTable { nullptr };
+ };
+ 
+ class JSLock : public ThreadSafeRefCounted<JSLock> {
 diff --git a/Source/JavaScriptCore/runtime/JSMicrotask.cpp b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 index b17afacd7..475ba4957 100644
 --- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp

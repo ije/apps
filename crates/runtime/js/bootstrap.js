@@ -1,7 +1,8 @@
 (() => {
-  const native = globalThis.__appsNative, clock = globalThis.__appsNow;
+  const native = globalThis.__appsNative, clock = globalThis.__appsNow, codec = globalThis.__appsEncoding;
   const role = globalThis.__appsRole, disabled = new Set(globalThis.__appsDisabled);
   delete globalThis.__appsNative;
+  delete globalThis.__appsEncoding;
   delete globalThis.__appsRole;
   delete globalThis.__appsDisabled;
   const feature = name => {
@@ -163,7 +164,7 @@
     for (let i = 0; i < ticks.length; i++) { const [fn, args] = ticks[i]; try { fn(...args); } catch (error) { ticks.splice(0, i + 1); i = -1; fail(error); } }
     ticks.length = 0;
   };
-  const pollWeb = globalThis.__appsWeb(call);
+  const pollWeb = globalThis.__appsWeb(call, codec);
   delete globalThis.__appsWeb;
   // WARNING: runtime import() loads data: and blob: modules only with jsExecute, and http(s) modules only with httpImport.
   const download = globalThis.fetch;
@@ -173,7 +174,7 @@
     if (disabled.has(name)) return reject(new TypeError(`Importing ${url.slice(0, url.indexOf(':'))} URLs needs the ${name} feature. Add "${name}" to "features" in package.json`));
     download(url).then(response => response.ok ? response.text() : Promise.reject(new TypeError(`Cannot import ${url}: HTTP ${response.status}`))).then(resolve, reject);
   };
-  globalThis.__appsPlatform(call, nodeRole);
+  globalThis.__appsPlatform(call, nodeRole, codec);
   delete globalThis.__appsPlatform;
   let modulesPending = 0;
   const moduleErrors = [];
@@ -289,7 +290,7 @@
   }
   globalThis.setImmediate = (fn, ...args) => { callable(fn, 'callback'); const immediate = new Immediate(); immediates.set(immediate, [fn, args]); return immediate; };
   globalThis.clearImmediate = immediate => { immediates.delete(immediate); };
-  const ffi = globalThis.__appsFFI(globalThis.__appsFFINative);
+  const ffi = globalThis.__appsFFI(globalThis.__appsFFINative, codec);
   delete globalThis.__appsFFI;
   delete globalThis.__appsFFINative;
   const sqlite = globalThis.__appsSQLite(call);
@@ -300,7 +301,7 @@
   delete globalThis.__appsEventTargets;
   servers = globalThis.__appsServe(call);
   delete globalThis.__appsServe;
-  node = globalThis.__appsNode(call, events.EventEmitter, inspector, info);
+  node = globalThis.__appsNode(call, events.EventEmitter, inspector, info, codec);
   delete globalThis.__appsNode;
   const stream = globalThis.__appsNodeStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder);
   delete globalThis.__appsNodeStreams;
@@ -1054,7 +1055,7 @@
       const request = captures.get(data.id);
       captures.delete(data.id);
       if (data.error) return request?.reject(new Error(data.error));
-      const bytes = Uint8Array.from(atob(data.png), char => char.charCodeAt(0));
+      const bytes = Uint8Array.fromBase64(data.png);
       request?.resolve(electron.nativeImage.createFromBuffer(bytes));
     }
   };

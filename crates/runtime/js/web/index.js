@@ -1,4 +1,4 @@
-globalThis.__appsWeb = call => {
+globalThis.__appsWeb = (call, codec) => {
   const disturbed = globalThis.__appsStreamDisturbed;
   delete globalThis.__appsStreamDisturbed;
   const bytes = value => {
@@ -7,7 +7,7 @@ globalThis.__appsWeb = call => {
     throw new TypeError('Expected an ArrayBuffer or a view');
   };
   const encodeBytes = value => value;
-  const decodeBytes = value => typeof value === 'string' ? (Uint8Array.fromBase64 ? Uint8Array.fromBase64(value) : Uint8Array.from(atob(value), c => c.charCodeAt(0))) : value instanceof Uint8Array ? value : new Uint8Array(value);
+  const decodeBytes = value => typeof value === 'string' ? Uint8Array.fromBase64(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
   globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes, memory: body => memoryBodies.get(body) };
   // WARNING: work that waits for a native wake without an event of its own, like an IndexedDB transaction on a busy database, runs again on each poll.
   const retries = globalThis.__appsRetries = new Set();
@@ -129,47 +129,19 @@ globalThis.__appsWeb = call => {
     get signal() { return this.#signal; }
     abort(reason) { abort(this.#signal, reason); }
   }
-  const utf8 = (text, read, output, written) => {
-    const length = text.length, size = output.length;
-    while (read < length) {
-      let code = text.charCodeAt(read), units = 1;
-      if (code < 128) { if (written === size) break; output[written++] = code; read++; continue; }
-      if ((code & 0xF800) === 0xD800) { const next = text.charCodeAt(read + 1); if (code < 0xDC00 && (next & 0xFC00) === 0xDC00) { code = 0x10000 + ((code & 0x3FF) << 10) + (next & 0x3FF); units = 2; } else code = 0xFFFD; }
-      const bytes = code < 2048 ? 2 : code < 65536 ? 3 : 4;
-      if (written + bytes > size) break;
-      if (bytes === 2) output[written++] = 0xC0 | code >> 6;
-      else { if (bytes === 4) { output[written++] = 0xF0 | code >> 18; output[written++] = 0x80 | code >> 12 & 63; } else output[written++] = 0xE0 | code >> 12; output[written++] = 0x80 | code >> 6 & 63; }
-      output[written++] = 0x80 | code & 63;
-      read += units;
-    }
-    return { read, written };
-  };
   class TextEncoder {
     get encoding() { return 'utf-8'; }
-    encode(input = '') {
-      const text = String(input), length = text.length, output = new Uint8Array(length);
-      for (let i = 0; i < length; i++) {
-        const code = text.charCodeAt(i);
-        if (code < 128) { output[i] = code; continue; }
-        // WARNING: count the exact size, so long text needs no 3x buffer and no copy of it.
-        let size = i;
-        for (let j = i; j < length; j++) { const c = text.charCodeAt(j); size += c < 128 ? 1 : c < 2048 ? 2 : (c & 0xFC00) === 0xD800 && (text.charCodeAt(j + 1) & 0xFC00) === 0xDC00 ? (j++, 4) : 3; }
-        const wide = new Uint8Array(size);
-        if (i) wide.set(output.subarray(0, i));
-        utf8(text, i, wide, i);
-        return wide;
-      }
-      return output;
-    }
+    encode(input = '') { return codec.encode(String(input), 0); }
     encodeInto(input, output) {
       if (!(output instanceof Uint8Array)) throw new TypeError('Expected Uint8Array');
-      return utf8(String(input), 0, output, 0);
+      const [read, written] = codec.encodeInto(String(input), output);
+      return { read, written };
     }
   }
   const decoderLabels = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be', latin1: 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252', ascii: 'windows-1252', 'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', cp1252: 'windows-1252', 'x-cp1252': 'windows-1252' };
-  const cp1252 = '€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8DŽ\x8F\x90‘’“”•–—˜™š›œ\x9DžŸ';
+  const decoderKinds = { 'utf-8': 0, 'utf-16le': 4, 'utf-16be': 5, 'windows-1252': 6 };
   class TextDecoder {
-    #pending = []; #started = false; #fatal; #ignoreBOM; #encoding;
+    #pending = null; #started = false; #fatal; #ignoreBOM; #encoding;
     constructor(label = 'utf-8', options = {}) {
       this.#encoding = Object.hasOwn(decoderLabels, String(label).trim().toLowerCase()) ? decoderLabels[String(label).trim().toLowerCase()] : null;
       if (!this.#encoding) throw new RangeError(`The encoding label provided ('${label}') is invalid.`);
@@ -179,27 +151,18 @@ globalThis.__appsWeb = call => {
     get fatal() { return this.#fatal; }
     get ignoreBOM() { return this.#ignoreBOM; }
     decode(input = new Uint8Array(), options = {}) {
-      let data = bytes(input);
-      if (this.#pending.length) { const combined = new Uint8Array(this.#pending.length + data.length); combined.set(this.#pending); combined.set(data, this.#pending.length); data = combined; }
-      if (this.#encoding === 'windows-1252') { let text = ''; for (const byte of data) text += byte >= 0x80 && byte < 0xA0 ? cp1252[byte - 0x80] : String.fromCharCode(byte); return text; }
-      if (this.#encoding !== 'utf-8') {
-        const end = data.length & ~1, big = this.#encoding === 'utf-16be', parts = [];
-        let units = [];
-        for (let index = 0; index < end; index += 2) { units.push(big ? data[index] << 8 | data[index + 1] : data[index] | data[index + 1] << 8); if (units.length === 8192) { parts.push(String.fromCharCode(...units)); units = []; } }
-        parts.push(String.fromCharCode(...units));
-        let text = parts.join('');
-        if (options.stream) this.#pending = data.slice(end); else { this.#pending = []; if (end !== data.length) { if (this.#fatal) throw new TypeError('The encoded data was not valid'); text += '�'; } }
-        if (text && !this.#started) { this.#started = true; if (!this.#ignoreBOM && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); }
-        if (!options.stream) this.#started = false;
-        return this.#fatal && !text.isWellFormed() ? (() => { throw new TypeError('The encoded data was not valid'); })() : text.toWellFormed();
-      }
-      try {
-        let [text, pending] = call('web.decode', encodeBytes(data), !!options.stream, this.#fatal);
-        this.#pending = pending ? data.slice(data.length - pending) : [];
-        if (text && !this.#started) { this.#started = true; if (!this.#ignoreBOM && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); }
-        if (!options.stream) { this.#pending = []; this.#started = false; }
-        return text;
-      } catch (error) { this.#pending = []; this.#started = false; throw new TypeError(error.message); }
+      let data = input;
+      if (this.#pending) { const head = bytes(input), combined = new Uint8Array(this.#pending.length + head.length); combined.set(this.#pending); combined.set(head, this.#pending.length); data = combined; }
+      else if (!ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer) && !(typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)) throw new TypeError('Expected an ArrayBuffer or a view');
+      const stream = !!options.stream;
+      let text;
+      try { text = codec.decode(data, decoderKinds[this.#encoding], this.#fatal, stream); }
+      catch (error) { this.#pending = null; this.#started = false; throw new TypeError(error.message); }
+      this.#pending = null;
+      if (stream) { const kept = text[1]; text = text[0]; if (kept) this.#pending = bytes(data).slice(-kept); }
+      if (text && !this.#started) { this.#started = true; if (!this.#ignoreBOM && text.charCodeAt(0) === 0xFEFF) text = text.slice(1); }
+      if (!stream) this.#started = false;
+      return text;
     }
   }
   class TextEncoderStream {
@@ -263,15 +226,23 @@ globalThis.__appsWeb = call => {
     [Symbol.iterator]() { return this.entries(); }
     toString() { return call('web.params.stringify', params.get(this).list); }
   }
-  const parseURL = (...args) => { try { return call('web.url', ...args.map(value => typeof value === 'string' ? usv(value) : value)); } catch (error) { throw new TypeError(error.message); } };
+  const parseURL = (...args) => {
+    let parts;
+    try { parts = call('web.url', ...args.map(value => typeof value === 'string' ? usv(value) : value)); } catch (error) { throw new TypeError(error.message); }
+    const [href, origin, protocol, username, password, host, hostname, port, pathname, search, hash] = parts;
+    return { href, origin, protocol, username, password, host, hostname, port, pathname, search, hash };
+  };
   class URL {
-    constructor(input, base) {
-      const data = parseURL(String(input), base === undefined ? null : String(base)), searchParams = new URLSearchParams(data.search);
-      urls.set(this, { data, searchParams });
-      params.get(searchParams).update = () => { const state = urls.get(this); state.data = parseURL(state.data.href, null, 'search', searchParams.toString()); };
-    }
+    constructor(input, base) { urls.set(this, { data: parseURL(String(input), base === undefined ? null : String(base)), searchParams: null }); }
     get origin() { return urls.get(this).data.origin; }
-    get searchParams() { return urls.get(this).searchParams; }
+    get searchParams() {
+      const state = urls.get(this);
+      if (!state.searchParams) {
+        state.searchParams = new URLSearchParams(state.data.search);
+        params.get(state.searchParams).update = () => { state.data = parseURL(state.data.href, null, 'search', state.searchParams.toString()); };
+      }
+      return state.searchParams;
+    }
     toString() { return this.href; }
     toJSON() { return this.href; }
     static canParse(input, base) { try { new URL(input, base); return true; } catch { return false; } }
@@ -280,7 +251,7 @@ globalThis.__appsWeb = call => {
   for (const key of ['href', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(URL.prototype, key, {
     enumerable: true, configurable: true,
     get() { return urls.get(this).data[key]; },
-    set(value) { const state = urls.get(this); state.data = parseURL(state.data.href, null, key, String(value)); if (key === 'search' || key === 'href') params.get(state.searchParams).list = call('web.params.parse', state.data.search.slice(1)); },
+    set(value) { const state = urls.get(this); state.data = parseURL(state.data.href, null, key, String(value)); if ((key === 'search' || key === 'href') && state.searchParams) params.get(state.searchParams).list = call('web.params.parse', state.data.search.slice(1)); },
   });
   const crypto = globalThis.__appsCrypto(call, encodeBytes, decodeBytes, {
     getRandomValues(array) {
@@ -576,7 +547,7 @@ globalThis.__appsWeb = call => {
         const raw=source.slice(comma+1);
         const encoder=new TextEncoder();
         for(let i=0;i<raw.length;){const code=raw.charCodeAt(i);if(code===37&&/^[0-9a-f]{2}$/i.test(raw.slice(i+1,i+3))){bytes.push(parseInt(raw.slice(i+1,i+3),16));i+=3;}else if(code<128){bytes.push(code);i++;}else{let end=i+1;while(end<raw.length&&raw.charCodeAt(end)>=128)end++;for(const byte of encoder.encode(raw.slice(i,end)))bytes.push(byte);i=end;}}
-        if(/;base64$/i.test(type)){type=type.slice(0,-7);let text='';for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.slice(i,i+8192));bytes=Uint8Array.from(atob(text),character=>character.charCodeAt(0));}
+        if(/;base64$/i.test(type)){type=type.slice(0,-7);bytes=Uint8Array.fromBase64(codec.decode(new Uint8Array(bytes),1));}
         if(!type)type='text/plain;charset=US-ASCII';else if(type.startsWith(';'))type='text/plain'+type;
         resolve(new Response(new Uint8Array(bytes),{headers:{'content-type':type}}));return;
       }
@@ -761,7 +732,6 @@ globalThis.__appsWeb = call => {
       return this.responseXML;
     }
   }
-  const base64Bytes = bytes => { if (bytes.toBase64) return bytes.toBase64(); let text = ''; for (let i = 0; i < bytes.length; i += 8192) text += String.fromCharCode(...bytes.subarray(i, i + 8192)); return btoa(text); };
   class FileReader extends EventTarget {
     static EMPTY = 0; static LOADING = 1; static DONE = 2;
     EMPTY = 0; LOADING = 1; DONE = 2;
@@ -789,9 +759,9 @@ globalThis.__appsWeb = call => {
       }, 0);
     }
     readAsArrayBuffer(blob) { this.#read(blob, buffer => buffer); }
-    readAsBinaryString(blob) { this.#read(blob, buffer => { let text = ''; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.length; i += 8192) text += String.fromCharCode(...bytes.subarray(i, i + 8192)); return text; }); }
+    readAsBinaryString(blob) { this.#read(blob, buffer => codec.decode(buffer, 1)); }
     readAsText(blob, encoding = 'utf-8') { this.#read(blob, buffer => new TextDecoder(encoding).decode(buffer)); }
-    readAsDataURL(blob) { this.#read(blob, buffer => `data:${blob.type || 'application/octet-stream'};base64,${base64Bytes(new Uint8Array(buffer))}`); }
+    readAsDataURL(blob) { this.#read(blob, buffer => `data:${blob.type || 'application/octet-stream'};base64,${new Uint8Array(buffer).toBase64()}`); }
     abort() { if (this.readyState !== 1) { return; } this.#run++; this.readyState = 2; this.result = null; const blob = new Blob(); this.#fire('abort', blob); this.#fire('loadend', blob); }
   }
   Object.assign(globalThis, { FileReader, ProgressEvent, XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload, DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,

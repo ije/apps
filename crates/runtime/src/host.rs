@@ -19,6 +19,7 @@ pub enum Role {
 pub struct Waker(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
 
 thread_local! { static WAKER: std::cell::RefCell<Waker> = std::cell::RefCell::default(); }
+static CWD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 thread_local! {
     pub(crate) static IDLE: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Instant>, std::time::Duration)> = std::cell::Cell::default();
@@ -978,8 +979,17 @@ impl Host {
                     json!({"node":node,"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
-            "cwd" => Ok(json!(std::env::current_dir()?)),
+            // WARNING: getcwd takes about 9 µs on macOS, so like Node the process keeps the path until `chdir`.
+            "cwd" => {
+                let mut cwd = CWD.lock().unwrap_or_else(|error| error.into_inner());
+                if cwd.is_none() {
+                    *cwd = Some(std::env::current_dir()?);
+                }
+                Ok(json!(*cwd))
+            }
             "chdir" => {
+                let mut cwd = CWD.lock().unwrap_or_else(|error| error.into_inner());
+                *cwd = None;
                 std::env::set_current_dir(args[0].as_str().context("Expected path")?)?;
                 Ok(Value::Null)
             }

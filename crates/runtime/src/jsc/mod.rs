@@ -1,3 +1,4 @@
+pub(crate) mod encoding;
 pub(crate) mod payload;
 
 use crate::host::{Host, Role};
@@ -40,8 +41,6 @@ pub struct JavaScriptCore {
     pub(crate) string_create: unsafe extern "C" fn(*const u16, usize) -> Ptr,
     string_create_utf8: unsafe extern "C" fn(*const c_char) -> Ptr,
     pub(crate) string_release: unsafe extern "C" fn(Ptr),
-    pub(crate) string_size: unsafe extern "C" fn(Ptr) -> usize,
-    pub(crate) string_utf8: unsafe extern "C" fn(Ptr, *mut c_char, usize) -> usize,
     pub(crate) evaluate: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, i32, *mut Ptr) -> Ptr,
     pub(crate) to_string: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> Ptr,
     pub(crate) make_string: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
@@ -88,6 +87,13 @@ pub struct JavaScriptCore {
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
     memory: Option<unsafe extern "C" fn(Ptr) -> Ptr>,
     json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
+    get_chars: unsafe extern "C" fn(Ptr, Ptr, *mut usize, *mut bool) -> *const c_void,
+    get_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr, *mut usize) -> bool,
+    make_latin1: unsafe extern "C" fn(Ptr, *const u8, usize) -> Ptr,
+    make_utf16: unsafe extern "C" fn(Ptr, *const u16, usize) -> Ptr,
+    make_utf8: unsafe extern "C" fn(Ptr, *const c_char, usize) -> Ptr,
+    make_uint8: unsafe extern "C" fn(Ptr, usize, *mut Ptr, *mut Ptr) -> Ptr,
+    to_utf8: unsafe extern "C" fn(*const c_void, usize, bool, *mut c_char) -> usize,
     inspector: Option<Inspector>,
 }
 
@@ -178,9 +184,14 @@ impl JavaScriptCore {
                 std::env::set_var("JSC_useSharedArrayBuffer", "1");
                 // WARNING: with 16 GB of RAM or more, a heap may grow to about 4x its live size before a full GC. This makes it about 2x.
                 std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
+                // WARNING: JSC's incremental sweeper runs on a timer that the generic event loop never fires, so the
+                // memory of dead cells, like string buffers, stayed until allocation reached their blocks, hundreds
+                // of MB on pages that allocate a lot. A sweep after each collection frees it, in a few ms.
+                std::env::set_var("JSC_sweepSynchronously", "1");
                 group = Some(group_create());
                 std::env::remove_var("JSC_useSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
+                std::env::remove_var("JSC_sweepSynchronously");
             });
             Ok(Rc::new(Self {
                 // WARNING: engines of one thread share a VM, so JSC reuses compiled runtime code across windows.
@@ -217,8 +228,6 @@ impl JavaScriptCore {
                 string_create: *library.get(b"JSStringCreateWithCharacters\0")?,
                 string_create_utf8: *library.get(b"JSStringCreateWithUTF8CString\0")?,
                 string_release: *library.get(b"JSStringRelease\0")?,
-                string_size: *library.get(b"JSStringGetMaximumUTF8CStringSize\0")?,
-                string_utf8: *library.get(b"JSStringGetUTF8CString\0")?,
                 evaluate: *library.get(b"JSEvaluateScript\0")?,
                 to_string: *library.get(b"JSValueToStringCopy\0")?,
                 make_string: *library.get(b"JSValueMakeString\0")?,
@@ -265,6 +274,13 @@ impl JavaScriptCore {
                     .ok()
                     .map(|s| *s),
                 json_string: *library.get(b"JSValueCreateJSONString\0")?,
+                get_chars: *library.get(b"JSValueGetStringCharacters\0")?,
+                get_bytes: *library.get(b"JSValueGetBytes\0")?,
+                make_latin1: *library.get(b"JSValueMakeStringLatin1\0")?,
+                make_utf16: *library.get(b"JSValueMakeStringUTF16\0")?,
+                make_utf8: *library.get(b"JSValueMakeStringUTF8\0")?,
+                make_uint8: *library.get(b"JSObjectMakeUint8ArrayUninitialized\0")?,
+                to_utf8: *library.get(b"JSStringConvertCharactersToUTF8\0")?,
                 inspector: (|| {
                     Some(Inspector {
                         connect: *library.get(b"JSGlobalContextConnectInspector\0").ok()?,
@@ -301,40 +317,18 @@ impl JavaScriptCore {
     }
 
     pub(crate) fn text(&self, ctx: Ptr, value: Ptr) -> String {
+        if let Some(chars) = self.chars(ctx, value) {
+            return self.utf8_string(chars);
+        }
         unsafe {
             let string = (self.to_string)(ctx, value, ptr::null_mut());
             if string.is_null() {
                 return "JavaScript exception".into();
             }
-            let length = (self.string_length)(string);
-            let mut buffer = Vec::<u8>::with_capacity((self.string_size)(string));
-            let size = (self.string_utf8)(string, buffer.as_mut_ptr().cast(), buffer.capacity());
-            buffer.set_len(size.saturating_sub(1));
-            // WARNING: the buffer has room for 3 bytes per UTF-16 unit, so large texts give back what they did not use.
-            if buffer.capacity() >= 1024 && buffer.len() < buffer.capacity() / 2 {
-                buffer.shrink_to_fit();
-            }
-            if buffer.len() == length && buffer.is_ascii() {
-                (self.string_release)(string);
-                return String::from_utf8_unchecked(buffer);
-            }
-            // WARNING: JSC stops UTF-8 conversion at lone surrogates, so compare UTF-16 lengths.
-            if buffer
-                .iter()
-                .map(|&byte| ((byte as i8) >= -0x40) as usize + (byte >= 0xf0) as usize)
-                .sum::<usize>()
-                != length
-            {
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(
-                    (self.string_chars)(string),
-                    length,
-                ));
-                (self.string_release)(string);
-                return text;
-            }
+            let value = (self.make_string)(ctx, string);
             (self.string_release)(string);
-            String::from_utf8(buffer)
-                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+            self.chars(ctx, value)
+                .map_or_else(String::new, |chars| self.utf8_string(chars))
         }
     }
 
@@ -770,17 +764,14 @@ unsafe extern "C" fn call(
             let value = *values
                 .get(usize::from(generic))
                 .context("Missing host operation")?;
-            let string = unsafe { (api.to_string)(ctx, value, ptr::null_mut()) };
-            ensure!(!string.is_null(), "Invalid host operation");
-            let size = unsafe {
-                if (api.string_length)(string) < name.len() {
-                    (api.string_utf8)(string, name.as_mut_ptr().cast(), name.len())
-                } else {
-                    0
+            let size = match api.chars(ctx, value) {
+                Some(encoding::Chars::Latin1(op)) if op.len() <= name.len() => {
+                    name[..op.len()].copy_from_slice(op);
+                    op.len()
                 }
+                _ => 0,
             };
-            unsafe { (api.string_release)(string) };
-            std::str::from_utf8(&name[..size.saturating_sub(1)])
+            std::str::from_utf8(&name[..size])
                 .ok()
                 .filter(|op| !op.is_empty())
                 .context("Invalid host operation")?
@@ -937,9 +928,9 @@ unsafe extern "C" fn call(
         Err(_) => ("Host call failed".into(), None),
     };
     unsafe {
-        let text = api.string_owned(message);
-        let message = (api.make_string)(ctx, text);
-        (api.string_release)(text);
+        let message = api
+            .utf8(ctx, message.as_bytes())
+            .unwrap_or_else(|_| (api.undefined)(ctx));
         let error = (api.make_error)(ctx, 1, &message, ptr::null_mut());
         if let Some(code) = code {
             let key = api.string("code");
@@ -1294,8 +1285,10 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     if let Some(report) = binding.0.extra_memory
         && let Some(created) = created.filter(|&created| created > 0)
     {
-        // WARNING: a removed node is freed only after a GC finds its wrapper dead, and a scrolling list makes nodes
-        // much faster than GCs run. Each node counts for more than it costs, so young GCs keep the dead ones few.
+        // WARNING: a removed node with a wrapper is freed only after a GC finds the wrapper dead, and a scrolling
+        // list makes them much faster than GCs run. Each wrapper counts for more than it costs, so GCs keep the dead
+        // ones few. JSC drops this cost only in a full collection, so counting nodes without wrappers too made a
+        // page that rebuilds its rows every frame run full collections many times a second.
         unsafe { report(ctx, created * 65536) };
     }
 }
@@ -1342,12 +1335,9 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: crate::jsc::payload::Payload)
             Value::Null => (api.null)(ctx),
             Value::Bool(value) => (api.boolean)(ctx, value),
             Value::Number(value) => (api.number)(ctx, value.as_f64().unwrap_or(f64::NAN)),
-            Value::String(text) => {
-                let text = api.string_owned(text);
-                let value = (api.make_string)(ctx, text);
-                (api.string_release)(text);
-                value
-            }
+            Value::String(text) => api
+                .utf8(ctx, text.as_bytes())
+                .unwrap_or_else(|_| (api.null)(ctx)),
             Value::Array(values)
                 if values.len() <= 32
                     && values
@@ -1760,6 +1750,7 @@ impl JsContext {
                     },
                 )
         });
+        encoding::install(&engine.api, ctx);
         for (name, callback) in [("__appsNative", call as Callback), ("__appsNow", now)] {
             let name = engine.api.string(name);
             unsafe {
@@ -2574,6 +2565,60 @@ mod tests {
             preload.eval("document.body.tagName", "test").unwrap(),
             "BODY"
         );
+    }
+
+    #[test]
+    fn replaced_rows_free_without_gc() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse("<body><div id=list></div></body>"),
+                dirty: false,
+            },
+        );
+        let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
+        assert_eq!(
+            page.eval("customElements.define('x-row', class extends HTMLElement {});const list = document.getElementById('list');for (let i = 0; i < 50; i++) { list.innerHTML = '<div><span>a</span><span>b</span></div>'.repeat(20); list.insertAdjacentHTML('beforeend', '<p><b>c</b></p>'.repeat(20)); __appsDomSweep(); }const kept = list.firstChild, observer = new MutationObserver(() => {});observer.observe(list, { childList: true });list.innerHTML = '<i>x</i>';const records = observer.takeRecords();__appsDomSweep();[kept.textContent, kept.isConnected, records.length, records[0].removedNodes.length, records[0].removedNodes[0] === kept, list.textContent].join()", "test").unwrap(),
+            "ab,false,1,40,true,x"
+        );
+        let host = host.borrow();
+        let used = host.pages[&1].doc.nodes.len() - host.dom[&1].free.len();
+        assert!(used < 400, "{used}");
+    }
+
+    #[test]
+    fn resize_observers_see_style_changes_after_the_next_layout() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            crate::host::Page {
+                doc: crate::dom::Document::parse(
+                    "<body><div id=box style='width:100px;padding:5px'></div></body>",
+                ),
+                dirty: false,
+            },
+        );
+        let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
+        let id: usize = page
+            .eval("const box = document.getElementById('box');globalThis.seen = [];new ResizeObserver(entries => seen.push(entries[0].contentRect.width)).observe(box);box._id", "test")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let layout = || {
+            let mut host = host.borrow_mut();
+            let bounds = &mut host.dom.entry(1).or_default().bounds;
+            bounds.insert(id, [0., 0., 110., 10.]);
+            bounds.touch();
+        };
+        layout();
+        page.eval("__appsLayout()", "test").unwrap();
+        page.eval("box.style.padding = '10px'; box.style.width = '90px'; __appsLayout()", "test").unwrap();
+        page.eval("getComputedStyle(box).paddingLeft", "test").unwrap();
+        layout();
+        assert_eq!(page.eval("__appsLayout(); seen.join()", "test").unwrap(), "100,90");
     }
 
     #[test]

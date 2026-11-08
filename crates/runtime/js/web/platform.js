@@ -1,4 +1,4 @@
-globalThis.__appsPlatform = (call, node) => {
+globalThis.__appsPlatform = (call, node, codec) => {
   const codecBytes = globalThis.__appsBytes;
   globalThis.self = globalThis;
   const native = globalThis.__appsNow;
@@ -111,16 +111,13 @@ globalThis.__appsPlatform = (call, node) => {
   });
   globalThis.atob = function atob(value) {
     if (!arguments.length) throw new TypeError('Base64 data is required');
-    let text = String(value).replace(/[\t\n\f\r ]/g, '');
-    if (text.length % 4 === 0) text = text.replace(/={1,2}$/, '');
-    if (text.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(text)) throw new DOMException('Invalid Base64 data', 'InvalidCharacterError');
-    try { return call('web.platform.base64.decode', text); } catch { throw new DOMException('Invalid Base64 data', 'InvalidCharacterError'); }
+    try { return codec.decode(Uint8Array.fromBase64(String(value)), 1); } catch { throw new DOMException('Invalid Base64 data', 'InvalidCharacterError'); }
   };
   globalThis.btoa = function btoa(value) {
     if (!arguments.length) throw new TypeError('Binary data is required');
     const text = String(value);
     if (/[^\x00-\xff]/.test(text)) throw new DOMException('Expected a binary string', 'InvalidCharacterError');
-    return call('web.platform.base64.encode', text);
+    return codec.encode(text, 1).toBase64();
   };
   const codecs = typeof __appsFinalizers === 'function' ? new __appsFinalizers(id => call('web.platform.compression.close', id)) : null;
   const transform = (format, decompress) => {

@@ -206,6 +206,7 @@ dependencies = [
  "libloading",
  "libsqlite3-sys",
  "md-5",
+ "memchr",
  "memmap2",
  "miniz_oxide 0.8.9",
  "notify",

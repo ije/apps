@@ -146,42 +146,15 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
     })
 }
 
-// WARNING: the bytes of an `ArrayBuffer` or typed array. JavaScriptCore pins them, so they stay valid while the value lives.
+// WARNING: the bytes of an `ArrayBuffer` or a view. They stay valid while the value lives and no JavaScript runs.
 pub(crate) fn view<'a>(
     api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
     value: crate::jsc::Ptr,
 ) -> Result<&'a [u8]> {
-    let mut error = std::ptr::null_mut();
-    let kind = unsafe { (api.typed_kind)(ctx, value, &mut error) };
-    ensure!(error.is_null() && kind != 10, "Expected typed bytes");
-    let (pointer, length) = unsafe {
-        if kind == 9 {
-            (
-                (api.buffer_bytes)(ctx, value, &mut error).cast::<u8>(),
-                (api.buffer_length)(ctx, value, &mut error),
-            )
-        } else {
-            let length = (api.typed_length)(ctx, value, &mut error);
-            let offset = (api.typed_offset)(ctx, value, &mut error);
-            (
-                (api.typed_bytes)(ctx, value, &mut error)
-                    .cast::<u8>()
-                    .wrapping_add(offset),
-                length,
-            )
-        }
-    };
-    ensure!(
-        error.is_null() && (length == 0 || !pointer.is_null()),
-        "Invalid binary storage"
-    );
-    ensure!(length <= 1 << 31, "Binary arguments are too large");
-    Ok(if length == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(pointer, length) }
-    })
+    let bytes = api.bytes(ctx, value).context("Expected typed bytes")?;
+    ensure!(bytes.len() <= 1 << 31, "Binary arguments are too large");
+    Ok(bytes)
 }
 
 pub(crate) struct Roots<'a> {
@@ -222,7 +195,7 @@ pub(crate) fn input<'a>(
             && count.fract() == 0.,
         "Invalid binary arguments"
     );
-    // WARNING: reading an item can run a getter that drops and collects earlier items, and the call can run JavaScript too, so all items are read and protected before any bytes are borrowed.
+    // WARNING: reading an item can run a getter that drops and collects earlier items, so all items are read and protected before any bytes are borrowed. The bytes are not pinned, so host operations must not run JavaScript, which could detach them. FFI and Node-API pin theirs.
     let mut roots = Roots {
         api,
         ctx,

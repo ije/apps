@@ -1,9 +1,8 @@
-globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOptions, deepEqual }, info) => {
+globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOptions, deepEqual }, info, codec) => {
   const windows = info.platform === 'win32';
-  const bytes = text => { if(typeof text !== 'string')return new Buffer(text.buffer, text.byteOffset, text.byteLength); const length = text.length, out = new Buffer(length); for (let i = 0; i < length; i++) out[i] = text.charCodeAt(i); return out; };
-  const binary = data => { let state = ''; for (let i = 0; i < data.length; i += 8192) state += String.fromCharCode.apply(null, data.subarray(i, i + 8192)); return state; };
+  const bytes = data => new Buffer(data.buffer, data.byteOffset, data.byteLength);
   const view = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
-  const utf8 = /^utf-?8$/i, utf8Encoder = new TextEncoder(), utf8Decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+  const utf8 = /^utf-?8$/i, encodeKinds = { __proto__: null, utf8: 0, latin1: 1, ascii: 1, utf16le: 2 }, decodeKinds = { __proto__: null, utf8: 0, latin1: 1, ascii: 2, utf16le: 3 };
   const error = (Type, code, message) => Object.assign(new Type(message), { code });
   const received = value => { if (value == null) return String(value); if (typeof value === 'function') return `function ${value.name}`; if (typeof value === 'object') return value.constructor?.name ? `an instance of ${value.constructor.name}` : inspect(value, { depth: -1 }); if (typeof value !== 'string') return `type ${typeof value} (${inspect(value)})`; if (value.length > 28) value = value.slice(0, 25) + '...'; return `type string (${value.includes("'") ? JSON.stringify(value) : `'${value}'`})`; };
   const typeError = (name, types, value) => error(TypeError, 'ERR_INVALID_ARG_TYPE', `The ${name.endsWith(' argument') ? name : `"${name}" ${name.includes('.') ? 'property' : 'argument'}`} must be ${types}. Received ${received(value)}`);
@@ -15,20 +14,14 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const normalize = encoding => encoding == null ? 'utf8' : encodings[encoding] ?? encodings[String(encoding).toLowerCase()];
   const encodingOf = encoding => { const value = encoding === null ? undefined : normalize(encoding); if (!value) throw error(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`); return value; };
   const encode = (value, encoding = 'utf8') => {
-    if (encoding === 'utf8') return utf8Encoder.encode(value);
     if (encoding === 'hex') return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]);
     if (encoding === 'base64' || encoding === 'base64url') { const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
-    if (encoding === 'utf16le') { const out = new Uint8Array(value.length * 2); for (let i = 0; i < value.length; i++) { const c = value.charCodeAt(i); out[i * 2] = c; out[i * 2 + 1] = c >>> 8; } return out; }
-    return bytes(value);
+    return codec.encode(value, encodeKinds[encoding]);
   };
   const decode = (data, encoding) => {
-    if (encoding === 'utf8') return utf8Decoder.decode(data);
     if (encoding === 'hex') return data.toHex();
     if (encoding === 'base64' || encoding === 'base64url') return data.toBase64({ alphabet: encoding, omitPadding: encoding === 'base64url' });
-    if (encoding === 'latin1') return binary(data);
-    if (encoding === 'ascii') return binary(data.map(byte => byte & 127));
-    const length = data.length >> 1;
-    return binary(data.byteOffset & 1 ? new Uint16Array(new Uint8Array(data.subarray(0, length * 2)).buffer) : new Uint16Array(data.buffer, data.byteOffset, length));
+    return codec.decode(data, decodeKinds[encoding]);
   };
   const bounds = (value, length, type) => { if (Math.floor(value) !== value) { if (typeof value !== 'number') throw typeError(type || 'offset', 'of type number', value); throw rangeError(type || 'offset', 'an integer', value); } if (length < 0) throw error(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS', 'Attempt to access memory outside buffer bounds'); throw rangeError(type || 'offset', `>= ${type ? 1 : 0} and <= ${length}`, value); };
   const at = (buffer, offset, size) => { if (typeof offset !== 'number') throw typeError('offset', 'of type number', offset); if (buffer[offset] === undefined || buffer[offset + size - 1] === undefined) bounds(offset, buffer.length - size); return offset; };
@@ -46,12 +39,10 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     else if (value instanceof Uint8Array) needle = value;
     else throw typeError('value', 'one of type number or string or an instance of Buffer or Uint8Array', value);
     if (!needle.length) return Math.min(Math.max(offset, 0), buffer.length);
-    if (last) { for (let i = Math.min(offset, buffer.length - needle.length); i >= 0; i--) { let j = 0; while (j < needle.length && buffer[i + j] === needle[j]) j++; if (j === needle.length) return i; } return -1; }
-    for (let i = Uint8Array.prototype.indexOf.call(buffer, needle[0], Math.max(offset, 0)); i >= 0 && i <= buffer.length - needle.length; i = Uint8Array.prototype.indexOf.call(buffer, needle[0], i + 1)) { let j = 1; while (j < needle.length && buffer[i + j] === needle[j]) j++; if (j === needle.length) return i; }
-    return -1;
+    return last && offset < 0 ? -1 : codec.indexOf(buffer, needle, Math.max(offset, 0), last);
   };
   const size = value => { if (typeof value !== 'number') throw typeError('size', 'of type number', value); if (!(value >= 0 && value <= kMaxLength)) throw rangeError('size', `>= 0 && <= ${kMaxLength}`, value); return value; };
-  const compare = (a, b) => { const length = Math.min(a.length, b.length); for (let i = 0; i < length; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; return Math.sign(a.length - b.length); };
+  const compare = codec.compare;
   class Buffer extends Uint8Array {
     static from(value, encoding, length) {
       if (typeof value === 'string') { const data = encode(value, typeof encoding === 'string' && encoding ? encodingOf(encoding) : 'utf8'); return new Buffer(data.buffer, data.byteOffset, data.length); }
@@ -90,9 +81,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       if (encoding === 'utf16le') return length * 2;
       if (encoding === 'hex') return length >>> 1;
       if (encoding === 'base64' || encoding === 'base64url') { if (value.charCodeAt(length - 1) === 61) length--; if (length > 1 && value.charCodeAt(length - 1) === 61) length--; return (length * 3) >>> 2; }
-      if (encoding !== 'utf8') return length;
-      for (let i = 0; i < value.length; i++) { const c = value.charCodeAt(i); if (c < 128) continue; length += c < 2048 ? 1 : 2; if (c >= 0xD800 && c < 0xDC00 && (value.charCodeAt(i + 1) & 0xFC00) === 0xDC00) i++; }
-      return length;
+      return encoding === 'utf8' ? codec.utf8Length(value) : length;
     }
     static concat(list, length) {
       if (!Array.isArray(list)) throw typeError('list', 'an instance of Array', list);
@@ -106,7 +95,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     }
     static compare(a, b) { if (!(a instanceof Uint8Array)) throw typeError('buf1', bufferTypes, a); if (!(b instanceof Uint8Array)) throw typeError('buf2', bufferTypes, b); return compare(a, b); }
     toString(encoding, start, end) {
-      if (!arguments.length) return utf8Decoder.decode(this);
+      if (!arguments.length) return codec.decode(this, 0);
       const length = this.length;
       if (start <= 0) start = 0; else if (start >= length) return ''; else start = Math.trunc(start) || 0;
       if (end === undefined || end > length) end = length; else end = Math.trunc(end) || 0;
@@ -136,7 +125,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       else { integer(offset, 'offset', 0, this.length); const remaining = this.length - offset; if (length === undefined) length = remaining; else if (typeof length === 'string') { encoding = length; length = remaining; } else length = Math.min(integer(length, 'length', 0, this.length), remaining); }
       const target = this.subarray(offset, offset + length);
       encoding = encoding ? encodingOf(encoding) : 'utf8';
-      if (encoding === 'utf8') return utf8Encoder.encodeInto(string, target).written;
+      if (encoding === 'utf8') return codec.encodeInto(string, target)[1];
       const data = encode(encoding === 'utf16le' ? string.slice(0, length >> 1) : string, encoding).subarray(0, length);
       target.set(data);
       return data.length;
@@ -183,7 +172,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const transcodeError = code => Object.assign(new Error(`Unable to transcode Buffer [${code}]`), { code, errno: code === 'U_ILLEGAL_ARGUMENT_ERROR' ? 1 : 10 });
   const buffer = { Buffer, Blob, File, atob, btoa, kMaxLength, kStringMaxLength: 2 ** 30 - 25, constants: { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 2 ** 30 - 25 }, INSPECT_MAX_BYTES: 50,
     isUtf8: value => { try { new TextDecoder('utf-8', { fatal: true }).decode(value); return true; } catch { return false; } },
-    isAscii: value => view(value).every(byte => byte < 128),
+    isAscii: value => !/[^\x00-\x7f]/.test(codec.decode(view(value), 1)),
     transcode(source, from, to) {
       if (!(source instanceof Uint8Array)) throw typeError('source', bufferTypes, source);
       if (!source.length) return new Buffer(0);
@@ -191,7 +180,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       if (![from, to].every(name => ['ascii', 'latin1', 'utf16le', 'utf8'].includes(name))) throw transcodeError('U_ILLEGAL_ARGUMENT_ERROR');
       let text;
       if (from === 'utf8') { try { text = new TextDecoder('utf-8', { fatal: to === 'utf16le', ignoreBOM: true }).decode(source); } catch { throw transcodeError('U_INVALID_CHAR_FOUND'); } }
-      else text = from === 'ascii' ? binary(source).replace(/[\x80-\xff]/g, '�') : decode(source, from);
+      else text = from === 'ascii' ? codec.decode(source, 1).replace(/[\x80-\xff]/g, '�') : decode(source, from);
       if (to === 'utf8' && from === 'utf16le' && /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text)) throw transcodeError('U_INVALID_CHAR_FOUND');
       if (to === 'ascii' || to === 'latin1') text = text.replace(to === 'ascii' ? /[\ud800-\udbff][\udc00-\udfff]|[^\x00-\x7f]/g : /[\ud800-\udbff][\udc00-\udfff]|[^\x00-\xff]/g, '?');
       return Buffer.from(text, to);
@@ -499,7 +488,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (typeof args[0] !== 'number') args[0] = pathArg(args[0]);
     if (['rename', 'copyFile', 'symlink', 'link'].includes(name)) args[1] = pathArg(args[1]);
     if (['readFile', 'readdir', 'mkdir', 'rm', 'rmdir'].includes(name)) args[1] = options(args[1]);
-    if (name === 'writeFile' || name === 'appendFile') { args[2] = options(args[2]); flag(args[2].flag); if (typeof args[1] !== 'string' && !ArrayBuffer.isView(args[1])) throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + ' Received ' + received(args[1])), { code: 'ERR_INVALID_ARG_TYPE' }); args[1] = typeof args[1] === 'string' && (!args[2].encoding || utf8.test(args[2].encoding)) ? args[1] : view(args[1], args[2].encoding); }
+    if (name === 'writeFile' || name === 'appendFile') { args[2] = options(args[2]); flag(args[2].flag); if (typeof args[1] !== 'string' && !ArrayBuffer.isView(args[1])) throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + ' Received ' + received(args[1])), { code: 'ERR_INVALID_ARG_TYPE' }); args[1] = typeof args[1] === 'string' ? encode(args[1], encodingOf(args[2].encoding)) : view(args[1]); }
     if (name === 'utimes' || name === 'lutimes' || name === 'futimes') { args[1] = seconds(args[1]); args[2] = seconds(args[2]); }
     if (name === 'truncate' || name === 'ftruncate') args[1] ??= 0;
     if (name === 'chmod' || name === 'fchmod') { const mode = typeof args[1] === 'string' && /^[0-7]+$/.test(args[1]) ? parseInt(args[1], 8) : args[1]; if (!Number.isInteger(mode) || mode < 0 || mode > 0xFFFFFFFF) throw Object.assign(new TypeError(`The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received ${inspect(args[1])}`), { code: 'ERR_INVALID_ARG_VALUE' }); args[1] = mode; }

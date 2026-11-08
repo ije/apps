@@ -45,7 +45,9 @@ By default macOS malloc keeps freed memory in the process footprint: about 40% o
 
 That mode makes malloc slower, so on macOS the runtime has a global allocator that keeps freed blocks of up to 512 bytes per thread, at most 64 KB per size, and gives them back when the thread is quiet. A Rust app can't define its own `#[global_allocator]`.
 
-JSC's GC timers don't fire on the generic event loop, so each VM collects itself. A thread that ran JS asks about once a second whether to collect: yes after a second that ran at least 100 ms of JS followed by 5 quiet seconds, or every 5 minutes at a second that ran less than 100 ms, because some apps' timers never leave a quiet second. Apps have timers that never stop, so collecting more often uses more CPU at idle than the app itself. A collection also drops all compiled code, about 70% of a typical live heap, and functions compile again when they next run. A window thread waits while it draws more than a few frames a second, because the collection blocks drawing. On machines with 16 GB of RAM or more, JSC lets a heap grow to about 4x its live size before a full collection, so the runtime sets `heapGrowthMaxIncrease` to make that about 2x.
+JSC's GC timers don't fire on the generic event loop, so each VM collects itself. A thread that ran JS asks about once a second whether to collect: yes after a second that ran at least 100 ms of JS followed by 5 quiet seconds, or every 5 minutes at a second that ran less than 100 ms, because some apps' timers never leave a quiet second. Apps have timers that never stop, so collecting more often uses more CPU at idle than the app itself. A collection also drops all compiled code, about 70% of a typical live heap, and functions compile again when they next run. A window thread waits while it draws more than a few frames a second, because the collection blocks drawing. On machines with 16 GB of RAM or more, JSC lets a heap grow to about 4x its live size before a full collection, so the runtime sets `heapGrowthMaxIncrease` to make that about 2x. JSC's sweeper, which frees the memory of dead cells such as string buffers, is a timer too, so every collection sweeps the heap at once, in a few ms.
+
+A removed DOM node is freed at the next event loop turn, unless page code made a JS wrapper for it or a node below it. Then it waits for a GC that collects the wrapper, so each new wrapper counts as 64 KB of memory to JSC and GCs keep up with pages that rebuild their rows.
 
 While a process draws with Metal, the driver on Apple GPUs holds about 126 MB for render encoders and 84 MB more for blit encoders, until about 1 second after the last frame, at any window size. So frames copy textures with draws and only `capturePage()` uses a blit. After the first 500 ms, Core Animation blinks a text caret, so a focused field draws no frames and the driver frees this memory. A caret in a box with an effect, under round clip corners or below a later box blinks by drawing.
 
@@ -150,7 +152,9 @@ bash scripts/build-ffmpeg.sh
 
 The runtime uses [Bun's WebKit fork](https://github.com/oven-sh/WebKit).
 The build enables Bun's JSC additions with the generic event loop.
-`scripts/jsc.patch` restores C API locks and adds support for shared libraries.
+`scripts/jsc.patch` restores C API locks and adds support for shared libraries. Each VM runs on one thread, so a native function keeps the lock while it runs, and the API calls it makes only count the lock up. A call into a native function costs about 0.07 µs.
+
+Like Bun, native code reads strings and bytes where JSC keeps them, without copies. It makes strings from Latin-1, UTF-16 or UTF-8 with one copy, and Uint8Arrays it fills without zeroing them. Conversions use the simdutf that JSC already has. `crates/runtime/src/jsc/encoding.rs` has `TextEncoder`, `TextDecoder`, the `Buffer` encodings, `atob()`, `btoa()`, `indexOf()` and `compare()` of `Buffer`.
 
 ```sh
 bash scripts/build-jsc.sh

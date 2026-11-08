@@ -62,7 +62,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     }
     executeJavaScript(script) { return this.#request('evaluate', { script: String(script) }); }
     capturePage(rect) {
-      return this.#request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.from(atob(image.png), char => char.charCodeAt(0))));
+      return this.#request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.fromBase64(image.png)));
     }
     get session() { return session.fromPartition(this.#partition ?? 'persist:default'); }
     get mainFrame() { const contents = this; return { get url() { return contents.getURL(); }, get top() { return this; }, parent: null, frames: [], framesInSubtree: [], processId: 0, routingId: 1, frameTreeNodeId: this.id, visibilityState: 'visible', detached: false, executeJavaScript: code => contents.executeJavaScript(code), send() {}, isDestroyed: () => contents.isDestroyed() }; }

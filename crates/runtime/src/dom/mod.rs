@@ -576,7 +576,6 @@ impl State {
     }
 
     pub(crate) fn allocate(&mut self, doc: &mut Document, node: Node) -> usize {
-        self.created += 1;
         let id = self.free.pop().map_or_else(
             || {
                 doc.nodes.push(Node::default());
@@ -595,12 +594,11 @@ impl State {
             // WARNING: every per-node list must grow here, and a detached node gets what a full pass gives it, or
             // reads of the new node index past their end and incremental passes keep other values.
             if let Some(computed) = Rc::get_mut(cached) {
-                computed
-                    .values
-                    .resize_with(doc.nodes.len(), Default::default);
-                computed.values[id] = Rc::default();
-                computed.vars.resize_with(doc.nodes.len(), Default::default);
-                computed.vars[id] = Default::default();
+                let (style, vars) = style::empty();
+                computed.values.resize(doc.nodes.len(), style.clone());
+                computed.values[id] = style;
+                computed.vars.resize(doc.nodes.len(), vars.clone());
+                computed.vars[id] = vars;
                 computed.flags.resize(doc.nodes.len(), 0);
                 computed.flags[id] = 0;
                 computed.lengths.grow(doc.nodes.len());
@@ -1201,8 +1199,11 @@ pub fn call(
             return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
         }
         if op == "dom.release" {
+            let wrapped = args[1].as_array().context("Expected live nodes")?;
+            // WARNING: only a wrapper keeps a removed tree until a GC, so new wrappers, not new nodes, count for `report_nodes`.
+            state.created += wrapped.len();
             // WARNING: the page already forgot these lists, so a bad id is skipped instead of failing the rest.
-            for value in args[1].as_array().context("Expected live nodes")? {
+            for value in wrapped {
                 if let Some(id) = value.as_u64().map(|id| id as usize)
                     && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
                 {
@@ -2483,13 +2484,24 @@ pub fn call(
             }
             "dom.client" => {
                 let rect = state.bounds.get(&id).copied().unwrap_or_default();
-                let system = state.text_system.clone();
-                let computed = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
-                );
+                // WARNING: resize observers measure the boxes of the last frame, so they read its styles too. Styling
+                // the page that changed since then cost a pass, and another after each callback that changed it.
+                let last = (args[1].as_bool() == Some(true))
+                    .then(|| state.computed.clone().or_else(|| state.previous.clone()))
+                    .flatten()
+                    .filter(|last| id < last.values.len() && last.lengths.get(id).is_some());
+                let computed = match last {
+                    Some(last) => last,
+                    None => {
+                        let system = state.text_system.clone();
+                        styles(
+                            doc,
+                            state,
+                            viewport,
+                            system.as_deref().map(|system| (system, state.pixel_ratio)),
+                        )
+                    }
+                };
                 let (style, units) = (&computed.values[id], &computed.lengths[id]);
                 let tag = doc.nodes[id].tag.as_str();
                 if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
@@ -2510,7 +2522,8 @@ pub fn call(
                     })
                     .find(|&parent| doc.nodes[parent].tag == "table")
                     .is_some_and(|table| {
-                        computed.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse")
+                        computed.values.get(table).and_then(|style| style.get(Prop::BORDER_COLLAPSE))
+                            == Some("collapse")
                     });
                 let base = doc.nodes[id]
                     .parent

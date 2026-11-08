@@ -1,8 +1,8 @@
 globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
   const keys = new WeakMap();
   const bytes = value => value instanceof ArrayBuffer ? new Uint8Array(value) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : (() => { throw new TypeError('Expected bytes'); })();
-  const encode = value => btoa(String.fromCharCode(...value)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
-  const decode = value => Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), c => c.charCodeAt(0));
+  const encode = value => value.toBase64({ alphabet: 'base64url', omitPadding: true });
+  const decode = value => Uint8Array.fromBase64(value.replaceAll('-', '+').replaceAll('_', '/'));
   const name = algorithm => typeof algorithm === 'string' ? algorithm : algorithm?.name;
   const fail = (message, type = 'NotSupportedError') => { throw new DOMException(message, type); };
   class CryptoKey {

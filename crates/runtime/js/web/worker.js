@@ -1,7 +1,7 @@
 globalThis.__appsWorkers = (call, nativeAccess, task) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
-  const encodeBytes = value => { if(value.toBase64)return value.toBase64();let text='';for(let i=0;i<value.length;i+=8192)text+=String.fromCharCode(...value.subarray(i,i+8192));return btoa(text); };
+  const encodeBytes = value => value.toBase64();
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
   const fresh = new WeakSet();
@@ -132,7 +132,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
       else if (/^(?:data|blob|apps):/.test(url)) Promise.resolve().then(async () => {
         if (url.startsWith('apps:')) return start(url, true);
         if (url.startsWith('blob:')) return start(await (await fetch(url)).text());
-        const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? atob(url.slice(comma + 1)) : decodeURIComponent(url.slice(comma + 1)));
+        const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? new TextDecoder().decode(Uint8Array.fromBase64(url.slice(comma + 1))) : decodeURIComponent(url.slice(comma + 1)));
       }).catch(error => { this._closed = true; this._emit('error', error); });
       else if (native && !/^[a-z][a-z0-9+.-]+:/i.test(url.replace(/^file:/, ''))) start(__apps.fs.readFileSync(url.startsWith('file:') ? decodeURIComponent(new URL(url).pathname) : url, 'utf8'));
       else throw new DOMException('Workers can only load bundled or local scripts', 'SecurityError');

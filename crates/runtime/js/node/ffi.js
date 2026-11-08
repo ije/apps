@@ -1,4 +1,4 @@
-globalThis.__appsFFI = native => {
+globalThis.__appsFFI = (native, codec) => {
   const send = (request, storage = null, keep = null) => {
     const result = native(request, storage, keep);
     if (typeof result !== 'string') return result;
@@ -230,13 +230,8 @@ globalThis.__appsFFI = native => {
       let storage;
       switch (encoding.toLowerCase()) {
         case 'utf8': case 'utf-8': storage = encoder.encode(value + '\0'); break;
-        case 'utf16le': case 'utf-16le': case 'ucs2': case 'ucs-2': {
-          storage = new Uint8Array((value.length + 1) * 2);
-          const view = new DataView(storage.buffer);
-          for (let index = 0; index < value.length; index++) view.setUint16(index * 2, value.charCodeAt(index), true);
-          break;
-        }
-        case 'latin1': case 'binary': case 'ascii': storage = Uint8Array.from({ length: value.length + 1 }, (_, index) => index < value.length ? value.charCodeAt(index) & 255 : 0); break;
+        case 'utf16le': case 'utf-16le': case 'ucs2': case 'ucs-2': storage = codec.encode(value + '\0', 2); break;
+        case 'latin1': case 'binary': case 'ascii': storage = codec.encode(value + '\0', 1); break;
         default: throw new TypeError('Unsupported string encoding: ' + encoding);
       }
       exportBytes(storage, address, size);
