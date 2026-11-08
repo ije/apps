@@ -2413,7 +2413,7 @@ impl Config {
                 ))
             }
             "supports" => {
-                if value == "glass" {
+                if value == "bg-glass" {
                     return Some(((rank, value.into()), template("@media (-macos-glass)")));
                 }
                 let raw = if value.starts_with(['[', '(']) {
@@ -2936,6 +2936,15 @@ impl Config {
                 .then(|| self.functional(root, value, modifier, negative))
                 .flatten()
         };
+        if matches!(
+            class,
+            "bg-glass" | "bg-glass-clear" | "bg-glass-interactive"
+        ) {
+            return None;
+        }
+        if let Some(value) = class.strip_prefix("bg-glass-") {
+            return functional("bg-glass", Some(value));
+        }
         if class.ends_with(']') || class.ends_with(')') {
             let open = if class.ends_with(']') { "-[" } else { "-(" };
             let index = class.find(open)?;
@@ -3138,7 +3147,7 @@ impl Config {
                     | "aspect"
                     | "text"
                     | "bg"
-                    | "glass-tint"
+                    | "bg-glass"
                     | "bg-linear"
                     | "bg-radial"
                     | "bg-conic"
@@ -4294,14 +4303,29 @@ impl Config {
                 }
                 Body::new(&[("stroke", self.color(value, modifier)?)])
             }
-            "fill" | "accent" | "caret" | "glass-tint" => {
+            "fill" | "accent" | "caret" | "bg-glass" => {
                 let property = match root {
                     "fill" => "fill",
                     "accent" => "accent-color",
-                    "glass-tint" => "-macos-glass-tint-color",
+                    "bg-glass" => "-macos-glass-tint-color",
                     _ => "caret-color",
                 };
-                Body::new(&[(property, self.color(value?, modifier)?)])
+                let mut body = Body::new(&[(property, self.color(value?, modifier)?)])?;
+                if root == "bg-glass" && cfg!(target_os = "macos") {
+                    body = body
+                        .nest(
+                            &[],
+                            ":where(&)",
+                            "appearance:none;background-color:transparent;border:0",
+                        )
+                        .nest(
+                            &[],
+                            ":where(&:not(.bg-glass-clear))",
+                            "-macos-glass:regular",
+                        );
+                    body.sort = Some("-macos-glass-tint-color");
+                }
+                Some(body)
             }
             "placeholder" => {
                 let color = self.color(value?, modifier)?;

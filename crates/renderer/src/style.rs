@@ -114,6 +114,17 @@ pub enum Baseline {
     None,
 }
 
+// WARNING: a flex row of `Lines` moves the baseline items of a line below a taller `FlexEnd` item, like
+// `vertical-align: bottom`, and moves the line by the last child of a `Hangs` item at its end, like a collapsible
+// space that hangs there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Inline {
+    #[default]
+    None,
+    Lines,
+    Hangs,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Position {
     #[default]
@@ -315,6 +326,7 @@ pub struct Style {
     pub flex_shrink: f32,
     pub baseline: Baseline,
     pub baseline_source: bool,
+    pub inline: Inline,
     pub background: Option<Rgba>,
     pub border_color: Option<Rgba>,
     pub border_style: BorderStyle,
@@ -356,6 +368,7 @@ impl Default for Style {
             flex_shrink: 1.,
             baseline: Baseline::Auto,
             baseline_source: false,
+            inline: Inline::None,
             background: None,
             border_color: None,
             border_style: BorderStyle::Solid,
@@ -549,6 +562,7 @@ pub struct TextStyle {
     pub letter_spacing: Pixels,
     pub word_spacing: Pixels,
     pub text_indent: Pixels,
+    pub float: Pixels,
     pub text_wrap: TextWrap,
     pub word_break: WordBreak,
     pub font_smoothing: bool,
@@ -575,6 +589,7 @@ impl Default for TextStyle {
             letter_spacing: Pixels::ZERO,
             word_spacing: Pixels::ZERO,
             text_indent: Pixels::ZERO,
+            float: Pixels::ZERO,
             text_wrap: TextWrap::Wrap,
             word_break: WordBreak::Normal,
             font_smoothing: true,
@@ -634,6 +649,7 @@ impl TextStyle {
             letter_spacing,
             word_spacing,
             text_indent,
+            float,
             text_wrap,
             word_break,
             font_smoothing
@@ -679,6 +695,7 @@ pub struct TextStyleRefinement {
     pub letter_spacing: Option<Pixels>,
     pub word_spacing: Option<Pixels>,
     pub text_indent: Option<Pixels>,
+    pub float: Option<Pixels>,
     pub text_wrap: Option<TextWrap>,
     pub word_break: Option<WordBreak>,
     pub font_smoothing: Option<bool>,

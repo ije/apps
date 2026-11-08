@@ -68,11 +68,28 @@ fn dump() {
     .unwrap();
 }
 
-fn assert_generated(author: &str, expected: &[(&str, &str)]) {
+fn assert_generated(author: &str, expected: &[(&str, impl AsRef<str>)]) {
     let classes: Vec<_> = expected.iter().map(|(class, _)| *class).collect();
     for ((class, css), actual) in expected.iter().zip(generated(author, &classes)) {
-        assert_eq!(actual, *css, "{class}");
+        assert_eq!(actual, css.as_ref(), "{class}");
     }
+}
+
+fn glass_css(selector: &str, color: &str, media: Option<&str>) -> String {
+    let mut rules = vec![format!("{selector}{{-macos-glass-tint-color:{color};}}")];
+    if cfg!(target_os = "macos") {
+        rules.extend([
+            format!(":where({selector}){{appearance:none;background-color:transparent;border:0;}}"),
+            format!(":where({selector}:not(.bg-glass-clear)){{-macos-glass:regular;}}"),
+        ]);
+    }
+    rules
+        .into_iter()
+        .map(|rule| match media {
+            Some(media) => format!("@media {media}{{{rule}}}"),
+            None => rule,
+        })
+        .collect()
 }
 
 #[test]
@@ -824,71 +841,171 @@ fn arbitrary_values_keep_modifiers_and_type_hints() {
 }
 
 #[test]
-fn glass_tint_uses_tailwind_colors_modifiers_and_variants() {
+fn bg_glass_tint_uses_tailwind_colors_modifiers_and_variants() {
     assert_generated(
         "",
         &[
             (
-                "glass-tint-blue-500",
-                ".glass-tint-blue-500{-macos-glass-tint-color:var(--color-blue-500);}",
+                "bg-glass-blue-500",
+                glass_css(".bg-glass-blue-500", "var(--color-blue-500)", None),
             ),
             (
-                "glass-tint-slate-950/50",
-                ".glass-tint-slate-950\\/50{-macos-glass-tint-color:color-mix(in oklab, var(--color-slate-950) 50%, transparent);}",
+                "bg-glass-slate-950/50",
+                glass_css(
+                    ".bg-glass-slate-950\\/50",
+                    "color-mix(in oklab, var(--color-slate-950) 50%, transparent)",
+                    None,
+                ),
             ),
             (
-                "glass-tint-[#123456]",
-                ".glass-tint-\\[\\#123456\\]{-macos-glass-tint-color:#123456;}",
+                "bg-glass-[#123456]",
+                glass_css(".bg-glass-\\[\\#123456\\]", "#123456", None),
             ),
             (
-                "glass-tint-(--brand)/(--alpha)",
-                ".glass-tint-\\(--brand\\)\\/\\(--alpha\\){-macos-glass-tint-color:color-mix(in oklab, var(--brand) var(--alpha), transparent);}",
+                "bg-glass-(--brand)/(--alpha)",
+                glass_css(
+                    ".bg-glass-\\(--brand\\)\\/\\(--alpha\\)",
+                    "color-mix(in oklab, var(--brand) var(--alpha), transparent)",
+                    None,
+                ),
             ),
             (
-                "hover:glass-tint-red-600",
-                "@media (hover: hover){.hover\\:glass-tint-red-600:hover{-macos-glass-tint-color:var(--color-red-600);}}",
+                "hover:bg-glass-red-600",
+                glass_css(
+                    ".hover\\:bg-glass-red-600:hover",
+                    "var(--color-red-600)",
+                    Some("(hover: hover)"),
+                ),
             ),
             (
-                "supports-glass:glass-tint-blue-500",
-                "@media (-macos-glass){.supports-glass\\:glass-tint-blue-500{-macos-glass-tint-color:var(--color-blue-500);}}",
+                "supports-bg-glass:bg-glass-blue-500",
+                glass_css(
+                    ".supports-bg-glass\\:bg-glass-blue-500",
+                    "var(--color-blue-500)",
+                    Some("(-macos-glass)"),
+                ),
             ),
-            ("glass-tint-blue", ""),
-            ("glass-tint-[length:2px]", ""),
-            ("glass-tint-blue-500/101", ""),
-            ("-glass-tint-blue-500", ""),
+            ("bg-glass-blue", String::new()),
+            ("bg-glass-[length:2px]", String::new()),
+            ("bg-glass-blue-500/101", String::new()),
+            ("-bg-glass-blue-500", String::new()),
+            ("glass-tint-blue-500", String::new()),
+            ("hover:glass-tint-blue-500", String::new()),
         ],
     );
     assert_generated(
         "@theme { --color-*:initial; --color-brand:#123456; } @theme inline { --color-inline:var(--brand); }",
         &[
-            ("glass-tint-blue-500", ""),
+            ("bg-glass-blue-500", String::new()),
             (
-                "glass-tint-brand",
-                ".glass-tint-brand{-macos-glass-tint-color:var(--color-brand);}",
+                "bg-glass-brand",
+                glass_css(".bg-glass-brand", "var(--color-brand)", None),
             ),
             (
-                "glass-tint-inline/25",
-                ".glass-tint-inline\\/25{-macos-glass-tint-color:color-mix(in oklab, var(--brand) 25%, transparent);}",
+                "bg-glass-inline/25",
+                glass_css(
+                    ".bg-glass-inline\\/25",
+                    "color-mix(in oklab, var(--brand) 25%, transparent)",
+                    None,
+                ),
+            ),
+        ],
+    );
+    assert_generated(
+        "@theme { --color-glass:#ffffff; --color-glass-clear:#ffffff; --color-clear:#ffffff; --color-interactive:#ffffff; --color-glass-interactive:#ffffff; --color-glass-missing:#ffffff; --color-glass-brand:#ffffff; --color-brand:#123456; }",
+        &[
+            ("bg-glass", String::new()),
+            ("bg-glass-clear", String::new()),
+            ("bg-glass-clear/50", String::new()),
+            ("bg-glass-interactive", String::new()),
+            ("bg-glass-interactive/50", String::new()),
+            ("bg-glass-missing", String::new()),
+            (
+                "bg-glass-brand",
+                glass_css(".bg-glass-brand", "var(--color-brand)", None),
+            ),
+            (
+                "bg-brand",
+                ".bg-brand{background-color:var(--color-brand);}".to_owned(),
             ),
         ],
     );
 }
 
 #[test]
-fn glass_tint_tracks_runtime_theme_overrides_and_apply() {
+fn bg_glass_material_tracks_tailwind_changes_in_cached_styles() {
+    let mut doc = Document::parse(
+        "<style id=utilities>@import 'tailwindcss';</style><style>.applied{@apply bg-glass-blue-500}</style><button id=direct class=bg-glass-blue-500></button><button id=applied class=applied></button><button id=base class=bg-glass></button>",
+    );
+    let sheet = id(&doc, "#utilities");
+    let nodes = [id(&doc, "#direct"), id(&doc, "#applied")];
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for (imported, disabled) in [
+        (true, false),
+        (true, true),
+        (true, false),
+        (false, false),
+        (true, false),
+    ] {
+        doc.nodes[sheet].stylesheet = Some(Rc::new(super::Stylesheet::parse(if imported {
+            "@import 'tailwindcss';"
+        } else {
+            ""
+        })));
+        if disabled {
+            doc.nodes[sheet].attrs.set("disabled", "");
+        } else {
+            doc.nodes[sheet].attrs.remove("disabled");
+        }
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        let active = cfg!(target_os = "macos") && imported && !disabled;
+        for node in nodes {
+            assert_eq!(
+                cached.values[node].get(Prop::MACOS_GLASS),
+                active.then_some("regular")
+            );
+            assert_eq!(
+                cached.values[node].contains(Prop::MACOS_GLASS_TINT_COLOR),
+                imported && !disabled
+            );
+            if active {
+                assert_eq!(cached.values[node].get(Prop::APPEARANCE), Some("none"));
+            }
+        }
+        assert_eq!(
+            cached.values[id(&doc, "#base")].get(Prop::MACOS_GLASS),
+            cfg!(target_os = "macos").then_some("regular")
+        );
+        cache.finish();
+    }
+}
+
+#[test]
+fn bg_glass_tint_tracks_runtime_theme_overrides_and_apply() {
     let mut doc = Document::parse(
         "<html><style>@import 'tailwindcss';
         @theme { --color-brand:#123456; --color-blue-500:#112233; }
         @theme inline { --color-inline:var(--brand); }
         :root{--brand:#345678}
         .night{--color-blue-500:#abcdef;--color-brand:#abcdef;--brand:#fedcba}
-        .applied{@apply bg-brand/50 glass-tint-brand/50}
+        .applied{@apply bg-brand/50 bg-glass-brand/50}
         </style><body>
-        <p id=shade class='bg-blue-500 glass-tint-blue-500'></p>
-        <p id=custom class='bg-brand glass-tint-brand'></p>
-        <p id=inline class='bg-inline glass-tint-inline'></p>
+        <p id=shade class='bg-blue-500 bg-glass-blue-500'></p>
+        <p id=custom class='bg-brand bg-glass-brand'></p>
+        <p id=inline class='bg-inline bg-glass-inline'></p>
         <p id=applied class=applied></p>
-        <p id=hover class='bg-blue-500 hover:bg-brand glass-tint-blue-500 hover:glass-tint-brand'></p>
+        <p id=hover class='bg-blue-500 hover:bg-brand bg-glass-blue-500 hover:bg-glass-brand'></p>
         </body></html>",
     );
     let root = id(&doc, "html");
@@ -939,25 +1056,25 @@ fn glass_tint_tracks_runtime_theme_overrides_and_apply() {
 }
 
 #[test]
-fn supports_glass_variants_keep_runtime_conditions_and_stack() {
+fn supports_bg_glass_variants_keep_runtime_conditions_and_stack() {
     assert_generated(
         "",
         &[
             (
-                "supports-glass:flex",
-                "@media (-macos-glass){.supports-glass\\:flex{display:flex;}}",
+                "supports-bg-glass:flex",
+                "@media (-macos-glass){.supports-bg-glass\\:flex{display:flex;}}",
             ),
             (
-                "not-supports-glass:flex",
-                "@media not (-macos-glass){.not-supports-glass\\:flex{display:flex;}}",
+                "not-supports-bg-glass:flex",
+                "@media not (-macos-glass){.not-supports-bg-glass\\:flex{display:flex;}}",
             ),
             (
-                "supports-glass:hover:flex",
-                "@media (-macos-glass){@media (hover: hover){.supports-glass\\:hover\\:flex:hover{display:flex;}}}",
+                "supports-bg-glass:hover:flex",
+                "@media (-macos-glass){@media (hover: hover){.supports-bg-glass\\:hover\\:flex:hover{display:flex;}}}",
             ),
             (
-                "md:hover:not-supports-glass:flex",
-                "@media (width >= 48rem){@media (hover: hover){@media not (-macos-glass){.md\\:hover\\:not-supports-glass\\:flex:hover{display:flex;}}}}",
+                "md:hover:not-supports-bg-glass:flex",
+                "@media (width >= 48rem){@media (hover: hover){@media not (-macos-glass){.md\\:hover\\:not-supports-bg-glass\\:flex:hover{display:flex;}}}}",
             ),
             (
                 "supports-[glass]:flex",
@@ -967,7 +1084,19 @@ fn supports_glass_variants_keep_runtime_conditions_and_stack() {
                 "not-supports-[glass]:flex",
                 "@supports not (glass: var(--tw)){.not-supports-\\[glass\\]\\:flex{display:flex;}}",
             ),
-            ("supports-glass/named:flex", ""),
+            (
+                "supports-[bg-glass]:flex",
+                "@supports (bg-glass: var(--tw)){.supports-\\[bg-glass\\]\\:flex{display:flex;}}",
+            ),
+            (
+                "supports-glass:flex",
+                "@supports (glass: var(--tw)){.supports-glass\\:flex{display:flex;}}",
+            ),
+            (
+                "not-supports-glass:flex",
+                "@supports not (glass: var(--tw)){.not-supports-glass\\:flex{display:flex;}}",
+            ),
+            ("supports-bg-glass/named:flex", ""),
         ],
     );
 }

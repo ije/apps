@@ -1,6 +1,4 @@
 @import "tailwindcss";
-@import "liquid-glass"; /* macOS 26+ only */
-@import "sf-symbols"; /* macOS only */
 
 body {
   margin: 0;

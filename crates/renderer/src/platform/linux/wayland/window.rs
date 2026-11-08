@@ -288,6 +288,10 @@ impl Window {
         }
     }
 
+    pub fn cancel_composition(&self) {
+        self.client.cancel_composition();
+    }
+
     pub fn activate(&self) {
         if !self.shared.shown.replace(true) {
             self.request_frame();

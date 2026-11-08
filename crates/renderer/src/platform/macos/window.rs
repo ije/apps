@@ -12,7 +12,7 @@ use crate::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
     PlatformInput, Point, Scene, ScrollDelta, ScrollPhase, Size, WindowChange, WindowOptions,
     WindowState,
-    app::{Callbacks, dispatch},
+    app::{Callbacks, dispatch, send_ime_key},
     point, px, size,
 };
 use anyhow::Result;
@@ -25,7 +25,7 @@ use core_graphics::display::CGDirectDisplayID;
 use objc2::{
     AnyThread, MainThreadMarker, class, msg_send,
     rc::{Retained, autoreleasepool},
-    runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, Sel},
+    runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, MessageReceiver, Sel},
     sel,
 };
 #[expect(
@@ -45,7 +45,7 @@ use objc2_foundation::{
     NSArray, NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint, NSProcessInfo, NSRect,
     NSSize, NSString, NSUInteger,
 };
-use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CALayer, CAMetalLayer};
 use raw_window_handle as rwh;
 use std::{
     cell::RefCell,
@@ -61,6 +61,7 @@ use std::{
 };
 
 const STATE_IVAR: &CStr = c"windowState";
+const VISUAL_EFFECT_STATE_IVAR: &CStr = c"visualEffectState";
 
 #[allow(non_upper_case_globals)]
 const NSNormalWindowLevel: NSInteger = 0;
@@ -70,16 +71,30 @@ const NSFloatingWindowLevel: NSInteger = 3;
 struct Classes {
     window: usize,
     view: usize,
+    overlay: usize,
 }
 
-fn classes() -> (&'static AnyClass, &'static AnyClass) {
+fn classes() -> (&'static AnyClass, &'static AnyClass, &'static AnyClass) {
     static CLASSES: OnceLock<Classes> = OnceLock::new();
     let classes = CLASSES.get_or_init(|| {
+        extern "C" fn no_hit(_: &AnyObject, _: Sel, _: NSPoint) -> *mut AnyObject {
+            ptr::null_mut()
+        }
+        extern "C" fn flipped(_: &AnyObject, _: Sel) -> Bool {
+            Bool::YES
+        }
         // SAFETY: the methods have the signatures AppKit calls them with.
         unsafe {
+            let mut overlay = ClassBuilder::new(c"AppsOverlayView", class!(NSView)).unwrap();
+            overlay.add_method(
+                sel!(hitTest:),
+                no_hit as extern "C" fn(_, Sel, NSPoint) -> *mut AnyObject,
+            );
+            overlay.add_method(sel!(isFlipped), flipped as extern "C" fn(_, Sel) -> Bool);
             Classes {
                 window: build_window_class() as usize,
                 view: build_view_class() as usize,
+                overlay: overlay.register() as *const AnyClass as usize,
             }
         }
     });
@@ -88,6 +103,7 @@ fn classes() -> (&'static AnyClass, &'static AnyClass) {
         (
             &*(classes.window as *const AnyClass),
             &*(classes.view as *const AnyClass),
+            &*(classes.overlay as *const AnyClass),
         )
     }
 }
@@ -216,6 +232,17 @@ unsafe fn build_window_class() -> *const AnyClass {
     unsafe {
         let mut decl = ClassBuilder::new(c"AppsWindow", class!(NSWindow)).unwrap();
         decl.add_ivar::<*mut c_void>(STATE_IVAR);
+        decl.add_ivar::<isize>(VISUAL_EFFECT_STATE_IVAR);
+        // WARNING: Liquid Glass needs this private getter. Its ivar stays readable when AppKit reenters with State borrowed.
+        if class!(NSWindow)
+            .instance_method(sel!(_hasActiveAppearance))
+            .is_some()
+        {
+            decl.add_method(
+                sel!(_hasActiveAppearance),
+                has_active_appearance as extern "C" fn(_, Sel) -> Bool,
+            );
+        }
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(_, Sel));
         decl.add_method(
             sel!(canBecomeMainWindow),
@@ -618,9 +645,10 @@ fn open_native(
     options: &WindowOptions,
     callbacks: Callbacks,
     layer: Retained<CAMetalLayer>,
+    overlay: Retained<CALayer>,
 ) -> Result<Sendable<Opened>> {
     let marker = MainThreadMarker::new().unwrap();
-    let (window_class, view_class) = classes();
+    let (window_class, view_class, overlay_class) = classes();
     autoreleasepool(|_| unsafe {
         let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: Bool::NO];
         let mut style_mask = NSWindowStyleMask::Closable | NSWindowStyleMask::Titled;
@@ -754,6 +782,18 @@ fn open_native(
         // place, where the default placement would stretch the whole window for that frame. AppKit
         // owns the gravity of this layer, so setting it on the layer does nothing.
         let () = msg_send![native_view, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];
+        // WARNING: AppKit owns the sublayers of the frame layer: it puts the layers of subviews over the ones
+        // added by hand whenever a subview changes. So promoted layers and the caret go in the layer this view
+        // hosts, and the order from the bottom is: frame, glass views, this view, web views and other subviews.
+        // Native glass has nothing painted over it, and web views stay on top, as the renderer can't see them.
+        let overlay_view: *mut AnyObject = msg_send![overlay_class, alloc];
+        let overlay_view: *mut AnyObject = msg_send![overlay_view, initWithFrame: content_bounds];
+        anyhow::ensure!(!overlay_view.is_null(), "AppKit did not create the view");
+        let () = msg_send![overlay_view, setLayer: &*overlay];
+        let () = msg_send![overlay_view, setWantsLayer: Bool::YES];
+        let () = msg_send![overlay_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
+        let () = msg_send![native_view, addSubview: overlay_view];
+        let () = msg_send![overlay_view, release];
         let native_view: *mut AnyObject = msg_send![native_view, autorelease];
         let () = msg_send![content_view, addSubview: native_view];
         let _: Bool = msg_send![native_window, makeFirstResponder: native_view];
@@ -878,9 +918,10 @@ impl Window {
             renderer.update_transparency(true);
         }
         let atlas = renderer.atlas().clone();
-        let layer = Sendable::new(renderer.layer().clone());
+        let layers = Sendable::new((renderer.layer().clone(), renderer.overlay().clone()));
         let opened = native_sync(move || {
-            autoreleasepool(|_| open_native(options, callbacks, layer.take())).map(Sendable::new)
+            let (layer, overlay) = layers.take();
+            autoreleasepool(|_| open_native(options, callbacks, layer, overlay)).map(Sendable::new)
         })?
         .take()
         .take();
@@ -1198,6 +1239,16 @@ impl WindowControl {
                         state.focusable = on;
                     }
                 }
+                WindowChange::CancelComposition => {
+                    // SAFETY: the window retains its view, and discarding needs no answer.
+                    unsafe {
+                        let context: *mut AnyObject = msg_send![view.as_ptr(), inputContext];
+                        if !context.is_null() {
+                            let () = msg_send![context, discardMarkedText];
+                        }
+                    }
+                    return;
+                }
                 WindowChange::AspectRatio(ratio, extra) => {
                     // WARNING: resize increments clear the aspect ratio.
                     if ratio > 0. {
@@ -1230,6 +1281,15 @@ impl WindowControl {
                     }
                 }
                 WindowChange::Vibrancy(material, effect) => {
+                    unsafe {
+                        let object: &AnyObject = window;
+                        object
+                            .class()
+                            .instance_variable(VISUAL_EFFECT_STATE_IVAR)
+                            .unwrap()
+                            .load_ptr::<isize>(object)
+                            .write(effect);
+                    }
                     let Some(content) = window.contentView() else {
                         return;
                     };
@@ -1565,6 +1625,21 @@ extern "C" fn can_become_key(this: &AnyObject, _: Sel) -> Bool {
     )
 }
 
+extern "C" fn has_active_appearance(this: &AnyObject, selector: Sel) -> Bool {
+    unsafe {
+        match *this
+            .class()
+            .instance_variable(VISUAL_EFFECT_STATE_IVAR)
+            .unwrap()
+            .load::<isize>(this)
+        {
+            1 => Bool::YES,
+            2 => Bool::NO,
+            _ => this.send_super_message(class!(NSWindow), selector, ()),
+        }
+    }
+}
+
 extern "C" fn dealloc_window(this: &AnyObject, _: Sel) {
     unsafe {
         drop_state(this);
@@ -1738,7 +1813,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
     let Some(input) = (unsafe { platform_input_from_native(event, Some(height)) }) else {
         return Bool::NO;
     };
-    match input {
+    let down = match &input {
         PlatformInput::KeyDown(down) => {
             // WARNING: AppKit sends some keys as a key equivalent, then again as a key down when that was
             // not handled. The second one is skipped.
@@ -1750,15 +1825,27 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
             } else if lock
                 .last_key_equivalent
                 .take()
-                .is_some_and(|last| same(&last, &down))
+                .is_some_and(|last| same(&last, down))
             {
                 return Bool::NO;
             }
-            drop(lock);
+            true
+        }
+        PlatformInput::KeyUp(_) => false,
+        _ => return Bool::NO,
+    };
+    drop(lock);
+    let composing = down && callbacks.marked_text_range().is_some();
+    // WARNING: the main thread's filter sees each key once, before the page. As in Electron, a key it blocks
+    // still goes to a composing input method, which only can't send it on to the page.
+    let blocked = crate::app::native::key(callbacks.id, &input, &|| {
+        composing || !down && callbacks.marked_text_range().is_some()
+    });
+    match input {
+        PlatformInput::KeyDown(down) => {
             let keystroke = &down.keystroke;
             let modifiers = keystroke.modifiers;
             let plain = !modifiers.control && !modifiers.function && !modifiers.platform;
-            let composing = callbacks.marked_text_range().is_some();
             // WARNING: composed keys, keys without text (arrows, escape) and printable keys of a composing
             // input method go to the input method first. It calls `doCommandBySelector:` for keys
             // it does not want, which sends them to the app.
@@ -1770,18 +1857,36 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
                     .is_some_and(|text| text.chars().all(|c| !c.is_control()))
                 && unsafe { is_ime_input_source_active() }
                 && callbacks.accepts_text_input();
+            if blocked && !composing && !ime_printable {
+                return Bool::YES;
+            }
             if composing || ime_printable || (keystroke.key_char.is_none() && plain) {
                 {
                     let mut lock = state.borrow_mut();
-                    lock.keystroke_for_do_command = Some(keystroke.clone());
+                    lock.keystroke_for_do_command = (!blocked).then(|| keystroke.clone());
                     lock.do_command_handled = None;
+                }
+                // WARNING: the page gets a key that the input method takes only with the first change it makes,
+                // or after it when it made none. A key that comes back through `doCommandBySelector:` drops it.
+                let held = !blocked && (composing || ime_printable);
+                if held {
+                    let down = down.clone();
+                    callbacks.queue(move |window, _| window.ime_key = Some((down, composing)));
                 }
                 let handled = input_context_handles(this, event);
                 let mut lock = state.borrow_mut();
                 lock.keystroke_for_do_command = None;
+                if blocked {
+                    return Bool::YES;
+                }
                 if let Some(handled) = lock.do_command_handled.take() {
                     return Bool::new(handled);
                 } else if handled {
+                    if held {
+                        callbacks.queue(|window, app| {
+                            send_ime_key(window, app, false);
+                        });
+                    }
                     return Bool::YES;
                 }
                 drop(lock);
@@ -1809,11 +1914,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
             }
             Bool::new(input_context_handles(this, event))
         }
-        PlatformInput::KeyUp(_) => {
-            drop(lock);
-            Bool::new(callbacks.input(input))
-        }
-        _ => Bool::NO,
+        input => Bool::new(blocked || callbacks.input(input)),
     }
 }
 
@@ -2367,6 +2468,7 @@ extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
         let handled = callbacks.input(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
             is_held: false,
+            ime: false,
         }));
         if let Ok(mut lock) = state.try_borrow_mut() {
             lock.do_command_handled = Some(handled);

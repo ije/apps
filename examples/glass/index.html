@@ -12,16 +12,16 @@
         <p class="mt-3">Native macOS material. HTML controls.</p>
       </div>
       <div class="flex gap-8">
-        <button id="plain" class="glass glass-interactive rounded-full px-6 py-3 text-lg">Count 0</button>
-        <button id="tinted" class="glass glass-interactive glass-tint-blue-500 rounded-full px-6 py-3 text-lg">Blue</button>
-        <button id="clear" class="glass-clear glass-interactive rounded-xl px-6 py-3 text-lg">Clear</button>
+        <button id="plain" class="bg-glass bg-glass-interactive rounded-full px-6 py-3 text-lg">Count 0</button>
+        <button id="tinted" class="bg-glass-blue-500 bg-glass-interactive rounded-full px-6 py-3 text-lg">Blue</button>
+        <button id="clear" class="bg-glass-clear bg-glass-interactive rounded-xl px-6 py-3 text-lg">Clear</button>
       </div>
-      <button id="mouse" type="button" aria-pressed="false" class="glass glass-interactive rounded-full flex items-center gap-2 px-6 py-3 text-lg">
-        <span class="sf-icon-magicmouse size-5" aria-hidden="true"></span>
+      <button id="mouse" type="button" aria-pressed="false" class="bg-glass bg-glass-interactive rounded-full flex items-center gap-2 px-6 py-3 text-lg">
+        <sf-symbol-magicmouse class="size-5" aria-hidden="true" />
         <span id="mouse-label">Magic Mouse OFF</span>
       </button>
       <p class="flex items-center gap-2 text-sm">
-        <span class="sf-icon-info-circle size-4" aria-hidden="true"></span>
+        <sf-symbol-info-circle class="size-4" aria-hidden="true" />
         <span id="status">Click a button to test DOM events.</span>
       </p>
     </main>
@@ -42,14 +42,14 @@
         document.querySelector('#status').textContent = `Clicked ${count} time${count === 1 ? '' : 's'}.`;
       });
       document.querySelector('#tinted').addEventListener('click', (event) => {
-        const green = event.currentTarget.classList.toggle('glass-tint-green-500');
-        event.currentTarget.classList.toggle('glass-tint-blue-500', !green);
+        const green = event.currentTarget.classList.toggle('bg-glass-green-500');
+        event.currentTarget.classList.toggle('bg-glass-blue-500', !green);
         event.currentTarget.textContent = green ? 'Green' : 'Blue';
       });
       document.querySelector('#clear').addEventListener('click', () => {
         const button = document.querySelector('#plain');
-        button.classList.toggle('glass');
-        document.querySelector('#status').textContent = button.classList.contains('glass') ? 'Glass enabled.' : 'Glass removed.';
+        button.classList.toggle('bg-glass');
+        document.querySelector('#status').textContent = button.classList.contains('bg-glass') ? 'Glass enabled.' : 'Glass removed.';
       });
     </script>
   </body>

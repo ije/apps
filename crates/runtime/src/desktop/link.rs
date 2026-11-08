@@ -36,7 +36,6 @@ pub(crate) enum ToMain {
     Event(String, &'static str),
     Bridge(Payload),
     Sync(Payload, Answer),
-    Input(u64, Value, Answer),
     Open(u64, Value, Answer),
     Spawn(u64),
     Window(u64, WindowId, WindowControl),
@@ -345,7 +344,33 @@ pub(crate) fn native_action(action: &str) -> bool {
             | "focusable"
             | "aspectRatio"
             | "parent"
+            | "input"
     )
+}
+
+pub(crate) enum Tool {
+    Hud,
+    DevTools,
+}
+
+// WARNING: in `apps run` these keys open the tools before `before-input-event`, so no listener can block them.
+pub(crate) fn tool(keystroke: &renderer::Keystroke) -> Option<Tool> {
+    let (key, modifiers) = (keystroke.key.as_str(), &keystroke.modifiers);
+    let primary = if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    };
+    if key == "f" && modifiers.alt && primary {
+        Some(Tool::Hud)
+    } else if key == "f12"
+        || (key == "i"
+            && ((modifiers.platform && modifiers.alt) || (modifiers.control && modifiers.shift)))
+    {
+        Some(Tool::DevTools)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value {
@@ -370,6 +395,7 @@ pub(crate) struct Main {
     pool: RefCell<Option<mpsc::Sender<Job>>>,
     windows: RefCell<HashMap<u64, (WindowId, WindowControl)>>,
     opened: RefCell<std::collections::BTreeSet<u64>>,
+    inputs: RefCell<std::collections::BTreeSet<u64>>,
     spawner: RefCell<Option<Spawner>>,
     waiting: RefCell<Vec<Value>>,
     changed: RefCell<Vec<u64>>,
@@ -396,6 +422,7 @@ impl Main {
             pool: RefCell::default(),
             windows: RefCell::default(),
             opened: RefCell::default(),
+            inputs: RefCell::default(),
             spawner: RefCell::default(),
             waiting: RefCell::default(),
             changed: RefCell::default(),
@@ -444,7 +471,7 @@ impl Main {
                 ToMain::Bridge(message) | ToMain::Sync(message, _) => {
                     message.value["sender"]["preload"].as_u64()
                 }
-                ToMain::Input(id, ..) | ToMain::Open(id, ..) => Some(*id),
+                ToMain::Open(id, ..) => Some(*id),
                 _ => None,
             };
             // WARNING: like Electron, what a window sent after it closed is dropped, so main never sees a message without a sender.
@@ -455,11 +482,7 @@ impl Main {
                 && self.engine.is_some()
                 && matches!(
                     message,
-                    ToMain::Event(..)
-                        | ToMain::Bridge(_)
-                        | ToMain::Sync(..)
-                        | ToMain::Input(..)
-                        | ToMain::Open(..)
+                    ToMain::Event(..) | ToMain::Bridge(_) | ToMain::Sync(..) | ToMain::Open(..)
                 )
             {
                 later.push_back(message);
@@ -479,12 +502,6 @@ impl Main {
                 (ToMain::Bridge(message), None) => self.invoke(message.value),
                 (ToMain::Sync(message, answer), Some(engine)) => {
                     let _ = answer.send(engine.receive(message));
-                }
-                (ToMain::Input(id, input, answer), Some(engine)) => {
-                    let result = engine
-                        .call("__appsBeforeInput", &[&id.to_string(), &input.to_string()])
-                        .map(|text| Value::Bool(text == "true").into());
-                    let _ = answer.send(result);
                 }
                 (ToMain::Open(id, args, answer), Some(engine)) => {
                     let result = engine
@@ -519,10 +536,7 @@ impl Main {
                     }
                 },
                 (ToMain::OpenTools, None) => {}
-                (
-                    ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..) | ToMain::Input(..),
-                    None,
-                ) => {}
+                (ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..), None) => {}
             }
         }
         if !later.is_empty() {
@@ -580,13 +594,71 @@ impl Main {
         busy
     }
 
-    pub(crate) fn window_event(&self, window: WindowId, event: WindowEvent) {
-        let id = self
-            .windows
+    pub(crate) fn page(&self, window: WindowId) -> Option<u64> {
+        self.windows
             .borrow()
             .iter()
-            .find_map(|(&id, (other, _))| (*other == window).then_some(id));
-        let Some(id) = id else {
+            .find_map(|(&id, (other, _))| (*other == window).then_some(id))
+    }
+
+    // WARNING: main emits `before-input-event` when the system gives it a key, before the page gets it, so a
+    // page never waits for main. It runs no script inside another one, like in a loop nested under
+    // `dialog.showMessageBoxSync()` or a host call, so there the key goes on as not prevented.
+    pub(crate) fn before_input(
+        &self,
+        id: u64,
+        input: &renderer::PlatformInput,
+        composing: &dyn Fn() -> bool,
+    ) -> bool {
+        let (kind, keystroke, held, ime) = match input {
+            renderer::PlatformInput::KeyDown(down) => {
+                ("keyDown", &down.keystroke, down.is_held, down.ime)
+            }
+            renderer::PlatformInput::KeyUp(up) => ("keyUp", &up.keystroke, false, up.ime),
+            _ => return false,
+        };
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        let Ok(packaged) = self.host.try_borrow().map(|host| host.packaged) else {
+            return false;
+        };
+        if !self.inputs.borrow().contains(&id)
+            || self.driving.get()
+            || !packaged && tool(keystroke).is_some()
+        {
+            return false;
+        }
+        let modifiers = &keystroke.modifiers;
+        let input = json!({
+            "type": kind,
+            "key": if ime {
+                "Process"
+            } else {
+                keystroke.key_char.as_deref().unwrap_or(&keystroke.key)
+            },
+            "code": keystroke.key,
+            "isAutoRepeat": held,
+            "isComposing": composing(),
+            "shift": modifiers.shift,
+            "control": modifiers.control,
+            "alt": modifiers.alt,
+            "meta": modifiers.platform,
+            "location": 0,
+            "modifiers": [],
+        });
+        self.driving.set(true);
+        let result = engine.call("__appsBeforeInput", &[&id.to_string(), &input.to_string()]);
+        self.driving.set(false);
+        // WARNING: listeners can add timers and IPC, which only a turn of main runs.
+        self.link.wake_main();
+        result
+            .inspect_err(|error| eprintln!("apps: {error}"))
+            .is_ok_and(|prevented| prevented == "true")
+    }
+
+    pub(crate) fn window_event(&self, window: WindowId, event: WindowEvent) {
+        let Some(id) = self.page(window) else {
             return;
         };
         match event {
@@ -615,6 +687,15 @@ impl Main {
         let Some(id) = args[1].as_u64() else {
             return;
         };
+        if action == "input" {
+            let mut inputs = self.inputs.borrow_mut();
+            if args[2] == true {
+                inputs.insert(id);
+            } else {
+                inputs.remove(&id);
+            }
+            return;
+        }
         if action == "close" {
             // WARNING: a nested loop can run this inside a host call of the main script, so it waits for that call.
             if self.host.try_borrow_mut().is_err() {
@@ -640,6 +721,7 @@ impl Main {
             self.link.forget_page(id);
             self.link
                 .event(format!("__appsEvent('closed',{id})"), "apps:closed");
+            self.inputs.borrow_mut().remove(&id);
             let mut opened = self.opened.borrow_mut();
             opened.remove(&id);
             if self.engine.is_none() && opened.is_empty() {
@@ -739,6 +821,7 @@ impl Main {
             "closable" => WindowChange::Closable(on),
             "movable" => WindowChange::Movable(on),
             "alwaysOnTop" => WindowChange::AlwaysOnTop(on),
+            "composition" => WindowChange::CancelComposition,
             _ => return,
         };
         window.change(change);
@@ -1003,5 +1086,99 @@ mod tests {
             assert_eq!(reply.try_recv().is_ok(), id == 902);
         }
         assert_eq!(runs(), "event,open902");
+    }
+
+    #[test]
+    fn main_filters_the_keys_of_listening_windows_outside_its_scripts() {
+        use renderer::{KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, PlatformInput};
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+        engine
+            .eval(
+                "globalThis.keys=[];globalThis.__appsBeforeInput=(id,input)=>{keys.push(id+JSON.stringify(input));return input.code==='p'}",
+                "test",
+            )
+            .unwrap();
+        let main = Main::new(Some(engine), host.clone(), Link::new(), api);
+        let key = |key: &str, modifiers: Modifiers| Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: (key.len() == 1).then(|| key.to_uppercase()),
+        };
+        let down = |keystroke: Keystroke| {
+            PlatformInput::KeyDown(KeyDownEvent {
+                keystroke,
+                is_held: true,
+                ime: false,
+            })
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let keys = || {
+            main.engine
+                .as_ref()
+                .unwrap()
+                .eval("keys.splice(0).join('|')", "test")
+                .unwrap()
+        };
+        let p = down(key("p", shift));
+        assert!(!main.before_input(5, &p, &|| true));
+        main.native(json!({"op":"window","args":["input",5,true]}));
+        assert!(main.before_input(5, &p, &|| true));
+        assert!(!main.before_input(
+            5,
+            &PlatformInput::KeyUp(KeyUpEvent {
+                keystroke: key("q", Modifiers::default()),
+                ime: false,
+            }),
+            &|| false
+        ));
+        assert_eq!(
+            keys(),
+            r#"5{"type":"keyDown","key":"P","code":"p","isAutoRepeat":true,"isComposing":true,"shift":true,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}|5{"type":"keyUp","key":"Q","code":"q","isAutoRepeat":false,"isComposing":false,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}"#
+        );
+        let process = |ime| {
+            PlatformInput::KeyDown(KeyDownEvent {
+                keystroke: key("p", Modifiers::default()),
+                is_held: false,
+                ime,
+            })
+        };
+        assert!(main.before_input(5, &process(true), &|| true));
+        assert!(main.before_input(5, &process(false), &|| false));
+        assert_eq!(
+            keys(),
+            r#"5{"type":"keyDown","key":"Process","code":"p","isAutoRepeat":false,"isComposing":true,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}|5{"type":"keyDown","key":"P","code":"p","isAutoRepeat":false,"isComposing":false,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}"#
+        );
+        let tools = Modifiers {
+            platform: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        for tool in [
+            key("f12", Modifiers::default()),
+            key("i", tools),
+            key("f", tools),
+        ] {
+            assert!(!main.before_input(5, &down(tool), &|| false));
+        }
+        assert_eq!(keys(), "");
+        host.borrow_mut().packaged = true;
+        main.before_input(5, &down(key("f12", Modifiers::default())), &|| false);
+        assert!(keys().contains(r#""code":"f12""#));
+        // WARNING: a nested loop under a main script or a host call runs no listener.
+        main.driving.set(true);
+        assert!(!main.before_input(5, &p, &|| false));
+        main.driving.set(false);
+        let borrowed = host.borrow_mut();
+        assert!(!main.before_input(5, &p, &|| false));
+        drop(borrowed);
+        assert_eq!(keys(), "");
+        main.native(json!({"op":"window","args":["input",5,false]}));
+        assert!(!main.before_input(5, &p, &|| false));
+        assert_eq!(keys(), "");
     }
 }

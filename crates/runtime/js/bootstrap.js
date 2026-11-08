@@ -536,7 +536,7 @@
       this.emit('did-fail-load', event(), failure.errno, failure.code, url, true, info.pid, 1);
       return Promise.reject(failure);
     }
-    // WARNING: a window waits for main on its keys only while main listens to its `before-input-event`.
+    // WARNING: main runs a script for the keys of a window only while it listens to its `before-input-event`.
     #input = false;
     #listen() { const on = this.listenerCount('before-input-event') > 0; if (on !== this.#input && !this.isDestroyed()) { this.#input = on; call('window', 'input', pages.get(this).win, on); } return this; }
     static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }

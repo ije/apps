@@ -1193,6 +1193,12 @@ fn dispatch(
             );
         }
         Ok(serde_json::Value::Null)
+    } else if let (Role::Renderer(id), "dom.endComposition") = (role, op) {
+        host.try_borrow_mut().context("Host is busy")?.command(
+            crate::desktop::link::Target::Main,
+            serde_json::json!({"op":"window","args":["composition",id]}),
+        );
+        Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.filePicker") = (role, op) {
         let picker = &values[0];
         anyhow::ensure!(

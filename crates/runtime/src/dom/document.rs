@@ -155,13 +155,6 @@ impl Nodes {
         Some(node)
     }
 
-    // WARNING: the pass must put the node back before anything else reads the tree.
-    pub(crate) fn swap(&mut self, id: usize, node: Node) -> Node {
-        self.latest = stamp();
-        self.revisions[id] = self.latest;
-        std::mem::replace(&mut self.list[id], node)
-    }
-
     pub(crate) fn tree(&self) -> u64 {
         self.tree
     }
@@ -172,6 +165,7 @@ impl Nodes {
     }
 
     // WARNING: only for passes that change no other node, so nothing misses a real change.
+    #[cfg(test)]
     pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64, tree: u64) {
         for &(id, revision) in revisions {
             self.revisions[id] = revision;
@@ -1450,7 +1444,11 @@ impl Builder {
             }
             _ => {
                 self.reconstruct();
-                self.open(tag, attrs, None)
+                let id = self.element(tag, attrs);
+                if self.nodes[id].sf_symbol().is_none() {
+                    self.push(id, false, None);
+                }
+                Content::Markup
             }
         }
     }
@@ -2169,6 +2167,10 @@ impl Document {
                         result.push('"');
                     }
                 }
+                if node.sf_symbol().is_some() {
+                    result.push_str("/>");
+                    continue;
+                }
                 result.push('>');
             }
             if matches!(node.tag.as_str(), "script" | "style") {
@@ -2361,6 +2363,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sf_symbols_are_void_html_elements_and_roundtrip() {
+        for symbol in [
+            "<sf-symbol-folder/>",
+            "<sf-symbol-folder />",
+            "<sf-symbol-folder>",
+            "<SF-SYMBOL-FOLDER></SF-SYMBOL-FOLDER>",
+        ] {
+            let source = format!(
+                "<button>{symbol}<span>Open</span><sf-symbol-doc-text class='size-4'/><b>End</b></button>"
+            );
+            for doc in [Document::parse(&source), Document::fragment(&source, "body")] {
+                let button = find(&doc, "button");
+                assert_eq!(
+                    doc.nodes[button]
+                        .children
+                        .iter()
+                        .map(|&id| doc.nodes[id].tag.as_str())
+                        .collect::<Vec<_>>(),
+                    ["sf-symbol-folder", "span", "sf-symbol-doc-text", "b"]
+                );
+                assert!(doc.nodes[find(&doc, "sf-symbol-folder")].children.is_empty());
+                assert!(doc.matches(find(&doc, "sf-symbol-folder"), ":-internal-sf-symbol"));
+                assert!(!doc.matches(find(&doc, "span"), ":-internal-sf-symbol"));
+                let source = doc.serialize(button);
+                assert_eq!(
+                    source,
+                    "<button><sf-symbol-folder/><span>Open</span><sf-symbol-doc-text class=\"size-4\"/><b>End</b></button>"
+                );
+                let again = Document::parse(&source);
+                assert_eq!(tree(&doc, button), tree(&again, find(&again, "button")));
+            }
+        }
+        let doc = Document::parse("<x-card/><span>inside</span></x-card><sf-symbol-folder--fill/><b>inside</b></sf-symbol-folder--fill><i>after</i>");
+        assert_eq!(parent(&doc, "span"), "x-card");
+        assert_eq!(parent(&doc, "b"), "sf-symbol-folder--fill");
+        assert_eq!(parent(&doc, "i"), "body");
+        let doc = Document::parse("<svg><sf-symbol-folder/><path d='M0 0'/></svg>");
+        assert_eq!(tree(&Document::parse(&doc.serialize(0)), 0), tree(&doc, 0));
     }
 
     #[test]
@@ -2775,9 +2818,6 @@ mod tests {
         doc.nodes.edit(1).unwrap().state = 1;
         assert_eq!(doc.nodes.tree(), tree);
         assert_ne!(doc.nodes.latest(), latest);
-        let old = doc.nodes.swap(0, Node::default());
-        doc.nodes.swap(0, old);
-        assert_eq!(doc.nodes.tree(), tree);
         doc.nodes[1].state = 2;
         assert_ne!(doc.nodes.tree(), tree);
         let tree = doc.nodes.tree();

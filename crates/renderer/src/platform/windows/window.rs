@@ -406,6 +406,14 @@ impl Window {
                     };
                     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
                 }
+                WindowChange::CancelComposition => {
+                    let context = ImmGetContext(hwnd);
+                    if !context.is_invalid() {
+                        let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                    }
+                    let _ = ImmReleaseContext(hwnd, context);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -603,7 +611,14 @@ pub(super) fn key_down(msg: &MSG) -> bool {
         Ok(mut state) => events::key_event(&mut state.keys, msg.wParam, msg.lParam, true),
         Err(_) => None,
     };
-    input.is_some_and(|input| inner.callbacks.input(input))
+    let callbacks = inner.callbacks;
+    input.is_some_and(|input| {
+        let handled = crate::app::native::key(callbacks.id, &input, &|| {
+            callbacks.marked_text_range().is_some()
+        }) || callbacks.input(input);
+        // WARNING: the input method gets its keys from TranslateMessage, so it gets them even when stopped.
+        handled && msg.wParam.0 as u16 != VK_PROCESSKEY.0
+    })
 }
 
 fn frame(inner: &Inner) -> bool {
@@ -1162,7 +1177,11 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                     Ok(mut state) => events::key_event(&mut state.keys, wparam, lparam, false),
                     Err(_) => None,
                 };
-                if let Some(input) = input {
+                if let Some(input) = input
+                    && !crate::app::native::key(callbacks.id, &input, &|| {
+                        callbacks.marked_text_range().is_some()
+                    })
+                {
                     callbacks.input(input);
                 }
                 // WARNING: also keeps a released Alt from opening the window menu.
@@ -1204,19 +1223,20 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                     return None;
                 }
                 let flags = lparam.0 as u32;
-                let result = if flags == 0 {
-                    callbacks.replace_text_in_range(None, "");
-                    Some(0)
-                } else {
-                    if flags & GCS_RESULTSTR.0 != 0
-                        && let Some(text) = events::composition(context, GCS_RESULTSTR)
-                    {
-                        callbacks.replace_text_in_range(None, &String::from_utf16_lossy(&text));
-                    }
-                    if flags & GCS_COMPSTR.0 != 0
-                        && let Some(text) = events::composition(context, GCS_COMPSTR)
-                    {
-                        let caret = (!text.is_empty() && flags & GCS_CURSORPOS.0 != 0).then(|| {
+                if flags & GCS_RESULTSTR.0 != 0
+                    && let Some(text) = events::composition(context, GCS_RESULTSTR)
+                {
+                    callbacks.replace_text_in_range(None, &String::from_utf16_lossy(&text));
+                }
+                // WARNING: no flags cancel the composition.
+                let marked = match flags {
+                    0 => Some(Vec::new()),
+                    _ if flags & GCS_COMPSTR.0 != 0 => events::composition(context, GCS_COMPSTR),
+                    _ => None,
+                };
+                match marked {
+                    Some(text) if !text.is_empty() => {
+                        let caret = (flags & GCS_CURSORPOS.0 != 0).then(|| {
                             let caret = events::composition_caret(context, text.len());
                             caret..caret
                         });
@@ -1226,11 +1246,16 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                             caret,
                         );
                     }
-                    (flags & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) != 0).then_some(0)
-                };
+                    Some(_) => callbacks.clear_marked_text(),
+                    None => {}
+                }
                 let _ = ImmReleaseContext(hwnd, context);
                 ime_position(inner);
-                result
+                (flags == 0 || flags & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) != 0).then_some(0)
+            }
+            WM_IME_ENDCOMPOSITION => {
+                callbacks.clear_marked_text();
+                None
             }
             WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
                 SetCursor(CURSOR.get());

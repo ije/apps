@@ -16,6 +16,7 @@ struct TextLayoutInner {
     shaped_width: Option<Pixels>,
     lines: Vec<WrappedLine>,
     line_height: Pixels,
+    top: Pixels,
     wrap_width: Option<Pixels>,
     truncated: bool,
     size: Size<Pixels>,
@@ -92,7 +93,7 @@ impl TextState {
         let wraps = style.white_space == WhiteSpace::Normal;
         let wrap_width = width.filter(|_| wraps);
         let truncate = style.text_overflow.clone().zip(width);
-        let probe = (wraps && width.is_none())
+        let probe = ((wraps || style.float > px(0.)) && width.is_none())
             .then(|| (available.width != AvailableSpace::MinContent) as usize);
         if let Some(probe) = probe {
             if let Some((size, baselines)) = probes.get()[probe] {
@@ -119,38 +120,62 @@ impl TextState {
             None => (text.clone(), Cow::Borrowed(runs), false),
         };
         // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
-        let lines = system
-            .shape_text_indented(
-                text,
-                style.font_size,
-                &runs,
-                if min_content {
-                    Some(px(0.))
-                } else {
-                    wrap_width
-                },
-                style.line_clamp.filter(|_| !min_content),
-                style.text_indent,
-                if min_content {
-                    TextWrap::Wrap
-                } else {
-                    style.text_wrap
-                },
-                match style.word_break {
-                    WordBreak::BreakWord if min_content => WordBreak::Normal,
-                    word_break => word_break,
-                },
-            )
-            .unwrap_or_default();
+        let shape = |runs: &[TextRun]| {
+            system
+                .shape_text_indented(
+                    text.clone(),
+                    style.font_size,
+                    runs,
+                    if min_content && wraps {
+                        Some(px(0.))
+                    } else {
+                        wrap_width
+                    },
+                    style.line_clamp.filter(|_| !min_content),
+                    style.text_indent,
+                    if min_content {
+                        TextWrap::Wrap
+                    } else {
+                        style.text_wrap
+                    },
+                    match style.word_break {
+                        WordBreak::BreakWord if min_content => WordBreak::Normal,
+                        word_break => word_break,
+                    },
+                )
+                .unwrap_or_default()
+        };
+        // WARNING: like a CSS float, the float moves the first line, and the text goes below it when the first
+        // word doesn't fit beside it, as at the min-content size of text that wraps. The float doesn't widen the
+        // min-content size of the text, which is at least as wide as the float.
+        let float = style.float;
+        let beside = (float > px(0.) && !(min_content && wraps))
+            .then(|| {
+                let mut runs = runs.to_vec();
+                runs.first_mut()?.inset[0] += float;
+                Some(shape(&runs))
+            })
+            .flatten()
+            .filter(|lines| {
+                wrap_width
+                    .zip(lines.first())
+                    .is_none_or(|(width, line)| line.first_row_end() <= width + px(0.01))
+            });
+        let top = if beside.is_none() { float } else { px(0.) };
+        let lines = beside.unwrap_or_else(|| shape(&runs));
         let mut size = Size::<Pixels>::default();
-        for line in &lines {
-            let line = line.size(line_height);
-            size.height += line.height;
-            size.width = size.width.max(line.width);
+        for (index, line) in lines.iter().enumerate() {
+            let mut line_size = line.size(line_height);
+            // WARNING: like CSS, the indent widens a first line that doesn't wrap.
+            if index == 0 && line.wrap_boundaries.is_empty() {
+                line_size.width = (line_size.width + style.text_indent).max(px(0.));
+            }
+            size.height += line_size.height;
+            size.width = size.width.max(line_size.width);
         }
         if min_content {
             size.width = px(0.);
-            let mut start = px(0.) - style.text_indent;
+            let mut start = float - top - style.text_indent;
             for line in &lines {
                 let unwrapped = &line.unwrapped_layout;
                 let mut breaks = line.wrap_boundaries.iter().peekable();
@@ -187,13 +212,15 @@ impl TextState {
                 start = px(0.);
             }
         }
+        size.width = size.width.max(float);
+        size.height += top;
         let baseline = system.baseline(
             system.resolve_font(&style.font()),
             style.font_size,
             line_height,
             window.scale_factor(),
         );
-        let baselines = [baseline, baseline + size.height - line_height];
+        let baselines = [top + baseline, baseline + size.height - line_height];
         if let Some(probe) = probe {
             let mut kept = probes.get();
             kept[probe] = Some((size, baselines));
@@ -205,6 +232,7 @@ impl TextState {
                 shaped_width: if min_content { Some(px(0.)) } else { width },
                 lines,
                 line_height,
+                top,
                 wrap_width,
                 truncated,
                 size,
@@ -250,7 +278,7 @@ impl TextLayout {
         let Some(bounds) = inner.bounds else {
             return;
         };
-        let mut origin = bounds.origin;
+        let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         for line in &inner.lines {
             line.paint_background(origin, inner.line_height, align, Some(bounds), window);
             line.paint(origin, inner.line_height, align, Some(bounds), window);
@@ -269,7 +297,7 @@ impl TextLayout {
         if position.y < bounds.top() {
             return Err(0);
         }
-        let mut origin = bounds.origin;
+        let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
         for line in &inner.lines {
             let bottom = origin.y + line.size(inner.line_height).height;
@@ -289,7 +317,7 @@ impl TextLayout {
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let inner = self.0.borrow();
         let inner = inner.as_ref()?;
-        let mut origin = inner.bounds?.origin;
+        let mut origin = inner.bounds?.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
         for line in &inner.lines {
             let end = start + line.len();

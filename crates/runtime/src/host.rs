@@ -430,11 +430,12 @@ impl Host {
                             state.invalidate();
                         }
                         // WARNING: kept walks of the tree read these attributes, so they count as tree changes.
-                        let current = if matches!(key, "slot" | "name" | "contenteditable") {
-                            doc.nodes.get_mut(id)
-                        } else {
-                            doc.nodes.edit(id)
-                        };
+                        let current =
+                            if matches!(key, "slot" | "name" | "contenteditable" | "inert") {
+                                doc.nodes.get_mut(id)
+                            } else {
+                                doc.nodes.edit(id)
+                            };
                         if let Some(current) = current {
                             match value {
                                 Some(value) => current.attrs.set(key, value),
@@ -499,29 +500,45 @@ impl Host {
                         true
                     }
                     8 => {
-                        use crate::dom::{CHECKED, DIRTY, FULLSCREEN, MODAL, POPOVER};
+                        use crate::dom::{
+                            BROKEN, CHECKED, DIRTY, FULLSCREEN, LEAVING, MODAL, POPOVER, TOP_LAYER,
+                        };
                         let id = node(doc, a)?;
-                        let bits = [CHECKED, DIRTY, MODAL, POPOVER, FULLSCREEN]
+                        let bits = [CHECKED, DIRTY, MODAL, POPOVER, FULLSCREEN, BROKEN]
                             .into_iter()
                             .enumerate()
                             .fold(0, |bits, (index, bit)| {
                                 bits | if b & 1 << index != 0 { bit } else { 0 }
                             });
-                        let mask = CHECKED | DIRTY | MODAL | POPOVER | FULLSCREEN;
-                        if doc.nodes[id].state & mask == bits {
+                        let mask = CHECKED | DIRTY | MODAL | POPOVER | FULLSCREEN | BROKEN;
+                        let old = doc.nodes[id].state;
+                        if old & mask == bits {
                             return Ok(false);
                         }
+                        // WARNING: a box that leaves the top layer stays in it until render sees its `overlay`
+                        // end, so it keeps what it lost as `LEAVING` bits; a box that comes back drops them. A
+                        // page without a window never draws, so its boxes leave at once.
+                        let leaving = if bits & TOP_LAYER == 0
+                            && state.text_system.is_some()
+                            && state.top_layer.contains(&id)
+                        {
+                            old & LEAVING | (old & TOP_LAYER) << 5
+                        } else {
+                            0
+                        };
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.invalidate();
                         }
                         if let Some(node) = doc.nodes.edit(id) {
-                            node.state = node.state & !mask | bits;
+                            node.state = node.state & !(mask | LEAVING) | bits | leaving;
                         }
                         true
                     }
                     9 => {
                         let id = node(doc, a)?;
-                        state.top_layer.retain(|&other| other != id);
+                        if b != 0 || doc.nodes[id].state & crate::dom::LEAVING == 0 {
+                            state.top_layer.retain(|&other| other != id);
+                        }
                         if b != 0 {
                             state.top_layer.push(id);
                         }

@@ -128,8 +128,8 @@ impl Walk {
 struct ShadowWalk {
     tree: u64,
     count: usize,
-    hosts: Vec<usize>,
-    slots: HashMap<usize, Vec<usize>>,
+    slots: rustc_hash::FxHashMap<usize, Vec<usize>>,
+    shadows: Rc<style::Shadows>,
 }
 
 pub(crate) const CHECKED: u16 = 16;
@@ -137,9 +137,24 @@ pub(crate) const DIRTY: u16 = 32;
 pub(crate) const MODAL: u16 = 64;
 pub(crate) const POPOVER: u16 = 256;
 pub(crate) const FULLSCREEN: u16 = 512;
+// WARNING: an image that failed to load, which shows its alt text.
+pub(crate) const BROKEN: u16 = 1024;
 pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
+// WARNING: the top layer bits that a box lost, shifted, while it stays in the top layer until its `overlay`
+// transition ends.
+pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
 
 impl Node {
+    pub(crate) fn sf_symbol(&self) -> Option<&str> {
+        let name = self.tag.strip_prefix("sf-symbol-")?;
+        (!name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !name.split('-').any(str::is_empty))
+        .then_some(name)
+    }
+
     pub(crate) fn checked(&self) -> bool {
         if self.state & DIRTY != 0 {
             self.state & CHECKED != 0
@@ -181,6 +196,12 @@ pub(crate) const MIRROR_CLIP: u8 = 4;
 pub(crate) const MIRROR_POSITIONED: u8 = 8;
 pub(crate) const MIRROR_HIDDEN: u8 = 16;
 pub(crate) const MIRROR_FIXED: u8 = 32;
+// WARNING: inert, or hidden by the cascade while an exit transition or animation still paints it, so it takes no
+// focus, as in browsers.
+pub(crate) const MIRROR_INERT: u8 = 64;
+const HIDDEN: u8 = 1;
+const EDITABLE: u8 = 2;
+const INERT: u8 = 4;
 
 impl LayoutMirror {
     fn slot(&self, id: usize) -> *mut f32 {
@@ -361,6 +382,8 @@ pub struct State {
     old_styles: Option<Rc<style::ComputedStyles>>,
     pub(crate) style_walk: Walk,
     editable: Vec<usize>,
+    inert: Vec<usize>,
+    // WARNING: by node id, the `HIDDEN`, `EDITABLE` and `INERT` bits of the last style pass.
     select_marks: Vec<u8>,
     shadow_walk: Rc<ShadowWalk>,
     pub(crate) grids: rustc_hash::FxHashMap<
@@ -530,6 +553,14 @@ impl State {
         len < before
     }
 
+    // WARNING: inertness stays out of `ComputedStyles.user_select`, because kept boxes read that with their
+    // revision, and a modal dialog changes it without one.
+    pub(crate) fn inert(&self, id: usize) -> bool {
+        self.select_marks
+            .get(id)
+            .is_some_and(|marks| marks & INERT != 0)
+    }
+
     pub(crate) fn invalidate(&mut self) {
         if let Some(computed) = self.computed.take() {
             self.previous = Some(computed);
@@ -561,14 +592,19 @@ impl State {
         doc.nodes[id] = node;
         self.detached.push(id);
         if let Some(cached) = &mut self.computed {
+            // WARNING: every per-node list must grow here, and a detached node gets what a full pass gives it, or
+            // reads of the new node index past their end and incremental passes keep other values.
             if let Some(computed) = Rc::get_mut(cached) {
                 computed
                     .values
                     .resize_with(doc.nodes.len(), Default::default);
                 computed.values[id] = Rc::default();
+                computed.vars.resize_with(doc.nodes.len(), Default::default);
+                computed.vars[id] = Default::default();
                 computed.flags.resize(doc.nodes.len(), 0);
                 computed.flags[id] = 0;
-                computed.lengths.resize(doc.nodes.len());
+                computed.lengths.grow(doc.nodes.len());
+                computed.lengths.unset(id);
                 computed
                     .user_select
                     .resize(doc.nodes.len(), (style::UserSelect::None, 0));
@@ -584,11 +620,12 @@ impl State {
 fn slots(
     doc: &Document,
     roots: impl IntoIterator<Item = (usize, usize)>,
-) -> HashMap<usize, Vec<usize>> {
-    let mut slots = HashMap::new();
+) -> rustc_hash::FxHashMap<usize, Vec<usize>> {
+    let mut slots = rustc_hash::FxHashMap::default();
+    let (mut names, mut pending) = (rustc_hash::FxHashMap::default(), Vec::new());
     for (host, root) in roots {
-        let mut names = HashMap::new();
-        let mut pending = vec![root];
+        names.clear();
+        pending.push(root);
         while let Some(id) = pending.pop() {
             let node = &doc.nodes[id];
             if node.tag == "slot" {
@@ -603,8 +640,9 @@ fn slots(
             let node = &doc.nodes[child];
             if (node.tag == "#text" || !node.tag.starts_with('#'))
                 && let Some(slot) = names.get(node.attrs.get("slot").map_or("", String::as_str))
+                && let Some(assigned) = slots.get_mut(slot)
             {
-                slots.get_mut(slot).unwrap().push(child);
+                assigned.push(child);
             }
         }
     }
@@ -719,6 +757,13 @@ pub(crate) fn show_frame(
     // WARNING: a poster that decodes later must not replace the frame.
     state.decoding.remove(&id);
     let size = image.as_ref().map(|image| image.size());
+    match size {
+        Some(size) => state.measurements.naturals.insert(
+            id,
+            [u32::from(size.width) as f32, u32::from(size.height) as f32],
+        ),
+        None => state.measurements.naturals.remove(&id),
+    };
     let old = match image {
         Some(image) => state.images.insert(id, image),
         None => state.images.remove(&id),
@@ -911,6 +956,10 @@ pub fn call(
                     match result {
                         Ok(Ok(image)) => {
                             let size = image.size();
+                            state.measurements.naturals.insert(
+                                id,
+                                [u32::from(size.width) as f32, u32::from(size.height) as f32],
+                            );
                             state.svg_images.remove(&id);
                             state
                                 .retired
@@ -918,6 +967,7 @@ pub fn call(
                             json!([u32::from(size.width), u32::from(size.height)])
                         }
                         Ok(Err((text, size))) => {
+                            state.measurements.naturals.insert(id, size);
                             state.retired.extend(state.images.remove(&id));
                             state.svg_images.insert(id, (text.into(), size));
                             json!(size)
@@ -1242,6 +1292,7 @@ pub fn call(
                     state.svg_boxes.remove(&id);
                     state.svg_trees.remove(&id);
                     state.svg_images.remove(&id);
+                    state.measurements.naturals.remove(&id);
                     state.sources.get_mut().remove(&id);
                     state.decoding.remove(&id);
                     if let Some(root) = state.shadows.remove(&id) {
@@ -1392,6 +1443,9 @@ pub fn call(
                 _ => (2, ACTIVE),
             };
             let focus = if op == "dom.focus" { FOCUS } else { 0 };
+            // WARNING: like Chrome, `:focus` and `:focus-within` don't match while the window is not focused, but the
+            // focus stays, so fields keep their selection.
+            let shown = args[2].as_bool() != Some(true);
             let used = state.style_cache.states & (flag | focus) != 0;
             let control = |id: &usize| {
                 doc.nodes.get(*id).is_some_and(|node| {
@@ -1408,7 +1462,11 @@ pub fn call(
                     node.state &= !(FOCUS | FOCUS_VISIBLE);
                 }
                 state.focus = ids.first().copied();
-                if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
+                if let Some(node) = state
+                    .focus
+                    .filter(|_| shown)
+                    .and_then(|id| doc.nodes.edit(id))
+                {
                     node.state |= if args[1].as_bool() == Some(false) {
                         FOCUS
                     } else {
@@ -1421,7 +1479,7 @@ pub fn call(
                     node.state &= !flag;
                 }
             }
-            for &id in &ids {
+            for &id in ids.iter().filter(|_| shown) {
                 if let Some(node) = doc.nodes.edit(id) {
                     node.state |= flag;
                 }
@@ -1651,6 +1709,9 @@ pub fn call(
                     })
                     .flatten();
                 let mut sampled = None;
+                let backdrop = (pseudo == "backdrop")
+                    .then(|| state.motion.backdrop(id, styles.backdrops.get(&id)?))
+                    .flatten();
                 let style = match pseudo {
                     "" => Some(current.as_ref().unwrap_or_else(|| {
                         &**state
@@ -1664,7 +1725,9 @@ pub fn call(
                         .get(&id)
                         .or_else(|| styles.pseudos.get(&id))
                         .map(|values| &values[usize::from(pseudo == "after")]),
-                    "backdrop" => styles.backdrops.get(&id).map(|style| &**style),
+                    "backdrop" => backdrop
+                        .as_ref()
+                        .or_else(|| styles.backdrops.get(&id).map(|style| &**style)),
                     _ => None,
                 };
                 let style = match (style, scripted) {
@@ -1832,14 +1895,20 @@ pub fn call(
                     system.as_deref().map(|system| (system, state.pixel_ratio)),
                 );
                 if op == "dom.userSelect" {
-                    return Ok(json!(computed.user_select[id]));
+                    return Ok(if state.inert(id) {
+                        json!((style::UserSelect::None, id))
+                    } else {
+                        json!(computed.user_select[id])
+                    });
                 }
                 let mut text = String::new();
                 if let Some(ranges) = args[1].as_array() {
                     for range in ranges {
                         let node = range[0].as_u64().context("Expected selection node")? as usize;
                         ensure!(node < doc.nodes.len(), "Invalid selection node");
-                        if computed.user_select[node].0 == style::UserSelect::None {
+                        if computed.user_select[node].0 == style::UserSelect::None
+                            || state.inert(node)
+                        {
                             continue;
                         }
                         let value = &doc.nodes[node].text;
@@ -2787,7 +2856,8 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
         state.bounds.reserve(id);
         unsafe {
             let flags = state.bounds.flags(id);
-            *flags = (*flags & (MIRROR_BOUNDS | MIRROR_SCROLLER | MIRROR_HIDDEN)) | bits;
+            *flags =
+                (*flags & (MIRROR_BOUNDS | MIRROR_SCROLLER | MIRROR_HIDDEN | MIRROR_INERT)) | bits;
         }
     }
 }
@@ -2824,12 +2894,13 @@ pub(crate) fn hit_test(
             .parent
             .or_else(|| state.hosts.get(&id).copied())
     };
+    // WARNING: a box leaving the top layer still paints there, and takes hits there while the cascade shows it.
     let top: Vec<usize> = state
         .top_layer
         .iter()
         .copied()
         .filter(|&id| {
-            doc.nodes[id].state & TOP_LAYER != 0
+            doc.nodes[id].state & (TOP_LAYER | LEAVING) != 0
                 && doc.nodes[id].tag != "html"
                 && std::iter::successors(Some(id), |&id| up(id)).all(|id| {
                     computed
@@ -2849,13 +2920,15 @@ pub(crate) fn hit_test(
             continue;
         }
         let node = &doc.nodes[id];
-        // WARNING: the styles can be older than the tree, from the last frame.
+        // WARNING: the styles can be older than the tree, from the last frame. Every box inside an inert one is
+        // inert too, but top layer boxes, which start their own walk.
         let Some(style) = computed.values.get(id) else {
             continue;
         };
-        if style
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| value == "none")
+        if state.inert(id)
+            || style
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| value == "none")
         {
             continue;
         }
@@ -2931,13 +3004,15 @@ pub(crate) fn hit_test(
         }) {
             break;
         }
-        if computed.backdrops.get(&id).is_some_and(|backdrop| {
-            backdrop.get(Prop::POINTER_EVENTS) != Some("none")
-                && backdrop
-                    .get(Prop::VISIBILITY)
-                    .is_none_or(|value| value == "visible")
-                && backdrop.get(Prop::DISPLAY) != Some("none")
-        }) && x >= 0.
+        if !state.inert(id)
+            && computed.backdrops.get(&id).is_some_and(|backdrop| {
+                backdrop.get(Prop::POINTER_EVENTS) != Some("none")
+                    && backdrop
+                        .get(Prop::VISIBILITY)
+                        .is_none_or(|value| value == "visible")
+                    && backdrop.get(Prop::DISPLAY) != Some("none")
+            })
+            && x >= 0.
             && y >= 0.
             && x < viewport[0]
             && y < viewport[1]
@@ -3015,29 +3090,66 @@ pub(crate) fn styles(
     }
     if state.shadow_walk.tree != doc.nodes.tree() || state.shadow_walk.count != state.shadows.len()
     {
-        let mut hosts = Vec::new();
-        let mut pending = if state.shadows.is_empty() {
-            vec![]
-        } else {
-            vec![0]
-        };
-        while let Some(id) = pending.pop() {
-            if let Some(&root) = state.shadows.get(&id) {
-                hosts.push(id);
-                pending.push(root);
-            }
-            pending.extend(&doc.nodes[id].children);
+        let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
+        let assigned: rustc_hash::FxHashSet<usize> = slots.values().flatten().copied().collect();
+        let mut composed = rustc_hash::FxHashMap::default();
+        for (&host, &root) in &state.shadows {
+            composed.insert(
+                host,
+                std::iter::once(root)
+                    .chain(
+                        doc.nodes[host]
+                            .children
+                            .iter()
+                            .copied()
+                            .filter(|child| !assigned.contains(child)),
+                    )
+                    .collect(),
+            );
         }
+        for (&slot, nodes) in &slots {
+            if !nodes.is_empty() {
+                composed.insert(
+                    slot,
+                    nodes
+                        .iter()
+                        .chain(&doc.nodes[slot].children)
+                        .copied()
+                        .collect(),
+                );
+            }
+        }
+        let old = &state.shadow_walk.shadows.hosts;
+        let hosts = if old.len() == state.hosts.len()
+            && state
+                .hosts
+                .iter()
+                .all(|(root, host)| old.get(root) == Some(host))
+        {
+            old.clone()
+        } else {
+            Rc::new(
+                state
+                    .hosts
+                    .iter()
+                    .map(|(&root, &host)| (root, host))
+                    .collect(),
+            )
+        };
         state.shadow_walk = Rc::new(ShadowWalk {
             tree: doc.nodes.tree(),
             count: state.shadows.len(),
-            hosts,
-            slots: slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root))),
+            slots,
+            shadows: Rc::new(style::Shadows {
+                roots: state.shadows.clone(),
+                hosts,
+                composed,
+            }),
         });
     }
     let shadow_walk = state.shadow_walk.clone();
-    let slots = &shadow_walk.slots;
     let mut context = style::StyleContext {
+        shadows: shadow_walk.shadows.clone(),
         reduced_motion,
         theme,
         scale: scale.unwrap_or(1.),
@@ -3050,26 +3162,7 @@ pub(crate) fn styles(
             .collect(),
         previous: state.computed.clone().or_else(|| state.previous.take()),
         top_layer: !state.top_layer.is_empty(),
-        incremental: state.shadows.is_empty(),
-        ..Default::default()
     };
-    if !state.shadows.is_empty() {
-        let mut required = rustc_hash::FxHashSet::from_iter([0]);
-        for &node in slots
-            .keys()
-            .chain(state.shadows.keys())
-            .chain(state.shadows.values())
-        {
-            let mut current = Some(node);
-            while let Some(node) = current {
-                if !required.insert(node) {
-                    break;
-                }
-                current = doc.nodes[node].parent;
-            }
-        }
-        context.required = Some(required);
-    }
     let mut result = style::compute_styles(
         doc,
         viewport[0],
@@ -3079,184 +3172,6 @@ pub(crate) fn styles(
         &mut state.style_cache,
         Some(&context),
     );
-    // WARNING: the first pass computes only hosts, roots, slots and their ancestors to collect `:host` declarations and slot styles; pass 1 recomputes every node with them.
-    // WARNING: each shadow tree cascades with its root swapped in as the document, which stamps both nodes, so
-    // their revisions go back afterwards: the style pass changed no node, and kept boxes compare revisions.
-    let (latest, tree) = (doc.nodes.latest(), doc.nodes.tree());
-    let swapped: Vec<(usize, u64)> = std::iter::once(0)
-        .chain(state.shadows.values().copied())
-        .map(|id| (id, doc.nodes.revision(id)))
-        .collect();
-    for pass in 0..if state.shadows.is_empty() { 0 } else { 2 } {
-        if pass == 1 {
-            context.required = None;
-            result.pseudos.clear();
-            result.text_pseudos.clear();
-            result.backdrops.clear();
-            result.scrollbars.clear();
-            result.selections.clear();
-            result.animations.clear();
-            result.slotted.clear();
-            result.parts.clear();
-            result.starting.clear();
-            style::cascade(
-                doc,
-                viewport,
-                system,
-                &mut state.sheets,
-                &mut state.style_cache,
-                Some(&context),
-                &mut result,
-            );
-        }
-        context.parts.clear();
-        for &id in &shadow_walk.hosts {
-            if let Some(&root) = state.shadows.get(&id) {
-                if let Some(rules) = result.parts.get(&id).cloned() {
-                    let mut batch: HashMap<usize, Vec<_>> = HashMap::new();
-                    type Exported = Option<Rc<HashMap<String, String>>>;
-                    let mut stack: Vec<(usize, Exported)> = vec![(root, None)];
-                    while let Some((node, mapping)) = stack.pop() {
-                        let names: Vec<String> = doc.nodes[node]
-                            .attrs
-                            .get("part")
-                            .into_iter()
-                            .flat_map(|names| names.split_ascii_whitespace())
-                            .filter_map(|name| match &mapping {
-                                Some(mapping) => mapping.get(name).cloned(),
-                                None => Some(name.to_owned()),
-                            })
-                            .collect();
-                        for (name, declarations) in rules.iter() {
-                            if names.iter().any(|part| **part == **name) {
-                                batch
-                                    .entry(node)
-                                    .or_default()
-                                    .extend(declarations.iter().cloned());
-                            }
-                        }
-                        stack.extend(
-                            doc.nodes[node]
-                                .children
-                                .iter()
-                                .map(|&child| (child, mapping.clone())),
-                        );
-                        if let (Some(&inner), Some(exported)) = (
-                            state.shadows.get(&node),
-                            doc.nodes[node].attrs.get("exportparts"),
-                        ) {
-                            let exported: HashMap<String, String> = exported
-                                .split(',')
-                                .filter_map(|item| {
-                                    let (inner, outer) =
-                                        item.split_once(':').unwrap_or((item, item));
-                                    let outer = outer.trim();
-                                    let outer = match &mapping {
-                                        Some(mapping) => mapping.get(outer)?.clone(),
-                                        None => outer.to_owned(),
-                                    };
-                                    Some((inner.trim().to_owned(), outer))
-                                })
-                                .collect();
-                            stack.push((inner, Some(Rc::new(exported))));
-                        }
-                    }
-                    for (node, declarations) in batch {
-                        context
-                            .parts
-                            .entry(node)
-                            .or_default()
-                            .splice(0..0, declarations);
-                    }
-                }
-                let mut scoped_root = doc.nodes[root].clone();
-                scoped_root.parent = Some(0);
-                scoped_root.tag = "apps-shadow-root".into();
-                scoped_root.attrs = doc.nodes[id].attrs.clone();
-                scoped_root.inline = None;
-                scoped_root.attrs.remove("style");
-                scoped_root.state = doc.nodes[id].state;
-                let host = (
-                    result.values[id].clone(),
-                    result.lengths[id],
-                    result.vars[id].clone(),
-                );
-                if pass == 0 {
-                    context.inherited.insert(root, host);
-                } else {
-                    context.roots.insert(root, host);
-                }
-                let scoped_doc = Node {
-                    tag: "#document".into(),
-                    children: vec![root],
-                    ..Default::default()
-                };
-                let document = doc.nodes.swap(0, scoped_doc);
-                let shadow = doc.nodes.swap(root, scoped_root);
-                let top = (
-                    result.values[0].clone(),
-                    result.lengths[0],
-                    result.flags[0],
-                    result.vars[0].clone(),
-                );
-                style::cascade(
-                    doc,
-                    viewport,
-                    system,
-                    &mut state.sheets,
-                    &mut state.style_cache,
-                    Some(&context),
-                    &mut result,
-                );
-                let lengths;
-                (result.values[0], lengths, result.flags[0], result.vars[0]) = top;
-                result.lengths.set(0, lengths);
-                doc.nodes.swap(0, document);
-                doc.nodes.swap(root, shadow);
-                if pass == 0 {
-                    context
-                        .hosts
-                        .insert(id, std::mem::take(&mut result.host_declarations));
-                }
-            }
-        }
-        if pass == 0 {
-            for (&slot, assigned) in slots {
-                for &child in assigned {
-                    context.inherited.insert(
-                        child,
-                        (
-                            result.values[slot].clone(),
-                            result.lengths[slot],
-                            result.vars[slot].clone(),
-                        ),
-                    );
-                }
-                let Some(rules) = result.slotted.get(&slot).cloned() else {
-                    continue;
-                };
-                for (compound, declarations) in rules.iter() {
-                    let selectors = Selector::parse(compound, None);
-                    for &child in assigned {
-                        if selectors
-                            .iter()
-                            .any(|selector| selector.matches(doc, child))
-                        {
-                            context
-                                .slotted
-                                .entry(child)
-                                .or_default()
-                                .extend(declarations.iter().cloned());
-                        }
-                    }
-                }
-            }
-            for declarations in context.slotted.values_mut() {
-                declarations.sort_by_key(|(_, _, important)| *important);
-            }
-        }
-    }
-    doc.nodes.restore(&swapped, latest, tree);
     state.style_cache.finish();
     state.sheets.retain(|text, _| Rc::strong_count(text) > 1);
     for (&host, &root) in &state.shadows {
@@ -3264,7 +3179,7 @@ pub(crate) fn styles(
             .children
             .insert(host, doc.nodes[root].children.clone());
     }
-    for (&slot, assigned) in slots {
+    for (&slot, assigned) in &shadow_walk.slots {
         if !assigned.is_empty() {
             result.children.insert(slot, assigned.clone());
         }
@@ -3274,44 +3189,63 @@ pub(crate) fn styles(
         .update(doc, &result.children, state.style_cache.document_walk())
     {
         state.editable.clear();
-        state.editable.extend(
-            state
-                .style_walk
-                .nodes
-                .iter()
-                .map(|&(id, _)| id as usize)
-                .filter(|&id| {
-                    let node = &doc.nodes[id];
-                    matches!(node.tag.as_str(), "input" | "textarea")
-                        || node.attrs.get("contenteditable").is_some_and(|value| {
-                            matches!(
-                                value.to_ascii_lowercase().as_str(),
-                                "" | "true" | "plaintext-only"
-                            )
-                        })
-                }),
-        );
+        state.inert.clear();
+        for &(id, _) in state.style_walk.nodes.iter() {
+            let node = &doc.nodes[id as usize];
+            if node.attrs.contains_key("inert") {
+                state.inert.push(id as usize);
+            }
+            if matches!(node.tag.as_str(), "input" | "textarea")
+                || node.attrs.get("contenteditable").is_some_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "" | "true" | "plaintext-only"
+                    )
+                })
+            {
+                state.editable.push(id as usize);
+            }
+        }
     }
-    const HIDDEN: u8 = 1;
-    const EDITABLE: u8 = 2;
+    // WARNING: like HTML's "blocked by a modal dialog", the topmost modal dialog, or else the fullscreen element,
+    // makes every node but its flat tree descendants inert. It escapes `inert` ancestors, as in Chromium.
+    let subject = [MODAL, FULLSCREEN].into_iter().find_map(|bit| {
+        state
+            .top_layer
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| doc.nodes.get(id).is_some_and(|node| node.state & bit != 0))
+    });
     let marks = &mut state.select_marks;
     marks.clear();
     marks.resize(doc.nodes.len(), 0);
     for &id in &state.editable {
         marks[id] = EDITABLE;
     }
+    for &id in &state.inert {
+        marks[id] |= INERT;
+    }
+    state.bounds.reserve(doc.nodes.len().saturating_sub(1));
     for &(id, parent) in state.style_walk.nodes.iter() {
         let id = id as usize;
-        let (inherited, hidden) = match parent {
-            u32::MAX => ((style::UserSelect::Text, 0), false),
+        let (inherited, hidden, inert) = match parent {
+            u32::MAX => ((style::UserSelect::Text, 0), false, false),
             parent => (
                 result.user_select[parent as usize],
                 marks[parent as usize] & HIDDEN != 0,
+                Some(id) != subject
+                    && (parent == 0 && subject.is_some() || marks[parent as usize] & INERT != 0),
             ),
         };
         let flags = result.flags[id];
         let hidden = hidden || flags & style::DISPLAY_NONE != 0;
-        marks[id] |= u8::from(hidden) * HIDDEN;
+        let inert = inert || marks[id] & INERT != 0;
+        marks[id] |= u8::from(hidden) * HIDDEN | u8::from(inert) * INERT;
+        unsafe {
+            let mirror = state.bounds.flags(id);
+            *mirror = *mirror & !MIRROR_INERT | u8::from(hidden || inert) * MIRROR_INERT;
+        }
         let mode = if hidden || flags & style::INVISIBLE != 0 {
             style::UserSelect::None
         } else if marks[id] & EDITABLE != 0 {
@@ -3332,11 +3266,17 @@ pub(crate) fn styles(
         .iter()
         .any(|flags| flags & style::DISPLAY_CONTENTS != 0)
     {
+        let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
+        let mut parents = vec![false; doc.nodes.len()];
+        for &(id, parent) in state.style_walk.nodes.iter() {
+            if parent != u32::MAX && contents(id as usize) {
+                parents[parent as usize] = true;
+            }
+        }
         for &(id, _) in state.style_walk.nodes.iter().rev() {
             let id = id as usize;
-            let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
-            let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
-            if children.iter().any(|&child| contents(child)) {
+            if parents[id] {
+                let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
                 let mut flattened = Vec::new();
                 for &child in children {
                     if contents(child) {
@@ -3455,6 +3395,30 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sf_symbol_names_require_nonempty_ascii_segments() {
+        for (tag, expected) in [
+            ("sf-symbol-folder", Some("folder")),
+            ("sf-symbol-square-and-arrow-up", Some("square-and-arrow-up")),
+            ("sf-symbol-4k-tv", Some("4k-tv")),
+            ("sf-symbol-arrow_uturn-right", Some("arrow_uturn-right")),
+            ("sf-symbol-", None),
+            ("sf-symbol--folder", None),
+            ("sf-symbol-folder-", None),
+            ("sf-symbol-folder--fill", None),
+            ("sf-symbol-folder.fill", None),
+            ("sf-symbol-étoile", None),
+            ("sf-icon-folder", None),
+            ("span", None),
+        ] {
+            let node = super::Node {
+                tag: tag.into(),
+                ..Default::default()
+            };
+            assert_eq!(node.sf_symbol(), expected, "{tag}");
+        }
+    }
+
     #[test]
     fn offsets_map_through_collapsed_white_space() {
         let (source, shown) = ("  a  b\n c ", "a b c");
@@ -3881,6 +3845,123 @@ mod tests {
     }
 
     #[test]
+    fn incremental_styles_match_full_passes_in_shadow_trees() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    "<html><head><style>
+                    :root{--ink:navy} x-card.big{font-size:20px} x-card::part(title){color:green}
+                    x-card.alt::part(title){color:olive} x-card::part(deep){padding-left:3px}
+                    #b{margin-top:1px} .late{color:maroon}
+                    </style></head><body><x-card id=card class=c><span id=a class=on>a<s id=s></s></span>
+                    <b id=b slot=side>b</b><i id=i>i</i></x-card><x-card id=other></x-card>
+                    <x-card id=third></x-card><div id=late class=late><p id=lp>late</p></div></body></html>",
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let card = host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").is_some_and(|id| id == "card"))
+            .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!(r#"
+                for (const id of ['card','a','b','i','other','third','late']) globalThis[id] = document.getElementById(id);
+                globalThis.root = card.attachShadow({{mode:'open'}});
+                root.innerHTML = '<style>:host{{display:block;color:var(--ink)}} :host(.on){{border-top:1px solid red}} :host(:hover){{color:orange}} ::slotted(.on){{color:red}} slot[name=side]::slotted(*){{padding-top:2px}} .t{{font-weight:700;font-size:2em}} slot{{color:var(--tone,inherit)}} slot.wide::slotted(*){{padding-left:9px}} :host(:has(> .flag)){{padding-right:2px}} ::slotted(:first-child){{padding-bottom:4px}} ::slotted(:has(> .mark)){{padding-right:5px}}</style><h1 part=title class=t id=t>t</h1><slot id=main></slot><slot name=side id=side>fallback</slot><x-inner id=inner exportparts="core: deep"></x-inner>';
+                globalThis.inner = root.getElementById('inner').attachShadow({{mode:'open'}});
+                inner.innerHTML = '<style>:host{{display:block}} b{{color:var(--ink)}}</style><b part=core id=core>c</b>';
+                globalThis.sheet = new CSSStyleSheet();
+                sheet.replaceSync(':host{{margin-left:4px}} p{{color:teal}}');
+                for (const host of [other, third]) {{ const shadow = host.attachShadow({{mode:'open'}}); shadow.adoptedStyleSheets = [sheet]; shadow.innerHTML = '<p>o</p>'; }}
+                {read}"#), "test")
+            .unwrap();
+        let mut full = Vec::new();
+        for step in [
+            "card.classList.add('on')",
+            "card.classList.add('alt')",
+            "card.classList.add('big')",
+            "document.documentElement.style.setProperty('--ink','purple')",
+            "card.style.setProperty('--ink','teal')",
+            "card.style.setProperty('--tone','gray')",
+            "a.classList.remove('on')",
+            "a.classList.add('on')",
+            "root.getElementById('main').classList.add('wide')",
+            "root.getElementById('main').classList.remove('wide')",
+            "a.classList.add('flag')",
+            "a.classList.remove('flag')",
+            "card.prepend(document.createElement('u'))",
+            "document.getElementById('s').classList.add('mark')",
+            "document.getElementById('s').classList.remove('mark')",
+            "b.slot=''",
+            "b.slot='side'",
+            "root.getElementById('side').setAttribute('name','none')",
+            "root.getElementById('side').setAttribute('name','side')",
+            "root.getElementById('t').setAttribute('part','other')",
+            "root.getElementById('t').setAttribute('part','title')",
+            "root.getElementById('inner').setAttribute('exportparts','core')",
+            "root.getElementById('inner').setAttribute('exportparts','core: deep')",
+            "inner.getElementById('core').classList.add('x')",
+            "card.append(document.createElement('em'))",
+            "root.append(document.createElement('div'))",
+            "i.remove()",
+            "card.prepend(i)",
+            "other.remove()",
+            "document.body.append(other)",
+            "late.attachShadow({mode:'open'}).adoptedStyleSheets=[sheet]",
+            "late.shadowRoot.innerHTML='<slot></slot><p>s</p>'",
+            "third.remove()",
+            "card.classList.remove('big')",
+            "card.classList.remove('on')",
+            "sheet.replaceSync(':host{margin-left:5px} p{color:red}')",
+            "card.classList.add('on')",
+        ] {
+            let before = host.borrow().dom[&1].style_cache.incremental;
+            engine.eval(&format!("{step};{read}"), "test").unwrap();
+            if host.borrow().dom[&1].style_cache.incremental == before {
+                full.push(step);
+            }
+        }
+        for ids in [vec![card], vec![]] {
+            host.borrow_mut()
+                .call(Role::Renderer(1), "dom.hover", json!([ids]))
+                .unwrap();
+            engine.eval(read, "test").unwrap();
+        }
+        assert_eq!(
+            full,
+            ["sheet.replaceSync(':host{margin-left:5px} p{color:red}')"]
+        );
+        let colors = engine
+            .eval(
+                "JSON.stringify([getComputedStyle(card).color, getComputedStyle(a).color, getComputedStyle(root.getElementById('t')).color, getComputedStyle(inner.getElementById('core')).paddingLeft, getComputedStyle(late.shadowRoot.querySelector('p')).color])",
+                "test",
+            )
+            .unwrap();
+        assert_eq!(
+            colors,
+            r#"["rgb(0, 128, 128)","rgb(255, 0, 0)","rgb(128, 128, 0)","3px","rgb(255, 0, 0)"]"#
+        );
+    }
+
+    #[test]
     fn runtime_stylesheets_reuse_parses_and_evict_old_text() {
         let mut doc = Document::parse(
             &(0..200)
@@ -3940,6 +4021,37 @@ mod tests {
         let fresh = styles(&mut doc, &mut State::default(), viewport, None);
         assert_eq!(returned.values[p], fresh.values[p]);
         assert_eq!(returned.values[p].get(Prop::COLOR), Some("red"));
+    }
+
+    #[test]
+    fn new_nodes_grow_cached_styles_like_a_full_pass() {
+        let mut doc = Document::parse("<p style='font-size:30px;--x:1'>a</p>");
+        let mut state = State::default();
+        let viewport = [800., 600.];
+        styles(&mut doc, &mut state, viewport, None);
+        let id = state.allocate(
+            &mut doc,
+            Node {
+                tag: "div".into(),
+                ..Default::default()
+            },
+        );
+        let read = |doc: &mut Document, state: &mut State| {
+            call("dom.computed", &json!([id, "color", ""]), doc, state, viewport)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(read(&mut doc, &mut state), json!(""));
+        let cached = styles(&mut doc, &mut state, viewport, None);
+        let fresh = styles(&mut doc, &mut State::default(), viewport, None);
+        assert_eq!(cached.vars.len(), doc.nodes.len());
+        for node in 0..doc.nodes.len() {
+            assert!(cached.lengths[node] == fresh.lengths[node], "{node}");
+        }
+        let p = (0..doc.nodes.len()).find(|&node| doc.nodes[node].tag == "p").unwrap();
+        doc.nodes[p].attrs.insert("class".into(), "x".into());
+        state.invalidate();
+        styles(&mut doc, &mut state, viewport, None);
     }
 
     #[test]

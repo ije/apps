@@ -1,7 +1,7 @@
 use crate::style::Prop;
 use crate::{dom::Document, style};
 use renderer::{Child, px};
-use std::{collections::HashMap, rc::Rc};
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 pub(crate) const UNCULLABLE: u16 = 1;
 pub(crate) const CHANGED: u16 = 2;
@@ -15,11 +15,9 @@ pub(crate) const CHILDREN_CHANGED: u16 = 256;
 pub(crate) const READS_VIEWPORT: u16 = 512;
 pub(crate) const COMPOSITED: u16 = 1024;
 pub(crate) const TRANSFORMED: u16 = 2048;
-pub(crate) const ALWAYS_REBUILT: u16 = 4096;
 pub(crate) const ANIMATED: u16 = 8192;
 pub(crate) const READS_LAST_FRAME: u16 = 16384;
 pub(crate) const READS_HEIGHT: u16 = 32768;
-pub(crate) const INPUT: u16 = 1;
 
 pub(crate) fn reads_height(style: &style::Style) -> bool {
     [
@@ -69,9 +67,11 @@ pub(crate) struct Cull {
     /// Nodes whose info holds paint animation flags from a frame since the last info pass.
     pub(crate) painted: Vec<usize>,
     pub(crate) cells: Vec<usize>,
-    pub(crate) inputs: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
     pub(crate) subtrees: Subtrees,
+    // WARNING: how far each scroll handle moved since the last frame. Culling reads last frame's rects, which lie that
+    // far from where their boxes are now.
+    pub(crate) scrolled: rustc_hash::FxHashMap<usize, f32>,
 }
 
 pub(crate) type Subtrees = (u64, rustc_hash::FxHashMap<usize, Vec<usize>>);
@@ -207,9 +207,12 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
-    // WARNING: a form control's value and checked state draw like its text.
-    node.value.hash(&mut shape);
-    (node.state & (crate::dom::CHECKED | crate::dom::DIRTY)).hash(&mut shape);
+    // WARNING: a form control's value and checked state draw like its text, and a failed image draws its alt text. A
+    // text field's value only fills the box, so a new one builds the field again in place, see `element::Patch`.
+    if !super::element::text_field(node) {
+        node.value.hash(&mut shape);
+    }
+    (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
     let mut own = shape.finish();
     let mut attrs = rustc_hash::FxHasher::default();
     for pair in node.attrs.iter() {
@@ -274,15 +277,6 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         ]
         .into_iter()
         .any(|name| style.get(name).is_some_and(|value| value.contains('%')));
-    // WARNING: scroll boxes build their bars from the scroll state, which changes without a new revision.
-    let volatile = display != "none"
-        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-            .into_iter()
-            .any(|prop| {
-                style
-                    .get(prop)
-                    .is_some_and(|value| matches!(value, "scroll" | "auto"))
-            });
     let framed = !matches!(
         display,
         "block"
@@ -321,7 +315,6 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
     [
         (moved, MOVES_CONTENT),
         (blocked, UNCULLABLE),
-        (volatile, ALWAYS_REBUILT),
         (framed, READS_LAST_FRAME),
         (
             display == "none" || matches!(position, "absolute" | "fixed"),
@@ -519,9 +512,12 @@ pub(super) fn shift(
     }
 }
 
+// WARNING: `path` is the box that culled and the boxes it was built in. A subtree that culled is kept with its spacers,
+// so a spacer that comes into view, or near it after it moved, drops the records along `path`, and the next pass
+// culls again from where the boxes are then.
 pub(super) fn spacer(
     run: Run,
-    parent: usize,
+    path: Rc<[usize]>,
     [left, width]: [f32; 2],
     zone: Rc<Zone>,
     view: Rc<super::PageState>,
@@ -534,6 +530,8 @@ pub(super) fn spacer(
         margins,
         watch,
     } = run;
+    let parent = path.last().copied().unwrap_or_default();
+    let (first, last) = (Cell::new(None), Cell::new([left, top]));
     renderer::canvas(
         move |bounds, window| {
             let view = &*view;
@@ -559,21 +557,25 @@ pub(super) fn spacer(
                     .get(id)
                     .is_none_or(|placed| (placed.1[0] - width).abs() > 0.01)
             });
-            if resized || reflowed || y < high && y + height > low {
-                // WARNING: a kept subtree keeps this spacer and its old width, so asking for a frame alone would
-                // repeat this in every frame, forever. The next frame builds the path down to it again.
-                if let Some(page) = host.pages.get(&view.id) {
-                    let mut kept = view.kept.borrow_mut();
-                    let mut node = Some(parent);
-                    while let Some(id) = node {
-                        kept.remove(&id);
-                        node = page.doc.nodes[id].parent;
-                    }
+            let at = [x.unwrap_or(left), y];
+            let moved = first.get().is_some_and(|first| first != at);
+            first.set(first.get().or(Some(at)));
+            let near = f32::from(window.viewport_size().height) / 2.;
+            let shown = resized || reflowed || y < high && y + height > low;
+            if shown || moved && y < high + near && y + height > low - near {
+                let mut kept = view.kept.borrow_mut();
+                for id in path.iter() {
+                    kept.remove(id);
                 }
                 dom.cull.off |= resized || reflowed;
-                window.redraw();
+                if shown {
+                    window.redraw();
+                } else {
+                    window.request_animation_frame();
+                }
             }
-            let delta = [x.unwrap_or(left) - left, y - top];
+            let delta = [at[0] - last.get()[0], at[1] - last.get()[1]];
+            last.set(at);
             if delta != [0., 0.]
                 && let Some(page) = host.pages.get(&view.id)
             {
@@ -599,9 +601,11 @@ pub(super) fn spacer(
 
 pub(super) fn anchor(
     items: Vec<(usize, [f32; 4])>,
+    path: Rc<[usize]>,
     zone: Rc<Zone>,
     view: Rc<super::PageState>,
 ) -> Child {
+    let first = Cell::new(None);
     renderer::canvas(
         move |bounds, window| {
             let view = &*view;
@@ -613,11 +617,14 @@ pub(super) fn anchor(
             };
             let [low, high] = zone.visible(&dom.bounds, window);
             let [left, top] = [f32::from(bounds.left()), f32::from(bounds.top())];
+            let moved = first.get().is_some_and(|first| first != [left, top]);
+            first.set(first.get().or(Some([left, top])));
+            let near = f32::from(window.viewport_size().height) / 2.;
+            let (mut shown, mut close) = (false, false);
             for &(id, [x, y, _, height]) in &items {
                 let [x, y] = [left + x, top + y];
-                if y < high && y + height > low {
-                    window.redraw();
-                }
+                shown |= y < high && y + height > low;
+                close |= y < high + near && y + height > low - near;
                 if let Some(&[old_x, old_y, ..]) = dom.bounds.get(&id)
                     && [old_x, old_y] != [x, y]
                 {
@@ -629,6 +636,17 @@ pub(super) fn anchor(
                         &[id],
                         [x - old_x, y - old_y],
                     );
+                }
+            }
+            if shown || moved && close {
+                let mut kept = view.kept.borrow_mut();
+                for id in path.iter() {
+                    kept.remove(id);
+                }
+                if shown {
+                    window.redraw();
+                } else {
+                    window.request_animation_frame();
                 }
             }
         },
@@ -715,11 +733,7 @@ mod tests {
             ("u", PLAIN_BLOCK),
             ("v", PLAIN_BLOCK),
         ] {
-            assert_eq!(
-                flags(name) & !(ALWAYS_REBUILT | READS_LAST_FRAME),
-                expected,
-                "{name}"
-            );
+            assert_eq!(flags(name) & !READS_LAST_FRAME, expected, "{name}");
         }
         for (name, framed) in [
             ("a", false),
@@ -735,8 +749,6 @@ mod tests {
         ] {
             assert_eq!(flags(name) & READS_LAST_FRAME != 0, framed, "{name}");
         }
-        assert_eq!(flags("y") & ALWAYS_REBUILT, ALWAYS_REBUILT);
-        assert_eq!(flags("a") & ALWAYS_REBUILT, 0);
     }
 
     #[test]
@@ -808,6 +820,23 @@ mod tests {
         assert_eq!(content(&doc.nodes[id]), cosmetic);
         doc.nodes[id].value = Some("v".into());
         assert_ne!(content(&doc.nodes[id]).0, start.0);
+        let (doc, ..) = page("<input id=f><input id=r type=range>");
+        for (index, kind) in [(0, false), (1, true)] {
+            let mut node = doc
+                .nodes
+                .iter()
+                .filter(|node| node.tag == "input")
+                .nth(index)
+                .unwrap()
+                .clone();
+            let old = content(&node);
+            node.value = Some("5".into());
+            assert_eq!(
+                content(&node) != old,
+                kind,
+                "only controls that draw their value resize with it"
+            );
+        }
     }
 
     #[test]

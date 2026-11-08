@@ -33,8 +33,8 @@ pub(crate) struct View {
     pub(crate) title: Option<String>,
     pub(crate) preload: Option<Rc<JsContext>>,
     pub(crate) renderer: Option<Rc<JsContext>>,
-    pub(crate) input: bool,
     fullscreen: Option<[bool; 2]>,
+    focused: bool,
 }
 
 pub struct Desktop {
@@ -404,7 +404,8 @@ impl Desktop {
                                         WindowChange::Focusable(false),
                                     ),
                                     (
-                                        vibrancy.is_some(),
+                                        vibrancy.is_some()
+                                            || options["visualEffectState"].as_i64().unwrap_or(0) != 0,
                                         WindowChange::Vibrancy(
                                             vibrancy.map(|material| material as isize),
                                             options["visualEffectState"].as_i64().unwrap_or(0)
@@ -439,8 +440,8 @@ impl Desktop {
                                 title: None,
                                 preload: None,
                                 renderer: None,
-                                input: false,
                                 fullscreen: None,
+                                focused: true,
                             },
                         );
                         if let Some(state) = baseline {
@@ -589,6 +590,7 @@ impl Desktop {
                             .insert(id, Page { doc, dirty: true });
                         self.host.borrow_mut().dom.remove(&id);
                         let view = self.views.get_mut(&id).context("Window is closed")?;
+                        view.focused = true;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                             cx.update_window(handle, |window, _| {
                                 let mut host = self.host.borrow_mut();
@@ -596,6 +598,8 @@ impl Desktop {
                                 state.text_system = Some(window.text_system().clone());
                                 state.pixel_ratio = window.scale_factor();
                                 state.window = window.window_state();
+                                // WARNING: like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
+                                view.focused = window.is_window_active() || mcp::enabled();
                             });
                         }
                         view.preload = None;
@@ -631,6 +635,12 @@ impl Desktop {
                             &format!("__appsSetLocation({})", serde_json::json!(location)),
                             "apps:location",
                         )?;
+                        if !view.focused {
+                            renderer.eval(
+                                "__appsDispatch('window:blur',[],{quiet:true})",
+                                "apps:blur",
+                            )?;
+                        }
                         self.host.borrow_mut().dom.entry(id).or_default().base =
                             url::Url::parse(&location).ok();
                         renderer.eval("__appsSyncBridge()", "apps:bridge")?;
@@ -699,11 +709,6 @@ impl Desktop {
                         let event = serde_json::json!({"request":request,"url":location});
                         self.link
                             .event(format!("__appsEvent('loaded',{id},{event})"), "apps:loaded");
-                    }
-                    "input" => {
-                        if let Some(view) = self.views.get_mut(&id) {
-                            view.input = args[2] == true;
-                        }
                     }
                     "deliver" => {
                         let name = match args[2].as_str() {
@@ -1027,6 +1032,22 @@ impl Desktop {
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
                 };
+                let focused = state["focused"] == true || mcp::enabled();
+                if view.focused != focused
+                    && let Some(renderer) = &view.renderer
+                {
+                    view.focused = focused;
+                    let script = if focused {
+                        "__appsDispatch('window:focus',[])"
+                    } else {
+                        "__appsDispatch('window:blur',[])"
+                    };
+                    if let Err(error) =
+                        crate::render::scripted(cx, None, || renderer.eval(script, "apps:focus"))
+                    {
+                        eprintln!("apps: {error}");
+                    }
+                }
                 match &mut view.fullscreen {
                     Some([_, seen]) if state["fullscreen"] == true => *seen = true,
                     Some([_, true]) => {
@@ -1371,6 +1392,11 @@ impl Desktop {
             let events = main.clone();
             renderer::native::on_window_event(move |window, event| {
                 events.window_event(window, event);
+            });
+            let keys = main.clone();
+            renderer::native::on_key(move |window, input, composing| {
+                keys.page(window)
+                    .is_some_and(|id| keys.before_input(id, input, composing))
             });
             let reopen = main.clone();
             renderer::native::on_reopen(move |visible| {
@@ -2638,15 +2664,27 @@ mod tests {
     }
 
     #[test]
-    fn keys_wait_for_main_only_while_it_listens() {
-        let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();globalThis.contents=win.webContents;globalThis.f=e=>e.preventDefault();win.load('<body></body>')})";
+    fn main_runs_before_input_event_only_while_it_listens() {
+        let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();globalThis.contents=win.webContents;globalThis.f=e=>e.preventDefault();globalThis.calls=0;const real=__appsBeforeInput;globalThis.__appsBeforeInput=(...args)=>(calls++,real(...args));win.load('<body></body>')})";
         let mut desktop = app(code, &[], std::path::PathBuf::new());
-        let mut input = |script: &str| {
+        let main = desktop.main.clone().unwrap();
+        let down = renderer::PlatformInput::KeyDown(renderer::KeyDownEvent::default());
+        let mut key = |script: &str| {
             desktop.js().eval(script, "test").unwrap();
             desktop.pump(None, None).unwrap();
-            desktop.views[&1].input
+            let prevented = main.before_input(1, &down, &|| false);
+            match desktop
+                .js()
+                .eval("[calls,calls=0][0]", "test")
+                .unwrap()
+                .as_str()
+            {
+                "0" => "skipped",
+                _ if prevented => "prevented",
+                _ => "passed",
+            }
         };
-        assert!(!input("contents.on('other',f)"));
+        assert_eq!(key("contents.on('other',f)"), "skipped");
         for method in [
             "on",
             "once",
@@ -2654,18 +2692,25 @@ mod tests {
             "prependListener",
             "prependOnceListener",
         ] {
-            assert!(
-                input(&format!("contents.{method}('before-input-event',f)")),
+            assert_eq!(
+                key(&format!("contents.{method}('before-input-event',f)")),
+                "prevented",
                 "{method}"
             );
-            assert!(!input("contents.off('before-input-event',f)"), "{method}");
+            assert_eq!(
+                key("contents.off('before-input-event',f)"),
+                "skipped",
+                "{method}"
+            );
         }
-        assert!(input("contents.on('before-input-event',f)"));
-        assert!(!input("contents.removeAllListeners('before-input-event')"));
-        assert!(input("contents.once('before-input-event',f)"));
-        assert!(!input(
-            "if(!__appsBeforeInput(1,{type:'keyDown'}))throw Error('not prevented')"
-        ));
+        assert_eq!(key("contents.on('before-input-event',()=>{})"), "passed");
+        assert_eq!(key("contents.on('before-input-event',f)"), "prevented");
+        assert_eq!(
+            key("contents.removeAllListeners('before-input-event')"),
+            "skipped"
+        );
+        assert_eq!(key("contents.once('before-input-event',f)"), "prevented");
+        assert_eq!(key(""), "skipped");
     }
 
     #[test]

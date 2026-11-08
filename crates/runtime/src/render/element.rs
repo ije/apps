@@ -11,11 +11,10 @@ use crate::{
     dom::Document,
     style::{self, ComputedStyles},
 };
-use renderer::{Bounds, Child, MouseButton, SharedString, img, point, px, relative, rgba, size};
+use renderer::{Bounds, Child, MouseButton, SharedString, point, px, relative, rgba, size};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 pub(super) struct Build<'a> {
-    pub(super) inputs: &'a rustc_hash::FxHashMap<usize, u64>,
     pub(super) doc: &'a Document,
     pub(super) styles: &'a ComputedStyles,
     pub(super) text: &'a renderer::TextSystem,
@@ -38,125 +37,527 @@ pub(super) struct Build<'a> {
     pub(super) culls: &'a std::cell::Cell<usize>,
     pub(super) resized: bool,
     pub(super) settled: bool,
+    pub(super) reads: &'a RefCell<Vec<Read>>,
+    // WARNING: moves when a node, a style, the focus, an animated value or the frame may have changed, so the page
+    // reads of a record checked in this epoch still hold.
+    pub(super) epoch: u64,
+    #[cfg(debug_assertions)]
+    pub(super) prints: &'a RefCell<Vec<u64>>,
+    #[cfg(debug_assertions)]
+    pub(super) checking: bool,
+    #[cfg(debug_assertions)]
+    pub(super) extra: std::cell::Cell<u64>,
+    #[cfg(debug_assertions)]
+    pub(super) plan: RefCell<Rc<[usize]>>,
+}
+
+// WARNING: a box is kept while its subtree revision and call are the same and every read its build made beyond them
+// gives what it gave then. A build reads other boxes, the host and the frame only through `Build::log`, or the box is
+// never kept, see `element`. The queries up to `Shrunk` replay at the box whose record holds them, the rest name
+// what they read.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Query {
+    Margins,
+    Parent(Prop),
+    ParentFont,
+    FlatParent,
+    FlatParentPadding,
+    StickyParent,
+    Break,
+    UserSelect,
+    Positioner(bool),
+    Backdrop,
+    Scroller,
+    Editable,
+    Shrunk,
+    Uses(u32),
+    Block(u32),
+    Scroll(u32),
+    Width(u32),
+    Track(u32, u8),
+    Baselines(u32),
+    Atom(u32),
+    Image(u32),
+    Look(u32),
+    Boxless(u32),
+    Value(u32),
+    Viewport,
+    Theme,
+}
+
+impl Query {
+    // WARNING: the last layout, scroll handles and the system theme change without a new node or style, so these are
+    // checked in every frame, the others only in a new epoch.
+    fn host(self) -> bool {
+        matches!(
+            self,
+            Query::Scroller
+                | Query::Block(_)
+                | Query::Scroll(_)
+                | Query::Width(_)
+                | Query::Track(..)
+                | Query::Baselines(_)
+                | Query::Atom(_)
+                | Query::Image(_)
+                | Query::Viewport
+                | Query::Theme
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct Read {
+    query: Query,
+    value: u64,
+    // WARNING: in the build log, `scope` is one more than the depth of the box whose subtree revision covers the read,
+    // 0 when none does, and `reader` is the depth of the box that read it. In a record, `scope` counts boxes up from
+    // the record's box and `reader` is 1 for reads of the boxes below it.
+    scope: u16,
+    reader: u16,
+}
+
+// WARNING: what a text field was last built with. Its value is in no revision, so when only the value changed, the
+// frame builds the field again from this in place, under its kept boxes, see `render_page`.
+pub(super) struct Patch {
+    pub(super) ancestors: Rc<[usize]>,
+    pub(super) containing: [f32; 2],
+    pub(super) container: [f32; 2],
+    pub(super) slot: Option<([f32; 4], super::grid::Grid)>,
+    pub(super) flex_parent: bool,
+    pub(super) perspective: Option<(f32, String)>,
+    pub(super) value: u64,
+}
+
+pub(super) struct Kept {
+    pub(super) call: Call,
+    pub(super) reads: Box<[Read]>,
+    epoch: std::cell::Cell<u64>,
+    pub(super) culled: bool,
+    #[cfg(debug_assertions)]
+    pub(super) print: u64,
+    // WARNING: the children that the box's build culled, which its debug check leaves out too.
+    #[cfg(debug_assertions)]
+    plan: Rc<[usize]>,
 }
 
 #[derive(PartialEq)]
-pub(super) struct Reuse {
+pub(super) struct Call {
     subtree: u64,
     containing: [f32; 2],
     container: [f32; 2],
     flex_parent: bool,
-    grid_parent: bool,
-    margin: [f32; 4],
-    scrolled: bool,
-    inputs: u64,
     cell: Option<([f32; 2], bool, bool, u64)>,
 }
 
-pub(super) fn own_inputs(
+#[derive(PartialEq)]
+enum Replay {
+    Same,
+    Close,
+    Changed,
+}
+
+pub(super) fn hashed(value: impl std::hash::Hash) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(value)
+}
+
+fn parent_style<'b>(
+    doc: &Document,
+    styles: &'b ComputedStyles,
+    id: usize,
+    prop: Prop,
+) -> Option<&'b str> {
+    doc.nodes[id]
+        .parent
+        .and_then(|parent| styles.values[parent].get(prop))
+}
+
+fn parent_font(
     doc: &Document,
     styles: &ComputedStyles,
-    dom: &crate::dom::State,
-    ids: &super::effects::Ids,
-    made: &mut rustc_hash::FxHashMap<*const style::Style, super::effects::Establishes>,
     id: usize,
-) -> u64 {
+) -> Option<([u32; 6], renderer::Font)> {
+    doc.nodes[id].parent.map(|parent| {
+        let font = styles.lengths[parent].font;
+        (
+            [font.em, font.ch, font.ex, font.cap, font.ic, font.lh].map(f32::to_bits),
+            style::font(&styles.values[parent]),
+        )
+    })
+}
+
+// WARNING: the nearest ancestor that makes a box, as `display: contents` makes none.
+fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usize> {
+    let mut parent = doc.nodes[id].parent;
+    while let Some(ancestor) = parent
+        && styles.values[ancestor]
+            .get(Prop::DISPLAY)
+            .is_some_and(|value| value == "contents")
+    {
+        parent = doc.nodes[ancestor].parent;
+    }
+    parent
+}
+
+fn padding_left(styles: &ComputedStyles, parent: usize, width: f32) -> f32 {
+    styles.lengths[parent].edges(&styles.values[parent], style::PADDING, width)[3].max(0.)
+}
+
+fn starts_line(doc: &Document, id: usize) -> bool {
+    doc.nodes[id].parent.is_none_or(|parent| {
+        let siblings = &doc.nodes[parent].children;
+        siblings[..siblings.iter().position(|&child| child == id).unwrap_or(0)]
+            .iter()
+            .rfind(|&&child| {
+                let node = &doc.nodes[child];
+                node.tag != "#comment" && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
+            })
+            .is_none_or(|&child| doc.nodes[child].tag == "br")
+    })
+}
+
+fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f32; 4] {
+    let (style, units) = (&styles.values[node], &styles.lengths[node]);
+    let padding = if padding {
+        units.edges(style, style::PADDING, width)
+    } else {
+        [0.; 4]
+    };
+    std::array::from_fn(|side| {
+        let [size, kind, _] = style::BORDERS[side];
+        padding[side]
+            + if style
+                .get(kind)
+                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+            {
+                0.
+            } else {
+                style
+                    .get(size)
+                    .map_or(Some(3.), |v| units.resolve(v, width))
+                    .unwrap_or(0.)
+                    .max(0.)
+            }
+    })
+}
+
+// WARNING: the nearest opaque background from the box up, and how many boxes up it is.
+fn backdrop(styles: &ComputedStyles, ancestors: &[usize], id: usize) -> Option<(usize, u32)> {
+    std::iter::once(id)
+        .chain(ancestors.iter().rev().copied())
+        .enumerate()
+        .find_map(|(up, node)| {
+            let (ink, alpha) = style::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
+            (alpha >= 128).then_some((up, ink))
+        })
+}
+
+// WARNING: native controls draw these node states, which no revision covers.
+const LOOK: u16 = crate::dom::HOVER | crate::dom::ACTIVE;
+
+// WARNING: the select of an option, and whether the option shows inside the select's box as a drop-down's choice
+// instead of in a box of its own.
+fn boxless(doc: &Document, id: usize) -> Option<(usize, bool)> {
+    std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
+        .take(2)
+        .find(|&parent| doc.nodes[parent].tag == "select")
+        .map(|select| {
+            let attrs = &doc.nodes[select].attrs;
+            (
+                select,
+                !attrs.contains_key("multiple")
+                    && !attrs
+                        .get("size")
+                        .is_some_and(|size| size.trim().parse::<u32>().is_ok_and(|size| size > 1)),
+            )
+        })
+}
+
+fn content_editable(doc: &Document, id: usize) -> Option<usize> {
+    std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
+        .find(|&node| doc.nodes[node].attrs.contains_key("contenteditable"))
+}
+
+// WARNING: whether a grid without a set width shrinks to its content, and the farthest node the walk read. `first`
+// is false when the walk goes on from a box above the grid.
+fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (bool, usize) {
+    let mut child = id;
+    loop {
+        let own = &styles.values[child];
+        let inset = |prop| own.get(prop).is_some_and(|v| v != "auto");
+        if float_side(own).is_some()
+            || own
+                .get(Prop::POSITION)
+                .is_some_and(|v| matches!(v, "absolute" | "fixed"))
+                && !(inset(Prop::LEFT) && inset(Prop::RIGHT))
+        {
+            break (true, child);
+        }
+        let Some(parent) = doc.nodes[child].parent else {
+            break (false, child);
+        };
+        let style = &styles.values[parent];
+        let display = style.get(Prop::DISPLAY).unwrap_or("block");
+        if display.ends_with("flex")
+            && style
+                .get(Prop::FLEX_DIRECTION)
+                .is_none_or(|v| v.starts_with("row"))
+        {
+            break (
+                first && child == id
+                    || own
+                        .get(Prop::FLEX_GROW)
+                        .is_none_or(|v| v.parse::<f32>().is_ok_and(|grow| grow == 0.)),
+                parent,
+            );
+        }
+        // WARNING: a column stretches to its own width, which can come from its content, as in a popup.
+        if !matches!(display, "block" | "inline-block" | "flex" | "inline-flex")
+            || style.get(Prop::WIDTH).is_some_and(|v| v != "auto")
+        {
+            break (false, parent);
+        }
+        if display == "inline-block" {
+            break (true, parent);
+        }
+        child = parent;
+    }
+}
+
+// WARNING: what the `<use>` elements of an SVG take from the rest of the page, which its subtree revision does not
+// cover, or `None` without such elements.
+fn uses(
+    doc: &Document,
+    styles: &ComputedStyles,
+    ids: &super::effects::Ids,
+    svg: usize,
+) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
-    if let Some(size) = dom.atoms.get(&id) {
-        size.map(f32::to_bits).hash(&mut hasher);
-    }
-    if doc.nodes[id].tag == "svg" {
-        let mut pending = vec![id];
-        let mut visited = rustc_hash::FxHashSet::default();
-        while let Some(node) = pending.pop() {
-            if !visited.insert(node) {
-                continue;
-            }
+    let mut found = false;
+    let mut pending = vec![(svg, false)];
+    let mut visited = rustc_hash::FxHashSet::default();
+    while let Some((node, outside)) = pending.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        if outside {
             (
                 node,
                 doc.nodes.revision(node),
                 Rc::as_ptr(&styles.values[node]),
             )
                 .hash(&mut hasher);
-            let current = &doc.nodes[node];
-            pending.extend(&current.children);
-            if current.tag == "use"
-                && let Some(name) = current
-                    .attrs
-                    .get("href")
-                    .or_else(|| current.attrs.get("xlink:href"))
-                    .and_then(|value| value.strip_prefix('#'))
-            {
-                pending.extend(
-                    super::effects::index(ids, doc)
-                        .get(name)
-                        .into_iter()
-                        .flatten(),
-                );
-            }
         }
-        return hasher.finish();
-    }
-    if styles.values[id]
-        .get(Prop::DISPLAY)
-        .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
-    {
-        // WARNING: grids read only the axes they track, and a size that prepaint would not draw again for is
-        // the size they were built with.
-        if let (Some(axes), Some(sizes)) = (dom.flexed_grids.get(&id), dom.cull.widths.get(&id)) {
-            for (axis, size) in axes.iter().zip(sizes) {
-                if let Some((used, _)) = axis {
-                    let size = if (size - used).abs() <= 0.5 {
-                        used
-                    } else {
-                        size
-                    };
-                    size.to_bits().hash(&mut hasher);
-                }
-            }
-        }
-        for child in &doc.nodes[id].children {
-            for baseline in dom.baselines.get(child).into_iter().flatten() {
-                baseline.map(f32::to_bits).hash(&mut hasher);
-            }
+        let current = &doc.nodes[node];
+        pending.extend(current.children.iter().map(|&child| (child, outside)));
+        if current.tag == "use"
+            && let Some(name) = current
+                .attrs
+                .get("href")
+                .or_else(|| current.attrs.get("xlink:href"))
+                .and_then(|value| value.strip_prefix('#'))
+        {
+            found = true;
+            name.hash(&mut hasher);
+            pending.extend(
+                super::effects::index(ids, doc)
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|&target| (target, true)),
+            );
         }
     }
-    let position = styles.values[id].get(Prop::POSITION).unwrap_or("static");
-    if !matches!(position, "absolute" | "fixed" | "sticky") {
-        return hasher.finish();
-    }
-    if let Some(parent) = doc.nodes[id].parent {
-        Rc::as_ptr(&styles.values[parent]).hash(&mut hasher);
-    }
-    // WARNING: `create` resolves the same block and scroller, from the same ancestors in the flat tree.
-    let ancestors = std::iter::successors(crate::dom::flat_parent(doc, dom, styles, id), |&node| {
-        crate::dom::flat_parent(doc, dom, styles, node)
-    });
-    if position == "sticky" {
-        let scroller = scroller(doc, styles, ancestors, &dom.scroll);
-        (
-            scroller,
-            Rc::as_ptr(&styles.values[scroller]),
-            dom.scroll.contains_key(&scroller),
-        )
+    found.then(|| hasher.finish())
+}
+
+fn scrolled(handle: Option<&renderer::ScrollHandle>) -> Option<[bool; 2]> {
+    handle.map(|handle| {
+        let max = handle.max_offset();
+        [max.x > px(0.5), max.y > px(0.5)]
+    })
+}
+
+// WARNING: a raster image paints by node with `paint::Picture`, and an SVG image paints its source by node, so only
+// their sizes count, and a new video frame of the same size keeps the box.
+fn pictured(
+    image: Option<&Arc<renderer::RenderImage>>,
+    vector: Option<&(Rc<str>, [f32; 2])>,
+) -> u64 {
+    hashed((
+        image.map(|image| {
+            let size = image.size();
+            [size.width.0, size.height.0]
+        }),
+        vector.map(|(_, natural)| natural.map(f32::to_bits)),
+    ))
+}
+
+fn baselines(doc: &Document, dom: Option<&crate::dom::State>, grid: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for child in &doc.nodes[grid].children {
+        dom.and_then(|dom| dom.baselines.get(child))
+            .map(|baselines| baselines.map(|value| value.map(f32::to_bits)))
             .hash(&mut hasher);
-    } else if let Some(block) = positioner(position, ancestors, |node| {
-        *made
-            .entry(Rc::as_ptr(&styles.values[node]))
-            .or_insert_with(|| super::effects::establishes(&styles.values[node]))
-    }) {
-        block.hash(&mut hasher);
-        if let Some(bounds) = dom.blocks.get(&block) {
-            [bounds.size.width, bounds.size.height]
-                .map(|value| f32::from(value).to_bits())
-                .hash(&mut hasher);
-        }
-    }
-    for value in styles.lengths[id].viewport {
-        value.to_bits().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+impl<'a> Build<'a> {
+    // WARNING: `scope` is one more than the depth of the box whose subtree revision covers the read, or 0 when none
+    // does: `ancestors.len()` for the parent, one more for the reading box itself, which drops the read.
+    #[inline(never)]
+    fn log(&self, query: Query, scope: usize, value: u64) {
+        self.reads.borrow_mut().push(Read {
+            query,
+            value,
+            scope: scope as u16,
+            reader: self.ancestors.len() as u16,
+        });
+    }
+
+    fn parent(&self, id: usize, prop: Prop) -> Option<&'a str> {
+        let value = parent_style(self.doc, self.styles, id, prop);
+        self.log(Query::Parent(prop), self.ancestors.len(), hashed(value));
+        value
+    }
+
+    // WARNING: the scope of a read of `node`, the box itself or one of its DOM ancestors: the nearest box of the chain
+    // that holds it.
+    fn scope_of(&self, id: usize, node: usize) -> usize {
+        std::iter::successors(Some(node), |&node| self.doc.nodes[node].parent)
+            .find_map(|node| {
+                if node == id {
+                    Some(self.ancestors.len() + 1)
+                } else {
+                    self.ancestors
+                        .iter()
+                        .rposition(|&ancestor| ancestor == node)
+                        .map(|index| index + 1)
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn block_size(&self, dom: Option<&crate::dom::State>, block: usize) -> Option<[f32; 2]> {
+        dom.and_then(|dom| dom.blocks.get(&block))
+            .map(|bounds| [f32::from(bounds.size.width), f32::from(bounds.size.height)])
+            .or_else(|| self.blocks.borrow().get(&block).copied())
+    }
+
+    fn replay(
+        &self,
+        id: usize,
+        [width, _]: [f32; 2],
+        container: [f32; 2],
+        slot: bool,
+        dom: Option<&crate::dom::State>,
+        read: &Read,
+    ) -> Replay {
+        let (doc, styles) = (self.doc, self.styles);
+        let below = read.reader != 0;
+        let now = match read.query {
+            Query::Margins => {
+                let mut units = styles.lengths[id];
+                units.container = Some(container);
+                hashed(margins(self, id, &units, width, self.flex_parent, slot).map(f32::to_bits))
+            }
+            Query::Parent(prop) => hashed(parent_style(doc, styles, id, prop)),
+            Query::ParentFont => hashed(parent_font(doc, styles, id)),
+            Query::FlatParent => {
+                let parent = box_parent(doc, styles, id);
+                hashed((
+                    parent,
+                    parent.and_then(|parent| styles.values[parent].get(Prop::DISPLAY)),
+                ))
+            }
+            Query::FlatParentPadding => hashed(
+                box_parent(doc, styles, id)
+                    .map(|parent| padding_left(styles, parent, width).to_bits()),
+            ),
+            Query::StickyParent => hashed(
+                self.ancestors
+                    .last()
+                    .map(|&parent| (parent, insets(styles, parent, true, width).map(f32::to_bits))),
+            ),
+            Query::Break => hashed(starts_line(doc, id)),
+            Query::UserSelect => hashed(styles.user_select[id].0 as u8),
+            Query::Positioner(fixed) => hashed(positioner(
+                if fixed { "fixed" } else { "absolute" },
+                self.ancestors.iter().rev().copied(),
+                |ancestor| super::effects::establishes(&styles.values[ancestor]),
+            )),
+            Query::Backdrop => hashed(backdrop(styles, &self.ancestors, id).map(|(_, ink)| ink)),
+            Query::Scroller => {
+                let Some(handles) = dom.map(|dom| &dom.scroll) else {
+                    return Replay::Changed;
+                };
+                // WARNING: a box above the sticky one may be `<html>` or `<body>`, which scroll only with a handle.
+                let ancestors = self.ancestors.iter().rev().copied();
+                let scroller = if below {
+                    scroller(doc, styles, std::iter::once(id).chain(ancestors), handles)
+                } else {
+                    scroller(doc, styles, ancestors, handles)
+                };
+                hashed((
+                    scroller,
+                    insets(styles, scroller, false, width).map(f32::to_bits),
+                    handles.contains_key(&scroller),
+                ))
+            }
+            Query::Editable => hashed(content_editable(doc, id).is_some()),
+            Query::Shrunk => hashed(shrinks(doc, styles, id, !below).0),
+            Query::Uses(svg) => hashed(uses(doc, styles, self.ids, svg as usize)),
+            Query::Block(block) => hashed(
+                self.block_size(dom, block as usize)
+                    .map(|size| size.map(f32::to_bits)),
+            ),
+            Query::Scroll(node) => hashed(scrolled(
+                dom.and_then(|dom| dom.scroll.get(&(node as usize))),
+            )),
+            Query::Width(node) => hashed(
+                dom.and_then(|dom| dom.cull.widths.get(&(node as usize)))
+                    .map(|size| size.map(f32::to_bits)),
+            ),
+            Query::Track(node, axis) => {
+                // WARNING: prepaint draws again only for a size more than half a pixel off the one the tracks used.
+                let used = f32::from_bits(read.value as u32);
+                return match dom
+                    .and_then(|dom| dom.cull.widths.get(&(node as usize)))
+                    .map(|size| size[usize::from(axis)])
+                {
+                    Some(size) if size.to_bits() == used.to_bits() => Replay::Same,
+                    Some(size) if (size - used).abs() <= 0.5 => Replay::Close,
+                    _ => Replay::Changed,
+                };
+            }
+            Query::Baselines(grid) => baselines(doc, dom, grid as usize),
+            Query::Atom(node) => hashed(
+                dom.and_then(|dom| dom.atoms.get(&(node as usize)))
+                    .map(|size| size.map(f32::to_bits)),
+            ),
+            Query::Image(node) => {
+                let node = node as usize;
+                let dom = dom.filter(|_| !broken_image(&doc.nodes[node]));
+                pictured(
+                    dom.and_then(|dom| dom.images.get(&node)),
+                    dom.and_then(|dom| dom.svg_images.get(&node)),
+                )
+            }
+            Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
+            Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
+            Query::Value(node) => hashed(&doc.nodes[node as usize].value),
+            Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
+            Query::Theme => hashed(crate::desktop::native::theme_state() & 1),
+        };
+        if now == read.value {
+            Replay::Same
+        } else {
+            Replay::Changed
+        }
+    }
 }
 
 // WARNING: an absolute box without such an ancestor takes the document, a fixed one the viewport (`None`).
@@ -484,46 +885,24 @@ pub(super) fn element(
     slot: Option<([f32; 4], super::grid::Grid)>,
 ) -> Child {
     let info = build.info[id];
-    // WARNING: a 3D parent resolves the box's transform with its own units, so such boxes build again.
-    if build.perspective.is_some()
-        || build.doc.nodes[id].tag.starts_with('#')
-        || build.ancestors.len() >= 256
-        || info.flags
-            & (cull::ALWAYS_REBUILT
-                | cull::ANIMATED
+    let depth = build.ancestors.len();
+    let mark = build.reads.borrow().len();
+    #[cfg(debug_assertions)]
+    let printed = build.prints.borrow().len();
+    let text = build.doc.nodes[id].tag.starts_with('#');
+    // WARNING: a 3D parent resolves the box's transform with its own units, so such boxes build again. The others
+    // build from what no read records: animated values or their transforms.
+    let storable = !text
+        && build.perspective.is_none()
+        && depth < 256
+        && info.flags
+            & (cull::ANIMATED
                 | cull::HIDDEN
                 | cull::MOVES_CONTENT
                 | cull::COMPOSITED
-                | cull::TRANSFORMED
-                | if build.resized {
-                    cull::READS_VIEWPORT
-                } else {
-                    0
-                })
-            != 0
-    {
-        return create(build, id, containing, container, slot);
-    }
-    // WARNING: a kept subtree culls nothing, so while culling is on only subtrees that were within the
-    // culling margin of the visible range keep their boxes. Others build again and cull their offscreen children.
-    if let Some(zone) = &build.zone {
-        let margin = build.styles.lengths[id].viewport[1];
-        let host = build.view.host.borrow();
-        let inside = host
-            .dom
-            .get(&build.view.id)
-            .and_then(|dom| dom.bounds.get(&id))
-            .is_some_and(|&[_, y, _, height]| {
-                y >= zone.top - margin && y + height <= zone.bottom + margin
-            });
-        drop(host);
-        if !inside {
-            return create(build, id, containing, container, slot);
-        }
-    }
-    let mut units = build.styles.lengths[id];
-    units.container = Some(container);
-    let key = Reuse {
+                | cull::TRANSFORMED)
+            == 0;
+    let call = Call {
         subtree: info.subtree,
         containing: if info.flags & cull::READS_HEIGHT != 0 {
             containing
@@ -532,34 +911,6 @@ pub(super) fn element(
         },
         container,
         flex_parent: build.flex_parent,
-        grid_parent: build.doc.nodes[id].parent.is_some_and(|parent| {
-            build.styles.values[parent]
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
-        }),
-        margin: margins(
-            build,
-            id,
-            &units,
-            containing[0],
-            build.flex_parent,
-            slot.is_some(),
-        ),
-        scrolled: [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-            .into_iter()
-            .any(|prop| {
-                build.styles.values[id]
-                    .get(prop)
-                    .is_some_and(|value| value != "visible")
-            })
-            && build
-                .view
-                .host
-                .borrow()
-                .dom
-                .get(&build.view.id)
-                .is_some_and(|dom| dom.scroll.contains_key(&id)),
-        inputs: build.inputs.get(&id).copied().unwrap_or(0),
         cell: slot.as_ref().map(|(bounds, grid)| {
             use std::hash::{Hash, Hasher};
             let mut tracks = rustc_hash::FxHasher::default();
@@ -574,22 +925,338 @@ pub(super) fn element(
             )
         }),
     };
-    if (build.settled || info.flags & cull::READS_LAST_FRAME == 0)
-        && build.tree.contains(id)
-        && build.view.kept.borrow().get(&id) == Some(&key)
-    {
+    // WARNING: `Some` when the box's record still holds, with `true` when a read held only within prepaint's
+    // tolerance. The record goes into the log, so the boxes around a kept box keep its reads too.
+    let keep = 'keep: {
+        if !storable
+            || build.resized && info.flags & cull::READS_VIEWPORT != 0
+            || !build.settled && info.flags & cull::READS_LAST_FRAME != 0
+            || !build.tree.contains(id)
+        {
+            break 'keep None;
+        }
+        let kept = build.view.kept.borrow();
+        let Some(record) = kept.get(&id) else {
+            break 'keep None;
+        };
+        let slotted = slot.is_some();
+        // WARNING: a kept subtree culls only what its build culled. One that culled keeps its spacers, which build
+        // it again when they come near the visible range. Others are kept only while no box below them that a parent
+        // could cull lies wholly outside the culling margin, also inside scroll boxes and in subtrees built without
+        // culling.
+        if !record.culled
+            && let Some(zone) = &build.zone
+        {
+            let margin = build.styles.lengths[id].viewport[1];
+            let reach = build.view.reach.borrow().get(id).copied();
+            if !reach.is_some_and(|[bottom, top]| {
+                bottom >= zone.top - margin && top <= zone.bottom + margin
+            }) {
+                break 'keep None;
+            }
+        }
+        let mut close = false;
+        let held = record.call == call && {
+            let fresh = record.epoch.get() == build.epoch;
+            let host = build.view.host.borrow();
+            let dom = host.dom.get(&build.view.id);
+            record.reads.iter().all(|read| {
+                fresh && !read.query.host()
+                    || match build.replay(id, containing, container, slotted, dom, read) {
+                        Replay::Same => true,
+                        Replay::Close => {
+                            close = true;
+                            true
+                        }
+                        Replay::Changed => false,
+                    }
+            })
+        };
+        #[cfg(debug_assertions)]
+        assert!(
+            held || !build.checking,
+            "box {id} <{}> builds again inside a kept box: {}",
+            build.doc.nodes[id].tag,
+            if record.call == call {
+                let host = build.view.host.borrow();
+                let dom = host.dom.get(&build.view.id);
+                format!(
+                    "{:?} changed",
+                    record
+                        .reads
+                        .iter()
+                        .filter(
+                            |read| build.replay(id, containing, container, slotted, dom, read)
+                                == Replay::Changed
+                        )
+                        .map(|read| read.query)
+                        .collect::<Vec<_>>()
+                )
+            } else {
+                "its call changed".into()
+            }
+        );
+        if !held {
+            break 'keep None;
+        }
+        record.epoch.set(build.epoch);
+        if record.culled {
+            build.culls.set(build.culls.get() + 1);
+        }
+        let depth = build.ancestors.len();
+        build
+            .reads
+            .borrow_mut()
+            .extend(record.reads.iter().map(|read| Read {
+                scope: if read.scope == 0 {
+                    0
+                } else {
+                    (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
+                },
+                reader: depth as u16 + read.reader,
+                ..*read
+            }));
+        #[cfg(debug_assertions)]
+        build.prints.borrow_mut().push(record.print);
+        Some(close)
+    };
+    if let Some(_close) = keep {
+        #[cfg(debug_assertions)]
+        if !_close {
+            check(build, id, containing, container, slot, mark, printed);
+        }
         return Child::Kept(id.into());
     }
     let culls = build.culls.get();
-    let child = create(build, id, containing, container, slot);
-    let mut kept = build.view.kept.borrow_mut();
-    // WARNING: culled runs depend on the scroll position, so a subtree with spacers is built again.
-    if build.culls.get() == culls {
-        kept.insert(id, key);
-    } else {
-        kept.remove(&id);
+    let patch = text_field(&build.doc.nodes[id]).then(|| Patch {
+        ancestors: build.ancestors.clone(),
+        containing,
+        container,
+        slot: slot.clone(),
+        flex_parent: build.flex_parent,
+        perspective: build.perspective.clone(),
+        value: hashed(&build.doc.nodes[id].value),
+    });
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut child = create(build, id, containing, container, slot);
+    #[cfg(debug_assertions)]
+    let plan = build.plan.take();
+    #[cfg(debug_assertions)]
+    if !build.checking
+        && *TRACE
+        && let Some(name) = build.doc.nodes[id].attrs.get("id")
+    {
+        eprintln!("BUILT {name}");
+    }
+    // WARNING: reads that the box's subtree revision covers leave the log, the others stay for the boxes around it. A
+    // read that boxes below repeat stays once, as it gave them all the same. Repeats come from neighbors, so a long
+    // record only looks back a few reads for them.
+    let reads = {
+        let depth = build.ancestors.len();
+        let below = |read: &Read| usize::from(read.reader) > depth;
+        let mut log = build.reads.borrow_mut();
+        let mut end = mark;
+        for at in mark..log.len() {
+            let read = log[at];
+            if usize::from(read.scope) <= depth
+                && !log[end.saturating_sub(16).max(mark)..end]
+                    .iter()
+                    .any(|old| old.query == read.query && below(old) == below(&read))
+            {
+                log[end] = read;
+                end += 1;
+            }
+        }
+        log.truncate(end);
+        storable.then(|| {
+            log[mark..]
+                .iter()
+                .map(|read| Read {
+                    scope: if read.scope == 0 {
+                        0
+                    } else {
+                        (depth + 1 - usize::from(read.scope)) as u16
+                    },
+                    reader: u16::from(below(read)),
+                    ..*read
+                })
+                .collect()
+        })
+    };
+    #[cfg(debug_assertions)]
+    let print = print(build, printed, &mut child);
+    #[cfg(debug_assertions)]
+    let checking = build.checking;
+    #[cfg(not(debug_assertions))]
+    let checking = false;
+    if let Some(patch) = patch.filter(|_| !checking) {
+        build.view.patches.borrow_mut().insert(id, patch);
+    }
+    if !text {
+        let mut kept = build.view.kept.borrow_mut();
+        match reads {
+            Some(reads) => {
+                kept.insert(
+                    id,
+                    Kept {
+                        call,
+                        reads,
+                        epoch: build.epoch.into(),
+                        culled: build.culls.get() != culls,
+                        #[cfg(debug_assertions)]
+                        print,
+                        #[cfg(debug_assertions)]
+                        plan,
+                    },
+                );
+            }
+            None => {
+                kept.remove(&id);
+            }
+        }
     }
     child
+}
+
+// WARNING: with `APPS_TRACE_BUILDS` set, debug builds print the `id` attribute of each box they build, so tests see
+// which boxes were kept.
+#[cfg(debug_assertions)]
+static TRACE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("APPS_TRACE_BUILDS").is_some());
+
+// WARNING: debug builds build each kept box again, culling only the children its build culled, and it must read and
+// build the same, or its build reads something that no record holds.
+#[cfg(debug_assertions)]
+fn check(
+    build: &Build<'_>,
+    id: usize,
+    containing: [f32; 2],
+    container: [f32; 2],
+    slot: Option<([f32; 4], super::grid::Grid)>,
+    mark: usize,
+    printed: usize,
+) {
+    let culls = std::cell::Cell::new(0);
+    let shadow = Build {
+        doc: build.doc,
+        styles: build.styles,
+        text: build.text,
+        pixel_ratio: build.pixel_ratio,
+        view: build.view,
+        ancestors: build.ancestors.clone(),
+        flex_parent: build.flex_parent,
+        measured: build.measured,
+        inline_text: build.inline_text,
+        perspective: build.perspective.clone(),
+        siblings: build.siblings,
+        margins: build.margins,
+        blocks: build.blocks,
+        ids: build.ids,
+        info: build.info,
+        zone: None,
+        top_layer: build.top_layer,
+        tree: build.tree,
+        culls: &culls,
+        resized: build.resized,
+        settled: build.settled,
+        reads: build.reads,
+        epoch: build.epoch,
+        prints: build.prints,
+        checking: true,
+        extra: Default::default(),
+        plan: Default::default(),
+    };
+    let start = build.reads.borrow().len();
+    let mut fresh = create(&shadow, id, containing, container, slot);
+    let depth = build.ancestors.len();
+    let set = |reads: &[Read]| {
+        let mut set: Vec<_> = reads
+            .iter()
+            .filter(|read| usize::from(read.scope) <= depth)
+            .map(|read| (read.query, usize::from(read.reader) > depth, read.value))
+            .collect();
+        set.sort_unstable_by_key(|&(query, below, _)| (query, below));
+        set.dedup_by_key(|&mut (query, below, _)| (query, below));
+        set
+    };
+    let mut log = build.reads.borrow_mut();
+    let (kept, now) = (set(&log[mark..start]), set(&log[start..]));
+    log.truncate(start);
+    drop(log);
+    let tag = &build.doc.nodes[id].tag;
+    assert!(
+        kept == now,
+        "kept box {id} <{tag}> reads otherwise when built again: {:?} instead of {:?}",
+        now.iter().map(|read| read.0).collect::<Vec<_>>(),
+        kept.iter().map(|read| read.0).collect::<Vec<_>>()
+    );
+    let print = print(&shadow, printed + 1, &mut fresh);
+    let mut prints = build.prints.borrow_mut();
+    assert_eq!(
+        prints[printed], print,
+        "kept box {id} <{tag}> builds otherwise when built again"
+    );
+    prints.truncate(printed + 1);
+}
+
+// WARNING: a debug fingerprint of a box: its own style, what its hooks hold, and the fingerprints of the boxes built
+// under it since `from`.
+#[cfg(debug_assertions)]
+fn print(build: &Build<'_>, from: usize, child: &mut Child) -> u64 {
+    use std::hash::Hasher;
+    struct Hashed(rustc_hash::FxHasher);
+    impl std::fmt::Write for Hashed {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.write(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut hasher = Hashed(Default::default());
+    if let Child::Node(node) = child {
+        let _ = std::fmt::Write::write_fmt(&mut hasher, format_args!("{:?}", node.style()));
+    }
+    hasher.0.write_u64(build.extra.take());
+    let mut prints = build.prints.borrow_mut();
+    for print in prints.drain(from..) {
+        hasher.0.write_u64(print);
+    }
+    let print = hasher.0.finish();
+    prints.push(print);
+    print
+}
+
+#[cfg(debug_assertions)]
+impl std::fmt::Debug for Query {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Query::Margins => write!(f, "Margins"),
+            Query::Parent(prop) => write!(f, "Parent({})", prop.name()),
+            Query::ParentFont => write!(f, "ParentFont"),
+            Query::FlatParent => write!(f, "FlatParent"),
+            Query::FlatParentPadding => write!(f, "FlatParentPadding"),
+            Query::StickyParent => write!(f, "StickyParent"),
+            Query::Break => write!(f, "Break"),
+            Query::UserSelect => write!(f, "UserSelect"),
+            Query::Positioner(fixed) => write!(f, "Positioner({fixed})"),
+            Query::Backdrop => write!(f, "Backdrop"),
+            Query::Scroller => write!(f, "Scroller"),
+            Query::Editable => write!(f, "Editable"),
+            Query::Shrunk => write!(f, "Shrunk"),
+            Query::Uses(node) => write!(f, "Uses({node})"),
+            Query::Block(node) => write!(f, "Block({node})"),
+            Query::Scroll(node) => write!(f, "Scroll({node})"),
+            Query::Width(node) => write!(f, "Width({node})"),
+            Query::Track(node, axis) => write!(f, "Track({node}, {axis})"),
+            Query::Baselines(node) => write!(f, "Baselines({node})"),
+            Query::Atom(node) => write!(f, "Atom({node})"),
+            Query::Image(node) => write!(f, "Image({node})"),
+            Query::Look(node) => write!(f, "Look({node})"),
+            Query::Boxless(node) => write!(f, "Boxless({node})"),
+            Query::Value(node) => write!(f, "Value({node})"),
+            Query::Viewport => write!(f, "Viewport"),
+            Query::Theme => write!(f, "Theme"),
+        }
+    }
 }
 
 fn create(
@@ -599,9 +1266,9 @@ fn create(
     container: [f32; 2],
     slot: Option<([f32; 4], super::grid::Grid)>,
 ) -> Child {
+    let reader = build;
     let Build {
         blocks,
-        inputs,
         doc,
         styles,
         text,
@@ -622,8 +1289,13 @@ fn create(
         culls,
         resized,
         settled,
+        reads,
+        epoch,
+        ..
     } = *build;
+    let depth = ancestors.len();
     let node = &doc.nodes[id];
+    let symbol = node.sf_symbol();
     let style = &styles.values[id];
     let display =
         style
@@ -633,7 +1305,18 @@ fn create(
             } else {
                 "inline"
             });
-    let display = if display == "inline" && style::holds_block_box(doc, styles, id) {
+    // WARNING: like Chrome, a failed image with alt text is a box of a broken image icon and the text, which is an
+    // inline block that ignores its size when the image is inline, as Chrome's UA sheet makes it.
+    let broken = broken_image(node);
+    let alt = broken
+        .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
+        .flatten();
+    let sizeless = alt.is_some()
+        && (display == "inline"
+            || display == "inline-block" && styles.flags[id] & style::AGENT_DISPLAY != 0);
+    let display = if sizeless {
+        "inline-block"
+    } else if display == "inline" && style::holds_block_box(doc, styles, id) {
         "block"
     } else {
         display
@@ -644,23 +1327,22 @@ fn create(
     let positioned = style
         .get(Prop::POSITION)
         .is_some_and(|value| value != "static");
-    let layered = positioned
-        || flex_parent
-        || node.parent.is_some_and(|parent| {
-            styles.values[parent]
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| matches!(value, "grid" | "inline-grid"))
-        });
+    let layered = order.is_some()
+        && (positioned
+            || flex_parent
+            || matches!(
+                reader.parent(id, Prop::DISPLAY),
+                Some("grid" | "inline-grid")
+            ));
     // WARNING: a box whose opacity animates keeps one stacking context and effect layer at every
     // value, so animation frames only patch the layer's opacity.
     let composited = info[id].flags & cull::COMPOSITED != 0;
     let made = super::effects::establishes(style);
     // WARNING: the renderer paints a z-indexed box in its nearest stacking ancestor, so every box that paints
     // through a layer must be one, or such boxes escape its transform, opacity or clip.
-    let stacking = id == 0 || composited || made.stacking || layered && order.is_some();
+    let stacking = id == 0 || composited || made.stacking || layered;
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
-        inputs,
         doc,
         styles,
         text,
@@ -678,6 +1360,16 @@ fn create(
         culls,
         resized,
         settled,
+        reads,
+        epoch,
+        #[cfg(debug_assertions)]
+        prints: build.prints,
+        #[cfg(debug_assertions)]
+        checking: build.checking,
+        #[cfg(debug_assertions)]
+        extra: Default::default(),
+        #[cfg(debug_assertions)]
+        plan: Default::default(),
         zone: zone
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVES_CONTENT) == 0)
@@ -688,10 +1380,14 @@ fn create(
                 {
                     return Some(zone.clone());
                 }
-                let rect = *view.host.borrow().dom.get(&view.id)?.bounds.get(&id)?;
+                let host = view.host.borrow();
+                let dom = host.dom.get(&view.id)?;
+                let rect = *dom.bounds.get(&id)?;
+                // WARNING: zones hold last frame's places, and the children moved by the box's scroll since.
+                let moved = dom.cull.scrolled.get(&id).copied().unwrap_or(0.);
                 Some(Rc::new(cull::Zone {
-                    top: zone.top.max(rect[1]),
-                    bottom: zone.bottom.min(rect[1] + rect[3]),
+                    top: zone.top.max(rect[1]) + moved,
+                    bottom: zone.bottom.min(rect[1] + rect[3]) + moved,
                     clips: zone.clips.iter().copied().chain([id]).collect(),
                     resized: zone.resized,
                 }))
@@ -716,40 +1412,48 @@ fn create(
     let mut units = styles.lengths[id];
     units.container = Some(container);
     let position = style.get(Prop::POSITION).unwrap_or("static");
-    let mut parent = node.parent;
-    while let Some(ancestor) = parent
-        && styles.values[ancestor]
-            .get(Prop::DISPLAY)
-            .is_some_and(|value| value == "contents")
-    {
-        parent = doc.nodes[ancestor].parent;
-    }
+    let parent = box_parent(doc, styles, id);
     let positioner = positioner(position, ancestors.iter().rev().copied(), |ancestor| {
         super::effects::establishes(&styles.values[ancestor])
-    })
-    .filter(|_| id != 0);
-    let block_size = if position == "fixed" && positioner.is_none() {
+    });
+    if matches!(position, "absolute" | "fixed") {
+        let scope = positioner
+            .and_then(|block| ancestors.iter().rposition(|&ancestor| ancestor == block))
+            .map_or(1, |index| index + 1);
+        reader.log(Query::Positioner(position == "fixed"), scope, hashed(positioner));
+        reader.log(
+            Query::FlatParent,
+            depth,
+            hashed((
+                parent,
+                parent.and_then(|parent| styles.values[parent].get(Prop::DISPLAY)),
+            )),
+        );
+    }
+    let positioner = positioner.filter(|_| id != 0);
+    let viewport = || {
+        reader.log(Query::Viewport, 0, hashed(units.viewport.map(f32::to_bits)));
         Some(units.viewport)
+    };
+    let block_size = if position == "fixed" && positioner.is_none() {
+        viewport()
     } else {
         positioner
             .filter(|&block| Some(block) != parent)
             .and_then(|block| {
                 if block == 0 {
-                    return Some(units.viewport);
+                    return viewport();
                 }
                 // WARNING: the block's last layout comes before the estimate of its build, which can miss its
                 // min and max sizes. Prepaint draws again when they differ, so an estimate first would draw
                 // again in every frame.
-                if let Some(bounds) = view
-                    .host
-                    .borrow()
-                    .dom
-                    .get(&view.id)
-                    .and_then(|dom| dom.blocks.get(&block))
-                {
-                    return Some([f32::from(bounds.size.width), f32::from(bounds.size.height)]);
-                }
-                blocks.borrow().get(&block).copied()
+                let size = reader.block_size(view.host.borrow().dom.get(&view.id), block);
+                reader.log(
+                    Query::Block(block as u32),
+                    0,
+                    hashed(size.map(|size| size.map(f32::to_bits))),
+                );
+                size
             })
     };
     let containing = block_size.unwrap_or(containing);
@@ -784,6 +1488,29 @@ fn create(
             .flex_shrink_0()
             .baseline(renderer::Baseline::Bottom)
     };
+    let align_of = |element: &mut renderer::Child| match element {
+        renderer::Child::Node(node) => node.style().align_self,
+        renderer::Child::Kept(id) => build.tree.align_self(*id),
+    };
+    // WARNING: taffy moves an item that doesn't fit its line to a new line when any item is before it, even the
+    // zero-width strut, so the strut and the first item are one item, aligned like the item. Like browsers, a first
+    // item wider than its line then stays on the first line. A group that is not on the baseline takes the strut
+    // out of the line's baseline, so a second strut goes before the next item: true is returned for it.
+    let with_strut = |mut element: renderer::Child| {
+        let align = align_of(&mut element);
+        let mut group = renderer::node()
+            .flex()
+            .flex_row()
+            .flex_shrink(1.)
+            .child(strut())
+            .child(element);
+        group.style().align_items = Some(renderer::AlignItems::Baseline);
+        group.style().align_self = align;
+        group.style().inline = renderer::Inline::Lines;
+        (group, align.is_some())
+    };
+    let mut strut_due = false;
+    let mut strut_next = false;
     let mut el = renderer::node()
         .id(id)
         .flex()
@@ -821,17 +1548,8 @@ fn create(
         el.text_style().font_style = Some(face.style);
     }
     if node.tag == "br" {
-        let empty = node.parent.is_none_or(|parent| {
-            let siblings = &doc.nodes[parent].children;
-            siblings[..siblings.iter().position(|&child| child == id).unwrap_or(0)]
-                .iter()
-                .rfind(|&&child| {
-                    let node = &doc.nodes[child];
-                    node.tag != "#comment"
-                        && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
-                })
-                .is_none_or(|&child| doc.nodes[child].tag == "br")
-        });
+        let empty = starts_line(doc, id);
+        reader.log(Query::Break, depth, hashed(empty));
         let painter = view.clone();
         let ink = [Prop::CARET_COLOR, Prop::COLOR]
             .into_iter()
@@ -887,11 +1605,12 @@ fn create(
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
     let mut flat = Vec::new();
-    let mut pending: Vec<usize> = if matches!(node.tag.as_str(), "svg" | "canvas" | "iframe") {
-        Vec::new()
-    } else {
-        node.children.iter().rev().copied().collect()
-    };
+    let mut pending: Vec<usize> =
+        if symbol.is_some() || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe") {
+            Vec::new()
+        } else {
+            node.children.iter().rev().copied().collect()
+        };
     while let Some(child) = pending.pop() {
         if styles.values[child]
             .get(Prop::DISPLAY)
@@ -949,7 +1668,9 @@ fn create(
         el = el.flex_row().flex_wrap();
         el.style().justify_content = line_justify;
         el.style().align_items = line_align;
+        el.style().inline = renderer::Inline::Lines;
         let merged = !text_field(node)
+            && symbol.is_none()
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
             && inline_text
                 .borrow_mut()
@@ -966,84 +1687,64 @@ fn create(
                     && !style::makes_no_line(doc, styles, child)
             })
         {
-            el = el.child(strut());
+            strut_due = true;
         }
     }
+    // WARNING: like browsers, a canvas takes its natural size and ratio from its attributes, whatever it shows.
+    // An auto height comes from the in-flow picture, which keeps that ratio in the content box, also in a flex
+    // row, where taffy drops the box's own ratio for a percentage width. The drawing covers that picture, so it
+    // stays in the content box too. Pictures paint from the node, so a drawing or a frame changes no box.
+    let (mut natural, mut natural_ratio) = match node.tag.as_str() {
+        "img" | "video" => (None, None),
+        _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
+    };
     if node.tag == "canvas" {
-        let size = |name: &str, default: f32| {
-            node.attrs
-                .get(name)
-                .and_then(|value| dimension(value, true))
-                .unwrap_or(default)
+        let picture = |source| {
+            renderer::node().size_full().hooks(super::paint::Picture {
+                id,
+                view: view.clone(),
+                source,
+                fit: renderer::ObjectFit::Fill,
+                cropped: None,
+            })
         };
-        el = el.w(px(size("width", 300.))).h(px(size("height", 150.)));
-        let host = view.host.borrow();
-        let state = host.dom.get(&view.id);
-        if let Some(image) = view
-            .images
-            .borrow()
-            .get(&id)
-            .or_else(|| state?.images.get(&id))
-        {
-            el = el.child(img(image.clone()).size_full());
-        }
-        if let Some(canvas) = state.and_then(|state| state.canvases.get(&id)) {
-            el = el.child(img(canvas.image.clone()).absolute().size_full());
-        }
-        drop(host);
+        let mut presented = picture(super::paint::Source::Presented)
+            .child(picture(super::paint::Source::Drawn).absolute());
+        presented.style().aspect_ratio = natural_ratio;
+        el = el.child(presented);
     }
-    let mut image_child = None;
-    let mut cropped = None;
+    let mut picture = None;
     if node.tag == "img" || node.tag == "video" {
         let (image, vector) = view
             .host
             .borrow()
             .dom
             .get(&view.id)
+            .filter(|_| !broken)
             .map_or((None, None), |state| {
                 (
                     state.images.get(&id).cloned(),
                     state.svg_images.get(&id).cloned(),
                 )
             });
-        if let Some(natural) = image
-            .as_ref()
-            .map(|image| {
-                let size = image.size();
-                [u32::from(size.width) as f32, u32::from(size.height) as f32]
-            })
-            .or(vector.as_ref().map(|(_, natural)| *natural))
-            .or((node.tag == "video").then_some([300., 150.]))
-        {
-            let attr = |name: &str| {
-                node.attrs
-                    .get(name)
-                    .and_then(|value| dimension(value, false))
-            };
-            let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
-            if image.is_none() && vector.is_none() {
-                if auto(Prop::HEIGHT) && attr("height").is_none() {
-                    el = el.h(px(natural[1]));
-                }
-            } else if natural[1] > 0. {
-                el.style().aspect_ratio = Some(natural[0] / natural[1]);
-                el = only_auto_ratio(el, style);
-            }
-            match (
-                auto(Prop::WIDTH),
-                auto(Prop::HEIGHT),
-                attr("width"),
-                attr("height"),
-            ) {
-                (true, _, Some(width), _) => el = el.w(px(width)),
-                (true, true, None, None) => el = el.w(px(natural[0])),
-                _ => {}
-            }
-            if auto(Prop::HEIGHT)
-                && let Some(height) = attr("height")
-            {
-                el = el.h(px(height));
-            }
+        reader.log(
+            Query::Image(id as u32),
+            0,
+            pictured(image.as_ref(), vector.as_ref()),
+        );
+        (natural, natural_ratio) = natural_size(
+            doc,
+            id,
+            image
+                .as_ref()
+                .map(|image| {
+                    let size = image.size();
+                    [u32::from(size.width) as f32, u32::from(size.height) as f32]
+                })
+                .or(vector.as_ref().map(|(_, natural)| *natural)),
+        )
+        .map_or((None, None), |(size, ratio)| (Some(size), ratio));
+        if image.is_some() || vector.is_some() {
             let fit = match style.get(Prop::OBJECT_FIT) {
                 Some("contain") => renderer::ObjectFit::Contain,
                 Some("cover") => renderer::ObjectFit::Cover,
@@ -1051,16 +1752,17 @@ fn create(
                 Some("scale-down") => renderer::ObjectFit::ScaleDown,
                 _ => renderer::ObjectFit::Fill,
             };
-            if let Some(image) = image {
-                if matches!(fit, renderer::ObjectFit::Cover | renderer::ObjectFit::None) {
-                    cropped = Some((image, fit));
-                } else {
-                    image_child = Some(img(image).size_full().object_fit(fit));
-                }
-            } else if vector.is_some() {
+            if image.is_some() {
+                picture = Some(fit);
+            } else {
                 el = el.child(svg_layer(id, false, view.clone()));
             }
-        } else {
+        }
+        if image.is_none() && natural_ratio.is_some() {
+            let mut sized = renderer::node().size_full();
+            sized.style().aspect_ratio = natural_ratio;
+            el = el.child(sized);
+        } else if natural.is_none() && !sizeless {
             // WARNING: images that are loading or failed to decode keep only their attribute size.
             for (name, prop, horizontal) in [
                 ("width", Prop::WIDTH, true),
@@ -1080,6 +1782,69 @@ fn create(
                 }
             }
         }
+    }
+    if broken {
+        let icon = || {
+            renderer::canvas(
+                |_, _| (),
+                |bounds, _, window| paint_broken_icon(bounds.origin, window),
+            )
+            .w(px(16.))
+            .h(px(16.))
+            .flex_shrink_0()
+        };
+        // WARNING: like Chrome, a failed image with both sizes and no alt text has a silver frame, and its icon
+        // shows only when 18 pixels fit.
+        let framed = alt.is_none()
+            && natural.is_some_and(|size| size != [0., 0.])
+            && [("width", Prop::WIDTH), ("height", Prop::HEIGHT)]
+                .iter()
+                .all(|&(name, prop)| {
+                    style.get(prop).is_some_and(|value| value != "auto")
+                        || node.attrs.contains_key(name)
+                });
+        // WARNING: the icon is out of flow, so the text gives the box its baseline. Like Chrome's floated icon, it
+        // moves only the first line, or the text goes below it when the first word doesn't fit beside it.
+        el = if let Some(alt) = alt {
+            let mut text = renderer::text(
+                alt.clone(),
+                Some(vec![style::text_run(style, &units, alt.len())]),
+            );
+            text.text_style().float = Some(px(16.));
+            el.child(
+                renderer::node()
+                    .min_h(px(16.))
+                    .child(text)
+                    .child(icon().absolute().top_0().left_0()),
+            )
+        } else if framed {
+            el.child(
+                renderer::canvas(
+                    |_, _| (),
+                    |bounds, _, window| {
+                        window.paint_quad(renderer::quad(
+                            bounds,
+                            px(0.),
+                            renderer::transparent_black(),
+                            px(1.),
+                            rgba(0xc0c0c0ff),
+                            renderer::BorderStyle::Solid,
+                        ));
+                        if bounds.size.width >= px(18.) && bounds.size.height >= px(18.) {
+                            paint_broken_icon(bounds.origin + point(px(2.), px(2.)), window);
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+        } else if natural == Some([16., 16.]) {
+            el.child(icon())
+        } else {
+            el
+        };
     }
     if node.tag == "svg" {
         let [width, height] = [(Prop::WIDTH, "width"), (Prop::HEIGHT, "height")]
@@ -1152,6 +1917,9 @@ fn create(
                 targets.push(target);
                 pending.push(target);
             }
+        }
+        if let Some(value) = uses(doc, styles, ids, id) {
+            reader.log(Query::Uses(id as u32), 1, value);
         }
         let key = ([width, height], std::hash::Hasher::finish(&hasher));
         let props = || style::SVG.iter().chain(&SVG_SOURCE);
@@ -1290,34 +2058,51 @@ fn create(
             .h(px(height))
             .child(svg_layer(id, true, view.clone()));
     }
-    if node.tag == "iframe" {
-        let auto = |prop: Prop| style.get(prop).is_none_or(|value| value == "auto");
-        let ratio = style
-            .get(Prop::ASPECT_RATIO)
-            .and_then(aspect_ratio)
-            .is_some();
-        let [width, height] = [("width", 300.), ("height", 150.)].map(|(name, default)| {
-            node.attrs
-                .get(name)
-                .and_then(|value| dimension(value, false))
-                .unwrap_or(default)
-        });
-        if auto(Prop::WIDTH) && (!ratio || auto(Prop::HEIGHT)) {
-            el = el.w(px(width));
-        }
-        if auto(Prop::HEIGHT) && !ratio {
-            el = el.h(px(height));
-        }
-    }
+    // WARNING: a flex line stretches an item with an auto size across it, also a replaced element or a control, so
+    // their natural size gives way in that axis.
+    let stretched = |axis: usize| {
+        let [size, start, end] = [
+            [Prop::WIDTH, Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
+            [Prop::HEIGHT, Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
+        ][axis];
+        flex_parent
+            && reader
+                .parent(id, Prop::FLEX_DIRECTION)
+                .is_some_and(|value| value.starts_with("column"))
+                == (axis == 0)
+            && !matches!(position, "absolute" | "fixed")
+            && style.get(size).is_none_or(|value| value == "auto")
+            && [start, end]
+                .iter()
+                .all(|&prop| style.get(prop) != Some("auto"))
+            && style
+                .get(Prop::ALIGN_SELF)
+                .filter(|value| *value != "auto")
+                .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
+                .is_none_or(|value| matches!(value, "normal" | "stretch"))
+    };
     let input =
         (node.tag == "input").then(|| node.attrs.get("type").map_or("text", String::as_str));
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
     let editable = text_field(node);
+    // WARNING: controls draw from the system theme when their `color-scheme` allows both, which no style holds.
+    let dark = || {
+        if style
+            .get(Prop::COLOR_SCHEME)
+            .is_some_and(|value| value.contains("dark") && value.contains("light"))
+        {
+            reader.log(
+                Query::Theme,
+                0,
+                hashed(crate::desktop::native::theme_state() & 1),
+            );
+        }
+        style::dark(style)
+    };
     if input.is_some_and(|kind| kind.eq_ignore_ascii_case("file")) {
-        let dark = style::dark(style);
-        let [fill, edge] = if dark {
+        let [fill, edge] = if dark() {
             [0x6b6b6b, 0x858585]
         } else {
             [0xefefef, 0x767676]
@@ -1373,9 +2158,9 @@ fn create(
     }) {
         el = el.items_center().justify_center().child(SharedString::from(
             node.attrs.get("value").cloned().unwrap_or_else(|| {
-                if input == Some("reset") {
+                if input.is_some_and(|kind| kind.eq_ignore_ascii_case("reset")) {
                     "Reset".into()
-                } else if input == Some("submit") {
+                } else if input.is_some_and(|kind| kind.eq_ignore_ascii_case("submit")) {
                     "Submit".into()
                 } else {
                     String::new()
@@ -1401,6 +2186,10 @@ fn create(
         );
     }
     if editable {
+        // WARNING: a field sized by its content lays out from its value, which no revision covers.
+        if style.get(Prop::FIELD_SIZING) == Some("content") {
+            reader.log(Query::Value(id as u32), 0, hashed(&node.value));
+        }
         let text = node.shown_text(
             node.current_value()
                 .map_or_else(|| doc.text(id), str::to_owned),
@@ -1526,6 +2315,7 @@ fn create(
             .filter(|(_, alpha)| *alpha > 0)
     };
     let inline_box = display == "inline"
+        && symbol.is_none()
         && !node.tag.starts_with('#')
         && !flex_parent
         && slot.is_none()
@@ -1595,14 +2385,22 @@ fn create(
     }
     let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
     let look = if scrolls.contains(&true) {
+        let backdrop = backdrop(styles, ancestors, id);
+        reader.log(
+            Query::Backdrop,
+            backdrop.map_or(1, |(up, _)| depth + 1 - up),
+            hashed(backdrop.map(|(_, ink)| ink)),
+        );
+        reader.log(
+            Query::Theme,
+            0,
+            hashed(crate::desktop::native::theme_state() & 1),
+        );
         scrollbar::Look::new(
             style,
             styles.scrollbars.get(&id).map(|parts| &**parts),
             &units,
-            chain.iter().rev().find_map(|&id| {
-                let (ink, alpha) = style::color(styles.values[id].get(Prop::BACKGROUND_COLOR)?)?;
-                (alpha >= 128).then_some(ink)
-            }),
+            backdrop.map(|(_, ink)| ink),
         )
         .map(|mut look| {
             if page {
@@ -1614,12 +2412,10 @@ fn create(
         None
     };
     let reserved = look.as_ref().map_or([0.; 2], |look| {
-        let max = view
-            .host
-            .borrow()
-            .dom
-            .get(&view.id)
-            .and_then(|dom| dom.scroll.get(&id))
+        let host = view.host.borrow();
+        let handle = host.dom.get(&view.id).and_then(|dom| dom.scroll.get(&id));
+        reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(handle)));
+        let max = handle
             .map(renderer::ScrollHandle::max_offset)
             .unwrap_or_default();
         look.space(look.shown(scrolls, max))
@@ -1651,6 +2447,7 @@ fn create(
         flex_parent,
         slot.is_some(),
     );
+    reader.log(Query::Margins, depth, hashed(margin.map(f32::to_bits)));
     el = el
         .mt(px(margin[0]))
         .mr(px(margin[1]))
@@ -1678,9 +2475,7 @@ fn create(
     // WARNING: right-to-left blocks put an over-constrained child at the right, so its left margin gives way.
     if !flex_parent
         && slot.is_none()
-        && node
-            .parent
-            .is_some_and(|parent| styles.values[parent].get(Prop::DIRECTION) == Some("rtl"))
+        && reader.parent(id, Prop::DIRECTION) == Some("rtl")
         && style.get(Prop::DISPLAY).is_some_and(|value| {
             matches!(
                 value,
@@ -1837,7 +2632,7 @@ fn create(
                     0.
                 }),
             };
-            let dark = style::dark(style);
+            let dark = dark();
             let accent = match control {
                 super::control::Control::Meter => {
                     let low = number("low").unwrap_or(min).clamp(min, max);
@@ -1897,6 +2692,23 @@ fn create(
                 },
             }
         });
+    if native.is_some() {
+        reader.log(Query::Look(id as u32), 0, hashed(node.state & LOOK));
+    }
+    #[cfg(debug_assertions)]
+    if let Some(look) = &native {
+        reader.extra.set(hashed((
+            reader.extra.get(),
+            [
+                look.hover,
+                look.active,
+                look.checked,
+                look.disabled,
+                look.dark,
+            ],
+            [look.accent, look.ink, look.value.to_bits()],
+        )));
+    }
     if let Some(look) = &native {
         if look.boxed {
             let (edge, fill) = super::control::box_colors(look);
@@ -1973,14 +2785,18 @@ fn create(
                 let [ascent, descent, _] = text
                     .line_metrics(face, px(units.font.em * pixel_ratio))
                     .map(f32::from);
-                el = el
-                    .h(px((ascent + descent) / pixel_ratio
-                        + 2.
-                        + padding[0]
-                        + padding[2]
-                        + borders[0]
-                        + borders[2]))
-                    .justify_center();
+                let height = px((ascent + descent) / pixel_ratio
+                    + 2.
+                    + padding[0]
+                    + padding[2]
+                    + borders[0]
+                    + borders[2]);
+                el = if stretched(1) {
+                    el.min_h(height)
+                } else {
+                    el.h(height)
+                }
+                .justify_center();
             }
         }
         el = el
@@ -2051,6 +2867,30 @@ fn create(
             padding[0] + padding[2] + borders[0] + borders[2] - reserved[0],
         ]
     };
+    // WARNING: a flex item does not shrink below its natural size in its main axis while its minimum is `auto`, and
+    // that minimum stays within its maximum.
+    let floor = |axis: usize, size: f32| {
+        let [min, max] = [
+            [Prop::MIN_WIDTH, Prop::MAX_WIDTH],
+            [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT],
+        ][axis];
+        if !flex_parent
+            || style.get(min).is_some_and(|value| value != "auto")
+            || reader
+                .parent(id, Prop::FLEX_DIRECTION)
+                .is_some_and(|value| value.starts_with("column"))
+                != (axis == 1)
+        {
+            return None;
+        }
+        match style.get(max).filter(|value| *value != "none") {
+            Some(value) if value.contains('%') => None,
+            Some(value) => units
+                .resolve(value, containing[axis])
+                .map(|max| size.min(max + extra[axis])),
+            None => Some(size),
+        }
+    };
     if editable {
         let chrome = [
             padding[1] + padding[3] + borders[1] + borders[3],
@@ -2070,7 +2910,19 @@ fn create(
             None,
         );
         if auto[0] {
-            el = el.w(px(width + chrome[0]));
+            // WARNING: like a block, a field stretches between both insets when it is absolute.
+            if !stretched(0)
+                && !(matches!(position, "absolute" | "fixed")
+                    && [Prop::LEFT, Prop::RIGHT]
+                        .iter()
+                        .all(|&prop| style.get(prop).is_some_and(|value| value != "auto")))
+            {
+                el = el.w(px(width + chrome[0]));
+            }
+            // WARNING: a textarea scrolls, so as a flex item it can shrink below its natural size.
+            if let Some(min) = floor(0, width + chrome[0]).filter(|_| node.tag != "textarea") {
+                el = el.min_w(px(min));
+            }
         } else if percent {
             el = el.child(super::input::natural_width(px(width)));
         }
@@ -2095,18 +2947,17 @@ fn create(
     }
     let mut inner_shadows = Vec::new();
     let mut intrinsic_width = None;
-    let stretched = flex_parent
-        && node.parent.is_some_and(|parent| {
-            let parent = &styles.values[parent];
-            parent
-                .get(Prop::FLEX_DIRECTION)
+    let column_stretched = || {
+        flex_parent
+            && reader
+                .parent(id, Prop::FLEX_DIRECTION)
                 .is_some_and(|value| value.starts_with("column"))
-                && style
-                    .get(Prop::ALIGN_SELF)
-                    .filter(|value| *value != "auto")
-                    .or_else(|| parent.get(Prop::ALIGN_ITEMS))
-                    .is_none_or(|value| matches!(value, "normal" | "stretch"))
-        });
+            && style
+                .get(Prop::ALIGN_SELF)
+                .filter(|value| *value != "auto")
+                .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
+                .is_none_or(|value| matches!(value, "normal" | "stretch"))
+    };
     for (prop, value) in style.iter() {
         let value: &str = value;
         let vertical = matches!(
@@ -2116,6 +2967,7 @@ fn create(
         let base = containing[usize::from(vertical)];
         let length = || units.resolve(value, base);
         match prop {
+            Prop::WIDTH | Prop::HEIGHT if sizeless => {}
             Prop::WIDTH
             | Prop::HEIGHT
             | Prop::MIN_WIDTH
@@ -2145,7 +2997,7 @@ fn create(
                     || prop == Prop::WIDTH
                         && node.tag == "table"
                         && value == "fit-content"
-                        && stretched
+                        && column_stretched()
                     || prop == Prop::WIDTH
                         && value == "fit-content"
                         && matches!(position, "absolute" | "fixed")
@@ -2201,8 +3053,11 @@ fn create(
                 el.style().box_shadow = units.shadows(value, false);
                 inner_shadows = units.shadows(value, true);
             }
+            // WARNING: `auto <ratio>` keeps a replaced element's natural ratio.
             Prop::ASPECT_RATIO => {
-                if let Some(ratio) = aspect_ratio(value) {
+                if !(value.contains("auto") && natural_ratio.is_some())
+                    && let Some(ratio) = aspect_ratio(value)
+                {
                     el.style().aspect_ratio = Some(ratio);
                     el = only_auto_ratio(el, style);
                 }
@@ -2243,11 +3098,11 @@ fn create(
                 }
             }
             Prop::FLEX_BASIS if flex_parent => {
-                let axis = usize::from(node.parent.is_some_and(|parent| {
-                    styles.values[parent]
-                        .get(Prop::FLEX_DIRECTION)
-                        .is_some_and(|v| v.starts_with("column"))
-                }));
+                let axis = usize::from(
+                    reader
+                        .parent(id, Prop::FLEX_DIRECTION)
+                        .is_some_and(|v| v.starts_with("column")),
+                );
                 let base = containing[axis];
                 el.style().flex_basis = if let Some(percent) = value
                     .strip_suffix('%')
@@ -2383,7 +3238,102 @@ fn create(
             _ => {}
         }
     }
-    if block_size.is_some() {
+    // WARNING: a replaced element or a control takes its natural size for an auto size, in the content box like its
+    // natural ratio, unless a flex line stretches it. The ratio turns a set or stretched height into the width, and
+    // the in-flow picture turns the used width into an auto height.
+    if let Some(natural) = natural {
+        let chrome = [
+            padding[1] + padding[3] + borders[1] + borders[3],
+            padding[0] + padding[2] + borders[0] + borders[2],
+        ];
+        let props = [Prop::WIDTH, Prop::HEIGHT];
+        // WARNING: the size attributes of images and videos only hint a size that no rule sets.
+        let hint = [0, 1].map(|axis| {
+            node.attrs
+                .get(["width", "height"][axis])
+                .filter(|_| {
+                    style.get(props[axis]).is_none()
+                        && matches!(node.tag.as_str(), "img" | "video")
+                        && !(broken && natural == [16., 16.])
+                })
+                .and_then(|value| dimension(value, false))
+                .map(|length| length + extra[axis])
+        });
+        if let Some(width) = hint[0] {
+            el = el.w(px(width));
+        }
+        if let Some(height) = hint[1] {
+            el = el.h(px(height));
+        }
+        let set = [0, 1].map(|axis| {
+            hint[axis].is_some() || style.get(props[axis]).is_some_and(|value| value != "auto")
+        });
+        let [content_width, content_height] = [0, 1].map(|axis| {
+            hint[axis]
+                .or_else(|| {
+                    style
+                        .get(props[axis])
+                        .filter(|value| !value.contains('%'))
+                        .and_then(|value| units.resolve(value, containing[axis]))
+                        .map(|length| length + extra[axis])
+                })
+                .map(|length| (length - chrome[axis]).max(0.))
+        });
+        let stretch = [stretched(0), stretched(1)];
+        let css = el.style().aspect_ratio.is_some();
+        // WARNING: the line of a single-line row with a set height is definite, so it carries the ratio.
+        let line = (stretch[1]
+            && reader
+                .parent(id, Prop::FLEX_WRAP)
+                .is_none_or(|value| value == "nowrap")
+            && reader
+                .parent(id, Prop::HEIGHT)
+                .is_some_and(|value| value != "auto" && !value.contains('%')))
+        .then(|| (containing[1] - margin[0] - margin[2] - chrome[1]).max(0.));
+        let sized = !set[0] && !stretch[0] && !(css && set[1]);
+        let width = if set[0] {
+            content_width
+        } else if !sized {
+            None
+        } else {
+            match natural_ratio.filter(|_| !css) {
+                Some(ratio) if set[1] => content_height.map(|height| height * ratio),
+                Some(ratio) => Some(line.map_or(natural[0], |line| line * ratio)),
+                None => Some(natural[0]),
+            }
+        };
+        if sized {
+            if let Some(width) = width {
+                el = el.w(px(width + chrome[0]));
+                if let Some(min) = floor(0, width + chrome[0]) {
+                    el = el.min_w(px(min));
+                }
+            } else {
+                el.style().aspect_ratio = natural_ratio;
+                el = only_auto_ratio(el, style);
+            }
+        }
+        // WARNING: a line that is not definite takes its height from its items, so a stretched item keeps its
+        // natural height as a minimum. An absolute box would stretch to both its insets, so it takes the height
+        // of its ratio too.
+        if let Some(height) = match natural_ratio {
+            _ if set[1] || line.is_some() || css => None,
+            None => Some(natural[1]),
+            Some(ratio) if matches!(position, "absolute" | "fixed") => width.map(|width| width / ratio),
+            Some(_) => None,
+        } {
+            let height = height + chrome[1];
+            if stretch[1] && style.get(Prop::MIN_HEIGHT).is_none_or(|value| value == "auto") {
+                el = el.min_h(px(height));
+            } else {
+                el = el.h(px(height));
+                if let Some(min) = floor(1, height) {
+                    el = el.min_h(px(min));
+                }
+            }
+        }
+    }
+    if block_size.is_some() && natural.is_none() {
         for (axis, size, sides) in [(0, Prop::WIDTH, [3, 1]), (1, Prop::HEIGHT, [0, 2])] {
             let [start, end] = sides.map(|side| {
                 style
@@ -2406,6 +3356,13 @@ fn create(
             }
         }
     }
+    // WARNING: like replaced elements, controls keep their own width as blocks.
+    let replaced = natural.is_some()
+        || symbol.is_some()
+        || matches!(
+            node.tag.as_str(),
+            "svg" | "input" | "button" | "select" | "textarea" | "progress" | "meter"
+        );
     let auto = [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT]
         .map(|prop| style.get(prop).is_some_and(|value| value == "auto"));
     if auto.contains(&true)
@@ -2418,18 +3375,7 @@ fn create(
         && style.get(Prop::WIDTH).is_none_or(|value| value == "auto")
         && !matches!(position, "absolute" | "fixed")
         && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
-        && !matches!(
-            node.tag.as_str(),
-            "img"
-                | "svg"
-                | "canvas"
-                | "video"
-                | "iframe"
-                | "input"
-                | "button"
-                | "select"
-                | "textarea"
-        )
+        && !replaced
     {
         if auto == [true, true] || margin[1] + margin[3] == 0. {
             el = el.w(relative(1.));
@@ -2449,11 +3395,10 @@ fn create(
         && style
             .get(Prop::FLEX_BASIS)
             .is_none_or(|value| value == "auto")
-        && node.parent.is_some_and(|parent| {
-            styles.values[parent]
-                .get(Prop::FLEX_DIRECTION)
-                .is_none_or(|value| value.starts_with("row"))
-        })
+        && node.parent.is_some()
+        && reader
+            .parent(id, Prop::FLEX_DIRECTION)
+            .is_none_or(|value| value.starts_with("row"))
         && let width @ (renderer::Length::Px(_) | renderer::Length::Calc(..)) =
             el.style().size.width
     {
@@ -2466,10 +3411,24 @@ fn create(
         && display.starts_with("inline")
         && let Some(parent) = node.parent
     {
+        // WARNING: like shrink-to-fit, an inline block of auto width gets no wider than its line, which is always a
+        // flex row, so its text wraps.
+        if display != "inline"
+            && el.style().size.width == renderer::Length::Auto
+            && (!replaced || node.tag == "button")
+            && float_side(style).is_none()
+        {
+            el.style().flex_shrink = 1.;
+        }
+        reader.log(
+            Query::ParentFont,
+            depth,
+            hashed(parent_font(doc, styles, id)),
+        );
         let align = style.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
         let middle = match el.style().size.height {
             _ if align != "middle" => None,
-            _ if display == "inline" => Some(units.font.lh),
+            _ if display == "inline" && symbol.is_none() => Some(units.font.lh),
             renderer::Length::Px(height) => Some(f32::from(height) + margin[0] - margin[2]),
             _ => None,
         };
@@ -2486,20 +3445,22 @@ fn create(
             font.lh - f32::from(text.baseline(face, px(font.em), px(font.lh), pixel_ratio))
         };
         let line = styles.lengths[parent].font;
-        let replaced = matches!(
-            node.tag.as_str(),
-            "img"
-                | "svg"
-                | "canvas"
-                | "video"
-                | "audio"
-                | "iframe"
-                | "embed"
-                | "object"
-                | "progress"
-                | "meter"
-                | "textarea"
-        ) || check
+        let replaced = symbol.is_some()
+            || matches!(
+                node.tag.as_str(),
+                "img"
+                    | "svg"
+                    | "canvas"
+                    | "video"
+                    | "audio"
+                    | "iframe"
+                    | "embed"
+                    | "object"
+                    | "progress"
+                    | "meter"
+                    | "textarea"
+            )
+            || check
             || display == "inline-block"
                 && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                     .into_iter()
@@ -2514,6 +3475,7 @@ fn create(
                 && node.children.iter().all(|&child| {
                     doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
                 });
+        let replaced = replaced && alt.is_none();
         let field = editable && node.tag == "input";
         let swatch = native
             .as_ref()
@@ -2547,6 +3509,13 @@ fn create(
             line.ex / 2. - height / 2.
         } else if swatch {
             -padding[2] - borders[2] - 4.
+        } else if node.tag == "button"
+            && node.children.iter().all(|&child| {
+                doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
+            })
+        {
+            // WARNING: like Chrome, an empty button has its baseline at the bottom of its content box.
+            -padding[2] - borders[2]
         } else if native.is_some() {
             0.
         } else {
@@ -2624,53 +3593,42 @@ fn create(
         el = el.child(inset_shadows(inner_shadows, radius, borders));
     }
     if cfg!(target_os = "macos")
-        && node.tag == "span"
-        && node.children.iter().all(|&child| {
-            let child = &doc.nodes[child];
-            child.tag == "#comment" || child.tag == "#text" && child.text.trim().is_empty()
-        })
-        && let Some(symbol) = style
-            .get(Prop::APP_SF_SYMBOL)
-            .filter(|name| *name != "none")
+        && let Some(symbol) = symbol
     {
-        let symbol = symbol.trim_matches(['\'', '"']).to_owned();
+        let symbol = symbol.replace('-', ".");
         el = el.child(
             renderer::canvas(
                 |_, _| (),
                 move |bounds, _, window| window.paint_symbol(&symbol, bounds, ink),
             )
             .absolute()
-            .top_0()
-            .left_0()
-            .size_full(),
+            .top(px(padding[0]))
+            .right(px(padding[1]))
+            .bottom(px(padding[2]))
+            .left(px(padding[3])),
         );
     }
-    if image_child.is_some() || cropped.is_some() {
+    if let Some(fit) = picture {
         let inset = |side: usize| px(borders[side] + padding[side]);
         let corners = radius
             .to_pixels(size(px(basis()[0]), px(basis()[1])))
             .inset(inset(0), inset(1), inset(2), inset(3));
-        if let Some(mut image) = image_child {
+        let cropped = matches!(fit, renderer::ObjectFit::Cover | renderer::ObjectFit::None);
+        let mut image = renderer::node().size_full().hooks(super::paint::Picture {
+            id,
+            view: view.clone(),
+            source: super::paint::Source::Element,
+            fit,
+            cropped: cropped.then_some(corners),
+        });
+        image.style().aspect_ratio = natural_ratio;
+        if !cropped {
             image.style().corner_radii = renderer::Radii {
                 x: corners.x.map(renderer::Length::Px),
                 y: corners.y.map(renderer::Length::Px),
             };
-            el = el.child(image);
-        } else if let Some((image, fit)) = cropped {
-            el = el.child(
-                renderer::canvas(
-                    |_, _| (),
-                    move |bounds, _, window| {
-                        let natural = image.size();
-                        if u32::from(natural.width) > 0 && u32::from(natural.height) > 0 {
-                            let fitted = fit.get_bounds(bounds, natural);
-                            window.paint_image(bounds, fitted, corners, image.clone(), false);
-                        }
-                    },
-                )
-                .size_full(),
-            );
         }
+        el = el.child(image);
     }
     if let Some(lines) = style
         .get(Prop::WEBKIT_LINE_CLAMP)
@@ -2875,6 +3833,7 @@ fn create(
         {
             Some(scroll.entry(id).or_default().clone())
         } else if overflow.contains(&renderer::Overflow::Hidden) {
+            reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(scroll.get(&id))));
             scroll.get(&id).cloned()
         } else {
             None
@@ -3094,8 +4053,88 @@ fn create(
         }
         el = el.child(marker_box);
     }
+    // WARNING: an estimate of the content box, for a box that the last layout did not size.
+    let content_box = || {
+        let mut content = containing;
+        for (axis, (prop, min, max)) in [
+            (Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH),
+            (Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(value) = style
+                .get(prop)
+                .and_then(|v| units.resolve(v, containing[axis]))
+                .map(|value| value + extra[axis])
+                .or(intrinsic_width.filter(|_| axis == 0))
+            {
+                content[axis] = value;
+            } else if axis == 0 {
+                content[axis] -= margin[1] + margin[3];
+            }
+            if let Some(value) = style
+                .get(max)
+                .and_then(|v| units.resolve(v, containing[axis]))
+            {
+                content[axis] = content[axis].min(value + extra[axis]);
+            }
+            if let Some(value) = style
+                .get(min)
+                .and_then(|v| units.resolve(v, containing[axis]))
+            {
+                content[axis] = content[axis].max(value + extra[axis]);
+            }
+            content[axis] = (content[axis]
+                - padding[1 - axis]
+                - padding[3 - axis]
+                - borders[1 - axis]
+                - borders[3 - axis])
+                .max(0.);
+        }
+        if let Some((bounds, _)) = &slot {
+            content[0] = (bounds[2]
+                - padding[1]
+                - padding[3]
+                - margin[1]
+                - margin[3]
+                - borders[1]
+                - borders[3])
+                .max(0.);
+            content[1] = (bounds[3]
+                - padding[0]
+                - padding[2]
+                - margin[0]
+                - margin[2]
+                - borders[0]
+                - borders[2])
+                .max(0.);
+        }
+        content
+    };
+    // WARNING: pseudo-elements query their originating element, so a container records its size even without
+    // children, and its pseudo-elements and children resolve container units against it. The size from the last
+    // layout wins over the estimate.
+    let own = style
+        .get(Prop::CONTAINER_TYPE)
+        .is_some_and(|v| matches!(v, "inline-size" | "size"))
+        .then(|| {
+            let mut host = view.host.borrow_mut();
+            let dom = host.dom.entry(view.id).or_default();
+            let last = dom.cull.widths.get(&id).copied();
+            reader.log(
+                Query::Width(id as u32),
+                0,
+                hashed(last.map(|size| size.map(f32::to_bits))),
+            );
+            let size = last.unwrap_or_else(content_box);
+            dom.containers.insert(id, size);
+            size
+        });
     let mut after = None;
     if let Some(pseudos) = styles.pseudos.get(&id) {
+        let mut units = units;
+        units.container = own.or(units.container);
         for (index, pseudo) in pseudos.iter().enumerate() {
             let Some(content) = pseudo
                 .get(Prop::CONTENT)
@@ -3394,6 +4433,9 @@ fn create(
                 decoration
             };
             if index == 0 {
+                if std::mem::take(&mut strut_due) {
+                    el = el.child(strut());
+                }
                 el = el.child(decoration);
             } else {
                 after = Some(decoration);
@@ -3404,7 +4446,8 @@ fn create(
         .get(Prop::WHITE_SPACE)
         .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"))
         || node.tag == "pre";
-    if (node.tag == "#text" || display == "inline" && !flex_parent && slot.is_none())
+    if (node.tag == "#text"
+        || display == "inline" && symbol.is_none() && !flex_parent && slot.is_none())
         && style
             .get(Prop::WHITE_SPACE)
             .is_none_or(|value| !matches!(value, "pre" | "nowrap"))
@@ -3414,65 +4457,91 @@ fn create(
     if preserve && node.text == "\n" {
         el = el.min_h(px(units.font.lh));
     }
-    let inline = if editable || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe") {
-        None
-    } else {
-        inline_text
-            .borrow_mut()
-            .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
-            .clone()
-            .filter(|data| {
-                !data.text.is_empty()
-                    || std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
-                        .any(|node| doc.nodes[node].attrs.contains_key("contenteditable"))
-            })
-    };
+    let inline =
+        if editable || symbol.is_some() || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
+        {
+            None
+        } else {
+            inline_text
+                .borrow_mut()
+                .entry(id)
+                .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
+                .clone()
+                .filter(|data| {
+                    !data.text.is_empty() || {
+                        let found = content_editable(doc, id);
+                        reader.log(
+                            Query::Editable,
+                            found.map_or(1, |node| reader.scope_of(id, node)),
+                            hashed(found.is_some()),
+                        );
+                        found.is_some()
+                    }
+                })
+        };
     let hit_test = inline.is_some();
     let drag = style
         .get(Prop::APP_REGION)
         .is_some_and(|value| value == "drag");
     if (hit_test || node.tag == "#text")
         && !drag
-        && styles.user_select[id].0 != style::UserSelect::None
+        && {
+            // WARNING: an inherited mode is the same in all boxes from the one that sets it down, so a box above
+            // replays it as its own. A box that sets its own mode reads its parent too, because an ancestor in an
+            // exit transition gets `display: none` and hides the box with no new revision.
+            let (mode, origin) = styles.user_select[id];
+            let origin = if origin == id {
+                node.parent.unwrap_or(id)
+            } else {
+                origin
+            };
+            reader.log(
+                Query::UserSelect,
+                reader.scope_of(id, origin),
+                hashed(mode as u8),
+            );
+            mode != style::UserSelect::None
+        }
         && style.get(Prop::CURSOR).is_none_or(|value| value == "auto")
     {
         el = el.cursor(renderer::CursorStyle::IBeam);
     }
+    let mut plans = 0;
     if let Some(data) = inline {
-        if style
-            .get(Prop::CONTAINER_TYPE)
-            .is_some_and(|v| matches!(v, "inline-size" | "size"))
-        {
-            let size = [0, 1].map(|axis| {
-                (style
-                    .get([Prop::WIDTH, Prop::HEIGHT][axis])
-                    .and_then(|v| units.resolve(v, containing[axis]))
-                    .map_or(
-                        containing[axis] - [margin[1] + margin[3], 0.][axis],
-                        |value| value + extra[axis],
-                    )
-                    - padding[1 - axis]
-                    - padding[3 - axis]
-                    - borders[1 - axis]
-                    - borders[3 - axis])
-                    .max(0.)
-            });
-            let mut host = view.host.borrow_mut();
-            let dom = host.dom.entry(view.id).or_default();
-            let size = dom.cull.widths.get(&id).copied().unwrap_or(size);
-            dom.containers.insert(id, size);
-        }
+        #[cfg(debug_assertions)]
+        reader.extra.set(hashed(&*data.text));
+        let atom_containing = [
+            (containing[0]
+                - margin[1]
+                - margin[3]
+                - padding[1]
+                - padding[3]
+                - borders[1]
+                - borders[3])
+                .max(0.),
+            containing[1],
+        ];
+        let mut atom_elements: Vec<renderer::Child> = data
+            .atoms
+            .iter()
+            .map(|atom| element(build, atom.node, atom_containing, container, None))
+            .collect();
         let atom_slots: Rc<[super::text::AtomSlot]> = data
             .atoms
             .iter()
-            .map(|atom| {
+            .zip(&mut atom_elements)
+            .map(|(atom, child)| {
                 let last = view
                     .host
                     .borrow()
                     .dom
                     .get(&view.id)
                     .and_then(|dom| dom.atoms.get(&atom.node).copied());
+                reader.log(
+                    Query::Atom(atom.node as u32),
+                    0,
+                    hashed(last.map(|size| size.map(f32::to_bits))),
+                );
                 let size = last.unwrap_or_else(|| {
                     let [_, max, _, height] = super::grid::intrinsic(
                         doc,
@@ -3488,6 +4557,7 @@ fn create(
                 });
                 super::text::AtomSlot {
                     size,
+                    align: align_of(child),
                     at: std::cell::Cell::new(point(px(0.), px(0.))),
                 }
             })
@@ -3550,25 +4620,14 @@ fn create(
                         }),
                 }),
         );
-        let atom_containing = [
-            (containing[0]
-                - margin[1]
-                - margin[3]
-                - padding[1]
-                - padding[3]
-                - borders[1]
-                - borders[3])
-                .max(0.),
-            containing[1],
-        ];
-        for (index, atom) in data.atoms.iter().enumerate() {
+        for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
             let mut wrapper = renderer::node()
                 .absolute()
                 .left(px(padding[3]))
                 .top(px(padding[0]))
                 .flex()
                 .flex_row()
-                .max_w(relative(1.));
+                .max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3])));
             wrapper.style().align_items = Some(renderer::AlignItems::Baseline);
             el = el.child(
                 wrapper
@@ -3578,7 +4637,7 @@ fn create(
                         node: atom.node,
                         view: view.clone(),
                     })
-                    .child(element(build, atom.node, atom_containing, container, None)),
+                    .child(child),
             );
         }
     } else if !node.children.is_empty()
@@ -3587,88 +4646,19 @@ fn create(
         && node.tag != "svg"
         && !editable
     {
-        let mut content = containing;
-        for (axis, (prop, min, max)) in [
-            (Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH),
-            (Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if let Some(value) = style
-                .get(prop)
-                .and_then(|v| units.resolve(v, containing[axis]))
-                .map(|value| value + extra[axis])
-                .or(intrinsic_width.filter(|_| axis == 0))
-            {
-                content[axis] = value;
-            } else if axis == 0 {
-                content[axis] -= margin[1] + margin[3];
-            }
-            if let Some(value) = style
-                .get(max)
-                .and_then(|v| units.resolve(v, containing[axis]))
-            {
-                content[axis] = content[axis].min(value + extra[axis]);
-            }
-            if let Some(value) = style
-                .get(min)
-                .and_then(|v| units.resolve(v, containing[axis]))
-            {
-                content[axis] = content[axis].max(value + extra[axis]);
-            }
-            content[axis] = (content[axis]
-                - padding[1 - axis]
-                - padding[3 - axis]
-                - borders[1 - axis]
-                - borders[3 - axis])
-                .max(0.);
-        }
-        if let Some((bounds, _)) = &slot {
-            content[0] = (bounds[2]
-                - padding[1]
-                - padding[3]
-                - margin[1]
-                - margin[3]
-                - borders[1]
-                - borders[3])
-                .max(0.);
-            content[1] = (bounds[3]
-                - padding[0]
-                - padding[2]
-                - margin[0]
-                - margin[2]
-                - borders[0]
-                - borders[2])
-                .max(0.);
-        }
-        let container = if style
-            .get(Prop::CONTAINER_TYPE)
-            .is_some_and(|v| matches!(v, "inline-size" | "size"))
-        {
-            // WARNING: `content` is an estimate, so the size from the last layout wins.
-            let mut host = view.host.borrow_mut();
-            let dom = host.dom.entry(view.id).or_default();
-            let size = dom.cull.widths.get(&id).copied().unwrap_or(content);
-            dom.containers.insert(id, size);
-            size
-        } else {
-            container
-        };
+        let mut content = content_box();
+        let container = own.unwrap_or(container);
         let flexed = style
             .get(Prop::DISPLAY)
             .is_some_and(|v| v.ends_with("grid"))
             && slot.is_none()
             && style.get(Prop::HEIGHT).is_none_or(|v| v == "auto")
-            && node.parent.is_some_and(|parent| {
-                let parent = &styles.values[parent];
-                parent
-                    .get(Prop::DISPLAY)
-                    .is_some_and(|v| v.ends_with("flex"))
-                    && parent
-                        .get(Prop::FLEX_DIRECTION)
-                        .is_some_and(|v| v.starts_with("column"))
-            })
+            && reader
+                .parent(id, Prop::DISPLAY)
+                .is_some_and(|v| v.ends_with("flex"))
+            && reader
+                .parent(id, Prop::FLEX_DIRECTION)
+                .is_some_and(|v| v.starts_with("column"))
             && (style
                 .get(Prop::FLEX_GROW)
                 .and_then(|v| v.parse::<f32>().ok())
@@ -3680,44 +4670,9 @@ fn create(
             && slot.is_none()
             && style.get(Prop::WIDTH).is_none_or(|v| v == "auto")
             && {
-                let mut child = id;
-                loop {
-                    let own = &styles.values[child];
-                    let inset = |prop| own.get(prop).is_some_and(|v| v != "auto");
-                    if float_side(own).is_some()
-                        || own
-                            .get(Prop::POSITION)
-                            .is_some_and(|v| matches!(v, "absolute" | "fixed"))
-                            && !(inset(Prop::LEFT) && inset(Prop::RIGHT))
-                    {
-                        break true;
-                    }
-                    let Some(parent) = doc.nodes[child].parent else {
-                        break false;
-                    };
-                    let parent = &styles.values[parent];
-                    let display = parent.get(Prop::DISPLAY).unwrap_or("block");
-                    if display.ends_with("flex")
-                        && parent
-                            .get(Prop::FLEX_DIRECTION)
-                            .is_none_or(|v| v.starts_with("row"))
-                    {
-                        break child == id
-                            || own
-                                .get(Prop::FLEX_GROW)
-                                .is_none_or(|v| v.parse::<f32>().is_ok_and(|grow| grow == 0.));
-                    }
-                    // WARNING: a column stretches to its own width, which can come from its content, as in a popup.
-                    if !matches!(display, "block" | "inline-block" | "flex" | "inline-flex")
-                        || parent.get(Prop::WIDTH).is_some_and(|v| v != "auto")
-                    {
-                        break false;
-                    }
-                    if display == "inline-block" {
-                        break true;
-                    }
-                    child = doc.nodes[child].parent.unwrap_or(child);
-                }
+                let (shrunk, farthest) = shrinks(doc, styles, id, true);
+                reader.log(Query::Shrunk, reader.scope_of(id, farthest), hashed(shrunk));
+                shrunk
             };
         let mut widest = None;
         let fills = style.get(Prop::DISPLAY).is_some_and(|v| v == "grid")
@@ -3728,24 +4683,22 @@ fn create(
                 .get(Prop::WIDTH)
                 .is_none_or(|v| matches!(v, "auto" | "100%"))
             && !matches!(position, "absolute" | "fixed")
-            && node.parent.is_some_and(|parent| {
-                let parent = &styles.values[parent];
-                match parent.get(Prop::DISPLAY).unwrap_or("block") {
-                    "block" | "flow-root" | "list-item" => true,
-                    "flex" | "inline-flex" => {
-                        parent
-                            .get(Prop::FLEX_DIRECTION)
-                            .is_some_and(|v| v.starts_with("column"))
-                            && parent
-                                .get(Prop::ALIGN_ITEMS)
-                                .is_none_or(|v| matches!(v, "normal" | "stretch"))
-                            && style
-                                .get(Prop::ALIGN_SELF)
-                                .is_none_or(|v| matches!(v, "auto" | "stretch"))
-                    }
-                    _ => false,
+            && node.parent.is_some()
+            && match reader.parent(id, Prop::DISPLAY).unwrap_or("block") {
+                "block" | "flow-root" | "list-item" => true,
+                "flex" | "inline-flex" => {
+                    reader
+                        .parent(id, Prop::FLEX_DIRECTION)
+                        .is_some_and(|v| v.starts_with("column"))
+                        && reader
+                            .parent(id, Prop::ALIGN_ITEMS)
+                            .is_none_or(|v| matches!(v, "normal" | "stretch"))
+                        && style
+                            .get(Prop::ALIGN_SELF)
+                            .is_none_or(|v| matches!(v, "auto" | "stretch"))
                 }
-            });
+                _ => false,
+            };
         let grid = if let Some(display) = style
             .get(Prop::DISPLAY)
             .filter(|v| matches!(*v, "grid" | "inline-grid"))
@@ -3843,11 +4796,17 @@ fn create(
                 };
             // WARNING: entries stay while the grid is kept, so its size is checked in each frame.
             let mut host = view.host.borrow_mut();
-            let flexed = &mut host.dom.entry(view.id).or_default().flexed_grids;
+            let dom = host.dom.entry(view.id).or_default();
+            for (axis, track) in tracked.iter().enumerate() {
+                if let Some((used, _)) = track {
+                    reader.log(Query::Track(id as u32, axis as u8), 0, used.to_bits().into());
+                }
+            }
+            reader.log(Query::Baselines(id as u32), 0, baselines(doc, Some(&*dom), id));
             if tracked.iter().any(Option::is_some) {
-                flexed.insert(id, tracked);
+                dom.flexed_grids.insert(id, tracked);
             } else {
-                flexed.remove(&id);
+                dom.flexed_grids.remove(&id);
             }
             drop(host);
             let cached = view
@@ -3971,6 +4930,8 @@ fn create(
         };
         let multicol = columns(style, &units, content[0]);
         let mut line: Option<renderer::Node> = None;
+        let mut line_strut = false;
+        let mut joined = usize::MAX;
         let mut floating = Vec::new();
         let mut group: Option<(Vec<Child>, Vec<Child>, Vec<Child>)> = None;
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
@@ -4004,23 +4965,39 @@ fn create(
             && !flex_parent
             && slot.is_none()
             && info[id].flags & cull::CHILDREN_CHANGED == 0;
-        let stack = build.zone.clone().filter(|_| {
-            grid.is_none()
-                && columns.is_none()
-                && !all_inline
-                && display != "inline"
-                && if flexbox {
-                    wrap || style
-                        .get(Prop::FLEX_DIRECTION)
-                        .is_some_and(|v| v == "column")
-                        && style.get(Prop::FLEX_WRAP).is_none_or(|v| v == "nowrap")
-                        && style.get(Prop::JUSTIFY_CONTENT).is_none_or(|v| {
-                            matches!(v, "normal" | "flex-start" | "start" | "stretch")
-                        })
-                } else {
-                    flow && !children.iter().any(|&child| floated(child))
-                }
-        });
+        let stacks = grid.is_none()
+            && columns.is_none()
+            && !all_inline
+            && display != "inline"
+            && if flexbox {
+                wrap || style
+                    .get(Prop::FLEX_DIRECTION)
+                    .is_some_and(|v| v == "column")
+                    && style.get(Prop::FLEX_WRAP).is_none_or(|v| v == "nowrap")
+                    && style.get(Prop::JUSTIFY_CONTENT).is_none_or(|v| {
+                        matches!(v, "normal" | "flex-start" | "start" | "stretch")
+                    })
+            } else {
+                flow && !children.iter().any(|&child| floated(child))
+            };
+        // WARNING: how this box culls its children, for `PageState::reach`: 1 as blocks, 2 as a flex column, which
+        // keeps boxes with a set height, and none below a box that moves its content, whose subtree never culls.
+        plans = if info[id].flags & cull::MOVES_CONTENT != 0 {
+            u8::MAX
+        } else if grid.is_some() || stacks && (!flexbox || wrap) {
+            1
+        } else {
+            2 * u8::from(stacks)
+        };
+        let stack = build.zone.clone().filter(|_| stacks);
+        // WARNING: a debug check builds a kept box again without culling, so it leaves out what the kept build culled.
+        #[cfg(debug_assertions)]
+        let checked = build
+            .checking
+            .then(|| view.kept.borrow().get(&id).map(|kept| kept.plan.clone()))
+            .flatten();
+        #[cfg(debug_assertions)]
+        let mut culled_ids = Vec::new();
         let mut plan = None;
         if let Some(zone) = stack {
             let host = view.host.borrow();
@@ -4159,7 +5136,14 @@ fn create(
             }
             if !culled.is_empty() {
                 culls.set(culls.get() + 1);
-                el = el.child(cull::anchor(culled.clone(), zone.clone(), view.clone()));
+                #[cfg(debug_assertions)]
+                culled_ids.extend(culled.iter().map(|&(child, _)| child));
+                el = el.child(cull::anchor(
+                    culled.clone(),
+                    build.ancestors.clone(),
+                    zone.clone(),
+                    view.clone(),
+                ));
             }
             if let Some(baseline) = grid.first_baseline.filter(|_| {
                 grid.first_item
@@ -4178,7 +5162,13 @@ fn create(
         }
         macro_rules! place {
             ($element:expr, $child:expr) => {{
-                let element = $element.into();
+                let element: renderer::Child = $element.into();
+                if std::mem::take(&mut strut_next) && group.is_none() && columns.is_none() {
+                    el = el.child(strut());
+                }
+                if std::mem::take(&mut strut_due) {
+                    el = el.child(strut());
+                }
                 match group.as_mut() {
                     Some((_, _, content)) => content.push(element),
                     None if columns.is_some() => collected.push(($child, element)),
@@ -4220,18 +5210,33 @@ fn create(
             el.style().align_self = Some(renderer::AlignSelf::FlexStart);
             el
         };
+        let hangs = !preserve
+            && style
+                .get(Prop::WHITE_SPACE)
+                .is_none_or(|value| value != "nowrap")
+            && style
+                .get(Prop::TEXT_WRAP)
+                .is_none_or(|value| !value.contains("nowrap"));
         for (index, &child) in children.iter().enumerate() {
-            if shown(index) {
+            if index != joined && shown(index) {
                 if let Some((slots, runs, then, zone)) = plan.as_mut()
                     && let Some(&slot) = slots.get(index).filter(|&&slot| slot > 0)
                 {
                     if let Some(run) = runs[slot - 1].take() {
                         culls.set(culls.get() + 1);
+                        #[cfg(debug_assertions)]
+                        culled_ids.extend(&run.members);
                         if let Some(open) = line.take() {
                             place!(open, None);
                         }
                         place!(
-                            cull::spacer(run, id, *then, zone.clone(), view.clone()),
+                            cull::spacer(
+                                run,
+                                build.ancestors.clone(),
+                                *then,
+                                zone.clone(),
+                                view.clone()
+                            ),
                             None
                         );
                     }
@@ -4239,6 +5244,13 @@ fn create(
                 }
                 if culled.binary_search_by_key(&child, |&(id, _)| id).is_ok()
                     || top_layer.contains(&child)
+                {
+                    continue;
+                }
+                #[cfg(debug_assertions)]
+                if checked
+                    .as_ref()
+                    .is_some_and(|ids| ids.binary_search(&child).is_ok())
                 {
                     continue;
                 }
@@ -4284,6 +5296,33 @@ fn create(
                     .get(Prop::POSITION)
                     .is_some_and(|value| matches!(value, "absolute" | "fixed"));
                 let child_style = &styles.values[child];
+                // WARNING: like browsers, a collapsible space after an inline box hangs at the end of its line instead
+                // of starting the next one, so it joins the box in one item and shrinks first. There it doesn't move
+                // a centered or end aligned line (`Inline::Hangs`).
+                let child_element = match children.get(index + 1) {
+                    Some(&next)
+                        if hangs
+                            && grid.is_none()
+                            && !out_of_flow
+                            && !floated(child)
+                            && doc.nodes[next].tag == "#text"
+                            && doc.nodes[next].text.trim_ascii().is_empty()
+                            && shown(index + 1) =>
+                    {
+                        joined = index + 1;
+                        let mut child_element = child_element;
+                        let mut space = element(build, next, content, container, None);
+                        if let renderer::Child::Node(node) = &mut space {
+                            node.style().flex_shrink = 1e6;
+                        }
+                        let mut joint = renderer::node().flex().flex_row().flex_shrink(1.);
+                        joint.style().align_items = line_align;
+                        joint.style().align_self = align_of(&mut child_element);
+                        joint.style().inline = renderer::Inline::Hangs;
+                        joint.child(child_element).child(space).into()
+                    }
+                    _ => child_element,
+                };
                 if grid.is_none() && !out_of_flow {
                     let clear = child_style.get(Prop::CLEAR).unwrap_or("none");
                     if group.is_some() && clear != "none" {
@@ -4393,7 +5432,9 @@ fn create(
                         None => {
                             let mut next = renderer::node().flex().flex_row().flex_wrap();
                             next.style().justify_content = line_justify;
+                            next.style().inline = renderer::Inline::Lines;
                             line = Some(next.child(placeholder));
+                            line_strut = false;
                         }
                     }
                 }
@@ -4414,16 +5455,26 @@ fn create(
                     && inline_level(child)
                     && !out_of_flow
                 {
-                    let mut next = line.take().unwrap_or_else(|| {
-                        renderer::node()
+                    let mut next = match line.take() {
+                        Some(open) if std::mem::take(&mut line_strut) => {
+                            open.child(strut()).child(child_element)
+                        }
+                        Some(open) => open.child(child_element),
+                        None if doc.nodes[child].tag != "br" => {
+                            let (shared, aligned) = with_strut(child_element);
+                            line_strut = aligned;
+                            renderer::node().flex().flex_row().flex_wrap().child(shared)
+                        }
+                        None => renderer::node()
                             .flex()
                             .flex_row()
                             .flex_wrap()
                             .child(strut())
-                    });
+                            .child(child_element),
+                    };
                     next.style().justify_content = line_justify;
                     next.style().align_items = line_align;
-                    next = next.child(child_element);
+                    next.style().inline = renderer::Inline::Lines;
                     if doc.nodes[child].tag == "br" {
                         place!(next, None);
                     } else {
@@ -4435,7 +5486,16 @@ fn create(
                     if let Some(line) = line.take() {
                         place!(line, None);
                     }
+                    let (child_element, aligned) = if strut_due && doc.nodes[child].tag != "br" {
+                        strut_due = false;
+                        let (shared, aligned) = with_strut(child_element);
+                        (shared.into(), aligned)
+                    } else {
+                        (child_element, false)
+                    };
+                    let direct = group.is_none() && columns.is_none();
                     place!(child_element, Some(child));
+                    strut_next = aligned && direct;
                     if flow && all_inline && doc.nodes[child].tag == "br" {
                         place!(line_break(), None);
                     }
@@ -4443,6 +5503,11 @@ fn create(
             }
         }
         close_group!();
+        #[cfg(debug_assertions)]
+        {
+            culled_ids.sort_unstable();
+            reader.plan.replace(culled_ids.into());
+        }
         if let Some((count, gap, rule)) = columns {
             let width = ((content[0] - gap * (count - 1) as f32) / count as f32).max(0.);
             let heights: Vec<f32> = collected
@@ -4593,12 +5658,9 @@ fn create(
                 && axes[0]
                 && let Some(parent) = parent
             {
-                el = el.left(px(styles.lengths[parent].edges(
-                    &styles.values[parent],
-                    style::PADDING,
-                    containing[0],
-                )[3]
-                .max(0.)));
+                let left = padding_left(styles, parent, containing[0]);
+                reader.log(Query::FlatParentPadding, depth, hashed(Some(left.to_bits())));
+                el = el.left(px(left));
             }
             anchor = Some((axes, block, [margin[3], margin[0]]));
         }
@@ -4610,41 +5672,53 @@ fn create(
     let sticky = (style.get(Prop::POSITION).is_some_and(|v| v == "sticky"))
         .then(|| {
             let host = view.host.borrow();
-            let insets = |parent: usize, padding: bool| {
-                let (style, units) = (&styles.values[parent], &styles.lengths[parent]);
-                let padding = if padding {
-                    units.edges(style, style::PADDING, containing[0])
-                } else {
-                    [0.; 4]
-                };
-                std::array::from_fn::<f32, 4, _>(|side| {
-                    let [width, kind, _] = style::BORDERS[side];
-                    padding[side]
-                        + if style
-                            .get(kind)
-                            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                        {
-                            0.
-                        } else {
-                            style
-                                .get(width)
-                                .map_or(Some(3.), |v| units.resolve(v, containing[0]))
-                                .unwrap_or(0.)
-                                .max(0.)
-                        }
-                })
-            };
             let scrolls = &host.dom.get(&view.id)?.scroll;
             let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls);
+            let border = insets(styles, parent, false, containing[0]);
+            reader.log(
+                Query::Scroller,
+                ancestors
+                    .iter()
+                    .rposition(|&ancestor| ancestor == parent)
+                    .map_or(1, |index| index + 1),
+                hashed((
+                    parent,
+                    border.map(f32::to_bits),
+                    scrolls.contains_key(&parent),
+                )),
+            );
+            let block = ancestors
+                .last()
+                .map(|&parent| (parent, insets(styles, parent, true, containing[0])));
+            reader.log(
+                Query::StickyParent,
+                depth,
+                hashed(block.map(|(parent, insets)| (parent, insets.map(f32::to_bits)))),
+            );
             Some(super::paint::Sticky {
                 scroll: scrolls.get(&parent)?.clone(),
-                border: insets(parent, false),
-                block: ancestors
-                    .last()
-                    .map(|&parent| (parent, insets(parent, true))),
+                border,
+                block,
             })
         })
         .flatten();
+    // WARNING: blocks lay out as a stretched flex column, so a replaced element or a control, and a block whose width
+    // comes from its ratio and a set height, must not stretch, and they start at the right in right-to-left blocks.
+    if !flex_parent
+        && slot.is_none()
+        && !display.starts_with("inline")
+        && el.style().align_self.is_none()
+        && (replaced
+            || el.style().aspect_ratio.is_some()
+                && matches!(el.style().size.width, renderer::Length::Auto)
+                && !matches!(el.style().size.height, renderer::Length::Auto))
+    {
+        el.style().align_self = Some(if reader.parent(id, Prop::DIRECTION) == Some("rtl") {
+            renderer::AlignItems::FlexEnd
+        } else {
+            renderer::AlignItems::FlexStart
+        });
+    }
     let vertical = style
         .get(Prop::WRITING_MODE)
         .filter(|mode| mode.starts_with("vertical") || mode.starts_with("sideways"))
@@ -4690,7 +5764,7 @@ fn create(
         }
         None => el,
     };
-    let element = el.hooks(DomBox {
+    let hooks = DomBox {
         placed: Default::default(),
         anchor,
         block: made.absolute.then_some(borders),
@@ -4722,17 +5796,15 @@ fn create(
                     styles.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse")
                 }))
         .then(|| borders.map(|width| width / 2.)),
-        boxless: node.tag == "option"
-            && std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
-                .take(2)
-                .find(|&parent| doc.nodes[parent].tag == "select")
-                .is_some_and(|select| {
-                    let attrs = &doc.nodes[select].attrs;
-                    !attrs.contains_key("multiple")
-                        && !attrs.get("size").is_some_and(|size| {
-                            size.trim().parse::<u32>().is_ok_and(|size| size > 1)
-                        })
-                }),
+        boxless: node.tag == "option" && {
+            let found = boxless(doc, id);
+            reader.log(
+                Query::Boxless(id as u32),
+                found.map_or(0, |(select, _)| reader.scope_of(id, select)),
+                hashed(found.map(|select| select.1)),
+            );
+            found.is_some_and(|select| select.1)
+        },
         text: (display == "inline" && !node.tag.starts_with('#'))
             .then(|| {
                 let mut texts = node.children.iter().copied().filter(|&child| {
@@ -4789,6 +5861,7 @@ fn create(
             Rc::from([])
         },
         id,
+        plans,
         ids: ids.clone(),
         view: view.clone(),
         sticky,
@@ -4799,7 +5872,38 @@ fn create(
                 .get(prop)
                 .and_then(|v| units.resolve(v, containing[axis]))
         }),
-    });
+    };
+    #[cfg(debug_assertions)]
+    reader.extra.set(hashed(format!(
+        "{} {:?}",
+        reader.extra.get(),
+        (
+            (
+                hooks.anchor,
+                hooks.block,
+                hooks.container,
+                hooks.sized,
+                hooks.inset,
+                hooks.effects,
+                hooks.composited,
+                hooks.revision,
+                hooks.sides,
+                hooks.margin,
+            ),
+            (
+                hooks.cell,
+                hooks.grid,
+                &hooks.parts,
+                hooks.shared,
+                hooks.leading,
+                hooks.boxless,
+                hooks.text,
+                hooks.fixed,
+                hooks.sticky.as_ref().map(|sticky| (sticky.border, sticky.block)),
+            ),
+        )
+    )));
+    let element = el.hooks(hooks);
     // WARNING: `z-index` does nothing in the top layer, whose boxes paint in their own order.
     if layered
         && let Some(order) = order.filter(|order| *order != 0)
@@ -4964,6 +6068,96 @@ pub(super) fn text_field(node: &crate::dom::Node) -> bool {
                 .iter()
                 .any(|other| kind.eq_ignore_ascii_case(other))
             })
+}
+
+// WARNING: an image without a picture stays a replaced element only with both size attributes, which give its
+// natural size and ratio, or with neither a source nor alt text, at size 0. An object shows its children unless it
+// has neither data nor fallback content. Sizes are in the content box.
+pub(super) fn natural_size(
+    doc: &Document,
+    id: usize,
+    decoded: Option<[f32; 2]>,
+) -> Option<([f32; 2], Option<f32>)> {
+    let node = &doc.nodes[id];
+    let attr = |name: &str, default: f32| {
+        node.attrs
+            .get(name)
+            .and_then(|value| dimension(value, node.tag == "canvas"))
+            .unwrap_or(default)
+    };
+    let pictured = |size: [f32; 2]| (size, (size[0] > 0. && size[1] > 0.).then(|| size[0] / size[1]));
+    let kind = node.attrs.get("type").map_or("", String::as_str);
+    // WARNING: a failed image keeps the size of the last picture it decoded, which it no longer shows.
+    match (node.tag.as_str(), decoded.filter(|_| !broken_image(node))) {
+        ("canvas", _) => Some(pictured([attr("width", 300.), attr("height", 150.)])),
+        ("img" | "video", Some(size)) => Some(pictured(size)),
+        ("video", None) => Some(([300., 150.], None)),
+        // WARNING: like Chrome, a failed image with alt text has no natural size, and one without shows a broken
+        // image icon only when it has a source and no alt attribute.
+        ("img", None) => {
+            let (broken, alt) = (broken_image(node), node.attrs.get("alt"));
+            match ["width", "height"].map(|name| {
+                node.attrs
+                    .get(name)
+                    .and_then(|value| dimension(value, false))
+            }) {
+                [Some(width), Some(height)] if !broken || alt.is_none_or(|alt| alt.is_empty()) => {
+                    Some(pictured([width, height]))
+                }
+                _ if !broken || alt.is_some_and(|alt| !alt.is_empty()) => None,
+                _ if alt.is_none() && node.attrs.contains_key("src") => Some(([16., 16.], None)),
+                _ => Some(([0., 0.], None)),
+            }
+        }
+        ("object", _)
+            if node.attrs.contains_key("data")
+                || node.children.iter().any(|&child| {
+                    let child = &doc.nodes[child];
+                    !matches!(child.tag.as_str(), "param" | "#comment")
+                        && (child.tag != "#text" || !child.text.trim_ascii().is_empty())
+                }) =>
+        {
+            None
+        }
+        ("iframe" | "object" | "embed", _) => {
+            Some(([attr("width", 300.), attr("height", 150.)], None))
+        }
+        ("input", _) if kind.eq_ignore_ascii_case("range") => Some(([129., 16.], None)),
+        ("input", _)
+            if kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio") =>
+        {
+            Some(([13., 13.], None))
+        }
+        _ => None,
+    }
+}
+
+// WARNING: like Chrome, an image without a source counts as failed.
+pub(super) fn broken_image(node: &crate::dom::Node) -> bool {
+    node.tag == "img"
+        && (node.state & crate::dom::BROKEN != 0
+            || !node.attrs.contains_key("src") && !node.attrs.contains_key("srcset"))
+}
+
+// WARNING: one raster per thread and scale, never freed, like a UA resource.
+fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut renderer::Window) {
+    thread_local! {
+        static ICON: RefCell<Option<(u32, Arc<renderer::RenderImage>)>> = const { RefCell::new(None) };
+    }
+    const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><defs><linearGradient id="s" x2="0" y2="1"><stop offset="0" stop-color="#ebf2fd"/><stop offset="1" stop-color="#c3d4f3"/></linearGradient><clipPath id="c"><path d="M.25.25h10l5.5 5.5v10H.25z"/></clipPath></defs><g clip-path="url(#c)"><rect width="16" height="16" fill="url(#s)"/><ellipse cx="6" cy="4.5" rx="2.5" ry="1.25" fill="#fff"/><ellipse cx="7" cy="17" rx="7.5" ry="6.5" fill="#58ae39"/></g><path d="M.25.25h10l5.5 5.5v10H.25z" fill="none" stroke="#999" stroke-width=".5"/><path d="M10.25.25v5.5h5.5" fill="#f2f2f2" stroke="#999" stroke-width=".5"/><path d="M16.5 8 7.5 16.5" stroke="#fff" stroke-width="1.25"/></svg>"##;
+    let raster = (16. * window.scale_factor()).ceil() as u32;
+    let Some(image) = ICON.with_borrow_mut(|icon| {
+        if icon.as_ref().is_none_or(|(size, _)| *size != raster) {
+            *icon = super::canvas::svg(SVG, raster, raster, None)
+                .ok()
+                .map(|image| (raster, image));
+        }
+        icon.as_ref().map(|(_, image)| image.clone())
+    }) else {
+        return;
+    };
+    let bounds = Bounds::new(origin, size(px(16.), px(16.)));
+    window.paint_image(bounds, bounds, px(0.), image, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5244,8 +6438,27 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
             Prop::BORDER_BOTTOM_STYLE,
         ]
     };
+    // WARNING: replaced elements and form controls have content of their own, so margins never collapse through
+    // them or into their fallback children.
     id != 0
-        && doc.nodes[id].tag != "html"
+        && doc.nodes[id].sf_symbol().is_none()
+        && !matches!(
+            doc.nodes[id].tag.as_str(),
+            "html"
+                | "img"
+                | "svg"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "embed"
+                | "input"
+                | "button"
+                | "select"
+                | "textarea"
+                | "progress"
+                | "meter"
+        )
         && doc.nodes[id]
             .parent
             .is_none_or(|parent| container(build, parent))

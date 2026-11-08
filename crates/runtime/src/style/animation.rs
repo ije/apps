@@ -195,8 +195,12 @@ fn tracks(
         );
         resolve_style(&mut frame, Some(style), None, &custom, registry);
         resolve_keywords(&mut frame, Some(style));
+        // WARNING: the UA's `overlay` outranks keyframes, so only transitions change it.
         for (key, value) in declarations.iter() {
-            if value.ends_with("!important") || !animatable(key, registry) && !key.is_custom() {
+            if value.ends_with("!important")
+                || key == Prop::OVERLAY
+                || !animatable(key, registry) && !key.is_custom()
+            {
                 continue;
             }
             let Some(value) = computed(&frame, key, registry) else {
@@ -454,6 +458,238 @@ impl Transition {
         interpolate(self.property.name(), &self.from, &self.to, progress)
             .unwrap_or_else(|| if progress < 0.5 { &self.from } else { &self.to }.clone())
     }
+
+    fn shows(&self, now: Instant) -> bool {
+        self.property == Prop::DISPLAY
+            && self
+                .progress(now)
+                .is_some_and(|progress| self.value(progress) != "none")
+    }
+}
+
+// WARNING: a box that its `display` transition or script animation shows paints though the cascade hides it,
+// so it and its subtree count as visible, and so does a box inside that `shows` too.
+fn show(
+    painted: &mut Cow<[bool]>,
+    doc: &Document,
+    styles: &ComputedStyles,
+    shows: &dyn Fn(usize) -> bool,
+    id: usize,
+) {
+    if painted.get(id) != Some(&false)
+        || doc.nodes[id]
+            .parent
+            .is_some_and(|parent| painted.get(parent) != Some(&true))
+    {
+        return;
+    }
+    let painted = painted.to_mut();
+    let mut pending = vec![id];
+    while let Some(id) = pending.pop() {
+        painted[id] = true;
+        for &child in styles.children.get(&id).unwrap_or(&doc.nodes[id].children) {
+            if painted.get(child) == Some(&false)
+                && (styles.values[child].get(Prop::DISPLAY) != Some("none") || shows(child))
+            {
+                pending.push(child);
+            }
+        }
+    }
+}
+
+type Events = Vec<(usize, &'static str, String, f64)>;
+
+// WARNING: the transitions that a style change from `old` to `new` runs, keeping the `running` ones that still go to
+// the new values. Events of a pseudo-element name it before a NUL, like `::backdrop\0opacity`.
+#[allow(clippy::too_many_arguments)]
+fn retarget(
+    old: &Style,
+    new: &Style,
+    running: &[Transition],
+    registry: &Registry,
+    now: Instant,
+    serial: &mut u32,
+    (id, pseudo): (usize, &str),
+    runs: &mut Events,
+) -> Vec<Transition> {
+    let mut properties: Vec<(Prop, f64, f64, String, bool)> = Vec::new();
+    for (name, duration, delay, timing, discrete) in transitions(new) {
+        let names: Vec<Prop> = match name.as_str() {
+            "none" => continue,
+            "all" => old
+                .iter()
+                .chain(new.iter())
+                .map(|(key, _)| key)
+                .filter(|&key| animatable(key, registry) && old.get(key) != new.get(key))
+                .chain(running.iter().map(|transition| transition.property))
+                .collect(),
+            _ => {
+                let mut longhands = Vec::new();
+                if !expand(&name, "0", &mut longhands) {
+                    longhands.push((name, String::new()));
+                }
+                longhands
+                    .into_iter()
+                    .map(|(name, _)| Prop::new(&name))
+                    .collect()
+            }
+        };
+        for name in names {
+            properties.retain(|property| property.0 != name);
+            properties.push((name, duration, delay, timing.clone(), discrete));
+        }
+    }
+    let mut next = Vec::new();
+    for (property, duration, delay, timing, discrete) in properties {
+        let Some(after) = computed(new, property, registry) else {
+            continue;
+        };
+        if property.is_custom() && !animatable(property, registry) {
+            continue;
+        }
+        if duration.max(0.) + delay <= 0. {
+            continue;
+        }
+        let old_transition = running.iter().find(|old| old.property == property);
+        let (from, reverse, factor) = match old_transition {
+            Some(old) if old.to == after => {
+                next.push(old.clone());
+                continue;
+            }
+            Some(old) => {
+                let progress = old.progress(now);
+                let current = progress.map_or_else(|| old.to.clone(), |p| old.value(p));
+                if old.reverse == after {
+                    let factor = (progress.unwrap_or(1.) * old.shortening + 1. - old.shortening)
+                        .abs()
+                        .clamp(0., 1.);
+                    (current, old.to.clone(), factor)
+                } else {
+                    (current.clone(), current, 1.)
+                }
+            }
+            None => match computed(old, property, registry) {
+                Some(before) => (before.to_owned(), before.to_owned(), 1.),
+                None => continue,
+            },
+        };
+        // WARNING: discrete values, and `display` and `overlay` though they keep the shown value,
+        // transition only with `transition-behavior: allow-discrete`.
+        if from == after
+            || !discrete
+                && (matches!(property, Prop::DISPLAY | Prop::OVERLAY)
+                    || interpolate(property.name(), &from, after, 0.5).is_none())
+        {
+            continue;
+        }
+        *serial += 1;
+        let delay = if delay < 0. { delay * factor } else { delay };
+        next.push(Transition {
+            serial: *serial,
+            property,
+            from,
+            to: after.to_owned(),
+            playback: Playback {
+                time: 0.,
+                since: now,
+                rate: 1.,
+            },
+            delay,
+            duration: duration.max(0.) * factor,
+            timing,
+            reverse,
+            shortening: factor,
+            started: false,
+        });
+        runs.push((
+            id,
+            "transitionrun",
+            format!("{pseudo}{}", property.name()),
+            (-delay).max(0.),
+        ));
+    }
+    next
+}
+
+fn cancel(
+    running: &[Transition],
+    kept: &[Transition],
+    (id, pseudo): (usize, &str),
+    now: Instant,
+    events: &mut Events,
+) {
+    for transition in running {
+        if !kept
+            .iter()
+            .any(|next| next.property == transition.property && next.serial == transition.serial)
+        {
+            let time = transition.playback.at(now) - transition.delay;
+            events.push((
+                id,
+                "transitioncancel",
+                format!("{pseudo}{}", transition.property.name()),
+                time.clamp(0., transition.duration),
+            ));
+        }
+    }
+}
+
+type Wake = (usize, bool, bool, f64, f64);
+
+// WARNING: samples the transitions of a box or its pseudo-element into `out` and drops the ended ones, with their
+// events and wakes. A pseudo-element is not a box of its own, so it is never parked or unseen by itself.
+fn advance(
+    list: &mut Vec<Transition>,
+    (id, pseudo): (usize, &str),
+    now: Instant,
+    out: &mut Style,
+    events: &mut Events,
+    wakes: &mut Vec<Wake>,
+) {
+    list.retain_mut(|transition| match transition.progress(now) {
+        Some(progress) => {
+            let time = transition.playback.at(now) - transition.delay;
+            if !transition.started && time >= 0. {
+                transition.started = true;
+                events.push((
+                    id,
+                    "transitionstart",
+                    format!("{pseudo}{}", transition.property.name()),
+                    (-transition.delay).max(0.),
+                ));
+            }
+            out.insert(transition.property, transition.value(progress));
+            let held = (transition.playback.rate == 0.).then_some(f64::INFINITY);
+            // WARNING: a `display` or `overlay` that keeps the shown value changes only at the end.
+            let flat = matches!(transition.property, Prop::DISPLAY | Prop::OVERLAY)
+                && (transition.from == "none" || transition.to == "none");
+            wakes.push((
+                id,
+                pseudo.is_empty() && PAINT.contains(&transition.property),
+                pseudo.is_empty()
+                    && keeps_box_in_place(
+                        transition.property,
+                        [transition.from.as_str(), transition.to.as_str()].into_iter(),
+                    ),
+                held.unwrap_or(if flat && time > 0. {
+                    transition.duration - time
+                } else {
+                    (-time).max(0.)
+                }),
+                held.unwrap_or(transition.duration - time),
+            ));
+            true
+        }
+        None => {
+            events.push((
+                id,
+                "transitionend",
+                format!("{pseudo}{}", transition.property.name()),
+                transition.duration,
+            ));
+            false
+        }
+    });
 }
 
 // WARNING: an instant this far away doesn't exist, so such a time never wakes the view.
@@ -565,6 +801,13 @@ pub(crate) struct Motion {
     serial: u32,
     queued: Vec<(usize, &'static str, String, f64)>,
     pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
+    // WARNING: the `visible` of the last `update` with its animated `display` values, or `None` if they
+    // changed nothing.
+    pub painted: Option<Vec<bool>>,
+    // WARNING: by box in the top layer, its last `::backdrop` style and the transitions running on it.
+    backdrop: HashMap<usize, (Rc<Style>, Vec<Transition>)>,
+    // WARNING: the `::backdrop` styles that the last `update` animated, for render to paint.
+    pub backdrops: Vec<(usize, Rc<Style>)>,
 }
 
 impl Motion {
@@ -674,6 +917,7 @@ impl Motion {
         self.clocks.remove(&id);
         self.transitions.remove(&id);
         self.scripted.remove(&id);
+        self.backdrop.remove(&id);
     }
 
     pub fn script(&mut self, node: usize, mut animation: Scripted, time: f64, rate: Option<f64>) {
@@ -907,6 +1151,19 @@ impl Motion {
         false
     }
 
+    pub fn backdrop(&self, id: usize, base: &Style) -> Option<Style> {
+        let now = Instant::now();
+        let mut style = None;
+        for transition in self.backdrop.get(&id).into_iter().flat_map(|(_, list)| list) {
+            if let Some(progress) = transition.progress(now) {
+                style
+                    .get_or_insert_with(|| base.clone())
+                    .insert(transition.property, transition.value(progress));
+            }
+        }
+        style
+    }
+
     pub fn scripted(&mut self, node: usize, pseudo: u8, styles: &ComputedStyles) -> Option<Style> {
         let now = Instant::now();
         let list = self.scripted.get_mut(&node)?;
@@ -940,160 +1197,123 @@ impl Motion {
     ) -> (Animated, Option<Instant>) {
         let registry = &*styles.registry;
         events.append(&mut self.queued);
+        // WARNING: script animations that set `display` show a box that the cascade hides, as in browsers. CSS
+        // animations never start on such a box.
+        let mut revealed = Vec::new();
+        for (&id, list) in &mut self.scripted {
+            if visible.get(id) != Some(&false) {
+                continue;
+            }
+            let mut out = Style::new();
+            for animation in list.iter_mut().filter(|animation| {
+                animation.effect.pseudo == 0
+                    && animation
+                        .rules
+                        .iter()
+                        .any(|(_, rule, _)| rule.contains(Prop::DISPLAY))
+            }) {
+                let Some((owner, base)) = animation.base(id, styles) else {
+                    continue;
+                };
+                animation.resolve(owner, &base, registry);
+                let (local, paused) = (animation.playback.at(now), animation.playback.rate == 0.);
+                animation
+                    .effect
+                    .sample(local, paused, &base, registry, &mut out);
+            }
+            if out.get(Prop::DISPLAY).is_some_and(|value| value != "none") {
+                revealed.push(id);
+            }
+        }
+        // WARNING: `visible` follows the cascade, where a box in an exit transition already has `display: none`.
+        // `painted` follows the animated `display`, and exits restyle first, so the boxes inside them see it.
+        let shows = |transitions: &HashMap<usize, Vec<Transition>>, id: usize| {
+            revealed.contains(&id)
+                || transitions
+                    .get(&id)
+                    .is_some_and(|list| list.iter().any(|transition| transition.shows(now)))
+        };
+        let mut painted = Cow::Borrowed(visible);
+        for &id in self.transitions.keys().chain(&revealed) {
+            if shows(&self.transitions, id) {
+                show(&mut painted, doc, styles, &|id| shows(&self.transitions, id), id);
+            }
+        }
         // WARNING: a box that gets `display: none` stays shown while its `display` transition runs, so only its
         // parent must be visible then.
-        let hiding = |id: usize, style: &Style| {
+        let hiding = |painted: &[bool], id: usize, style: &Style| {
             style.get(Prop::DISPLAY) == Some("none")
                 && doc
                     .nodes
                     .get(id)
                     .and_then(|node| node.parent)
-                    .is_none_or(|parent| visible.get(parent) == Some(&true))
+                    .is_none_or(|parent| painted.get(parent) == Some(&true))
         };
         self.previous
             .resize_with(styles.values.len(), Default::default);
+        let (mut exits, mut changed) = (Vec::new(), Vec::new());
         for (id, new) in styles.values.iter().enumerate() {
             if Rc::ptr_eq(&self.previous[id], new) {
                 continue;
             }
+            if (new.contains(Prop::TRANSITION) || new.contains(Prop::TRANSITION_PROPERTY))
+                && new.get(Prop::DISPLAY) == Some("none")
+            {
+                exits.push(id);
+            } else {
+                changed.push(id);
+            }
+        }
+        // WARNING: a box can be created before its parent, so a nested exit needs its parent's exit to start first.
+        exits.sort_by_cached_key(|&id| {
+            std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent).count()
+        });
+        for id in exits.into_iter().chain(changed) {
+            let new = &styles.values[id];
             let old = std::mem::replace(&mut self.previous[id], new.clone());
             // WARNING: a container query pass recomputes styles inside one frame, so it must not start transitions.
             if repass {
                 continue;
             }
             let running = self.transitions.remove(&id).unwrap_or_default();
-            let cancel =
-                |kept: &[Transition], events: &mut Vec<(usize, &'static str, String, f64)>| {
-                    for transition in &running {
-                        if !kept.iter().any(|next| {
-                            next.property == transition.property && next.serial == transition.serial
-                        }) {
-                            let time = transition.playback.at(now) - transition.delay;
-                            events.push((
-                                id,
-                                "transitioncancel",
-                                transition.property.name().to_owned(),
-                                time.clamp(0., transition.duration),
-                            ));
-                        }
-                    }
-                };
+            let cancel = |kept: &[Transition], events: &mut Events| {
+                cancel(&running, kept, (id, ""), now, events)
+            };
+            // WARNING: a box in an exit transition still paints, so it restyles as a shown box, without its
+            // starting style.
+            let exiting = running
+                .iter()
+                .any(|transition| transition.property == Prop::DISPLAY);
             let old = match styles.starting.get(&id) {
                 Some(starting)
                     if old.is_empty()
-                        || old.get(Prop::DISPLAY).is_some_and(|value| value == "none") =>
+                        || !exiting
+                            && old.get(Prop::DISPLAY).is_some_and(|value| value == "none") =>
                 {
                     starting.clone()
                 }
                 _ => old,
             };
-            let shown = visible.get(id) == Some(&true);
+            let shown = painted.get(id) == Some(&true);
             if old.is_empty()
-                || !shown && !hiding(id, new)
-                || old.get(Prop::DISPLAY).is_some_and(|value| value == "none")
+                || !shown && !hiding(&painted, id, new)
+                || !exiting && old.get(Prop::DISPLAY).is_some_and(|value| value == "none")
                 || !new.contains(Prop::TRANSITION) && !new.contains(Prop::TRANSITION_PROPERTY)
             {
                 cancel(&[], events);
                 continue;
             }
-            let mut properties: Vec<(Prop, f64, f64, String, bool)> = Vec::new();
-            for (name, duration, delay, timing, discrete) in transitions(new) {
-                let names: Vec<Prop> = match name.as_str() {
-                    "none" => continue,
-                    "all" => old
-                        .iter()
-                        .chain(new.iter())
-                        .map(|(key, _)| key)
-                        .filter(|&key| animatable(key, registry) && old.get(key) != new.get(key))
-                        .chain(running.iter().map(|transition| transition.property))
-                        .collect(),
-                    _ => {
-                        let mut longhands = Vec::new();
-                        if !expand(&name, "0", &mut longhands) {
-                            longhands.push((name, String::new()));
-                        }
-                        longhands
-                            .into_iter()
-                            .map(|(name, _)| Prop::new(&name))
-                            .collect()
-                    }
-                };
-                for name in names {
-                    properties.retain(|property| property.0 != name);
-                    properties.push((name, duration, delay, timing.clone(), discrete));
-                }
-            }
-            let mut next = Vec::new();
             let mut runs = Vec::new();
-            for (property, duration, delay, timing, discrete) in properties {
-                let Some(after) = computed(new, property, registry) else {
-                    continue;
-                };
-                if property.is_custom() && !animatable(property, registry) {
-                    continue;
-                }
-                if duration.max(0.) + delay <= 0. {
-                    continue;
-                }
-                let old_transition = running.iter().find(|old| old.property == property);
-                let (from, reverse, factor) = match old_transition {
-                    Some(old) if old.to == after => {
-                        next.push(old.clone());
-                        continue;
-                    }
-                    Some(old) => {
-                        let progress = old.progress(now);
-                        let current = progress.map_or_else(|| old.to.clone(), |p| old.value(p));
-                        if old.reverse == after {
-                            let factor = (progress.unwrap_or(1.) * old.shortening + 1.
-                                - old.shortening)
-                                .abs()
-                                .clamp(0., 1.);
-                            (current, old.to.clone(), factor)
-                        } else {
-                            (current.clone(), current, 1.)
-                        }
-                    }
-                    None => match computed(&old, property, registry) {
-                        Some(before) => (before.to_owned(), before.to_owned(), 1.),
-                        None => continue,
-                    },
-                };
-                // WARNING: discrete values, and `display` though it keeps the shown value, transition only
-                // with `transition-behavior: allow-discrete`.
-                if from == after
-                    || !discrete
-                        && (property == Prop::DISPLAY
-                            || interpolate(property.name(), &from, after, 0.5).is_none())
-                {
-                    continue;
-                }
-                self.serial += 1;
-                let delay = if delay < 0. { delay * factor } else { delay };
-                next.push(Transition {
-                    serial: self.serial,
-                    property,
-                    from,
-                    to: after.to_owned(),
-                    playback: Playback {
-                        time: 0.,
-                        since: now,
-                        rate: 1.,
-                    },
-                    delay,
-                    duration: duration.max(0.) * factor,
-                    timing,
-                    reverse,
-                    shortening: factor,
-                    started: false,
-                });
-                runs.push((
-                    id,
-                    "transitionrun",
-                    property.name().to_owned(),
-                    (-delay).max(0.),
-                ));
-            }
+            let mut next = retarget(
+                &old,
+                new,
+                &running,
+                registry,
+                now,
+                &mut self.serial,
+                (id, ""),
+                &mut runs,
+            );
             if !shown
                 && !next
                     .iter()
@@ -1105,8 +1325,44 @@ impl Motion {
             cancel(&next, events);
             events.append(&mut runs);
             if !next.is_empty() {
+                let exit = next.iter().any(|transition| transition.shows(now));
                 self.transitions.insert(id, next);
+                if exit {
+                    show(&mut painted, doc, styles, &|id| shows(&self.transitions, id), id);
+                }
             }
+        }
+        // WARNING: a `::backdrop` exists while its box is in the top layer, so a new one starts from its
+        // `@starting-style` like a newly shown box, and one that goes away cancels its transitions.
+        let mut gone = std::mem::take(&mut self.backdrop);
+        for (&id, new) in &styles.backdrops {
+            let (old, running) = match gone.remove(&id) {
+                Some((old, running)) => (Some(old), running),
+                None => (styles.backdrop_starts.get(&id).cloned(), Vec::new()),
+            };
+            let next = match old {
+                Some(old) if !repass && !Rc::ptr_eq(&old, new) => {
+                    let mut runs = Vec::new();
+                    let next = retarget(
+                        &old,
+                        new,
+                        &running,
+                        registry,
+                        now,
+                        &mut self.serial,
+                        (id, "::backdrop\0"),
+                        &mut runs,
+                    );
+                    cancel(&running, &next, (id, "::backdrop\0"), now, events);
+                    events.append(&mut runs);
+                    next
+                }
+                _ => running,
+            };
+            self.backdrop.insert(id, (new.clone(), next));
+        }
+        for (id, (_, running)) in gone {
+            cancel(&running, &[], (id, "::backdrop\0"), now, events);
         }
         let cancel =
             |id: usize, clock: &Clock, events: &mut Vec<(usize, &'static str, String, f64)>| {
@@ -1120,7 +1376,7 @@ impl Motion {
                 }
             };
         self.clocks.retain(|&id, clocks| {
-            let kept = visible.get(id) == Some(&true) && styles.animations.contains_key(&id);
+            let kept = painted.get(id) == Some(&true) && styles.animations.contains_key(&id);
             if !kept {
                 for clock in clocks.iter() {
                     cancel(id, clock, events);
@@ -1129,11 +1385,14 @@ impl Motion {
             kept
         });
         self.transitions.retain(|&id, list| {
-            let kept = visible.get(id) == Some(&true)
+            let kept = painted.get(id) == Some(&true)
                 || list
                     .iter()
                     .any(|transition| transition.property == Prop::DISPLAY)
-                    && styles.values.get(id).is_some_and(|style| hiding(id, style));
+                    && styles
+                        .values
+                        .get(id)
+                        .is_some_and(|style| hiding(&painted, id, style));
             if !kept {
                 for transition in list.iter() {
                     let time = transition.playback.at(now) - transition.delay;
@@ -1149,9 +1408,9 @@ impl Motion {
         });
         let mut animated: HashMap<usize, Style> = HashMap::new();
         let mut pseudo: HashMap<(usize, u8), Style> = HashMap::new();
-        let mut wakes: Vec<(usize, bool, bool, f64, f64)> = Vec::new();
+        let mut wakes: Vec<Wake> = Vec::new();
         for (&id, effects) in &styles.animations {
-            if visible.get(id) != Some(&true) {
+            if painted.get(id) != Some(&true) {
                 continue;
             }
             let clocks = self.clocks.entry(id).or_default();
@@ -1284,7 +1543,7 @@ impl Motion {
             }
         }
         for (&id, list) in &mut self.scripted {
-            if visible.get(id) != Some(&true) {
+            if painted.get(id) != Some(&true) {
                 continue;
             }
             for animation in list.iter_mut() {
@@ -1324,42 +1583,17 @@ impl Motion {
         }
         for (&id, list) in &mut self.transitions {
             let out = animated.entry(id).or_default();
-            list.retain_mut(|transition| match transition.progress(now) {
-                Some(progress) => {
-                    let time = transition.playback.at(now) - transition.delay;
-                    if !transition.started && time >= 0. {
-                        transition.started = true;
-                        events.push((
-                            id,
-                            "transitionstart",
-                            transition.property.name().to_owned(),
-                            (-transition.delay).max(0.),
-                        ));
-                    }
-                    out.insert(transition.property, transition.value(progress));
-                    let held = (transition.playback.rate == 0.).then_some(f64::INFINITY);
-                    wakes.push((
-                        id,
-                        PAINT.contains(&transition.property),
-                        keeps_box_in_place(
-                            transition.property,
-                            [transition.from.as_str(), transition.to.as_str()].into_iter(),
-                        ),
-                        held.unwrap_or((-time).max(0.)),
-                        held.unwrap_or(transition.duration - time),
-                    ));
-                    true
+            advance(list, (id, ""), now, out, events, &mut wakes);
+        }
+        self.backdrops.clear();
+        for (&id, (base, list)) in &mut self.backdrop {
+            if !list.is_empty() {
+                let mut out = (**base).clone();
+                advance(list, (id, "::backdrop\0"), now, &mut out, events, &mut wakes);
+                if !list.is_empty() {
+                    self.backdrops.push((id, Rc::new(out)));
                 }
-                None => {
-                    events.push((
-                        id,
-                        "transitionend",
-                        transition.property.name().to_owned(),
-                        transition.duration,
-                    ));
-                    false
-                }
-            });
+            }
         }
         self.transitions.retain(|_, list| !list.is_empty());
         // WARNING: a layout value equal to the base one, like the shown `display` of an exit animation, would lay
@@ -1370,6 +1604,19 @@ impl Motion {
             });
             !values.is_empty()
         });
+        // WARNING: an animated `display: none` hides the box and its subtree, though the cascade shows them.
+        for (&id, values) in &animated {
+            if values.get(Prop::DISPLAY) == Some("none") && painted.get(id) == Some(&true) {
+                let painted = painted.to_mut();
+                let mut pending = vec![id];
+                while let Some(id) = pending.pop() {
+                    if painted.get(id) == Some(&true) {
+                        painted[id] = false;
+                        pending.extend(styles.children.get(&id).unwrap_or(&doc.nodes[id].children));
+                    }
+                }
+            }
+        }
         self.custom.clear();
         // WARNING: custom properties, font sizes and line heights change other values and units of the box and
         // its children, so they need the cascade again.
@@ -1430,36 +1677,41 @@ impl Motion {
         let mut next = f64::INFINITY;
         self.parked.clear();
         for (id, paint, still, change, end) in wakes {
-            let unseen = paint && {
-                let mut faded = false;
-                let mut chain = Some(id);
-                while let Some(node) = chain {
-                    faded |= fixed(node, Prop::OPACITY)
-                        && styles.values[node].get(Prop::OPACITY).is_some_and(|value| {
-                            value.trim_end_matches('%').parse::<f32>() == Ok(0.)
-                        });
-                    chain = doc.nodes[node].parent.filter(|_| !faded);
-                }
-                let mut hidden = true;
-                let mut pending = vec![id];
-                while hidden && let Some(node) = pending.pop() {
-                    let tag = &doc.nodes[node].tag;
-                    if tag.starts_with('#') && tag != "#text" {
-                        continue;
+            // WARNING: a box that an animated `display: none` above it hides can't be seen either.
+            let unseen = painted.get(id) != Some(&true)
+                && animated
+                    .get(&id)
+                    .is_none_or(|values| values.get(Prop::DISPLAY) != Some("none"))
+                || paint && {
+                    let mut faded = false;
+                    let mut chain = Some(id);
+                    while let Some(node) = chain {
+                        faded |= fixed(node, Prop::OPACITY)
+                            && styles.values[node].get(Prop::OPACITY).is_some_and(|value| {
+                                value.trim_end_matches('%').parse::<f32>() == Ok(0.)
+                            });
+                        chain = doc.nodes[node].parent.filter(|_| !faded);
                     }
-                    hidden = fixed(node, Prop::VISIBILITY)
-                        && styles.values[node]
-                            .get(Prop::VISIBILITY)
-                            .is_some_and(|value| matches!(value, "hidden" | "collapse"));
-                    pending.extend(
-                        styles
-                            .children
-                            .get(&node)
-                            .unwrap_or(&doc.nodes[node].children),
-                    );
-                }
-                faded || hidden
-            };
+                    let mut hidden = true;
+                    let mut pending = vec![id];
+                    while hidden && let Some(node) = pending.pop() {
+                        let tag = &doc.nodes[node].tag;
+                        if tag.starts_with('#') && tag != "#text" {
+                            continue;
+                        }
+                        hidden = fixed(node, Prop::VISIBILITY)
+                            && styles.values[node]
+                                .get(Prop::VISIBILITY)
+                                .is_some_and(|value| matches!(value, "hidden" | "collapse"));
+                        pending.extend(
+                            styles
+                                .children
+                                .get(&node)
+                                .unwrap_or(&doc.nodes[node].children),
+                        );
+                    }
+                    faded || hidden
+                };
             // WARNING: scrolls, resizes and DOM changes draw a frame, and render checks parked boxes after
             // it lays them out, so their animations go on once they come into view.
             let parked = !unseen && still && change < end && !shown(id);
@@ -1468,6 +1720,10 @@ impl Motion {
             }
             next = next.min(if unseen || parked { end } else { change });
         }
+        self.painted = match painted {
+            Cow::Owned(painted) => Some(painted),
+            Cow::Borrowed(_) => None,
+        };
         self.styled.retain(|id, _| animated.contains_key(id));
         let mut animated: Animated = animated
             .into_iter()
@@ -1666,6 +1922,7 @@ fn computed<'a>(style: &'a Style, prop: Prop, registry: &'a Registry) -> Option<
         "background-position" => Some("0% 0%"),
         "visibility" => Some("visible"),
         "display" => Some("inline"),
+        "overlay" => Some("none"),
         "position" => Some("static"),
         "content" | "line-height" => Some("normal"),
         _ if key.starts_with("margin-")
@@ -1960,10 +2217,11 @@ impl Lerp {
         if from == to {
             return Some(Self::Same(from.to_owned()));
         }
-        // WARNING: like `visibility`, `display` keeps the shown value between the ends when one side hides the box.
+        // WARNING: like `visibility`, `display` and `overlay` keep the shown value between the ends when one side
+        // hides the box or takes it out of the top layer.
         let shown = match property {
             "visibility" if from == "visible" || to == "visible" => Some("visible"),
-            "display" if from == "none" || to == "none" => {
+            "display" | "overlay" if from == "none" || to == "none" => {
                 Some(if from == "none" { to } else { from })
             }
             _ => None,
@@ -3706,6 +3964,146 @@ mod tests {
     }
 
     #[test]
+    fn overlay_keeps_leaving_boxes_in_the_top_layer_until_it_ends() {
+        let mut doc = Document::parse(
+            "<style>dialog{opacity:0;transition:opacity 1s linear,overlay 1s allow-discrete,display 1s allow-discrete}dialog[open]{opacity:1}p{display:block;transition:overlay 1s}</style><dialog open></dialog><p popover></p>",
+        );
+        let [d, p] = ["dialog", "p"].map(|tag| node(&doc, tag));
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        let mut motion = Motion::default();
+        doc.nodes[d].state = crate::dom::MODAL;
+        doc.nodes[p].state = crate::dom::POPOVER;
+        let styles = computed_styles(&doc);
+        assert!(step(&mut motion, &doc, &styles, at(0.)).0.is_empty());
+        doc.nodes[d].attrs.remove("open");
+        doc.nodes[d].state = crate::dom::MODAL << 5;
+        doc.nodes[p].state = crate::dom::POPOVER << 5;
+        let styles = computed_styles(&doc);
+        assert_eq!(styles.values[d].get(Prop::OVERLAY), Some("none"));
+        let (animated, ..) = step(&mut motion, &doc, &styles, at(1.));
+        assert_eq!(animated[&d].0.get(Prop::OVERLAY), Some("auto"));
+        assert!(!animated.contains_key(&p));
+        let (animated, ..) = step(&mut motion, &doc, &styles, at(1.5));
+        let style = &animated[&d].0;
+        assert_eq!(
+            [Prop::OVERLAY, Prop::DISPLAY, Prop::OPACITY].map(|prop| style.get(prop)),
+            [Some("auto"), Some("block"), Some("0.5")]
+        );
+        let (animated, next, events) = step(&mut motion, &doc, &styles, at(2.));
+        assert!(!animated.contains_key(&d) && next.is_none());
+        assert!(events.contains(&(d, "transitionend", "overlay".into(), 1.)));
+        // WARNING: a transition that keeps `overlay` and `display` until its end wakes the view only then.
+        let mut doc = Document::parse(
+            "<style>dialog{transition:overlay 1s allow-discrete,display 1s allow-discrete}</style><dialog></dialog>",
+        );
+        let d = node(&doc, "dialog");
+        let mut motion = Motion::default();
+        doc.nodes[d].attrs.insert("open".into(), String::new());
+        doc.nodes[d].state = crate::dom::MODAL;
+        step(&mut motion, &doc, &computed_styles(&doc), at(0.));
+        doc.nodes[d].attrs.remove("open");
+        doc.nodes[d].state = crate::dom::MODAL << 5;
+        let styles = computed_styles(&doc);
+        step(&mut motion, &doc, &styles, at(1.));
+        let (_, next, _) = step(&mut motion, &doc, &styles, at(1.25));
+        assert_eq!(next, Some(at(2.)));
+    }
+
+    #[test]
+    fn backdrops_transition_from_their_starting_style_and_out() {
+        let mut doc = Document::parse(
+            "<style>dialog::backdrop{opacity:0;transition:opacity 1s linear}dialog[open]::backdrop{opacity:1}@starting-style{dialog[open]::backdrop{opacity:0}}</style><dialog></dialog>",
+        );
+        let d = node(&doc, "dialog");
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        let mut motion = Motion::default();
+        step(&mut motion, &doc, &computed_styles(&doc), at(0.));
+        doc.nodes[d].attrs.insert("open".into(), String::new());
+        doc.nodes[d].state = crate::dom::MODAL;
+        let mut opacity = |seconds: f64, doc: &Document| {
+            let (_, _, events) = step(&mut motion, doc, &computed_styles(doc), at(seconds));
+            let opacity = motion
+                .backdrops
+                .iter()
+                .find(|(id, _)| *id == d)
+                .and_then(|(_, style)| style.get(Prop::OPACITY).map(str::to_owned));
+            (opacity, events)
+        };
+        let (value, events) = opacity(1., &doc);
+        assert_eq!(value.as_deref(), Some("0"));
+        assert!(events.contains(&(d, "transitionrun", "::backdrop\0opacity".into(), 0.)));
+        assert_eq!(opacity(1.5, &doc).0.as_deref(), Some("0.5"));
+        let (value, events) = opacity(2., &doc);
+        assert_eq!(value, None);
+        assert!(events.contains(&(d, "transitionend", "::backdrop\0opacity".into(), 1.)));
+        doc.nodes[d].attrs.remove("open");
+        doc.nodes[d].state = crate::dom::MODAL << 5;
+        opacity(3., &doc);
+        assert_eq!(opacity(3.25, &doc).0.as_deref(), Some("0.75"));
+        doc.nodes[d].state = 0;
+        let (value, events) = opacity(3.5, &doc);
+        assert_eq!(value, None);
+        assert!(events.contains(&(d, "transitioncancel", "::backdrop\0opacity".into(), 0.5)));
+    }
+
+    #[test]
+    fn script_animations_that_set_display_show_hidden_boxes() {
+        let doc = Document::parse(
+            "<style>@keyframes show{from,to{display:block}}div{display:none}i{display:block}b{display:none;animation:show 1s}</style><div><i></i></div><b></b>",
+        );
+        let [div, i, b] = ["div", "i", "b"].map(|tag| node(&doc, tag));
+        let styles = computed_styles(&doc);
+        let mut visible = vec![false; doc.nodes.len()];
+        let mut pending = vec![0];
+        while let Some(id) = pending.pop() {
+            if styles.values[id].get(Prop::DISPLAY) != Some("none") {
+                visible[id] = true;
+                pending.extend(&doc.nodes[id].children);
+            }
+        }
+        let mut motion = Motion::default();
+        motion.script(
+            div,
+            Scripted::new(
+                1,
+                &[
+                    (0., "display:block;opacity:0", "linear".into()),
+                    (1., "display:block;opacity:1", "linear".into()),
+                ],
+                [0., 0., 1., 1., 0.],
+                ["normal", "none", "linear", "replace"],
+                0,
+            ),
+            0.,
+            Some(1.),
+        );
+        let start = Instant::now();
+        let mut update = |seconds: f64| {
+            let mut events = Vec::new();
+            let (animated, next) = motion.update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| true,
+                start + Duration::from_secs_f64(seconds),
+                false,
+                &mut events,
+            );
+            (animated, motion.painted.take(), next, events)
+        };
+        let (animated, painted, next, events) = update(0.5);
+        let painted = painted.unwrap();
+        assert!(painted[div] && painted[i] && !painted[b]);
+        let (_, style, layout) = animated.iter().find(|(id, ..)| *id == div).unwrap();
+        assert_eq!(style.get(Prop::DISPLAY), Some("block"));
+        assert!(*layout && next.is_some() && events.is_empty());
+        let (animated, painted, next, events) = update(1.5);
+        assert!(animated.is_empty() && painted.is_none() && next.is_none() && events.is_empty());
+    }
+
+    #[test]
     fn tailwind_transform_lists_transition_smoothly() {
         let mut doc = Document::parse(
             "<style>@import 'tailwindcss';</style><div class='transition-transform duration-1000 ease-linear rotate-x-12'></div>",
@@ -3753,5 +4151,93 @@ mod tests {
             "matrix(1.73205, 1, -1.04189, 2.86257, 2.40892, 22.1754)"
         );
         assert_eq!(lerp.at(1.), "matrix(1, 0.0174551, 0, 1, 0, 0)");
+    }
+
+    #[test]
+    fn exits_keep_their_subtree_painted_until_they_end() {
+        let mut doc = Document::parse(
+            "<style>@keyframes spin{to{rotate:1turn}}@keyframes out{to{display:none}}div,i,p,s,u,b,em{display:block}div{transition:opacity 1s linear,display 1s allow-discrete}div.off{display:none;opacity:0}i,em{animation:spin 1s linear infinite}p{transition:opacity 1s linear}div.off p{opacity:0}s{transition:display 1s allow-discrete}div.off s{display:none}b.out{animation:out .5s forwards}a{display:block;opacity:1;transition:opacity 1s linear,display 1s allow-discrete}a.off{display:none}@starting-style{a{opacity:0}}</style><p></p><s><u></u></s><div><i></i></div><b><em></em></b><a class=off></a>",
+        );
+        let [div, i, p, s, u, b, em, a] =
+            ["div", "i", "p", "s", "u", "b", "em", "a"].map(|tag| node(&doc, tag));
+        // WARNING: scripts can create a child before its parent, so `p` and the exiting `s` get smaller ids.
+        let body = doc.nodes[p].parent.unwrap();
+        for child in [s, p] {
+            doc.nodes[body].children.retain(|&other| other != child);
+            doc.nodes[div].children.push(child);
+            doc.nodes[child].parent = Some(div);
+        }
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        let mut motion = Motion::default();
+        let mut step = |doc: &Document, seconds: f64| {
+            let styles = computed_styles(doc);
+            let mut visible = vec![false; doc.nodes.len()];
+            let mut pending = vec![0];
+            while let Some(id) = pending.pop() {
+                if styles.values[id].get(Prop::DISPLAY) != Some("none") {
+                    visible[id] = true;
+                    pending.extend(&doc.nodes[id].children);
+                }
+            }
+            let mut events = Vec::new();
+            let (animated, next) = motion.update(
+                doc,
+                &styles,
+                &visible,
+                &|_| true,
+                at(seconds),
+                false,
+                &mut events,
+            );
+            let painted = motion.painted.take();
+            let shown = painted.clone().unwrap_or(visible);
+            let animated: HashMap<usize, Rc<Style>> = animated
+                .into_iter()
+                .map(|(id, style, _)| (id, style))
+                .collect();
+            (painted.is_some(), shown, animated, events, next)
+        };
+        let (changed, shown, ..) = step(&doc, 0.);
+        assert!(!changed && shown[div] && !shown[a]);
+        doc.nodes[div].attrs.insert("class".into(), "off".into());
+        doc.nodes[a].attrs.remove("class");
+        for seconds in [0.1, 0.6] {
+            let (changed, shown, animated, events, _) = step(&doc, seconds);
+            assert!(changed, "{seconds}");
+            assert_eq!(
+                [div, i, p, s, u, a].map(|id| shown[id]),
+                [true; 6],
+                "{events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| event.1.ends_with("cancel")),
+                "{events:?}"
+            );
+            assert!(animated[&i].get(Prop::ROTATE).is_some());
+            assert_eq!(animated[&s].get(Prop::DISPLAY), Some("block"));
+            let opacity = |id: usize| {
+                animated[&id]
+                    .get(Prop::OPACITY)
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            assert!((opacity(p) + seconds - 1.1).abs() < 1e-3, "{}", opacity(p));
+            assert!((opacity(a) - seconds + 0.1).abs() < 1e-3, "{}", opacity(a));
+        }
+        let (changed, shown, animated, events, _) = step(&doc, 1.2);
+        assert!(!changed && [div, i, p, s, u].iter().all(|&id| !shown[id]) && shown[a]);
+        assert!(!animated.contains_key(&div) && !animated.contains_key(&i));
+        assert!(
+            events
+                .iter()
+                .any(|event| event == &(div, "transitionend", "display".into(), 1.))
+        );
+        doc.nodes[b].attrs.insert("class".into(), "out".into());
+        step(&doc, 2.);
+        let (changed, shown, animated, _, next) = step(&doc, 2.6);
+        assert_eq!(animated[&b].get(Prop::DISPLAY), Some("none"));
+        assert!(changed && !shown[b] && !shown[em] && next.is_none());
     }
 }

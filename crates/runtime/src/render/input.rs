@@ -1,6 +1,12 @@
 use super::{PageState, PageView};
 use crate::style::Prop;
-use crate::{desktop::Desktop, style};
+use crate::{
+    desktop::{
+        Desktop,
+        link::{Tool, tool},
+    },
+    style,
+};
 use anyhow::{Context as _, Result, ensure};
 use renderer::{
     App, Bounds, FileDropEvent, Pixels, PlatformInput, Point, Utf16Selection, Window, point, px,
@@ -352,40 +358,6 @@ fn password<'a>(
         .then(|| state["text"].as_str())?
 }
 
-impl PageView {
-    fn before_input(&self, kind: &str, event: &renderer::KeyDownEvent) -> bool {
-        // WARNING: a key waits for main only while main listens to this window's `before-input-event`.
-        if !self
-            .runtime
-            .try_borrow()
-            .is_ok_and(|app| app.views.get(&self.id).is_some_and(|view| view.input))
-        {
-            return false;
-        }
-        let Some(link) = self.host.borrow().link.clone() else {
-            return false;
-        };
-        let keystroke = &event.keystroke;
-        let modifiers = &keystroke.modifiers;
-        let input = serde_json::json!({
-            "type": kind,
-            "key": keystroke.key_char.clone().unwrap_or_else(|| keystroke.key.clone()),
-            "code": keystroke.key,
-            "isAutoRepeat": event.is_held,
-            "isComposing": false,
-            "shift": modifiers.shift,
-            "control": modifiers.control,
-            "alt": modifiers.alt,
-            "meta": modifiers.platform,
-            "location": 0,
-            "modifiers": [],
-        });
-        let id = self.id;
-        link.ask(|answer| crate::desktop::link::ToMain::Input(id, input, answer))
-            .is_ok_and(|answer| answer.value == true)
-    }
-}
-
 impl renderer::View for PageView {
     fn render(
         &mut self,
@@ -417,48 +389,37 @@ impl renderer::View for PageView {
             PlatformInput::KeyDown(event) => {
                 let key = event.keystroke.key.as_str();
                 let modifiers = &event.keystroke.modifiers;
-                if !self.host.borrow().packaged
-                    && key == "f"
-                    && modifiers.alt
-                    && if cfg!(target_os = "macos") {
-                        modifiers.platform
-                    } else {
-                        modifiers.control
+                match tool(&event.keystroke).filter(|_| !self.host.borrow().packaged) {
+                    Some(Tool::Hud) => {
+                        super::hud::Hud::toggle(&self.0, window);
+                        cx.stop_propagation();
+                        return;
                     }
-                {
-                    super::hud::Hud::toggle(&self.0, window);
-                    cx.stop_propagation();
-                    return;
-                }
-                if !self.host.borrow().packaged
-                    && (key == "f12"
-                        || (key == "i"
-                            && ((modifiers.platform && modifiers.alt)
-                                || (modifiers.control && modifiers.shift))))
-                {
-                    self.host.borrow_mut().command(
-                        crate::desktop::link::Target::Window(id),
-                        serde_json::json!({"op":"window","args":["devtools",id]}),
-                    );
-                    self.drive(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.before_input("keyDown", event) {
-                    cx.stop_propagation();
-                    return;
+                    Some(Tool::DevTools) => {
+                        self.host.borrow_mut().command(
+                            crate::desktop::link::Target::Window(id),
+                            serde_json::json!({"op":"window","args":["devtools",id]}),
+                        );
+                        self.drive(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    None => {}
                 }
                 let allowed = Desktop::dispatch(
                     self.runtime.clone(),
                     id,
                     "keydown",
                     &[],
-                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"repeat":event.is_held}),
+                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"repeat":event.is_held,"ime":event.ime}),
                     Some(window),
                     cx,
                 );
                 if !allowed {
                     cx.stop_propagation();
+                    return;
+                }
+                if event.ime {
                     return;
                 }
                 if cfg!(target_os = "macos")
@@ -497,19 +458,12 @@ impl renderer::View for PageView {
             }
             PlatformInput::KeyUp(event) => {
                 let modifiers = &event.keystroke.modifiers;
-                let held = renderer::KeyDownEvent {
-                    keystroke: event.keystroke.clone(),
-                    is_held: false,
-                };
-                if self.before_input("keyUp", &held) {
-                    return;
-                }
                 Desktop::dispatch(
                     self.runtime.clone(),
                     id,
                     "keyup",
                     &[],
-                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift}),
+                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"ime":event.ime}),
                     Some(window),
                     cx,
                 );

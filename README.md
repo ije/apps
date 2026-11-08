@@ -79,27 +79,32 @@ const server = import.meta.resolve('./server.ts'); // a script that `ELECTRON_RU
 
 `productName` names the app, `executableName` names its executable, and `env` gives the values of `import.meta.env`.
 
-On macOS, import the built-in Liquid Glass styles to use native glass behind HTML controls:
+On macOS, `bg-glass`, `bg-glass-clear`, and `bg-glass-interactive` are built in and need no import.
+Use Tailwind for color and layout utilities:
 
 ```css
 @import "tailwindcss";
-@import "liquid-glass";
-@import "sf-symbols";
 ```
 
 ```html
-<button class="glass glass-interactive glass-tint-blue-500 rounded-full flex items-center gap-2 px-4 py-2">
-  <span class="sf-icon-folder size-5" aria-hidden="true"></span>
+<button class="bg-glass-blue-500 bg-glass-interactive rounded-full flex items-center gap-2 px-4 py-2">
+  <sf-symbol-folder-fill class="size-5" aria-hidden="true" />
   Open
 </button>
 ```
 
-The base glass classes work without Tailwind. JSX uses `className`. `glass-clear` selects clear glass.
+JSX uses `className`. `bg-glass-clear` selects clear glass.
+A valid `bg-glass-*` color utility enables glass without `bg-glass`.
+`bg-glass-interactive` modifies active glass and does not enable glass by itself.
 Glass does not set a corner radius. Use `rounded`, `rounded-xl`, or `rounded-full`, or set `border-radius` in CSS.
 The CSS properties are `-macos-glass`, `-macos-glass-interactive`, and `-macos-glass-tint-color`.
 
-With Tailwind, `glass-tint-*` uses the same colors as `bg-*`: palette shades, theme colors, arbitrary colors, and opacity modifiers.
-For example, use `glass-tint-blue-500`, `glass-tint-blue-500/50`, or `glass-tint-[#123456]`.
+For an unfocused float, set `visualEffectState: 'active'` in `BrowserWindow` options.
+This keeps native glass active without keyboard focus. The default, `followWindow`, follows window activity. `inactive` keeps the inactive appearance.
+The glass override uses an undocumented AppKit method and can change with macOS.
+
+With Tailwind, `bg-glass-*` uses the same colors as `bg-*`: palette shades, theme colors, arbitrary colors, and opacity modifiers.
+For example, use `bg-glass-blue-500`, `bg-glass-blue-500/50`, or `bg-glass-[#123456]`.
 
 ```css
 @theme {
@@ -111,30 +116,30 @@ For example, use `glass-tint-blue-500`, `glass-tint-blue-500/50`, or `glass-tint
 }
 ```
 
-Use `glass-tint-brand` to follow that theme color. Changes to `--color-brand` update the tint.
-Tint utilities also support `@theme inline`, `@apply`, and variants such as `hover:glass-tint-brand` and `dark:glass-tint-blue-300`.
+Use `bg-glass-brand` to follow that theme color. Changes to `--color-brand` update the tint.
+Tint utilities also support `@theme inline`, `@apply`, and variants such as `hover:bg-glass-brand` and `dark:bg-glass-blue-300`.
 
-With Tailwind, use `supports-glass:` and `not-supports-glass:` for native glass and fallback styles:
+With Tailwind, use `supports-bg-glass:` and `not-supports-bg-glass:` for native glass and fallback styles:
 
 ```html
-<button class="glass px-4 py-2 supports-glass:text-white not-supports-glass:bg-white not-supports-glass:text-black">
+<button class="bg-glass px-4 py-2 supports-bg-glass:text-white not-supports-bg-glass:bg-white not-supports-bg-glass:text-black">
   Open
 </button>
 ```
 
-These variants check native Liquid Glass availability on the running OS. They work with other variants, such as `not-supports-glass:hover:bg-gray-100`.
-The check is independent of the glass import and does not test whether an individual element can use glass.
+These variants check native Liquid Glass availability on the running OS. They work with other variants, such as `not-supports-bg-glass:hover:bg-gray-100`.
+The check does not test whether an individual element can use glass.
 
 The effect needs macOS 26 or later. Native interaction feedback needs macOS 27 or later.
 This first version supports controls with uniform corners, without transforms, filters, clipping, or non-glass content above them. Native glass controls can overlap each other.
 
-Other targets ignore the import. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
+The base glass classes have no effect on other platforms. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
 
-`@import "sf-symbols"` also works without Liquid Glass or Tailwind on macOS.
-An empty `<span>` with `sf-icon-folder` shows Apple's `folder` symbol. Hyphens separate name parts: `sf-icon-folder-fill` selects `folder.fill`.
-Icons inherit `color` and default to `1em` square. CSS width and height, including Tailwind `size-*`, set their bounds.
+Native `<sf-symbol-*>` elements show SF Symbols on macOS without an import or Tailwind.
+For example, `<sf-symbol-folder-fill class="size-5" />` selects Apple's `folder.fill` symbol. Hyphens in the tag suffix map to dots.
+Icons inherit `color` and default to `1em` square. CSS width and height, such as Tailwind `size-*`, set their bounds.
 
-These icons are monochrome. A symbol that the installed macOS version does not contain shows no image.
+These icons are monochrome. Missing symbols and other platforms show an empty element with the same CSS bounds.
 
 Set `loaders` in `package.json` to import other file types. Each key is a file extension, and each value is a module path relative to `package.json` or a package name:
 

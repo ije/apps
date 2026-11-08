@@ -221,20 +221,6 @@ impl<'i> AtRuleParser<'i> for Rules {
     ) -> Result<Item, ParseError<()>> {
         if name.eq_ignore_ascii_case("import") && self.top_level {
             let url = input.expect_url_or_string()?.clone();
-            if url == "sf-symbols" {
-                input.expect_exhausted()?;
-                return Ok(Item::Rule(Rule::SfSymbols));
-            }
-            if url == "liquid-glass" {
-                input.expect_exhausted()?;
-                return Ok(Item::Rule(Rule::LiquidGlass(
-                    Stylesheet::parse(include_str!("tailwind/liquid-glass.css"))
-                        .0
-                        .into_iter()
-                        .map(Rc::unwrap_or_clone)
-                        .collect(),
-                )));
-            }
             let preflight = match url.strip_suffix(".css").unwrap_or(&url) {
                 "tailwindcss" | "tailwindcss/index" | "tailwindcss/preflight" => true,
                 "tailwindcss/theme" | "tailwindcss/utilities" => false,
@@ -478,10 +464,7 @@ impl<'i> AtRuleParser<'i> for Rules {
 
     fn rule_without_block(&mut self, item: Item, _: &ParserState) -> Result<Item, ()> {
         match item {
-            Item::Rule(
-                Rule::Tailwind(_) | Rule::LiquidGlass(_) | Rule::SfSymbols | Rule::Layer(..),
-            )
-            | Item::Declaration(_) => Ok(item),
+            Item::Rule(Rule::Tailwind(_) | Rule::Layer(..)) | Item::Declaration(_) => Ok(item),
             Item::Rule(Rule::Variant(_, ref template)) if !template.is_empty() => Ok(item),
             _ => Err(()),
         }
@@ -927,11 +910,6 @@ impl NodeLengths {
         self.list.clear();
         self.list.push(lengths);
         self.last = 0;
-    }
-
-    pub(crate) fn resize(&mut self, count: usize) {
-        let first = self.ids.first().copied().unwrap_or_default();
-        self.ids.resize(count, first);
     }
 
     pub(crate) fn set(&mut self, id: usize, lengths: Lengths) {

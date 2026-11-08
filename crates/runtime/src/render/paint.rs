@@ -104,6 +104,61 @@ impl Hooks for Effected {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Source {
+    Element,
+    Presented,
+    Drawn,
+}
+
+// WARNING: a picture reads its image when it paints, so video frames and canvas drawings change no box. The build
+// records only the image sizes, which lay the box out.
+pub(super) struct Picture {
+    pub(super) id: usize,
+    pub(super) view: Rc<super::PageState>,
+    pub(super) source: Source,
+    pub(super) fit: renderer::ObjectFit,
+    pub(super) cropped: Option<renderer::Radii<Pixels>>,
+}
+
+impl Hooks for Picture {
+    // WARNING: the image paints under the box's children, like an image box's content.
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let view = &*self.view;
+        let image = view.host.try_borrow().ok().and_then(|host| {
+            let dom = host.dom.get(&view.id);
+            match self.source {
+                Source::Element => dom?.images.get(&self.id).cloned(),
+                Source::Presented => view
+                    .images
+                    .borrow()
+                    .get(&self.id)
+                    .or_else(|| dom?.images.get(&self.id))
+                    .cloned(),
+                Source::Drawn => dom?
+                    .canvases
+                    .get(&self.id)
+                    .map(|canvas| canvas.image.clone()),
+            }
+        });
+        if let Some(image) = image
+            && image.size().width.0 > 0
+            && image.size().height.0 > 0
+        {
+            let bounds = cx.bounds;
+            let fitted = self.fit.get_bounds(bounds, image.size());
+            match self.cropped {
+                Some(corners) => cx.window.paint_image(bounds, fitted, corners, image, false),
+                None => {
+                    let radii = cx.style.corner_radii.resolve(bounds.size);
+                    cx.window.paint_image(fitted, bounds, radii, image, false);
+                }
+            }
+        }
+        inner(cx.window);
+    }
+}
+
 pub(super) struct Sticky {
     pub(super) scroll: renderer::ScrollHandle,
     pub(super) border: [f32; 4],
@@ -113,6 +168,7 @@ pub(super) struct Sticky {
 pub(super) struct DomBox {
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
+    pub(super) plans: u8,
     pub(super) ids: Rc<super::effects::Ids>,
     pub(super) view: Rc<super::PageState>,
     pub(super) sticky: Option<Sticky>,
@@ -363,7 +419,7 @@ impl Hooks for DomBox {
         let mut prepaint = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
             let view = &*self.view;
-            {
+            let flags = {
                 let mut host = view.host.borrow_mut();
                 let dom = host.dom.entry(view.id).or_default();
                 // WARNING: grid tracks are sized before transforms, so they compare with the untransformed box.
@@ -418,6 +474,10 @@ impl Hooks for DomBox {
                     f32::from(bounds.size.height) - self.sides[1],
                 ];
                 cull.widths.insert(self.id, inner);
+                let flags = cull.info.get(self.id).map_or(0, |info| info.flags);
+                view.reaching
+                    .borrow_mut()
+                    .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
                 // WARNING: a container's size starts from an estimate, so queries read the size that layout gave it.
                 if dom
                     .containers
@@ -438,7 +498,8 @@ impl Hooks for DomBox {
                         }
                     }
                 }
-            }
+                flags
+            };
             if let Some((browser, _)) = view.browsers.borrow().get(&self.id)
                 && let Some((set, ..)) = view.frames.borrow_mut().get_mut(&self.id)
             {
@@ -457,6 +518,31 @@ impl Hooks for DomBox {
                 }
             }
             window.with_element_offset(offset, |window| inner(window));
+            {
+                // WARNING: where the boxes below this one lie that a parent could cull: plain blocks in boxes that
+                // cull their children, see `element::element`.
+                let mut reaching = view.reaching.borrow_mut();
+                let none = [f32::INFINITY, f32::NEG_INFINITY];
+                let found = reaching.pop().map_or(none, |(reach, _)| reach);
+                let reach = if self.plans == u8::MAX { none } else { found };
+                let mut reached = view.reach.borrow_mut();
+                if reached.len() <= self.id {
+                    reached.resize(self.id + 1, [f32::NAN; 2]);
+                }
+                reached[self.id] = reach;
+                if let Some(([bottom, top], plans)) = reaching.last_mut() {
+                    *bottom = bottom.min(reach[0]);
+                    *top = top.max(reach[1]);
+                    if matches!(*plans, 1 | 2)
+                        && flags & (super::cull::PLAIN_BLOCK | super::cull::UNCULLABLE)
+                            == super::cull::PLAIN_BLOCK
+                        && (*plans == 1 || flags & super::cull::DEFINITE_SIZE == 0)
+                    {
+                        *bottom = bottom.min(f32::from(window_bounds.bottom()));
+                        *top = top.max(f32::from(window_bounds.top()));
+                    }
+                }
+            }
             if let Some(([first, last], [above, below])) = self.text {
                 let mut host = view.host.borrow_mut();
                 let bounds = &mut host.dom.entry(view.id).or_default().bounds;

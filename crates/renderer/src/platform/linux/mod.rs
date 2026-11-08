@@ -6,9 +6,9 @@ mod wayland;
 mod x11;
 
 use crate::{
-    Bounds, Capslock, CursorStyle, KeyDownEvent, Keystroke, Modifiers, MouseButton, Pixels,
-    PlatformInput, Point, Scene, Size, WindowChange, WindowOptions, WindowState, app::Callbacks,
-    px,
+    Bounds, Capslock, CursorStyle, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton,
+    Pixels, PlatformInput, Point, Scene, Size, WindowChange, WindowOptions, WindowState,
+    app::Callbacks, px,
 };
 use anyhow::{Context as _, Result};
 use calloop::{
@@ -256,6 +256,7 @@ impl Window {
                     window.set_parent(parent);
                 }
             }
+            WindowChange::CancelComposition => each!(self, window => window.cancel_composition()),
             _ => {}
         }
     }
@@ -321,14 +322,38 @@ impl Clicks {
     }
 }
 
-fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool) {
+// WARNING: a key that changes the composition comes without text and reaches the page as `Process` before the
+// change, like in Chrome. Neither the page nor main can stop the change.
+fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool, ime: Vec<Ime>) {
     let modifiers = keystroke.modifiers;
     let text = keystroke.key_char.clone().filter(|_| {
         !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.function
     });
-    let handled = callbacks.input(PlatformInput::KeyDown(KeyDownEvent { keystroke, is_held }));
+    let input = PlatformInput::KeyDown(KeyDownEvent {
+        keystroke,
+        is_held,
+        ime: !ime.is_empty(),
+    });
+    let handled = crate::app::native::key(callbacks.id, &input, &|| {
+        callbacks.marked_text_range().is_some()
+    }) || callbacks.input(input);
+    for ime in ime {
+        ime.apply(callbacks);
+    }
     if !handled && let Some(text) = text {
         callbacks.replace_text_in_range(None, &text);
+    }
+}
+
+fn key_up(callbacks: Callbacks, keystroke: Keystroke) {
+    let input = PlatformInput::KeyUp(KeyUpEvent {
+        keystroke,
+        ime: false,
+    });
+    if !crate::app::native::key(callbacks.id, &input, &|| {
+        callbacks.marked_text_range().is_some()
+    }) {
+        callbacks.input(input);
     }
 }
 
@@ -343,13 +368,11 @@ impl Ime {
     fn apply(self, callbacks: Callbacks) {
         match self {
             Self::Commit(text) => callbacks.replace_text_in_range(None, &text),
-            Self::Preedit(text) => callbacks.replace_and_mark_text_in_range(None, &text, None),
-            Self::Unmark => callbacks.unmark_text(),
-            Self::Clear => {
-                if let Some(marked) = callbacks.marked_text_range() {
-                    callbacks.replace_text_in_range(Some(marked), "");
-                }
+            Self::Preedit(text) if !text.is_empty() => {
+                callbacks.replace_and_mark_text_in_range(None, &text, None)
             }
+            Self::Preedit(_) | Self::Clear => callbacks.clear_marked_text(),
+            Self::Unmark => callbacks.unmark_text(),
         }
     }
 }
@@ -358,38 +381,48 @@ fn ime_area(callbacks: Callbacks) -> Option<Bounds<Pixels>> {
     callbacks.bounds_for_range(callbacks.selected_text_range()?.range)
 }
 
+// WARNING: returns the text that a cancelled sequence commits before the key, like Chrome does for keys that an
+// input method lets through, and the changes of the key itself, which make it a `Process` key.
 fn compose(
     state: &mut xkb::compose::State,
     pre_edit: &mut Option<String>,
     keysym: Keysym,
     keystroke: &mut Keystroke,
-) -> Vec<Ime> {
+) -> (Option<String>, Vec<Ime>) {
     state.feed(keysym);
     match state.status() {
         xkb::Status::Composed => {
-            pre_edit.take();
-            keystroke.key_char = state.utf8();
+            let composed = state.utf8();
+            if pre_edit.take().is_some() {
+                keystroke.key_char = None;
+                return (None, vec![composed.map_or(Ime::Clear, Ime::Commit)]);
+            }
+            keystroke.key_char = composed;
             if let Some(keysym) = state.keysym() {
                 keystroke.key = xkb::keysym_get_name(keysym);
             }
-            Vec::new()
+            (None, Vec::new())
         }
         xkb::Status::Composing => {
             keystroke.key_char = None;
             *pre_edit = state.utf8().or_else(|| dead_key(keysym));
-            vec![Ime::Preedit(pre_edit.clone().unwrap_or_default())]
+            (
+                None,
+                vec![Ime::Preedit(pre_edit.clone().unwrap_or_default())],
+            )
         }
         xkb::Status::Cancelled => {
             let previous = pre_edit.take();
             *pre_edit = dead_key(keysym);
             state.feed(keysym);
-            previous
-                .map(Ime::Commit)
-                .into_iter()
-                .chain(pre_edit.clone().map(Ime::Preedit))
-                .collect()
+            let Some(text) = pre_edit.clone() else {
+                return (previous, Vec::new());
+            };
+            keystroke.key_char = None;
+            let ime = previous.map(Ime::Commit).into_iter();
+            (None, ime.chain([Ime::Preedit(text)]).collect())
         }
-        _ => Vec::new(),
+        _ => (None, Vec::new()),
     }
 }
 

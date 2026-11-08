@@ -1,6 +1,3 @@
-@import "liquid-glass";
-@import "sf-symbols";
-
 :root {
   color-scheme: light dark;
   color: light-dark(#1d1d1f, #f5f5f7);
@@ -105,7 +102,7 @@ h1 {
   visibility: hidden;
 }
 
-#close .sf-icon-xmark {
+#close sf-symbol-xmark {
   width: 8px;
   height: 8px;
 }

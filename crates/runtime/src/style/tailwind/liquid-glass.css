@@ -1,6 +1,6 @@
 @layer theme,base,components,utilities;
 @layer components{
-.glass{-macos-glass:regular;appearance:none;background-color:transparent;border:0}
-.glass-clear{-macos-glass:clear;appearance:none;background-color:transparent;border:0}
-.glass-interactive{-macos-glass-interactive:true}
+.bg-glass{-macos-glass:regular;appearance:none;background-color:transparent;border:0}
+.bg-glass-clear{-macos-glass:clear;appearance:none;background-color:transparent;border:0}
+.bg-glass-interactive{-macos-glass-interactive:true}
 }

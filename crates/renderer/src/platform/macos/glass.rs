@@ -186,8 +186,8 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
         }
         native.surface = surface;
     }
-    // WARNING: the renderer doesn't know where web views paint, and they sit above the GPU frame, so glass views
-    // stay below every other subview in paint order. Web views are added on top later.
+    // WARNING: glass views stay below every other subview. Glass painted over a promoted layer or the caret stops
+    // them, so the overlay view that holds those goes above, and so do web views, which the renderer can't see.
     if restack {
         for native in views.iter().rev() {
             parent.addSubview_positioned_relativeTo(

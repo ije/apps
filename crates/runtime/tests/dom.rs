@@ -1826,6 +1826,34 @@ fn range_inputs_sanitize_slide_and_step() {
 }
 
 #[test]
+fn sf_symbols_parse_and_serialize_as_void_elements() {
+    let (host, engine) = checked_page(
+        "<main id='symbols'><sf-symbol-folder/><span>Open</span><sf-symbol-doc-text /></main>",
+        r#"
+        const box = document.getElementById('symbols');
+        check('literal self closing symbols', () => box.children.length === 3 && box.children[1].localName === 'span' && !box.firstChild.hasChildNodes());
+        check('symbol outerHTML', () => box.firstChild.outerHTML === '<sf-symbol-folder/>');
+        const saved = box.innerHTML;
+        box.innerHTML = saved;
+        check('symbol innerHTML roundtrip', () => box.innerHTML === saved && box.children.length === 3);
+        box.firstChild.outerHTML = '<sf-symbol-square-and-arrow-up/>';
+        check('symbol outerHTML replacement', () => box.children.length === 3 && box.firstChild.localName === 'sf-symbol-square-and-arrow-up');
+        const created = document.createElement('sf-symbol-checkmark-circle-fill');
+        created.className = 'size-4';
+        box.append(created);
+        check('created symbol serialization', () => created.outerHTML === '<sf-symbol-checkmark-circle-fill class="size-4"/>');
+        const invalid = document.createElement('sf-symbol-folder--fill');
+        check('invalid suffix stays ordinary', () => invalid.outerHTML === '<sf-symbol-folder--fill></sf-symbol-folder--fill>');
+        "#,
+    );
+    let source = engine.eval("document.getElementById('symbols').outerHTML", "test").unwrap();
+    let host = host.borrow();
+    let doc = &host.pages[&1].doc;
+    let id = doc.nodes.iter().position(|node| node.attrs.get("id").is_some_and(|id| id == "symbols")).unwrap();
+    assert_eq!(doc.serialize(id), source);
+}
+
+#[test]
 fn parser_raw_text_tables_and_document_structure() {
     checked_page(
         "<!doctype html><title>x &amp; y</title><style>a>b{}</style><p>one<p>two<table><tr><td>cell</table>a &lt; b &notin; &#x80;",
@@ -2212,6 +2240,24 @@ fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
         expect(getComputedStyle(document.getElementById('h')), 'display', 'none');
         if (!s.length || !s.item(0)) throw Error('length');
     "#, "test").unwrap();
+}
+
+#[test]
+fn hosts_take_pseudo_elements_from_their_shadow_tree() {
+    checked_page(
+        "<html><head><style>x-card::before{color:blue}</style></head><body><x-card id=card class=on></x-card></body></html>",
+        r#"
+        const card = document.getElementById('card');
+        card.attachShadow({ mode: 'open' }).innerHTML = `<style>:host::before{content:"A";color:red;font-weight:700!important} :host(.on)::after{content:"B";color:green}</style>`;
+        const before = getComputedStyle(card, '::before');
+        check('content', () => before.content === '"A"');
+        check('outer normal wins', () => before.color === 'rgb(0, 0, 255)');
+        check('inner important wins', () => before.fontWeight === '700');
+        check(':host(.on)::after', () => getComputedStyle(card, '::after').content === '"B"');
+        card.classList.remove('on');
+        check('class change', () => getComputedStyle(card, '::after').content === '');
+        "#,
+    );
 }
 
 #[test]
@@ -2851,6 +2897,86 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
             command["args"][0] == "htmlFullscreen" && command["args"][2] == false
         })
     );
+}
+
+#[test]
+fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
+    let (host, engine) = checked_page(
+        "<html><body><style>body.through dialog::backdrop{pointer-events:none}</style>\
+         <div id='wrap' inert><button id='b'>b</button><span id='t'>inert text</span><dialog id='d'><button id='in'>in</button></dialog></div>\
+         <div id='under'><button id='u'>u</button></div><div id='over' inert></div><button id='out'>out</button><p id='free'>free text</p>\
+         <div id='pop' popover='manual'><button id='pb'>pb</button></div><div id='fs'><button id='fb'>fb</button></div></body></html>",
+        r#"
+        const $ = id => document.getElementById(id);
+        check('inert takes no focus', () => { $('b').focus(); return document.activeElement === document.body; });
+        check('other nodes take focus', () => { $('out').focus(); return document.activeElement === $('out'); });
+        check('tab skips inert and hidden nodes', () => { const order = []; for (let n = 0; n < 3; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); } return order.join() === 'fb,u,out'; });
+        check('inert text is not selected', () => { getSelection().selectAllChildren($('t')); return String(getSelection()) === ''; });
+        check('other text is selected', () => { getSelection().selectAllChildren($('free')); return String(getSelection()) === 'free text'; });
+        check('tailwind variant and attribute', () => $('t').matches('[inert] *') && $('wrap').inert);
+        "#,
+    );
+    let id = |name: &str| -> usize {
+        engine
+            .eval(&format!("document.getElementById('{name}')._id"), "test")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let rects = [
+        ("wrap", [0., 0., 50., 40.]),
+        ("b", [0., 0., 50., 20.]),
+        ("t", [0., 20., 50., 20.]),
+        ("under", [100., 0., 50., 50.]),
+        ("u", [100., 0., 50., 20.]),
+        ("over", [100., 0., 50., 50.]),
+        ("out", [0., 60., 50., 20.]),
+        ("free", [0., 90., 50., 20.]),
+        ("d", [200., 200., 100., 50.]),
+        ("in", [200., 200., 50., 20.]),
+        ("pop", [300., 0., 50., 50.]),
+        ("pb", [300., 0., 50., 20.]),
+        ("fs", [0., 120., 50., 50.]),
+        ("fb", [0., 120., 50., 20.]),
+    ]
+    .map(|(name, rect)| (id(name), rect));
+    host.borrow_mut()
+        .dom
+        .entry(1)
+        .or_default()
+        .bounds
+        .extend(rects);
+    let fails = engine
+        .eval(
+            r#"(() => {
+        const $ = id => document.getElementById(id), at = (x, y) => { const node = document.elementFromPoint(x, y); return node?.id || node?.localName; };
+        const fails = [], check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (e) { fails.push(name + ': ' + e.message); } };
+        check('hits pass through inert boxes', () => at(5, 5) === 'html' && at(105, 5) === 'u');
+        $('out').focus();
+        $('d').showModal();
+        check('a modal dialog in an inert subtree escapes it', () => document.activeElement === $('in') && at(205, 205) === 'in');
+        check('its backdrop takes presses', () => at(5, 65) === 'd');
+        document.body.className = 'through';
+        check('a see-through backdrop shows an inert page', () => at(5, 65) === 'html' && at(105, 5) === 'html');
+        check('the page takes no focus', () => { $('out').focus(); $('u').focus(); return document.activeElement === $('in'); });
+        check('the page text is not selected', () => { getSelection().selectAllChildren($('free')); return String(getSelection()) === ''; });
+        $('pop').showPopover();
+        check('a popover above the modal dialog is inert', () => { $('pb').focus(); return document.activeElement === $('in') && at(305, 5) === 'html'; });
+        $('pop').hidePopover();
+        $('fs').requestFullscreen();
+        check('the modal dialog stays above a fullscreen element', () => { $('fb').focus(); return document.activeElement === $('in') && at(5, 125) === 'html'; });
+        $('d').close();
+        check('a fullscreen element makes the rest inert', () => at(5, 125) === 'fb' && at(5, 65) === 'fs' && ($('fb').focus(), $('out').focus(), document.activeElement === $('fb')));
+        document.exitFullscreen();
+        check('the page is live again', () => at(5, 65) === 'out' && ($('out').focus(), document.activeElement === $('out')));
+        $('wrap').inert = false;
+        check('removing inert', () => at(5, 5) === 'b' && ($('b').focus(), document.activeElement === $('b')));
+        return fails.join('\n');
+    })()"#,
+            "test",
+        )
+        .unwrap();
+    assert_eq!(fails, "");
 }
 
 #[test]

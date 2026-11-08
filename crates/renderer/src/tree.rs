@@ -1,6 +1,6 @@
 use crate::{
-    AvailableSpace, Baseline, Bounds, ContentMask, Display, ElementId, Hitbox, HitboxBehavior,
-    Hooks, Pixels, Point, Size, Style, TextStyle, Visibility, Window,
+    AlignContent, AlignItems, AvailableSpace, Baseline, Bounds, ContentMask, Display, ElementId,
+    Hitbox, HitboxBehavior, Hooks, Inline, Pixels, Point, Size, Style, TextStyle, Visibility, Window,
     geometry::round_half_up,
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx},
     point, px, quad, size,
@@ -130,6 +130,11 @@ impl Tree {
         self.keys.contains_key(&(identity(Some(id.into()), 0), 0))
     }
 
+    pub fn align_self(&self, id: ElementId) -> Option<crate::AlignSelf> {
+        let &index = self.keys.get(&(identity(Some(id), 0), 0))?;
+        self.slots[index as usize].style.align_self
+    }
+
     pub(crate) fn commit_root(
         &mut self,
         root: Child,
@@ -148,6 +153,21 @@ impl Tree {
         // compact the arena, which moves the root.
         self.free_orphans();
         root.and(self.root).map(|root| NodeId::from(root as usize))
+    }
+
+    // WARNING: a patch replaces a box that this pass kept, so its parents keep their slots, and layout clears the caches
+    // from it up. A box that this pass built already is left alone.
+    pub(crate) fn patch(&mut self, node: Node, scale: f32) {
+        let identity = identity(node.id, 0);
+        if node.id.is_none() || self.occurrences.contains_key(&identity) {
+            return;
+        }
+        let Some(&index) = self.keys.get(&(identity, 0)) else {
+            return;
+        };
+        let inherited = self.slots[index as usize].inherited.clone();
+        self.commit_node(node, &inherited, scale);
+        self.free_orphans();
     }
 
     fn commit(&mut self, child: Child, inherited: &Rc<TextStyle>, scale: f32) -> Option<NodeId> {
@@ -317,7 +337,8 @@ impl Tree {
             || taffy.as_ref().is_some_and(|taffy| slot.taffy != *taffy)
             || restyled
                 && (slot.style.baseline != style.baseline
-                    || slot.style.baseline_source != style.baseline_source);
+                    || slot.style.baseline_source != style.baseline_source
+                    || slot.style.inline != style.inline);
         if !same_measure {
             match measurement {
                 Some(measurement) => {
@@ -887,8 +908,9 @@ impl LayoutTree<'_> {
     }
 
     fn flexbox(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
-        let output = taffy::compute_flexbox_layout(self, node, inputs);
-        let style = &self.slots[usize::from(node)].taffy;
+        let mut output = taffy::compute_flexbox_layout(self, node, inputs);
+        let index = usize::from(node);
+        let style = &self.slots[index].taffy;
         if inputs.known_dimensions.width.is_none()
             && matches!(
                 style.flex_direction,
@@ -911,7 +933,7 @@ impl LayoutTree<'_> {
             );
             let width = available.max(min.size.width);
             if width < output.size.width {
-                return taffy::compute_flexbox_layout(
+                output = taffy::compute_flexbox_layout(
                     self,
                     node,
                     LayoutInput {
@@ -924,6 +946,108 @@ impl LayoutTree<'_> {
                 );
             }
         }
+        if inputs.run_mode != RunMode::PerformLayout
+            || self.slots[index].style.inline != Inline::Lines
+        {
+            return output;
+        }
+        let style = self.slots[index].style.clone();
+        // WARNING: taffy keeps the baseline items of a line at its top, and like Chrome, they move down when the first
+        // of the tallest `FlexStart` and `FlexEnd` items is a `FlexEnd` item taller than they are. The lines keep
+        // their heights. Items sit side by side in a line, so an item that starts left of the one before starts a
+        // new line.
+        let lift = match style.justify_content {
+            Some(AlignContent::Center) => 0.5,
+            Some(AlignContent::End | AlignContent::FlexEnd) => 1.,
+            _ => 0.,
+        };
+        let flows = |slot: &Slot| {
+            slot.taffy.position != taffy::Position::Absolute
+                && slot.taffy.display != taffy::Display::None
+        };
+        let align = |slot: &Slot| slot.style.align_self.or(style.align_items);
+        let children = mem::take(&mut self.slots[index].children);
+        let (mut first, mut right, mut top) = (0, f32::NEG_INFINITY, true);
+        for at in 0..=children.len() {
+            if let Some(&child) = children.get(at) {
+                let slot = &self.slots[usize::from(child)];
+                if !flows(slot) {
+                    continue;
+                }
+                let layout = &slot.layout;
+                let starts = layout.location.x - layout.margin.left < right - 0.5;
+                right = layout.location.x + layout.size.width + layout.margin.right;
+                if !starts {
+                    continue;
+                }
+            }
+            let line = &children[first..at];
+            first = at;
+            let (mut above, mut below) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for &child in line {
+                let slot = &self.slots[usize::from(child)];
+                if flows(slot) && align(slot) == Some(AlignItems::Baseline) {
+                    let layout = &slot.layout;
+                    let base = slot.baselines.first.unwrap_or(layout.size.height);
+                    above = above.max(base + layout.margin.top);
+                    below = below.max(layout.size.height + layout.margin.bottom - base);
+                }
+            }
+            let mut tallest = (0., false);
+            for &child in line {
+                let slot = &self.slots[usize::from(child)];
+                let layout = &slot.layout;
+                let height = layout.size.height + layout.margin.top + layout.margin.bottom;
+                let edge = align(slot).filter(|align| {
+                    matches!(align, AlignItems::FlexStart | AlignItems::FlexEnd)
+                });
+                if flows(slot) && edge.is_some() && height > tallest.0 {
+                    tallest = (height, edge == Some(AlignItems::FlexEnd));
+                }
+            }
+            let drop = if tallest.1 && above.is_finite() {
+                (tallest.0 - above - below).max(0.)
+            } else {
+                0.
+            };
+            let last = |children: &[NodeId]| {
+                children
+                    .iter()
+                    .rev()
+                    .map(|&child| &self.slots[usize::from(child)])
+                    .find(|slot| flows(slot))
+            };
+            // WARNING: a `Lines` row that doesn't wrap holds the strut and the first item, so it ends with that item.
+            let mut end = last(line);
+            while let Some(slot) = end.filter(|slot| {
+                slot.style.inline == Inline::Lines && slot.taffy.flex_wrap == taffy::FlexWrap::NoWrap
+            }) {
+                end = last(&slot.children);
+            }
+            let hang = end
+                .filter(|slot| lift > 0. && slot.style.inline == Inline::Hangs)
+                .and_then(|slot| slot.children.last())
+                .map_or(0., |&space| {
+                    let layout = &self.slots[usize::from(space)].layout;
+                    (layout.size.width + layout.margin.left + layout.margin.right) * lift
+                });
+            if drop > 0. || hang > 0. {
+                for &child in line {
+                    let slot = &mut self.slots[usize::from(child)];
+                    if flows(slot) {
+                        slot.layout.location.x += hang;
+                        if align(slot) == Some(AlignItems::Baseline) {
+                            slot.layout.location.y += drop;
+                        }
+                    }
+                }
+                if top {
+                    output.baselines.first = output.baselines.first.map(|base| base + drop);
+                }
+            }
+            top = false;
+        }
+        self.slots[index].children = children;
         output
     }
 
@@ -1286,5 +1410,43 @@ mod tests {
         let text = index_of(slot(&tree, 1).children[0]);
         assert_eq!(tree.slots[text as usize].text.font_size, px(20.));
         assert!(tree.slots[text as usize].cache.is_empty());
+    }
+
+    #[test]
+    fn patches_replace_kept_boxes_in_place() {
+        let mut tree = Tree::default();
+        let viewport = size(px(100.), px(100.));
+        let field = |width: f32| node().id(2usize).w(px(width)).child(node().child("a"));
+        let page = |child: Child| {
+            node()
+                .id(0usize)
+                .child(node().id(1usize).child(child))
+                .into()
+        };
+        let width = |tree: &Tree| slot(tree, 2).style.size.width;
+        tree.begin(1., 0);
+        tree.commit_root(page(field(10.).into()), viewport, 1.);
+        let (parent, own, inner) = (
+            tree.keys[&(identity(Some(ElementId::from(1usize)), 0), 0)],
+            tree.keys[&(identity(Some(ElementId::from(2usize)), 0), 0)],
+            slot(&tree, 2).children.clone(),
+        );
+        let slots = live(&tree);
+        tree.begin(1., 0);
+        tree.commit_root(Child::Kept(0usize.into()), viewport, 1.);
+        tree.patch(field(20.), 1.);
+        assert_eq!(width(&tree), px(20.).into());
+        assert_eq!(slot(&tree, 1).children, [(own as usize).into()]);
+        assert_eq!(slot(&tree, 2).parent, parent);
+        assert_eq!(slot(&tree, 2).children, inner);
+        assert_eq!(live(&tree), slots);
+        tree.begin(1., 0);
+        tree.commit_root(page(field(30.).into()), viewport, 1.);
+        tree.patch(field(40.), 1.);
+        assert_eq!(
+            width(&tree),
+            px(30.).into(),
+            "a box built in this pass keeps its build"
+        );
     }
 }

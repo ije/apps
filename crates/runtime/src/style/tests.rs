@@ -1,68 +1,118 @@
 use super::*;
 
 #[test]
-fn sf_symbols_import_is_opt_in_and_utilities_override_defaults() {
-    for imports in [
-        "",
-        "@import 'tailwindcss';",
-        "@import 'sf-symbols';",
-        "@import 'sf-symbols';</style><style>@import 'tailwindcss';",
-        "@import 'tailwindcss';</style><style>@import 'sf-symbols';",
+fn sf_symbol_elements_have_inherited_color_and_native_defaults() {
+    let doc = Document::parse(
+        "<div style='color:#123456;font-size:20px'><sf-symbol-chevron-left id=icon></sf-symbol-chevron-left><span id=after></span><sf-symbol- id=empty></sf-symbol-><sf-symbol--folder id=invalid></sf-symbol--folder><span id=legacy class=sf-icon-folder></span><sf-symbol-folder id=hidden hidden></sf-symbol-folder></div>",
+    );
+    let values = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .values;
+    let icon = &values[element(&doc, "#icon")];
+    for (prop, value) in [
+        (Prop::DISPLAY, "inline-block"),
+        (Prop::WIDTH, "1em"),
+        (Prop::HEIGHT, "1em"),
+        (Prop::VERTICAL_ALIGN, "middle"),
+        (Prop::FLEX_SHRINK, "0"),
+        (Prop::COLOR, "#123456"),
+        (Prop::FONT_SIZE, "20px"),
     ] {
-        let doc = Document::parse(&format!(
-            "<style>{imports}</style><div style='color:#123456'><span id=icon class='sf-icon-chevron-left'><b></b></span><span id=sized class='sf-icon-folder size-16'></span><span id=invalid class='sf-icon- sf-icon--folder'></span></div>"
-        ));
-        let values = compute_styles(
-            &doc,
-            800.,
-            600.,
-            None,
-            &mut HashMap::new(),
-            &mut StyleCache::default(),
-            None,
-        )
-        .values;
-        let active = cfg!(target_os = "macos") && imports.contains("sf-symbols");
-        let icon = &values[element(&doc, "#icon")];
-        assert_eq!(
-            icon.get(Prop::APP_SF_SYMBOL),
-            active.then_some("\"chevron.left\"")
-        );
-        assert_eq!(icon.get(Prop::COLOR), Some("#123456"));
-        assert!(!values[element(&doc, "b")].contains(Prop::APP_SF_SYMBOL));
-        assert!(!values[element(&doc, "#invalid")].contains(Prop::APP_SF_SYMBOL));
-        if active {
-            assert_eq!(icon.get(Prop::DISPLAY), Some("inline-block"));
-            assert_eq!(icon.get(Prop::WIDTH), Some("1em"));
-            assert_eq!(icon.get(Prop::HEIGHT), Some("1em"));
-            assert_eq!(icon.get(Prop::VERTICAL_ALIGN), Some("middle"));
-        }
-        if imports.contains("tailwindcss") {
-            let sized = &values[element(&doc, "#sized")];
-            assert_eq!(length(&sized["width"], 0., 16., 800., 600.), 64.);
-            assert_eq!(length(&sized["height"], 0., 16., 800., 600.), 64.);
-        }
+        assert_eq!(icon.get(prop), Some(value), "{prop:?}");
+    }
+    for selector in ["#after", "#empty", "#invalid", "#legacy"] {
+        let style = &values[element(&doc, selector)];
+        assert_eq!(style.get(Prop::DISPLAY).unwrap_or("inline"), "inline");
+        assert!(!style.contains(Prop::WIDTH));
+        assert!(!style.contains(Prop::HEIGHT));
+        assert!(!style.contains(Prop::FLEX_SHRINK));
+        assert_eq!(style.get(Prop::COLOR), Some("#123456"));
+    }
+    assert_eq!(
+        values[element(&doc, "#hidden")].get(Prop::DISPLAY),
+        Some("none")
+    );
+    assert!(Stylesheet::parse("@import 'sf-symbols';").0.is_empty());
+    assert_eq!(supports("-apps-sf-symbol", "folder"), None);
+    assert!(declare("-apps-sf-symbol:folder").is_empty());
+}
+
+#[test]
+fn sf_symbol_defaults_follow_author_cascade_and_revert() {
+    let doc = Document::parse(
+        "<style>@import 'tailwindcss';@layer components{.authored{display:inline;width:21px;height:13px;vertical-align:top;flex-shrink:2}}</style><sf-symbol-folder id=utility class='size-16 shrink inline-flex align-bottom'></sf-symbol-folder><sf-symbol-folder id=author class=authored></sf-symbol-folder><sf-symbol-folder id=inline class=authored style='width:23px'></sf-symbol-folder><sf-symbol-folder id=revert class=authored style='all:revert'></sf-symbol-folder>",
+    );
+    let values = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .values;
+    let utility = &values[element(&doc, "#utility")];
+    assert_eq!(length(&utility["width"], 0., 16., 800., 600.), 64.);
+    assert_eq!(length(&utility["height"], 0., 16., 800., 600.), 64.);
+    assert_eq!(utility.get(Prop::DISPLAY), Some("inline-flex"));
+    assert_eq!(utility.get(Prop::VERTICAL_ALIGN), Some("bottom"));
+    assert_eq!(utility.get(Prop::FLEX_SHRINK), Some("1"));
+    let author = &values[element(&doc, "#author")];
+    for (prop, value) in [
+        (Prop::DISPLAY, "inline"),
+        (Prop::WIDTH, "21px"),
+        (Prop::HEIGHT, "13px"),
+        (Prop::VERTICAL_ALIGN, "top"),
+        (Prop::FLEX_SHRINK, "2"),
+    ] {
+        assert_eq!(author.get(prop), Some(value), "{prop:?}");
+    }
+    assert_eq!(
+        values[element(&doc, "#inline")].get(Prop::WIDTH),
+        Some("23px")
+    );
+    let reverted = &values[element(&doc, "#revert")];
+    for (prop, value) in [
+        (Prop::DISPLAY, "inline-block"),
+        (Prop::WIDTH, "1em"),
+        (Prop::HEIGHT, "1em"),
+        (Prop::VERTICAL_ALIGN, "middle"),
+        (Prop::FLEX_SHRINK, "0"),
+    ] {
+        assert_eq!(reverted.get(prop), Some(value), "{prop:?}");
     }
 }
 
 #[test]
-fn sf_symbols_follow_dynamic_classes_cascade_and_disabled_imports() {
+fn sf_symbol_cached_styles_follow_classes_and_inheritance() {
     let mut doc = Document::parse(
-        "<style>@import 'sf-symbols';#override{-apps-sf-symbol:var(--symbol)}</style><span id=changing class=sf-icon-folder></span><span id=override class=sf-icon-trash style='--symbol:\"star.fill\"'></span>",
+        "<style>@import 'tailwindcss';</style><div><sf-symbol-folder id=icon></sf-symbol-folder></div>",
     );
     let sheet = element(&doc, "style");
-    let icon = element(&doc, "#changing");
-    let overridden = element(&doc, "#override");
+    let parent = element(&doc, "div");
+    let icon = element(&doc, "#icon");
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
-    for (class, disabled, symbol) in [
-        ("sf-icon-folder", false, Some("\"folder\"")),
-        ("sf-icon-chevron-right", false, Some("\"chevron.right\"")),
-        ("sf-icon-chevron-right", true, None),
-        ("sf-icon-folder", false, Some("\"folder\"")),
-        ("", false, None),
+    for (class, disabled, color, expected) in [
+        ("size-16", false, "#123456", 64.),
+        ("size-8", false, "#abcdef", 32.),
+        ("size-8", true, "#112233", 20.),
+        ("size-16", false, "#123456", 64.),
+        ("sf-icon-trash", false, "#abcdef", 20.),
+        ("", false, "#abcdef", 20.),
     ] {
         doc.nodes[icon].attrs.set("class", class);
+        doc.nodes[parent]
+            .attrs
+            .set("style", &format!("color:{color};font-size:20px"));
         if disabled {
             doc.nodes[sheet].attrs.set("disabled", "");
         } else {
@@ -79,50 +129,21 @@ fn sf_symbols_follow_dynamic_classes_cascade_and_disabled_imports() {
             None,
         );
         assert_eq!(cached.values, fresh.values);
-        assert_eq!(
-            cached.values[icon].get(Prop::APP_SF_SYMBOL),
-            symbol.filter(|_| cfg!(target_os = "macos"))
-        );
-        assert_eq!(
-            cached.values[overridden].get(Prop::APP_SF_SYMBOL),
-            (!disabled).then_some("\"star.fill\"")
-        );
+        let style = &cached.values[icon];
+        assert_eq!(length(&style["width"], 0., 20., 800., 600.), expected);
+        assert_eq!(length(&style["height"], 0., 20., 800., 600.), expected);
+        assert_eq!(style.get(Prop::COLOR), Some(color));
+        assert_eq!(style.get(Prop::DISPLAY), Some("inline-block"));
         let same = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         assert!(Rc::ptr_eq(&cached.values[icon], &same.values[icon]));
     }
 }
 
 #[test]
-fn sf_symbols_import_survives_serialization_and_cssom_removal() {
-    let source = "@import 'sf-symbols';";
-    let sheet = Stylesheet::parse(source);
-    assert_eq!(sheet.source(), source);
-    assert_eq!(sheet.cssom(), serde_json::json!([["import", "sf-symbols"]]));
-    let bytes = postcard::to_allocvec(&sheet).unwrap();
-    let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
-    let mut doc = Document::parse("<style></style><span class=sf-icon-folder-fill></span>");
-    let style = element(&doc, "style");
-    let icon = element(&doc, "span");
-    doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
-    let mut sheets = HashMap::new();
-    let mut cache = StyleCache::default();
-    let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(
-        before.values[icon].get(Prop::APP_SF_SYMBOL),
-        cfg!(target_os = "macos").then_some("\"folder.fill\"")
-    );
-    sheet.edit(&[0], Edit::Delete).unwrap();
-    doc.nodes[style].stylesheet = Some(Rc::new(sheet));
-    let after = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert!(!after.values[icon].contains(Prop::APP_SF_SYMBOL));
-    assert!(!after.values[icon].contains(Prop::WIDTH));
-}
-
-#[test]
 fn glass_variants_follow_native_support_and_cached_states() {
     let supported = renderer::supports_glass();
     let mut doc = Document::parse(
-        "<style>@import 'tailwindcss';</style><button class='supports-glass:w-[31px] not-supports-glass:w-[47px] h-[11px] md:supports-glass:hover:h-[33px] md:not-supports-glass:hover:h-[49px]'></button>",
+        "<style>@import 'tailwindcss';</style><button class='bg-glass not-supports-bg-glass:bg-[#123456] supports-bg-glass:w-[31px] not-supports-bg-glass:w-[47px] h-[11px] md:supports-bg-glass:hover:h-[33px] md:not-supports-bg-glass:hover:h-[49px]'></button>",
     );
     let button = element(&doc, "button");
     let mut sheets = HashMap::new();
@@ -141,6 +162,10 @@ fn glass_variants_follow_native_support_and_cached_states() {
         );
         assert_eq!(cached.values, fresh.values);
         let style = &cached.values[button];
+        assert_eq!(
+            style.get(Prop::BACKGROUND_COLOR),
+            Some(if supported { "transparent" } else { "#123456" })
+        );
         assert_eq!(
             style.get(Prop::WIDTH),
             Some(if supported { "31px" } else { "47px" })
@@ -203,7 +228,6 @@ fn glass_properties_are_known_declarations() {
             "#123456",
             Prop::MACOS_GLASS_TINT_COLOR,
         ),
-        ("-apps-sf-symbol", "\"folder\"", Prop::APP_SF_SYMBOL),
     ] {
         assert_eq!(Prop::find(name), Some(prop));
         assert_eq!(supports(name, value), Some(true));
@@ -220,20 +244,23 @@ fn glass_tints_follow_theme_changes_and_color_utilities() {
     let mut doc = Document::parse(
         r#"<style>
             @import 'tailwindcss';
-            @import 'liquid-glass';
             @theme { --color-brand: #123456; }
             @theme inline { --color-accent: var(--accent); }
             .theme { --accent: #112233; color: #fedcba; }
             .theme.dark { --color-brand: #abcdef; --accent: #654321; }
-            #applied { @apply glass-tint-brand/50; }
+            #applied { @apply bg-glass-brand/50; }
+            #reset { @apply bg-glass-brand/50 bg-white border-2 appearance-auto; }
         </style><section class=theme>
-            <button id=brand class='glass glass-tint-brand'></button>
-            <button id=alpha class='glass-tint-brand/50'></button>
-            <button id=inline class='glass-tint-accent'></button>
-            <button id=current class='glass-tint-current/50'></button>
+            <button id=brand class='bg-glass-brand'></button>
+            <button id=alpha class='bg-glass-brand/50'></button>
+            <button id=inline class='bg-glass-accent'></button>
+            <button id=current class='bg-glass-current/50'></button>
             <button id=applied></button>
-            <button id=variant class='glass-tint-[#123abc] hover:glass-tint-brand'></button>
-            <button id=legacy class='glass-tint-blue'></button>
+            <button id=reset></button>
+            <button id=explicit class='bg-glass-brand bg-white border-2 appearance-auto'></button>
+            <button id=variant class='bg-glass-[#123abc] hover:bg-glass-brand'></button>
+            <button id=hoveronly class='hover:bg-glass-brand bg-glass-interactive'></button>
+            <button id=legacy class='bg-glass-blue'></button>
         </section>"#,
     );
     let host = element(&doc, "section");
@@ -245,6 +272,8 @@ fn glass_tints_follow_theme_changes_and_color_utilities() {
             .attrs
             .set("class", if dark { "theme dark" } else { "theme" });
         doc.nodes[variant].state = if dark { crate::dom::HOVER } else { 0 };
+        let hoveronly = element(&doc, "#hoveronly");
+        doc.nodes[hoveronly].state = if dark { crate::dom::HOVER } else { 0 };
         let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         let fresh = compute_styles(
             &doc,
@@ -265,31 +294,47 @@ fn glass_tints_follow_theme_changes_and_color_utilities() {
             ("#applied", (brand, 128)),
             ("#variant", (if dark { brand } else { 0x123abc }, 255)),
         ] {
+            let values = &cached.values[element(&doc, selector)];
             assert_eq!(
-                cached.values[element(&doc, selector)]
-                    .get(Prop::MACOS_GLASS_TINT_COLOR)
-                    .and_then(color),
+                values.get(Prop::MACOS_GLASS_TINT_COLOR).and_then(color),
                 Some(expected),
                 "{selector}, dark={dark}"
             );
+            assert_eq!(
+                values.get(Prop::MACOS_GLASS),
+                cfg!(target_os = "macos").then_some("regular")
+            );
+            if cfg!(target_os = "macos") {
+                assert_eq!(values.get(Prop::BACKGROUND_COLOR), Some("transparent"));
+                assert_eq!(values.get(Prop::APPEARANCE), Some("none"));
+                assert_eq!(values.get(Prop::BORDER_TOP_WIDTH), Some("0"));
+            }
         }
         assert!(!cached.values[element(&doc, "#legacy")].contains(Prop::MACOS_GLASS_TINT_COLOR));
+        assert!(!cached.values[element(&doc, "#legacy")].contains(Prop::MACOS_GLASS));
+        for selector in ["#reset", "#explicit"] {
+            let values = &cached.values[element(&doc, selector)];
+            assert_eq!(values.get(Prop::BACKGROUND_COLOR), Some("#fff"));
+            assert_eq!(values.get(Prop::BORDER_TOP_WIDTH), Some("2px"));
+            assert_eq!(values.get(Prop::APPEARANCE), Some("auto"));
+        }
+        assert_eq!(
+            cached.values[hoveronly].get(Prop::MACOS_GLASS),
+            (cfg!(target_os = "macos") && dark).then_some("regular")
+        );
     }
 }
 
 #[test]
-fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
+fn glass_classes_are_builtin_and_independent_of_tailwind() {
     for imports in [
         "",
         "@import 'tailwindcss';",
-        "@import 'liquid-glass';",
-        "@import 'liquid-glass'; @import 'tailwindcss';",
-        "@import 'tailwindcss'; @import 'liquid-glass';",
-        "@import 'liquid-glass';</style><style>@import 'tailwindcss';",
-        "@import 'tailwindcss';</style><style>@import 'liquid-glass';",
+        "span{color:red}</style><style>@import 'tailwindcss';",
+        "@import 'tailwindcss';</style><style>span{color:red}",
     ] {
         let doc = Document::parse(&format!(
-            "<style>{imports}</style><button class='glass glass-interactive glass-tint-blue-500'><span>Save</span></button><div class=glass-clear></div><button id=utility class='glass bg-white rounded-lg'></button>"
+            "<style>{imports}</style><button class='bg-glass bg-glass-interactive bg-glass-blue-500'><span>Save</span></button><div class=bg-glass-clear></div><button id=utility class='bg-glass bg-white rounded-lg'></button><button id=tinted class='bg-glass-blue-500 bg-glass-interactive'></button><button id=modifier class=bg-glass-interactive></button>"
         ));
         let values = compute_styles(
             &doc,
@@ -301,7 +346,12 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
             None,
         )
         .values;
-        let active = cfg!(target_os = "macos") && imports.contains("liquid-glass");
+        let active = cfg!(target_os = "macos");
+        assert_eq!(
+            values[element(&doc, "#tinted")].get(Prop::MACOS_GLASS),
+            (active && imports.contains("tailwindcss")).then_some("regular")
+        );
+        assert!(!values[element(&doc, "#modifier")].contains(Prop::MACOS_GLASS));
         let button = &values[element(&doc, "button")];
         assert_eq!(button.get(Prop::MACOS_GLASS), active.then_some("regular"));
         assert_eq!(
@@ -340,9 +390,9 @@ fn liquid_glass_import_is_opt_in_and_independent_of_tailwind() {
 }
 
 #[test]
-fn liquid_glass_classes_follow_cascade_and_cached_changes() {
+fn glass_classes_follow_cascade_and_cached_changes() {
     let mut doc = Document::parse(
-        "<style>@import 'liquid-glass';@import 'tailwindcss';#override{-macos-glass:clear;-macos-glass-tint-color:var(--tint);background-color:red}</style><button id=changing></button><button id=override class='glass glass-tint-blue-500' style='--tint:#123456'></button><button id=utility class='glass rounded-lg bg-white'></button>",
+        "<style>@import 'tailwindcss';@layer components{.component{appearance:auto;background-color:red}}#override{-macos-glass:clear;-macos-glass-tint-color:var(--tint);background-color:red}</style><button id=changing></button><button id=override class='bg-glass bg-glass-blue-500' style='--tint:#123456'></button><button id=utility class='bg-glass rounded-lg bg-white'></button><button id=component class='bg-glass component'></button>",
     );
     let changing = element(&doc, "#changing");
     let overridden = element(&doc, "#override");
@@ -351,11 +401,23 @@ fn liquid_glass_classes_follow_cascade_and_cached_changes() {
     let mut cache = StyleCache::default();
     for (class, effect, tint) in [
         (
-            "glass glass-interactive glass-tint-blue-500",
+            "bg-glass bg-glass-interactive bg-glass-blue-500",
             Some("regular"),
             "#123456",
         ),
-        ("glass-clear", Some("clear"), "#abcdef"),
+        ("bg-glass-clear", Some("clear"), "#abcdef"),
+        (
+            "bg-glass-blue-500 bg-glass-interactive",
+            Some("regular"),
+            "#112233",
+        ),
+        (
+            "bg-glass-clear bg-glass-blue-500 bg-glass-interactive",
+            Some("clear"),
+            "#223344",
+        ),
+        ("bg-glass-interactive", None, "#334455"),
+        ("glass glass-clear glass-tint-blue-500", None, "#654321"),
         ("", None, "#fedcba"),
     ] {
         doc.nodes[changing].attrs.set("class", class);
@@ -379,7 +441,11 @@ fn liquid_glass_classes_follow_cascade_and_cached_changes() {
         );
         assert_eq!(
             cached.values[changing].get(Prop::MACOS_GLASS_INTERACTIVE),
-            (cfg!(target_os = "macos") && class.contains("interactive")).then_some("true")
+            (cfg!(target_os = "macos")
+                && class
+                    .split_ascii_whitespace()
+                    .any(|class| class == "bg-glass-interactive"))
+            .then_some("true")
         );
         assert_eq!(
             cached.values[overridden].get(Prop::MACOS_GLASS),
@@ -401,23 +467,20 @@ fn liquid_glass_classes_follow_cascade_and_cached_changes() {
             cached.values[utility].get(Prop::BORDER_TOP_LEFT_RADIUS),
             Some("0.5rem")
         );
+        let component = &cached.values[element(&doc, "#component")];
+        assert_eq!(component.get(Prop::BACKGROUND_COLOR), Some("red"));
+        assert_eq!(component.get(Prop::APPEARANCE), Some("auto"));
     }
 }
 
 #[test]
-fn liquid_glass_import_survives_serialization_and_cssom_removal() {
-    let source = "@import 'liquid-glass';";
+fn builtin_glass_survives_cssom_edits_and_serialization() {
+    let source = "div{-macos-glass:clear;-macos-glass-interactive:false}";
     let sheet = Stylesheet::parse(source);
-    assert_eq!(sheet.source(), source);
-    assert_eq!(
-        sheet.cssom(),
-        serde_json::json!([["import", "liquid-glass"]])
-    );
     let bytes = postcard::to_allocvec(&sheet).unwrap();
     let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
     sheet.bind_parents().unwrap();
-    assert!(matches!(&*sheet.0[0], Rule::LiquidGlass(children) if !children.is_empty()));
-    let mut doc = Document::parse("<style></style><div class='glass glass-tint-blue-500'></div>");
+    let mut doc = Document::parse("<style></style><div class='bg-glass bg-glass-interactive'></div>");
     let style = element(&doc, "style");
     let glass = element(&doc, "div");
     doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
@@ -426,13 +489,23 @@ fn liquid_glass_import_survives_serialization_and_cssom_removal() {
     let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(
         before.values[glass].get(Prop::MACOS_GLASS),
-        cfg!(target_os = "macos").then_some("regular")
+        Some("clear")
+    );
+    assert_eq!(
+        before.values[glass].get(Prop::MACOS_GLASS_INTERACTIVE),
+        Some("false")
     );
     sheet.edit(&[0], Edit::Delete).unwrap();
     doc.nodes[style].stylesheet = Some(Rc::new(sheet));
     let after = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert!(!after.values[glass].contains(Prop::MACOS_GLASS));
-    assert!(!after.values[glass].contains(Prop::MACOS_GLASS_TINT_COLOR));
+    assert_eq!(
+        after.values[glass].get(Prop::MACOS_GLASS),
+        cfg!(target_os = "macos").then_some("regular")
+    );
+    assert_eq!(
+        after.values[glass].get(Prop::MACOS_GLASS_INTERACTIVE),
+        cfg!(target_os = "macos").then_some("true")
+    );
 }
 
 #[test]
@@ -1210,10 +1283,10 @@ fn nested_layers_media_and_supports_keep_cascade_order() {
 fn logical_borders_and_theme_colors_resolve_variables() {
     let doc = Document::parse(
         r#"<style>
-            :host { --edge:2px solid #fff; --bg:#fff; --ink:light-dark(#f00,#0f0); color-scheme:dark; }
+            .wrap { --edge:2px solid #fff; --bg:#fff; --ink:light-dark(#f00,#0f0); color-scheme:dark; }
             .item { border-right:var(--edge); border-left:1px solid var(--bg); padding-inline:1ch 2ch; margin-block:8px; color:var(--ink); background-color:color-mix(in lab, white 50%, black); }
             .item span { background-color:light-dark(inherit,inherit); }
-        </style><apps-shadow-root><div class="item"><span>text</span></div></apps-shadow-root>"#,
+        </style><div class="wrap"><div class="item"><span>text</span></div></div>"#,
     );
     let computed = styles(&doc, 800., 600.);
     let item = element(&doc, ".item");
@@ -2897,33 +2970,50 @@ fn syntax_checks_never_split_multibyte_text() {
     assert!(!supports_condition("(width: aaéé)"));
 }
 
+// Turns `#root` into the shadow root of `#host`, and `#root2`, if there is one, into that of `#inner`, and gives the
+// host's children to the first slot.
+fn attach(doc: &mut Document) -> Rc<Shadows> {
+    let mut pairs = Vec::new();
+    for (host, root) in [("#host", "#root"), ("#inner", "#root2")] {
+        let Some(root) = (0..doc.nodes.len()).find(|&id| doc.matches(id, root)) else {
+            continue;
+        };
+        if let Some(parent) = doc.nodes[root].parent {
+            doc.nodes[parent].children.retain(|&id| id != root);
+        }
+        pairs.push((element(doc, host), root));
+        let node = &mut doc.nodes[root];
+        node.parent = None;
+        node.tag = "#fragment".into();
+        node.attrs.clear();
+    }
+    let host = pairs[0].0;
+    let mut composed: FxHashMap<usize, Vec<usize>> = pairs
+        .iter()
+        .map(|&(host, root)| (host, vec![root]))
+        .collect();
+    if let Some(slot) = doc.nodes.iter().position(|node| node.tag == "slot") {
+        let assigned = doc.nodes[host].children.iter();
+        composed.insert(
+            slot,
+            assigned.chain(&doc.nodes[slot].children).copied().collect(),
+        );
+    }
+    Rc::new(Shadows {
+        roots: pairs.iter().copied().collect(),
+        hosts: Rc::new(pairs.iter().map(|&(host, root)| (root, host)).collect()),
+        composed,
+    })
+}
+
 #[test]
 fn slotted_and_part_declarations_are_part_of_the_cache_key() {
-    let doc = Document::parse("<div><span id=a></span><span id=b></span></div>");
-    let [a, b] = ["#a", "#b"].map(|selector| element(&doc, selector));
-    let red: Vec<Declared> = vec![(Prop::COLOR, "red".into(), false)];
-    let mut sheets = HashMap::new();
-    let mut cache = StyleCache::default();
-    for (on, off) in [(a, b), (b, a)] {
-        let context = StyleContext {
-            slotted: FxHashMap::from_iter([(on, red.clone())]),
-            ..StyleContext::default()
-        };
-        let computed = compute_styles(
-            &doc,
-            800.,
-            600.,
-            None,
-            &mut sheets,
-            &mut cache,
-            Some(&context),
-        );
-        cache.finish();
-        assert_eq!(computed.values[on].get(Prop::COLOR), Some("red"));
-        assert_ne!(computed.values[off].get(Prop::COLOR), Some("red"));
-    }
+    let mut doc = Document::parse(
+        "<style>#host::part(label){color:blue}</style><div id=host><span id=a class=on></span><span id=b></span></div><div id=root><style>::slotted(.on){color:red}</style><slot></slot><p part=label id=p></p><p id=q></p></div>",
+    );
+    let [a, b, p, q] = ["#a", "#b", "#p", "#q"].map(|selector| element(&doc, selector));
     let context = StyleContext {
-        parts: FxHashMap::from_iter([(a, red)]),
+        shadows: attach(&mut doc),
         ..StyleContext::default()
     };
     let computed = compute_styles(
@@ -2931,12 +3021,51 @@ fn slotted_and_part_declarations_are_part_of_the_cache_key() {
         800.,
         600.,
         None,
-        &mut sheets,
-        &mut cache,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
         Some(&context),
     );
     assert_eq!(computed.values[a].get(Prop::COLOR), Some("red"));
     assert_ne!(computed.values[b].get(Prop::COLOR), Some("red"));
+    assert_eq!(computed.values[p].get(Prop::COLOR), Some("blue"));
+    assert_ne!(computed.values[q].get(Prop::COLOR), Some("blue"));
+}
+
+#[test]
+fn hosts_are_featureless_in_their_shadow_tree() {
+    let mut doc = Document::parse(
+        "<style>x-a{color:green}</style><x-a id=host class=k style='color:blue'><em id=e>e</em></x-a><div id=root><style>*{padding-top:3px}.k{margin-left:5px}:host{color:red;--tone:teal}:host(.k){padding-left:6px}:host(.j){padding-right:7px}:is(:host) b{margin-top:8px}slot{background-color:var(--tone)}</style><slot id=s></slot><b id=b>b</b></div>",
+    );
+    let [host, e, s, b] = ["#host", "#e", "#s", "#b"].map(|selector| element(&doc, selector));
+    let context = StyleContext {
+        shadows: attach(&mut doc),
+        ..StyleContext::default()
+    };
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        Some(&context),
+    );
+    let get = |id: usize, prop: Prop| computed.values[id].get(prop).map(str::to_owned);
+    for prop in [
+        Prop::DISPLAY,
+        Prop::PADDING_TOP,
+        Prop::MARGIN_LEFT,
+        Prop::PADDING_RIGHT,
+    ] {
+        assert_eq!(get(host, prop), None, "{}", prop.name());
+    }
+    assert_eq!(get(host, Prop::PADDING_LEFT).as_deref(), Some("6px"));
+    assert_eq!(get(host, Prop::COLOR).as_deref(), Some("blue"));
+    assert_eq!(get(s, Prop::COLOR).as_deref(), Some("blue"));
+    assert_eq!(get(e, Prop::COLOR).as_deref(), Some("blue"));
+    assert_eq!(get(s, Prop::BACKGROUND_COLOR).as_deref(), Some("teal"));
+    assert_eq!(get(b, Prop::MARGIN_TOP).as_deref(), Some("8px"));
+    assert_eq!(get(b, Prop::PADDING_TOP).as_deref(), Some("3px"));
 }
 
 #[test]
@@ -3148,11 +3277,11 @@ fn appended_style_text_shares_old_rules_and_parses_like_the_whole_text() {
         let mut cache = StyleCache::default();
         compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
         cache.finish();
-        let before = cache.sheets[&style].2.clone();
+        let before = cache.sheets[&style].3.clone();
         let text = doc.nodes[style].children[0];
         doc.nodes[text].text.push_str(added);
         let computed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-        let after = &cache.sheets[&style].2;
+        let after = &cache.sheets[&style].3;
         assert_eq!(Rc::ptr_eq(&before.0[0], &after.0[0]), shared, "{old}");
         let fresh = styles(&doc, 800., 600.);
         for id in [".a", ".b", ".c"].map(|selector| element(&doc, selector)) {
@@ -3318,6 +3447,49 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
 }
 
 #[test]
+fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
+    let mut doc = Document::parse(
+        "<style>dialog{transition:overlay 1s allow-discrete}dialog[open]::backdrop{background:red}@starting-style{dialog[open]::backdrop{background:blue}}#p::backdrop{color:blue}#x{overlay:auto}</style><dialog id=d open>d</dialog><div id=p popover>p</div><div id=x style='overlay:auto'>x</div>",
+    );
+    let [d, p, x] = ["#d", "#p", "#x"].map(|selector| element(&doc, selector));
+    let (mut sheets, mut cache) = (HashMap::new(), StyleCache::default());
+    let mut styles = |doc: &Document| compute_styles(doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let closed = styles(&doc);
+    assert_eq!(
+        [d, p, x].map(|id| closed.values[id].get(Prop::OVERLAY)),
+        [None; 3]
+    );
+    doc.nodes[d].state = crate::dom::MODAL;
+    doc.nodes[p].state = crate::dom::POPOVER;
+    let open = styles(&doc);
+    assert_eq!(
+        [d, p].map(|id| open.values[id].get(Prop::OVERLAY)),
+        [Some("auto"); 2]
+    );
+    assert_eq!(&open.backdrops[&d]["background-color"], "red");
+    assert_eq!(&open.backdrop_starts[&d]["background-color"], "blue");
+    assert!(!open.backdrop_starts.contains_key(&p));
+    doc.nodes[d].attrs.remove("open");
+    doc.nodes[d].state = crate::dom::MODAL << 5;
+    doc.nodes[p].state = crate::dom::POPOVER << 5;
+    let leaving = styles(&doc);
+    assert_eq!(
+        [d, p].map(|id| leaving.values[id].get(Prop::OVERLAY)),
+        [Some("none"); 2]
+    );
+    assert_eq!(
+        [&leaving.values[d]["position"], &leaving.values[d]["display"]],
+        ["fixed", "none"]
+    );
+    assert!(leaving.backdrops.contains_key(&d) && leaving.backdrops.contains_key(&p));
+    assert!(!doc.matches(d, ":modal"));
+    doc.nodes[d].state = 0;
+    let left = styles(&doc);
+    assert_eq!(&left.values[d]["position"], "absolute");
+    assert!(!left.backdrops.contains_key(&d));
+}
+
+#[test]
 fn node_lengths_share_equal_values() {
     let mut lengths = super::NodeLengths::default();
     let base = Lengths::new(16., 800., 600.);
@@ -3329,7 +3501,7 @@ fn node_lengths_share_equal_values() {
     assert_eq!(lengths[1].font.em, 20.);
     assert_eq!(lengths[2], base);
     assert_eq!(lengths[3], lengths[1]);
-    lengths.resize(6);
+    lengths.grow(6);
     assert_eq!(lengths[5], base);
     assert!(lengths.get(6).is_none());
     assert_eq!(lengths.list_len(), 2);
@@ -3343,7 +3515,6 @@ fn incremental(
 ) -> Rc<ComputedStyles> {
     let context = StyleContext {
         previous: last.clone(),
-        incremental: true,
         ..Default::default()
     };
     let out = Rc::new(compute_styles(
@@ -3641,4 +3812,356 @@ fn collapsed_borders_follow_column_spans_and_reuse_cached_tables() {
         None,
     );
     assert_eq!(bottom(&wide, cells[0]).as_deref(), Some("2px"));
+}
+
+fn shadowed(
+    doc: &Document,
+    shadows: &Rc<Shadows>,
+    cache: &mut StyleCache,
+    last: &mut Option<Rc<ComputedStyles>>,
+) -> Rc<ComputedStyles> {
+    let context = StyleContext {
+        shadows: shadows.clone(),
+        previous: last.clone(),
+        ..Default::default()
+    };
+    let out = Rc::new(compute_styles(
+        doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        cache,
+        Some(&context),
+    ));
+    cache.finish();
+    *last = Some(out.clone());
+    out
+}
+
+#[test]
+fn hosts_take_pseudo_elements_from_their_shadow_tree() {
+    let mut doc = Document::parse(
+        "<style>x-a::before{color:blue;background-color:blue!important}</style><x-a id=host class=on></x-a><div id=root><style>:host::before{content:'A';color:red;background-color:red!important}:host(.on)::after{content:'B';color:green}:host(:hover)::after{color:purple}@starting-style{:host{opacity:0}}</style></div>",
+    );
+    let host = element(&doc, "#host");
+    let shadows = attach(&mut doc);
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    let pseudos = out.pseudos.get(&host).cloned().unwrap();
+    assert_eq!(pseudos[0].get(Prop::CONTENT), Some("'A'"));
+    assert_eq!(pseudos[0].get(Prop::COLOR), Some("blue"));
+    assert_eq!(pseudos[0].get(Prop::BACKGROUND_COLOR), Some("red"));
+    assert_eq!(pseudos[1].get(Prop::CONTENT), Some("'B'"));
+    assert_eq!(pseudos[1].get(Prop::COLOR), Some("green"));
+    assert_eq!(out.starting[&host].get(Prop::OPACITY), Some("0"));
+    doc.nodes[host].attrs.set("class", "off");
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    let pseudos = out.pseudos.get(&host).cloned().unwrap();
+    assert_eq!(pseudos[0].get(Prop::CONTENT), Some("'A'"));
+    assert!(!pseudos[1].contains(Prop::CONTENT));
+    doc.nodes[host].attrs.set("class", "on");
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    assert_eq!(out.pseudos[&host][1].get(Prop::CONTENT), Some("'B'"));
+    doc.nodes[host].state = crate::dom::HOVER;
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    assert_eq!(out.pseudos[&host][1].get(Prop::COLOR), Some("purple"));
+    #[cfg(debug_assertions)]
+    assert_eq!(cache.incremental, 3);
+}
+
+#[test]
+fn host_rules_query_the_containers_of_the_flat_tree() {
+    let mut doc = Document::parse(
+        "<style>#outer{container-type:inline-size}.self{container-type:inline-size}@container (width < 300px){#p::before{content:'P'}}</style>
+        <div id=outer><x-a id=host><span id=s>s</span></x-a><div id=p class=self></div></div>
+        <div id=root><style>:host{color:gray;font-size:10cqw;container-type:inline-size}
+        @container (width > 300px){:host{color:green}}@container (width < 300px){:host{background-color:red}}
+        @container (width < 300px){:host::before{content:'C'}}@container (width > 300px){:host::after{content:'D'}}
+        slot{display:block;container-type:inline-size}@container (width < 150px){::slotted(span){padding-left:5px}}</style><slot id=slot></slot></div>",
+    );
+    let [outer, host, s, p] =
+        ["#outer", "#host", "#s", "#p"].map(|selector| element(&doc, selector));
+    let slot = element(&doc, "#slot");
+    let shadows = attach(&mut doc);
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    shadowed(&doc, &shadows, &mut cache, &mut last);
+    let mut sizes = HashMap::from([
+        (outer, [400., 50.]),
+        (host, [200., 50.]),
+        (slot, [100., 50.]),
+        (p, [200., 50.]),
+    ]);
+    let mut check = |sizes: &HashMap<usize, [f32; 2]>| {
+        assert!(cache.set_containers(sizes, &doc));
+        let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+        let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
+        let content = |slot: usize| {
+            out.pseudos
+                .get(&host)
+                .and_then(|pair| pair[slot].get(Prop::CONTENT).map(str::to_owned))
+        };
+        let (wide, narrow, slim) = (
+            sizes[&outer][0] > 300.,
+            sizes[&host][0] < 300.,
+            sizes[&slot][0] < 150.,
+        );
+        assert_eq!(
+            get(host, Prop::COLOR).as_deref(),
+            Some(if wide { "green" } else { "gray" })
+        );
+        assert_eq!(
+            get(host, Prop::BACKGROUND_COLOR).as_deref(),
+            (!wide).then_some("red")
+        );
+        assert_eq!(
+            get(host, Prop::FONT_SIZE),
+            Some(format!("{}px", sizes[&outer][0] / 10.))
+        );
+        assert_eq!(content(0).as_deref(), narrow.then_some("'C'"));
+        assert_eq!(content(1).as_deref(), (!narrow).then_some("'D'"));
+        assert_eq!(get(s, Prop::PADDING_LEFT).as_deref(), slim.then_some("5px"));
+        assert_eq!(out.pseudos[&p][0].get(Prop::CONTENT), Some("'P'"));
+        let mut fresh = StyleCache {
+            containers: sizes.clone(),
+            ..Default::default()
+        };
+        let reference = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut fresh,
+            Some(&StyleContext {
+                shadows: shadows.clone(),
+                ..Default::default()
+            }),
+        );
+        assert!(out.values == reference.values && out.pseudos == reference.pseudos);
+    };
+    check(&sizes);
+    sizes.insert(host, [400., 50.]);
+    sizes.insert(slot, [200., 50.]);
+    check(&sizes);
+    sizes.insert(outer, [250., 50.]);
+    check(&sizes);
+    sizes.insert(host, [100., 50.]);
+    sizes.insert(slot, [50., 50.]);
+    check(&sizes);
+    #[cfg(debug_assertions)]
+    assert_eq!(cache.incremental, 2);
+}
+
+#[test]
+fn part_and_slotted_rules_query_the_containers_of_the_node_they_reach() {
+    let mut doc = Document::parse(
+        "<style>#outer{container-type:inline-size;container-name:out}
+        @container (width > 500px){#host::part(p){color:red}}
+        @container (200px < width < 500px){#host::part(p){padding-left:1px}}
+        @container (width < 200px){#host::part(p){padding-right:2px}}
+        @container in (width < 500px){#host::part(p){margin-left:3px}}
+        @container out (width > 500px){#host::part(p){margin-right:4px}}
+        @container (200px < width < 500px){#host::part(p)::before{content:'B'}}
+        @container (width < 200px){#host::part(p)::after{content:'A'}}</style>
+        <div id=outer><div id=host><span id=s>s</span></div></div>
+        <div id=root><style>#in{container-type:inline-size;container-name:in}#p{container-type:inline-size}
+        slot{display:block;container-type:inline-size}::slotted(span){display:block;container-type:inline-size}
+        @container (width < 200px){::slotted(span)::before{content:'C'}}
+        @container (200px < width < 500px){::slotted(span)::after{content:'D'}}
+        @container (200px < width < 500px){::slotted(span){color:green}}</style>
+        <slot id=slot></slot><div id=in><div><span id=p part=p>x</span></div></div></div>",
+    );
+    let [outer, s, slot, inner, p] =
+        ["#outer", "#s", "#slot", "#in", "#p"].map(|selector| element(&doc, selector));
+    let shadows = attach(&mut doc);
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    shadowed(&doc, &shadows, &mut cache, &mut last);
+    let mut sizes = HashMap::from([
+        (outer, [600., 50.]),
+        (inner, [300., 50.]),
+        (p, [100., 50.]),
+        (slot, [300., 50.]),
+        (s, [100., 50.]),
+    ]);
+    let mut check = |sizes: &HashMap<usize, [f32; 2]>| {
+        assert!(cache.set_containers(sizes, &doc));
+        let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+        let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
+        let content = |id: usize, slot: usize| {
+            out.pseudos
+                .get(&id)
+                .and_then(|pair| pair[slot].get(Prop::CONTENT).map(str::to_owned))
+        };
+        let [within, own, slim, inside] = [inner, p, s, slot].map(|id| sizes[&id][0]);
+        let mid = |width: f32| 200. < width && width < 500.;
+        assert_eq!(get(p, Prop::COLOR).as_deref() == Some("red"), within > 500.);
+        assert_eq!(
+            get(p, Prop::PADDING_LEFT).as_deref() == Some("1px"),
+            mid(within)
+        );
+        assert_eq!(
+            get(p, Prop::PADDING_RIGHT).as_deref() == Some("2px"),
+            within < 200.
+        );
+        assert_eq!(
+            get(p, Prop::MARGIN_LEFT).as_deref() == Some("3px"),
+            within < 500.
+        );
+        assert_eq!(get(p, Prop::MARGIN_RIGHT).as_deref(), Some("4px"));
+        assert_eq!(content(p, 0).as_deref(), mid(own).then_some("'B'"));
+        assert_eq!(content(p, 1).as_deref(), (own < 200.).then_some("'A'"));
+        assert_eq!(content(s, 0).as_deref(), (slim < 200.).then_some("'C'"));
+        assert_eq!(content(s, 1).as_deref(), mid(slim).then_some("'D'"));
+        assert_eq!(get(s, Prop::COLOR).as_deref() == Some("green"), mid(inside));
+        let mut fresh = StyleCache {
+            containers: sizes.clone(),
+            ..Default::default()
+        };
+        let reference = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut fresh,
+            Some(&StyleContext {
+                shadows: shadows.clone(),
+                ..Default::default()
+            }),
+        );
+        assert!(out.values == reference.values && out.pseudos == reference.pseudos);
+    };
+    check(&sizes);
+    sizes.insert(inner, [600., 50.]);
+    sizes.insert(p, [300., 50.]);
+    sizes.insert(s, [300., 50.]);
+    check(&sizes);
+    sizes.insert(inner, [150., 50.]);
+    sizes.insert(slot, [100., 50.]);
+    check(&sizes);
+    #[cfg(debug_assertions)]
+    assert_eq!(cache.incremental, 3);
+}
+
+#[test]
+fn slotted_and_part_rules_style_pseudo_elements() {
+    let mut doc = Document::parse(
+        "<style>#host::part(p)::before{content:'P';color:green}#host::part(p)::first-line{color:green}
+        #host::part(p)::selection{color:green}#host::part(i)::placeholder{color:green}
+        #host::part(p).x{color:red}#host::part(p)::before:hover{color:red}#host::part(p)::slotted(b){color:red}
+        @starting-style{#host::part(p){opacity:0.5}}</style>
+        <div id=host><span id=a class=a>a</span><span id=b>b</span><input id=c placeholder=x><li id=l>l</li></div>
+        <div id=root><style>::slotted(span.a)::before{content:'B';background-color:green}
+        ::slotted(.a)::before{background-color:red;color:green}::slotted(span)::after{content:'A'}
+        ::slotted(input)::placeholder{color:green}::slotted(li)::marker{color:green}
+        ::slotted(span)::first-line{color:red}::slotted(span):hover{color:red}
+        ::slotted(span.a){color:green}::slotted(.a){color:red}@starting-style{::slotted(.a){opacity:0}}</style>
+        <slot></slot><p id=p part=p>p</p><input id=i part=i placeholder=y></div>",
+    );
+    let [a, b, c, l, p, i] =
+        ["#a", "#b", "#c", "#l", "#p", "#i"].map(|selector| element(&doc, selector));
+    let shadows = attach(&mut doc);
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    let pseudo = |out: &ComputedStyles, id: usize, slot: usize, prop: Prop| {
+        out.pseudos
+            .get(&id)
+            .and_then(|pair| pair[slot].get(prop).map(str::to_owned))
+    };
+    let text = |out: &ComputedStyles, id: usize, slot: usize| {
+        out.text_pseudos
+            .get(&id)
+            .and_then(|list| list[slot].as_ref()?.get(Prop::COLOR).map(str::to_owned))
+    };
+    assert_eq!(out.values[a].get(Prop::COLOR), Some("green"));
+    assert_eq!(pseudo(&out, a, 0, Prop::CONTENT).as_deref(), Some("'B'"));
+    assert_eq!(pseudo(&out, a, 0, Prop::COLOR).as_deref(), Some("green"));
+    assert_eq!(
+        pseudo(&out, a, 0, Prop::BACKGROUND_COLOR).as_deref(),
+        Some("green")
+    );
+    assert_eq!(pseudo(&out, a, 1, Prop::CONTENT).as_deref(), Some("'A'"));
+    assert_eq!(pseudo(&out, b, 0, Prop::CONTENT), None);
+    assert_eq!(pseudo(&out, b, 1, Prop::CONTENT).as_deref(), Some("'A'"));
+    assert_eq!(text(&out, a, 2), None);
+    assert_eq!(text(&out, c, 3).as_deref(), Some("green"));
+    assert_eq!(text(&out, l, 0).as_deref(), Some("green"));
+    assert_eq!(pseudo(&out, p, 0, Prop::CONTENT).as_deref(), Some("'P'"));
+    assert_eq!(pseudo(&out, p, 0, Prop::COLOR).as_deref(), Some("green"));
+    assert_eq!(text(&out, p, 2).as_deref(), Some("green"));
+    assert_eq!(out.selections[&p].get(Prop::COLOR), Some("green"));
+    assert_eq!(text(&out, i, 3).as_deref(), Some("green"));
+    assert_ne!(out.values[p].get(Prop::COLOR), Some("red"));
+    assert_eq!(out.starting[&a].get(Prop::OPACITY), Some("0"));
+    assert_eq!(out.starting[&p].get(Prop::OPACITY), Some("0.5"));
+    assert!(!out.starting.contains_key(&b));
+    doc.nodes[a].state = crate::dom::HOVER;
+    doc.nodes[p].state = crate::dom::HOVER;
+    doc.nodes[p].attrs.set("class", "x");
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    assert_eq!(out.values[a].get(Prop::COLOR), Some("green"));
+    assert_ne!(out.values[p].get(Prop::COLOR), Some("red"));
+    assert_eq!(pseudo(&out, p, 0, Prop::COLOR).as_deref(), Some("green"));
+    doc.nodes[a].attrs.set("class", "");
+    let out = shadowed(&doc, &shadows, &mut cache, &mut last);
+    assert_eq!(pseudo(&out, a, 0, Prop::CONTENT), None);
+    assert_eq!(pseudo(&out, a, 1, Prop::CONTENT).as_deref(), Some("'A'"));
+    assert_ne!(out.values[a].get(Prop::COLOR), Some("green"));
+    #[cfg(debug_assertions)]
+    assert_eq!(cache.incremental, 2);
+}
+
+#[test]
+fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
+    let mut doc = Document::parse(
+        "<style>#host::part(p):hover{color:green}#host::part(q){color:blue}#host::part(w  q){margin-top:6px}
+        #host::part(q v){margin-bottom:7px}#host::part(x y){margin-top:8px}#host::part(x v){margin-bottom:9px}</style>
+        <div id=host class=on></div>
+        <div id=root><style>#p{color:red}:host::part(p){color:green;padding-left:1px}span{padding-left:2px}
+        :host(.on)::part(p)::before{content:'H'}:host::part(q){color:red;padding-right:3px}
+        #inner::part(r){margin-left:4px}</style>
+        <span id=p part=p>p</span><span id=q part='q w'>q</span>
+        <div id=inner exportparts='r:q, s:x, t:y, t:v'></div></div>
+        <div id=root2><span id=r part=r>r</span><span id=t part='t s'>t</span></div>",
+    );
+    let [host, p, q, r, t] =
+        ["#host", "#p", "#q", "#r", "#t"].map(|selector| element(&doc, selector));
+    let shadows = attach(&mut doc);
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let mut step = |doc: &Document, hover: bool, on: bool| {
+        let out = shadowed(doc, &shadows, &mut cache, &mut last);
+        let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
+        assert_eq!(
+            get(p, Prop::COLOR).as_deref(),
+            Some(if hover { "green" } else { "red" })
+        );
+        assert_eq!(get(p, Prop::PADDING_LEFT).as_deref(), Some("1px"));
+        assert_eq!(
+            out.pseudos
+                .get(&p)
+                .and_then(|pair| pair[0].get(Prop::CONTENT).map(str::to_owned))
+                .as_deref(),
+            on.then_some("'H'")
+        );
+        assert_eq!(get(q, Prop::COLOR).as_deref(), Some("blue"));
+        assert_eq!(get(q, Prop::PADDING_RIGHT).as_deref(), Some("3px"));
+        assert_eq!(get(r, Prop::COLOR).as_deref(), Some("blue"));
+        assert_eq!(get(r, Prop::MARGIN_LEFT).as_deref(), Some("4px"));
+        assert_eq!(get(r, Prop::PADDING_RIGHT), None);
+        assert_eq!(get(q, Prop::MARGIN_TOP).as_deref(), Some("6px"));
+        assert_eq!(get(q, Prop::MARGIN_BOTTOM), None);
+        assert_eq!(get(t, Prop::MARGIN_TOP).as_deref(), Some("8px"));
+        assert_eq!(get(t, Prop::MARGIN_BOTTOM).as_deref(), Some("9px"));
+    };
+    step(&doc, false, true);
+    doc.nodes[p].state = crate::dom::HOVER;
+    step(&doc, true, true);
+    doc.nodes[host].attrs.set("class", "off");
+    step(&doc, true, false);
+    doc.nodes[p].state = 0;
+    doc.nodes[host].attrs.set("class", "on");
+    step(&doc, false, true);
+    #[cfg(debug_assertions)]
+    assert_eq!(cache.incremental, 3);
 }

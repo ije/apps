@@ -101,15 +101,19 @@ impl ScrollDelta {
     }
 }
 
+// WARNING: `ime` marks a key that the input method took. Like Chrome, pages see it with key code 229, as `Process`
+// except on macOS, and neither the page nor main can stop the input method from getting it.
 #[derive(Clone, Debug, Default)]
 pub struct KeyDownEvent {
     pub keystroke: Keystroke,
     pub is_held: bool,
+    pub ime: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct KeyUpEvent {
     pub keystroke: Keystroke,
+    pub ime: bool,
 }
 
 #[derive(Clone, Debug, Default)]

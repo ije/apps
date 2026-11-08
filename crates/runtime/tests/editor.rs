@@ -21,7 +21,12 @@ fn editor_selection_keyboard_and_input_events() {
             dirty: false,
         },
     );
-    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
     engine
         .eval(include_str!("editor.js"), "editor-tests")
         .unwrap();
@@ -36,6 +41,17 @@ fn editor_selection_keyboard_and_input_events() {
         assert!(Instant::now() < deadline, "Editor tests timed out");
         std::thread::sleep(Duration::from_millis(1));
     }
+    let composition = serde_json::json!({"op":"window","args":["composition",1]});
+    let ended = host
+        .borrow()
+        .commands
+        .iter()
+        .filter(|command| **command == composition)
+        .count();
+    assert_eq!(
+        ended, 7,
+        "Each finished composition asks the window to drop its own"
+    );
 }
 
 #[test]

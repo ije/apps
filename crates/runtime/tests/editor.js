@@ -112,6 +112,17 @@ globalThis.editorResult = 'pending';
   compositionController.abort();
   assert(__appsDispatch('keydown', [], { nativeKey: 'z', ...primary }) === false && editor.textContent === 'AB', 'Undo removes the committed composition');
   assert(__appsDispatch('keydown', [], { nativeKey: 'z', shiftKey: true, ...primary }) === false && editor.textContent === 'A文B', 'Redo commits it again');
+  editor.textContent = 'AB'; selection.collapse(editor.firstChild, 1); keys.length = 0;
+  __appsDispatch('keydown', [], { nativeKey: 'a', ime: true });
+  __appsInput('あ', null, null, true, [1,1]);
+  __appsDispatch('keyup', [], { nativeKey: 'a', keyChar: 'a', ime: false });
+  __appsDispatch('keydown', [], { nativeKey: 'backspace', ime: true });
+  assert(editor.textContent === 'AあB', 'Input method keys skip editing defaults');
+  __appsInput('', 1, 2);
+  __appsDispatch('keydown', [], { nativeKey: 'backspace', ime: false });
+  const imeKeys = keys.map(event => [event.type, event.key, event.code, event.keyCode, event.isComposing].join(' ')).join(), mac = navigator.platform.includes('Mac');
+  assert(imeKeys === `keydown ${mac ? 'a' : 'Process'} KeyA 229 false,keyup a KeyA 65 true,keydown ${mac ? 'Backspace' : 'Process'} Backspace 229 true,keydown Backspace Backspace 8 false`, 'Input method keys: ' + imeKeys);
+  assert(editor.textContent === 'B' && __appsEditing().marked === null && !('ime' in keys[0]), 'A cleared composition ends');
   for (const [name,html,caret,result] of [
     ['an empty block','<p><br></p>',() => [editor.firstChild,0],'<p>中</p>'],
     ['an empty block after text','<p>ab</p><p><br></p>',() => [editor.lastChild,0],'<p>ab</p><p>中</p>'],
@@ -129,6 +140,33 @@ globalThis.editorResult = 'pending';
   editor.innerHTML = '<p><br></p>'; selection.removeAllRanges();
   __appsInput('中');
   assert(editor.innerHTML === '<p>中</p>', 'Input without a selection uses the first empty block: ' + editor.innerHTML);
+
+  const field = document.createElement('div'), other = document.createElement('textarea'), log = [];
+  field.contentEditable = 'true'; field.innerHTML = '<p>ab</p>'; document.body.append(field, other);
+  for (const type of ['compositionend', 'change', 'blur', 'focus', 'pointerdown']) for (const node of [field, other]) node.addEventListener(type, event => log.push(type + ':' + (event.data ?? '') + ':' + node.localName));
+  const compose = (...texts) => { for (const text of texts) __appsInput(text, null, null, true, [text.length, text.length]); };
+  field.focus(); selection.collapse(field.firstChild.firstChild, 1); compose('k', 'か');
+  log.length = 0; other.value = 'xyz'; other.focus(); other.setSelectionRange(3, 3);
+  assert(field.innerHTML === '<p>aかb</p>' && log.join() === 'compositionend:か:div,blur::div,focus::textarea', 'Focus change finishes the composition: ' + log.join());
+  __appsInput('w');
+  assert(other.value === 'xyzw' && __appsEditing().marked === null, 'The next field starts without the old composition: ' + other.value);
+  field.focus(); __appsDispatch('keydown', [], { nativeKey: 'z', ...primary });
+  assert(field.innerHTML === '<p>ab</p>', 'Undo removes a finished composition: ' + field.innerHTML);
+  other.focus(); other.value = ''; log.length = 0; compose('n', 'に'); other.blur();
+  assert(other.value === 'に' && log.join() === 'compositionend:に:textarea,change::textarea,blur::textarea', 'Blur finishes the composition before change and blur: ' + log.join());
+  other.focus(); log.length = 0; compose('a'); other.remove();
+  field.focus(); selection.collapse(field.firstChild.firstChild, 0); __appsInput('q');
+  assert(log.join() === 'blur::textarea,focus::div' && field.textContent === 'qab', 'A removed field ends its composition without events: ' + log.join() + ' ' + field.textContent);
+  selection.collapse(field.firstChild.firstChild, 3); log.length = 0; compose('ん');
+  __appsDispatch('pointerdown', [field._id], { pointerId: 1, clientX: 0, clientY: 0 }); __appsDispatch('pointerup', [field._id], { pointerId: 1, clientX: 0, clientY: 0 });
+  assert(field.textContent === 'qabん' && log.slice(0, 2).join() === 'compositionend:ん:div,pointerdown::div', 'A press finishes the composition first: ' + log.join());
+  field.innerHTML = '<p>ab</p>'; selection.collapse(field.firstChild.firstChild, 0); log.length = 0; compose('え'); __appsFinishComposition();
+  assert(document.activeElement === field && field.textContent === 'えab' && log.join() === 'compositionend:え:div' && __appsEditing().marked === null, 'Window blur finishes the composition and keeps focus: ' + log.join());
+  compose('a'); compose(''); log.length = 0; __appsFinishComposition();
+  assert(log.length === 0 && __appsEditing().marked === null && field.textContent === 'えab', 'An empty composition ends without events');
+  document.body.append(other); other.focus(); other.value = 'r'; compose('ら'); log.length = 0; other.readOnly = true; compose('らん');
+  assert(other.value === 'rら' && log.join() === 'compositionend:ら:textarea' && __appsEditing().marked === null, 'A field that turns read only ends its composition: ' + log.join());
+  other.readOnly = false; other.remove(); field.remove(); editor.focus();
 
   const input = document.querySelector('textarea'); input.focus();
   input.value = 'A😀e\u0301B'; input.setSelectionRange(5,5);

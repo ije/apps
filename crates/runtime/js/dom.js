@@ -46,10 +46,10 @@
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
   let webviewScan = true, pickFiles;
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font') { stale = true; version++; } return host(name, ...args); };
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; version++; } return host(name, ...args); };
   // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
   const F32 = Float32Array, U8 = Uint8Array;
-  let geometry = new F32(1), marks, limit = 0; geometry[0] = 1;
+  let geometry = new F32(1), marks, limit = 0, flagged = -1; geometry[0] = 1;
   // WARNING: observers measure the layout of the last frame, so the frame that follows their delivery lays the page out once.
   let observing = false;
   const layout = () => {
@@ -202,10 +202,12 @@
   const group = radio => { const name = radio.name, form = radio.form, root = radio.getRootNode(); return name && root !== radio ? [...root.querySelectorAll('input[name=' + quote(name) + ']')].filter(other => other.type === 'radio' && other.form === form) : [radio]; };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
+    // WARNING: 16 has no box, and 64 is inert or hidden by the cascade while an exit transition still paints it. Style passes mark 64, so a page that never drew (no window) runs one here after each write.
     layout();
-    if (marks[node._id] & 16) return false;
+    if (!geometry[2] && flagged !== version) { flagged = version; call('dom.layout', false, true); layout(); }
+    if (marks[node._id] & 80) return false;
     const rec = node._m, tag = rec.tag;
-    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
+    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
   };
   const commit = node => { if (node._edited) { node._edited = false; dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
   const selectors = (name, id, selector, first) => { try { return call(name, id, String(selector), first); } catch (error) { if (/^SyntaxError/.test(error?.message)) throw new DOMException(error.message.replace(/^SyntaxError: /, ''), 'SyntaxError'); throw error; } };
@@ -249,7 +251,7 @@
     }
     return allowed;
   };
-  const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
+  const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr|sf-symbol-[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)*)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
   const serialize = rec => {
     if (rec.tag === '#text') return rec.up && rawText.test(rec.up.tag) ? own(rec) : own(rec).replace(/[&<>\u00a0]/g, c => escapes[c]);
     if (rec.tag === '#comment') return '<!--' + rec.text + '-->';
@@ -257,6 +259,7 @@
     if (rec.tag[0] === '#') return rec.kids.map(serialize).join('');
     let attrs = '';
     for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
+    if (rec.tag.startsWith('sf-symbol-') && voids.test(rec.tag)) return '<' + rec.tag + attrs + '/>';
     return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (voids.test(rec.tag) ? '' : '</' + rec.tag + '>');
   };
   // WARNING: like CEReactions, custom element reactions queue per element while a DOM call runs and run when the outermost call returns, each in its own try/catch, so a throwing callback can't stop the change that queued it. A DOM call from a callback runs the reactions it queued when it returns.
@@ -360,7 +363,8 @@
     }
     if (captures.size) for (const [id, node] of captures) if (!node.isConnected) { captures.delete(id); dispatch(document, new PointerEvent('lostpointercapture', { pointerId: id, bubbles: true, composed: true })); }
     if (!active || active.isConnected) return;
-    const previous = active; active = null; call('dom.focus', []); dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true }));
+    finishComposition();
+    const previous = active; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true })); }
   };
   const ignore = () => {};
   // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it. A `replace` that inserts calls `removed` once the old children left both trees, so their disconnected callbacks run before re-inserted ones connect again.
@@ -624,7 +628,7 @@
     return out.join(' ');
   };
   const readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
-  let keyboardFocus = true;
+  let keyboardFocus = true, windowFocused = true, ring = false;
   const focusVisible = node => keyboardFocus || node.isContentEditable || node.localName === 'textarea' || node.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(node.getAttribute('type') ?? '');
   class CSSStyleDeclaration {
     constructor(owner) { this._owner = owner; }
@@ -749,13 +753,16 @@
     }
     focus() {
       if (active === this || !focusable(this)) return;
-      const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), focusVisible(this));
+      finishComposition();
+      const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), ring = focusVisible(this), !windowFocused);
       if (this.isContentEditable && selection.isCollapsed) selection._send();
+      // WARNING: like Chrome, focus changes fire no events while the window is not focused. The window's `focus` fires them for the element focused then.
+      if (!windowFocused) return;
       const mark = native ? trusted : event => event;
       if (previous) { commit(previous); dispatch(previous, mark(new FocusEvent('blur', { composed: true, relatedTarget: this }))); dispatch(previous, mark(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }))); }
       if (active === this) { dispatch(this, mark(new FocusEvent('focus', { composed: true, relatedTarget: previous }))); dispatch(this, mark(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous }))); }
     }
-    blur() { if (active !== this) return; const mark = native ? trusted : event => event; active = null; call('dom.focus', []); commit(this); dispatch(this, mark(new FocusEvent('blur', { composed: true }))); dispatch(this, mark(new FocusEvent('focusout', { bubbles: true, composed: true }))); }
+    blur() { if (active !== this) return; finishComposition(); const mark = native ? trusted : event => event; active = null; call('dom.focus', []); if (!windowFocused) return; commit(this); dispatch(this, mark(new FocusEvent('blur', { composed: true }))); dispatch(this, mark(new FocusEvent('focusout', { bubbles: true, composed: true }))); }
     click() { if (disabled(this) || this._clicking) return; this._clicking = true; try { fireClick(this); } finally { this._clicking = false; } }
     get contentEditable() { return this.getAttribute('contenteditable') ?? 'inherit'; } set contentEditable(value) { this.setAttribute('contenteditable', value); }
     get isContentEditable() { const value = this.contentEditable.toLowerCase(); return ['true','plaintext-only',''].includes(value) || (value !== 'false' && !!this.parentElement?.isContentEditable); }
@@ -1046,7 +1053,7 @@
     node._popover = mode; node._returnFocus = active;
     if (mode !== 'manual') { stackOf(node).push(node); watchers.push(node); }
     flag(node, 8, true); layer(node, true);
-    (node.hasAttribute('autofocus') ? node : node.querySelector('[autofocus]'))?.focus();
+    (node.hasAttribute('autofocus') ? node : [...node.querySelectorAll('[autofocus]')].find(focusable))?.focus();
     toggled(node, 'closed', 'open', source);
   };
   const hidePopover = (node, focus, events, source = null) => {
@@ -1071,7 +1078,8 @@
     dialog._focus = active; dialogs.push(dialog); watchers.push(dialog);
     if (modal) { dialog._modal = true; modals.push(dialog); flag(dialog, 4, true); layer(dialog, true); }
     hideUntil(ancestorPopover(dialog, hints, null) ?? ancestorPopover(dialog, autos, null) ?? document);
-    (dialog.querySelector('[autofocus]') ?? [...dialog.querySelectorAll('*')].find(focusable))?.focus();
+    // WARNING: like Chrome, a dialog with nothing to focus takes the focus itself. It isn't in the tab order.
+    ([...dialog.querySelectorAll('[autofocus]')].find(focusable) ?? [...dialog.querySelectorAll('*')].find(focusable) ?? dialog).focus();
   };
   class HTMLDialogElement extends HTMLElement {
     get open() { return this.hasAttribute('open'); } set open(value) { this.toggleAttribute('open', !!value); }
@@ -1207,7 +1215,7 @@
     get complete() { return !this.src || !!this._complete; }
     setAttribute(name,value) { super.setAttribute(name,value); if (name === 'src') this._loadImage(); }
     _loadImage() {
-      const raw = this.getAttribute('src'), source = this.src, load = this._load = {}, current = () => this._load === load && this.getAttribute('src') === raw; this._complete = false;
+      const raw = this.getAttribute('src'), source = this.src, load = this._load = {}, current = () => this._load === load && this.getAttribute('src') === raw; this._complete = false; if (this._bits & 32) flag(this, 32, false);
       this._loading = (async () => {
         const data = await resource(source, 'Image');
         if (!current()) return;
@@ -1216,7 +1224,7 @@
         if (typeof result === 'string') throw new Error(result);
         this._dimensions=result; this._complete=true; this.dispatchEvent(new Event('load'));
       })();
-      this._loading.catch(()=>{ if (current()) {this._complete=true; this.dispatchEvent(new Event('error'));} });
+      this._loading.catch(()=>{ if (current()) {this._complete=true; flag(this, 32, true); this.dispatchEvent(new Event('error'));} });
     }
     decode() { if (!this._loading && this.src) this._loadImage(); return this._loading ?? Promise.resolve(); }
   }
@@ -1689,7 +1697,7 @@
       }
       title.textContent = String(value);
     }
-    getSelection() { return selection; } hasFocus() { return !!active; }
+    getSelection() { return selection; } hasFocus() { return windowFocused; }
     createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
     createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     caretRangeFromPoint(x,y) {
@@ -2850,7 +2858,8 @@
   };
   globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
-  globalThis.__appsLayout = () => { syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
+  // WARNING: like the focus fixup of browsers, a focused element that a frame shows inert, hidden or disabled loses focus. It reads that frame's flags, as a forced layout here would cost every frame.
+  globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === version) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, version, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
     if (!mediaQueries.size) return;
@@ -2933,18 +2942,35 @@
     return [created, 0];
   };
   const histories = new WeakMap();
+  const remember = (target, at, removed, inserted, typed) => {
+    const history = histories.get(target) ?? histories.set(target, { undo: [], redo: [] }).get(target), last = history.undo.at(-1);
+    history.redo.length = 0;
+    if (typed && last?.typed && last.at + last.inserted.length === at) last.inserted += inserted;
+    else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
+  };
+  // WARNING: `[start, replaced text, marked text]` of the composition.
   let composed = null;
+  // WARNING: like Chromium, a composition whose field loses focus, or that a press or the window's blur ends, keeps its text and fires only `compositionend`, and the input method drops its own text. Focus changes call this before `active` changes.
+  const finishComposition = () => {
+    if (composing === null) return;
+    const target = active, [at, removed, text] = composed;
+    composing = null; call('dom.endComposition');
+    if (!text || !target?.isConnected) return;
+    remember(target, at, removed, text, !removed);
+    dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
+  };
+  globalThis.__appsFinishComposition = finishComposition;
   globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null) => {
     const target = active;
-    if (!target || disabled(target) || target.readOnly) return;
-    const state = __appsEditing(); if (!state) return;
+    if (!target || disabled(target) || target.readOnly) return finishComposition();
+    const state = __appsEditing(); if (!state) return finishComposition();
     text = String(text);
     start ??= composing?.[0] ?? Math.min(state.start,state.end); end ??= composing?.[1] ?? Math.max(state.start,state.end);
     start = Math.max(0, Math.min(start, state.text.length)); end = Math.max(start, Math.min(end, state.text.length));
     const isComposing = mark || composing !== null, control = editable(target);
     inputType ??= isComposing ? 'insertCompositionText' : text ? 'insertText' : 'deleteContentBackward';
     if (mark && !composing) {
-      composing = [start,end]; composed = [start, state.text.slice(start,end)];
+      composing = [start,end]; composed = [start, state.text.slice(start,end), ''];
       dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
     if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
@@ -2959,7 +2985,7 @@
     const data = inputType.startsWith('delete') || ['insertParagraph','insertLineBreak','historyUndo','historyRedo'].includes(inputType) || (inputType === 'insertFromPaste' && !control) ? null : text;
     const options = { bubbles: true, composed: true, data, inputType, isComposing, dataTransfer: control ? null : dataTransfer };
     if (!dispatch(target, trusted(new InputEvent('beforeinput', { ...options, cancelable: !isComposing, targetRanges })))) return;
-    if (active !== target || !target.isConnected) { if (isComposing) composing = null; return; }
+    if (active !== target || !target.isConnected) return finishComposition();
     if (control) {
       setValue(target, state.text.slice(0,start) + text + state.text.slice(end));
       target._edited = true;
@@ -2973,14 +2999,10 @@
       else { const [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset]; if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at); }
     }
     if (!mark && !inputType.startsWith('history')) {
-      const history = histories.get(target) ?? histories.set(target, { undo: [], redo: [] }).get(target), last = history.undo.at(-1);
-      const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)], inserted = control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '';
-      const typed = !removed && /^insert(Text|CompositionText)$/.test(inputType);
-      history.redo.length = 0;
-      if (typed && last?.typed && last.at + last.inserted.length === at) last.inserted += inserted;
-      else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
+      const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)];
+      remember(target, at, removed, control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '', !removed && /^insert(Text|CompositionText)$/.test(inputType));
     }
-    if (isComposing) composing = [start,start+text.length];
+    if (isComposing) { composing = [start,start+text.length]; composed[2] = text; }
     dispatch(target, trusted(new InputEvent('input', options)));
     if (isComposing && !mark) {
       composing = null;
@@ -3093,7 +3115,7 @@
     dragEvent('drop', target, x, y, null, data);
   };
   const nativeKeys = { backspace:'Backspace', delete:'Delete', enter:'Enter', escape:'Escape', tab:'Tab', left:'ArrowLeft', right:'ArrowRight', up:'ArrowUp', down:'ArrowDown', home:'Home', end:'End', pageup:'PageUp', pagedown:'PageDown', insert:'Insert', space:' ', shift:'Shift', control:'Control', ctrl:'Control', alt:'Alt', command:'Meta', super:'Meta' };
-  const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91 };
+  const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91, Process:229 };
   let modifiers = {}, graphemes, words;
   const textBoundary = (text, offset, forward, word = false) => {
     const part = forward ? text.slice(offset) : text.slice(0,offset);
@@ -3140,8 +3162,7 @@
   };
   const tabOrder = () => {
     const list = [], stack = [document];
-    const above = modals.length ? topLayer.slice(topLayer.indexOf(modals.at(-1))) : null;
-    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable) && (!above || path(node).some(item => above.includes(item)))) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
+    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
     return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
   };
   // WARNING: native presses follow the browser order: pointerdown, mousedown, focus and selection, contextmenu; a canceled pointerdown drops the mouse events of the press, and a canceled mousedown keeps focus and selection.
@@ -3153,6 +3174,19 @@
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
     if (name === 'fullscreen:exit') { if (fullscreens.length) exitFullscreen(true, true); return true; }
+    // WARNING: like Chrome, the focused element keeps its focus while the window is not focused. It gets `blur` before the window and `focus` after it.
+    if (name === 'window:focus' || name === 'window:blur') {
+      const focused = name === 'window:focus', target = active;
+      if (windowFocused === focused) return true;
+      windowFocused = focused;
+      if (!focused) finishComposition();
+      if (target) call('dom.focus', path(target).map(node => node._id), ring, !focused);
+      if (data.quiet) return true;
+      if (target && !focused) { commit(target); dispatch(target, trusted(new FocusEvent('blur', { composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusout', { bubbles: true, composed: true }))); }
+      dispatchEvent(trusted(new Event(name.slice(7))));
+      if (target && focused && active === target) { dispatch(target, trusted(new FocusEvent('focus', { composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusin', { bubbles: true, composed: true }))); }
+      return true;
+    }
     if (name.startsWith('window:')) return dispatchEvent(trusted(new Event(name.slice(7))));
     if (/^(animation|transition)(start|end|run|cancel|iteration)$/.test(name)) { const target = wrap(ids[0]); return !!target && dispatch(target, trusted(Object.assign(new Event(name, { bubbles: true, composed: true }), { pseudoElement: '' }, data))); }
     if (name === 'modifiers') {
@@ -3163,13 +3197,14 @@
       return true;
     }
     if (name === 'keydown' || name === 'keyup') {
-      if (name === 'keydown' && !keyboardFocus && !data.metaKey && !data.ctrlKey && !data.altKey) { keyboardFocus = true; if (active) call('dom.focus', path(active).map(node => node._id), true); }
+      if (name === 'keydown' && !keyboardFocus && !data.metaKey && !data.ctrlKey && !data.altKey) { keyboardFocus = true; if (active) call('dom.focus', path(active).map(node => node._id), ring = true, !windowFocused); }
       const target = active ?? document.body; if (!target) return false;
       if (data.nativeKey !== undefined) {
         const raw = data.nativeKey, upper = raw.toUpperCase(), named = nativeKeys[raw] ?? (/^f\d{1,2}$/.test(raw) ? upper : null);
         const code = /^[a-z]$/i.test(raw) ? 'Key' + upper : /^\d$/.test(raw) ? 'Digit' + raw : ({ ' ':'Space', space:'Space', '-':'Minus', '=':'Equal', '[':'BracketLeft', ']':'BracketRight', '\\':'Backslash', ';':'Semicolon', "'":'Quote', ',':'Comma', '.':'Period', '/':'Slash', '`':'Backquote' })[raw] ?? named ?? '';
-        const key = named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
-        data = { ...data, key, code, keyCode: keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
+        // WARNING: like Chrome, a key that the input method took has key code 229, and its key is `Process` except on macOS.
+        const { ime, ...rest } = data, key = ime && !navigator.platform.includes('Mac') ? 'Process' : named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
+        data = { ...rest, key, code, keyCode: ime ? 229 : keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }
       if (name === 'keydown' && data.key === 'Escape' && fullscreens.length) { exitFullscreen(true); return false; }
       const event = trusted(new KeyboardEvent(name, { bubbles: true, cancelable: true, composed: true, isComposing: composing !== null, ...data }));
@@ -3258,6 +3293,7 @@
       return result;
     }
     if (name !== 'pointermove' && name !== 'pointerdown' && name !== 'pointerup') return false;
+    if (name === 'pointerdown') finishComposition();
     if (!captures.has(1)) hover(element, mouseInit(data));
     const target = element ?? sliding?.[0] ?? (selectionDrag ? selectionDrag.host : null), button = data.button ?? 0, init = mouseInit(data, name === 'pointermove' ? { button: -1 } : {});
     last = [data.clientX, data.clientY];

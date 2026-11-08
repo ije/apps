@@ -405,6 +405,10 @@ impl Window {
         );
     }
 
+    pub fn cancel_composition(&self) {
+        self.client.reset_ime();
+    }
+
     pub fn activate(&self) {
         if !self.shared.mapped.get() {
             let _ = self.client.xcb.map_window(self.shared.id);

@@ -4,14 +4,13 @@ pub(crate) use window::Window;
 
 use super::{
     Clicks, DEFAULT_CURSOR, Ime, SCROLL_LINES, capslock_from_xkb, compose, compose_state,
-    cursor_names, file_paths, ime_area, key_down, keystroke_from_xkb, modifiers_from_xkb,
+    cursor_names, file_paths, ime_area, key_down, key_up, keystroke_from_xkb, modifiers_from_xkb,
     new_xkb_context, read_pipe, with_loop,
 };
 use crate::{
-    Bounds, Capslock, CursorStyle, FileDropEvent, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent,
-    point, px, size,
+    Bounds, Capslock, CursorStyle, FileDropEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, point, px, size,
 };
 use anyhow::{Context as _, Result};
 use calloop::{
@@ -133,7 +132,8 @@ struct State {
     compose: Option<xkb::compose::State>,
     pre_edit: Option<String>,
     ime_pre_edit: Option<String>,
-    composing: bool,
+    ime_commit: Option<String>,
+    composing: Option<String>,
     repeat: Repeat,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -254,7 +254,8 @@ impl Client {
                 compose: None,
                 pre_edit: None,
                 ime_pre_edit: None,
-                composing: false,
+                ime_commit: None,
+                composing: None,
                 repeat: Repeat {
                     rate: 16,
                     delay: Duration::from_millis(500),
@@ -349,6 +350,48 @@ impl Client {
             _ => token.set_surface(surface),
         }
         token.commit();
+    }
+
+    fn enable_ime(&self) {
+        let (text_input, window) = {
+            let state = self.state.borrow();
+            (
+                state.text_input.clone(),
+                state.focused(&state.keyboard_focus),
+            )
+        };
+        let Some(text_input) = text_input.filter(|_| {
+            window
+                .as_ref()
+                .is_none_or(|window| window.callbacks.accepts_text_input())
+        }) else {
+            return;
+        };
+        text_input.enable();
+        text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
+        if let Some(area) = window.and_then(|window| ime_area(window.callbacks)) {
+            set_cursor_rectangle(&text_input, area);
+        }
+        text_input.commit();
+    }
+
+    fn cancel_composition(&self) {
+        let text_input = {
+            let mut state = self.state.borrow_mut();
+            state.pre_edit = None;
+            if let Some(compose) = &mut state.compose {
+                compose.reset();
+            }
+            state.ime_pre_edit = None;
+            state.ime_commit = None;
+            state.composing.take().and(state.text_input.clone())
+        };
+        // WARNING: text-input-v3 has no reset, so the input method is turned off and on.
+        if let Some(text_input) = text_input {
+            text_input.disable();
+            text_input.commit();
+            self.enable_ime();
+        }
     }
 
     pub fn primary_display_bounds(&self) -> Option<Bounds<Pixels>> {
@@ -610,29 +653,6 @@ impl Handle {
                     },
                 );
         });
-    }
-
-    fn enable_ime(&self, client: &Client) {
-        let (text_input, window) = {
-            let state = client.state.borrow();
-            (
-                state.text_input.clone(),
-                state.focused(&state.keyboard_focus),
-            )
-        };
-        let Some(text_input) = text_input.filter(|_| {
-            window
-                .as_ref()
-                .is_none_or(|window| window.callbacks.accepts_text_input())
-        }) else {
-            return;
-        };
-        text_input.enable();
-        text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
-        if let Some(area) = window.and_then(|window| ime_area(window.callbacks)) {
-            set_cursor_rectangle(&text_input, area);
-        }
-        text_input.commit();
     }
 }
 
@@ -965,8 +985,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
                 state.pre_edit = None;
                 let window = state.windows.get(&surface.id()).and_then(Weak::upgrade);
                 drop(state);
+                // WARNING: like Chrome, the page ends its composition and keeps the text when the window goes.
                 if let Some(window) = window {
-                    Ime::Clear.apply(window.callbacks);
                     window.set_active(false);
                 }
             }
@@ -1021,25 +1041,23 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
                         state.repeat.key = None;
                     }
                     drop(state);
-                    window
-                        .callbacks
-                        .input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+                    key_up(window.callbacks, keystroke);
                     return;
                 }
-                let ime = match state.compose.take() {
+                let (commit, ime) = match state.compose.take() {
                     Some(mut composer) => {
                         let ime =
                             compose(&mut composer, &mut state.pre_edit, keysym, &mut keystroke);
                         state.compose = Some(composer);
                         ime
                     }
-                    None => Vec::new(),
+                    None => (None, Vec::new()),
                 };
                 state.repeat.id += 1;
                 state.repeat.key = Some(keycode);
                 let (id, rate, delay) = (state.repeat.id, state.repeat.rate, state.repeat.delay);
                 drop(state);
-                if rate > 0 {
+                if rate > 0 && ime.is_empty() {
                     start_repeat(
                         this.clone(),
                         keystroke.clone(),
@@ -1048,10 +1066,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
                         Duration::from_secs(1) / rate,
                     );
                 }
-                for ime in ime {
-                    ime.apply(window.callbacks);
+                if let Some(text) = commit {
+                    Ime::Commit(text).apply(window.callbacks);
                 }
-                key_down(window.callbacks, keystroke, false);
+                key_down(window.callbacks, keystroke, false, ime);
             }
             _ => {}
         }
@@ -1078,7 +1096,7 @@ fn start_repeat(
                 return TimeoutAction::Drop;
             };
             drop(state);
-            key_down(window.callbacks, keystroke.clone(), true);
+            key_down(window.callbacks, keystroke.clone(), true, Vec::new());
             TimeoutAction::ToInstant(deadline + interval)
         });
     });
@@ -1097,59 +1115,60 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for Handle {
             return;
         };
         match event {
-            zwp_text_input_v3::Event::Enter { .. } => this.enable_ime(&client),
+            zwp_text_input_v3::Event::Enter { .. } => client.enable_ime(),
             zwp_text_input_v3::Event::Leave { .. } => {
-                client.state.borrow_mut().composing = false;
+                client.state.borrow_mut().composing = None;
                 text_input.disable();
                 text_input.commit();
             }
-            zwp_text_input_v3::Event::CommitString { text: Some(text) } => {
-                let window = {
-                    let mut state = client.state.borrow_mut();
-                    state.composing = false;
-                    state.focused(&state.keyboard_focus)
-                };
-                let Some(window) = window else {
-                    return;
-                };
-                if text.len() == 1 {
-                    key_down(
-                        window.callbacks,
-                        Keystroke {
-                            modifiers: Modifiers::default(),
-                            key: text.clone(),
-                            key_char: Some(text),
-                        },
-                        false,
-                    );
-                } else {
-                    Ime::Commit(text).apply(window.callbacks);
-                }
+            zwp_text_input_v3::Event::CommitString { text } => {
+                client.state.borrow_mut().ime_commit = text;
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
-                let mut state = client.state.borrow_mut();
-                state.composing = true;
-                state.ime_pre_edit = text;
+                client.state.borrow_mut().ime_pre_edit = text;
             }
             zwp_text_input_v3::Event::Done { .. } => {
-                let (window, text) = {
+                let (window, commit, preedit, shown) = {
                     let mut state = client.state.borrow_mut();
-                    let text = state.ime_pre_edit.take();
-                    state.composing = text.is_some();
-                    (state.focused(&state.keyboard_focus), text)
+                    let commit = state.ime_commit.take();
+                    let preedit = state.ime_pre_edit.take().filter(|text| !text.is_empty());
+                    let shown = std::mem::replace(&mut state.composing, preedit.clone());
+                    (state.focused(&state.keyboard_focus), commit, preedit, shown)
                 };
                 let Some(window) = window else {
                     return;
                 };
-                match text {
-                    Some(text) => {
-                        Ime::Preedit(text).apply(window.callbacks);
-                        if let Some(area) = ime_area(window.callbacks) {
-                            set_cursor_rectangle(text_input, area);
-                            text_input.commit();
-                        }
+                if shown.is_none()
+                    && preedit.is_none()
+                    && let Some(text) = commit.as_ref().filter(|text| text.len() == 1)
+                {
+                    let keystroke = Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: text.clone(),
+                        key_char: Some(text.clone()),
+                    };
+                    key_down(window.callbacks, keystroke, false, Vec::new());
+                    return;
+                }
+                // WARNING: the input method takes its keys from the compositor, so like Chrome each change of
+                // the text is a `Process` key without a code.
+                let mut ime: Vec<_> = commit.map(Ime::Commit).into_iter().collect();
+                match &preedit {
+                    Some(text) if !ime.is_empty() || shown.as_ref() != Some(text) => {
+                        ime.push(Ime::Preedit(text.clone()))
                     }
-                    None => Ime::Clear.apply(window.callbacks),
+                    None if ime.is_empty() && shown.is_some() => ime.push(Ime::Clear),
+                    _ => {}
+                }
+                if ime.is_empty() {
+                    return;
+                }
+                key_down(window.callbacks, Keystroke::default(), false, ime);
+                if preedit.is_some()
+                    && let Some(area) = ime_area(window.callbacks)
+                {
+                    set_cursor_rectangle(text_input, area);
+                    text_input.commit();
                 }
             }
             _ => {}
@@ -1264,7 +1283,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 }
                 state.button = Some(button);
                 let click_count = state.clicks.press(button, position);
-                let composing = state.composing && state.text_input.is_some();
+                let composing = state.composing.take().is_some() && state.text_input.is_some();
                 let pre_edit = state.pre_edit.take();
                 if pre_edit.is_some()
                     && let Some(compose) = &mut state.compose
@@ -1277,7 +1296,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                     // WARNING: text-input-v3 has no reset, so the input method is turned off and on.
                     text_input.disable();
                     text_input.commit();
-                    this.enable_ime(&client);
+                    client.enable_ime();
                     Ime::Unmark.apply(window.callbacks);
                 } else if let Some(text) = pre_edit {
                     Ime::Commit(text).apply(window.callbacks);

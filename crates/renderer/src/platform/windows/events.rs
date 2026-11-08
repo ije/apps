@@ -36,7 +36,16 @@ pub(super) fn key_event(
     lparam: LPARAM,
     down: bool,
 ) -> Option<PlatformInput> {
-    let vkey = VIRTUAL_KEY(wparam.0 as u16);
+    let mut vkey = VIRTUAL_KEY(wparam.0 as u16);
+    let scan_code = (lparam.0 >> 16) as u32 & 0xFF;
+    // WARNING: a key that the input method takes comes as VK_PROCESSKEY. Its scan code still names the `code`.
+    let ime = vkey == VK_PROCESSKEY;
+    if ime {
+        let extended = if lparam.0 & (1 << 24) != 0 { 0xE000 } else { 0 };
+        // SAFETY: plain keyboard layout query.
+        vkey =
+            VIRTUAL_KEY(unsafe { MapVirtualKeyW(scan_code | extended, MAPVK_VSC_TO_VK_EX) } as u16);
+    }
     let mut modifiers = modifiers();
     match vkey {
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN | VK_CAPITAL => {
@@ -53,14 +62,13 @@ pub(super) fn key_event(
         }
         VK_PACKET => None,
         _ => {
-            let scan_code = (lparam.0 >> 16) as u32 & 0xFF;
-            let key_char = if down {
+            let key_char = if down && !ime {
                 key_char(vkey, scan_code)
             } else {
                 None
             };
             let key = named_key(vkey).map(str::to_owned).or_else(|| {
-                if modifiers.shift && shifts_to_symbol(vkey) {
+                if modifiers.shift && !ime && shifts_to_symbol(vkey) {
                     let shifted = translate(vkey, scan_code, true);
                     if shifted.is_some() {
                         modifiers.shift = false;
@@ -73,19 +81,20 @@ pub(super) fn key_event(
                         .filter(|char| *char != '\0')
                         .map(|char| char.to_ascii_lowercase().to_string())
                 }
-            })?;
+            });
             let keystroke = Keystroke {
                 modifiers,
-                key,
+                key: if ime { key.unwrap_or_default() } else { key? },
                 key_char,
             };
             Some(if down {
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
                     is_held: lparam.0 & (1 << 30) != 0,
+                    ime,
                 })
             } else {
-                PlatformInput::KeyUp(KeyUpEvent { keystroke })
+                PlatformInput::KeyUp(KeyUpEvent { keystroke, ime })
             })
         }
     }

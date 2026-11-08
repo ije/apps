@@ -13,6 +13,7 @@ app.whenReady().then(() => {
     opacity: 0,
     alwaysOnTop: true,
     focusable: false,
+    visualEffectState: 'active',
     resizable: false,
     movable: false,
     hasShadow: false,

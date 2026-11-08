@@ -17,11 +17,11 @@
 
 The main side and the pages share no JavaScript state. Each has its own `Host`, and they talk only through the queues in `crates/runtime/src/desktop/link.rs`. These are threads, not OS processes, so a crash in native code ends the whole app.
 
-A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard, opening a window, and a key while main listens to the window's `before-input-event`. Main never blocks on a page without a limit. AppKit needs some answers at once, like whether a page handled a key and the IME ranges, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question. A frame for a live resize gets 8 ms, because the window server moves the old frame until AppKit's transaction commits. A later frame shows after the commit, anchored to the top left, so a slow page lags only at the window's edge.
+A page or preload can block on main: `window.open()`, `ipcRenderer.sendSync()`, the clipboard and opening a window. Main never blocks on a page without a limit. Keys come to main, which runs a window's `before-input-event` before it gives the key to the page, so a page never waits for main on its keys. AppKit needs some answers at once, like whether a page handled a key and the IME ranges, so main asks the window's render thread and waits for at most 100 ms, running its own work meanwhile. After that it answers as if the page ignored the question. A key that the input method takes goes to the page with the first change the input method makes, so main doesn't wait for it. When focus, a press or the window's focus ends a composition, the page keeps the text and asks main, without waiting, to make the input method drop its own. A frame for a live resize gets 8 ms, because the window server moves the old frame until AppKit's transaction commits. A later frame shows after the commit, anchored to the top left, so a slow page lags only at the window's edge.
 
 Window commands like `setBounds()`, `minimize()` and `close()` run on main and don't wait for the page. `close()` and quitting also stop a running page script, so a hung page can't hold them up.
 
-Main's work runs from a run loop source and timers in the common modes, so it goes on while a popup menu or a modal panel runs a nested loop. While a main script waits in such a loop, like `dialog.showMessageBoxSync()`, IPC and events that would run main scripts wait until it returns, and window commands and the native work of pages still run. `Menu.popup()` returns at once, as in Electron.
+Main's work runs from a run loop source and timers in the common modes, so it goes on while a popup menu or a modal panel runs a nested loop. While a main script waits in such a loop, like `dialog.showMessageBoxSync()`, IPC and events that would run main scripts wait until it returns, keys skip `before-input-event`, and window commands and the native work of pages still run. `Menu.popup()` returns at once, as in Electron.
 
 Render threads exist on macOS. On Windows and Linux the main side and all pages run on the main thread, so a busy script delays page frames there.
 
@@ -91,7 +91,11 @@ A module has a namespace object only where code needs one: `import *` used as a 
 
 Boxes are kept across frames. A box keeps its identity (element id, or position in the nearest box with an id). Each frame the view describes only what changed and links unchanged subtrees with `Child::Kept`, so they are not built, measured or laid out again. A changed box drops the layout caches of itself and its ancestors only, and taffy skips the rest. Measured leaves (text) keep their state while it compares equal.
 
-Styles are incremental too. The selector cache records which nodes each node's matches read, so a DOM change marks only the nodes that could match differently. A style pass starts from the last output and styles those nodes, the children of nodes whose output changed, and every node after a new root font size. Pages with shadow trees, CSS counters or tables, and passes after a new viewport or stylesheet, style every node. Debug builds check each incremental pass against a full one with an empty cache. The per-frame cull info works the same way: only nodes with a new revision, style or focus, and their ancestors, are visited again.
+A subtree is kept while the revision of its nodes and styles and the sizes it is built in are the same, and each read its build made beyond them gives the same value again: styles of ancestors and siblings, the last layout, scroll handles, images and the frame. The build logs these reads, and each box keeps a record of its own reads and of the reads below it that its revision doesn't cover. Page reads are checked again only after the page changed, the others in every frame. Images, video frames and canvas drawings paint from their node when the box paints, so the build reads only their sizes, and a new frame or drawing keeps every box. Fields paint their selection, caret and scroll offset, and native views take their bounds, in the same way. Controls record their hover and pressed state as reads. A text field's value is in no revision: when it changes, the frame builds only the field again and patches it into the kept tree. Tables, lists and quotes read their siblings, so they are kept only in frames where nothing changed. Debug builds build each kept box again and check that it reads and builds the same.
+
+Boxes far from the view are culled: a parent replaces runs of plain blocks more than a viewport above or below the visible range with spacers of their size. Culling reads the last layout, moved by the scroll since. A subtree that culled is kept with its spacers, so a long list builds nothing while it scrolls, until a spacer comes within half a viewport of the view. Then the boxes down to the list build again, and of its rows only those that came into range. A scroll of more than half a viewport in one frame culls again at once. A subtree that culled nothing is kept only while no box below it that could be culled is out of range, also inside scroll boxes.
+
+Styles are incremental too. The selector cache records which nodes each node's matches read, so a DOM change marks only the nodes that could match differently. A style pass starts from the last output and styles those nodes, the children of nodes whose output changed, and every node after a new root font size. It walks the composed tree, so a shadow root inherits from its host and a slotted node from its slot, and each tree matches the rules of its own sheets. Pages with CSS counters or tables, and passes after a new viewport or a changed stylesheet, style every node. Debug builds check each incremental pass against a full one with an empty cache. The per-frame cull info works the same way: only nodes with a new revision, style or focus, and their ancestors, are visited again.
 
 Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` below it and paints them around its children. Code that draws more than a box (text, effects, sticky and fixed offsets) runs as `Hooks` around the box each frame.
 
@@ -101,18 +105,22 @@ Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` be
 | Windows | Win32 | Direct3D 11 with DirectComposition | DirectWrite |
 | Linux | X11 and Wayland | wgpu on Vulkan or OpenGL | cosmic-text |
 
-`@import "liquid-glass"` adds macOS-only CSS classes. A supported glass box keeps its foreground in a separate Metal surface.
+The runtime adds built-in `bg-glass`, `bg-glass-clear`, and `bg-glass-interactive` classes on macOS without an import.
+Tailwind supplies glass color utilities and availability variants. A supported glass box keeps its foreground in a separate Metal surface.
 AppKit puts that surface in an `NSGlassEffectView` above the page. The native material supplies the highlights, refraction, and tint.
 
 The renderer reuses the native views and removes them when their boxes disappear. Idle windows release spare glass drawables.
 These frames need the main thread to update the native views and present their Metal surfaces together.
 Only the newest such frame waits for main, and a newer one drops it unseen, so a busy main thread skips frames but never stops the page.
-The renderer doesn't know where web views paint, so glass views always stay below them.
+The native layers of a window keep one order, from the bottom: the frame, glass views, a view that holds the Core Animation layers of composited animations and the blinking caret, then web views.
+AppKit reorders sublayers added to the frame layer by hand, so none are. The renderer doesn't know where web views paint, so they stay on top.
 Glass currently needs a top-level effect with uniform corners, no transforms or filters, and no clipping or content above it.
 
 Unsupported boxes keep their ordinary CSS appearance. Native glass does not appear in Metal readback, so `capturePage()` rejects these frames.
 
-`@import "sf-symbols"` adds macOS-only `sf-icon-*` classes for empty spans. Cache misses rasterize symbols with AppKit on the render thread.
+Native `<sf-symbol-*>` elements need no import. Tag suffixes map hyphens to dots in SF Symbol names.
+The elements inherit CSS color and default to `1em` square. CSS width and height set their bounds on all platforms.
+On macOS, cache misses rasterize symbols with AppKit on the render thread. Other platforms keep the empty element bounds.
 The renderer keeps a bounded alpha cache and draws the icons through its monochrome atlas. CSS color changes need no new bitmap.
 The cache keeps every symbol that the current frame uses, even past its bounds.
 

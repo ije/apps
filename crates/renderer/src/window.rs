@@ -213,6 +213,8 @@ pub enum WindowChange {
     AspectRatio(f32, Size<Pixels>),
     Parent(Option<raw_window_handle::RawWindowHandle>, bool),
     Vibrancy(Option<isize>, isize),
+    // WARNING: the page has already ended its composition, so the input method only drops its own text.
+    CancelComposition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -526,6 +528,7 @@ pub struct Window {
     next_states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
     next_frame_callbacks: Vec<FrameCallback>,
     pub(crate) captures: Vec<CaptureCallback>,
+    pub(crate) ime_key: Option<(KeyDownEvent, bool)>,
     #[cfg(target_os = "macos")]
     caret: Option<Caret>,
     #[cfg(target_os = "macos")]
@@ -535,6 +538,7 @@ pub struct Window {
     pub(crate) dirty: bool,
     redraw: [bool; 2],
     rebuild: bool,
+    patches: Vec<crate::Node>,
     drawing: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
@@ -587,6 +591,7 @@ impl Window {
             scroll_chain: None,
             gesture: ScrollGesture::default(),
             captures: Vec::new(),
+            ime_key: None,
             #[cfg(target_os = "macos")]
             caret: None,
             #[cfg(target_os = "macos")]
@@ -596,6 +601,7 @@ impl Window {
             dirty: false,
             redraw: [false; 2],
             rebuild: false,
+            patches: Vec::new(),
             drawing: false,
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
@@ -649,6 +655,11 @@ impl Window {
 
     pub fn rebuild(&mut self) {
         self.rebuild = true;
+    }
+
+    // WARNING: the box builds again in place under its kept parents, so the node needs its element id.
+    pub fn patch(&mut self, node: crate::Node) {
+        self.patches.push(node);
     }
 
     pub fn redrawing(&self) -> bool {
@@ -718,7 +729,7 @@ impl Window {
         };
         let region = crate::frame::region(content);
         // WARNING: the compositor draws the layer over the window without its clip, so it must stay
-        // inside the clip and nothing may paint over it there.
+        // inside the clip and nothing may paint over it there. Web views stay above it, as above the frame.
         let mask = &effect.content_mask;
         if reach.is_none_or(|reach| {
             mask.bounds.intersect(&reach) != reach
@@ -1016,6 +1027,9 @@ impl Window {
             tree.begin(self.scale_factor, self.text_system.generation());
             let child = render(tree, self, cx);
             let root = tree.commit_root(child, self.viewport_size, self.scale_factor);
+            for node in mem::take(&mut self.patches) {
+                tree.patch(node, self.scale_factor);
+            }
             if !mem::take(&mut self.rebuild) {
                 return root;
             }
@@ -1216,20 +1230,30 @@ impl Window {
         self.scroll_chain = Some(chain);
     }
 
+    // WARNING: these keys pass the main thread's key filter like real ones, so this thread waits for main.
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
-        let handled = self.dispatch_event(
-            PlatformInput::KeyDown(KeyDownEvent {
-                keystroke: keystroke.clone(),
-                is_held: false,
-            }),
-            cx,
-        );
+        let id = self.id;
+        let filter = |input: PlatformInput| {
+            crate::native::sync(move || crate::native::key(id, &input, &|| false))
+        };
+        let down = PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            ime: false,
+        });
+        let handled = filter(down.clone()) || self.dispatch_event(down, cx);
         if !handled && let Some(text) = &keystroke.key_char {
             self.with_view(cx, |view, window, cx| {
                 view.replace_text_in_range(None, text, window, cx)
             });
         }
-        self.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke }), cx);
+        let up = PlatformInput::KeyUp(KeyUpEvent {
+            keystroke,
+            ime: false,
+        });
+        if !filter(up.clone()) {
+            self.dispatch_event(up, cx);
+        }
         handled
     }
 

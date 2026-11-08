@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub(crate) struct Measurements {
     pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
     pub(crate) pixel_ratio: f32,
+    // WARNING: the sizes of decoded images and video frames, kept with `State::images` and `svg_images`.
+    pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -553,11 +555,21 @@ pub(crate) fn intrinsic(
     let border_box = style
         .get(Prop::BOX_SIZING)
         .is_some_and(|v| v == "border-box");
+    // WARNING: like Chrome, a failed image with alt text holds a broken image icon and the text, and an inline one
+    // ignores its size. Only the UA sheet makes images inline blocks.
+    let alt = super::element::broken_image(node)
+        .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
+        .flatten();
+    let sizeless = alt.is_some()
+        && style.get(Prop::DISPLAY).is_none_or(|v| {
+            v == "inline" || v == "inline-block" && styles.flags[id] & style::AGENT_DISPLAY != 0
+        });
     let sizes = |props: [Prop; 3], base: Option<f32>| {
         let axis = usize::from(props[0] == Prop::HEIGHT);
         props.map(|prop| {
             style
                 .get(prop)
+                .filter(|_| !(sizeless && matches!(prop, Prop::WIDTH | Prop::HEIGHT)))
                 .filter(|v| base.is_some() || !v.contains('%'))
                 .and_then(|v| units.resolve(v, base.unwrap_or(0.)))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
@@ -577,20 +589,41 @@ pub(crate) fn intrinsic(
         .map(|width| clamp(width, used).max(0.));
     let vertical = sizes([Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], height);
     let mut content = [0f32; 3];
-    if matches!(node.tag.as_str(), "svg" | "img" | "canvas" | "video") {
-        let default = match node.tag.as_str() {
-            "svg" => [24., 24.],
-            "canvas" | "video" => [300., 150.],
-            _ => [0., 0.],
-        };
+    let natural = (node.tag != "svg")
+        .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied()))
+        .flatten();
+    if let Some((natural, ratio)) = natural {
+        // WARNING: the size attributes of images and videos only hint a size that no rule sets, and a natural ratio
+        // turns the used width into the height, in the content box.
+        let hint = [0, 1].map(|axis| {
+            node.attrs
+                .get(["width", "height"][axis])
+                .filter(|_| {
+                    matches!(node.tag.as_str(), "img" | "video")
+                        && style.get([Prop::WIDTH, Prop::HEIGHT][axis]).is_none()
+                })
+                .and_then(|v| super::element::dimension(v, false))
+                .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
+        });
+        let height = vertical[0].or(hint[1]);
+        let width = hint[0]
+            .or_else(|| ratio.zip(height).map(|(ratio, height)| height * ratio))
+            .unwrap_or(natural[0]);
+        let height = height.unwrap_or_else(|| {
+            ratio.map_or(natural[1], |ratio| {
+                clamp(used[0].unwrap_or(width), used) / ratio
+            })
+        });
+        content = [width, width, height];
+    } else if node.tag == "svg" {
         let [width, height] = [0, 1].map(|axis| {
             node.attrs
                 .get(["width", "height"][axis])
-                .and_then(|v| super::element::dimension(v, node.tag == "canvas"))
-                .unwrap_or(default[axis])
+                .and_then(|v| super::element::dimension(v, false))
+                .unwrap_or(24.)
         });
         // WARNING: like browsers, an svg with a set height and auto width takes its width from the viewBox ratio.
-        let ratio = (node.tag == "svg" && !node.attrs.contains_key("width"))
+        let ratio = (!node.attrs.contains_key("width"))
             .then(|| node.attrs.get("viewBox"))
             .flatten()
             .and_then(|view| {
@@ -618,9 +651,39 @@ pub(crate) fn intrinsic(
             available,
         );
         content = [width, width, height];
-    } else if let Some(inline) = style::inline_text(doc, styles, id) {
-        let mut runs = inline.runs.to_vec();
-        for atom in &inline.atoms {
+    } else if node.tag == "input"
+        && let Some(kind) = node.attrs.get("type").filter(|value| {
+            ["button", "submit", "reset"]
+                .iter()
+                .any(|kind| value.eq_ignore_ascii_case(kind))
+        })
+    {
+        let label = node.attrs.get("value").map_or(
+            if kind.eq_ignore_ascii_case("submit") {
+                "Submit"
+            } else if kind.eq_ignore_ascii_case("reset") {
+                "Reset"
+            } else {
+                ""
+            },
+            String::as_str,
+        );
+        let run = style::text_run(style, units, label.len());
+        let width = f32::from(
+            text.shape_line(label, renderer::px(units.font.em), &[run], None)
+                .width,
+        );
+        content = [width, width, units.font.lh];
+    } else if let Some((source, mut runs, atoms)) = match alt {
+        Some(alt) => Some((
+            renderer::SharedString::from(alt.clone()),
+            vec![style::text_run(style, units, alt.len())],
+            Box::default(),
+        )),
+        None => style::inline_text(doc, styles, id)
+            .map(|inline| (inline.text.to_string().into(), inline.runs.into_vec(), inline.atoms)),
+    } {
+        for atom in &atoms {
             let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
             runs[atom.run].inset[1] = renderer::px(max);
         }
@@ -632,11 +695,11 @@ pub(crate) fn intrinsic(
             word_break,
             renderer::WordBreak::Anywhere | renderer::WordBreak::BreakAll
         );
-        let lines = text
-            .shape_text(
-                inline.text.to_string().into(),
+        let shape = |runs: &[renderer::TextRun]| {
+            text.shape_text(
+                source.clone(),
                 renderer::px(units.font.em),
-                &runs,
+                runs,
                 available.filter(|_| wrap).map(renderer::px),
                 style
                     .get(Prop::WEBKIT_LINE_CLAMP)
@@ -645,7 +708,26 @@ pub(crate) fn intrinsic(
                     .map(|lines| lines.max(1)),
                 word_break,
             )
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
+        // WARNING: like Chrome's floated icon, alt text goes below the icon when its first word doesn't fit beside
+        // it, and the icon doesn't widen the min-content width of the text.
+        let float = if alt.is_some() { 16. } else { 0. };
+        let beside = alt
+            .is_some()
+            .then(|| {
+                let mut runs = runs.clone();
+                runs[0].inset[0] = renderer::px(float);
+                shape(&runs)
+            })
+            .filter(|lines| {
+                available
+                    .filter(|_| wrap)
+                    .zip(lines.first())
+                    .is_none_or(|(width, line)| f32::from(line.first_row_end()) <= width + 0.01)
+            });
+        let top = if beside.is_none() { float } else { 0. };
+        let lines = beside.unwrap_or_else(|| shape(&runs));
         let mut opening = Vec::new();
         let mut at = 0;
         for run in &*runs {
@@ -686,8 +768,13 @@ pub(crate) fn intrinsic(
             line_start += line.text.len() + 1;
         }
         if !wrap {
-            content[0] = content[1];
+            content[0] = content[1] - float;
         }
+        content = [
+            content[0].max(float),
+            content[1] + top,
+            (content[2] + top).max(float),
+        ];
     } else if matches!(display, "grid" | "inline-grid")
         && ![Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS]
             .into_iter()
@@ -915,6 +1002,20 @@ pub(crate) fn intrinsic(
             }
         }
     }
+    // WARNING: a select that shows one option is as tall as its font, like its box.
+    if node.tag == "select"
+        && !node.attrs.contains_key("multiple")
+        && node
+            .attrs
+            .get("size")
+            .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
+    {
+        let face = text.resolve_font(&style::font(style));
+        let [ascent, descent, _] = text
+            .line_metrics(face, renderer::px(units.font.em * measured.pixel_ratio))
+            .map(f32::from);
+        content[2] = (ascent + descent) / measured.pixel_ratio + 2.;
+    }
     let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
     let min = if matches!(
         node.tag.as_str(),
@@ -931,6 +1032,7 @@ pub(crate) fn intrinsic(
         .is_none()
         .then(|| style.get(Prop::ASPECT_RATIO))
         .flatten()
+        .filter(|value| !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some())))
         .and_then(super::element::aspect_ratio)
         .zip(available)
         .map(|(ratio, width)| {
@@ -1157,7 +1259,7 @@ pub(crate) fn layout(
     let ident = |value: &&str| {
         *value != "auto" && !value.contains(char::is_whitespace) && value.parse::<isize>().is_err()
     };
-    let alignment = |child: usize, axis: usize| {
+    let alignment = |child: usize, axis: usize, replaced: bool| {
         let own = &styles.values[child];
         let margins = [
             [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
@@ -1194,14 +1296,7 @@ pub(crate) fn layout(
             ([true, true], _) => (Some(0.5), None),
             ([true, false], _) => (Some(1.), None),
             ([false, true], _) => (Some(0.), None),
-            (_, "normal")
-                if matches!(
-                    doc.nodes[child].tag.as_str(),
-                    "img" | "svg" | "canvas" | "video"
-                ) =>
-            {
-                (Some(0.), None)
-            }
+            (_, "normal") if replaced => (Some(0.), None),
             (_, "normal" | "stretch") => (None, None),
             (_, "center") => (Some(0.5), None),
             (_, "end" | "flex-end" | "self-end" | "right") => (Some(1.), None),
@@ -1229,10 +1324,11 @@ pub(crate) fn layout(
         .map(|(legend, ..)| legend);
     let mut read = |child: usize| -> Item {
         let style = &styles.values[child];
-        let replaced = matches!(
-            doc.nodes[child].tag.as_str(),
-            "img" | "svg" | "canvas" | "video"
-        );
+        // WARNING: grid items stretch by default, but replaced elements start, unlike controls.
+        let replaced = doc.nodes[child].tag == "svg"
+            || doc.nodes[child].tag != "input"
+                && super::element::natural_size(doc, child, measured.naturals.get(&child).copied())
+                    .is_some();
         let mut item = *memo
             .entry((std::rc::Rc::as_ptr(style), replaced))
             .or_insert_with(|| {
@@ -1303,7 +1399,8 @@ pub(crate) fn layout(
                         .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
                         .is_some_and(|v| v.starts_with("subgrid"))
                 });
-                let [(column, _), (row, baseline)] = [0, 1].map(|axis| alignment(child, axis));
+                let [(column, _), (row, baseline)] =
+                    [0, 1].map(|axis| alignment(child, axis, replaced));
                 Item {
                     flowed,
                     order,

@@ -117,6 +117,7 @@ impl Drop for Present {
 pub(crate) struct Renderer {
     device: Device,
     layer: Retained<CAMetalLayer>,
+    overlay: Retained<CALayer>,
     size: CGSize,
     unified: bool,
     presents_with_transaction: bool,
@@ -306,6 +307,10 @@ impl Renderer {
             objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable
                 | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
         );
+        // WARNING: AppKit sets the flip of a hosted layer from its view, and the overlay view is flipped, so
+        // promoted layers and the caret are placed from the top left, like the frame during a resize.
+        let overlay = CALayer::new();
+        overlay.setGeometryFlipped(true);
         let unified = device.hasUnifiedMemory();
         let shared = device.supportsFamily(MTLGPUFamily::Apple1);
         let queue = device.newCommandQueue().context("creating command queue")?;
@@ -319,6 +324,7 @@ impl Renderer {
             pipelines: Pipelines::new(&device)?,
             device,
             layer,
+            overlay,
             size: CGSize::new(0., 0.),
             unified,
             presents_with_transaction: false,
@@ -353,8 +359,6 @@ impl Renderer {
         CATransaction::setDisableActions(true);
         let scale = self.layer.contentsScale();
         let [x, y, w, h] = region.map(|value| value as f64 / scale);
-        let height = self.layer.bounds().size.height;
-        let flipped = self.layer.isGeometryFlipped();
         let mut fresh = false;
         if let Some(at) = self
             .promoted
@@ -384,11 +388,10 @@ impl Renderer {
                     objc2_core_foundation::CGPoint::new(0., 0.),
                     CGSize::new(w, h),
                 ));
-                sublayer.setPosition(objc2_core_foundation::CGPoint::new(
-                    x,
-                    if flipped { y } else { height - y - h },
-                ));
-                self.layer.addSublayer(&sublayer);
+                sublayer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
+                // WARNING: below the caret. A covered caret blinks in the frame, but promotion can't see the
+                // caret, so a layer under it can be promoted.
+                self.overlay.insertSublayer_atIndex(&sublayer, 0);
                 self.promoted.push(Promoted {
                     key,
                     index,
@@ -430,34 +433,21 @@ impl Renderer {
         });
         sublayer.setOpacity(opacities.last().copied().unwrap_or(1.));
         if !transforms.is_empty() {
-            // WARNING: the superlayer is y-up unless flipped, and a sublayer turns about its anchor: a
-            // sublayer point maps to the window by `place`, a window point to the superlayer by `lift`.
+            // WARNING: a sublayer turns about its anchor, its top left corner, so the window matrix goes
+            // between moves from and back to that corner.
             let mul = |a: &[f64; 16], b: &[f64; 16]| -> [f64; 16] {
                 std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[i / 4 * 4 + k]).sum())
             };
-            let shift = |dx: f64, dy: f64, flip: bool| {
+            let shift = |dx: f64, dy: f64| {
                 let mut m = [0.; 16];
-                [m[0], m[5], m[10], m[15]] = [1., if flip { -1. } else { 1. }, 1., 1.];
-                [m[12], m[13]] = [dx, dy];
+                [m[0], m[5], m[10], m[15], m[12], m[13]] = [1., 1., 1., 1., dx, dy];
                 m
             };
-            let (place, lift, anchor) = if flipped {
-                (
-                    shift(x, y, false),
-                    shift(0., 0., false),
-                    shift(-x, -y, false),
-                )
-            } else {
-                (
-                    shift(x, y + h, true),
-                    shift(0., height, true),
-                    shift(-x, -(height - y - h), false),
-                )
-            };
+            let (place, anchor) = (shift(x, y), shift(-x, -y));
             let values: Vec<_> = transforms
                 .iter()
                 .map(|matrix| {
-                    let m = mul(&anchor, &mul(&lift, &mul(matrix, &place)));
+                    let m = mul(&anchor, &mul(matrix, &place));
                     // SAFETY: a `CATransform3D` is 16 `CGFloat`s, which are `f64`, column by column.
                     let t = unsafe { mem::transmute::<[f64; 16], CATransform3D>(m) };
                     // SAFETY: a plain struct value.
@@ -518,14 +508,7 @@ impl Renderer {
             objc2_core_foundation::CGPoint::new(0., 0.),
             CGSize::new(w, h),
         ));
-        layer.setPosition(objc2_core_foundation::CGPoint::new(
-            x,
-            if self.layer.isGeometryFlipped() {
-                y
-            } else {
-                self.layer.bounds().size.height - y - h
-            },
-        ));
+        layer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
         let srgb = objc2_core_graphics::CGColor::new_srgb(
             f64::from(color.r),
             f64::from(color.g),
@@ -553,7 +536,7 @@ impl Renderer {
         animation.setFillMode(unsafe { kCAFillModeBoth });
         animation.setRemovedOnCompletion(false);
         layer.addAnimation_forKey(&animation, Some(ns_string!("opacity")));
-        self.layer.addSublayer(&layer);
+        self.overlay.addSublayer(&layer);
         self.caret = Some((layer, bounds, color, since));
     }
 
@@ -563,6 +546,10 @@ impl Renderer {
 
     pub fn layer(&self) -> &Retained<CAMetalLayer> {
         &self.layer
+    }
+
+    pub fn overlay(&self) -> &Retained<CALayer> {
+        &self.overlay
     }
 
     // WARNING: sets the size of the next drawables. Only the thread that draws changes it, so a frame always
@@ -1456,5 +1443,70 @@ impl AtlasBackend for AtlasTextures {
         if empty {
             list.emptied(index, |texture| texture.packer.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Bounds, Rgba, ScaledPixels, point, size};
+    use objc2::rc::Retained;
+    use objc2_quartz_core::CALayer;
+
+    #[test]
+    fn page_sublayers_stay_in_the_overlay_below_the_caret() {
+        let mut renderer = super::Renderer::new(false).unwrap();
+        let sublayers = |layer: &CALayer| -> Vec<*const CALayer> {
+            // SAFETY: a plain layer property.
+            unsafe { layer.sublayers() }.map_or_else(Vec::new, |list| {
+                list.iter().map(|layer| Retained::as_ptr(&layer)).collect()
+            })
+        };
+        // A quarter turn about the center of the box at 20, 10 with size 40 x 30, in window points.
+        let turn = [
+            0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 65., -15., 0., 1.,
+        ];
+        renderer.promote(1, 3, [20, 10, 40, 30], 1. / 120., &[1., 0.5], &[turn, turn]);
+        let caret = Bounds {
+            origin: point(ScaledPixels(4.), ScaledPixels(6.)),
+            size: size(ScaledPixels(2.), ScaledPixels(16.)),
+        };
+        let black = Rgba {
+            r: 0.,
+            g: 0.,
+            b: 0.,
+            a: 1.,
+        };
+        renderer.set_caret(Some((caret, black, std::time::Instant::now())));
+        renderer.promote(2, 4, [100, 10, 40, 30], 1. / 120., &[1., 0.5], &[]);
+        let caret = Retained::as_ptr(&renderer.caret.as_ref().unwrap().0);
+        let promoted: Vec<_> = renderer
+            .promoted
+            .iter()
+            .map(|promoted| Retained::as_ptr(&promoted.sublayer).cast::<CALayer>())
+            .collect();
+        assert!(
+            sublayers(&renderer.layer).is_empty(),
+            "AppKit owns the frame layer's sublayers"
+        );
+        assert_eq!(
+            sublayers(&renderer.overlay),
+            [promoted[1], promoted[0], caret]
+        );
+        let first = &renderer.promoted[0].sublayer;
+        assert_eq!((first.position().x, first.position().y), (20., 10.));
+        let turned = first.transform();
+        assert_eq!(
+            [
+                turned.m11, turned.m12, turned.m21, turned.m22, turned.m41, turned.m42
+            ],
+            [0., 1., -1., 0., 35., -5.],
+            "a turn about the center of the sublayer, from its top left corner"
+        );
+        let position = renderer.caret.as_ref().unwrap().0.position();
+        assert_eq!((position.x, position.y), (4., 6.));
+        renderer.demote();
+        assert_eq!(sublayers(&renderer.overlay), [caret]);
+        renderer.set_caret(None);
+        assert!(sublayers(&renderer.overlay).is_empty());
     }
 }

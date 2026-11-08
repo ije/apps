@@ -31,7 +31,7 @@ curl -s $D/evaluate -d '{"expression":"document.title","window":1}'
 curl -s $D/screenshot -d '{"window":1}' -o /tmp/shot.png    # then read the PNG
 ```
 
-Omit `window` to use the main process. Window ids come from `windows`. Lines and columns are 1-based and refer to your source files.
+Omit `window` to use the main process. Window ids come from `windows`. Lines and columns are 1-based and refer to your source files. Like Playwright, pages count as focused while this server runs, so hidden windows get focus events and `:focus` styles, and pages get no `focus` or `blur` on `window`.
 
 | Tool | Use |
 |---|---|

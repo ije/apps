@@ -4148,7 +4148,7 @@ fn css(
             !name.contains('\\'),
             "Escaped CSS imports are not supported"
         );
-        if matches!(name, "liquid-glass" | "sf-symbols" | "tailwindcss")
+        if name == "tailwindcss"
             || name.strip_prefix("tailwindcss/").is_some_and(|part| {
                 matches!(
                     part.strip_suffix(".css").unwrap_or(part),

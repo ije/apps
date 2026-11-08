@@ -163,6 +163,7 @@ struct Snapshot {
     revisions: [u32; KINDS],
 }
 const KINDS: usize = 7;
+const CHILDREN: u32 = 1 << 31;
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
@@ -181,25 +182,80 @@ pub(crate) struct SelectorCache {
     // `dependents` lists, per node, the nodes whose matches read it (with stale entries, as a superset).
     // An incremental pass styles only dirty nodes, so every recorded dependency must reach `dependents`.
     pub(crate) dirty: Vec<bool>,
+    // WARNING: the top bit of an entry marks a node that read the children list, so a change of only the
+    // children marks just those nodes.
     dependents: Vec<(u32, Vec<u32>)>,
+    // WARNING: by shadow root, its host. In its own tree a root stands for its host, which only `:host` matches.
+    hosts: Rc<rustc_hash::FxHashMap<usize, usize>>,
 }
 
 impl SelectorCache {
+    // WARNING: roots that join or leave the map match again, as their snapshots go.
+    pub(crate) fn set_hosts(&mut self, hosts: &Rc<rustc_hash::FxHashMap<usize, usize>>) {
+        if Rc::ptr_eq(&self.hosts, hosts) {
+            return;
+        }
+        let moved: Vec<usize> = self
+            .hosts
+            .iter()
+            .chain(hosts.iter())
+            .filter(|(root, _)| self.hosts.get(root) != hosts.get(root))
+            .map(|(&root, _)| root)
+            .collect();
+        for root in moved {
+            self.forget(root);
+        }
+        self.hosts = hosts.clone();
+    }
+
+    // WARNING: results are keyed by selector address, so they must go with the scopes that held the selectors.
+    // Positions of `:nth-child(An+B of S)` go as a children change of their parent, as in `update`.
+    pub(crate) fn forget_selectors(&mut self) {
+        self.values.clear();
+        self.size = 0;
+        let mut changes = Vec::new();
+        for ((_, parent, _), _) in std::mem::take(&mut self.nth) {
+            if let Some(slot) = self.nodes.get_mut(parent) {
+                self.revision = self.revision.wrapping_add(1);
+                slot.revisions[2] = self.revision;
+                changes.push((parent * KINDS + 2) as u32);
+            }
+        }
+        self.record(changes);
+    }
+
+    fn record(&mut self, changes: Vec<u32>) {
+        for &change in &changes {
+            self.mark(change as usize / KINDS, change as usize % KINDS == 2);
+        }
+        if !changes.is_empty() {
+            self.epoch += 1;
+            self.changes.push_back((self.epoch, changes));
+            if self.changes.len() > 32 {
+                self.changes.pop_front();
+            }
+        }
+    }
+
     pub fn forget(&mut self, id: usize) {
         if let Some(snapshot) = self.nodes.get_mut(id) {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
-            self.mark(id);
+            self.mark(id, false);
         }
     }
 
-    pub(crate) fn mark(&mut self, id: usize) {
+    // WARNING: `id` is always marked, but with `children` only the nodes whose matches read its children are.
+    pub(crate) fn mark(&mut self, id: usize, children: bool) {
         if let Some(dirty) = self.dirty.get_mut(id) {
             *dirty = true;
         }
+        let only = if children { CHILDREN } else { 0 };
         if let Some((_, dependents)) = self.dependents.get(id) {
             for &node in dependents {
-                if let Some(dirty) = self.dirty.get_mut(node as usize) {
+                if node & only == only
+                    && let Some(dirty) = self.dirty.get_mut((node & !CHILDREN) as usize)
+                {
                     *dirty = true;
                 }
             }
@@ -208,21 +264,32 @@ impl SelectorCache {
 
     /// Records that `id` read the nodes in `dependencies`, which must be sorted.
     pub(crate) fn register(&mut self, id: usize) {
-        let mut last = usize::MAX;
-        for &(dependency, _) in &self.dependencies {
-            let node = dependency as usize / KINDS;
-            if node == id || node == last {
-                continue;
-            }
-            last = node;
-            let Some((compacted, list)) = self.dependents.get_mut(node) else {
+        for group in self
+            .dependencies
+            .chunk_by(|a, b| a.0 as usize / KINDS == b.0 as usize / KINDS)
+        {
+            let node = group[0].0 as usize / KINDS;
+            let Some((compacted, list)) = self.dependents.get_mut(node).filter(|_| node != id)
+            else {
                 continue;
             };
-            if list.last() != Some(&(id as u32)) {
-                list.push(id as u32);
+            let entry = id as u32
+                | if group.iter().any(|&(kind, _)| kind as usize % KINDS == 2) {
+                    CHILDREN
+                } else {
+                    0
+                };
+            if list.last() != Some(&entry) {
+                list.push(entry);
                 if list.len() >= 16.max(*compacted as usize * 2) {
-                    list.sort_unstable();
-                    list.dedup();
+                    list.sort_unstable_by_key(|entry| entry & !CHILDREN);
+                    list.dedup_by(|later, kept| {
+                        let same = *later & !CHILDREN == *kept & !CHILDREN;
+                        if same {
+                            *kept |= *later & CHILDREN;
+                        }
+                        same
+                    });
                     *compacted = list.len() as u32;
                 }
             }
@@ -368,16 +435,7 @@ impl SelectorCache {
                 }
             }
         }
-        for &change in &changes {
-            self.mark(change as usize / KINDS);
-        }
-        if !changes.is_empty() {
-            self.epoch += 1;
-            self.changes.push_back((self.epoch, changes));
-            if self.changes.len() > 32 {
-                self.changes.pop_front();
-            }
-        }
+        self.record(changes);
     }
 
     pub(crate) fn depend(&mut self, id: usize, kind: usize) {
@@ -626,6 +684,19 @@ impl Selector {
             ))
         })?;
         let mut selector = self.clone();
+        // WARNING: a `::backdrop` rule in `@starting-style` is kind 16.
+        if kind == 15
+            && matches!(&self.simple[index + 1..], [SimpleSelector::Element(name, _)]
+                if name == "starting-style")
+        {
+            selector.simple.truncate(index);
+            return Some((16, selector));
+        }
+        // WARNING: `shadow_target()` reads what follows `::slotted()` and `::part()`.
+        if matches!(kind, 12 | 13) {
+            selector.simple.truncate(index);
+            return Some((kind, selector));
+        }
         if !(7..12).contains(&kind) {
             selector.simple.remove(index);
             return Some((kind, selector));
@@ -639,6 +710,52 @@ impl Selector {
         };
         selector.simple.truncate(index);
         Some((kind, selector))
+    }
+
+    // WARNING: for `::slotted()` and `::part()`, the pseudo-element they style (`usize::MAX` for the element, 14 and 16
+    // in `@starting-style`) and the pseudo-classes that a part must match. As in Chrome, `::slotted()` takes `::before`,
+    // `::after`, `::marker`, `::placeholder` and `::backdrop`, and `::part()` also the other pseudo-elements and
+    // non-structural pseudo-classes.
+    pub(crate) fn shadow_target(&self) -> Option<(usize, Self)> {
+        let index = self
+            .simple
+            .iter()
+            .position(|part| matches!(part, SimpleSelector::Element(..)))?;
+        let part =
+            matches!(&self.simple[index], SimpleSelector::Element(name, _) if name == "part");
+        let rest = &self.simple[index + 1..];
+        let split = rest
+            .iter()
+            .position(|part| matches!(part, SimpleSelector::Element(..)))
+            .unwrap_or(rest.len());
+        let compound = |simple: &[SimpleSelector]| Self {
+            simple: simple.to_vec(),
+            previous: None,
+            specificity: [0; 3],
+        };
+        let kind = match compound(&rest[split..]).without_pseudo_element() {
+            _ if split == rest.len() => usize::MAX,
+            Some((kind, left)) if left.simple.is_empty() => kind,
+            _ => return None,
+        };
+        let classes = compound(&rest[..split]);
+        let allowed = if part {
+            !matches!(kind, 12 | 13) && classes.stateful()
+        } else {
+            matches!(kind, 0 | 1 | 3 | 6 | 14..=16 | usize::MAX) && classes.simple.is_empty()
+        };
+        allowed.then_some((kind, classes))
+    }
+
+    fn stateful(&self) -> bool {
+        self.previous.is_none()
+            && self.simple.iter().all(|simple| {
+                matches!(simple, SimpleSelector::Pseudo(name, _, parsed, _)
+                    if !(name.ends_with("child")
+                        || name.ends_with("of-type")
+                        || matches!(name.as_str(), "empty" | "has" | "host" | "host-context" | "scope"))
+                        && parsed.iter().all(Self::stateful))
+            })
     }
 
     pub(crate) fn pseudo_argument(&self) -> Option<&str> {
@@ -1075,7 +1192,45 @@ impl Selector {
         }
         let result = (|| {
             let node = &doc.nodes[id];
-            if node.tag.starts_with('#')
+            let host = node
+                .tag
+                .starts_with('#')
+                .then(|| memo.hosts.get(&id).copied())
+                .flatten();
+            if let Some(host) = host {
+                // WARNING: the host is featureless in its shadow tree: only `:host`, and lists that hold it,
+                // match the root.
+                let mut hosted = false;
+                for simple in &self.simple {
+                    let matched = match simple {
+                        SimpleSelector::Universal => continue,
+                        SimpleSelector::Pseudo(name, _, parsed, _) if name == "host" => {
+                            parsed.is_empty()
+                                || parsed
+                                    .iter()
+                                    .any(|s| s.matches_cached(doc, host, scope, memo))
+                        }
+                        SimpleSelector::Pseudo(name, _, parsed, _)
+                            if matches!(name.as_str(), "is" | "where") =>
+                        {
+                            parsed
+                                .iter()
+                                .any(|s| s.matches_cached(doc, id, scope, memo))
+                        }
+                        SimpleSelector::Parent(parent, _) => parent
+                            .iter()
+                            .any(|s| s.matches_cached(doc, id, scope, memo)),
+                        _ => false,
+                    };
+                    if !matched {
+                        return false;
+                    }
+                    hosted = true;
+                }
+                if !hosted {
+                    return false;
+                }
+            } else if node.tag.starts_with('#')
                 || !self.simple.iter().all(|s| match s {
                     // WARNING: HTML tags and attribute names are lowercase in the tree and match selectors ASCII case-insensitively; SVG ones keep their case and match as written.
                     SimpleSelector::Tag(tag) => {
@@ -1205,13 +1360,6 @@ impl Selector {
                             }
                             found
                         }
-                        "host" => {
-                            node.tag == "apps-shadow-root"
-                                && (parsed.is_empty()
-                                    || parsed
-                                        .iter()
-                                        .any(|s| s.matches_cached(doc, id, scope, memo)))
-                        }
                         "empty" => {
                             memo.depend(id, 2);
                             memo.depend(id, 3);
@@ -1312,6 +1460,13 @@ impl Selector {
                                 }
                                 != 0
                         }
+                        // WARNING: for the UA sheet: a modal dialog keeps its place until it leaves the top layer.
+                        "-internal-dialog-in-top-layer" => {
+                            memo.depend(id, 5);
+                            node.tag == "dialog"
+                                && node.state & (super::MODAL | super::MODAL << 5) != 0
+                        }
+                        "-internal-sf-symbol" => node.sf_symbol().is_some(),
                         "disabled" | "enabled" => {
                             matches!(
                                 node.tag.as_str(),
@@ -2208,6 +2363,55 @@ mod tests {
                     "step {step}: {key}:{value}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn slotted_and_part_take_what_chrome_takes_after_them() {
+        let element = Some(usize::MAX);
+        for (selector, target) in [
+            ("::part(a)", element),
+            ("x::part(a)::before", Some(0)),
+            ("::part(a)::selection", Some(2)),
+            ("::part(a)::marker", Some(3)),
+            ("::part(a)::first-line", Some(5)),
+            ("::part(a)::placeholder", Some(6)),
+            ("::part(a)::-webkit-scrollbar-thumb:hover", Some(11)),
+            ("::part(a)::backdrop", Some(15)),
+            ("::part(a):hover:focus", element),
+            ("::part(a):not(:hover)", element),
+            ("::part(a):state(x)", element),
+            ("::part(a):hover::after", Some(1)),
+            ("::part(a):first-child", None),
+            ("::part(a):not(:first-child)", None),
+            ("::part(a):empty", None),
+            ("::part(a):has(b)", None),
+            ("::part(a):root", None),
+            ("::part(a):is(.x)", None),
+            ("::part(a).x", None),
+            ("::part(a)::before:hover", None),
+            ("::part(a)::part(b)", None),
+            ("::part(a)::slotted(b)", None),
+            ("::slotted(a)", element),
+            ("::slotted(a)::before", Some(0)),
+            ("::slotted(a)::after", Some(1)),
+            ("::slotted(a)::marker", Some(3)),
+            ("::slotted(a)::placeholder", Some(6)),
+            ("::slotted(a)::backdrop", Some(15)),
+            ("::slotted(a)::starting-style", Some(14)),
+            ("::part(a)::backdrop::starting-style", Some(16)),
+            ("::slotted(a)::first-line", None),
+            ("::slotted(a)::selection", None),
+            ("::slotted(a)::-webkit-scrollbar", None),
+            ("::slotted(a):hover", None),
+            ("::slotted(a)::part(b)", None),
+        ] {
+            let parsed = Selector::parse(selector, None);
+            assert_eq!(
+                parsed[0].shadow_target().map(|(kind, _)| kind),
+                target,
+                "{selector}"
+            );
         }
     }
 }

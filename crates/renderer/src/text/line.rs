@@ -69,6 +69,14 @@ impl WrappedLine {
         self.layout.len()
     }
 
+    pub fn first_row_end(&self) -> Pixels {
+        let layout = &self.unwrapped_layout;
+        let end = self.wrap_boundaries.first().map_or(layout.len, |at| {
+            layout.runs[at.run_index].glyphs[at.glyph_index].index
+        });
+        layout.x_for_index(self.text[..end].trim_end().len())
+    }
+
     pub fn paint(
         &self,
         origin: Point<Pixels>,

@@ -1441,71 +1441,95 @@ fn cycles_reexports_and_missing_exports() {
 }
 
 #[test]
-fn sf_symbols_import_survives_nested_css_without_a_package() {
+fn sf_symbol_tags_keep_siblings_and_tailwind_sizes() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("icons.css"), "@import 'sf-symbols';").unwrap();
-    fs::write(
-        dir.path().join("style.css"),
-        "@import './icons.css'; @import 'tailwindcss';",
-    )
-    .unwrap();
+    fs::write(dir.path().join("style.css"), "@import 'tailwindcss';").unwrap();
     let path = dir.path().join("index.html");
     fs::write(
         &path,
-        "<link rel='stylesheet' href='./style.css'><span class='sf-icon-folder-fill size-16'></span>",
+        "<link rel='stylesheet' href='./style.css'><main><sf-symbol-folder-fill class='size-16'/><span>After</span><sf-symbol-xmark /></main>",
     )
     .unwrap();
     let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
-    assert!(linked_css(&source).contains("@import \"sf-symbols\";"));
-    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
-        .pop()
-        .unwrap();
+    let doc = apps_runtime::bundle::page(&source);
+    let [symbol, after, close] = ["sf-symbol-folder-fill", "span", "sf-symbol-xmark"]
+        .map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
+    assert!(doc.nodes[symbol].children.is_empty());
+    assert!(doc.nodes[close].children.is_empty());
     assert_eq!(
-        style.get("-apps-sf-symbol").map(String::as_str),
-        cfg!(target_os = "macos").then_some("\"folder.fill\"")
+        doc.nodes[doc.nodes[symbol].parent.unwrap()].children,
+        [symbol, after, close]
     );
-    assert_eq!(
-        apps_runtime::style::length(&style["width"], 0., 16., 800., 600.),
-        64.
-    );
+    let styles = apps_runtime::style::styles(&doc, 800., 600.);
+    for property in ["width", "height"] {
+        assert_eq!(
+            apps_runtime::style::length(&styles[symbol][property], 0., 16., 800., 600.),
+            64.
+        );
+    }
 }
 
 #[test]
-fn liquid_glass_import_survives_nested_css_without_a_package() {
+fn glass_classes_work_with_nested_css_and_no_glass_import() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("glass.css"), "@import 'liquid-glass';").unwrap();
-    fs::write(
-        dir.path().join("style.css"),
-        "@import './glass.css'; @import 'tailwindcss';",
-    )
-    .unwrap();
+    fs::write(dir.path().join("style.css"), "@import './base.css';").unwrap();
     let path = dir.path().join("index.html");
-    fs::write(
-        &path,
-        "<link rel='stylesheet' href='./style.css'><button class='glass glass-interactive glass-tint-blue-500 px-4'></button>",
-    )
-    .unwrap();
-    let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
-    let css = linked_css(&source);
-    assert!(css.contains("@import \"liquid-glass\";"));
-    assert!(css.contains("@import \"tailwindcss\";"));
-    let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
-        .pop()
+    for (tailwind, classes, material) in [
+        (
+            true,
+            "bg-glass-interactive bg-glass-blue-500 px-4 w-12 h-6",
+            "regular",
+        ),
+        (false, "bg-glass bg-glass-interactive", "regular"),
+        (false, "bg-glass-clear bg-glass-interactive", "clear"),
+    ] {
+        fs::write(
+            dir.path().join("base.css"),
+            if tailwind {
+                "@import 'tailwindcss';"
+            } else {
+                "button{padding-left:16px;width:48px;height:24px}"
+            },
+        )
         .unwrap();
-    assert_eq!(
-        style.get("-macos-glass").map(String::as_str),
-        cfg!(target_os = "macos").then_some("regular")
-    );
-    assert_eq!(
-        style
-            .get("-macos-glass-tint-color")
-            .and_then(|value| apps_runtime::style::color(value)),
-        apps_runtime::style::color("oklch(62.3% 0.214 259.815)")
-    );
-    assert_eq!(
-        apps_runtime::style::length(&style["padding-left"], 0., 16., 800., 600.),
-        16.
-    );
+        fs::write(
+            &path,
+            format!(
+                "<link rel='stylesheet' href='./style.css'><button class='{classes}'></button>"
+            ),
+        )
+        .unwrap();
+        let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+        assert_eq!(
+            linked_css(&source).contains("@import \"tailwindcss\";"),
+            tailwind
+        );
+        let style = apps_runtime::style::styles(&apps_runtime::bundle::page(&source), 800., 600.)
+            .pop()
+            .unwrap();
+        assert_eq!(
+            style.get("-macos-glass").map(String::as_str),
+            cfg!(target_os = "macos").then_some(material)
+        );
+        assert_eq!(
+            style.get("-macos-glass-interactive").map(String::as_str),
+            cfg!(target_os = "macos").then_some("true")
+        );
+        if tailwind {
+            assert_eq!(
+                style
+                    .get("-macos-glass-tint-color")
+                    .and_then(|value| apps_runtime::style::color(value)),
+                apps_runtime::style::color("oklch(62.3% 0.214 259.815)")
+            );
+        }
+        for (property, expected) in [("padding-left", 16.), ("width", 48.), ("height", 24.)] {
+            assert_eq!(
+                apps_runtime::style::length(&style[property], 0., 16., 800., 600.),
+                expected
+            );
+        }
+    }
 }
 
 #[test]

@@ -351,6 +351,18 @@ pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformIn
     window.dispatch_event(input, app)
 }
 
+// WARNING: like Chrome, a key that the input method took reaches the page just before the first change it makes:
+// with key code 229 while it composes or when it inserts more than one character, else as itself, and then the
+// page can keep its character out.
+pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, ime: bool) -> bool {
+    let Some((mut down, composing)) = window.ime_key.take() else {
+        return false;
+    };
+    down.ime = ime || composing;
+    let ime = down.ime;
+    dispatch(window, app, PlatformInput::KeyDown(down)) && !ime
+}
+
 impl Callbacks {
     pub(crate) fn with<R: Send + 'static>(
         &self,
@@ -380,8 +392,11 @@ impl Callbacks {
     }
 
     pub fn input(&self, input: PlatformInput) -> bool {
-        self.with(move |window, app| dispatch(window, app, input))
-            .unwrap_or(false)
+        self.with(move |window, app| {
+            window.ime_key = None;
+            dispatch(window, app, input)
+        })
+        .unwrap_or(false)
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -464,13 +479,20 @@ impl Callbacks {
         .flatten()
     }
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn marked_text_range(&self) -> Option<Range<usize>> {
         self.with(|window, app| {
             window.with_view(app, |view, window, app| view.marked_text_range(window, app))
         })
         .flatten()
         .flatten()
+    }
+
+    // WARNING: like Chrome, an empty or canceled composition removes its text and ends with `compositionend`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn clear_marked_text(&self) {
+        if let Some(marked) = self.marked_text_range() {
+            self.replace_text_in_range(Some(marked), "");
+        }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -490,6 +512,9 @@ impl Callbacks {
     pub fn replace_text_in_range(&self, range: Option<Range<usize>>, text: &str) {
         let text = text.to_owned();
         self.queue(move |window, app| {
+            if send_ime_key(window, app, text.encode_utf16().count() > 1) {
+                return;
+            }
             window.with_view(app, |view, window, app| {
                 view.replace_text_in_range(range, &text, window, app)
             });
@@ -504,6 +529,7 @@ impl Callbacks {
     ) {
         let text = text.to_owned();
         self.queue(move |window, app| {
+            send_ime_key(window, app, true);
             window.with_view(app, |view, window, app| {
                 view.replace_and_mark_text_in_range(range, &text, selected, window, app)
             });
@@ -513,6 +539,7 @@ impl Callbacks {
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&self) {
         self.queue(|window, app| {
+            send_ime_key(window, app, false);
             window.with_view(app, |view, window, app| view.unmark_text(window, app));
         });
     }
@@ -552,9 +579,12 @@ pub mod native {
         CloseRequested,
     }
 
+    type KeyFilter = Box<dyn FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool>;
+
     #[derive(Default)]
     struct Handlers {
         window: Option<Box<dyn FnMut(WindowId, WindowEvent)>>,
+        key: Option<KeyFilter>,
         reopen: Option<Box<dyn FnMut(bool)>>,
         should_quit: Option<Box<dyn FnMut() -> bool>>,
         open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
@@ -575,6 +605,25 @@ pub mod native {
                 handlers.window.get_or_insert(callback);
             });
         }
+    }
+
+    // WARNING: the filter runs on the main thread for each key down and up of a window, before the page gets it.
+    // When it returns true, the page never gets the key, and the system takes it as handled, but a composing input
+    // method still does. The last argument tells whether one composes, and asks the page only when it is called.
+    pub fn on_key(f: impl FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.key = Some(Box::new(f)));
+    }
+
+    // WARNING: a key that comes while the filter runs, from a loop nested in it, passes unfiltered.
+    pub(crate) fn key(id: WindowId, input: &PlatformInput, composing: &dyn Fn() -> bool) -> bool {
+        let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.key.take()) else {
+            return false;
+        };
+        let blocked = callback(id, input, composing);
+        HANDLERS.with_borrow_mut(|handlers| {
+            handlers.key.get_or_insert(callback);
+        });
+        blocked
     }
 
     pub fn on_reopen(f: impl FnMut(bool) + 'static) {
@@ -686,5 +735,24 @@ pub(crate) mod events {
     pub(crate) use super::native::{open_urls, reopen};
     pub fn quit() {
         super::native::quit_handler();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native;
+    use crate::{KeyUpEvent, PlatformInput, WindowId};
+
+    #[test]
+    fn the_key_filter_blocks_keys_but_not_the_ones_of_a_loop_nested_in_it() {
+        let input = PlatformInput::KeyUp(KeyUpEvent::default());
+        assert!(!native::key(WindowId(1), &input, &|| true));
+        native::on_key(|id, input, composing| {
+            assert!(!native::key(id, input, composing));
+            id == WindowId(1) && composing()
+        });
+        assert!(native::key(WindowId(1), &input, &|| true));
+        assert!(!native::key(WindowId(1), &input, &|| false));
+        assert!(!native::key(WindowId(2), &input, &|| true));
     }
 }

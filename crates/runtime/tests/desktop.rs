@@ -288,6 +288,50 @@ fn run_window_test(main: &str, page: &str) -> std::process::Output {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
+fn native_glass_appearance_preserves_focus() {
+    let main = r#"
+        const { app, BrowserWindow } = __apps;
+        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+        app.whenReady().then(async () => {
+            setTimeout(() => process.exit(3), 8000);
+            const owner = new BrowserWindow({ width: 300, height: 200 });
+            await owner.loadFile('apps:///index.html');
+            await sleep(100);
+            if (!owner.isFocused()) throw Error('Owner did not get focus');
+            for (const visualEffectState of ['followWindow', 'active', 'inactive']) {
+                const float = new BrowserWindow({ width: 260, height: 76, frame: false, transparent: true, focusable: false, show: false, visualEffectState });
+                let focused = false;
+                float.on('focus', () => { focused = true; });
+                await float.loadFile('apps:///index.html');
+                for (let i = 0; i < 2; i++) {
+                    float.showInactive();
+                    await sleep(100);
+                    if (!float.isVisible() || float.isFocused() || focused || BrowserWindow.getFocusedWindow() !== owner)
+                        throw Error(visualEffectState + ' glass changed keyboard focus');
+                    float.hide();
+                    await sleep(50);
+                }
+                const closed = new Promise(resolve => float.once('closed', resolve));
+                float.close();
+                await closed;
+            }
+            console.log('GLASS_FOCUS_OK'); app.quit();
+        });
+    "#;
+    let output = run_window_test(
+        main,
+        r#"<body style="margin:0;background:transparent"><div style="-macos-glass:clear;width:236px;height:52px;border-radius:26px">Glass</div></body>"#,
+    );
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("GLASS_FOCUS_OK"),
+        "{text}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
 fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
     let capture = r#"
         const { app, BrowserWindow } = __apps;

@@ -1,7 +1,7 @@
 use crate::style;
 use crate::style::Prop;
 use anyhow::Result;
-use renderer::{Bounds, Pixels, Point, SharedString, Window, point, px, rgba, size};
+use renderer::{AlignItems, Bounds, Pixels, Point, SharedString, Window, point, px, rgba, size};
 use std::{ops::Range, rc::Rc};
 
 pub(super) struct TextHighlight {
@@ -257,7 +257,7 @@ fn row_extents<'a>(
     lines: impl IntoIterator<Item = &'a renderer::WrappedLineLayout>,
     runs: &[renderer::TextRun],
     heights: &[(usize, style::LineHeight)],
-    atoms: &[(usize, [f32; 3])],
+    atoms: &[(usize, [f32; 3], Option<AlignItems>)],
     strut: (renderer::FontId, Pixels, Pixels),
     system: &renderer::TextSystem,
     scale: f32,
@@ -277,6 +277,7 @@ fn row_extents<'a>(
         })
         .collect();
     let mut rows = Vec::new();
+    let mut edges = Vec::new();
     let mut offset = 0;
     for line in lines {
         let layout = &line.unwrapped_layout;
@@ -292,9 +293,13 @@ fn row_extents<'a>(
             for glyph in &run.glyphs {
                 let row = first + ends.partition_point(|&end| end <= glyph.index);
                 let at = offset + glyph.index;
-                if let Some((_, [_, height, baseline])) =
-                    atoms.iter().find(|(place, _)| *place == at)
+                if let Some((_, [_, height, baseline], align)) =
+                    atoms.iter().find(|(place, ..)| *place == at)
                 {
+                    if let Some(align @ (AlignItems::FlexStart | AlignItems::FlexEnd)) = align {
+                        edges.push((row, height * scale, *align == AlignItems::FlexEnd));
+                        continue;
+                    }
                     // WARNING: a box on the baseline as tall as the line differs from the strut by a fraction of a
                     // device pixel, which must not move the row.
                     let [above, below] = [baseline * scale, (height - baseline) * scale];
@@ -331,6 +336,17 @@ fn row_extents<'a>(
             }
         }
         offset += line.len() + 1;
+    }
+    // WARNING: like Chrome, a `top` or `bottom` box taller than the rest of its row grows the row on the other side,
+    // the first of the tallest first, which leaves no room for the others.
+    edges.sort_by(|a: &(usize, f32, bool), b| b.1.total_cmp(&a.1));
+    for (row, height, bottom) in edges {
+        let [above, below] = &mut rows[row];
+        if bottom {
+            *above = above.max(height - *below);
+        } else {
+            *below = below.max(height - *above);
+        }
     }
     rows.into_iter()
         .map(|[above, below]| {
@@ -556,6 +572,7 @@ pub(super) struct InlineText {
 
 pub(super) struct AtomSlot {
     pub(super) size: [f32; 3],
+    pub(super) align: Option<AlignItems>,
     pub(super) at: std::cell::Cell<Point<Pixels>>,
 }
 
@@ -615,7 +632,7 @@ fn with_atoms(
 
 struct Measured {
     data: Rc<style::InlineText>,
-    atoms: Box<[[f32; 3]]>,
+    atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: Rc<std::cell::Cell<[Pixels; 2]>>,
     cached: std::cell::Cell<Option<(Option<Pixels>, renderer::Size<Pixels>)>>,
@@ -645,7 +662,11 @@ impl From<InlineText> for renderer::Child {
             .measure(
                 Measured {
                     data: data.clone(),
-                    atoms: text.atoms.iter().map(|slot| slot.size).collect(),
+                    atoms: text
+                        .atoms
+                        .iter()
+                        .map(|slot| (slot.size, slot.align))
+                        .collect(),
                     styled: Default::default(),
                     measured: Rc::default(),
                     cached: std::cell::Cell::new(None),
@@ -682,7 +703,7 @@ impl From<InlineText> for renderer::Child {
                     }
                     let system = window.text_system().clone();
                     let (text, mut runs) = first_line(data, width, font_size, &system);
-                    with_atoms(data, |index| atoms[index][0], &mut runs);
+                    with_atoms(data, |index| atoms[index].0[0], &mut runs);
                     let mut size = renderer::Size::<Pixels>::default();
                     let lines = system
                         .shape_text_indented(
@@ -696,10 +717,14 @@ impl From<InlineText> for renderer::Child {
                             style.word_break,
                         )
                         .unwrap_or_default();
-                    for line in &lines {
-                        let line = line.size(line_height);
-                        size.height += line.height;
-                        size.width = size.width.max(line.width);
+                    for (index, line) in lines.iter().enumerate() {
+                        let mut line_size = line.size(line_height);
+                        if index == 0 && line.wrap_boundaries.is_empty() {
+                            line_size.width =
+                                (line_size.width + style.text_indent).max(px(0.));
+                        }
+                        size.height += line_size.height;
+                        size.width = size.width.max(line_size.width);
                     }
                     let strut = (system.resolve_font(&style.font()), font_size, line_height);
                     let scale = window.scale_factor();
@@ -711,7 +736,7 @@ impl From<InlineText> for renderer::Child {
                             .atoms
                             .iter()
                             .zip(atoms.iter())
-                            .map(|(atom, size)| (atom.at, *size))
+                            .map(|(atom, &(size, align))| (atom.at, size, align))
                             .collect::<Vec<_>>(),
                         strut,
                         &system,
@@ -780,7 +805,7 @@ impl renderer::Hooks for InlineText {
                 .atoms
                 .iter()
                 .zip(self.atoms.iter())
-                .map(|(atom, slot)| (atom.at, slot.size))
+                .map(|(atom, slot)| (atom.at, slot.size, slot.align))
                 .collect::<Vec<_>>(),
             (
                 window.text_system().resolve_font(&style.font()),
@@ -896,7 +921,21 @@ impl renderer::Hooks for InlineText {
                 &style,
                 window,
             ) {
-                slot.at.set(point(a.x, a.y + base - px(slot.size[2])));
+                let row = rows
+                    .iter()
+                    .rposition(|row| row.start <= atom.at)
+                    .unwrap_or_else(|| {
+                        ((a.y - layout.bounds().top()) / layout.line_height()).round() as usize
+                    });
+                let [above, below] = extents.get(row).copied().unwrap_or_default();
+                let y = match slot.align {
+                    Some(AlignItems::FlexStart) => a.y - above,
+                    Some(AlignItems::FlexEnd) => {
+                        a.y + layout.line_height() + below - px(slot.size[1])
+                    }
+                    _ => a.y + base - px(slot.size[2]),
+                };
+                slot.at.set(point(a.x, y));
             }
         }
         let hitboxes = self
@@ -1168,7 +1207,7 @@ impl renderer::Hooks for InlineText {
                 let Some(styles) = &dom.computed else {
                     continue;
                 };
-                if styles.user_select[*id].0 == style::UserSelect::None {
+                if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
                     continue;
                 }
                 let caret = dom.selection_caret == Some(*id);

@@ -273,6 +273,7 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
         }
         "br" | "img" | "svg" | "canvas" | "video" | "audio" | "iframe" | "embed" | "object"
         | "input" | "button" | "select" | "textarea" | "progress" | "meter" => return false,
+        _ if node.sf_symbol().is_some() => return false,
         _ => {}
     }
     if style.get(Prop::DISPLAY) == Some("none")
@@ -332,6 +333,7 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
     let inline = |id: usize| {
         let tag = doc.nodes[id].tag.as_str();
         !tag.starts_with('#')
+            && doc.nodes[id].sf_symbol().is_none()
             && styles.values[id]
                 .get(Prop::DISPLAY)
                 .is_none_or(|value| value == "inline")
@@ -381,7 +383,8 @@ pub(crate) fn inline_text(
 ) -> Option<InlineText> {
     let parent = &styles.values[id];
     let own = doc.nodes[id].tag == "#text";
-    if !own && doc.nodes[id].children.is_empty()
+    if doc.nodes[id].sf_symbol().is_some()
+        || !own && doc.nodes[id].children.is_empty()
         || parent
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "grid" | "flex" | "inline-flex" | "inline-grid"))
@@ -506,23 +509,24 @@ pub(crate) fn inline_text(
         if atomic_allowed
             && (display.is_some_and(|value| value.starts_with("inline-"))
                 || display.is_none_or(|value| value == "inline")
-                    && matches!(
-                        node.tag.as_str(),
-                        "img"
-                            | "svg"
-                            | "canvas"
-                            | "video"
-                            | "audio"
-                            | "iframe"
-                            | "object"
-                            | "embed"
-                            | "input"
-                            | "button"
-                            | "select"
-                            | "textarea"
-                            | "progress"
-                            | "meter"
-                    ))
+                    && (node.sf_symbol().is_some()
+                        || matches!(
+                            node.tag.as_str(),
+                            "img"
+                                | "svg"
+                                | "canvas"
+                                | "video"
+                                | "audio"
+                                | "iframe"
+                                | "object"
+                                | "embed"
+                                | "input"
+                                | "button"
+                                | "select"
+                                | "textarea"
+                                | "progress"
+                                | "meter"
+                        )))
             && style
                 .get(Prop::POSITION)
                 .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
@@ -558,6 +562,7 @@ pub(crate) fn inline_text(
             && (style
                 .get(Prop::DISPLAY)
                 .is_some_and(|value| value != "inline")
+                || node.sf_symbol().is_some()
                 || matches!(
                     node.tag.as_str(),
                     "img"

@@ -5,11 +5,11 @@ pub(crate) use window::Window;
 
 use super::{
     Clicks, DEFAULT_CURSOR, Ime, SCROLL_LINES, capslock_from_xkb, compose, compose_state,
-    cursor_names, file_paths, ime_area, key_down, keystroke_from_xkb, modifiers_from_xkb,
+    cursor_names, file_paths, ime_area, key_down, key_up, keystroke_from_xkb, modifiers_from_xkb,
     new_xkb_context,
 };
 use crate::{
-    Bounds, Capslock, CursorStyle, FileDropEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    Bounds, Capslock, CursorStyle, FileDropEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, app::Callbacks, point, px, size,
 };
@@ -221,6 +221,7 @@ struct State {
     compose: Option<xkbc::compose::State>,
     pre_edit: Option<String>,
     composing: bool,
+    ime_press: Option<xproto::KeyPressEvent>,
     xim: Option<(X11rbClient<Rc<XCBConnection>>, XimHandler)>,
     modifiers: Modifiers,
     last_modifiers: (Modifiers, Capslock),
@@ -318,6 +319,7 @@ impl Client {
                 compose,
                 pre_edit: None,
                 composing: false,
+                ime_press: None,
                 xim,
                 modifiers: Modifiers::default(),
                 last_modifiers: Default::default(),
@@ -466,24 +468,49 @@ impl Client {
         let filtered = xim.filter_event(&event, &mut handler);
         let callback = handler.event.take();
         self.state.borrow_mut().xim = Some((xim, handler));
-        match callback {
+        let ime = match callback {
             Some(XimEvent::Key(event)) => {
+                if let Event::KeyPress(_) = event {
+                    self.state.borrow_mut().ime_press = None;
+                }
                 self.handle_event(event);
+                None
             }
             Some(XimEvent::Commit(window, text)) => {
                 self.state.borrow_mut().composing = false;
-                if let Some(window) = self.window(window) {
-                    Ime::Commit(text).apply(window.callbacks);
-                }
+                Some((window, Ime::Commit(text)))
             }
             Some(XimEvent::Preedit(window, text)) => {
-                self.state.borrow_mut().composing = !text.is_empty();
-                if let Some(window) = self.window(window) {
-                    Ime::Preedit(text).apply(window.callbacks);
-                    self.update_ime_position(window.callbacks);
-                }
+                let shown = !text.is_empty();
+                let was = std::mem::replace(&mut self.state.borrow_mut().composing, shown);
+                (was || shown).then_some((window, Ime::Preedit(text)))
             }
-            None => {}
+            None => None,
+        };
+        // WARNING: the input method answers a key it took only by changing the text, so its first change after
+        // the press is the page's `Process` key.
+        if let Some((window, ime)) = ime
+            && let Some(window) = self.window(window)
+        {
+            let preedit = matches!(ime, Ime::Preedit(_));
+            let keystroke = {
+                let mut state = self.state.borrow_mut();
+                state.ime_press.take().map(|press| Keystroke {
+                    key_char: None,
+                    ..keystroke_from_xkb(
+                        &key_event_state(&state.xkb, press.state),
+                        modifiers_from_state(press.state),
+                        press.detail.into(),
+                    )
+                })
+            };
+            match keystroke {
+                Some(keystroke) => key_down(window.callbacks, keystroke, false, vec![ime]),
+                None => ime.apply(window.callbacks),
+            }
+            if preedit {
+                self.update_ime_position(window.callbacks);
+            }
         }
         match filtered {
             Ok(true) => {}
@@ -500,6 +527,7 @@ impl Client {
     }
 
     fn forward_to_xim(&self, event: Event) {
+        let press = matches!(event, Event::KeyPress(_));
         let (Event::KeyPress(key) | Event::KeyRelease(key)) = event else {
             self.handle_event(event);
             return;
@@ -516,7 +544,24 @@ impl Client {
         ) {
             eprintln!("apps: XIM: {error}");
         }
-        self.state.borrow_mut().xim = Some((xim, handler));
+        let mut state = self.state.borrow_mut();
+        state.xim = Some((xim, handler));
+        if press
+            && !state
+                .xkb
+                .key_get_one_sym(key.detail.into())
+                .is_modifier_key()
+        {
+            state.ime_press = Some(key);
+        } else if !press
+            && state
+                .ime_press
+                .is_some_and(|pending| pending.detail == key.detail)
+        {
+            // WARNING: the input method can take a key without any answer, like a key that switches its mode, so a
+            // press waits for its change only until the key comes up. A later change is not that key's.
+            state.ime_press = None;
+        }
     }
 
     fn update_ime_position(&self, callbacks: Callbacks) {
@@ -566,6 +611,11 @@ impl Client {
     fn reset_ime(&self) {
         let mut state = self.state.borrow_mut();
         state.composing = false;
+        state.ime_press = None;
+        state.pre_edit = None;
+        if let Some(compose) = &mut state.compose {
+            compose.reset();
+        }
         if let Some((xim, handler)) = &mut state.xim {
             let _ = xim.reset_ic(handler.im_id, handler.ic_id);
         }
@@ -638,13 +688,9 @@ impl Client {
                     }
                     state.keyboard_focus = None;
                     state.pressed.clear();
-                    if let Some(compose) = &mut state.compose {
-                        compose.reset();
-                    }
-                    state.pre_edit = None;
                 }
+                // WARNING: like Chrome, the page ends its composition and keeps the text when the window goes.
                 self.reset_ime();
-                Ime::Clear.apply(window.callbacks);
                 window.set_active(false);
             }
             Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
@@ -699,20 +745,20 @@ impl Client {
                 if !held {
                     state.pressed.push(event.detail);
                 }
-                let ime = match state.compose.take() {
+                let (commit, ime) = match state.compose.take() {
                     Some(mut composer) => {
                         let ime =
                             compose(&mut composer, &mut state.pre_edit, keysym, &mut keystroke);
                         state.compose = Some(composer);
                         ime
                     }
-                    None => Vec::new(),
+                    None => (None, Vec::new()),
                 };
                 drop(state);
-                for ime in ime {
-                    ime.apply(window.callbacks);
+                if let Some(text) = commit {
+                    Ime::Commit(text).apply(window.callbacks);
                 }
-                key_down(window.callbacks, keystroke, held);
+                key_down(window.callbacks, keystroke, held, ime);
             }
             Event::KeyRelease(event) => {
                 let window = self.window(event.event)?;
@@ -727,9 +773,7 @@ impl Client {
                 }
                 let keystroke = keystroke_from_xkb(&key_state, modifiers, code);
                 drop(state);
-                window
-                    .callbacks
-                    .input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+                key_up(window.callbacks, keystroke);
             }
             Event::XinputButtonPress(event) => {
                 let window = self.window(event.event)?;
