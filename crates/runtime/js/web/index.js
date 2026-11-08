@@ -253,15 +253,23 @@ globalThis.__appsWeb = (call, codec) => {
     get() { return urls.get(this).data[key]; },
     set(value) { const state = urls.get(this); state.data = parseURL(state.data.href, null, key, String(value)); if ((key === 'search' || key === 'href') && state.searchParams) params.get(state.searchParams).list = call('web.params.parse', state.data.search.slice(1)); },
   });
+  // WARNING: like Node's entropy cache, small requests take unused bytes of a 4 KB block of OS randomness, so they make
+  // no host call. No byte is handed out twice, and the block never leaves this scope.
+  let entropy = new Uint8Array(0), entropyAt = 0;
+  const random = size => {
+    if (size > 256) return decodeBytes(call('web.random', size));
+    if (entropyAt + size > entropy.length) { entropy = decodeBytes(call('web.random', 4096)); entropyAt = 0; }
+    return entropy.subarray(entropyAt, entropyAt += size);
+  };
   const crypto = globalThis.__appsCrypto(call, encodeBytes, decodeBytes, {
     getRandomValues(array) {
       if (!ArrayBuffer.isView(array) || array instanceof DataView || array instanceof Float32Array || array instanceof Float64Array || (typeof Float16Array !== 'undefined' && array instanceof Float16Array)) throw new DOMException('Expected an integer typed array', 'TypeMismatchError');
       if (array.byteLength > 65536) throw new DOMException('Random byte quota exceeded', 'QuotaExceededError');
-      bytes(array).set(decodeBytes(call('web.random', array.byteLength))); return array;
+      bytes(array).set(random(array.byteLength)); return array;
     },
     randomUUID() {
-      const values = decodeBytes(call('web.random', 16)); values[6] = (values[6] & 15) | 64; values[8] = (values[8] & 63) | 128;
-      const hex = Array.from(values, value => value.toString(16).padStart(2, '0')).join('');
+      const values = random(16); values[6] = (values[6] & 15) | 64; values[8] = (values[8] & 63) | 128;
+      const hex = values.toHex();
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     },
     subtle: Object.freeze({

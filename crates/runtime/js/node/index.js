@@ -400,8 +400,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const options = value => typeof value === 'string' ? { encoding: value } : value ?? {};
   const kind = Symbol('type'), S = constants.fs;
   const typed = proto => Object.assign(proto, { isFile() { return this[kind]() === S.S_IFREG; }, isDirectory() { return this[kind]() === S.S_IFDIR; }, isSymbolicLink() { return this[kind]() === S.S_IFLNK; }, isBlockDevice() { return this[kind]() === S.S_IFBLK; }, isCharacterDevice() { return this[kind]() === S.S_IFCHR; }, isFIFO() { return this[kind]() === S.S_IFIFO; }, isSocket() { return this[kind]() === S.S_IFSOCK; } });
+  const statFields = ['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'rdev', 'size', 'blksize', 'blocks', 'atimeMs', 'mtimeMs', 'ctimeMs', 'birthtimeMs'];
   class Stats {
-    constructor(value) { Object.assign(this, value); this.birthtimeMs ??= this.ctimeMs; }
+    constructor(value) { for (let i = 0; i < 14; i++) this[statFields[i]] = value[i]; this.birthtimeMs ??= this.ctimeMs; }
     [kind]() { return this.mode & S.S_IFMT; }
   }
   for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) Object.defineProperty(Stats.prototype, name, { configurable: true, get() { return this[name] = new Date(this[name + 'Ms']); }, set(value) { Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true }); } });
@@ -639,7 +640,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const polls = new Map();
   files.watchFile = (value, o, listener) => {
     if (typeof o === 'function') { listener = o; o = {}; }
-    const file = pathArg(value), current = () => files.statSync(file, { throwIfNoEntry: false }) ?? new Stats({ dev: 0, ino: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, size: 0, blksize: 0, blocks: 0, atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0 });
+    const file = pathArg(value), current = () => files.statSync(file, { throwIfNoEntry: false }) ?? new Stats(new Array(14).fill(0));
     let entry = polls.get(file);
     if (!entry) {
       entry = Object.assign(new EventEmitter(), { previous: current(), ref() { return this; }, unref() { return this; } });

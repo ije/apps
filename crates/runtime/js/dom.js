@@ -79,6 +79,7 @@
     records[id] = new Record(id, tag, text); op(0, id, tag, text); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
   };
   const load = list => {
+    version++;
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
       if (end > i + 5) { rec.attrs = new Attrs(list.slice(i + 5, end)); const id = rec.attrs.get('id'); if (id) idAdd(id, rec); }
@@ -92,6 +93,7 @@
     const lists = [], seen = new Set();
     for (const rec of records) if (rec && !rec.up) try { lists.push(host('dom.tree', rec.id)); } catch {}
     if (!lists.length) return;
+    version++;
     for (const rec of records) if (rec?.kids.length) rec.kids = [];
     ids.clear();
     for (const list of lists) {
@@ -107,6 +109,10 @@
     for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
   };
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
+  // WARNING: loops like `for (i < el.children.length) el.children[i]` read a list per step, so the last list stays until the
+  // next DOM change. Only one is kept, because a list holds the wrappers of its nodes, which keep removed nodes alive.
+  const listCache = { nodes: [null, null, -1], elements: [null, null, -1] };
+  const cachedList = (cache, rec, make) => { if (cache[0] !== rec || cache[1] !== rec.kids || cache[2] !== version) { cache[0] = rec; cache[1] = rec.kids; cache[2] = version; cache[3] = make(); } return cache[3]; };
   // WARNING: an id maps to its record, or to a list of them when elements share it. Lookups check that a record is current and in the tree, so stale entries cost nothing.
   const ids = new Map();
   const idAdd = (id, rec) => { const at = ids.get(id); if (!at) ids.set(id, rec); else if (Array.isArray(at)) { if (!at.includes(rec)) at.push(rec); } else if (at !== rec) ids.set(id, [at, rec]); };
@@ -115,7 +121,7 @@
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
-  const detach = rec => { if (rec.kids.length) { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; } rec.text = ''; };
+  const detach = rec => { version++; if (rec.kids.length) { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; } rec.text = ''; };
   // WARNING: wrappers hold their wrapped parent and children so that listeners and expandos live as long as their tree.
   const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
   const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
@@ -461,7 +467,7 @@
     get parentNode() { return of(this._m.up); }
     get parentElement() { const up = this._m.up; return up && up.tag[0] !== '#' ? of(up) : null; }
     get assignedSlot() { const slot = assignedSlot(this); return slot?.getRootNode().mode === 'closed' ? null : slot; }
-    get childNodes() { return listOf(NodeList, this._m.kids.map(of)); }
+    get childNodes() { return cachedList(listCache.nodes, this._m, () => listOf(NodeList, this._m.kids.map(of))); }
     get firstChild() { return of(this._m.kids[0]); }
     get lastChild() { const kids = this._m.kids; return of(kids[kids.length - 1]); }
     get nextSibling() { const rec = this._m; if (!rec.up) return null; const next = rec.up.kids[index(rec) + 1]; if (next) next.i = rec.i + 1; return of(next); }
@@ -1761,8 +1767,8 @@
   }
   DocumentFragment.prototype.getElementById = Document.prototype.getElementById;
   class ParentNode {
-    get children() { return listOf(HTMLCollection, this._m.kids.filter(rec => rec.tag[0] !== '#').map(of)); }
-    get childElementCount() { return this._m.kids.filter(rec => rec.tag[0] !== '#').length; }
+    get children() { return cachedList(listCache.elements, this._m, () => listOf(HTMLCollection, this._m.kids.filter(rec => rec.tag[0] !== '#').map(of))); }
+    get childElementCount() { return this.children.length; }
     get firstElementChild() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
     get lastElementChild() { return of(this._m.kids.findLast(rec => rec.tag[0] !== '#')); }
     append(...children) { insertNodes(this, convert(children), null); }

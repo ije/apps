@@ -38,6 +38,7 @@ fn kind(ty: fs::FileType) -> u32 {
     }
 }
 
+// WARNING: a flat list of numbers becomes JavaScript values directly, without JSON. `Stats` in node/index.js reads this order.
 fn stat(meta: &fs::Metadata) -> Value {
     let ms = |time: std::io::Result<SystemTime>| {
         time.ok().map(|time| match time.duration_since(UNIX_EPOCH) {
@@ -49,7 +50,22 @@ fn stat(meta: &fs::Metadata) -> Value {
     {
         use std::os::unix::fs::MetadataExt;
         let time = |seconds: i64, nanos: i64| seconds as f64 * 1000. + nanos as f64 / 1e6;
-        json!({"dev":meta.dev(),"ino":meta.ino(),"mode":meta.mode(),"nlink":meta.nlink(),"uid":meta.uid(),"gid":meta.gid(),"rdev":meta.rdev(),"size":meta.size(),"blksize":meta.blksize(),"blocks":meta.blocks(),"atimeMs":time(meta.atime(),meta.atime_nsec()),"mtimeMs":time(meta.mtime(),meta.mtime_nsec()),"ctimeMs":time(meta.ctime(),meta.ctime_nsec()),"birthtimeMs":ms(meta.created())})
+        json!([
+            meta.dev(),
+            meta.ino(),
+            meta.mode(),
+            meta.nlink(),
+            meta.uid(),
+            meta.gid(),
+            meta.rdev(),
+            meta.size(),
+            meta.blksize(),
+            meta.blocks(),
+            time(meta.atime(), meta.atime_nsec()),
+            time(meta.mtime(), meta.mtime_nsec()),
+            time(meta.ctime(), meta.ctime_nsec()),
+            ms(meta.created())
+        ])
     }
     #[cfg(not(unix))]
     {
@@ -59,7 +75,22 @@ fn stat(meta: &fs::Metadata) -> Value {
             } else {
                 0o666
             };
-        json!({"dev":0,"ino":0,"mode":mode,"nlink":1,"uid":0,"gid":0,"rdev":0,"size":meta.len(),"blksize":4096,"blocks":meta.len().div_ceil(512),"atimeMs":ms(meta.accessed()),"mtimeMs":ms(meta.modified()),"ctimeMs":ms(meta.modified()),"birthtimeMs":ms(meta.created())})
+        json!([
+            0,
+            0,
+            mode,
+            1,
+            0,
+            0,
+            0,
+            meta.len(),
+            4096,
+            meta.len().div_ceil(512),
+            ms(meta.accessed()),
+            ms(meta.modified()),
+            ms(meta.modified()),
+            ms(meta.created())
+        ])
     }
 }
 
@@ -225,7 +256,8 @@ impl Files {
                         let ty = entry.file_type()?;
                         entries.push((directory.join(entry.file_name()), kind(ty)));
                     }
-                    entries[start..].sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    // WARNING: names in one directory have no separator, so byte order is path order, and much cheaper.
+                    entries[start..].sort_unstable_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
                     if recursive {
                         directories.extend(
                             entries[start..]
