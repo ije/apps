@@ -75,7 +75,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
     if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas))) throw new DOMException('Only ArrayBuffer, ImageBitmap and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
-  // WARNING: native calls pin the bytes they read, so messages send moved or copied buffers and never the caller's own.
+  // WARNING: messages send moved or copied buffers and never the caller's own, because a worker that hasn't started yet gets them later, after the caller may have changed them.
   const message = (value, options) => {
     const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers, transfer));
     const wire = [text, ...buffers.map(buffer => new Uint8Array(fresh.has(buffer) ? buffer : transfer.includes(buffer) ? buffer.transfer() : buffer.slice(0)))];

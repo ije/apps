@@ -1108,8 +1108,11 @@ pub fn call(
         if op == "dom.properties" {
             return Ok(json!(style::Prop::names()));
         }
+        // WARNING: a flat list of name, value and priority becomes JavaScript strings directly, without JSON.
         if op == "dom.declare" {
-            return Ok(json!(style::declare(args[0].as_str().unwrap_or_default())));
+            return Ok(json!(
+                style::declare(args[0].as_str().unwrap_or_default()).concat()
+            ));
         }
         if matches!(
             op,

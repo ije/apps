@@ -437,21 +437,23 @@
     get(list, key, receiver) { const i = tokenIndex(key); return i < 0 ? Reflect.get(list, key, receiver) : tokens(list)[i]; },
     has(list, key) { const i = tokenIndex(key); return i < 0 ? Reflect.has(list, key) : i < tokens(list).length; },
   };
+  // WARNING: methods run with the proxy as `this`, so they look up the list once instead of trapping each field read.
+  const rawLists = new WeakMap(), rawList = list => rawLists.get(list) ?? list;
   class DOMTokenList {
-    constructor(element, name) { this._element = element; this._name = name; this._source = null; this._tokens = null; return new Proxy(this, indexed); }
-    get value() { return this._element.getAttribute(this._name) ?? ''; } set value(value) { this._element.setAttribute(this._name, value); }
-    get length() { return tokens(this).length; }
-    item(index) { return tokens(this)[index] ?? null; }
-    contains(value) { return tokens(this).includes(String(value)); }
+    constructor(element, name) { this._element = element; this._name = name; this._source = null; this._tokens = null; const proxy = new Proxy(this, indexed); rawLists.set(proxy, this); return proxy; }
+    get value() { const list = rawList(this); return list._element.getAttribute(list._name) ?? ''; } set value(value) { const list = rawList(this); list._element.setAttribute(list._name, value); }
+    get length() { return tokens(rawList(this)).length; }
+    item(index) { return tokens(rawList(this))[index] ?? null; }
+    contains(value) { return tokens(rawList(this)).includes(String(value)); }
     // WARNING: like the DOM's update steps, an empty set doesn't add a missing attribute.
-    add(...values) { const list = tokens(this).slice(); for (const value of values.map(token)) if (!list.includes(value)) list.push(value); if (list.length || this._element.hasAttribute(this._name)) this.value = list.join(' '); }
-    remove(...values) { values = values.map(token); const list = tokens(this).filter(value => !values.includes(value)); if (list.length || this._element.hasAttribute(this._name)) this.value = list.join(' '); }
-    toggle(value, force) { value = token(value); const add = force === undefined ? !this.contains(value) : !!force; if (add) this.add(value); else this.remove(value); return add; }
-    replace(old, value) { old = token(old); value = token(value); const list = tokens(this).slice(), index = list.indexOf(old); if (index < 0) return false; list[index] = value; this.value = [...new Set(list)].join(' '); return true; }
+    add(...values) { const list = rawList(this), next = tokens(list).slice(); for (const value of values.map(token)) if (!next.includes(value)) next.push(value); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
+    remove(...values) { const list = rawList(this); values = values.map(token); const next = tokens(list).filter(value => !values.includes(value)); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
+    toggle(value, force) { const list = rawList(this); value = token(value); const add = force === undefined ? !list.contains(value) : !!force; if (add) list.add(value); else list.remove(value); return add; }
+    replace(old, value) { const list = rawList(this); old = token(old); value = token(value); const next = tokens(list).slice(), index = next.indexOf(old); if (index < 0) return false; next[index] = value; list.value = [...new Set(next)].join(' '); return true; }
     supports() { return true; }
-    forEach(fn, thisArg) { tokens(this).forEach((value, index) => fn.call(thisArg, value, index, this)); }
-    keys() { return tokens(this).keys(); } values() { return tokens(this).values(); } entries() { return tokens(this).entries(); } [Symbol.iterator]() { return this.values(); }
-    toString() { return this.value; }
+    forEach(fn, thisArg) { tokens(rawList(this)).forEach((value, index) => fn.call(thisArg, value, index, this)); }
+    keys() { return tokens(rawList(this)).keys(); } values() { return tokens(rawList(this)).values(); } entries() { return tokens(rawList(this)).entries(); } [Symbol.iterator]() { return this.values(); }
+    toString() { return rawList(this).value; }
   }
   class Node {
     constructor(id, tag) { const rec = this._m = records[id]; this._id = id; this._held = null; this._parent = null; this._slot = 0; rec.ref = new WeakRef(this); wrapped.push(rec); registered.push(id); this.nodeType = types[tag] ?? 1; this.nodeName = names.get(tag) ?? (tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
@@ -611,12 +613,20 @@
     || /^(\+\/\/silmaril\/\/dtd html pro v0r11 19970101\/\/|-\/\/(as|advasoft ltd)\/\/dtd html 3\.0 aswedit \+ extensions\/\/|-\/\/ietf\/\/dtd html|-\/\/metrius\/\/dtd metrius presentational\/\/|-\/\/microsoft\/\/dtd internet explorer [23]\.0|-\/\/netscape comm\. corp\.\/\/dtd|-\/\/o'reilly and associates\/\/dtd html|-\/\/softquad|-\/\/spyglass\/\/dtd html 2\.0 extended\/\/|-\/\/sq\/\/dtd html 2\.0 hotmetal \+ extensions\/\/|-\/\/sun microsystems corp\.\/\/dtd hotjava|-\/\/w3c\/\/dtd html (3|4\.0 (frameset|transitional)|experimental)|-\/\/w3c\/\/dtd w3 html\/\/|-\/\/w3o\/\/dtd w3 html 3\.0\/\/|-\/\/webtechs\/\/dtd mozilla html)/i.test(doctype.publicId)
     || !doctype.systemId && /^-\/\/w3c\/\/dtd html 4\.01 (frameset|transitional)\/\//i.test(doctype.publicId);
   const cssName = name => String(name).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
-  const styleName = name => { name = String(name); if (name.startsWith('--')) return name; if (name === 'cssFloat') return 'float'; return name.replace(/^(webkit|moz|ms)(?=[A-Z])/, '-$1').replace(/^(Webkit|Moz|Ms)(?=[A-Z])/, prefix => '-' + prefix.toLowerCase()).replace(/[A-Z]/g, c => '-' + c.toLowerCase()); };
+  const styleNames = new Map();
+  const styleName = name => {
+    name = String(name);
+    let css = styleNames.get(name);
+    if (css !== undefined) return css;
+    css = name.startsWith('--') ? name : name === 'cssFloat' ? 'float' : name.replace(/^(webkit|moz|ms)(?=[A-Z])/, '-$1').replace(/^(Webkit|Moz|Ms)(?=[A-Z])/, prefix => '-' + prefix.toLowerCase()).replace(/[A-Z]/g, c => '-' + c.toLowerCase());
+    if (styleNames.size < 4096) styleNames.set(name, css);
+    return css;
+  };
   let cssProperties = null;
   const cssProperty = name => (cssProperties ??= new Set(call('dom.properties'))).has(name) || name === 'float';
   const cssKeys = () => { const names = [...(cssProperties ??= new Set(call('dom.properties')))]; return [...new Set([...names, ...names.map(name => name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, c) => c.toUpperCase()))])]; };
   const declared = new Map();
-  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); declared.set(text, list = /\S/.test(text) ? call('dom.declare', text) : []); } return list.map(entry => entry.slice()); };
+  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? call('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
   const sides = (prefix, suffix = '') => ['top', 'right', 'bottom', 'left'].map(side => prefix + side + suffix);
   const shorthands = Object.entries({
     border: [...sides('border-', '-width'), ...sides('border-', '-style'), ...sides('border-', '-color')], 'border-width': sides('border-', '-width'), 'border-style': sides('border-', '-style'), 'border-color': sides('border-', '-color'),
@@ -625,6 +635,8 @@
     gap: ['row-gap', 'column-gap'], overflow: ['overflow-x', 'overflow-y'], 'overscroll-behavior': ['overscroll-behavior-x', 'overscroll-behavior-y'], 'flex-flow': ['flex-direction', 'flex-wrap'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'], 'place-content': ['align-content', 'justify-content'], 'place-items': ['align-items', 'justify-items'], 'place-self': ['align-self', 'justify-self'],
     'text-decoration': ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'], 'list-style': ['list-style-type', 'list-style-position', 'list-style-image'], outline: ['outline-width', 'outline-style', 'outline-color'], container: ['container-name', 'container-type'],
   });
+  const shorthandsOf = new Map();
+  for (const entry of shorthands) for (const part of entry[1]) shorthandsOf.set(part, [...shorthandsOf.get(part) ?? [], entry]);
   const shorthandValue = (name, values) => {
     if (name === 'border') { const groups = [0, 1, 2, 3].map(side => [values[side], values[side + 4], values[side + 8]]); return groups.every(group => group.join() === groups[0].join()) ? shorthandValue('border-top', groups[0]) : ''; }
     if (values.length === 4 && name !== 'text-decoration') { const [top, right, bottom, left] = values; return left !== right ? values.join(' ') : top !== bottom ? `${top} ${right} ${bottom}` : top !== right ? `${top} ${right}` : top; }
@@ -638,8 +650,8 @@
     for (const [name, , priority] of list) {
       if (done.has(name)) continue;
       let text = '';
-      for (const [shorthand, parts] of shorthands) {
-        if (!parts.includes(name) || parts.some(part => done.has(part))) continue;
+      for (const [shorthand, parts] of shorthandsOf.get(name) ?? []) {
+        if (parts.some(part => done.has(part))) continue;
         const entries = parts.map(part => list.findLast(entry => entry[0] === part));
         if (entries.some(entry => !entry || entry[2] !== priority)) continue;
         const merged = shorthandValue(shorthand, entries.map(entry => entry[1]));
@@ -677,15 +689,18 @@
       return parts.every(part => list.findLast(entry => entry[0] === part)?.[2] === 'important') ? 'important' : '';
     }
     setProperty(name, value, priority = '') {
-      if (this._owner.computed) readOnly();
+      const owner = this._owner;
+      if (owner.computed) readOnly();
       name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
       value = value == null ? '' : String(value).trim(); priority = String(priority ?? '').toLowerCase();
       if (value === '') { this.removeProperty(name); return; }
       if (priority && priority !== 'important') return;
-      const added = this._owner.raw || name.startsWith('--') ? [[name, value, priority]] : declare(name + ':' + value + (priority ? ' !important' : ''));
+      const added = owner.raw || name.startsWith('--') ? [[name, value, priority]] : declare(name + ':' + value + (priority ? ' !important' : ''));
       if (!added.length) return;
+      const list = owner.read();
+      if (added.length === 1) { owner.write([...list.filter(entry => entry[0] !== added[0][0]), added[0]]); return; }
       const names = new Set(added.map(entry => entry[0]));
-      this._owner.write([...this._list.filter(entry => !names.has(entry[0])), ...added]);
+      owner.write([...list.filter(entry => !names.has(entry[0])), ...added]);
     }
     removeProperty(name) {
       if (this._owner.computed) readOnly();
@@ -697,7 +712,7 @@
     get cssText() { return this._owner.computed ? '' : declarationText(this._list); }
     set cssText(value) { if (this._owner.computed) readOnly(); this._owner.write(this._owner.raw ? String(value).split(';').flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim(), '']] : []; }) : declare(String(value))); }
   }
-  const styleKey = key => typeof key === 'string' && !/^\d+$/.test(key);
+  const styleKey = key => typeof key === 'string' && !(key.charCodeAt(0) <= 57 && /^\d+$/.test(key));
   const declaration = owner => new Proxy(new CSSStyleDeclaration(owner), {
     get: (target, key) => typeof key !== 'string' || key in target ? Reflect.get(target, key) : /^\d+$/.test(key) ? target.item(Number(key)) : target.getPropertyValue(styleName(key)),
     set: (target, key, value) => { if (typeof key !== 'string' || key in target) return Reflect.set(target, key, value); if (styleKey(key)) target.setProperty(styleName(key), value); return true; },
@@ -729,7 +744,12 @@
     toggleAttribute(name, force) { const present = force ?? !this.hasAttribute(name); if (present) this.setAttribute(name, ''); else this.removeAttribute(name); return present; }
     getAttributeNode(name) { name = attrName(this, name); return this._m.attrs.has(name) ? new Attr(this, name, this._m.attrs.get(name)) : null; }
     removeAttributeNode(attr) { if (!(attr instanceof Attr) || attr.ownerElement !== this || !this._m.attrs.has(attr.name)) throw new DOMException('The attribute is not on this element', 'NotFoundError'); attr._value = this._m.attrs.get(attr.name); this.removeAttribute(attr.name); attr.ownerElement = null; return attr; }
-    get style() { return this._style ??= declaration({ read: () => declare(this.getAttribute('style') ?? ''), write: list => { const value = declarationText(list); declared.set(value, list.map(entry => entry.slice())); this.setAttribute('style', value); } }); }
+    get style() {
+      if (this._style) return this._style;
+      // WARNING: the parsed list is shared, not copied, so declaration code must never change its entries.
+      let text = null, list = [];
+      return this._style = declaration({ read: () => { const now = this.getAttribute('style') ?? ''; if (now !== text) { text = now; list = declare(now); } return list; }, write: next => { text = declarationText(next); list = next; this.setAttribute('style', text); } });
+    }
     set style(value) { this.style.cssText = value; }
     get innerHTML() { return this._m.kids.map(serialize).join('') || own(this._m); }
     set innerHTML(value) { setHTML(this, value); }

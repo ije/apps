@@ -6,14 +6,35 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const peer=role=>role==='main'?'main':typeof role==='object'&&role!==null?'preload'in role?'preload:'+role.preload:'renderer'in role?'renderer:'+role.renderer:null:null;
   const send=(target,message)=>call('bridge.dispatch',target,message);
   const uncloneable=()=>{throw new Error('An object could not be cloned.');};
+  const jsonEncoder=new TextEncoder(),jsonDecoder=new TextDecoder();
   const capability=(action,target,once)=>{const id=random();functions.set(id,{action,recipient:peer(target),persistent:!once,once});return id;};
+  // WARNING: plain data crosses as JSON, which keeps it exactly: finite numbers but -0, no undefined, no holes, plain
+  // prototypes and no object twice. Everything else takes the structured clone encoding below.
+  let floats=false;
+  const plain=(value,seen)=>{
+    if(value===null||typeof value==='string'||typeof value==='boolean')return true;
+    if(typeof value==='number'){if(!Number.isSafeInteger(value))floats=true;return Number.isFinite(value)&&!Object.is(value,-0);}
+    if(typeof value!=='object'||seen.has(value))return false;
+    seen.add(value);
+    if(Array.isArray(value)){if(Object.getPrototypeOf(value)!==Array.prototype)return false;for(let i=0;i<value.length;i++)if(!(i in value)||!plain(value[i],seen))return false;return true;}
+    const proto=Object.getPrototypeOf(value);
+    if(proto!==Object.prototype&&proto!==null)return false;
+    for(const key in value)if(!plain(value[key],seen))return false;
+    return true;
+  };
   // WARNING: IPC payloads follow structured clone, so functions and promises only cross in contextBridge values (`strict` false).
   const encode=(value,target,strict=true,persistent=false,seen=new Map())=>{
+    // WARNING: Rust forwards bytes without parsing them, and its JSON parser can change the last bit of a float, so
+    // plain data with floats or of more than 4 KB goes as UTF-8 JSON, and other numbers that are not safe integers go as text.
+    if(!seen.size&&(typeof value==='object'&&value!==null||typeof value==='string')){
+      floats=false;
+      if(plain(value,new Set())){const text=JSON.stringify(value);return floats||text.length>4096?{type:'json',value:jsonEncoder.encode(text)}:{type:'json',value};}
+    }
     const next=v=>encode(v,target,strict,persistent,seen);
     if(typeof value==='function'){if(strict)uncloneable();const recipient=peer(target);if(!recipient)throw new TypeError('Invalid bridge target');let ids=functionIds.get(value);if(!ids){ids=new Map();functionIds.set(value,ids);}let id=ids.get(recipient);if(!functions.has(id)){id=random();functions.set(id,{action:value,recipient,persistent});ids.set(recipient,id);}else if(persistent)functions.get(id).persistent=true;return{type:'function',id};}
     if(value===undefined)return{type:'undefined'};
     if(typeof value==='bigint')return{type:'bigint',value:String(value)};
-    if(typeof value==='number'&&(!Number.isFinite(value)||Object.is(value,-0)))return{type:'number',value:Object.is(value,-0)?'-0':String(value)};
+    if(typeof value==='number'&&!Number.isSafeInteger(value)||Object.is(value,-0))return{type:'number',value:Object.is(value,-0)?'-0':String(value)};
     if(typeof value==='symbol')uncloneable();
     if(value===null||typeof value!=='object')return{type:'value',value};
     if(seen.has(value))return{type:'reference',id:seen.get(value)};
@@ -34,6 +55,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(value.type==='undefined')return undefined;
     if(value.type==='bigint')return BigInt(value.value);
     if(value.type==='number')return Number(value.value);
+    if(value.type==='json')return value.value instanceof Uint8Array?JSON.parse(jsonDecoder.decode(value.value)):value.value;
     if(value.type==='value')return value.value;
     if(value.type==='reference')return seen.get(value.id);
     let result;

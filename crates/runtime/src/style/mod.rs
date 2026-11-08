@@ -7162,9 +7162,10 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
                 let kind = kind.trim();
                 let value = value.trim();
                 let units = Lengths::new(16., 100., 100.);
-                let math = units.math(value, f32::NAN, &[]);
+                // WARNING: only numbers and angles need the math parse, so keywords and functions skip it.
+                let math = || units.math(value, f32::NAN, &[]);
                 let number = |integer: bool| {
-                    math.is_some_and(|(n, kind)| {
+                    math().is_some_and(|(n, kind)| {
                         kind == parser::Kind::Number && (!integer || n.fract() == 0.)
                     })
                 };
@@ -7176,7 +7177,7 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
                     "<length-percentage>" => units.resolve(value, 100.).is_some(),
                     "<number>" => number(false),
                     "<integer>" => number(true),
-                    "<angle>" => math.is_some_and(|(_, kind)| kind == parser::Kind::Angle),
+                    "<angle>" => math().is_some_and(|(_, kind)| kind == parser::Kind::Angle),
                     "<time>" => value
                         .strip_suffix("ms")
                         .or_else(|| value.strip_suffix('s'))
