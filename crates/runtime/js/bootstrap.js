@@ -28,6 +28,8 @@
   const nested = (value, depth) => {
     if (value === null || typeof value !== 'object') return false;
     if (depth > 32 || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+    // WARNING: `for in` makes a string key per array index, which cost 14x more on a WebGPU frame's command list.
+    if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (nested(value[i], depth + 1)) return true; return false; }
     for (const key in value) if (nested(value[key], depth + 1)) return true;
     return false;
   };
