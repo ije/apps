@@ -3,6 +3,7 @@
   "productName": "React",
   "private": true,
   "main": "main.ts",
+  "features": ["reactCompiler"],
   "scripts": {
     "dev": "apps run --watch",
     "build": "apps build"

@@ -21,6 +21,8 @@ oxc_ast_visit = "=0.155.0"
 oxc_codegen = "=0.155.0"
 oxc_minifier = "=0.155.0"
 oxc_parser = { version = "=0.155.0", default-features = false }
+# WARNING: crates.io stops at 0.143.0, so this tag must match the oxc version above. See the patch in the root Cargo.toml.
+oxc_react_compiler = { git = "https://github.com/oxc-project/oxc", tag = "crates_v0.155.0" }
 oxc_semantic = "=0.155.0"
 oxc_sourcemap = "=9.0.0"
 oxc_span = "=0.155.0"

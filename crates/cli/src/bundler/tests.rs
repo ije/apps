@@ -135,6 +135,63 @@ fn oxc_transforms_typescript_and_export_declarations() {
 }
 
 #[test]
+fn react_compiler_memoizes_page_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let react = dir.path().join("node_modules/react");
+    fs::create_dir_all(&react).unwrap();
+    fs::write(react.join("package.json"), r#"{"main":"index.js"}"#).unwrap();
+    fs::write(react.join("index.js"), "").unwrap();
+    fs::write(react.join("compiler-runtime.js"), "let cache; exports.c = size => cache ??= new Array(size).fill(Symbol.for('react.memo_cache_sentinel'));").unwrap();
+    for name in ["jsx-runtime.js", "jsx-dev-runtime.js"] {
+        fs::write(
+            react.join(name),
+            "exports.jsx = exports.jsxs = exports.jsxDEV = (type, props) => ({type, props});",
+        )
+        .unwrap();
+    }
+    fs::write(
+        react.join("dependency.jsx"),
+        "export function Dependency() { return <i />; }",
+    )
+    .unwrap();
+    let entry = dir.path().join("page.tsx");
+    fs::write(&entry, "import {Dependency} from 'react/dependency.jsx'; function Greeting({name}: {name: string}) { return <b>{name.toUpperCase()}</b>; } const a = Greeting({name: 'x'}); globalThis.result = [a === Greeting({name: 'x'}), a === Greeting({name: 'y'}), Dependency() === Dependency()].join(':');").unwrap();
+    for (features, expected) in [
+        ("[]", "false:false:false"),
+        (r#"["reactCompiler"]"#, "true:false:false"),
+    ] {
+        fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"name":"react_compiler","features":{features}}}"#),
+        )
+        .unwrap();
+        for production in [false, true] {
+            let files = compile(
+                &entry,
+                Realm::Renderer,
+                None,
+                Rc::default(),
+                production,
+                None,
+            )
+            .unwrap();
+            let engine = apps_runtime::jsc::JsContext::new(
+                apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+                Rc::default(),
+                apps_runtime::host::Role::Main,
+            )
+            .unwrap();
+            engine.load_bundle(&files, "test").unwrap();
+            assert_eq!(
+                engine.eval("result", "test").unwrap(),
+                expected,
+                "{features}"
+            );
+        }
+    }
+}
+
+#[test]
 fn linked_imports_stay_live_without_a_with_scope() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

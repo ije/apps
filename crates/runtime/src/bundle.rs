@@ -150,13 +150,14 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
     Ok((name.into(), product_name.into(), version.into(), identifier))
 }
 
-pub const FEATURES: [(&str, bool); 6] = [
+pub const FEATURES: [(&str, bool); 7] = [
     ("webgpu", false),
     ("video", false),
     ("audio", false),
     ("jsExecute", false),
     ("httpImport", false),
     ("localNetwork", false),
+    ("reactCompiler", false),
 ];
 
 pub fn feature_bit(feature: &str) -> u32 {
@@ -667,18 +668,19 @@ mod tests {
     #[test]
     fn package_features_enable_and_disable_in_order() {
         for (features, disabled) in [
-            (None, 63),
-            (Some(json!([])), 63),
-            (Some(json!(["webgpu"])), 62),
+            (None, 127),
+            (Some(json!([])), 127),
+            (Some(json!(["webgpu"])), 126),
             (Some(json!(["*"])), 0),
-            (Some(json!(["-*"])), 63),
+            (Some(json!(["-*"])), 127),
             (Some(json!(["*", "-webgpu"])), 1),
-            (Some(json!(["-*", "webgpu"])), 62),
-            (Some(json!(["webgpu", "-webgpu"])), 63),
-            (Some(json!(["video", "audio"])), 57),
+            (Some(json!(["-*", "webgpu"])), 126),
+            (Some(json!(["webgpu", "-webgpu"])), 127),
+            (Some(json!(["video", "audio"])), 121),
             (Some(json!(["*", "-audio"])), 4),
-            (Some(json!(["jsExecute", "httpImport"])), 39),
-            (Some(json!(["localNetwork"])), 31),
+            (Some(json!(["jsExecute", "httpImport"])), 103),
+            (Some(json!(["localNetwork"])), 95),
+            (Some(json!(["reactCompiler"])), 63),
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(

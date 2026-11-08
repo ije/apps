@@ -12,12 +12,13 @@ use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
 use oxc_minifier::{Minifier, MinifierOptions};
 use oxc_parser::Parser;
+use oxc_react_compiler::{CompileResult, PluginOptions};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_transformer::{TransformOptions, Transformer};
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, VecDeque},
     fmt::Write,
     fs,
@@ -98,6 +99,7 @@ impl Shared {
 pub struct Cache {
     graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
     loaders: RefCell<Option<Rc<Loaders>>>,
+    disabled: Cell<u32>,
     pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
 }
 
@@ -1904,9 +1906,12 @@ impl Builder {
             parsed.diagnostics
         );
         let mut program = parsed.program;
+        let react =
+            self.realm == Realm::Renderer && !dependency && self.shared.enabled("reactCompiler");
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .with_enum_eval(true)
+            .with_build_nodes(react)
             .build(&program);
         ensure!(
             semantic.diagnostics.is_empty(),
@@ -1914,7 +1919,34 @@ impl Builder {
             path.display(),
             semantic.diagnostics
         );
-        let scoping = semantic.semantic.into_scoping();
+        // WARNING: the React Compiler must run on the program as parsed, before any other transform.
+        let compiled = react.then(|| {
+            oxc_react_compiler::compile(
+                &program,
+                &semantic.semantic,
+                &allocator,
+                PluginOptions::default(),
+            )
+        });
+        let mut scoping = semantic.semantic.into_scoping();
+        match compiled {
+            Some(CompileResult::Success {
+                output: Some(output),
+                ..
+            }) => {
+                output.transform(&mut program);
+                scoping = SemanticBuilder::new()
+                    .with_enum_eval(true)
+                    .build(&program)
+                    .semantic
+                    .into_scoping();
+            }
+            Some(CompileResult::Fatal { diagnostics }) => bail!(
+                "Cannot compile React in {}: {diagnostics:?}",
+                path.display()
+            ),
+            _ => {}
+        }
         for name in scoping.symbol_names().chain(
             scoping
                 .root_unresolved_references()
@@ -2558,6 +2590,10 @@ pub fn compile(
                 .graphs
                 .borrow_mut()
                 .retain(|(_, entry), _| entry.ends_with("package.json#loaders"));
+        }
+        // WARNING: cached modules also keep the output of the features that compiled them, like reactCompiler.
+        if cache.disabled.replace(disabled) != disabled {
+            cache.graphs.borrow_mut().clear();
         }
     }
     let shared = Rc::new(Shared {
