@@ -2509,6 +2509,24 @@ pub fn compile(
         })
         .filter(|(_, keys)| !keys.is_empty());
     let disabled = apps_runtime::bundle::disabled_features(package.as_deref())?;
+    // WARNING: compiled components import react/compiler-runtime, which React has since 19. Experimental builds are 0.0.0.
+    if disabled & apps_runtime::bundle::feature_bit("reactCompiler") == 0
+        && let Some(react) = root.ancestors().find_map(|directory| {
+            fs::read_to_string(directory.join("node_modules/react/package.json")).ok()
+        })
+    {
+        let react: Value = serde_json::from_str(&react).context("Invalid React package.json")?;
+        let version = react["version"].as_str().unwrap_or_default();
+        ensure!(
+            version
+                .split('.')
+                .next()
+                .and_then(|major| major.parse::<u32>().ok())
+                .is_some_and(|major| major >= 19)
+                || version.starts_with("0.0.0-"),
+            "The reactCompiler feature needs React 19 or later, but node_modules has React {version}"
+        );
+    }
     let mut loaders = None;
     if let Some(value) = metadata.get("loaders") {
         let mut modules = Vec::new();

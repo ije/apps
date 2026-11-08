@@ -65,7 +65,7 @@ fn metal() {
     let source = "src/platform/macos/shaders.metal";
     println!("cargo::rerun-if-changed={source}");
     if !Command::new("xcrun")
-        .args(["-sdk", "macosx", "-f", "metal"])
+        .args(["-sdk", "macosx", "metal", "--version"])
         .output()
         .is_ok_and(|output| output.status.success())
     {

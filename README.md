@@ -174,7 +174,7 @@ WebGPU, `<video>`, `<audio>`, code from strings and remote imports are off by de
 
 `"name"` enables a feature, `"-name"` disables it, and `"*"` means all features. Entries apply in order.
 The `localNetwork` feature lets pages reach loopback and LAN addresses, for apps with a server in a child process.
-The `reactCompiler` feature runs the [React Compiler](https://react.dev/learn/react-compiler) on page scripts outside `node_modules`, so components and hooks are memoized without `useMemo`. It needs React 19, which has `react/compiler-runtime`.
+The `reactCompiler` feature runs the [React Compiler](https://react.dev/learn/react-compiler) on page scripts outside `node_modules`, so components and hooks are memoized without `useMemo`. It needs React 19 or later, which has `react/compiler-runtime`.
 A disabled feature is not loaded, and its API throws an error when called. On macOS and Windows, WebGPU is a separate library (3.2 MB) that `apps build` copies only for apps that enable it. Linux always includes it, because the renderer uses wgpu.
 
 `jsExecute` lets pages use `eval()`, `new Function()` and `import()` of `data:` and `blob:` URLs. `httpImport` lets apps import `http` and `https` URLs: `apps build` and `apps run` download the imports, `<script src>`, `<link rel="stylesheet">` and CSS `@import` with a string literal URL, and bundle them. Remote files can import other files only by relative or absolute URLs. An `import()` without a string literal stays in the code and loads its URL when it runs. It needs `jsExecute` or `httpImport`.

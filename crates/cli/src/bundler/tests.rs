@@ -139,7 +139,11 @@ fn react_compiler_memoizes_page_components() {
     let dir = tempfile::tempdir().unwrap();
     let react = dir.path().join("node_modules/react");
     fs::create_dir_all(&react).unwrap();
-    fs::write(react.join("package.json"), r#"{"main":"index.js"}"#).unwrap();
+    fs::write(
+        react.join("package.json"),
+        r#"{"main":"index.js","version":"18.3.1"}"#,
+    )
+    .unwrap();
     fs::write(react.join("index.js"), "").unwrap();
     fs::write(react.join("compiler-runtime.js"), "let cache; exports.c = size => cache ??= new Array(size).fill(Symbol.for('react.memo_cache_sentinel'));").unwrap();
     for name in ["jsx-runtime.js", "jsx-dev-runtime.js"] {
@@ -165,6 +169,17 @@ fn react_compiler_memoizes_page_components() {
             format!(r#"{{"name":"react_compiler","features":{features}}}"#),
         )
         .unwrap();
+        if features != "[]" {
+            let error = compile(&entry, Realm::Renderer, None, Rc::default(), false, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("React 18.3.1"), "{error}");
+            fs::write(
+                react.join("package.json"),
+                r#"{"main":"index.js","version":"19.0.0"}"#,
+            )
+            .unwrap();
+        }
         for production in [false, true] {
             let files = compile(
                 &entry,
