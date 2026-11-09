@@ -151,6 +151,9 @@ extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const 
     auto options = AOT::makeDefaultCompileOptions();
     options.admittedCode = AOT::Wire::AdmittedCode::ReplacedBuiltins;
     options.output = AOT::Wire::OutputOptions::RunsInSeveralRealms;
+    // WARNING: narrow references need the cell cage, whose allocator keeps every block resident. The runtime turns the
+    // cage off, which on DiffsHub's stress test keeps about 110 MB less resident.
+    options.target.referenceWidth = AOT::Wire::ReferenceWidth::Wide;
     auto output = AOT::compileProgram({ bytes, size }, options);
     auto image = output->section(AOT::Wire::ResultSection::Image);
     if (image.empty()) {

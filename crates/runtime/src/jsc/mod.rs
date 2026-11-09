@@ -268,11 +268,15 @@ impl JavaScriptCore {
                 // memory of dead cells, like string buffers, stayed until allocation reached their blocks, hundreds
                 // of MB on pages that allocate a lot. A sweep after each collection frees it, in a few ms.
                 std::env::set_var("JSC_sweepSynchronously", "1");
+                // WARNING: AOT images use wide references, which need no cell cage. In the cage, every block that the
+                // heap holds stays resident, about 110 MB more than fastMalloc on DiffsHub's stress test.
+                std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
                 let _ = aot::load(&path);
                 group = Some(group_create());
                 std::env::remove_var("JSC_useSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
                 std::env::remove_var("JSC_sweepSynchronously");
+                std::env::remove_var("JSC_markedBlockCageSizeInMB");
             });
             Ok(Rc::new(Self {
                 aot: aot::load(&path)?,
