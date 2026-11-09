@@ -100,7 +100,6 @@ impl Present {
         Self(Some(super::Sendable::new(Box::new(present))))
     }
 
-    // WARNING: drops the drawables without showing them, so their layers can hand them out again.
     fn discard(mut self) {
         self.0 = None;
     }
@@ -241,8 +240,8 @@ impl Pipelines {
         })
     }
 
-    // WARNING: on Apple GPUs a blit encoder makes the driver hold about 84 MB more until drawing stops, on top of
-    // the 126 MB for render encoders, so copies are draws. `offset` goes from a target pixel to its source pixel.
+    // WARNING: on Apple GPUs any blit encoder makes the driver hold about 84 MB more until drawing stops, so copies are
+    // draws.
     fn copy(
         &self,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -348,7 +347,6 @@ impl Renderer {
         })
     }
 
-    // WARNING: `timing` is the seconds between samples, the times they play and the seconds since the first sample.
     pub fn promote(
         &mut self,
         key: u64,
@@ -391,8 +389,8 @@ impl Renderer {
                     CGSize::new(w, h),
                 ));
                 sublayer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
-                // WARNING: below the caret. A covered caret blinks in the frame, but promotion can't see the
-                // caret, so a layer under it can be promoted.
+                // WARNING: promoted layers go below the caret, since promotion can't see the caret and may promote a
+                // layer under it.
                 self.overlay.insertSublayer_atIndex(&sublayer, 0);
                 self.promoted.push(Promoted {
                     key,
@@ -436,8 +434,6 @@ impl Renderer {
         });
         sublayer.setOpacity(opacities.last().copied().unwrap_or(1.));
         if !transforms.is_empty() {
-            // WARNING: a sublayer turns about its anchor, its top left corner, so the window matrix goes
-            // between moves from and back to that corner.
             let mul = |a: &[f64; 16], b: &[f64; 16]| -> [f64; 16] {
                 std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[i / 4 * 4 + k]).sum())
             };
@@ -519,7 +515,6 @@ impl Renderer {
             f64::from(color.a),
         );
         layer.setBackgroundColor(Some(&srgb));
-        // WARNING: the timeline starts when the caret last moved, so the blink goes on from the frames that drew it.
         let blink = crate::CARET_BLINK.as_secs_f64();
         let animation = CAKeyframeAnimation::animationWithKeyPath(Some(ns_string!("opacity")));
         let values = NSArray::from_retained_slice(&[NSNumber::new_f32(1.), NSNumber::new_f32(0.)]);
@@ -555,8 +550,7 @@ impl Renderer {
         &self.overlay
     }
 
-    // WARNING: sets the size of the next drawables. Only the thread that draws changes it, so a frame always
-    // fits its scene.
+    // WARNING: only the drawing thread may change the drawable size, so a frame always fits its scene.
     pub fn set_drawable_size(&mut self, size: CGSize) {
         self.size = size;
     }
@@ -602,7 +596,6 @@ impl Renderer {
         Some(update)
     }
 
-    // WARNING: the glass views of a dropped frame never showed, so the next frame updates them even without glass.
     pub fn discard(&mut self, present: Present) {
         present.discard();
         self.glass_stale = true;
@@ -617,8 +610,8 @@ impl Renderer {
         self.layer.setOpaque(!transparent);
     }
 
-    // WARNING: frames often stop for a moment, so this frees only tiles that no frame reads anymore. Buffers,
-    // layer textures and spare atlas pages wait for `release`, or each burst of frames would make them again.
+    // WARNING: frames often pause briefly, so this frees only retired tiles. Buffers, layer textures and spare pages
+    // wait for `release`, or each burst of frames makes them again.
     pub fn trim(&mut self) {
         if self.completed.load(Ordering::Acquire) == self.committed {
             self.atlas.free_retired(|| {});
@@ -1279,7 +1272,6 @@ impl Writer {
                 self.current.0.didModifyRange(NSRange::new(0, self.offset));
             }
         }
-        // WARNING: Metal retains encoded buffers until the frame completes; only the last one is pooled.
         self.current
     }
 }
@@ -1464,7 +1456,6 @@ mod tests {
                 list.iter().map(|layer| Retained::as_ptr(&layer)).collect()
             })
         };
-        // A quarter turn about the center of the box at 20, 10 with size 40 x 30, in window points.
         let turn = [
             0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 65., -15., 0., 1.,
         ];

@@ -342,7 +342,6 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
                 let chars_with_both =
                     chars_for_modified_key(native_event.keyCode(), CMD_MOD | SHIFT_MOD);
 
-                // WARNING: skip this when cmd-shift gives the same character as cmd (Norwegian).
                 if chars_with_both != chars_with_cmd {
                     chars_with_shift = chars_with_both;
                 } else if chars_with_cmd.to_ascii_uppercase() != chars_with_cmd {

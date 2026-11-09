@@ -27,7 +27,6 @@ const CHART: f32 = 60.;
 const LINE: f32 = 1.5;
 const COLUMNS: usize = 8;
 
-// WARNING: the page shows through the backdrop, so text colors stay bright to be readable over light pages.
 const BACKGROUND: u32 = 0x0a0c10a6;
 const FOREGROUND: u32 = 0xffffffff;
 const RULE: u32 = 0xffffff59;
@@ -296,7 +295,6 @@ pub unsafe extern "C" fn apps_perfhud_paint(
         &hz.map_or(String::new(), |hz| format!("{hz:.0} Hz")),
     );
     y += ROW;
-    // WARNING: 100% is one busy core, like Activity Monitor and top.
     let cpu = usage.map_or("-".into(), |usage| {
         if usage.cpu < 10. {
             format!("{:.1}%", usage.cpu)

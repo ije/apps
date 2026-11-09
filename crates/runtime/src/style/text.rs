@@ -198,9 +198,7 @@ pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
     })
 }
 
-// WARNING: by style pointer, the runs of its text, one for each units it was built with. An entry holds its style, so
-// the pointer is not reused while it lives, and a run is used only while the font names still give its family, which
-// new fonts renew.
+// WARNING: keyed by style pointer, so the entry must hold its style to keep the pointer from being reused.
 fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextRun {
     type Runs = rustc_hash::FxHashMap<*const Style, (Rc<Style>, Vec<(Lengths, renderer::TextRun)>)>;
     thread_local!(static RUNS: std::cell::RefCell<Runs> = Default::default());
@@ -396,7 +394,6 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
     if !inline(id) {
         return false;
     }
-    // WARNING: the stack allocates only when an inline child holds more children to walk.
     let (mut children, mut stack) = (doc.nodes[id].children.iter(), Vec::new());
     loop {
         let Some(&child) = children.next() else {
@@ -428,9 +425,7 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
     }
 }
 
-// WARNING: whether a node with `style` must be its own box in a paragraph whose box has `parent`, by their values
-// alone. Nodes that cascade alike share one style, so each pair is compared once. An entry holds both styles, so their
-// pointers are not reused while it lives, and entries whose styles only it holds go when the map fills.
+// WARNING: keyed by style pointers, so the entry must hold both styles to keep the pointers from being reused.
 fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
     type Pairs = rustc_hash::FxHashMap<(*const Style, *const Style), (Rc<Style>, Rc<Style>, bool)>;
     thread_local!(static PAIRS: std::cell::RefCell<Pairs> = Default::default());
@@ -756,7 +751,6 @@ pub(crate) fn inline_text(
             run.strikethrough = None;
             run.color = renderer::transparent_black();
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
-            // WARNING: the character only holds the place, and the box's width is its end inset.
             run.font_size = Some(renderer::px(0.01));
             run.inset[0] = renderer::px(opening);
             for (inline, (mark, _)) in boxes.iter_mut().zip(&marks) {

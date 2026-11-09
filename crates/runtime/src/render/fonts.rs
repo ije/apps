@@ -23,7 +23,6 @@ pub(crate) fn sources(src: &str) -> Vec<(&'static str, String)> {
                 hints.split_once(function).is_none_or(|(_, tail)| {
                     let mut items = tail.split(')').next().unwrap_or("").split(',').map(|item| {
                         let item = item.trim().trim_matches(['"', '\'']);
-                        // WARNING: like in browsers, `woff2-variations` and such mean the format with `tech(variations)`.
                         known.contains(&item.strip_suffix("-variations").unwrap_or(item))
                     });
                     if all {
@@ -79,8 +78,6 @@ pub(crate) fn load(
             range.as_ref().filter(|_| pending == Some(None))
         })
         .collect();
-    // WARNING: the characters of the page text are kept while a `unicode-range` face waits, and only text nodes
-    // changed since the last scan are read again. Removed text stays counted.
     let revision = doc.nodes.latest();
     let scanned = ranges.iter().any(Option::is_some) && state.font_text.0 != revision;
     if ranges.iter().all(Option::is_none) {

@@ -32,7 +32,6 @@ pub fn fill_path(
 ) -> Option<()> {
     let fill = path.fill()?;
 
-    // Horizontal and vertical lines cannot be filled. Skip.
     if path.data().bounds().width() == 0.0 || path.data().bounds().height() == 0.0 {
         return None;
     }

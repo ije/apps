@@ -637,7 +637,6 @@ struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) shadow_id: u32,
-    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -724,7 +723,6 @@ struct UnderlineVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) underline_id: u32,
-    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -811,7 +809,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, globals.grayscale_enhanced_contrast, globals.gamma_ratios);
 
-    // WARNING: alpha clip after using the derivatives.
+    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -855,7 +853,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // WARNING: alpha clip after using the derivatives.
+    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }

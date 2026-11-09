@@ -1,5 +1,3 @@
-// WARNING: media elements need FFmpeg from scripts/build-ffmpeg.sh. Without an audio output, audio keeps its time silently.
-
 use apps_runtime::{
     dom::Document,
     host::{Host, Page, Role},
@@ -32,7 +30,8 @@ fn page(disabled: u32) -> (Rc<RefCell<Host>>, JsContext, String) {
     (host, engine, base.to_string())
 }
 
-// WARNING: CoreAudio reads the folder of the executable once per process, and target/debug/deps can make that take seconds.
+// WARNING: CoreAudio reads the executable's folder once per process, and target/debug/deps can make that take seconds,
+// so this wait is long.
 fn wait(engine: &JsContext, ready: &str) -> String {
     for _ in 0..30000 {
         engine.tick().unwrap();

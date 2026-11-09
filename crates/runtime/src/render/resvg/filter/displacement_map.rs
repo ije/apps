@@ -4,16 +4,6 @@
 use super::{ImageRef, ImageRefMut};
 use usvg::filter::{ColorChannel, DisplacementMap};
 
-/// Applies a displacement map.
-///
-/// - `map` pixels should have a **unpremultiplied alpha**.
-/// - `src` pixels can have any alpha method.
-///
-/// `sx` and `sy` indicate canvas scale.
-///
-/// # Panics
-///
-/// When `src`, `map` and `dest` have different sizes.
 pub fn apply(
     fe: &DisplacementMap,
     sx: f32,
@@ -46,8 +36,6 @@ pub fn apply(
         let dy = calc_offset(fe.y_channel_selector());
         let ox = (x as f32 + dx * sx * fe.scale()).round() as i32;
         let oy = (y as f32 + dy * sy * fe.scale()).round() as i32;
-
-        // TODO: we should use some kind of anti-aliasing when offset is on a pixel border
 
         if x < w as u32 && y < h as u32 && ox >= 0 && ox < w && oy >= 0 && oy < h {
             let idx = (oy * w + ox) as usize;

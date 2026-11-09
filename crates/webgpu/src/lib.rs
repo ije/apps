@@ -17,7 +17,7 @@ pub const ABI: u32 = 1;
 
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
-// WARNING: runtime callbacks. Only `wake` and `drop_waker` run on other threads.
+// WARNING: only `wake` and `drop_waker` may be called from other threads.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
@@ -36,7 +36,7 @@ fn host() -> &'static Host {
 
 struct Waker(*mut c_void);
 
-// WARNING: runtime wakers are `Send + Sync`, so wgpu threads can wake the loop with them.
+// SAFETY: runtime wakers are `Send + Sync`, so wgpu threads may wake the loop with them.
 unsafe impl Send for Waker {}
 unsafe impl Sync for Waker {}
 
@@ -483,7 +483,6 @@ impl Gpu {
                                 submission_index: None,
                                 timeout: Some(std::time::Duration::from_millis(1)),
                             };
-                            // WARNING: `Timeout` is the normal result while work is pending.
                             if let Ok(PollStatus::QueueEmpty) = poller.poll(wait) {
                                 break;
                             }
@@ -1584,13 +1583,21 @@ impl Gpu {
                     let view = view?;
                     let row = width as usize * 4;
                     let length = row * height as usize;
-                    // WARNING: the runtime buffer is uninitialized until every byte is written here.
-                    let pixels =
-                        unsafe { std::slice::from_raw_parts_mut(alloc(out, length), length) };
-                    for (source, target) in view.chunks(stride as usize).zip(pixels.chunks_mut(row))
+                    let target = alloc(out, length);
+                    for (index, source) in view
+                        .chunks(stride as usize)
+                        .take(height as usize)
+                        .enumerate()
                     {
-                        target.copy_from_slice(&source[..row]);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                source[..row].as_ptr(),
+                                target.add(index * row),
+                                row,
+                            )
+                        };
                     }
+                    let pixels = unsafe { std::slice::from_raw_parts_mut(target, length) };
                     let rgba = texture.format() == TextureFormat::Rgba8Unorm;
                     let alpha = if canvas.opaque { 0xff00_0000 } else { 0 };
                     if rgba || canvas.opaque {

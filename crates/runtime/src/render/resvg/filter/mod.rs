@@ -18,14 +18,6 @@ mod lighting;
 mod morphology;
 mod turbulence;
 
-// TODO: apply single primitive filters in-place
-
-/// An image reference.
-///
-/// Image pixels should be stored in RGBA order.
-///
-/// Some filters will require premultiplied channels, some not.
-/// See specific filter documentation for details.
 #[derive(Clone, Copy)]
 pub struct ImageRef<'a> {
     data: &'a [RGBA8],
@@ -34,9 +26,6 @@ pub struct ImageRef<'a> {
 }
 
 impl<'a> ImageRef<'a> {
-    /// Creates a new image reference.
-    ///
-    /// Doesn't clone the provided data.
     #[inline]
     pub fn new(width: u32, height: u32, data: &'a [RGBA8]) -> Self {
         ImageRef {
@@ -52,7 +41,6 @@ impl<'a> ImageRef<'a> {
     }
 }
 
-/// A mutable `ImageRef` variant.
 pub struct ImageRefMut<'a> {
     data: &'a mut [RGBA8],
     width: u32,
@@ -60,9 +48,6 @@ pub struct ImageRefMut<'a> {
 }
 
 impl<'a> ImageRefMut<'a> {
-    /// Creates a new mutable image reference.
-    ///
-    /// Doesn't clone the provided data.
     #[inline]
     pub fn new(width: u32, height: u32, data: &'a mut [RGBA8]) -> Self {
         ImageRefMut {
@@ -125,7 +110,6 @@ impl PixmapExt for tiny_skia::Pixmap {
     }
 }
 
-/// Multiplies provided pixels alpha.
 fn multiply_alpha(data: &mut [RGBA8]) {
     for p in data {
         let a = p.a as f32 / 255.0;
@@ -135,7 +119,6 @@ fn multiply_alpha(data: &mut [RGBA8]) {
     }
 }
 
-/// Demultiplies provided pixels alpha.
 fn demultiply_alpha(data: &mut [RGBA8]) {
     for p in data {
         let a = p.a as f32 / 255.0;
@@ -145,19 +128,6 @@ fn demultiply_alpha(data: &mut [RGBA8]) {
     }
 }
 
-/// Precomputed sRGB to LinearRGB table.
-///
-/// Since we are storing the result in `u8`, there is no need to compute those
-/// values each time. Mainly because it's very expensive.
-///
-/// ```text
-/// if (C_srgb <= 0.04045)
-///     C_lin = C_srgb / 12.92;
-///  else
-///     C_lin = pow((C_srgb + 0.055) / 1.055, 2.4);
-/// ```
-///
-/// Thanks to librsvg for the idea.
 #[rustfmt::skip]
 const SRGB_TO_LINEAR_RGB_TABLE: &[u8; 256] = &[
     0,   0,   0,   0,   0,   0,  0,    1,   1,   1,   1,   1,   1,   1,   1,   1,
@@ -178,19 +148,6 @@ const SRGB_TO_LINEAR_RGB_TABLE: &[u8; 256] = &[
     222, 224, 226, 229, 231, 233, 235, 237, 239, 242, 244, 246, 248, 250, 253, 255,
 ];
 
-/// Precomputed LinearRGB to sRGB table.
-///
-/// Since we are storing the result in `u8`, there is no need to compute those
-/// values each time. Mainly because it's very expensive.
-///
-/// ```text
-/// if (C_lin <= 0.0031308)
-///     C_srgb = C_lin * 12.92;
-/// else
-///     C_srgb = 1.055 * pow(C_lin, 1.0 / 2.4) - 0.055;
-/// ```
-///
-/// Thanks to librsvg for the idea.
 #[rustfmt::skip]
 const LINEAR_RGB_TO_SRGB_TABLE: &[u8; 256] = &[
     0,  13,  22,  28,  34,  38,  42,  46,  50,  53,  56,  59,  61,  64,  66,  69,
@@ -211,11 +168,6 @@ const LINEAR_RGB_TO_SRGB_TABLE: &[u8; 256] = &[
     248, 249, 249, 250, 250, 251, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255,
 ];
 
-/// Converts input pixel from sRGB into LinearRGB.
-///
-/// Provided pixels should have an **unpremultiplied alpha**.
-///
-/// RGB channels order of the input image doesn't matter, but alpha channel must be the last one.
 fn into_linear_rgb(data: &mut [RGBA8]) {
     for p in data {
         p.r = SRGB_TO_LINEAR_RGB_TABLE[p.r as usize];
@@ -224,11 +176,6 @@ fn into_linear_rgb(data: &mut [RGBA8]) {
     }
 }
 
-/// Converts input pixel from LinearRGB into sRGB.
-///
-/// Provided pixels should have an **unpremultiplied alpha**.
-///
-/// RGB channels order of the input image doesn't matter, but alpha channel must be the last one.
 fn from_linear_rgb(data: &mut [RGBA8]) {
     for p in data {
         p.r = LINEAR_RGB_TO_SRGB_TABLE[p.r as usize];
@@ -237,7 +184,6 @@ fn from_linear_rgb(data: &mut [RGBA8]) {
     }
 }
 
-// TODO: https://github.com/rust-lang/rust/issues/44095
 #[inline]
 fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
     debug_assert!(min.is_finite());
@@ -255,21 +201,10 @@ fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
 
 #[derive(Clone)]
 struct Image {
-    /// Filter primitive result.
-    ///
-    /// All images have the same size which is equal to the current filter region.
     image: Rc<tiny_skia::Pixmap>,
 
-    /// Image's region that has actual data.
-    ///
-    /// Region is in global coordinates and not in `image` one.
-    ///
-    /// Image's content outside this region will be transparent/cleared.
-    ///
-    /// Currently used only for `feTile`.
     region: IntRect,
 
-    /// The current color space.
     color_space: usvg::filter::ColorInterpolation,
 }
 
@@ -340,7 +275,6 @@ pub fn apply(
     let result = apply_inner(filter, ts, source);
     let result = result.and_then(|image| apply_to_canvas(image, source));
 
-    // Clear on error.
     if result.is_err() {
         source.fill(tiny_skia::Color::TRANSPARENT);
     }
@@ -374,7 +308,6 @@ fn apply_inner(
             .map(|r| r.to_int_rect())
             .ok_or(Error::InvalidRegion)?;
 
-        // `feOffset` inherits its region from the input.
         if let usvg::filter::Kind::Offset(fe) = primitive.kind()
             && let usvg::filter::Input::Reference(name) = fe.input()
             && let Some(res) = results.iter().rev().find(|v| v.name == *name)
@@ -447,11 +380,7 @@ fn apply_inner(
         }?;
 
         if region != subregion {
-            // Clip result.
-
-            // TODO: explain
             let subregion2 = if let usvg::filter::Kind::Offset(..) = primitive.kind() {
-                // We do not support clipping on feOffset.
                 region.translate_to(0, 0)
             } else {
                 subregion.translate(-region.x(), -region.y())
@@ -461,7 +390,6 @@ fn apply_inner(
             let color_space = result.color_space;
 
             let pixmap = {
-                // This is cropping by clearing the pixels outside the region.
                 let mut paint = tiny_skia::Paint::default();
                 paint.set_color(tiny_skia::Color::BLACK);
                 paint.blend_mode = tiny_skia::BlendMode::Clear;
@@ -530,7 +458,6 @@ fn get_input(
         }
         usvg::filter::Input::SourceAlpha => {
             let mut image = source.clone();
-            // Set RGB to black. Keep alpha as is.
             for p in image.data_mut().as_rgba_mut() {
                 p.r = 0;
                 p.g = 0;
@@ -547,7 +474,6 @@ fn get_input(
             if let Some(v) = results.iter().rev().find(|v| v.name == *name) {
                 Ok(v.image.clone())
             } else {
-                // Technically unreachable.
                 log::warn!("Unknown filter primitive reference '{}'.", name);
                 get_input(&usvg::filter::Input::SourceGraphic, region, source, results)
             }
@@ -595,7 +521,6 @@ fn apply_drop_shadow(
         }
     }
 
-    // flood
     let color = tiny_skia::Color::from_rgba8(
         fe.color().red,
         fe.color().green,
@@ -1051,7 +976,6 @@ fn apply_specular_lighting(
     Ok(Image::from_image(pixmap, cs))
 }
 
-// TODO: do not modify LightSource
 fn transform_light_source(
     mut source: usvg::filter::LightSource,
     region: IntRect,
@@ -1105,19 +1029,14 @@ fn apply_to_canvas(input: Image, pixmap: &mut tiny_skia::Pixmap) -> Result<(), E
     Ok(())
 }
 
-/// Calculates Gaussian blur sigmas for the current world transform.
-///
-/// If the last flag is set, then a box blur should be used. Or IIR otherwise.
 fn resolve_std_dev(std_dx: f32, std_dy: f32, ts: usvg::Transform) -> Option<(f64, f64, bool)> {
     let (mut std_dx, mut std_dy) = scale_coordinates(std_dx, std_dy, ts)?;
 
-    // 'A negative value or a value of zero disables the effect of the given filter primitive
-    // (i.e., the result is the filter input image).'
     if std_dx.approx_eq_ulps(&0.0, 4) && std_dy.approx_eq_ulps(&0.0, 4) {
         return None;
     }
 
-    // Ignore tiny sigmas. In case of IIR blur it can lead to a transparent image.
+    // WARNING: tiny sigmas are dropped, because the IIR blur turns them into a transparent image.
     if std_dx < 0.05 {
         std_dx = 0.0;
     }
@@ -1127,7 +1046,6 @@ fn resolve_std_dev(std_dx: f32, std_dy: f32, ts: usvg::Transform) -> Option<(f64
     }
 
     const BLUR_SIGMA_THRESHOLD: f32 = 2.0;
-    // Check that the current feGaussianBlur filter can be applied using a box blur.
     let box_blur = std_dx >= BLUR_SIGMA_THRESHOLD || std_dy >= BLUR_SIGMA_THRESHOLD;
 
     Some((std_dx as f64, std_dy as f64, box_blur))

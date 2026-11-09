@@ -43,7 +43,6 @@ pub(crate) enum ToMain {
     OpenTools,
 }
 
-// WARNING: every message names where it goes, so routing never reads command fields.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Target {
     Window(u64),
@@ -170,8 +169,6 @@ impl Link {
         self.0.created.fetch_max(id, Ordering::AcqRel);
         let options = &command["args"][2];
         if let Some(parent) = options["parent"].as_u64() {
-            // WARNING: only the main side knows the native window of another window, so it joins
-            // the child to its parent and then shows it.
             self.main(ToMain::Native(json!({"op":"window","args":[
                 "parent", id, parent, options["modal"] == true, options["show"] != false,
             ]})));
@@ -227,7 +224,6 @@ impl Link {
             }
             ToPage::Window(id, _) | ToPage::Bridge(id, _) => match pages.get(&id) {
                 Some(queue) => queue.push(message),
-                // WARNING: a window that closed drops its messages, but one that never opened is a routing bug.
                 None => debug_assert!(
                     matches!(message, ToPage::Bridge(..))
                         || id <= self.0.created.load(Ordering::Acquire),
@@ -289,7 +285,7 @@ impl Link {
         self.0.exit_code.load(Ordering::Acquire)
     }
 
-    // WARNING: asks the main side and waits for its answer. Main must never wait for a page like this.
+    // WARNING: blocks until main answers. Main must never wait for a page like this, or the two can deadlock.
     pub(crate) fn ask(&self, message: impl FnOnce(Answer) -> ToMain) -> Result<Payload> {
         let (answer, reply) = mpsc::sync_channel(1);
         self.main(message(answer));
@@ -353,7 +349,6 @@ pub(crate) enum Tool {
     DevTools,
 }
 
-// WARNING: in `apps run` these keys open the tools before `before-input-event`, so no listener can block them.
 pub(crate) fn tool(keystroke: &renderer::Keystroke) -> Option<Tool> {
     let (key, modifiers) = (keystroke.key.as_str(), &keystroke.modifiers);
     let primary = if cfg!(target_os = "macos") {
@@ -452,9 +447,8 @@ impl Main {
         self.receive_with(!self.driving.get())
     }
 
-    // WARNING: AppKit runs nested loops under main scripts, like for a sync dialog or a popup. Messages that
-    // would run a script then wait until the outer one returns, and the others still run, so pages that wait
-    // for native work get it.
+    // WARNING: AppKit runs nested loops under main scripts, like for a sync dialog or a popup. There, messages that run
+    // a script must wait until the outer script returns; the others still run.
     pub(crate) fn receive_with(&self, scripts: bool) -> bool {
         let messages = std::mem::take(
             &mut *self
@@ -474,7 +468,6 @@ impl Main {
                 ToMain::Open(id, ..) => Some(*id),
                 _ => None,
             };
-            // WARNING: like Electron, what a window sent after it closed is dropped, so main never sees a message without a sender.
             if sender.is_some_and(|id| !self.opened.borrow().contains(&id)) {
                 continue;
             }
@@ -521,7 +514,6 @@ impl Main {
                     // WARNING: A window that closed on its way here must not stay retained.
                     if self.opened.borrow().contains(&id) {
                         self.windows.borrow_mut().insert(id, (window, control));
-                        // WARNING: main sends a window's first state, and reading it on main opens the window.
                         let mut changed = self.changed.borrow_mut();
                         if !changed.contains(&id) {
                             changed.push(id);
@@ -606,9 +598,8 @@ impl Main {
             .find_map(|(&id, (other, _))| (*other == window).then_some(id))
     }
 
-    // WARNING: main emits `before-input-event` when the system gives it a key, before the page gets it, so a
-    // page never waits for main. It runs no script inside another one, like in a loop nested under
-    // `dialog.showMessageBoxSync()` or a host call, so there the key goes on as not prevented.
+    // WARNING: this never runs a script inside another one, like in a loop nested under `dialog.showMessageBoxSync()`
+    // or a host call; there the key goes on as not prevented.
     pub(crate) fn before_input(
         &self,
         id: u64,
@@ -706,9 +697,7 @@ impl Main {
             if self.host.try_borrow_mut().is_err() {
                 return self.link.main(ToMain::Native(command));
             }
-            // WARNING: a page that runs a long script takes its time to go, so the window hides now
-            // and the script stops at its next tick.
-            // WARNING: on Windows a hide calls `window_event` at once, so the borrow must end first.
+            // WARNING: on Windows a hide calls `window_event` at once, so the `windows` borrow must end first.
             let removed = self.windows.borrow_mut().remove(&id);
             if let Some((_, control)) = removed {
                 control.change(WindowChange::Hide);
@@ -890,8 +879,6 @@ impl Main {
     }
 
     pub(crate) fn drive(self: &Rc<Self>) {
-        // WARNING: AppKit runs nested loops under main scripts, like for a dialog. Those turns only take
-        // messages that run no script, see `receive_with`.
         if self.driving.replace(true) {
             self.receive_with(false);
             return;
@@ -925,8 +912,6 @@ impl Main {
             crate::jsc::stop_pages();
             renderer::native::quit();
         }
-        // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the
-        // VM is collected like a page's, see `shrink_due`.
         if self.api.shrink_pending() && !self.quiet.replace(true) {
             self.shrink_when_quiet();
         }
@@ -970,7 +955,6 @@ impl Main {
                     .page(ToPage::All(json!({"op":"logs","args":logs})));
             }
         }
-        // WARNING: a call without a window comes here, also in an app without a main script.
         if super::mcp::poll_main() {
             delay = delay.min(0);
         }
@@ -988,7 +972,6 @@ impl Main {
         if self.link.main_pending() {
             delay = delay.min(0);
         }
-        // WARNING: a due task wakes main at once, as in Node, so setImmediate and MessageChannel don't wait a timer tick.
         Ok((delay != i64::MAX).then(|| delay.clamp(0, 1 << 31) as u64))
     }
 
@@ -1175,7 +1158,6 @@ mod tests {
         host.borrow_mut().packaged = true;
         main.before_input(5, &down(key("f12", Modifiers::default())), &|| false);
         assert!(keys().contains(r#""code":"f12""#));
-        // WARNING: a nested loop under a main script or a host call runs no listener.
         main.driving.set(true);
         assert!(!main.before_input(5, &p, &|| false));
         main.driving.set(false);

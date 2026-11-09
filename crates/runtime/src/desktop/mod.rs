@@ -61,7 +61,6 @@ type Reloaded = (
     Arc<HashMap<String, bytes::Bytes>>,
 );
 
-// The pages and script chunks of the last bundle that `apps run --watch` sent, which page loads use from then on.
 static RELOADED: std::sync::Mutex<Option<Reloaded>> = std::sync::Mutex::new(None);
 
 thread_local! {
@@ -99,7 +98,6 @@ impl Desktop {
         )
     }
 
-    // WARNING: the main side keeps running, so a bundle from `input` must change only pages and the chunks they load.
     pub fn reload_from(&self, mut input: impl std::io::BufRead + Send + 'static) {
         let link = self.link.clone();
         let _ = std::thread::Builder::new()
@@ -197,12 +195,9 @@ impl Desktop {
         rust: bool,
     ) -> Result<Self> {
         let api = JavaScriptCore::load()?;
-        // WARNING: after `new BrowserWindow()`, no thread could build the bytecode of the window's engines in time, so
-        // apps with pages build it, and load what windows need, from the start. Apps without pages do both with their
-        // first window, if any.
         let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
-        // WARNING: AppKit's launch, the first window and the first frame wait for the window server connection, the
-        // Metal driver and CoreText's font metadata, so a thread loads them while the main side starts.
+        // WARNING: AppKit's launch and the first frame wait for the window server, the Metal driver and CoreText font
+        // data, so this thread loads them early. The calls look unused but save launch time.
         #[cfg(target_os = "macos")]
         if windows {
             let _ = std::thread::Builder::new()
@@ -234,8 +229,6 @@ impl Desktop {
                     {
                         text.glyph_pixels(run.font_id, glyph.id, run.font_size, 2., 0, false);
                     }
-                    // WARNING: the text system keeps fonts for the process, so pages find the bold system font and the
-                    // monospace and sans-serif fallbacks loaded.
                     text.resolve_font(&renderer::Font {
                         weight: renderer::FontWeight(600.),
                         ..font(".SystemUIFont")
@@ -249,7 +242,7 @@ impl Desktop {
                 });
         }
         let link = Link::new();
-        // WARNING: native producers of this thread capture this waker before the app runs.
+        // WARNING: install the waker before the app runs, because native producers of this thread capture it then.
         crate::host::Waker::install({
             let link = link.clone();
             move || link.wake_main()
@@ -348,13 +341,11 @@ impl Desktop {
                 main.receive();
             }
             let messages = self.queue.take();
-            // WARNING: the main side quits the app, so pages only stop once their commands ran.
             if messages.is_empty() && self.link.quitting() {
                 self.quit = true;
                 return Ok(());
             }
             if messages.is_empty() {
-                // WARNING: titles walk the document, so windowed apps sync them once per drive.
                 if runtime.is_none() {
                     self.titles(cx.as_deref_mut())?;
                 }
@@ -458,7 +449,6 @@ impl Desktop {
                                 (Some(x), Some(y)) => point(px(x as f32), px(y as f32)),
                                 _ => cx.centered(outer).origin,
                             };
-                            // WARNING: children and windows that can't take focus open hidden, so they show after those changes.
                             let child = options["parent"].is_u64();
                             let later = child || options["focusable"] == false;
                             let show = options["show"] != false;
@@ -517,7 +507,8 @@ impl Desktop {
                                     ),
                                     (
                                         vibrancy.is_some()
-                                            || options["visualEffectState"].as_i64().unwrap_or(0) != 0,
+                                            || options["visualEffectState"].as_i64().unwrap_or(0)
+                                                != 0,
                                         WindowChange::Vibrancy(
                                             vibrancy.map(|material| material as isize),
                                             options["visualEffectState"].as_i64().unwrap_or(0)
@@ -533,8 +524,6 @@ impl Desktop {
                                 if options["fullscreen"] == true {
                                     window.toggle_fullscreen();
                                 }
-                                // WARNING: the native window opens later on main, so this size is its guess, and main
-                                // sends the first state once it opened.
                                 let size = window.viewport_size();
                                 self.host
                                     .borrow_mut()
@@ -732,7 +721,6 @@ impl Desktop {
                         .transpose();
                         let renderer =
                             JsContext::new(self.api.clone(), self.host.clone(), Role::Renderer(id));
-                        // WARNING: closing a window during its load stops these too, which is no failure.
                         if (preload.is_err() || renderer.is_err()) && crate::jsc::stopping(id) {
                             continue;
                         }
@@ -819,7 +807,6 @@ impl Desktop {
                         }
                         view.preload = preload;
                         view.renderer = Some(renderer);
-                        // WARNING: `titles` sets the new page's title after `page-title-updated`.
                         view.title = None;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                             cx.refresh_window(handle);
@@ -1049,7 +1036,6 @@ impl Desktop {
                 }
             }
         }
-        // WARNING: a page redirect loop must not quit the app, so later commands wait for the next turn.
         Ok(())
     }
 
@@ -1203,7 +1189,6 @@ impl Desktop {
                     delay = delay.min(next);
                 }
             }
-            // WARNING: IPC messages are delivered here in rounds, for at most 4 ms; the rest waits for the next wake.
             let start = Instant::now();
             loop {
                 app.pump(Some(cx), Some(&runtime))?;
@@ -1290,8 +1275,8 @@ impl Desktop {
                             eprintln!("apps: page script: {error:#}");
                         }
                     }
-                    // WARNING: the page takes a control's events before the next frame, which tells main the last
-                    // one it took, so the page's value doesn't undo edits that it has not taken yet.
+                    // WARNING: the page must take control events before the next frame, which tells main the last one
+                    // it took, or the page's value undoes edits it has not taken yet.
                     let controls = crate::render::native::events(&data);
                     for (node, event) in &controls {
                         let value = serde_json::to_string(&event.value).unwrap_or_default();
@@ -1342,7 +1327,6 @@ impl Desktop {
                         host.dom.get(&id).is_some_and(|dom| dom.frame_requested),
                     )
                 };
-                // WARNING: animation frame callbacks run before the frame lays out, like in browsers.
                 if frame
                     && let (Some(handle), Some(data)) = (view.handle, view.data.upgrade())
                     && cx
@@ -1358,9 +1342,6 @@ impl Desktop {
                     cx.refresh_window(handle);
                 }
             }
-            // WARNING: a due task wakes the loop at once, as in browsers, so a MessageChannel task doesn't wait a timer
-            // tick. The render thread runs a posted task (frames, input) between its timers, so a page that posts
-            // tasks without end still draws.
             Ok(if delay == i64::MAX || app.quit {
                 None
             } else {
@@ -1373,8 +1354,6 @@ impl Desktop {
                 cx.end_thread();
             });
         }
-        // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the VM
-        // is collected once, when JS has been quiet for a second.
         let api = runtime.borrow().api.clone();
         if api.shrink_pending() && !api.idle.replace(true) {
             shrink_when_quiet(runtime.clone(), cx);
@@ -1389,7 +1368,6 @@ impl Desktop {
                     *armed <= Instant::now() || at + Duration::from_micros(500) < *armed
                 }) {
                     let wake = runtime.clone();
-                    // WARNING: native dialogs and popup menus run a nested loop while the app is busy, so the timer runs after it.
                     let task = cx.timer(wait, move |cx| {
                         if let Ok(mut app) = wake.try_borrow_mut() {
                             app.wake = None;
@@ -2871,7 +2849,6 @@ mod tests {
         desktop.pump(None, None).unwrap();
         desktop.js().tick().unwrap();
         desktop.js().eval("win.close()", "test").unwrap();
-        // WARNING: main closes the window before its page hears of it, and the preload sends once more meanwhile.
         desktop.main.as_ref().unwrap().receive();
         preload.eval("send()", "test").unwrap();
         desktop.pump(None, None).unwrap();

@@ -191,9 +191,8 @@ pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// WARNING: pages can't reach private networks, except a loopback address and port that one of this app's servers is
-// bound to, so a page can call the app's own server but not another process on another loopback address. Every page
-// connection, redirects included, resolves the host first and checks each address, so DNS can't point it elsewhere.
+// WARNING: pages can't reach private networks, except loopback ports that this app's own servers bind. Every resolved
+// address is checked, redirects included, so DNS can't point a page elsewhere.
 pub(crate) async fn connect(
     host: &str,
     port: u16,
@@ -231,8 +230,6 @@ pub(crate) async fn connect(
     let (preferred, other): (Vec<_>, Vec<_>) = addresses
         .into_iter()
         .partition(|address| address.is_ipv6() == ipv6);
-    // WARNING: like hyper's connector, the other address family starts after 300 ms, so a broken IPv6 route can't
-    // stall the connection.
     let mut first = std::pin::pin!(tokio::net::TcpStream::connect(preferred.as_slice()));
     let stream = match tokio::time::timeout(Duration::from_millis(300), &mut first).await {
         Ok(Ok(stream)) => stream,
@@ -355,7 +352,6 @@ pub struct State {
     agent: Option<Agent>,
 }
 
-// WARNING: a setter parses the href again and sets one part, as the URL standard does, so `new URL()` and setters share this.
 pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) -> Result<Url> {
     let base = base.map(Url::parse).transpose()?;
     let mut url = Url::options().base_url(base.as_ref()).parse(input)?;

@@ -1,5 +1,3 @@
-// Native code of `apps build --aot`. Such an app loads JavaScriptCore from app.dylib, which also holds an image of the
-// compiled modules: the scripts of the bundle and the runtime scripts.
 use super::{JavaScriptCore, Ptr};
 use anyhow::{Context, Result, anyhow, ensure};
 use libloading::Library;
@@ -27,8 +25,8 @@ pub(super) struct Image {
     function: unsafe extern "C" fn(Ptr, u32, *mut Ptr) -> Ptr,
 }
 
-// The image of the JavaScriptCore library, if it has one. The first call registers it with JSC, which reads its options
-// then, so it must run before the first context group.
+// WARNING: the first call registers the image with JSC, which reads its options then, so it must run before the first
+// context group.
 pub(super) fn load(path: &Path) -> Result<Option<&'static Image>> {
     // WARNING: JSC keeps the image in process-wide tables, so its library is never unloaded.
     static IMAGE: OnceLock<std::result::Result<Option<Image>, String>> = OnceLock::new();
@@ -91,7 +89,6 @@ impl Image {
         self.modules.get(url).copied()
     }
 
-    // The module of a bundle script that `apps build --aot` replaced with a reference.
     pub(super) fn find(&self, source: &[u8]) -> Result<Option<u32>> {
         let Some(reference) = source.strip_prefix(crate::bundle::AOT_PREFIX.as_bytes()) else {
             return Ok(None);
@@ -112,7 +109,6 @@ impl Image {
             .with_context(|| format!("Missing AOT code for {name}"))
     }
 
-    // Runs a module, whose function returns the completion value of its script.
     pub(super) fn call(
         &self,
         api: &JavaScriptCore,

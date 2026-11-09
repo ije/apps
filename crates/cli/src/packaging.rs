@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn package_app(
     out: &Path,
     files: &BBTreeMap<String, String>,
@@ -138,7 +139,6 @@ pub fn package_app(
     let main = (bytecode && files.contains_key("app.js"))
         .then(|| apps_runtime::bundle::script_source(files, true));
     let bytecode = if bytecode {
-        // WARNING: bytecode is only valid for the JavaScriptCore that built it.
         ensure!(
             jsc == apps_runtime::jsc::library_path(
                 &std::env::current_exe()?,

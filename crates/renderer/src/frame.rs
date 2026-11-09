@@ -395,7 +395,6 @@ impl RenderFrame {
         }
     }
 
-    // WARNING: commands run in order, so a texture can be reused once the commands reading it are recorded.
     fn release(&mut self, target: Target) {
         if let Target::Layer(index) = target {
             self.free.push(self.layers[index].texture);
@@ -619,7 +618,6 @@ impl RenderFrame {
         let Some(content) = layer.bounds else {
             return;
         };
-        // WARNING: transformed content can be visible beyond the window, so allow a window of margin.
         let (w, h) = (self.window[0] as f32, self.window[1] as f32);
         let reach = if effect.transform.is_some() {
             [-w, -h, 3. * w, 3. * h]

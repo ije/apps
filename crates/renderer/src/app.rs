@@ -111,7 +111,8 @@ pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
             install(Rc::new(platform::Platform::new()));
             update(init);
         },
-        // WARNING: windows and their state can hold things that need other thread locals.
+        // WARNING: windows can hold things whose drop needs other thread locals, so the app drops here and not in its
+        // own thread-local destructor.
         || {
             APP.with_borrow_mut(|slot| *slot = None);
         },
@@ -351,9 +352,6 @@ pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformIn
     window.dispatch_event(input, app)
 }
 
-// WARNING: like Chrome, a key that the input method took reaches the page just before the first change it makes:
-// with key code 229 while it composes or when it inserts more than one character, else as itself, and then the
-// page can keep its character out.
 pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, ime: bool) -> bool {
     let Some((mut down, composing)) = window.ime_key.take() else {
         return false;
@@ -415,7 +413,6 @@ impl Callbacks {
                 window.draw(app);
             }
         })?;
-        // WARNING: deferred work can request another frame after drawing, before the display link stops.
         let cell = cell()?;
         let app = cell.app.borrow();
         Some(
@@ -487,7 +484,6 @@ impl Callbacks {
         .flatten()
     }
 
-    // WARNING: like Chrome, an empty or canceled composition removes its text and ends with `compositionend`.
     #[cfg(not(target_os = "macos"))]
     pub fn clear_marked_text(&self) {
         if let Some(marked) = self.marked_text_range() {
@@ -607,9 +603,8 @@ pub mod native {
         }
     }
 
-    // WARNING: the filter runs on the main thread for each key down and up of a window, before the page gets it.
-    // When it returns true, the page never gets the key, and the system takes it as handled, but a composing input
-    // method still does. The last argument tells whether one composes, and asks the page only when it is called.
+    // WARNING: calling the `composing` argument asks the page thread and waits for it, so call it only when the answer
+    // matters.
     pub fn on_key(f: impl FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.key = Some(Box::new(f)));
     }

@@ -34,8 +34,8 @@ struct State {
 }
 
 impl App {
-    // WARNING: registers a handler for `ipcRenderer.invoke()`. Handlers run on a small thread pool, so a
-    // handler that never returns should start its own thread and report with [`AppHandle`].
+    // WARNING: handlers run on a pool of up to 4 threads, so a handler that never returns must start its own thread and
+    // report with [`AppHandle`].
     pub fn handle(
         &self,
         channel: &str,

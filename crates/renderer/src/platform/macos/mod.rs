@@ -131,19 +131,17 @@ impl Inbox {
     }
 }
 
-// WARNING: A render thread, which owns one `App`: a window and its page scripts. It is leaked, because
-// `Callbacks` of native views can name it after it ends, and it is small.
+// WARNING: render thread inboxes are leaked on purpose, since `Callbacks` of native views can name one after its thread
+// ends.
 pub(crate) type AppThread = &'static Inbox;
 
-// WARNING: the work of the main thread, which owns AppKit. `ask` runs it too, so a page that waits for the
-// main thread never waits for an `ask` of that thread to time out.
+// WARNING: `ask` also runs this inbox, so a page that waits for main never waits for main's `ask` of that page to time
+// out.
 static MAIN: Inbox = Inbox::new();
 static MAIN_QUEUED: AtomicBool = AtomicBool::new(false);
 static RENDERS: Mutex<Vec<AppThread>> = Mutex::new(Vec::new());
 static RENDER_LEFT: Condvar = Condvar::new();
 
-// WARNING: how long the main thread waits for the render thread to answer AppKit. A busy page must not
-// freeze the menus and the window, so AppKit then gets the answer for a page that ignores it.
 const ASK_LIMIT: Duration = Duration::from_millis(100);
 
 pub(crate) struct Sendable<T>(T);
@@ -158,9 +156,8 @@ impl<T> Sendable<T> {
     }
 }
 
-// WARNING: the main thread's work runs from a run loop source in the common modes, and not from the
-// main dispatch queue, which AppKit doesn't serve in a loop nested in one of its blocks. So menus,
-// popups and modal panels that a main script opens don't stop windows, IPC and timers.
+// WARNING: main work runs from a run loop source in the common modes, not the main dispatch queue, which AppKit doesn't
+// serve in loops nested in its blocks, like menus and modal panels.
 fn main_source() -> CFRunLoopSourceRef {
     static SOURCE: OnceLock<usize> = OnceLock::new();
     *SOURCE.get_or_init(|| {
@@ -267,9 +264,8 @@ enum Asked<R> {
     Abandoned,
 }
 
-/// Runs `f` on the render thread and waits for its answer on the main thread, for at most
-/// `ASK_LIMIT`, while it runs the work of the main thread. `f` always runs, but while an earlier
-/// `f` is late nothing waits, so a hung page costs AppKit one wait and not one per question.
+// WARNING: `f` always runs, but while an earlier `f` is late nothing waits, so a hung page costs AppKit one wait and
+// not one per question.
 pub(crate) fn ask<R: Send + 'static>(
     thread: AppThread,
     f: impl FnOnce() -> R + Send + 'static,
@@ -562,8 +558,8 @@ pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
-    // WARNING: a run loop timer in the common modes fires in nested loops too, like `native_post`.
-    // `dispatch_after` would also fire a tenth of its delay late (300 ms for a 3 s `setTimeout`).
+    // WARNING: a common-modes run loop timer, not `dispatch_after`, so it fires in nested loops and isn't late by a
+    // tenth of its delay.
     let f: Box<dyn FnOnce()> = Box::new(f);
     let mut context = CFRunLoopTimerContext {
         version: 0,

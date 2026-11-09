@@ -111,31 +111,15 @@ Boxes paint in CSS order: a stacking context lists the boxes with a `z-index` be
 | Windows | Win32 | Direct3D 11 with DirectComposition | DirectWrite |
 | Linux | X11 and Wayland | wgpu on Vulkan or OpenGL | cosmic-text |
 
-The runtime adds built-in `bg-glass`, `bg-glass-clear`, and `bg-glass-interactive` classes on macOS without an import.
-Tailwind supplies glass color utilities and availability variants. A supported glass box keeps its foreground in a separate Metal surface.
-AppKit puts that surface in an `NSGlassEffectView` above the page. The native material supplies the highlights, refraction, and tint.
+On macOS, a box with Liquid Glass draws its content into its own Metal surface, which AppKit shows in an `NSGlassEffectView` above the page. The native material draws the highlights, refraction and tint. These frames need the main thread to update the views and present their surfaces together, so only the newest one waits for main and a newer one drops it: a busy main thread skips frames but never stops the page. Native glass is not in Metal readback, so `capturePage()` rejects these frames.
 
-The renderer reuses the native views and removes them when their boxes disappear. Idle windows release spare glass drawables.
-These frames need the main thread to update the native views and present their Metal surfaces together.
-Only the newest such frame waits for main, and a newer one drops it unseen, so a busy main thread skips frames but never stops the page.
-The native layers of a window keep one order, from the bottom: the frame, glass views, a view that holds the Core Animation layers of composited animations and the blinking caret, then web views.
-AppKit reorders sublayers added to the frame layer by hand, so none are. The renderer doesn't know where web views paint, so they stay on top.
-Glass currently needs a top-level effect with uniform corners, no transforms or filters, and no clipping or content above it.
+From the bottom, the native layers of a window are the frame, glass views, a view with the Core Animation layers of composited animations and the blinking caret, then web views. AppKit reorders sublayers added to the frame layer by hand, so none are. The renderer doesn't know where web views paint, so they stay on top.
 
-Unsupported boxes keep their ordinary CSS appearance. Native glass does not appear in Metal readback, so `capturePage()` rejects these frames.
+`<sf-symbol-*>` elements rasterize with AppKit on the render thread on a cache miss and draw through the monochrome atlas, so a new CSS color needs no new bitmap. The cache keeps every symbol that the current frame uses, even past its bounds.
 
-Native `<sf-symbol-*>` elements need no import. Tag suffixes map hyphens to dots in SF Symbol names.
-The elements inherit CSS color and default to `1em` square. CSS width and height set their bounds on all platforms.
-On macOS, cache misses rasterize symbols with AppKit on the render thread. Other platforms keep the empty element bounds.
-The renderer keeps a bounded alpha cache and draws the icons through its monochrome atlas. CSS color changes need no new bitmap.
-The cache keeps every symbol that the current frame uses, even past its bounds.
+Inputs with an `ns-*` type show AppKit controls on macOS. Their box paints nothing and takes the control's natural size, measured once on main. When it paints, it gives the window the control's state, its bounds and the clip of its ancestors. After the frame, a changed list goes to main, which keeps each control in a clipping view above the frame. Main takes only the newest list, so a busy main thread skips lists. A control's action goes back to the page's thread as user input. Each event has a number, and the page's lists carry the last number it took, so main doesn't set a value from the page while the page has not yet taken the control's own edits.
 
-Inputs with an `ns-*` type show AppKit controls on macOS. Their box paints nothing and takes the control's natural size, measured once on main. When it paints, it gives the window the control's state, its bounds and the clip of its ancestors.
-After the frame, a changed list goes to main, which keeps each control in a clipping view above the frame. Main takes only the newest list, so a busy main thread skips lists.
-A control's action goes back to the page's thread as user input. Each event has a number, and the page's lists carry the last number it took, so main doesn't set a value from the page while the page has not yet taken the control's own edits.
-
-The atlas keeps a tile that fails or is bigger than a GPU texture as an empty entry, so it is not built again each frame.
-A glyph bigger than 2048 device pixels on a side rasters at a smaller scale and stretches to its size.
+The atlas keeps a tile that fails or is bigger than a GPU texture as an empty entry, so it is not built again each frame. A glyph bigger than 2048 device pixels on a side rasters at a smaller scale and stretches to its size.
 
 
 ## Offscreen Canvases
@@ -174,7 +158,7 @@ Like Bun, native code reads strings and bytes where JSC keeps them, without copi
 
 Each VM runs the runtime scripts in `crates/runtime/js` before page or app code. The build removes their whitespace and comments and makes them ASCII, so the process keeps one copy, about 0.8 MB, that JSC reads in place. JSC's code cache is per VM, so when a second VM runs a runtime script, a thread compiles the script and all of its functions into bytecode, and later VMs decode that bytecode instead of compiling the script. A context in a new VM then starts in about 3 ms instead of 12 ms, and holds about 1 MB less. Decoded code points into the bytecode, so the process keeps it: about 2.6 MB for all runtime scripts. JSC compiles the source when the bytecode doesn't match it, for example while a debugger is attached.
 
-`apps build --bytecode` builds this bytecode with the JavaScriptCore that ships with the app, also for the main script and the ASCII script chunks, and packs it in `app.bundle`. The runtime finds the bytecode of a chunk by where its source is in the mapped file, so page, preload, worker and imported chunks all use it, and JSC reads both in place, so they don't count in the footprint. A small app with one window and a preload goes from launch to its loaded page in 141 ms instead of 160 ms, and its footprint goes from 53 to 47 MB. DiffsHub goes from 255 to 196 ms and from 136 to 125 MB, and its bundle from 6.2 to 18.3 MB.
+`apps build --bytecode` builds this bytecode with the JavaScriptCore that ships with the app, also for the main script and the ASCII script chunks, and packs it in `app.bundle`. The runtime finds the bytecode of a chunk by where its source is in the mapped file, so page, preload, worker and imported chunks all use it, and JSC reads both in place, so they don't count in the footprint.
 
 ```sh
 bash scripts/build-jsc.sh

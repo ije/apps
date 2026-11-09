@@ -4,9 +4,6 @@
 use super::{ImageRefMut, f32_bound};
 use usvg::filter::{ComponentTransfer, TransferFunction};
 
-/// Applies component transfer functions for each `src` image channel.
-///
-/// Input image pixels should have an **unpremultiplied alpha**.
 pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
     for pixel in src.data {
         if !is_dummy(fe.func_r()) {

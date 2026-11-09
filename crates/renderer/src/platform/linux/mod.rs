@@ -1,5 +1,3 @@
-//! Linux and FreeBSD: X11 or Wayland windows on a calloop loop, wgpu rendering and cosmic-text.
-
 mod gpu;
 mod text;
 mod wayland;
@@ -322,8 +320,6 @@ impl Clicks {
     }
 }
 
-// WARNING: a key that changes the composition comes without text and reaches the page as `Process` before the
-// change, like in Chrome. Neither the page nor main can stop the change.
 fn key_down(callbacks: Callbacks, keystroke: Keystroke, is_held: bool, ime: Vec<Ime>) {
     let modifiers = keystroke.modifiers;
     let text = keystroke.key_char.clone().filter(|_| {
@@ -381,8 +377,6 @@ fn ime_area(callbacks: Callbacks) -> Option<Bounds<Pixels>> {
     callbacks.bounds_for_range(callbacks.selected_text_range()?.range)
 }
 
-// WARNING: returns the text that a cancelled sequence commits before the key, like Chrome does for keys that an
-// input method lets through, and the changes of the key itself, which make it a `Process` key.
 fn compose(
     state: &mut xkb::compose::State,
     pre_edit: &mut Option<String>,

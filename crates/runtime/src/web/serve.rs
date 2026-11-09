@@ -179,7 +179,6 @@ impl State {
                                 .header_read_timeout(Duration::from_secs(5))
                                 .serve_connection(TokioIo::new(stream), service).with_upgrades();
                             tokio::pin!(connection);
-                            // WARNING: a stopping server closes idle connections and lets requests in flight finish, like Node's `server.close()`.
                             let stop = tokio::select! {
                                 _ = connection.as_mut() => false,
                                 _ = stopped.wait_for(|stop| *stop) => true,

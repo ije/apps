@@ -4,8 +4,6 @@ const BITS: usize = 8;
 const SIZE: usize = 1 << BITS;
 const MASK: usize = SIZE - 1;
 
-// WARNING: per-node outputs are as long as the node arena, while a pass writes few nodes, so copies share chunks of 256
-// entries and a write copies only its chunk. Copying the whole list every pass cost more than styling the new rows.
 #[derive(Clone)]
 pub(crate) struct Chunked<T> {
     chunks: Vec<Rc<Vec<T>>>,
@@ -14,7 +12,10 @@ pub(crate) struct Chunked<T> {
 
 impl<T> Default for Chunked<T> {
     fn default() -> Self {
-        Self { chunks: Vec::new(), len: 0 }
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
     }
 }
 
@@ -31,8 +32,6 @@ impl<T: Clone> Chunked<T> {
         (index < self.len).then(|| &self.chunks[index >> BITS][index & MASK])
     }
 
-    // The ranges of entries whose chunk is not `other`'s. A write copies its chunk, so a shared chunk holds the
-    // same entries.
     pub(crate) fn differing<'a>(
         &'a self,
         other: &'a Self,
@@ -50,7 +49,10 @@ impl<T: Clone> Chunked<T> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
-        self.chunks.iter().flat_map(|chunk| chunk.iter()).take(self.len)
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .take(self.len)
     }
 
     pub(crate) fn clear(&mut self) {

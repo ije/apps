@@ -10,8 +10,8 @@ use std::{
     rc::Rc,
 };
 
-// WARNING: macOS links the system SQLite (3.39 or later on macOS 13) instead of a bundled 1 MB copy.
-// It is declared here, because libsqlite3-sys without `bundled` can link another copy that pkg-config finds.
+// WARNING: macOS uses the system SQLite, declared here, because libsqlite3-sys without `bundled` can link another copy
+// that pkg-config finds.
 #[cfg(target_os = "macos")]
 #[allow(non_camel_case_types)]
 pub(crate) mod ffi {
@@ -505,7 +505,6 @@ impl State {
                 .get(&statement.database)
                 .context("Database is not open")?;
             let raw = statement.raw;
-            // WARNING: statements bind in the same call that steps them, so one row costs one host call.
             let bind = |bindings: &[Value]| -> Result<()> {
                 ffi::sqlite3_reset(raw);
                 ffi::sqlite3_clear_bindings(raw);

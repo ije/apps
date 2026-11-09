@@ -67,7 +67,6 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
   const absent = name => Object.assign(new Error(`Cannot get SEA asset ${name}: this is not a single executable application`), { code: 'ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION' });
   const sea = { isSea: () => false, getAssetKeys: () => [], getAsset(name) { throw absent(name); }, getAssetAsBlob(name) { throw absent(name); }, getRawAsset(name) { throw absent(name); } };
 
-  // WARNING: `@pierre/apps` has no TLS sockets. HTTPS goes through fetch, which checks certificates against the system roots.
   const noTLS = () => Object.assign(new Error('TLS sockets are not supported, use fetch or https.request()'), { code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM' });
   class TLSSocket extends net.Socket { constructor() { super(); throw noTLS(); } }
   class TLSServer extends net.Server { constructor() { super(); throw noTLS(); } }
@@ -122,7 +121,6 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
     Dispatcher, Agent, Client, Pool, Headers, Request, Response, FormData, WebSocket: globalThis.WebSocket, fetch: (...args) => fetch(...args), getGlobalDispatcher: () => global, setGlobalDispatcher: value => { global = value; },
     request: (url, options = {}) => { const target = new URL(url); return (options.dispatcher ?? global).request({ ...options, origin: target.origin, path: options.path ?? target.pathname + target.search }); },
   };
-  // WARNING: JavaScriptCore has no V8 heap, so the numbers come from the process.
   const v8 = {
     getHeapStatistics() { const rss = process.memoryUsage.rss(); return { total_heap_size: rss, total_heap_size_executable: 0, total_physical_size: rss, total_available_size: 0, used_heap_size: rss, heap_size_limit: 0, malloced_memory: 0, peak_malloced_memory: 0, does_zap_garbage: 0, number_of_native_contexts: 1, number_of_detached_contexts: 0, total_global_handles_size: 0, used_global_handles_size: 0, external_memory: 0 }; },
     getHeapSnapshot() { throw Object.assign(new Error('Heap snapshots are not supported'), { code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM' }); },

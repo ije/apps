@@ -16,7 +16,6 @@ const FALLBACKS: [(&str, &str); 7] = [
 ];
 
 impl Node {
-    // WARNING: an `ns-*` input type behaves as its fallback type everywhere, and shows an AppKit control on macOS.
     pub(crate) fn input_type(&self) -> &str {
         let kind = self.attrs.get("type").map_or("text", String::as_str);
         FALLBACKS
@@ -46,7 +45,6 @@ impl Node {
     }
 }
 
-// WARNING: the natural size of a control box. A button is as wide as its title, so the caller adds that.
 pub(super) fn size(kind: ControlKind) -> [f32; 2] {
     let [width, height] = renderer::control_size(kind);
     match kind {
@@ -56,8 +54,6 @@ pub(super) fn size(kind: ControlKind) -> [f32; 2] {
     }
 }
 
-// WARNING: a control keeps its key while its node stays a control, and `seen` is the last of its events that
-// the page took. Builds add controls, so per-frame work visits only them.
 #[derive(Default)]
 pub(crate) struct Controls {
     shown: rustc_hash::FxHashMap<usize, (u64, u64)>,
@@ -131,8 +127,6 @@ pub(super) fn paint(
         enabled: !node.attrs.contains_key("disabled"),
         editable: !node.attrs.contains_key("readonly"),
         checked: node.checked(),
-        // WARNING: like browser controls, a box is light unless its `color-scheme` allows dark. With both, the
-        // window's appearance decides.
         dark: match (scheme.contains("light"), scheme.contains("dark")) {
             (true, true) => None,
             (_, dark) => Some(dark),
@@ -150,7 +144,6 @@ pub(super) fn paint(
     window.native_control(control, sink);
 }
 
-// WARNING: the events that the main thread queued for this page, by node. Taking them marks them seen.
 pub(crate) fn events(view: &super::PageState) -> Vec<(usize, ControlEvent)> {
     let mut controls = view.controls.borrow_mut();
     let events = std::mem::take(

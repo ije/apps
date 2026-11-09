@@ -17,8 +17,6 @@ pub fn apply(
     let mut mask_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height()).unwrap();
 
     {
-        // TODO: only when needed
-        // Mask has to be clipped by mask.region
         let mut alpha_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
         alpha_mask.fill_path(
             &tiny_skia::PathBuilder::from_rect(mask.rect().to_rect()),

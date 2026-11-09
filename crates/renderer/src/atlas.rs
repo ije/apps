@@ -11,12 +11,10 @@ use std::{
 };
 
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
-// WARNING: a glyph rasters at most this many device pixels on a side. A bigger one rasters smaller and stretches.
 pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 const MAX_AGE: u32 = 60;
-// WARNING: removed tiles are freed this many frames later, when no frame in flight reads them.
-// WARNING: a window has at most 3 drawables on macOS, so the frame before the removal, the last
-// one to read a tile, is done before the frame after the free paints. More drawables need more.
+// WARNING: removed tiles are freed this many frames later, when no frame in flight reads them. That holds for at most 3
+// drawables per window; more drawables need a bigger value.
 const IN_FLIGHT: u32 = 2;
 const MIN_TEXTURE_SIDE: i32 = 1024;
 
@@ -64,7 +62,6 @@ pub(crate) struct Atlas<B> {
     pub(crate) backend: RefCell<B>,
 }
 
-// WARNING: the bounds say where the tile shows. A stretched glyph shows bigger than its pixels.
 pub(crate) type Raster<B> = (Bounds<DevicePixels>, Size<DevicePixels>, B);
 
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
@@ -152,7 +149,6 @@ impl<B: AtlasBackend> Atlas<B> {
         if glyph_pixels <= MAX_GLYPH_PIXELS {
             return;
         }
-        // WARNING: frames in flight may still read a tile, so only long unused tiles are freed.
         let mut backend = self.backend.borrow_mut();
         self.tiles.borrow_mut().retain(|key, entry| {
             if !matches!(key, AtlasKey::Glyph(_)) || frame.wrapping_sub(entry.used.get()) < MAX_AGE
@@ -181,8 +177,7 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
-    // WARNING: images keep their pixels, so a frame that shows one again only uploads it. The scene reads the
-    // tiles of the last frame, so they stay.
+    // WARNING: the scene still reads the tiles of the last frame, so they must stay.
     #[cfg(target_os = "macos")]
     pub fn release_images(&self) {
         let frame = self.frame.get();

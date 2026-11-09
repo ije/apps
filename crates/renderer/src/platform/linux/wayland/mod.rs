@@ -277,7 +277,6 @@ impl Client {
                 clipboard: None,
                 cached: None,
                 drag: Drag::default(),
-                // WARNING: removed from the environment below, so child processes don't take it.
                 startup_token: std::env::var("XDG_ACTIVATION_TOKEN")
                     .ok()
                     .filter(|token| !token.is_empty()),
@@ -985,7 +984,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Handle {
                 state.pre_edit = None;
                 let window = state.windows.get(&surface.id()).and_then(Weak::upgrade);
                 drop(state);
-                // WARNING: like Chrome, the page ends its composition and keeps the text when the window goes.
                 if let Some(window) = window {
                     window.set_active(false);
                 }
@@ -1150,8 +1148,6 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for Handle {
                     key_down(window.callbacks, keystroke, false, Vec::new());
                     return;
                 }
-                // WARNING: the input method takes its keys from the compositor, so like Chrome each change of
-                // the text is a `Process` key without a code.
                 let mut ime: Vec<_> = commit.map(Ime::Commit).into_iter().collect();
                 match &preedit {
                     Some(text) if !ime.is_empty() || shown.as_ref() != Some(text) => {
@@ -1255,7 +1251,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let Some(window) = state.focused(&state.mouse_focus) else {
                     return;
                 };
-                // WARNING: only presses count: requests that name a release serial are declined.
+                // WARNING: compositors decline requests that name a release serial, so only presses are kept.
                 if button_state == wl_pointer::ButtonState::Pressed {
                     state.press = Some((serial, window.surface.clone()));
                 }

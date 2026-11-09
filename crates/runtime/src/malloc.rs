@@ -3,10 +3,8 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::{copy_nonoverlapping, null_mut, write_bytes};
 
-// WARNING: by default macOS malloc keeps freed memory in the footprint: about 40% of small blocks and all blocks of
-// 48 KB or more, and `malloc_zone_pressure_relief` returns nothing (measured on macOS 27). Only this variable
-// changes that, and malloc reads it before any code here runs, so a process without it starts again at once.
-// `apps run` sets it for its child and `apps build` in `LSEnvironment`, so they don't start twice.
+// WARNING: macOS malloc keeps freed memory in the footprint unless `MallocSpaceEfficient=1` is set, and reads it before
+// any code here runs, so a process without it starts itself again.
 const SETTING: &CStr = c"MallocSpaceEfficient=1";
 const NAME: &CStr = c"MallocSpaceEfficient";
 
@@ -34,7 +32,6 @@ unsafe extern "C" fn start(
                 .strip_prefix(NAME.to_bytes())
                 .is_some_and(|rest| rest.first() == Some(&b'='))
             {
-                // WARNING: child processes and `process.env` don't see it.
                 libc::unsetenv(NAME.as_ptr());
                 return;
             }
@@ -57,10 +54,8 @@ const SMALL: usize = 512;
 const CLASSES: usize = SMALL / 16 + 1;
 const KEPT: u32 = 1024 * 1024;
 
-// WARNING: `MallocSpaceEfficient` makes malloc and free slower, and frames build and drop thousands of small
-// blocks. A thread takes back what it freed without calling them, and big blocks still go back to the system. A frame
-// that drops a thousand rows frees thousands of blocks of one size, so each size keeps up to 1 MB until the thread is
-// quiet.
+// WARNING: `MallocSpaceEfficient` makes malloc and free slow, and frames build and drop thousands of small blocks, so
+// each thread keeps freed small blocks, up to 1 MB per size, until it is quiet.
 struct Bins {
     heads: [*mut u8; CLASSES],
     bytes: [u32; CLASSES],

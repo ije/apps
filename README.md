@@ -1,7 +1,7 @@
 # @pierre/apps
 
 A tiny, fast, memory-safe Electron alternative with a compatible API.
- 
+
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps run --watch` / `-W`: Restart when the main code changes, and reload the pages when only page code changes. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.
@@ -81,12 +81,7 @@ const server = import.meta.resolve('./server.ts'); // a script that `ELECTRON_RU
 
 `productName` names the app, `executableName` names its executable, and `env` gives the values of `import.meta.env`.
 
-On macOS, `bg-glass`, `bg-glass-clear`, and `bg-glass-interactive` are built in and need no import.
-Use Tailwind for color and layout utilities:
-
-```css
-@import "tailwindcss";
-```
+On macOS, the built-in `bg-glass`, `bg-glass-clear` and `bg-glass-interactive` classes give a box native Liquid Glass (macOS 26 and later), and `<sf-symbol-*>` elements show SF Symbols, with no import:
 
 ```html
 <button class="bg-glass-blue-500 bg-glass-interactive rounded-full flex items-center gap-2 px-4 py-2">
@@ -95,55 +90,9 @@ Use Tailwind for color and layout utilities:
 </button>
 ```
 
-JSX uses `className`. `bg-glass-clear` selects clear glass.
-A valid `bg-glass-*` color utility enables glass without `bg-glass`.
-`bg-glass-interactive` modifies active glass and does not enable glass by itself.
-Glass does not set a corner radius. Use `rounded`, `rounded-xl`, or `rounded-full`, or set `border-radius` in CSS.
-The CSS properties are `-macos-glass`, `-macos-glass-interactive`, and `-macos-glass-tint-color`.
+Glass sets no corner radius. With `@import "tailwindcss"`, `bg-glass-*` takes the colors of `bg-*`, like `bg-glass-blue-500/50` or `bg-glass-brand` for a `@theme` color, and `supports-bg-glass:` and `not-supports-bg-glass:` style the fallback. The CSS properties are `-macos-glass`, `-macos-glass-interactive` and `-macos-glass-tint-color`. `visualEffectState: 'active'` in `BrowserWindow` options keeps glass active while the window has no focus. A symbol tag maps hyphens to dots, so `<sf-symbol-folder-fill>` is `folder.fill`. Symbols take the text color and are `1em` square. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
 
-For an unfocused float, set `visualEffectState: 'active'` in `BrowserWindow` options.
-This keeps native glass active without keyboard focus. The default, `followWindow`, follows window activity. `inactive` keeps the inactive appearance.
-The glass override uses an undocumented AppKit method and can change with macOS.
-
-With Tailwind, `bg-glass-*` uses the same colors as `bg-*`: palette shades, theme colors, arbitrary colors, and opacity modifiers.
-For example, use `bg-glass-blue-500`, `bg-glass-blue-500/50`, or `bg-glass-[#123456]`.
-
-```css
-@theme {
-  --color-brand: #2563eb;
-}
-
-.dark {
-  --color-brand: #60a5fa;
-}
-```
-
-Use `bg-glass-brand` to follow that theme color. Changes to `--color-brand` update the tint.
-Tint utilities also support `@theme inline`, `@apply`, and variants such as `hover:bg-glass-brand` and `dark:bg-glass-blue-300`.
-
-With Tailwind, use `supports-bg-glass:` and `not-supports-bg-glass:` for native glass and fallback styles:
-
-```html
-<button class="bg-glass px-4 py-2 supports-bg-glass:text-white not-supports-bg-glass:bg-white not-supports-bg-glass:text-black">
-  Open
-</button>
-```
-
-These variants check native Liquid Glass availability on the running OS. They work with other variants, such as `not-supports-bg-glass:hover:bg-gray-100`.
-The check does not test whether an individual element can use glass.
-
-The effect needs macOS 26 or later. Native interaction feedback needs macOS 27 or later.
-This first version supports controls with uniform corners, without transforms, filters, clipping, or non-glass content above them. Native glass controls can overlap each other.
-
-The base glass classes have no effect on other platforms. See [examples/glass](examples/glass) and [Compatibility](COMPATIBILITY.md).
-
-Native `<sf-symbol-*>` elements show SF Symbols on macOS without an import or Tailwind.
-For example, `<sf-symbol-folder-fill class="size-5" />` selects Apple's `folder.fill` symbol. Hyphens in the tag suffix map to dots.
-Icons inherit `color` and default to `1em` square. CSS width and height, such as Tailwind `size-*`, set their bounds.
-
-These icons are monochrome. Missing symbols and other platforms show an empty element with the same CSS bounds.
-
-Inputs with an `ns-*` type show native AppKit controls on macOS. Other platforms show the fallback input type:
+Inputs with an `ns-*` type show AppKit controls on macOS, and the fallback type elsewhere:
 
 | Type | macOS | Fallback |
 |---|---|---|
@@ -238,27 +187,7 @@ The default port is `3000`.
 
 ## macOS tray
 
-Create a `Tray` in the main process after `app.whenReady()`. Put the icon in `icons/` and add `"files": ["icons"]` to `package.json` so it ships with the app. A filename ending in `Template.png` lets macOS adapt the icon to the menu bar.
-
-```js
-import { app, BrowserWindow, Menu, Tray } from 'electron'
-import { join } from 'node:path'
-
-let tray
-app.whenReady().then(() => {
-  tray = new Tray(join(app.getAppPath(), 'icons', 'ServerTemplate.png'))
-  tray.setToolTip('Server is running')
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Server', sublabel: 'Running', enabled: false },
-    { type: 'separator' },
-    { label: 'Settings…', click: () => new BrowserWindow().loadFile('settings.html') },
-    { role: 'quit' },
-  ]))
-})
-app.on('window-all-closed', () => {})
-```
-
-The `window-all-closed` listener keeps the tray available after the settings window closes.
+`Tray` takes a file path. Ship the icon with `"files": ["icons"]` in `package.json` and load `join(app.getAppPath(), 'icons', 'TrayTemplate.png')`. A name that ends in `Template.png` lets macOS adapt the icon to the menu bar.
 
 ## AOT build (experimental)
 
@@ -287,7 +216,7 @@ Packaged `.wasm` files and valid Wasm in base64 string literals passed to `atob(
 The app doesn't start when `app.dylib` comes from another build or another runtime.
 
 Bun's AOT limits apply, for example to some changes of built-in objects.
-On DiffsHub, an AOT build starts with 215 ms of CPU instead of 395 ms with the JIT, and holds about 50 MB less memory under its stress test, at the same CPU load. The app is 16 MB bigger, and loops of `%` on numbers that are not known to be integers run about 2 times slower than with the JIT.
+On DiffsHub, AOT starts with about half the CPU and holds about 50 MB less memory, but the app is 16 MB bigger, and `%` on numbers that are not known to be integers is about 2 times slower than with the JIT.
 
 To run the integration test:
 
@@ -340,14 +269,10 @@ app.handle("start", move |window, _args| {
 
 ```ts
 // preload.ts
-ipcRenderer.on('progress', (_event, value) => console.log(value))
-```
-
-```ts
-// preload.ts
 import { ipcRenderer } from '@pierre/apps'
 
 export const greet = (name: string) => ipcRenderer.invoke('greet', name)
+ipcRenderer.on('progress', (_event, value) => console.log(value))
 ```
 
 Page scripts run in JavaScriptCore. They can import `greet` from the preload. The CLI bundles `index.html` if it exists. Set `"pages": ["index.html", "settings.html"]` to bundle more pages. Paths are relative to `package.json`.

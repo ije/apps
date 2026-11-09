@@ -121,16 +121,6 @@ impl Normal {
     }
 }
 
-/// Renders a diffuse lighting.
-///
-/// - `src` pixels can have any alpha method, since only the alpha channel is used.
-/// - `dest` will have an **unpremultiplied alpha**.
-///
-/// Does nothing when `src` is less than 3x3.
-///
-/// # Panics
-///
-/// - When `src` and `dest` have different sizes.
 pub fn diffuse_lighting(
     fe: &DiffuseLighting,
     light_source: LightSource,
@@ -166,16 +156,6 @@ pub fn diffuse_lighting(
     );
 }
 
-/// Renders a specular lighting.
-///
-/// - `src` pixels can have any alpha method, since only the alpha channel is used.
-/// - `dest` will have a **premultiplied alpha**.
-///
-/// Does nothing when `src` is less than 3x3.
-///
-/// # Panics
-///
-/// - When `src` and `dest` have different sizes.
 pub fn specular_lighting(
     fe: &SpecularLighting,
     light_source: LightSource,
@@ -244,7 +224,6 @@ fn apply(
     let width = src.width;
     let height = src.height;
 
-    // `feDistantLight` has a fixed vector, so calculate it beforehand.
     let mut light_vector = match light_source {
         LightSource::DistantLight(light) => {
             let azimuth = light.azimuth.to_radians();

@@ -635,7 +635,6 @@ impl State {
 
 type Shared = Rc<RefCell<State>>;
 
-// What `estimate` reads about the screen that windows open on.
 #[derive(Clone, Copy)]
 struct Screens {
     titlebar: f32,
@@ -646,7 +645,6 @@ struct Screens {
 
 static SCREENS: Mutex<Option<Screens>> = Mutex::new(None);
 
-// Runs on the main thread, at launch and after each window opens.
 pub(crate) fn measure_screens() {
     let marker = MainThreadMarker::new().unwrap();
     let screens = NSScreen::screens(marker);
@@ -682,8 +680,6 @@ pub(crate) fn measure_screens() {
     });
 }
 
-// WARNING: the window opens on the main thread after `Window::open` returns, so until then its mirror holds what
-// `open_native` will make of the options on the first screen. An open that finds another size reports a resize.
 fn estimate(options: &WindowOptions) -> Mirror {
     let mut screens = *SCREENS.lock().unwrap_or_else(PoisonError::into_inner);
     if screens.is_none() {
@@ -848,14 +844,11 @@ fn open_native(
         // Metal layer, so this one is layer backed from the start.
         let () = msg_send![native_view, setWantsLayer: Bool::YES];
         let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
-        // WARNING: during a resize a frame can show with the bounds of another size. Here it keeps its
-        // place, where the default placement would stretch the whole window for that frame. AppKit
-        // owns the gravity of this layer, so setting it on the layer does nothing.
+        // WARNING: during a resize a frame can show at another size; top-left placement keeps it in place instead of
+        // stretching the window. AppKit owns this layer's gravity, so set it on the view.
         let () = msg_send![native_view, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];
-        // WARNING: AppKit owns the sublayers of the frame layer: it puts the layers of subviews over the ones
-        // added by hand whenever a subview changes. So promoted layers and the caret go in the layer this view
-        // hosts, and the order from the bottom is: frame, glass views, this view, web views and other subviews.
-        // Native glass has nothing painted over it, and web views stay on top, as the renderer can't see them.
+        // WARNING: AppKit puts subview layers over sublayers added by hand to the frame layer, so promoted layers and
+        // the caret go in this view's layer. Order from the bottom: frame, glass, this view, web views.
         let overlay_view: *mut AnyObject = msg_send![overlay_class, alloc];
         let overlay_view: *mut AnyObject = msg_send![overlay_view, initWithFrame: content_bounds];
         anyhow::ensure!(!overlay_view.is_null(), "AppKit did not create the view");
@@ -928,9 +921,8 @@ fn set_button_visibility(state: &Shared, visible: bool) {
 
 type Open = Box<dyn FnOnce(&NativeRef) + Send>;
 
-// WARNING: the strong reference to a native window, which the main thread opens after `Window::open` returns, so
-// the render thread runs page scripts meanwhile. The main thread opens it at once if it needs it first, and the
-// render thread waits for it before it draws or hands out the view. AppKit must release it on the main thread.
+// WARNING: the main thread opens the window after `Window::open` returns, and the render thread waits for it before it
+// draws or hands out the view. AppKit must release it on the main thread.
 #[derive(Default)]
 struct NativeRef {
     window: AtomicPtr<AnyObject>,
@@ -939,7 +931,6 @@ struct NativeRef {
 }
 
 impl NativeRef {
-    // On the main thread: the window, opened now if it isn't yet, or null if AppKit didn't make it.
     fn window(&self) -> *mut AnyObject {
         let open = self
             .open
@@ -952,7 +943,6 @@ impl NativeRef {
         self.window.load(Ordering::Acquire)
     }
 
-    // Waits until the main thread opened the window, or on main opens it now.
     fn wait(self: &Arc<Self>) {
         if self
             .open
@@ -988,8 +978,8 @@ pub struct WindowControl {
     mirror: Arc<Mutex<Mirror>>,
 }
 
-// WARNING: a frame that the main thread has to show keeps its drawables. Only the newest one waits, and a newer
-// frame drops it unseen, so a busy main thread never makes the render thread wait for a drawable.
+// WARNING: only the newest frame waits for main and a newer one drops it, so a busy main thread never makes the render
+// thread wait for a drawable.
 #[derive(Default)]
 struct Waiting {
     present: Mutex<Option<Present>>,
@@ -998,7 +988,6 @@ struct Waiting {
 
 type ControlList = (Vec<crate::NativeControl>, Option<crate::ControlSink>);
 
-// WARNING: the newest list of native controls, which the main thread takes whole, so a busy main thread skips lists.
 #[derive(Default)]
 struct Controls {
     sent: std::cell::RefCell<Vec<crate::NativeControl>>,
@@ -1594,7 +1583,6 @@ impl Drop for Window {
         }
         let control = self.control.clone();
         native_post(Box::new(move || {
-            // WARNING: a window that closes before it opened never opens.
             drop(
                 control
                     .native
@@ -2045,8 +2033,8 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
     };
     drop(lock);
     let composing = down && callbacks.marked_text_range().is_some();
-    // WARNING: the main thread's filter sees each key once, before the page. As in Electron, a key it blocks
-    // still goes to a composing input method, which only can't send it on to the page.
+    // WARNING: like Electron, a key that main's filter blocks still goes to a composing input method, which only can't
+    // pass it on to the page.
     let blocked = crate::app::native::key(callbacks.id, &input, &|| {
         composing || !down && callbacks.marked_text_range().is_some()
     });
@@ -2075,8 +2063,6 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
                     lock.keystroke_for_do_command = (!blocked).then(|| keystroke.clone());
                     lock.do_command_handled = None;
                 }
-                // WARNING: the page gets a key that the input method takes only with the first change it makes,
-                // or after it when it made none. A key that comes back through `doCommandBySelector:` drops it.
                 let held = !blocked && (composing || ime_printable);
                 if held {
                     let down = down.clone();
@@ -2191,7 +2177,6 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, event: *mut AnyObject)
     match &input {
         PlatformInput::MouseDown(_) => {
             drop(lock);
-            // WARNING: this view takes key focus back from a web view, also for presses that glass views forward.
             // SAFETY: plain AppKit calls on this view and its window.
             unsafe {
                 let window: *mut AnyObject = msg_send![this, window];

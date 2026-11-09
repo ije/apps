@@ -126,7 +126,7 @@ pub(crate) fn slice(value: &Value) -> Option<Result<&[u8]>> {
     )
 }
 
-// WARNING: the bytes of binary argument `index` of the current call. They stay valid until the call returns.
+// WARNING: the pointer stays valid only until the current call returns.
 pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
     FRAMES.with(|frames| {
         let frames = frames.borrow();
@@ -146,7 +146,7 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
     })
 }
 
-// WARNING: the bytes of an `ArrayBuffer` or a view. They stay valid while the value lives and no JavaScript runs.
+// WARNING: the slice has an unbounded lifetime, but stays valid only while the value lives and no JavaScript runs.
 pub(crate) fn view<'a>(
     api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
@@ -195,7 +195,8 @@ pub(crate) fn input<'a>(
             && count.fract() == 0.,
         "Invalid binary arguments"
     );
-    // WARNING: reading an item can run a getter that drops and collects earlier items, so all items are read and protected before any bytes are borrowed. The bytes are not pinned, so host operations must not run JavaScript, which could detach them. FFI and Node-API pin theirs.
+    // WARNING: a getter can drop and collect earlier items, so all items are read and protected before any bytes are
+    // borrowed. The bytes are not pinned, so host operations must not run JavaScript.
     let mut roots = Roots {
         api,
         ctx,

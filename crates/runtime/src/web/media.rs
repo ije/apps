@@ -21,7 +21,6 @@ static HOST: Host = Host {
     free: free_pixels,
 };
 
-// WARNING: player threads allocate frames ahead of time, and the renderer frees the ones they show.
 extern "C" fn alloc_pixels(length: usize) -> *mut u8 {
     // WARNING: media files pick the frame size, so a failed allocation returns null instead of aborting.
     let mut pixels = Vec::<MaybeUninit<u8>>::new();

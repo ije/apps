@@ -29,7 +29,6 @@ globalThis.__appsSQLite = native => {
     if (typeof value !== 'boolean') throw new TypeError(name + ' must be a boolean');
     return value;
   };
-  // WARNING: bindings go to Rust flat as index, kind, value, so one row costs one host call without JSON.
   const encode = (value, index) => {
     if (value === null) return [0, null];
     if (typeof value === 'bigint') {

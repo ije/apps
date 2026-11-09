@@ -38,7 +38,7 @@ fn kind(ty: fs::FileType) -> u32 {
     }
 }
 
-// WARNING: a flat list of numbers becomes JavaScript values directly, without JSON. `Stats` in node/index.js reads this order.
+// WARNING: `Stats` in node/index.js reads these numbers by position, so keep both in the same order.
 fn stat(meta: &fs::Metadata) -> Value {
     let ms = |time: std::io::Result<SystemTime>| {
         time.ok().map(|time| match time.duration_since(UNIX_EPOCH) {
@@ -102,7 +102,6 @@ const SYNC: i32 = libc::O_SYNC;
 #[cfg(not(unix))]
 const SYNC: i32 = 0;
 
-// WARNING: Node's flags map to open(2) flags first, so `r` opens read-only and `r+` never creates or truncates.
 fn open_options(flag: &Value, fallback: &str, mode: &Value) -> Result<OpenOptions> {
     use libc::{
         O_APPEND as A, O_CREAT as C, O_EXCL as X, O_RDONLY, O_RDWR, O_TRUNC as T, O_WRONLY,
@@ -256,7 +255,6 @@ impl Files {
                         let ty = entry.file_type()?;
                         entries.push((directory.join(entry.file_name()), kind(ty)));
                     }
-                    // WARNING: names in one directory have no separator, so byte order is path order, and much cheaper.
                     entries[start..].sort_unstable_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
                     if recursive {
                         directories.extend(
@@ -380,7 +378,8 @@ impl Files {
                         };
                         time.context("Time is out of range")
                     };
-                    // WARNING: FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS let this work on directories and read-only files.
+                    // WARNING: FILE_WRITE_ATTRIBUTES (0x100) and FILE_FLAG_BACKUP_SEMANTICS (0x02000000) are needed to
+                    // set times on directories and read-only files.
                     OpenOptions::new()
                         .access_mode(0x100)
                         .custom_flags(0x0200_0000)
@@ -461,7 +460,9 @@ impl Files {
                 {
                     use std::os::unix::ffi::OsStrExt;
                     let path = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
-                    Ok(Value::Bool(unsafe { libc::access(path.as_ptr(), libc::F_OK) } == 0))
+                    Ok(Value::Bool(
+                        unsafe { libc::access(path.as_ptr(), libc::F_OK) } == 0,
+                    ))
                 }
                 #[cfg(not(unix))]
                 Ok(Value::Bool(path()?.exists()))

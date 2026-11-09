@@ -75,8 +75,6 @@ const DARK_SYSTEM_COLORS: [(&str, &str); 19] = [
 ];
 
 pub(crate) fn serialize(value: &str) -> Option<String> {
-    // WARNING: computed style reads serialize the same few colors again and again, so the text is kept by value
-    // like `COLORS`, and starts over when full.
     thread_local! {
         static SERIALIZED: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Option<String>>> =
             Default::default();
@@ -270,7 +268,6 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
         )
     });
     COLORS.with_borrow_mut(|colors| {
-        // WARNING: transitions make new color strings every frame, so the cache starts over when full.
         if colors.len() >= 1024 {
             colors.clear();
         }

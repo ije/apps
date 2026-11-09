@@ -171,7 +171,6 @@ const ELECTRON: &[&str] = &[
 ];
 
 const BUILTINS: &str = include_str!("builtins.txt");
-// WARNING: these are built in by their package name, never with `node:`, and only in main.
 const PACKAGES: &[&str] = &["@pierre/apps", "electron", "node-pty", "ws", "undici"];
 
 #[derive(Default)]
@@ -377,8 +376,6 @@ impl<'a> Visit<'a> for TopLevelAwait {
     }
 }
 
-// WARNING: top-level `await` becomes `yield`, and the loader resumes the generator with the awaited value.
-// The body then runs synchronously until its first `await`, like an ES module, so later page scripts run after it.
 struct Awaits<'a>(AstBuilder<'a>);
 
 impl<'a> VisitMut<'a> for Awaits<'a> {
@@ -395,8 +392,6 @@ impl<'a> VisitMut<'a> for Awaits<'a> {
     }
 }
 
-// A module's exports are slots in one array of the bundle: it writes them when its body ends, and importers read
-// `slots[k]`. So there is no generator, namespace object or getter per export, which took a quarter of the JS heap.
 struct Slots<'a, 'b> {
     ast: AstBuilder<'a>,
     allocator: &'a Allocator,
@@ -456,7 +451,6 @@ impl<'a> Slots<'a, '_> {
             };
         }
         if self.flat[origin] {
-            // WARNING: `ns.missing` on a namespace reads undefined. A named import of it fails at build time.
             return Expression::new_unary_expression(
                 span,
                 UnaryOperator::Void,
@@ -468,7 +462,8 @@ impl<'a> Slots<'a, '_> {
         namespace_read(&self.ast, self.allocator, span, origin, &name)
     }
 
-    // WARNING: like other bundlers, a called import gets `this` undefined, also through a namespace. It must not see the slots.
+    // WARNING: keep the `(0, read)()` form: a plain member call would pass the slots or the namespace as `this`. Like
+    // other bundlers, a called import gets `this` undefined.
     fn callee(&mut self, expression: &mut Expression<'a>) {
         if let Some((dep, name)) = Self::import(expression) {
             let span = expression.span();
@@ -514,7 +509,6 @@ impl<'a> VisitMut<'a> for Slots<'a, '_> {
     }
 }
 
-// Modules in import cycles can read each other's exports before their bodies end, so they keep namespaces.
 fn in_cycles(modules: &[Module]) -> Vec<bool> {
     let edges = |id: usize| -> Vec<usize> {
         let module = &modules[id];
@@ -576,9 +570,8 @@ fn in_cycles(modules: &[Module]) -> Vec<bool> {
     cyclic
 }
 
-// WARNING: root bindings that code can write after the module's body ended must be read live by importers. A write is
-// early only while the body runs: in the root statements, their blocks and loops, class static blocks, static fields
-// and computed keys. Functions, methods, accessors and instance fields run later.
+// WARNING: importers must read a root binding live when code can write it after the body ends: in functions, methods,
+// accessors or instance fields.
 struct Writes<'b> {
     scoping: &'b oxc_semantic::Scoping,
     late: bool,
@@ -799,7 +792,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 url.arguments[0] =
                     Expression::new_string_literal(specifier.span, value, None, &self.ast).into();
             }
-            // WARNING: apps often compile ESM to CommonJS, so ESM here also has these two as `import.meta` values.
             if !self.commonjs
                 && let Expression::Identifier(name) = expression
                 && matches!(name.name.as_str(), "__dirname" | "__filename")
@@ -923,7 +915,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             })?
                             .into()
                     };
-                    // WARNING: like Node, `filename` and `dirname` are paths of file modules, so pages and remote files get undefined.
                     let code = match member.property.name.as_str() {
                         "url" => {
                             let value = self.allocator.alloc_str(&url);
@@ -989,7 +980,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     "import.meta.resolve needs a local path"
                 );
                 let target = self.path.parent().unwrap_or(Path::new(".")).join(specifier);
-                // WARNING: a script becomes a chunk that `ELECTRON_RUN_AS_NODE` can run in a child process.
                 if !target.extension().is_some_and(|e| e == "html") {
                     let target = target
                         .canonicalize()
@@ -1014,7 +1004,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 *expression = Expression::new_string_literal(span, value, None, &self.ast);
                 return Ok(());
             }
-            // WARNING: only the eager `?url` form that Vite apps use for assets. It reads the folder of each pattern at build time.
             if let Expression::CallExpression(call) = expression
                 && let Expression::StaticMemberExpression(member) =
                     call.callee.get_inner_expression()
@@ -1091,7 +1080,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     self.resolved.insert(specifier.to_owned(), path.into());
                 }
             }
-            // WARNING: like Electron, a relative `loadFile` path is relative to the app folder, not to the module.
             if let Expression::CallExpression(call) = expression
                 && self.builder.realm == Realm::Main
                 && let Expression::StaticMemberExpression(member) =
@@ -1122,7 +1110,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                                 specifier.value.as_str().context("Invalid module path")?,
                             ))
                         }
-                        // WARNING: other specifiers stay native import() calls, which the runtime loads only with these features.
                         source => {
                             let (data, shared) = (source.is_string_literal(), &self.builder.shared);
                             let feature = if data {
@@ -1132,7 +1119,8 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             };
                             let enabled = shared.enabled("jsExecute")
                                 || (!data && shared.enabled("httpImport"));
-                            // WARNING: packages often keep such an import for a path that the app never takes, so there it fails when it runs.
+                            // WARNING: packages often keep such an import on a path the app never takes, so in
+                            // node_modules it fails when it runs, not at build time.
                             if !enabled
                                 && self
                                     .path
@@ -1207,7 +1195,6 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                         }
                     }
                 }
-                // WARNING: `url`, `filename`, `dirname` and `resolve` are static above, so other reads see only `env`.
                 Expression::ImportMeta(_) => {
                     let code = format!("({{env:{}}})", self.builder.meta_env());
                     *expression = Parser::new(
@@ -1225,7 +1212,8 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
             };
             if let Some((name, specifier)) = import {
                 let base = self.path.parent().unwrap_or(Path::new("."));
-                // WARNING: like esbuild, a require() that cannot be resolved throws MODULE_NOT_FOUND when it runs.
+                // WARNING: like esbuild, a require() that cannot be resolved is not a build error; it throws
+                // MODULE_NOT_FOUND when it runs.
                 let dep = if name == "$appsImport" {
                     self.builder.resolve(base, specifier, false)?
                 } else if let Ok((path, inline)) = self.builder.locate(base, specifier, true) {
@@ -1372,8 +1360,6 @@ impl Builder {
         specifier: &str,
         require: bool,
     ) -> Result<(PathBuf, Option<String>)> {
-        // WARNING: like Node, a built-in module without `node:` is built in unless it needs the prefix, and pages take a
-        // package of the same name first.
         let builtin = |name: &str| {
             BUILTINS
                 .lines()
@@ -1436,7 +1422,6 @@ impl Builder {
         if let Some((path, source)) = remote(base, specifier, self.shared.enabled("httpImport"))? {
             return Ok((path, Some(source)));
         }
-        // WARNING: `?url`, `?raw` and `?worker` work as in Vite. The query stays in the path, so the module is not the plain file.
         if let Some((file, query)) = specifier.split_once('?') {
             let kind = query.split('&').next().unwrap_or_default();
             if matches!(kind, "url" | "raw" | "worker" | "sharedworker") {
@@ -1516,7 +1501,6 @@ impl Builder {
             ensure!(components.len() >= count, "Invalid package name");
             let package = components[..count].join("/");
             let subpath = components[count..].join("/");
-            // WARNING: like Node, a package can import itself by name.
             (
                 base.ancestors()
                     .map(|p| p.join("node_modules").join(&package))
@@ -1608,7 +1592,6 @@ impl Builder {
                         break;
                     }
                     Value::Array(values) => candidates.extend(values.iter().rev()),
-                    // WARNING: like Node, a matching condition without a target falls back to the next matching key.
                     Value::Object(values) => candidates.extend(
                         values
                             .iter()
@@ -1650,7 +1633,6 @@ impl Builder {
                 (false, true) => &["main"],
                 (false, false) => &["main", "module"],
             };
-            // WARNING: like Vite, a field that names a missing file falls through to the next one.
             fields
                 .iter()
                 .find_map(|field| {
@@ -1855,7 +1837,6 @@ impl Builder {
                         )?)?
                     )
                 }
-                // WARNING: like Vite, importing CSS applies it. Tailwind's `@import` stays for the runtime compiler.
                 "css" if self.realm == Realm::Renderer => {
                     let text = json!(css(
                         &path,
@@ -1877,7 +1858,6 @@ impl Builder {
                         serde_json::to_string(&value.to_string())?
                     )
                 }
-                // WARNING: like Vite, importing an asset gives its URL.
                 _ if asset_name(&self.shared.root, &path).is_some() => format!(
                     "export default {};",
                     json!(format!(
@@ -2236,7 +2216,6 @@ impl Builder {
                 statement => body.push(statement),
             }
         }
-        // WARNING: `for await` keeps an async generator, whose body starts one microtask after `load`.
         let asynchronous = if !asynchronous.0 && !asynchronous.1 {
             0
         } else if asynchronous.1 {
@@ -2333,7 +2312,7 @@ impl Builder {
                 None => map.to_json_string(),
             };
             let mut map: Value = serde_json::from_str(&map)?;
-            // WARNING: The runtime adds one line before the module body.
+            // WARNING: the runtime adds one line before the module body, so the source map starts with an empty line.
             map["mappings"] = format!(";{}", map["mappings"].as_str().unwrap()).into();
             module.map = Some(map);
             module.url = Some(if is_remote(&path) {
@@ -2389,8 +2368,6 @@ impl Builder {
     }
 }
 
-// WARNING: files outside the app, like packages in a parent node_modules, keep their path from the app folder, so two
-// files never share a name. Only a file on another Windows drive gets its drive as the first folder.
 fn app_relative(root: &Path, path: &Path) -> PathBuf {
     let common = root
         .ancestors()
@@ -2435,7 +2412,6 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
     }
 }
 
-// WARNING: JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
 fn expand_braces(pattern: &str) -> Vec<String> {
     match (pattern.find('{'), pattern.find('}')) {
         (Some(open), Some(close)) if open < close => pattern[open + 1..close]
@@ -2452,6 +2428,7 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     }
 }
 
+// WARNING: JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
 fn ascii_json(value: &Value) -> Result<String> {
     let json = serde_json::to_string(value)?;
     let mut result = String::with_capacity(json.len());
@@ -2518,7 +2495,6 @@ pub fn compile(
         })
         .filter(|(_, keys)| !keys.is_empty());
     let disabled = apps_runtime::bundle::disabled_features(package.as_deref())?;
-    // WARNING: compiled components import react/compiler-runtime, which React has since 19. Experimental builds are 0.0.0.
     if disabled & apps_runtime::bundle::feature_bit("reactCompiler") == 0
         && let Some(react) = root.ancestors().find_map(|directory| {
             fs::read_to_string(directory.join("node_modules/react/package.json")).ok()
@@ -2611,14 +2587,14 @@ pub fn compile(
     }
     if let Some(cache) = &cache {
         let previous = cache.loaders.replace(loaders.clone());
-        // WARNING: cached modules keep the output of the loaders that compiled them.
+        // WARNING: cached modules keep the output of the loaders and features that compiled them, so a change to either
+        // must drop them.
         if previous.as_ref().map(Rc::as_ptr) != loaders.as_ref().map(Rc::as_ptr) {
             cache
                 .graphs
                 .borrow_mut()
                 .retain(|(_, entry), _| entry.ends_with("package.json#loaders"));
         }
-        // WARNING: cached modules also keep the output of the features that compiled them, like reactCompiler.
         if cache.disabled.replace(disabled) != disabled {
             cache.graphs.borrow_mut().clear();
         }
@@ -2739,9 +2715,6 @@ fn bundle(
             let Some(name) = path.to_str().and_then(|path| path.strip_prefix("apps:///")) else {
                 return builder.visit(path, inline);
             };
-            // WARNING: a classic script runs as its own bundled script through `__appsChunk`, so it gets the global
-            // scope, sloppy mode and the window as `this`. Its entry module only runs it in order. The name ends
-            // with `#` and the position of its `<script>` element.
             let (name, element) = name.split_once('#').context("Missing script element")?;
             let code = format!("$appsClassic({},{element})", json!(name));
             classic = true;
@@ -2847,7 +2820,6 @@ fn bundle(
                     .collect()
             })
             .collect();
-        // Follows re-exports and `export *` to the module that holds a binding, so barrels cost nothing at run time.
         let walk = |dep: usize, name: &str, through: &mut Vec<usize>| -> (usize, String) {
             let (mut dep, mut name) = (dep, name.to_owned());
             for _ in 0..256 {
@@ -3045,7 +3017,6 @@ fn bundle(
                 }
             }
             uses_of[id] = uses.0;
-            // WARNING: a flat module is printed after linking, so here its minified code only tells what it reads.
             if flat[id] {
                 continue;
             }
@@ -3068,9 +3039,8 @@ fn bundle(
             codegen.print_expression(&assignment.right);
             factories[id] = codegen.into_source_text();
         }
-        // WARNING: a module that package.json marks free of side effects is dropped when nothing reads it, and so is
-        // everything only it imports, like other bundlers. Its importers get `null` for its namespace.
-        // WARNING: reads skip a barrel, but a barrel that was read through still runs its imports with side effects.
+        // WARNING: reads skip a barrel, but a barrel that was read through must still run, for the side effects of its
+        // imports.
         let mut through = BTreeSet::new();
         for id in (0..modules.len()).filter(|&id| flat[id]) {
             for (target, name) in &uses_of[id] {
@@ -3157,7 +3127,6 @@ fn bundle(
                 params + ",$appsN" + &dep.to_string()
             });
             let declared = linker.namespaces.into_iter().collect::<Vec<_>>();
-            // WARNING: the linked body moves into the factory as AST, so it is not printed and parsed again.
             let factory = allocator.alloc_str(&format!(
                 "$appsFactory=function($appsS,$appsImport,$appsRequire{params}){{'use strict';}};"
             ));
@@ -3346,8 +3315,8 @@ fn bundle(
             }
             builder.lines[id] = Some(line.into());
         }
-        // WARNING: modules only reachable through `import()` go to chunk scripts that the loader runs on first use. Pages
-        // compile strings only while their own script runs, so modules that compile from a string stay in the bundle.
+        // WARNING: pages compile strings only while their own script runs, so modules that compile from a string must
+        // stay in the bundle, not in `import()` chunks.
         let mut owner = vec![usize::MAX; modules.len()];
         let mut groups = VecDeque::from([entries
             .iter()
@@ -3670,7 +3639,6 @@ fn asset_name(root: &Path, path: &Path) -> Option<String> {
     ) {
         return None;
     }
-    // WARNING: names hash the path in the app with FNV-1a, so builds of the same app match on every machine.
     let hash = app_relative(root, path)
         .as_os_str()
         .as_encoded_bytes()
@@ -3689,7 +3657,6 @@ fn asset_name(root: &Path, path: &Path) -> Option<String> {
 }
 
 thread_local! {
-    // WARNING: downloads stay for the process, so `apps run` rebuilds don't fetch remote files again.
     static DOWNLOADS: RefCell<HashMap<String, String>> = RefCell::default();
 }
 
@@ -3758,7 +3725,6 @@ fn asset(
     if let Some(base) = remote_base(directory) {
         return base.join(reference).ok().map(String::from);
     }
-    // WARNING: like browsers, `\` is `/`, so `\x.png` is in the app folder too.
     let reference = reference.replace('\\', "/");
     if reference.starts_with("//") {
         return None;
@@ -3791,7 +3757,6 @@ fn urls(
         (end + 1).min(bytes.len())
     };
     let (mut result, mut copied, mut pos) = (String::with_capacity(source.len()), 0, 0);
-    // WARNING: comments and strings are skipped, so a `url(` in them never takes the next `url()`.
     while pos < bytes.len() {
         if bytes[pos..].starts_with(b"/*") {
             pos = source[pos + 2..]
@@ -3835,7 +3800,6 @@ fn html(
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
     let http = shared.enabled("httpImport");
-    // WARNING: browsers run classic scripts without defer or async while they parse, before any module, so they go first.
     let mut blocking = Vec::new();
     let mut scripts: [Vec<(usize, Entry)>; 2] = Default::default();
     for index in 0..doc.nodes.len() {
@@ -3911,7 +3875,6 @@ fn html(
                     &shared,
                 )?,
             };
-            // WARNING: the link stays like in browsers, and the page loader moves its CSS out of this attribute.
             node.attrs
                 .insert(apps_runtime::bundle::LINK_SHEET.into(), text);
         } else if node.tag == "script" {
@@ -3926,14 +3889,12 @@ fn html(
                 Some("preload") => (false, true),
                 _ => continue,
             };
-            // WARNING: page scripts keep `src` and `type` like in browsers. Without text, the runtime skips them.
             let src = if preload {
                 node.attrs.remove("src")
             } else {
                 node.attrs.get("src").cloned()
             };
             node.children.clear();
-            // WARNING: like browsers with modules, `nomodule` scripts never run.
             if classic && node.attrs.contains_key("nomodule") {
                 continue;
             }
@@ -4014,8 +3975,6 @@ fn html(
         };
         let mut order = HashMap::new();
         if realm == Realm::Renderer {
-            // WARNING: the bundle runs from a new element before the page scripts, which keep their own attributes.
-            // A classic script gets the position of its element among all scripts, for `document.currentScript`.
             let parent = doc.nodes[first].parent.unwrap_or(0);
             let mut node = apps_runtime::dom::Node::default();
             node.tag = "script".into();

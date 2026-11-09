@@ -51,7 +51,6 @@ globalThis.__appsElectron = (call, EventEmitter, ready) => {
     checkForUpdates() { queueMicrotask(() => autoUpdater.emit('error', new Error('Could not get code signature for running application'))); },
   });
 
-  // WARNING: capturing the screen needs ScreenCaptureKit, which `@pierre/apps` doesn't link, so there are no sources.
   const desktopCapturer = Object.freeze({ getSources: async () => [] });
   class ClipboardItem {
     #items;

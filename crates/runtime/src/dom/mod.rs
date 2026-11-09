@@ -58,9 +58,8 @@ pub(crate) struct LayoutNode {
     pub marks: u16,
 }
 
-// WARNING: Node geometry from the last frame, shared with the page through an `ArrayBuffer`: 4 header
-// floats (stale, capacity, layout count, moved), 8 floats per node (x, y, width, height, scroll left, scroll top,
-// scroll range x, scroll range y), then one byte of `MIRROR_*` flags per node.
+// WARNING: page JS reads this buffer by fixed offsets: 4 header floats (stale, capacity, layout count, moved), 8 floats
+// per node, then one `MIRROR_*` byte per node.
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
@@ -69,7 +68,7 @@ pub struct LayoutMirror {
 
 struct MirrorMemory(std::ptr::NonNull<f32>, usize);
 
-// WARNING: only the JS thread reads and writes the floats. Other threads only drop the last owner after a GC.
+// SAFETY: only the JS thread reads and writes the floats; other threads only drop the last owner after a GC.
 unsafe impl Send for MirrorMemory {}
 unsafe impl Sync for MirrorMemory {}
 
@@ -137,11 +136,8 @@ pub(crate) const DIRTY: u16 = 32;
 pub(crate) const MODAL: u16 = 64;
 pub(crate) const POPOVER: u16 = 256;
 pub(crate) const FULLSCREEN: u16 = 512;
-// WARNING: an image that failed to load, which shows its alt text.
 pub(crate) const BROKEN: u16 = 1024;
 pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
-// WARNING: the top layer bits that a box lost, shifted, while it stays in the top layer until its `overlay`
-// transition ends.
 pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
 
 impl Node {
@@ -196,8 +192,6 @@ pub(crate) const MIRROR_CLIP: u8 = 4;
 pub(crate) const MIRROR_POSITIONED: u8 = 8;
 pub(crate) const MIRROR_HIDDEN: u8 = 16;
 pub(crate) const MIRROR_FIXED: u8 = 32;
-// WARNING: inert, or hidden by the cascade while an exit transition or animation still paints it, so it takes no
-// focus, as in browsers.
 pub(crate) const MIRROR_INERT: u8 = 64;
 const HIDDEN: u8 = 1;
 const EDITABLE: u8 = 2;
@@ -387,12 +381,12 @@ pub struct State {
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
-    // WARNING: a list per node is megabytes on big pages, and a new one costs a page fault per 16 KB.
+    // WARNING: kept so the next pass reuses its lists: a per-node list is megabytes on big pages, and a new one costs a
+    // page fault per 16 KB.
     old_styles: Option<Rc<style::ComputedStyles>>,
     pub(crate) style_walk: Walk,
     editable: Vec<usize>,
     inert: Vec<usize>,
-    // WARNING: by node id, the `HIDDEN`, `EDITABLE` and `INERT` bits of the last style pass.
     select_marks: Vec<u8>,
     shadow_walk: Rc<ShadowWalk>,
     pub(crate) grids: rustc_hash::FxHashMap<
@@ -411,7 +405,6 @@ pub struct State {
     pub(crate) measurements: crate::render::grid::Measurements,
     pub painted: Vec<u64>,
     pub(crate) paint_count: u64,
-    // WARNING: the last revision from the process-wide counter in `render`, so 0 means the state never drew.
     pub(crate) layout_revision: u64,
     style_epoch: u64,
     layout_epoch: u64,
@@ -497,8 +490,8 @@ impl State {
         }
     }
 
-    // WARNING: such nodes wait for a GC to be freed, and a scrolling list makes them much faster than GCs run,
-    // so they would outnumber the nodes in the document. A node that comes back computes them again.
+    // WARNING: removed nodes wait for a GC, and a scrolling list removes them faster than GCs run, so their data must
+    // go here or it outgrows the document.
     fn drop_removed(&mut self, doc: &Document) {
         let mut gone = Vec::new();
         for root in std::mem::take(&mut self.removed) {
@@ -589,7 +582,6 @@ impl State {
         id
     }
 
-    // An unused node id, freed or new, whose node is empty until `place` fills it.
     fn slot(&mut self, doc: &mut Document) -> usize {
         self.free.pop().map_or_else(
             || {
@@ -623,7 +615,6 @@ impl State {
             } else if id >= cached.values.len() {
                 self.invalidate();
             }
-            // WARNING: a frame keeps a clone of the styles, so they can't grow in place. Detached nodes have empty styles in them, and new nodes are detached, so only a new id makes them stale.
         }
     }
 }
@@ -698,17 +689,13 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
     Ok(canvas)
 }
 
-// WARNING: keyed by the image id, or by the SVG source address and drawn size. The entry holds the SVG source, so
-// its address cannot be reused for another source while the key is kept.
+// WARNING: keyed by the SVG source address, so the entry must hold the source to keep the address from being reused.
 pub(crate) type CanvasSource = (
     (u64, usize, [u32; 2]),
     Option<Rc<str>>,
     Rc<tiny_skia::Pixmap>,
 );
 
-// WARNING: images keep their premultiplied pixels for later draws, up to 64 MB in all, until the image or the
-// drawn SVG size changes or the node goes. A changed source is not kept at once, so videos and SVGs drawn at
-// changing sizes keep nothing.
 fn source_pixels(
     state: &State,
     id: usize,
@@ -786,7 +773,8 @@ pub(crate) fn show_frame(
         state.cull.seen = None;
     }
     state.dirty = true;
-    // WARNING: only the first frame replaced since the renderer drained `recycled` can be on the GPU; later ones are returned so unrendered windows do not grow it.
+    // WARNING: only the first frame replaced since the renderer drained `recycled` can be on the GPU; return later
+    // ones, or unrendered windows grow it without bound.
     match old {
         Some(old) if state.retired_canvases.insert(id) => {
             state.recycled.push((id, old));
@@ -834,7 +822,6 @@ pub(crate) fn load_image(
             .push((id, request, result));
         wake.wake();
     }));
-    // WARNING: at most two images decode at once to bound their memory, and idle workers exit.
     if jobs.1 < 2
         && std::thread::Builder::new()
             .name("apps-image".into())
@@ -956,7 +943,6 @@ pub fn call(
                 }
                 state.decoding.remove(&id);
                 state.dirty |= result.is_ok();
-                // WARNING: a decoded image resizes its box, so its layout and the culled spacers around it are stale.
                 if result.is_ok()
                     && let Some(node) = state.layout_nodes.get_mut(id)
                 {
@@ -1044,7 +1030,6 @@ pub fn call(
         if op == "dom.animation" {
             let id = args[0].as_u64().context("Expected an animation")? as u32;
             state.dirty = true;
-            // WARNING: the last frame's animated style of the node is stale now, so getComputedStyle samples again.
             if let Some(node) = state.motion.unscript(id) {
                 state.animating.remove(&node);
                 state.animating_pseudos.remove(&node);
@@ -1126,7 +1111,6 @@ pub fn call(
         if op == "dom.properties" {
             return Ok(json!(style::Prop::names()));
         }
-        // WARNING: a flat list of name, value and priority becomes JavaScript strings directly, without JSON.
         if op == "dom.declare" {
             return Ok(json!(
                 style::declare(args[0].as_str().unwrap_or_default()).concat()
@@ -1221,9 +1205,7 @@ pub fn call(
         }
         if op == "dom.release" {
             let wrapped = args[1].as_array().context("Expected live nodes")?;
-            // WARNING: only a wrapper keeps a removed tree until a GC, so new wrappers, not new nodes, count for `report_nodes`.
             state.created += wrapped.len();
-            // WARNING: the page already forgot these lists, so a bad id is skipped instead of failing the rest.
             for value in wrapped {
                 if let Some(id) = value.as_u64().map(|id| id as usize)
                     && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
@@ -1342,7 +1324,6 @@ pub fn call(
                     freed.push(id);
                 }
             }
-            // WARNING: the page drops the records of the freed nodes, so it doesn't walk the trees it detached again.
             let list = json!([canvases, freed]);
             if !freed.is_empty() {
                 state.style_cache.forget(&freed);
@@ -1467,8 +1448,6 @@ pub fn call(
                 _ => (2, ACTIVE),
             };
             let focus = if op == "dom.focus" { FOCUS } else { 0 };
-            // WARNING: like Chrome, `:focus` and `:focus-within` don't match while the window is not focused, but the
-            // focus stays, so fields keep their selection.
             let shown = args[2].as_bool() != Some(true);
             let used = state.style_cache.states & (flag | focus) != 0;
             let control = |id: &usize| {
@@ -1524,7 +1503,6 @@ pub fn call(
         }
         let id = args[0].as_u64().context("Expected node id")? as usize;
         ensure!(id < doc.nodes.len(), "Invalid node id");
-        // WARNING: the root element scrolls the page unless it is a scroll container itself.
         let page = doc.nodes[id].parent == Some(0)
             && doc.nodes[id].tag == "html"
             && !state.scroll.contains_key(&id);
@@ -1573,7 +1551,6 @@ pub fn call(
                 Ok(json!(nodes))
             }
             "dom.tree" => Ok(tree(doc, id, true)),
-            // WARNING: only the text of a `<style>` keeps its sheet as text; a `<link>` sheet is not text.
             "dom.source" => {
                 let node = &doc.nodes[id];
                 Ok(json!(match &node.stylesheet {
@@ -1629,11 +1606,11 @@ pub fn call(
             "dom.html" => {
                 let source = args[1].as_str().context("Expected HTML")?;
                 let tag = doc.nodes[id].tag.as_str();
-                // WARNING: only pages know namespaces, so they pass the context tag, `svg` for any SVG element outside an HTML integration point.
                 let parsed = match args[2].as_str() {
                     _ if tag == "#document" => Document::parse(source),
                     Some(context) => Document::fragment(source, context),
-                    // WARNING: template contents and shadow roots are the only fragments with markup, and template rules keep `<tr>` rows that Lit renders.
+                    // WARNING: shadow roots and template contents parse in `template` context, so the `<tr>` rows that
+                    // Lit renders are kept.
                     None if tag.starts_with('#') => Document::fragment(source, "template"),
                     None => Document::fragment(source, tag),
                 };
@@ -1653,7 +1630,6 @@ pub fn call(
                     .iter()
                     .map(|&child| ids[child])
                     .collect();
-                // WARNING: the new nodes hang below `id`, so they are not detached roots.
                 let detached = state.detached.len();
                 for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
                     node.parent = node.parent.map(|parent| ids[parent]);
@@ -2039,7 +2015,8 @@ pub fn call(
                     if state.retired.is_empty() {
                         state.retired_canvases.clear();
                     }
-                    // WARNING: only the first image replaced since the renderer drained `retired` can be on the GPU; later ones are dropped so unrendered windows do not grow it.
+                    // WARNING: only the first image replaced since the renderer drained `retired` can be on the GPU;
+                    // drop later ones, or unrendered windows grow it without bound.
                     if !Arc::ptr_eq(&old, &canvas.image) && state.retired_canvases.insert(id) {
                         state.retired.push(old);
                     }
@@ -2093,7 +2070,6 @@ pub fn call(
                     "Invalid pixel region"
                 );
                 let mut bytes = vec![0u8; width * height * 4];
-                // WARNING: with `true` the bytes stay premultiplied, as they are stored.
                 let premultiplied = args[5] == true;
                 for row in 0..height {
                     for col in 0..width {
@@ -2119,7 +2095,6 @@ pub fn call(
                 }
                 Ok(crate::web::base64(&bytes))
             }
-            // WARNING: `id` stays blank with its drawing state, as `transferToImageBitmap()` needs.
             "dom.canvasTake" => {
                 let to = args[1].as_u64().context("Expected node id")? as usize;
                 ensure!(to < doc.nodes.len(), "Invalid node id");
@@ -2236,7 +2211,6 @@ pub fn call(
                         if current.tag == "#text" {
                             return Ok(json!(offset + index));
                         }
-                        // WARNING: count only text nodes, like the walk above, so comments before the boundary add nothing.
                         pending.clear();
                         pending.extend(current.children.iter().take(index));
                         while let Some(node) = pending.pop() {
@@ -2262,7 +2236,6 @@ pub fn call(
                 Ok(if op == "dom.textOffset" {
                     json!(offset)
                 } else {
-                    // WARNING: with no text the point is inside the first empty block, as text after `<p><br></p>` would make a new line.
                     let mut node = id;
                     while let Some(&child) = doc.nodes[node].children.first()
                         && !doc.nodes[child].children.is_empty()
@@ -2296,7 +2269,6 @@ pub fn call(
                         json!(0)
                     });
                 };
-                // WARNING: a password shows bullets, so offsets go from its value to the bullets and back.
                 let password = doc.nodes[id]
                     .password()
                     .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
@@ -2351,7 +2323,6 @@ pub fn call(
                         .map_or_else(|| doc.text(id), str::to_owned),
                 );
                 let (font_size, height) = (units.font.em, units.font.lh.max(1.));
-                // WARNING: like render, the text starts in the content box, and an input centers its line there.
                 let padding = units.edges(style, style::PADDING, width);
                 let [top, right, bottom, left] = [0, 1, 2, 3].map(|side| {
                     let [size, kind, _] = style::BORDERS[side];
@@ -2510,8 +2481,8 @@ pub fn call(
             }
             "dom.client" => {
                 let rect = state.bounds.get(&id).copied().unwrap_or_default();
-                // WARNING: resize observers measure the boxes of the last frame, so they read its styles too. Styling
-                // the page that changed since then cost a pass, and another after each callback that changed it.
+                // WARNING: resize observers read the last frame's styles on purpose; styling the changed page here
+                // would cost a pass per callback.
                 let last = (args[1].as_bool() == Some(true))
                     .then(|| state.computed.clone().or_else(|| state.previous.clone()))
                     .flatten()
@@ -2548,7 +2519,10 @@ pub fn call(
                     })
                     .find(|&parent| doc.nodes[parent].tag == "table")
                     .is_some_and(|table| {
-                        computed.values.get(table).and_then(|style| style.get(Prop::BORDER_COLLAPSE))
+                        computed
+                            .values
+                            .get(table)
+                            .and_then(|style| style.get(Prop::BORDER_COLLAPSE))
                             == Some("collapse")
                     });
                 let base = doc.nodes[id]
@@ -2718,7 +2692,6 @@ pub fn call(
     })())
 }
 
-// WARNING: pages parse this JSON text, which costs a fraction of building and serializing JSON values for every node.
 fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     let mut list = Vec::with_capacity(1024);
     let mut pending: Vec<_> = if inclusive {
@@ -2728,7 +2701,6 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
     };
     while let Some(id) = pending.pop() {
         let node = &doc.nodes[id];
-        // WARNING: script and style sources can be large, so pages read them with `dom.source` when needed.
         let lazy = node.stylesheet.is_some() && node.tag == "#text"
             || !node.text.is_empty()
                 && node.parent.is_some_and(|parent| {
@@ -2736,7 +2708,6 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
                 });
         let text = (!lazy).then_some(&node.text);
         let count = node.attrs.iter().count();
-        // WARNING: each part is written as a JSON array, whose brackets become the commas of one flat list.
         let at = list.len();
         let _ = serde_json::to_writer(&mut list, &(id, node.parent, &node.tag, text, count));
         if at > 0 {
@@ -2778,7 +2749,6 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
         .as_ref()
         .context("Font loading requires a displayed window")?;
     ensure!(bytes.len() <= LIMIT, "Font exceeds 32 MB limit");
-    // WARNING: fontdb and the text systems read sfnt data only, so WOFF and WOFF2 fonts are decoded first.
     let bytes = match bytes.get(..4) {
         Some(b"\0\x01\0\0" | b"true" | b"OTTO" | b"ttcf") => bytes,
         #[cfg(target_os = "macos")]
@@ -2896,7 +2866,6 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
                         .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
                 });
             let position = style.get(Prop::POSITION).unwrap_or("static");
-            // WARNING: like CSSOM `offsetParent`, any box that contains its absolute descendants counts.
             let positioned = crate::render::effects::establishes(style).absolute;
             (if clip { MIRROR_CLIP } else { 0 })
                 | if positioned { MIRROR_POSITIONED } else { 0 }
@@ -2943,7 +2912,6 @@ pub(crate) fn hit_test(
             .parent
             .or_else(|| state.hosts.get(&id).copied())
     };
-    // WARNING: a box leaving the top layer still paints there, and takes hits there while the cascade shows it.
     let top: Vec<usize> = state
         .top_layer
         .iter()
@@ -2969,8 +2937,6 @@ pub(crate) fn hit_test(
             continue;
         }
         let node = &doc.nodes[id];
-        // WARNING: the styles can be older than the tree, from the last frame. Every box inside an inert one is
-        // inert too, but top layer boxes, which start their own walk.
         let Some(style) = computed.values.get(id) else {
             continue;
         };
@@ -3256,8 +3222,6 @@ pub(crate) fn styles(
             }
         }
     }
-    // WARNING: like HTML's "blocked by a modal dialog", the topmost modal dialog, or else the fullscreen element,
-    // makes every node but its flat tree descendants inert. It escapes `inert` ancestors, as in Chromium.
     let subject = [MODAL, FULLSCREEN].into_iter().find_map(|bit| {
         state
             .top_layer
@@ -3290,10 +3254,10 @@ pub(crate) fn styles(
         let flags = result.flags[id];
         let hidden = hidden || flags & style::DISPLAY_NONE != 0;
         let inert = inert || marks[id] & INERT != 0;
-        marks[id] |= u8::from(hidden) * HIDDEN | u8::from(inert) * INERT;
+        marks[id] |= (u8::from(hidden) * HIDDEN) | (u8::from(inert) * INERT);
         unsafe {
             let mirror = state.bounds.flags(id);
-            *mirror = *mirror & !MIRROR_INERT | u8::from(hidden || inert) * MIRROR_INERT;
+            *mirror = (*mirror & !MIRROR_INERT) | (u8::from(hidden || inert) * MIRROR_INERT);
         }
         let mode = if hidden || flags & style::INVISIBLE != 0 {
             style::UserSelect::None
@@ -4255,9 +4219,15 @@ mod tests {
             },
         );
         let read = |doc: &mut Document, state: &mut State| {
-            call("dom.computed", &json!([id, "color", ""]), doc, state, viewport)
-                .unwrap()
-                .unwrap()
+            call(
+                "dom.computed",
+                &json!([id, "color", ""]),
+                doc,
+                state,
+                viewport,
+            )
+            .unwrap()
+            .unwrap()
         };
         assert_eq!(read(&mut doc, &mut state), json!(""));
         let cached = styles(&mut doc, &mut state, viewport, None);

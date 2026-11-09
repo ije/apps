@@ -154,8 +154,8 @@ static id AppsValue(const char *text) {
 }
 
 static NSData *AppsSecretLookup(OSStatus *status);
-// WARNING: macOS asks to reset the keychain when it finds none, and a process with another HOME has none, so it gets no
-// secret store. The answer stays for the process, so availability checks never ask twice.
+// WARNING: macOS asks to reset the keychain when it finds none, as in a process with another HOME, so such a process
+// gets no secret store. The answer is cached so checks never ask twice.
 static NSData *AppsSecret(OSStatus *status) {
     static NSData *secret;
     static OSStatus result;
@@ -205,7 +205,6 @@ static void AppsNativeEmit(NSDictionary *event) {
     os_unfair_lock_unlock(&AppsEventsLock);
     if (AppsWake) AppsWake();
 }
-// WARNING: popups run a nested loop, so they open after the script that asked returns, like Electron's.
 static void AppsLater(dispatch_block_t block) {
     CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, block);
     CFRunLoopWakeUp(CFRunLoopGetMain());
@@ -907,7 +906,6 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         } else result = @{ @"openAtLogin": @NO, @"status": @"not-found" };
     }
     else if ([op hasPrefix:@"dialog."]) {
-        // WARNING: async dialogs must not run a modal loop, which would hold the main script until the dialog closes.
         NSNumber *request = args[@"async"];
         void (^emit)(NSDictionary *) = ^(NSDictionary *value) { AppsNativeEmit(@{ @"type": @"reply", @"id": request, @"value": value }); };
         if ([op isEqualToString:@"dialog.open"] || [op isEqualToString:@"dialog.save"]) {

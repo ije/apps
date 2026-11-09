@@ -226,12 +226,10 @@ impl<'i> AtRuleParser<'i> for Rules {
                 "tailwindcss/theme" | "tailwindcss/utilities" => false,
                 _ => return Err(ParseError::unexpected_token()),
             };
-            // WARNING: `layer()`, `source()`, `prefix()` and `important` are ignored.
             while input.next().is_ok() {}
             return Ok(Item::Rule(Rule::Tailwind(Some(preflight))));
         }
         if name.eq_ignore_ascii_case("reference") && self.top_level {
-            // WARNING: the referenced file isn't loaded; the theme of the page's other sheets applies.
             input.expect_url_or_string()?;
             while input.next().is_ok() {}
             return Ok(Item::Rule(Rule::Tailwind(None)));
@@ -896,7 +894,6 @@ pub(crate) struct Lengths {
     pub container: Option<[f32; 2]>,
 }
 
-// WARNING: `ids` is as long as the node arena, so copies share its chunks.
 #[derive(Clone, Default)]
 pub(crate) struct NodeLengths {
     ids: super::Chunked<u32>,
@@ -932,7 +929,6 @@ impl NodeLengths {
         self.ids.get(id).map(|&index| &self.list[index as usize])
     }
 
-    /// Gives nodes past the old end, and `id` with `unset`, the lengths `reset` started with.
     pub(crate) fn grow(&mut self, count: usize) {
         self.ids.resize(count, 0);
     }

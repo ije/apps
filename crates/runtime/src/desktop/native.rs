@@ -24,7 +24,6 @@ pub(crate) fn theme_state() -> u32 {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn observe() {
-    // WARNING: native events arrive on any thread, so they wake the main side through its own waker.
     static WAKER: std::sync::OnceLock<crate::host::Waker> = std::sync::OnceLock::new();
     extern "C" fn wake() {
         if let Some(waker) = WAKER.get() {

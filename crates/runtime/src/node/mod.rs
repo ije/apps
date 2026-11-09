@@ -36,7 +36,6 @@ unsafe extern "system" {
     fn WaitForSingleObject(handle: std::os::windows::io::RawHandle, milliseconds: u32) -> u32;
 }
 
-// WARNING: runs `done` on a thread after the child exits. The child stays unreaped for `try_wait`.
 pub(crate) fn on_exit(child: Exit, done: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("apps-exit".into())
@@ -218,8 +217,6 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
 });
 static READY: std::sync::Condvar = std::sync::Condvar::new();
 
-// WARNING: like libuv, all contexts share up to 4 threads for blocking work (fs, dns, zlib, crypto, Node-API async
-// work), so a slow job delays the jobs queued behind it.
 pub(crate) fn blocking(job: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
     let mut pool = POOL
         .lock()

@@ -16,8 +16,8 @@ fn redraw_when_decoded(
     decoding: Decoding,
 ) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
     move |window, _| {
-        // WARNING: a later box using the same file can take the image in the frame that started the job. Then
-        // only this closure holds the slot, and the first box still has to paint.
+        // WARNING: a later box with the same file can take the image first. Then only this closure holds the slot, and
+        // the first box still has to paint.
         if Arc::strong_count(&decoding) == 1
             || decoding
                 .lock()
@@ -105,7 +105,6 @@ pub(super) fn css_background(
                             let mut host = view.host.borrow_mut();
                             let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
                             let scale = window.scale_factor();
-                            // WARNING: a layer with a set size is one tile, repeated when it paints.
                             let [[tile_width, tile_height], [tile_x, tile_y]] =
                                 super::effects::tile(&size, &position, &units, width, height);
                             let tiled = !matches!(
@@ -160,15 +159,14 @@ pub(super) fn css_background(
                                     decoded(backgrounds)
                                         .is_some_and(|bitmap| Arc::ptr_eq(&bitmap, image))
                                 };
-                            // WARNING: bitmaps are decoded once per file and shared; SVGs are drawn at the box size.
                             if backgrounds.get(&key).is_none_or(|(old, image)| {
                                 *old != source
                                     || !fixed(backgrounds, image)
                                         && [image.size().width, image.size().height].map(u32::from)
                                             != cell
                             }) {
-                                // WARNING: files decode on workers like `<img>`. A decoded bitmap is taken
-                                // here, where a layer holds it at once, since `retire` drops unheld bitmaps.
+                                // WARNING: take a decoded bitmap only where a layer holds it at once, since `retire`
+                                // drops unheld bitmaps.
                                 let bitmap = match decoded(backgrounds) {
                                     Some(bitmap) => bitmap,
                                     None => {
@@ -207,7 +205,6 @@ pub(super) fn css_background(
                                                         .unwrap_or_else(PoisonError::into_inner) =
                                                         Some(image);
                                                 }));
-                                                // WARNING: at most two files decode at once to bound their memory, and idle workers exit.
                                                 if jobs.1 < 2
                                                     && std::thread::Builder::new()
                                                         .name("apps-image".into())
@@ -330,8 +327,8 @@ pub(super) fn css_background(
                                 return;
                             }
                             if tiled {
-                                // WARNING: only the tiles in the visible part of the box paint, found by index,
-                                // so a far position or a tiny tile never loops forever.
+                                // WARNING: find the visible tiles by index, so a far position or a tiny tile never
+                                // loops forever.
                                 let visible = window.content_mask().bounds.intersect(&bounds);
                                 let [width, height] = [width * nx, height * ny];
                                 let origin = [
@@ -420,9 +417,8 @@ pub(super) fn css_background(
                     if width <= 0. || height <= 0. {
                         return;
                     }
-                    // A layer that fills the box with a gradient along one axis is drawn as a strip three pixels
-                    // across. The GPU stretches the middle pixel over the box.
-                    // WARNING: the outer pixels stay outside the box, so filtering never reads other atlas tiles.
+                    // WARNING: a one-axis gradient draws as a 3 px strip stretched over the box. Its outer pixels stay
+                    // outside the box, so filtering never reads other atlas tiles.
                     let scale = window.scale_factor();
                     let axis = strip.filter(|_| {
                         matches!(size.as_str(), "" | "auto" | "auto auto")
@@ -466,8 +462,6 @@ pub(super) fn css_background(
                     } else {
                         position.as_str()
                     };
-                    // WARNING: building the gradient's SVG costs more than drawing the box, so the bitmap is
-                    // kept by its exact inputs: the strings, then the box size and units as hex bits.
                     let mut inputs = String::with_capacity(
                         kind.len() + body.len() + size.len() + position.len() + repeat.len() + 168,
                     );
@@ -491,8 +485,8 @@ pub(super) fn css_background(
                     };
                     let entry = dom.backgrounds.get(&key);
                     if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
-                        // WARNING: only new boxes take and fill the cache, so a gradient that animates
-                        // doesn't keep its old frames.
+                        // WARNING: only new boxes take and fill the cache, or an animated gradient would keep its old
+                        // frames.
                         let new = entry.is_none();
                         let cached = new
                             .then(|| {
@@ -543,8 +537,7 @@ pub(super) fn css_background(
                     if let Some((_, image)) = dom.backgrounds.get(&key)
                         && let Some([x, y]) = tiled
                     {
-                        // WARNING: tiles sit on device pixels, so their edges never sample other atlas tiles.
-                        // Only the visible ones paint, starting at the first whole tile that reaches it.
+                        // WARNING: tiles snap to device pixels, so their edges never sample other atlas tiles.
                         let visible = window.content_mask().bounds.intersect(&bounds);
                         let start = |edge, at: f32, side: f32, cell: f32, low| {
                             let at = f32::from(edge) + at - if at > 0. { side } else { 0. };

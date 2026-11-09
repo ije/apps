@@ -8,8 +8,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const uncloneable=()=>{throw new Error('An object could not be cloned.');};
   const jsonEncoder=new TextEncoder(),jsonDecoder=new TextDecoder();
   const capability=(action,target,once)=>{const id=random();functions.set(id,{action,recipient:peer(target),persistent:!once,once});return id;};
-  // WARNING: plain data crosses as JSON, which keeps it exactly: finite numbers but -0, no undefined, no holes, plain
-  // prototypes and no object twice. Everything else takes the structured clone encoding below.
+  // WARNING: only data that JSON keeps exactly may cross as JSON: finite numbers but -0, no undefined, no holes, plain
+  // prototypes and no object twice.
   let floats=false;
   const plain=(value,seen)=>{
     if(value===null||typeof value==='string'||typeof value==='boolean')return true;
@@ -22,7 +22,6 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     for(const key in value)if(!plain(value[key],seen))return false;
     return true;
   };
-  // WARNING: IPC payloads follow structured clone, so functions and promises only cross in contextBridge values (`strict` false).
   const encode=(value,target,strict=true,persistent=false,seen=new Map())=>{
     // WARNING: Rust forwards bytes without parsing them, and its JSON parser can change the last bit of a float, so
     // plain data with floats or of more than 4 KB goes as UTF-8 JSON, and other numbers that are not safe integers go as text.
@@ -156,7 +155,6 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     // WARNING: page objects never enter the preload realm: the preload `document` is a proxy, and the page answers with clones and object handles.
     const remote=(...args)=>answer(send(page,{kind:'dom',args:encode(args,page)}),page);
     const read=value=>Array.isArray(value)?value.map(read):value&&typeof value==='object'&&'$ref'in value?facade(value.$ref):value;
-    // WARNING: the page keeps each object handle until the preload proxy for it is collected, then forgets it in one batch.
     const released=new Set(),flush=()=>{if(!released.size)return;const ids=[...released];released.clear();try{remote('release',0,null,ids);}catch{}};
     const handles=new __appsFinalizers(ref=>{if(facades.get(ref)?.deref())return;facades.delete(ref);if(released.add(ref).size===1)queueMicrotask(flush);});
     const facade=ref=>{let proxy=facades.get(ref)?.deref();if(!proxy){proxy=new Proxy({},{get:(_,key)=>{if(typeof key!=='string'||key==='then')return undefined;const value=remote('get',ref,key);return value?.$method?(...args)=>read(remote('call',ref,key,args)):read(value);},set:(_,key,value)=>{if(typeof key!=='string')return false;remote('set',ref,key,value);return true;}});facades.set(ref,new WeakRef(proxy));handles.register(proxy,ref);released.delete(ref);}return proxy;};

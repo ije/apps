@@ -447,7 +447,8 @@ impl Prop {
                 if let Some(&prop) = ids.get(name) {
                     return prop;
                 }
-                // WARNING: each page thread has its own ids, so threads share the leaked names.
+                // WARNING: ids are per thread, so the leaked names are shared across threads to leak each name only
+                // once.
                 static LEAKED: std::sync::Mutex<rustc_hash::FxHashSet<&'static str>> =
                     std::sync::Mutex::new(rustc_hash::FxHashSet::with_hasher(
                         rustc_hash::FxBuildHasher,
@@ -694,7 +695,7 @@ fn merge(list: &mut Vec<(Prop, Rc<str>)>, start: usize) {
     {
         return;
     }
-    // WARNING: the stable sort keeps the later of two values for the same property.
+    // WARNING: the sort must stay stable, so reverse, dedup and reverse keeps the later of two values for one property.
     list.sort_by_key(|entry| entry.0);
     list.reverse();
     list.dedup_by_key(|entry| entry.0);

@@ -156,7 +156,6 @@ impl renderer::Hooks for FieldText {
         self.selected.set(selected);
     }
 
-    // WARNING: the field paints its own rows, so the text node's lines are not painted.
     fn paint(&self, cx: &mut renderer::NodeCx<'_>, _: &mut dyn FnMut(&mut Window)) {
         let Some(layout) = cx.text_layout().cloned() else {
             return;
@@ -178,7 +177,6 @@ impl renderer::Hooks for FieldText {
             .into_iter()
             .collect();
         let strut = window.text_system().resolve_font(&self.run.font);
-        // WARNING: a long field shapes all its text once, but paints only the rows its box shows.
         let mask = window.content_mask().bounds;
         let mut origin = layout.bounds().origin;
         let mut offset = 0;
@@ -579,7 +577,7 @@ impl renderer::View for PageView {
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let state = self.editing()?;
-        // WARNING: the IME asks right after an edit, before the next frame lays out the new text.
+        // WARNING: the IME asks right after an edit, before the next frame lays out the new text, so reflow first.
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();

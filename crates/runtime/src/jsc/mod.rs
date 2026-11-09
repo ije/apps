@@ -17,8 +17,6 @@ use std::{
 
 type Script = (&'static str, fn() -> &'static str);
 
-// Runtime scripts by URL, in the order engines run them. Main, preload and worker engines run the node scripts, every
-// engine runs the web scripts, and pages run the page scripts, WebGPU only with its feature.
 const NODE_SCRIPTS: [Script; 12] = [
     ("apps:ffi", || js!("node/ffi.js")),
     ("apps:sqlite", || js!("node/sqlite.js")),
@@ -53,10 +51,8 @@ const PAGE_SCRIPTS: [Script; 2] = [
     ("apps:dom", || js!("dom.js")),
 ];
 
-// Identifies the runtime scripts, see build.rs.
 pub const RUNTIME_SCRIPTS: &str = env!("APPS_RUNTIME_SCRIPTS");
 
-// All runtime scripts, by URL, for `apps build --aot`.
 pub fn runtime_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
     NODE_SCRIPTS
         .into_iter()
@@ -68,8 +64,6 @@ pub fn runtime_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
 pub(crate) type Ptr = *mut c_void;
 type Callback = unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr;
 
-// Runtime scripts that engines ran, by URL, and scripts of the app bundle, by name, with their bytecode once it is
-// built, and whether a thread builds it.
 type Scripts = (
     Vec<(&'static str, &'static str, Option<&'static [u8]>)>,
     bool,
@@ -207,7 +201,6 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     .any(|bundle| directory.join(bundle).is_file())
         && executable == std::env::current_exe()?.canonicalize()?
     {
-        // WARNING: app.dylib of `apps build --aot` holds JavaScriptCore and the app's native code.
         let aot = directory.join("../Resources/app.dylib");
         if aot.is_file() {
             return Ok(aot);
@@ -251,25 +244,24 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
 impl JavaScriptCore {
     pub fn load() -> Result<Rc<Self>> {
         let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
-        // WARNING: JSC libraries must export the C ABI and unhandled-rejection callback SPI.
         let library = unsafe { Library::new(&path) }
             .with_context(|| format!("Cannot load Bun JavaScriptCore from {}", path.display()))?;
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;
-            // WARNING: JSC reads its options once, from the environment, when the first group is created. The first load runs before other threads start.
+            // WARNING: JSC reads its options from the environment once, when the first group is created. `set_var` is
+            // sound here only because the first load runs before other threads start.
             static OPTIONS: std::sync::Once = std::sync::Once::new();
             let mut group = None;
             OPTIONS.call_once(|| {
                 std::env::set_var("JSC_useSharedArrayBuffer", "1");
                 // WARNING: with 16 GB of RAM or more, a heap may grow to about 4x its live size before a full GC. This makes it about 2x.
                 std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
-                // WARNING: JSC's incremental sweeper runs on a timer that the generic event loop never fires, so the
-                // memory of dead cells, like string buffers, stayed until allocation reached their blocks, hundreds
-                // of MB on pages that allocate a lot. A sweep after each collection frees it, in a few ms.
+                // WARNING: JSC's incremental sweeper runs on a timer that the generic event loop never fires, so
+                // without a sweep after each collection dead cells keep hundreds of MB.
                 std::env::set_var("JSC_sweepSynchronously", "1");
-                // WARNING: AOT images use wide references, which need no cell cage. In the cage, every block that the
-                // heap holds stays resident, about 110 MB more than fastMalloc on DiffsHub's stress test.
+                // WARNING: in JSC's cell cage every block the heap holds stays resident. AOT images use wide
+                // references, which need no cage.
                 std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
                 let _ = aot::load(&path);
                 group = Some(group_create());
@@ -280,7 +272,6 @@ impl JavaScriptCore {
             });
             Ok(Rc::new(Self {
                 aot: aot::load(&path)?,
-                // WARNING: engines of one thread share a VM, so JSC reuses compiled runtime code across windows.
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: library
                     .get(b"JSGlobalContextSetInspectable\0")
@@ -428,9 +419,8 @@ impl JavaScriptCore {
         self.shrink.is_some() && self.busy.get() >= std::time::Duration::from_millis(20)
     }
 
-    // WARNING: JSC's GC timers don't fire on the generic event loop, so garbage stays until the heap has grown
-    // about 2x. A collection costs about 300 ms of CPU over all GC threads and drops the compiled code, so it must
-    // not run for the timers and polls that apps always have, or it uses more CPU at idle than the app itself.
+    // WARNING: JSC's GC timers don't fire on the generic event loop, so the runtime collects itself. A collection drops
+    // compiled code and costs much CPU, so the timers and polls that apps always have must not trigger it.
     pub(crate) fn shrink_due(&self) -> bool {
         use std::time::Duration;
         let (now, busy) = (std::time::Instant::now(), self.busy.get());
@@ -444,8 +434,6 @@ impl JavaScriptCore {
             .set(self.burst.get() || ran >= Duration::from_millis(100));
         if ran >= Duration::from_millis(20) {
             self.quiet.set(0);
-            // WARNING: an app whose timers run 20 ms or more in every second never has a quiet one, so the
-            // 5-minute collection takes any second that isn't busy.
             return ran < Duration::from_millis(100)
                 && now.duration_since(self.shrunk.get()) >= Duration::from_secs(300);
         }
@@ -471,7 +459,7 @@ impl Drop for JavaScriptCore {
     }
 }
 
-// Compiles a script and all of its functions into bytecode, which is never freed, because decoded code points into it.
+// WARNING: the bytecode is never freed, because decoded code points into it.
 fn create_bytecode(
     api: &JavaScriptCore,
     ctx: Ptr,
@@ -492,8 +480,6 @@ fn create_bytecode(
     })
 }
 
-// WARNING: the first window's engines start some 60 ms after the main side, while AppKit launches, so a thread builds
-// the bytecode of the runtime scripts from the start, those of pages first.
 pub(crate) fn prebuild(api: &JavaScriptCore, webgpu: bool, node: bool) {
     if api.aot.is_some() || api.evaluate_latin1.is_none() || api.create_bytecode.is_none() {
         return;
@@ -516,7 +502,6 @@ pub(crate) fn prebuild(api: &JavaScriptCore, webgpu: bool, node: bool) {
         .spawn(build_bytecode);
 }
 
-// Builds the bytecode of the runtime scripts that have none yet, in a VM of its own.
 fn build_bytecode() -> Result<()> {
     let api = JavaScriptCore::load()?;
     let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
@@ -539,8 +524,6 @@ fn build_bytecode() -> Result<()> {
     Ok(())
 }
 
-// The bytecode of the runtime scripts that apps with these disabled features run, and of the app's own ASCII scripts,
-// for `apps build --bytecode`.
 pub fn bytecode<'a>(
     disabled: u32,
     app: &[(&'a str, &'a str)],
@@ -575,7 +558,6 @@ pub fn bytecode<'a>(
     Ok(bytecode)
 }
 
-// WARNING: the source and the bytecode must live as long as the process, because JSC reads both in place.
 pub(crate) fn add_bytecode(name: &'static str, source: &'static str, bytecode: &'static [u8]) {
     SCRIPTS
         .lock()
@@ -584,7 +566,6 @@ pub(crate) fn add_bytecode(name: &'static str, source: &'static str, bytecode: &
         .push((name, source, Some(bytecode)));
 }
 
-// The bytecode of a script of the app bundle, by where its source is.
 fn bundled(source: &[u8]) -> Option<&'static [u8]> {
     let scripts = SCRIPTS.lock().unwrap();
     let script = scripts
@@ -859,9 +840,8 @@ unsafe extern "C" fn chunk(
         }
     }
     let url = api.string(&format!("apps:///{name}"));
-    // WARNING: `JSEvaluateScript` keeps its own copy of the source, as UTF-16 if it holds a NUL or any non-ASCII
-    // byte. JSC points at these bytes instead, so they are never released. Mapped pages stay clean, so they don't
-    // count in the footprint, and windows and workers share them.
+    // WARNING: JSC reads these bytes in place, so they are never released. `JSEvaluateScript` would copy the source
+    // instead, as UTF-16 if it has a NUL or a non-ASCII byte.
     let result = if let Some(evaluate) = api.evaluate_latin1
         && source.is_ascii()
     {
@@ -899,7 +879,7 @@ fn well_formed(json: &mut str) {
     let mut from = 0;
     while let Some(at) = json.get(from..).and_then(|rest| rest.find('\\')) {
         let at = from + at;
-        // WARNING: ASCII bytes replace ASCII bytes here, so the text stays UTF-8.
+        // SAFETY: ASCII bytes replace ASCII bytes, so the text stays UTF-8.
         if let Some(escape) = unsafe { json.as_bytes_mut() }.get_mut(at + 1..at + 6)
             && escape[..2] == *b"ud"
             && matches!(escape[2], b'8'..=b'9' | b'a'..=b'f')
@@ -971,9 +951,6 @@ fn access(role: Role, op: &str) -> Result<()> {
     }
 }
 
-// WARNING: host calls: `native(op, ...args)` takes primitive and binary arguments directly, and
-// `native(0, op, json, buffers?)` takes the rest as JSON. Results come back as JavaScript values,
-// and failures throw an `Error` with the I/O `code`.
 unsafe extern "C" fn call(
     ctx: Ptr,
     _function: Ptr,
@@ -1037,7 +1014,6 @@ unsafe extern "C" fn call(
             let buffers = buffers.unwrap_or_default();
             let mut json = api.text(ctx, *values.get(2).context("Expected JSON arguments")?);
             well_formed(&mut json);
-            // WARNING: GPU command lists can be large, so only the WebGPU library parses their JSON.
             if let (Role::Renderer(id), Some(op)) = (binding.2, op.strip_prefix("gpu.")) {
                 return run(buffers, &mut || gpu(&binding, ctx, id, op, json.as_bytes()));
             }
@@ -1060,7 +1036,6 @@ unsafe extern "C" fn call(
             }
             return Ok(unsafe { (api.undefined)(ctx) });
         }
-        // WARNING: page writes arrive as `dom.batch` with integer codes in bytes and their strings joined in the text, so they skip JSON and copies.
         if let Role::Renderer(id) = role
             && op == "dom.batch"
         {
@@ -1136,7 +1111,8 @@ unsafe extern "C" fn call(
                 4 => Value::String(api.text(ctx, value)),
                 5 if unsafe { (api.is_function)(ctx, value) } => Value::Null,
                 5 => {
-                    // WARNING: the arguments live until the call returns, so their bytes are borrowed, see `payload::input`.
+                    // WARNING: these bytes are not static: they borrow the arguments, which live only until the call
+                    // returns.
                     buffers.push(bytes::Bytes::from_static(crate::jsc::payload::view(
                         &api, ctx, value,
                     )?));
@@ -1239,7 +1215,6 @@ fn dispatch(
             .call(op, values);
     }
     if let Some(op) = op.strip_prefix("native.") {
-        // WARNING: native state and its events belong to the process, so a preload gets only what Electron's gets.
         anyhow::ensure!(
             matches!(role, Role::Main)
                 || matches!(role, Role::Preload(_))
@@ -1512,8 +1487,8 @@ fn dispatch(
     }
 }
 
-// WARNING: JSC cannot see the native DOM, so the wrappers that keep removed nodes and their styles alive
-// would wait for an unrelated GC, and a page that rebuilds rows as it scrolls would grow without bound.
+// WARNING: JSC cannot see the native DOM, so without this report the wrappers of removed nodes wait for an unrelated
+// GC, and pages that rebuild rows grow without bound.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     let created = binding
         .1
@@ -1523,10 +1498,8 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     if let Some(report) = binding.0.extra_memory
         && let Some(created) = created.filter(|&created| created > 0)
     {
-        // WARNING: a removed node with a wrapper is freed only after a GC finds the wrapper dead, and a scrolling
-        // list makes them much faster than GCs run. Each wrapper counts for more than it costs, so GCs keep the dead
-        // ones few. JSC drops this cost only in a full collection, so counting nodes without wrappers too made a
-        // page that rebuilds its rows every frame run full collections many times a second.
+        // WARNING: report only nodes with wrappers. JSC drops this cost only in a full collection, so counting all
+        // nodes makes pages that rebuild rows each frame run many full GCs a second.
         unsafe { report(ctx, created * 65536) };
     }
 }
@@ -1820,8 +1793,8 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     if !matches!(role, Role::Renderer(_)) {
         return again();
     }
-    // WARNING: JSC doesn't say which run a tick belongs to, and restarts its budget per run, but
-    // `busy` changes only when a run returns.
+    // WARNING: JSC doesn't say which run a tick belongs to and restarts its budget per run, so ticks count per value of
+    // `busy`, which changes only when a run returns.
     let busy = api.busy.get();
     let ticks = match RUN_TICKS.get() {
         (last, ticks) if last == busy => ticks + 1,
@@ -2128,7 +2101,6 @@ impl JsContext {
                     engine.run(source(), url)?;
                 }
             }
-            // WARNING: pages can't turn strings into code: eval() and the constructors of every function kind throw.
             if !enabled("jsExecute") {
                 let message = engine.api.string("Code generation is disabled in pages");
                 unsafe {
@@ -2144,8 +2116,6 @@ impl JsContext {
         self.evaluate(source, url, ptr::null_mut())
     }
 
-    // Runs a runtime script, which JSC reads in place. When a second engine runs it, a thread builds its bytecode, and
-    // later engines of the process decode that instead of compiling the script. Apps built with --aot run native code.
     fn run(&self, source: &'static str, url: &'static str) -> Result<()> {
         if let Some(aot) = self.api.aot
             && let Some(module) = aot.runtime(url)
@@ -2234,7 +2204,7 @@ impl JsContext {
     }
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
-        // WARNING: runtime helpers like `NEXT` run under the URL of the script they continue, so they never replace its source.
+        // WARNING: `NEXT` runs under the URL of the script it continues, so it must not replace that script's source.
         if self.devtools
             && source != NEXT
             && (matches!(url, "app.js" | "apps:page" | "apps:preload") || !url.starts_with("apps:"))
@@ -2248,7 +2218,11 @@ impl JsContext {
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
-        let result = match (compiled, self.api.evaluate_latin1, bundled(source.as_bytes())) {
+        let result = match (
+            compiled,
+            self.api.evaluate_latin1,
+            bundled(source.as_bytes()),
+        ) {
             (Some((aot, module)), ..) => {
                 aot.call(&self.api, self.ctx, module, this, &mut exception)
             }
@@ -2275,7 +2249,9 @@ impl JsContext {
         };
         self.api.busy.set(self.api.busy.get() + start.elapsed());
         unsafe { (self.api.string_release)(source_url) };
-        Ok(self.api.text(self.ctx, self.checked(url, result, exception)?))
+        Ok(self
+            .api
+            .text(self.ctx, self.checked(url, result, exception)?))
     }
 
     fn log(&self, url: &str, message: &str) {
@@ -2379,7 +2355,7 @@ impl JsContext {
             napi.sweep();
             napi.drain();
         }
-        // WARNING: -2 means one macrotask ran. Each call returns to the VM, which drains the microtasks before the next one.
+        // WARNING: -2 means one macrotask ran. Run one per call, so the VM drains the microtasks between them.
         loop {
             let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
                 (self.api.to_number)(self.ctx, value, ptr::null_mut())
@@ -2837,7 +2813,6 @@ mod tests {
                 .unwrap(),
             "[\"a\u{fffd}\",\"b\u{fffd}\"]"
         );
-        // WARNING: getters can hand out arrays that nothing else holds, so `input` must keep them alive.
         page.eval(
             "globalThis.items=[];Object.defineProperty(items,0,{get:()=>new Uint8Array(1<<16).fill(7)});Object.defineProperty(items,1,{get:()=>new Uint8Array(4)})",
             "test",
@@ -2950,10 +2925,18 @@ mod tests {
         };
         layout();
         page.eval("__appsLayout()", "test").unwrap();
-        page.eval("box.style.padding = '10px'; box.style.width = '90px'; __appsLayout()", "test").unwrap();
-        page.eval("getComputedStyle(box).paddingLeft", "test").unwrap();
+        page.eval(
+            "box.style.padding = '10px'; box.style.width = '90px'; __appsLayout()",
+            "test",
+        )
+        .unwrap();
+        page.eval("getComputedStyle(box).paddingLeft", "test")
+            .unwrap();
         layout();
-        assert_eq!(page.eval("__appsLayout(); seen.join()", "test").unwrap(), "100,90");
+        assert_eq!(
+            page.eval("__appsLayout(); seen.join()", "test").unwrap(),
+            "100,90"
+        );
     }
 
     #[test]

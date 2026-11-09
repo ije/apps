@@ -80,9 +80,8 @@ impl JavaScriptCore {
         unsafe { String::from_utf8_unchecked(text) }
     }
 
-    // WARNING: SIMD counts a lone surrogate as 2 bytes and can't convert it, so `write_utf8` then returns false and
-    // the caller encodes again into `utf8_len` bytes with `encode_utf16`, which writes U+FFFD. Without `out` this
-    // returns the size.
+    // WARNING: SIMD counts a lone surrogate as 2 bytes and can't convert it, so `write_utf8` returns false and the
+    // caller must encode again with `encode_utf16`, which writes U+FFFD.
     fn simd_utf8(&self, chars: &Chars, out: *mut u8) -> usize {
         let (pointer, length, latin1) = match *chars {
             Chars::Latin1(text) => (text.as_ptr().cast(), text.len(), true),
@@ -101,8 +100,8 @@ impl JavaScriptCore {
     }
 }
 
-// WARNING: a lone surrogate counts 3 bytes, the size of the U+FFFD that replaces it. Sums in u16 over chunks of 4096
-// units vectorize and can't overflow.
+// WARNING: a lone surrogate counts 3 bytes, for the U+FFFD that replaces it. The u16 sums vectorize, and chunks of 4096
+// units keep them from overflowing.
 fn utf8_len(units: &[u16]) -> usize {
     let wide: usize = units
         .chunks(4096)
@@ -181,7 +180,6 @@ fn encode_utf16(units: &[u16], out: &mut [u8]) -> (usize, usize) {
     (read, written)
 }
 
-// The bytes of a UTF-8 sequence that the end of `bytes` cuts short, which a stream keeps for its next chunk.
 fn incomplete(bytes: &[u8]) -> usize {
     for back in 1..=bytes.len().min(3) {
         let start = bytes.len() - back;
@@ -247,7 +245,6 @@ fn number(api: &JavaScriptCore, ctx: Ptr, value: Ptr) -> f64 {
     unsafe { (api.to_number)(ctx, value, ptr::null_mut()) }
 }
 
-// encode(string, kind): 0 UTF-8, 1 Latin-1 (low byte of each unit), 2 UTF-16LE. Returns a Uint8Array.
 unsafe extern "C" fn encode(
     ctx: Ptr,
     _: Ptr,
@@ -297,7 +294,6 @@ unsafe extern "C" fn encode(
     })
 }
 
-// encodeInto(string, bytes): writes the UTF-8 characters that fit. Returns [read units, written bytes].
 unsafe extern "C" fn encode_into(
     ctx: Ptr,
     _: Ptr,
@@ -323,8 +319,6 @@ unsafe extern "C" fn encode_into(
     })
 }
 
-// decode(bytes, kind, fatal, stream): 0 UTF-8, 1 Latin-1, 2 ASCII, 3 UTF-16LE as it is, then for TextDecoder
-// 4 UTF-16LE, 5 UTF-16BE and 6 windows-1252. A stream returns [string, bytes kept for the next chunk].
 unsafe extern "C" fn decode(
     ctx: Ptr,
     _: Ptr,
@@ -390,8 +384,6 @@ unsafe extern "C" fn decode(
                         pending += 2;
                         units.to_mut().pop();
                     }
-                    // WARNING: the scan goes on after each fix, so many lone surrogates stay linear. The unit after
-                    // a lone one never pairs with it, so starting the slice there is safe.
                     let mut from = 0;
                     while let Some(index) = lone(&units[from..]) {
                         ensure!(!fatal, INVALID);
@@ -427,7 +419,6 @@ unsafe extern "C" fn decode(
     })
 }
 
-// utf8Length(string): the size of the string in UTF-8.
 unsafe extern "C" fn utf8_length(
     ctx: Ptr,
     _: Ptr,
@@ -445,8 +436,6 @@ unsafe extern "C" fn utf8_length(
     })
 }
 
-// indexOf(haystack, needle, from, last): the first match at or after `from`, or the last one that starts at or
-// before it. Returns -1 without one.
 unsafe extern "C" fn index_of(
     ctx: Ptr,
     _: Ptr,
@@ -471,7 +460,6 @@ unsafe extern "C" fn index_of(
     })
 }
 
-// compare(a, b): -1, 0 or 1, comparing the bytes as unsigned numbers.
 unsafe extern "C" fn compare(
     ctx: Ptr,
     _: Ptr,
@@ -491,8 +479,7 @@ thread_local! {
     static ENTROPY: std::cell::RefCell<(Vec<u8>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
 }
 
-// random(view): fills the bytes with OS randomness. Like Node's entropy cache, up to 256 bytes come from unused
-// bytes of a 4 KB block, so most calls make no system call. No byte is handed out twice and the block stays here.
+// WARNING: hand out each byte of the cached entropy block at most once, or two callers get the same random bytes.
 unsafe extern "C" fn random(
     ctx: Ptr,
     _: Ptr,
@@ -523,7 +510,6 @@ unsafe extern "C" fn random(
     })
 }
 
-// equal(a, b): whether the bytes are the same, compared in constant time.
 unsafe extern "C" fn equal(
     ctx: Ptr,
     _: Ptr,
@@ -541,7 +527,6 @@ unsafe extern "C" fn equal(
     })
 }
 
-// digest(name, bytes, key): the md5, sha1 or sha2 digest of the bytes, or their HMAC with a key. Returns a Uint8Array.
 unsafe extern "C" fn digest(
     ctx: Ptr,
     _: Ptr,
@@ -566,9 +551,6 @@ unsafe extern "C" fn digest(
     })
 }
 
-// url(input, base, part, value): parses a URL and sets one part when given. Returns [href, ...offsets] with the end of
-// the scheme, the start and end of the username, password and host, and the end of the port, path and query, so
-// the getters slice one string. Offsets count UTF-16 units.
 unsafe extern "C" fn url(
     ctx: Ptr,
     _: Ptr,
@@ -579,10 +561,17 @@ unsafe extern "C" fn url(
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
         use ::url::Position::*;
-        let text = |index| api.chars(ctx, arg(index)).map(|chars| api.utf8_string(chars));
+        let text = |index| {
+            api.chars(ctx, arg(index))
+                .map(|chars| api.utf8_string(chars))
+        };
         let (input, base) = (text(0).context("Expected URL")?, text(1));
         let (key, value) = (text(2), text(3));
-        let url = crate::web::url(&input, base.as_deref(), key.as_deref().zip(value.as_deref()))?;
+        let url = crate::web::url(
+            &input,
+            base.as_deref(),
+            key.as_deref().zip(value.as_deref()),
+        )?;
         let href = url.as_str();
         let mut items = [ptr::null_mut(); 11];
         items[0] = api.utf8(ctx, href.as_bytes())?;
@@ -604,14 +593,17 @@ unsafe extern "C" fn url(
                 position => position,
             };
             let end = url[..position].len();
-            let end = if href.is_ascii() { end } else { href[..end].encode_utf16().count() };
+            let end = if href.is_ascii() {
+                end
+            } else {
+                href[..end].encode_utf16().count()
+            };
             *item = unsafe { (api.number)(ctx, end as f64) };
         }
         Ok(unsafe { (api.make_array)(ctx, items.len(), items.as_ptr(), ptr::null_mut()) })
     })
 }
 
-// drain(): runs the queued microtasks now, so one loop turn runs its tasks with the microtasks of each in between.
 unsafe extern "C" fn drain(
     ctx: Ptr,
     _: Ptr,

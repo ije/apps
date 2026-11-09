@@ -51,7 +51,7 @@ async fn run(
 ) -> Result<()> {
     let (writer, mut reader) = socket.split();
     let writer = tokio::sync::Mutex::new(writer);
-    // WARNING: reads go on while a send waits for the peer, so both sides can stream at once.
+    // WARNING: reads must go on while a send waits for the peer, or two peers that both stream can deadlock.
     let read = async {
         while let Some(message) = reader.next().await {
             let event = match message? {
@@ -92,7 +92,6 @@ async fn run(
             let (size, closing) = (command.len(), command.is_close());
             writer.lock().await.send(command).await?;
             written.fetch_add(size, Ordering::Relaxed);
-            // WARNING: `bufferedAmount` only needs a wake once the queue drains; ticks read the count meanwhile.
             if commands.is_empty() {
                 wake.wake();
             }

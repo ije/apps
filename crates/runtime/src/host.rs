@@ -206,8 +206,8 @@ impl Host {
         }
     }
 
-    // WARNING: applies the page writes that `dom.js` queued: `code, a, b, c` runs of 32-bit integers, where string arguments are UTF-16 lengths of consecutive parts of `text`.
-    // WARNING: `dom.js` mirrors the tree for reads, so only this batch and `dom.html` may change nodes, attributes or text of a page.
+    // WARNING: `dom.js` mirrors the tree for reads, so only this batch and `dom.html` may change the nodes, attributes
+    // or text of a page.
     pub(crate) fn batch(&mut self, id: u64, codes: &[u8], mut text: &str) -> Result<Value> {
         let node = |doc: &Document, value: i32| {
             usize::try_from(value)
@@ -235,7 +235,8 @@ impl Host {
         let state = self.dom.entry(id).or_default();
         let doc = &mut page.doc;
         let mut errors = Vec::new();
-        // WARNING: removals from one parent and inserts at one place edit the children list once per run, so emptying or filling a list is O(n). Parent links are always current, while `stale` still lists children that left it and `run` holds children not in their parent's list yet.
+        // WARNING: during a batch, parent links are current, but `stale` names a parent whose children list still holds
+        // children that left, and `run` holds children not yet in their parent's list.
         let (mut stale, mut run, mut runs) = (None, None, Vec::new());
         'ops: for op in codes.as_chunks::<16>().0 {
             let [code, a, b, c] =
@@ -266,7 +267,6 @@ impl Host {
                 };
                 (*part, text) = text.split_at(end);
             }
-            // WARNING: pages validate writes before they queue them, so a failed operation is skipped and reported instead of stopping the batch.
             let result = (|| -> Result<bool> {
                 Ok(match code {
                     0 => {
@@ -301,7 +301,6 @@ impl Host {
                             prune(doc, id);
                         }
                         let current = &doc.nodes[id];
-                        // WARNING: selectors only see whether text is empty and layout diffs the text itself, so other text edits keep the styles.
                         if !(current.tag == "#text"
                             && current.text.is_empty() == value.is_empty()
                             && current
@@ -430,7 +429,8 @@ impl Host {
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.invalidate();
                         }
-                        // WARNING: kept walks of the tree read these attributes, so they count as tree changes.
+                        // WARNING: kept walks of the tree read these attributes, so their edits must use `get_mut` and
+                        // count as tree changes.
                         let current =
                             if matches!(key, "slot" | "name" | "contenteditable" | "inert") {
                                 doc.nodes.get_mut(id)
@@ -481,7 +481,6 @@ impl Host {
                         if current.value == value {
                             return Ok(false);
                         }
-                        // WARNING: selectors only see whether a value is empty, so other edits keep the styles.
                         let fallback = current.attrs.get("value").map(String::as_str);
                         let empty = |value: Option<&String>| {
                             value
@@ -516,9 +515,6 @@ impl Host {
                         if old & mask == bits {
                             return Ok(false);
                         }
-                        // WARNING: a box that leaves the top layer stays in it until render sees its `overlay`
-                        // end, so it keeps what it lost as `LEAVING` bits; a box that comes back drops them. A
-                        // page without a window never draws, so its boxes leave at once.
                         let leaving = if bits & TOP_LAYER == 0
                             && state.text_system.is_some()
                             && state.top_layer.contains(&id)
@@ -549,7 +545,8 @@ impl Host {
                 })
             })();
             match result {
-                // WARNING: the node of an offscreen canvas is never on the page, so making many must not cost frames.
+                // WARNING: offscreen canvas nodes are never on the page, so their changes must not mark it dirty, or
+                // making many of them costs frames.
                 Ok(changed) => {
                     page.dirty |= changed
                         && usize::try_from(a)
@@ -577,7 +574,6 @@ impl Host {
         ensure!(self.enabled("webgpu"), "The webgpu feature is disabled");
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let result = self.graphics.entry(id).or_default().call(op, args)?;
-        // WARNING: a read of a WebGPU canvas keeps its frame in the page images, see `dom.canvasCommit`.
         if op == "resetCanvas"
             && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
             && let Some(state) = self.dom.get_mut(&id)
@@ -661,7 +657,6 @@ impl Host {
             } else {
                 writeln!(std::io::stdout(), "{text}")
             };
-            // WARNING: only developer tools drain logs, and packaged apps have none.
             if !self.packaged {
                 if self.logs.len() == 500 {
                     self.logs.pop_front();
@@ -679,7 +674,6 @@ impl Host {
             if op == "dom.navigate" {
                 ensure!(self.pages.contains_key(&id), "Window is closed");
                 let url = args[0].as_str().context("Expected navigation URL")?;
-                // WARNING: like `loadURL`, pages cannot navigate the window to remote or non-local URLs.
                 ensure!(
                     url.starts_with("apps:///") || url.starts_with("file:///"),
                     "Pages can only navigate to bundled or local files"
@@ -712,7 +706,6 @@ impl Host {
             let page = self.pages.get_mut(&id).context("Window is closed")?;
             if op == "dom.viewport" {
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
-                // WARNING: a zoomed viewport has fractional sizes, but like browsers `innerWidth` is whole.
                 return Ok(json!([
                     viewport[0].round(),
                     viewport[1].round(),
@@ -725,18 +718,17 @@ impl Host {
                 ]));
             }
             let state = self.dom.entry(id).or_default();
-            // WARNING: a worker has no window to share a text system with, so its first canvas makes one.
             if id == WORKER_PAGE
                 && matches!(op, "dom.canvas" | "dom.measureText")
                 && state.text_system.is_none()
             {
                 state.text_system = Some(std::rc::Rc::new(renderer::TextSystem::new()));
             }
-            // WARNING: `dom.requestFrame` takes a text system to mean a window, so a worker's animation frames stay on their timer.
+            // WARNING: `dom.requestFrame` treats a text system as a window, and a worker's canvas makes one, so a
+            // worker returns here and its animation frames stay on their timer.
             if id == WORKER_PAGE && op == "dom.requestFrame" {
                 return Ok(json!(false));
             }
-            // WARNING: a WebGPU frame reaches the CPU some time after its submit, so with `args[1]` this waits for it, for reads.
             if op == "dom.canvasCommit" {
                 let node = args[0].as_u64().context("Expected node id")? as usize;
                 let image = if let Some(canvas) = state.canvases.get(&node) {
@@ -776,7 +768,6 @@ impl Host {
             if op == "dom.screen" {
                 let (display, work) = (state.window.display, state.window.work_area);
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
-                // WARNING: a page without a window yet sees its viewport as the screen.
                 return Ok(if f32::from(display.size.width) > 0. {
                     json!(
                         [
@@ -840,7 +831,8 @@ impl Host {
             )
             .unwrap_or_else(|| Err(anyhow::anyhow!("Unknown DOM operation: {op}")));
             page.dirty |= std::mem::take(&mut state.dirty);
-            // WARNING: a worker has no renderer to drop images on the GPU, so nothing drains these.
+            // WARNING: a worker has no renderer to drop retired images on the GPU, so they are cleared here, or they
+            // grow without bound.
             if id == WORKER_PAGE {
                 state.retired.clear();
             }

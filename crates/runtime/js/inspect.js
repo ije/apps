@@ -124,7 +124,6 @@ globalThis.__appsInspect = (() => {
     return `${braces[0]}${base === '' && braces[0].length === 1 ? ' ' : `${base ? ` ${base}` : ''}\n${indentation}  `}${output.join(`,\n${indentation}  `)} ${braces[1]}`;
   };
   const more = remaining => `... ${remaining} more item${remaining > 1 ? 's' : ''}`;
-  // WARNING: JSC stacks hold only frames (`name@file:line:column`), so they are shown in Node's `    at` form after the error line.
   const stackOf = error => {
     let stack;
     try { stack = error.stack; } catch {}

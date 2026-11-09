@@ -62,8 +62,6 @@ fn render_group(
     let bbox = group.layer_bounding_box().transform(transform)?;
 
     let mut ibbox = if group.filters().is_empty() {
-        // Convert group bbox into an integer one, expanding each side outwards by 2px
-        // to make sure that anti-aliased pixels would not be clipped.
         tiny_skia::IntRect::from_xywh(
             (bbox.x().floor() as i32).checked_sub(2)?,
             (bbox.y().floor() as i32).checked_sub(2)?,
@@ -71,27 +69,19 @@ fn render_group(
             (bbox.height().ceil() as u32).checked_add(4)?,
         )?
     } else {
-        // The bounding box for groups with filters is special and should not be expanded by 2px,
-        // because it's already acting as a clipping region.
+        // WARNING: don't expand the box of a group with filters by 2px, since it already acts as the clipping region.
         let bbox = bbox.to_int_rect();
-        // Make sure our filter region is not bigger than 4x the canvas size.
-        // This is required mainly to prevent huge filter regions that would tank the performance.
-        // It should not affect the final result in any way.
         super::geom::fit_to_rect(bbox, ctx.max_bbox)?
     };
 
-    // Make sure our layer is not bigger than 4x the canvas size.
-    // This is required to prevent huge layers.
     if group.filters().is_empty() {
         ibbox = super::geom::fit_to_rect(ibbox, ctx.max_bbox)?;
     }
 
     let shift_ts = {
-        // Original shift.
         let mut dx = bbox.x();
         let mut dy = bbox.y();
 
-        // Account for subpixel positioned layers.
         dx -= bbox.x() - ibbox.x() as f32;
         dy -= bbox.y() - ibbox.y() as f32;
 

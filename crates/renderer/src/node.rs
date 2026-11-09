@@ -1,15 +1,14 @@
 use crate::{
     AlignItems, App, Baseline, Bounds, Corners, CursorStyle, Display, Edges, FlexDirection,
     FlexWrap, FontWeight, Hitbox, JustifyContent, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, Overflow, Overscroll, Pixels, Point, Position, RenderImage, Rgba,
-    ScrollPhase, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
+    MouseMoveEvent, Overflow, Overscroll, Pixels, Point, Position, Rgba, ScrollPhase,
+    ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
     TextStyleRefinement, WhiteSpace, Window, input::DispatchPhase, point, px, relative,
 };
 use std::{
     any::Any,
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -81,8 +80,7 @@ pub struct Node {
     pub(crate) content: Content,
 }
 
-// WARNING: boxed, so the builder chains in the runtime move a pointer instead of a 736-byte style per call. A shared
-// style is one the runtime built before from the same inputs, so commit finds it by pointer, and a change copies it.
+// WARNING: styles are boxed so builder chains move a pointer, not a 736-byte style.
 pub(crate) enum NodeStyle {
     Own(Box<Style>),
     Shared(Rc<Style>),
@@ -117,12 +115,11 @@ impl NodeStyle {
     }
 }
 
-// WARNING: a node is about 100 bytes plus its boxed style, so lists hold it boxed: a box with one child no longer allocates room for four
-// nodes, and moving children moves pointers.
+// WARNING: child nodes are boxed so a child list doesn't reserve room for several whole nodes, and moving children
+// moves pointers.
 pub enum Child {
     Node(Box<Node>),
     Kept(ElementId),
-    // WARNING: a kept box that its parent places again: its left and top insets, width and height.
     Placed(ElementId, Bounds<Pixels>),
 }
 
@@ -154,7 +151,6 @@ impl From<&str> for Child {
 pub(crate) enum Content {
     #[default]
     None,
-    Image(Arc<RenderImage>, ObjectFit),
     Text(SharedString, Option<Vec<TextRun>>),
     Measured(Box<dyn Measurement>),
     Layers(bool),
@@ -204,22 +200,19 @@ pub trait Hooks: 'static {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window)
     }
-    // WARNING: a box whose subtree didn't change and lies where it lay keeps its last prepaint, and its hooks only
-    // `kept`, which gives again what a pass collects anew. A hook whose prepaint reads more than its box, or leaves
-    // state that its paint takes, is volatile and prepaints in every pass.
+    // WARNING: a kept box skips prepaint and calls only `kept`. Return false only when prepaint reads nothing beyond
+    // the box and leaves no state for paint.
     fn volatile(&self) -> bool {
         true
     }
-    // WARNING: true when the hook paints its box only within its bounds and its children where they lie. A
-    // transform, a filter or a drawing can paint anywhere.
+    // WARNING: return true only when the hook paints its box within its bounds and its children where they lie, or
+    // paint may skip it wrongly.
     fn bounded(&self) -> bool {
         false
     }
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window)
     }
-    // WARNING: paints the box's text or measured content in place of the box's own lines, inside its clip and under
-    // its children and border, and returns whether it did.
     fn paint_content(&self, _cx: &mut NodeCx<'_>) -> bool {
         false
     }
@@ -320,7 +313,6 @@ pub struct NodeCx<'a> {
     pub window: &'a mut Window,
     pub bounds: Bounds<Pixels>,
     pub exact: Bounds<Pixels>,
-    // WARNING: the padding and border of the box, top, right, bottom and left, which hold its text in.
     pub inset: [Pixels; 4],
     pub baselines: [Option<Pixels>; 2],
     pub text: &'a TextStyle,
@@ -338,14 +330,11 @@ impl NodeCx<'_> {
     }
 }
 
-// WARNING: nodes start with one shared default style, so a node whose style is never set, like a paragraph that its
-// box adopts, allocates none.
 pub fn node() -> Node {
     thread_local!(static STYLE: Rc<Style> = Rc::default());
     shared(STYLE.with(Rc::clone))
 }
 
-// WARNING: a node with a style the runtime built before, see `Node::share_style`.
 pub fn shared(style: Rc<Style>) -> Node {
     Node {
         id: None,
@@ -371,8 +360,7 @@ impl Node {
         &self.style
     }
 
-    // WARNING: makes the node's style one that other nodes can take with `share_style`, which only nodes whose inputs
-    // fully determine the same style may do.
+    // WARNING: share a style only between nodes whose inputs fully determine the same style.
     pub fn shared_style(&mut self) -> Rc<Style> {
         if let NodeStyle::Own(style) = &mut self.style {
             self.style = NodeStyle::Shared(Rc::new(std::mem::take(&mut **style)));
@@ -381,10 +369,6 @@ impl Node {
             NodeStyle::Shared(style) => style.clone(),
             NodeStyle::Own(_) => unreachable!(),
         }
-    }
-
-    pub fn share_style(&mut self, style: Rc<Style>) {
-        self.style = NodeStyle::Shared(style);
     }
 
     pub fn element_id(&self) -> Option<ElementId> {
@@ -415,8 +399,6 @@ impl Node {
         !self.children.is_empty()
     }
 
-    // WARNING: a box with no children takes the content and hooks of a text node, and lays out and paints the text
-    // itself in its content box, so the text needs no box of its own.
     pub fn adopt(mut self, text: Node) -> Self {
         debug_assert!(self.children.is_empty() && matches!(self.content, Content::None));
         self.content = text.content;
@@ -429,8 +411,6 @@ impl Node {
         self
     }
 
-    // WARNING: a node is about 840 bytes, so loops that add many children push in place and reserve first, instead
-    // of moving the node through `child` and growing the list one by one.
     pub fn push(&mut self, child: impl Into<Child>) {
         self.children.push(child.into());
     }
@@ -511,13 +491,6 @@ impl Node {
 
     pub fn window_drag_area(mut self) -> Self {
         self.events().drag = true;
-        self
-    }
-
-    pub fn object_fit(mut self, fit: ObjectFit) -> Self {
-        if let Content::Image(_, kept) = &mut self.content {
-            *kept = fit;
-        }
         self
     }
 
@@ -803,21 +776,10 @@ impl Node {
     }
 }
 
-// WARNING: every stacking context holds two of these, so they share one style.
 pub fn layers(negative: bool) -> Node {
     thread_local!(static STYLE: Rc<Style> = node().absolute().w(px(0.)).h(px(0.)).shared_style());
     let mut node = shared(STYLE.with(Rc::clone));
     node.content = Content::Layers(negative);
-    node
-}
-
-pub fn img(image: Arc<RenderImage>) -> Node {
-    let size = image.size();
-    let mut node = node();
-    if size.height.0 > 0 {
-        node.style().aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
-    }
-    node.content = Content::Image(image, ObjectFit::Fill);
     node
 }
 
@@ -845,7 +807,6 @@ pub fn canvas<T: 'static>(
     })
 }
 
-// WARNING: a canvas whose drawing stays within its bounds, so paint can skip it with its box, see `Hooks::bounded`.
 pub fn canvas_within<T: 'static>(
     prepaint: impl Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
     paint: impl Fn(Bounds<Pixels>, T, &mut Window) + 'static,
@@ -987,13 +948,11 @@ impl Events {
                 };
                 let stops = stops(overscroll.x, delta.x) || stops(overscroll.y, delta.y);
                 if !event.delta.precise() {
-                    // WARNING: a wheel tick adds to where a running scroll stops, so fast ticks lose no distance.
                     let from = handle.target();
                     let to = point(
                         (from.x + x).clamp(-max.x, px(0.)),
                         (from.y + y).clamp(-max.y, px(0.)),
                     );
-                    // WARNING: like browsers, only the innermost box that can scroll moves. Outer boxes get the event at its edge.
                     if to != from {
                         cx.stop_propagation();
                         handle.animate_to(to, true);
@@ -1027,8 +986,6 @@ impl Events {
                     elastic(overscroll.y, max.y, over.y),
                 );
                 if rest != Point::default() {
-                    // WARNING: a box at its edge at the start of a gesture passes it on, and only the
-                    // outermost one that can scroll stretches when no box around it moves.
                     if !latched && !stops {
                         window.gesture.edge = Some((handle.clone(), rest));
                         return;

@@ -301,7 +301,6 @@ fn call(tool: &str, args: Value) -> Result<Value> {
         list.sort_by_key(|window| window["id"].as_u64());
         return Ok(list.into());
     }
-    // WARNING: while a page is paused only its thread can answer the debugger.
     let paused = SHARED.page_paused.load(Ordering::Acquire);
     let key = if args["window"].is_null()
         && (tool == "evaluate" || tool == "debugger" || tool == "console" && pages.is_empty())
@@ -505,7 +504,6 @@ fn settle_step() {
     }
 }
 
-/// Runs the calls for this thread. A null `app` is the main side, which runs only calls without a window.
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_mcp_poll(app: *mut c_void) -> bool {
     if app.is_null() && !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {

@@ -172,8 +172,6 @@ if [[ $system == macos ]]; then
 fi
 mv -f "$output/.$name" "$output/$name"
 
-# `apps build --aot` loads libJavaScriptCoreCompiler.dylib to compile Bun's IR, and links app.dylib with
-# libJavaScriptCoreAOT.a, a JSC without JIT compilers or Inspector that runs the compiled code.
 if ((aot)); then
   bun_source=$root/target/bun-aot/source
   if [[ ! -d $bun_source ]]; then

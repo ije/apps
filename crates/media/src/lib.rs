@@ -20,8 +20,6 @@ pub struct Host {
     pub waker: extern "C" fn() -> *mut c_void,
     pub wake: extern "C" fn(waker: *mut c_void),
     pub drop_waker: extern "C" fn(waker: *mut c_void),
-    // WARNING: returns `length` bytes for pixels, which the runtime owns once `apps_media_frame` returns them,
-    // until it gives them back with `apps_media_recycle`.
     pub alloc: extern "C" fn(length: usize) -> *mut u8,
     pub free: extern "C" fn(bytes: *mut u8, length: usize),
 }
@@ -55,7 +53,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Waker(*mut c_void);
 
-// WARNING: runtime wakers are `Send + Sync`, so player threads can wake the loop with them.
+// SAFETY: runtime wakers are `Send + Sync`, so player threads may wake the loop with them.
 unsafe impl Send for Waker {}
 
 impl Waker {
@@ -165,7 +163,6 @@ mod missing {
 #[cfg(not(ffmpeg))]
 use missing::*;
 
-// WARNING: the audio callback reads these, so it never waits for a lock that a decoder or page thread holds.
 static PLAYING: [AtomicPtr<Sound>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
 // WARNING: odd while the audio callback reads `PLAYING`, so a removed sound is freed only after that read ends.
 static MIXING: AtomicU64 = AtomicU64::new(0);
@@ -182,10 +179,10 @@ struct Sound {
     ring: OnceLock<(Box<[AtomicU32]>, usize)>,
     write: AtomicUsize,
     read: AtomicUsize,
-    // WARNING: samples before `skip` were dropped by a seek. Only the callback moves `read` past them.
+    // WARNING: samples before `skip` were dropped by a seek. Only the reader moves `read`: the audio callback, or
+    // `drop_played` when there is no output.
     skip: AtomicUsize,
     gain: AtomicU32,
-    // WARNING: a sequence lock of the position the callback started to play and its `ticks`.
     played: [AtomicU64; 3],
     clock: Mutex<Clock>,
 }
@@ -289,7 +286,7 @@ impl Sound {
         clock.speed = speed.unwrap_or(clock.speed);
     }
 
-    // WARNING: the caller holds the player's state lock, so the decoder can't queue samples of the old position.
+    // WARNING: call with the player's state lock held, or the decoder can queue samples of the old position.
     fn flush(&self) {
         lock(&self.clock).marks.clear();
         self.skip.store(self.write.load(Acquire), Release);
@@ -308,7 +305,6 @@ impl Sound {
         for (index, sample) in samples[..count].iter().enumerate() {
             ring[(write + index) & (ring.len() - 1)].store(sample.to_bits(), Relaxed);
         }
-        // WARNING: the clock maps the position the callback last played to a time, so its run stays.
         let keep = self
             .played()
             .map_or(self.read.load(Acquire), |(position, _)| position)
@@ -323,7 +319,8 @@ impl Sound {
         count
     }
 
-    // WARNING: without an audio output nothing plays the samples, so the decoder drops the runs that the clock passed.
+    // WARNING: call only without an audio output, since this moves `read`, which otherwise only the audio callback
+    // does.
     fn drop_played(&self) {
         let Some((_, channels)) = self.ring.get() else {
             return;
@@ -346,7 +343,6 @@ impl Sound {
 struct Mixer {
     rate: u32,
     channels: usize,
-    // WARNING: sounds taken out of `PLAYING` while the callback read it are freed only after that read, by its `MIXING` value.
     retired: Mutex<Vec<(Arc<Sound>, u64)>>,
     control: mpsc::Sender<bool>,
 }
@@ -361,7 +357,6 @@ impl Mixer {
                 slot.store(std::ptr::null_mut(), SeqCst);
                 retired.push((unsafe { Arc::from_raw(pointer) }, MIXING.load(SeqCst)));
             }
-            // WARNING: past 64 playing elements, the others play no sound.
             None if on => {
                 if let Some(slot) = PLAYING.iter().find(|slot| slot.load(Relaxed).is_null()) {
                     slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst);
@@ -500,7 +495,6 @@ impl Shared {
     }
 }
 
-// WARNING: event strings go into the JSON array of `apps_media_poll`, so text must be escaped as JSON.
 fn json(text: &str) -> String {
     let mut json = String::with_capacity(text.len() + 2);
     json.push('"');
@@ -536,7 +530,6 @@ enum Source {
 }
 
 fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
-    // WARNING: without an audio output the audio still decodes, so audio files keep their time and end.
     let output = mixer().map(|mixer| (mixer.rate, mixer.channels));
     let (rate, channels) = output.unwrap_or((8000, 1));
     let event = |text: String| {
@@ -603,7 +596,6 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     let (mut target, mut loaded) = (Some(0.), false);
     let (mut pending, mut pending_time, mut pending_step) = (Vec::<f32>::new(), 0., 0.);
     let mut skipped = None;
-    // WARNING: a blocked track waits behind the other track's full packet queue until that track decodes, so it counts as ready.
     let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);
     let mut tick = Instant::now();
     loop {
@@ -651,7 +643,6 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
         let want = (c_int::from(!video_done && state.frames.len() < FRAMES)
             | c_int::from(!audio_done && buffered < AHEAD && pending.is_empty()) << 1)
             & !blocked;
-        // WARNING: paused elements decode only up to their first frame, so play starts at once and idle pages use no CPU.
         if want != 0 && (state.playing || target.is_some()) {
             drop(state);
             let (mut time, mut width, mut height) = (0., 0, 0);
@@ -667,7 +658,6 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     &mut count,
                 )
             };
-            // WARNING: like browsers, a seek past the last frame shows the last frame.
             let last = kind == 0 && want & 1 != 0 && skipped.is_some();
             if last && let Some(frame) = skipped.take() {
                 (time, width, height, kind) = frame;
@@ -687,7 +677,6 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                         continue;
                     }
                     skipped = None;
-                    // WARNING: a frame is not converted when the next one is due too, but one is every 0.1 s, so slow decoding still shows frames.
                     let (now, running) = sound.time();
                     if running && next <= now && time - converted < 0.1 {
                         continue;
@@ -924,7 +913,6 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
         PLAY => state.playing = true,
         PAUSE => state.playing = false,
         SEEK => {
-            // WARNING: like browsers, a seek past the end goes to the end. FFmpeg converts the time to an integer.
             let end = state
                 .duration
                 .filter(|duration| *duration >= 0.)
@@ -957,7 +945,8 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
             let gain = if player.muted { 0. } else { player.volume };
             shared.sound.gain.store(gain.to_bits(), Relaxed);
         }
-        // WARNING: like Chromium, rates stay in 1/16 to 16, so the resampler rate stays an integer.
+        // WARNING: the resampler rate is the output rate divided by the speed as an int, so speeds stay in 1/16 to 16,
+        // like Chromium.
         SPEED if value > 0. && value.is_finite() => {
             let value = value.clamp(1. / 16., 16.);
             state.speed = Some(value);

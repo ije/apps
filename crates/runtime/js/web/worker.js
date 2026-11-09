@@ -127,7 +127,6 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
         this._queue.length = 0;
       };
       const url = String(source);
-      // WARNING: workers run bundled or local code only; remote scripts are rejected.
       if (options.eval && native) start(url);
       else if (/^(?:data|blob|apps):/.test(url)) Promise.resolve().then(async () => {
         if (url.startsWith('apps:')) return start(url, true);
@@ -170,7 +169,6 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
     on(type, listener) { super.on(type, listener); if (type === 'message') this.start(); return this; }
   }
   class MessageChannel { constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); this.port1._peer = this.port2; this.port2._peer = this.port1; } }
-  // WARNING: node engines share channels across threads through native subscribers; pages only reach channels of their own engine.
   const channels = new Map();
   let subscriber = null;
   const dispatch = (name, data, except) => { for (const channel of channels.get(name) ?? []) if (channel !== except) { const copy = structuredClone(data); task(() => { if (channels.get(name)?.has(channel)) channel.dispatchEvent(new MessageEvent('message', { data: copy })); }); } };

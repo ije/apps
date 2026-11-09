@@ -1,7 +1,6 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// WARNING: build.rs embeds `js/` files minified, deflated and ASCII. The first use inflates one, and the process
-// keeps it, because JSC reads runtime scripts in place.
+// WARNING: the inflated text is leaked on purpose, because JSC reads runtime scripts in place.
 macro_rules! js {
     ($path:literal) => {{
         static SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

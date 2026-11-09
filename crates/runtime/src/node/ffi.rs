@@ -321,7 +321,6 @@ impl State {
                 json!({"suffix": if cfg!(windows) { "dll" } else if cfg!(target_os = "macos") { "dylib" } else { "so" }, "littleEndian": cfg!(target_endian = "little"), "pointerSize": size_of::<usize>(), "signedChar": c_char::MIN < 0})
             }
             "open" => {
-                // WARNING: Loading a library can execute its native initialization code.
                 let handle = if args[0].is_null() {
                     #[cfg(unix)]
                     {
@@ -475,7 +474,8 @@ impl State {
                 let mut result = 0u64;
                 let _active = Active::new(&function.owner.active);
                 self.errors.borrow_mut().push(None);
-                // WARNING: The caller must provide the correct native signature and valid pointers.
+                // SAFETY: the script must give the right native signature and valid pointers; nothing here can check
+                // them.
                 unsafe {
                     low::call_return_into(
                         function.cif.as_raw_ptr(),
@@ -492,7 +492,7 @@ impl State {
                 if let Some(error) = callback_error {
                     bail!(error);
                 }
-                // WARNING: `bytes` pins the private call buffer, so `storage` stays valid across callbacks.
+                // SAFETY: `bytes` pins the private call buffer, so `storage` stays valid across callbacks.
                 unsafe {
                     ptr::copy_nonoverlapping((&result as *const u64).cast::<u8>(), storage, 8);
                     return Ok(Output::Object((api.undefined)(ctx)));

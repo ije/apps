@@ -6,7 +6,6 @@ fn run_hidden(main: &str, pages: &[(&str, &str)]) -> String {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    // WARNING: a main script that names `MCP` gets the devtools MCP server at that URL.
     let port = main.contains("MCP").then(|| {
         std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -41,8 +40,6 @@ fn run_hidden(main: &str, pages: &[(&str, &str)]) -> String {
         files.push(serde_json::json!([name, html]));
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_apps-runtime"));
-    // WARNING: a main script that names `BUILT` gets a `BUILT <id>` line on stderr for each box with an `id` that a
-    // frame builds, in debug builds.
     if main.contains("BUILT") {
         command.env("APPS_TRACE_BUILDS", "1");
     }
@@ -515,7 +512,6 @@ fn closing_dialogs_stay_in_the_top_layer_until_their_overlay_ends() {
     );
 }
 
-// WARNING: presses and keys go through the devtools MCP server, like real input.
 const INPUT: &str = r#"
     const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
     const frames = async ms => { for (const end = Date.now() + ms; Date.now() < end; await wait(16)) await win.webContents.capturePage(); };
@@ -741,7 +737,6 @@ fn new_nodes_read_styles_like_a_full_pass_before_the_first_frame() {
     );
 }
 
-// WARNING: the ids that `BUILT` lines name between `STEP <step>` and `DONE <step>` on stderr.
 fn built<'a>(text: &'a str, step: &str) -> Vec<&'a str> {
     let (start, end) = (format!("STEP {step}"), format!("DONE {step}"));
     let lines: Vec<_> = text.lines().skip_while(|line| *line != start).collect();
@@ -1005,7 +1000,6 @@ fn video_frames_keep_the_boxes_around_them() {
     );
 }
 
-// WARNING: the box of each element with an `id` as `x,y,width,height` relative to its `.w` wrapper, read from the page.
 const RECTS: &str = r#"
     const rects = () => run(`JSON.stringify(Object.fromEntries([...document.querySelectorAll('.w [id]')].map(el => {
         const box = el.getBoundingClientRect(), wrap = el.closest('.w').getBoundingClientRect();
@@ -1186,7 +1180,6 @@ fn margins_never_collapse_through_replaced_elements() {
     }
 }
 
-// WARNING: each row's color tells its index: `rgb(index % 250, index / 250 * 30, 200)`.
 fn long_list(scroller: bool) -> String {
     let mut page = String::from(
         "<body id=body style='margin:0'><style>.r{height:20px;font:12px/20px sans-serif}</style>\
@@ -1222,7 +1215,6 @@ const LIST: &str = r#"
     };
 "#;
 
-// WARNING: the `LOOK` line of a step: scroll offset, hit row, last row's place in the list, and the pixel's BGRA.
 fn looks(text: &str) -> Vec<(String, f32, String, f32, Vec<u8>)> {
     text.lines()
         .filter_map(|line| line.strip_prefix("LOOK "))
@@ -1251,8 +1243,10 @@ fn check_looks(text: &str, offset: f32) {
     for (name, top, hit, last, pixel) in looks {
         let row = ((top + 110. - offset) / 20.).floor() as usize;
         assert_eq!(hit, format!("r{row}"), "{name}: the row under the point");
-        // WARNING: culled rows move by the scroll in f32 window units, which round at this distance.
-        assert!((last - 40000.).abs() < 0.1, "{name}: culled rows keep their place: {last}");
+        assert!(
+            (last - 40000.).abs() < 0.1,
+            "{name}: culled rows keep their place: {last}"
+        );
         let [blue, green, red] = [200, row / 250 * 30, row % 250].map(|value| value as i32);
         assert!(
             (pixel[0] as i32 - blue).abs() <= 2
@@ -1297,7 +1291,9 @@ fn long_lists_keep_their_rows_while_they_scroll() {
         idle.iter().all(|id| ["o", "body"].contains(id)),
         "an unrelated change keeps the list: {idle:?}"
     );
-    let slow: Vec<Vec<&str>> = (1..=30).map(|index| built(&text, &format!("slow{index}"))).collect();
+    let slow: Vec<Vec<&str>> = (1..=30)
+        .map(|index| built(&text, &format!("slow{index}")))
+        .collect();
     let planned = slow.iter().filter(|built| built.contains(&"list")).count();
     assert!(
         (1..10).contains(&planned),
@@ -1365,7 +1361,9 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
          <div id=s style='height:200px;overflow:auto'><div id=t style='transform:translateZ(0)'>",
     );
     for index in 0..400 {
-        page.push_str(&format!("<div id=r{index} style='height:20px'>row {index}</div>"));
+        page.push_str(&format!(
+            "<div id=r{index} style='height:20px'>row {index}</div>"
+        ));
     }
     page.push_str("</div></div></body>");
     let text = run_hidden(
@@ -1388,7 +1386,6 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
     }
 }
 
-// WARNING: a 50x40 PNG.
 const PICTURE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAoCAYAAAC8cqlMAAAASUlEQVR4nO3PsQ0AMAjAMP5/mp7RCHnIHs/O7IXm9wAISDyQWiC1QGqB1AKpBVILpBZILZBaILVAaoHUAqkFUgukFkgtkFpnIA+Vw5FCgTkXpwAAAABJRU5ErkJggg==";
 
 fn picture_rects(name: &str, page: &str) -> (String, std::collections::HashMap<String, String>) {
@@ -1501,7 +1498,11 @@ fn failed_images_show_their_alt_text_like_chrome() {
         "long alt text wraps in its line: {text}"
     );
     for (id, word, high) in [("g0", "g1", 52.), ("g2", "g3", 36.)] {
-        assert_eq!(width(id), width(word), "{id} is as wide as its longest word: {text}");
+        assert_eq!(
+            width(id),
+            width(word),
+            "{id} is as wide as its longest word: {text}"
+        );
         assert_eq!(
             height(id),
             high,
@@ -1516,7 +1517,10 @@ fn failed_images_show_their_alt_text_like_chrome() {
         (width("g6") - width("g5")).abs() < 0.02 && height("g6") == 18.,
         "the icon doesn't widen the min-content width of text that can't wrap: {text}"
     );
-    assert_eq!(rects["a11"], "0,0,40,52", "an image wider than its line stays on it: {text}");
+    assert_eq!(
+        rects["a11"], "0,0,40,52",
+        "an image wider than its line stays on it: {text}"
+    );
 }
 
 #[test]
@@ -1551,13 +1555,29 @@ fn images_that_fail_after_a_frame_show_their_alt_text() {
         &[("late.html", &page.replace("PICTURE", PICTURE))],
     );
     let other = built(&text, "other");
-    assert!(!other.contains(&"a0") && !other.contains(&"g0"), "{other:?}");
+    assert!(
+        !other.contains(&"a0") && !other.contains(&"g0"),
+        "{other:?}"
+    );
     let rects = rects(&text);
-    assert_eq!(rects["a0"], rects["a1"], "alt text after the picture: {text}");
-    assert_eq!(rects["a2"], rects["a1"], "alt text after a first frame without the picture: {text}");
+    assert_eq!(
+        rects["a0"], rects["a1"],
+        "alt text after the picture: {text}"
+    );
+    assert_eq!(
+        rects["a2"], rects["a1"],
+        "alt text after a first frame without the picture: {text}"
+    );
     let width = |id: &str| rects[id].split(',').nth(2).unwrap().parse::<f32>().unwrap();
-    assert_eq!(width("g0"), width("g1"), "no size from the old picture: {text}");
-    assert!(width("s0") > 20. && width("s0") == width("s1"), "Submit label: {text}");
+    assert_eq!(
+        width("g0"),
+        width("g1"),
+        "no size from the old picture: {text}"
+    );
+    assert!(
+        width("s0") > 20. && width("s0") == width("s1"),
+        "Submit label: {text}"
+    );
 }
 
 #[test]
@@ -1578,7 +1598,14 @@ fn inline_blocks_shrink_to_their_line_like_chrome() {
              <div class=w style='width:40px'><span id=l1 class=ib>Averyverylongword</span></div></body>"
         ),
     );
-    let at = |id: &str, index: usize| rects[id].split(',').nth(index).unwrap().parse::<f32>().unwrap();
+    let at = |id: &str, index: usize| {
+        rects[id]
+            .split(',')
+            .nth(index)
+            .unwrap()
+            .parse::<f32>()
+            .unwrap()
+    };
     for (id, [x, width]) in [
         ("s0", [0., 150.]),
         ("s1", [10., 130.]),
@@ -1586,13 +1613,24 @@ fn inline_blocks_shrink_to_their_line_like_chrome() {
         ("s3", [0., 300.]),
         ("b0", [0., 150.]),
     ] {
-        assert_eq!([at(id, 0), at(id, 2)], [x, width], "{id}, as in Chrome: {text}");
+        assert_eq!(
+            [at(id, 0), at(id, 2)],
+            [x, width],
+            "{id}, as in Chrome: {text}"
+        );
         assert!(at(id, 1) >= 18., "{id} starts a new line: {text}");
     }
     assert!(at("s0", 3) >= 36., "the text wraps: {text}");
-    assert_eq!(at("t0", 2), at("t1", 2) + 16., "the indent widens the box: {text}");
+    assert_eq!(
+        at("t0", 2),
+        at("t1", 2) + 16.,
+        "the indent widens the box: {text}"
+    );
     assert_eq!(at("t0", 3), 18., "an indented line doesn't wrap: {text}");
-    assert_eq!(rects["l0"], "0,0,40,36", "a box wider than its line shrinks on it: {text}");
+    assert_eq!(
+        rects["l0"], "0,0,40,36",
+        "a box wider than its line shrinks on it: {text}"
+    );
     assert!(
         rects["l1"].starts_with("0,0,") && at("l1", 2) > 40.,
         "a word wider than its line stays on it: {text}"
@@ -1682,7 +1720,10 @@ fn flex_and_grid_lines_stretch_replaced_elements_and_controls() {
          <div class='w g'><canvas id=gC width=200 height=100 style='height:50px;padding:10px'></canvas></div>\
          <div class='w n'><video id=nV></video></div><div class='w n'><input id=nR type=range></div></body>",
     );
-    assert!(rects["cI"].starts_with("0,0,300,"), "a field stretches: {text}");
+    assert!(
+        rects["cI"].starts_with("0,0,300,"),
+        "a field stretches: {text}"
+    );
     for (id, rect) in [
         ("cK", "4,3,293,13"),
         ("cP", "0,0,300,240"),

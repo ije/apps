@@ -117,7 +117,6 @@ pub(crate) struct State {
     ready: Arc<Mutex<Vec<Ready>>>,
     active: Cell<usize>,
     threadsafe: Cell<usize>,
-    // WARNING: this map holds the JavaScript thread's reference to each live thread-safe function.
     threadsafe_live: RefCell<HashMap<usize, Arc<Threadsafe>>>,
     external: Cell<i64>,
     callback_scopes: Cell<usize>,
@@ -135,7 +134,7 @@ impl State {
         let mut helpers = HashMap::new();
         if addon {
             let napi = js!("node/napi.js");
-            let source = api.string(&napi);
+            let source = api.string(napi);
             let mut exception = ptr::null_mut();
             let object = unsafe {
                 (api.evaluate)(
@@ -379,8 +378,6 @@ impl State {
         value
     }
 
-    // WARNING: callbacks that the runtime starts (finalizers, async work, thread-safe calls) have no JavaScript caller to
-    // throw to, so their exceptions go to `uncaughtException`, and are cleared even when that throws.
     fn report(&self) {
         let exception = self.take_exception();
         if !exception.is_null() && self.js("report", &[exception]).is_err() {
@@ -597,8 +594,8 @@ impl State {
         let packed = path
             .to_str()
             .and_then(|key| host.borrow().scripts.get(key).cloned());
-        // WARNING: dlopen needs a file, so an addon packed in app.bundle is written to the user's cache folder, named by
-        // its name and content so copies at other paths stay separate modules, and rewritten only when the file differs.
+        // WARNING: dlopen needs a file. A hash of name and content keeps copies at other paths separate modules, and a
+        // loaded library must be replaced by rename, never written in place.
         let path = match packed {
             Some(bytes) => {
                 let home = std::path::PathBuf::from(
@@ -647,7 +644,6 @@ impl State {
             path.extension().is_some_and(|ext| ext == "node"),
             "Expected a .node addon"
         );
-        // WARNING: Native addons execute arbitrary native code in the runtime process.
         #[cfg(unix)]
         let library: Library = unsafe {
             libloading::os::unix::Library::open(
@@ -2204,7 +2200,8 @@ pub(crate) unsafe extern "C" fn load(
     }
 }
 
-// WARNING: Node-API calls that addon threads make, so these take no environment and skip the thread check.
+// WARNING: addon threads call these, so they take no environment, skip the thread check, and must touch only
+// thread-safe state.
 macro_rules! raw_api {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
         #[unsafe(no_mangle)]
@@ -2507,7 +2504,6 @@ api!(napi_queue_async_work(env, work: Ptr) {
     crate::node::blocking(move || {
         let run = state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok();
         if run {
-            // WARNING: `execute` runs off the JS thread and may not call JavaScript, as Node-API documents.
             unsafe { execute(raw as *const State, data as Ptr) };
         }
         ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Ready::Work(work, if run { 0 } else { 11 }));
@@ -2774,7 +2770,8 @@ impl State {
         }
     }
 
-    // WARNING: like Node, values still queued at the end go to the call callback without an environment, so it can free them.
+    // WARNING: like Node, values still queued at the end go to the call callback with a null environment, so it can
+    // free them.
     fn end_threadsafe(&self, function: &Threadsafe) {
         function.finalized.store(true, Ordering::Release);
         if function.referenced.load(Ordering::Acquire) {

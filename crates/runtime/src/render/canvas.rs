@@ -3,12 +3,11 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use tiny_skia as skia;
 
-// WARNING: SVG rasters have at most this many pixels per side. Larger ones scale down to fit and draw scaled up.
 pub const RASTER_MAX: u32 = 4096;
 
 #[derive(Clone)]
 struct State {
-    // WARNING: `[a, b, c, d, e, f]` in f64, so a far translation and a far point cancel exactly.
+    // WARNING: f64, so a far translation and a far point cancel exactly.
     transform: [f64; 6],
     fill: skia::Shader<'static>,
     stroke: skia::Shader<'static>,
@@ -170,8 +169,8 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     }
 }
 
-// WARNING: device points of canvas points, or `None` past the range where tiny-skia drops the whole path, so
-// such a call is skipped like one with non-finite arguments.
+// WARNING: `None` past the range where tiny-skia drops the whole path, so such a call is skipped like one with
+// non-finite arguments.
 fn device<const N: usize>(
     [a, b, c, d, e, f]: [f64; 6],
     points: [[f64; 2]; N],
@@ -339,7 +338,6 @@ pub(crate) fn pixmap(image: &renderer::RenderImage) -> Option<skia::Pixmap> {
     Some(pixels)
 }
 
-// WARNING: the pixels of a `drawImage()` source: a canvas is borrowed, other sources come from a cache.
 pub enum Source<'a> {
     Pixels(&'a skia::Pixmap),
     Shared(Rc<skia::Pixmap>),
@@ -402,9 +400,6 @@ impl Canvas {
         })
     }
 
-    // WARNING: runs the `CanvasRenderingContext2D` operations from `dom.js`: a code and its arguments. Strings are
-    // UTF-16 lengths of consecutive parts of `strings`, and `putImageData` bytes are in `data`. `image`
-    // returns the pixels of another canvas or image node, with an SVG drawn at the given size.
     pub fn draw<'a>(
         &mut self,
         ops: &[f64],
@@ -550,8 +545,6 @@ impl Canvas {
                 10 => state.width = a[0] as f32,
                 11 => self.path.clear(),
                 12 => self.path.close(),
-                // WARNING: as the standard says, a call with non-finite arguments is ignored, and so is one
-                // whose points land too far for tiny-skia.
                 13 | 14 => {
                     let Some([(x, y)]) = device(t, [[a[0], a[1]]]) else {
                         continue;
@@ -721,12 +714,10 @@ impl Canvas {
                     } else {
                         (0., 0., t.pre_scale(1. / raster, 1. / raster))
                     };
-                    // WARNING: glyphs far outside the canvas are skipped and the layer is cut to the canvas, so a long or huge text cannot make a huge layer.
                     let Some(visible) = to_canvas.invert().and_then(|t| canvas?.transform(t))
                     else {
                         continue;
                     };
-                    // WARNING: pages can draw any glyph at any scale, so the cache starts over past 4 MB.
                     if self.glyph_bytes > 4 << 20 {
                         self.glyphs.clear();
                         self.glyph_bytes = 0;
@@ -798,7 +789,8 @@ impl Canvas {
                         .then(|| skia::Pixmap::new((right - left) as u32, (bottom - top) as u32))
                         .flatten()
                     else {
-                        // WARNING: a text that cannot draw keeps the canvas, so a covering mode gets it back.
+                        // WARNING: a covering mode moved the canvas into `covered`, so it must be put back before
+                        // skipping.
                         if let Some(saved) = covered.take() {
                             self.pixels = saved;
                         }
@@ -909,7 +901,6 @@ impl Canvas {
                     let [iw, ih, sx, sy, sw, sh, dx, dy, dw, dh] =
                         [a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]];
                     let (kx, ky) = (dw / sw, dh / sh);
-                    // WARNING: an SVG draws at the size it covers on the canvas, so `RASTER_MAX` caps its memory.
                     let size = [iw * kx * t[0].hypot(t[1]), ih * ky * t[2].hypot(t[3])]
                         .map(|side| side.abs().ceil().min(f64::from(RASTER_MAX)) as u32);
                     // WARNING: a negative node draws the canvas onto itself, so it is copied for each call.
@@ -1208,8 +1199,8 @@ pub fn render_svg(
     Ok(render_image(&svg_pixels(tree, width, height, transform)?))
 }
 
-// WARNING: every SVG raster goes through here, so `RASTER_MAX` bounds them all. A larger size draws scaled
-// down into a raster that fits, and `transform` stays in the pixels of the asked size.
+// WARNING: every SVG raster must go through here, so `RASTER_MAX` bounds them all. `transform` stays in the pixels of
+// the asked size.
 pub fn svg_pixels(
     tree: &usvg::Tree,
     width: u32,

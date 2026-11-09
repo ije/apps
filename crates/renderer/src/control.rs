@@ -13,8 +13,6 @@ pub enum ControlKind {
     Date,
 }
 
-// WARNING: a native control the page shows in a box, in window points. `seen` is the last of the control's own
-// events that the page took, so the page's value doesn't undo edits that it has not seen yet.
 #[derive(Clone, PartialEq, Debug)]
 pub struct NativeControl {
     pub key: u64,
@@ -33,8 +31,6 @@ pub struct NativeControl {
     pub seen: u64,
 }
 
-// WARNING: `value` is `None` for a press, which the page runs as a click. `done` ends an edit, like a released
-// slider or a text field that lost focus.
 #[derive(Clone, Debug)]
 pub struct ControlEvent {
     pub key: u64,
@@ -45,8 +41,6 @@ pub struct ControlEvent {
 
 pub type ControlSink = Arc<dyn Fn(ControlEvent) + Send + Sync>;
 
-// WARNING: the natural size of a control, measured once from AppKit. A button gives its padding beside the title
-// in place of a width, and sliders and text fields only their height.
 pub fn control_size(kind: ControlKind) -> [f32; 2] {
     #[cfg(target_os = "macos")]
     {

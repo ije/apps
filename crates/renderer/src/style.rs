@@ -46,8 +46,8 @@ impl Radii<Length> {
 }
 
 impl Length {
-    // WARNING: the taffy calc handle of `Calc`, or `None` when it is a plain fraction. Taffy treats the handle as
-    // opaque, so it holds the fraction's bits and the offset in 1/64 device pixels instead of a pointer.
+    // WARNING: taffy treats calc handles as opaque, so the handle packs the fraction's bits and the offset in 1/64
+    // device pixels instead of a pointer.
     fn calc(fraction: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
         let offset = (to_layout_unit(offset.0, scale) * 64.) as i32;
         (offset != 0).then(|| {
@@ -114,9 +114,6 @@ pub enum Baseline {
     None,
 }
 
-// WARNING: a flex row of `Lines` moves the baseline items of a line below a taller `FlexEnd` item, like
-// `vertical-align: bottom`, and moves the line by the last child of a `Hangs` item at its end, like a collapsible
-// space that hangs there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Inline {
     #[default]
@@ -512,7 +509,6 @@ impl Style {
             min.y += self.border_widths.top;
             max.y -= self.border_widths.bottom;
         }
-        // WARNING: the other axis stays visible, so `overflow-x: clip` keeps descenders that leave a trimmed text box.
         const FAR: Pixels = px(1e7);
         let clip = Bounds::from_corners(
             point(

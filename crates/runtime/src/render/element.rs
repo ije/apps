@@ -36,8 +36,6 @@ pub(super) struct Build<'a> {
     pub(super) resized: bool,
     pub(super) settled: bool,
     pub(super) reads: &'a RefCell<Vec<Read>>,
-    // WARNING: moves when a node, a style, the focus, an animated value or the frame may have changed, so the page
-    // reads of a record checked in this epoch still hold.
     pub(super) epoch: u64,
     #[cfg(debug_assertions)]
     pub(super) prints: &'a RefCell<Vec<u64>>,
@@ -49,10 +47,8 @@ pub(super) struct Build<'a> {
     pub(super) plan: RefCell<Rc<[usize]>>,
 }
 
-// WARNING: a box is kept while its subtree revision and call are the same and every read its build made beyond them
-// gives what it gave then. A build reads other boxes, the host and the frame only through `Build::log`, or the box is
-// never kept, see `element`. The queries up to `Shrunk` replay at the box whose record holds them, the rest name
-// what they read.
+// WARNING: a build must read other boxes, the host and the frame only through `Build::log`, or the box must never be
+// kept.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Query {
     Margins,
@@ -87,7 +83,6 @@ pub(super) enum Query {
 }
 
 impl Query {
-    // WARNING: shared styles keep the reads of their box with its node as `from`, so they name no other node.
     fn moved(self, from: u32, to: u32) -> Option<Self> {
         let at = |node: u32| (node == from).then_some(to);
         Some(match self {
@@ -106,8 +101,6 @@ impl Query {
         })
     }
 
-    // WARNING: the last layout, scroll handles and the system theme change without a new node or style, so these are
-    // checked in every frame, the others only in a new epoch.
     fn host(self) -> bool {
         matches!(
             self,
@@ -130,15 +123,10 @@ impl Query {
 pub(super) struct Read {
     query: Query,
     value: u64,
-    // WARNING: in the build log, `scope` is one more than the depth of the box whose subtree revision covers the read,
-    // 0 when none does, and `reader` is the depth of the box that read it. In a record, `scope` counts boxes up from
-    // the record's box and `reader` is 1 for reads of the boxes below it.
     scope: u16,
     reader: u16,
 }
 
-// WARNING: what a text field was last built with. Its value is in no revision, so when only the value changed, the
-// frame builds the field again from this in place, under its kept boxes, see `render_page`.
 pub(super) struct Patch {
     pub(super) ancestors: Rc<[usize]>,
     pub(super) containing: [f32; 2],
@@ -149,8 +137,6 @@ pub(super) struct Patch {
     pub(super) value: u64,
 }
 
-// WARNING: a box style that boxes with the same key and own reads share, see `create`. Its reads are kept like
-// those of a record, with `scope` counted up from the box.
 pub(super) struct Shared {
     plan: Rc<super::plan::Plan>,
     reads: Box<[Read]>,
@@ -160,20 +146,16 @@ pub(super) struct Shared {
 pub(super) struct Kept {
     pub(super) call: Call,
     pub(super) reads: Box<[Read]>,
-    // WARNING: the boxes the box was built in, so it can build again in place, see `repaint`.
     ancestors: Rc<[usize]>,
     epoch: std::cell::Cell<u64>,
     pub(super) culled: bool,
     #[cfg(debug_assertions)]
     pub(super) print: u64,
-    // WARNING: the children that the box's build culled, which its debug check leaves out too.
     #[cfg(debug_assertions)]
     plan: Rc<[usize]>,
 }
 
 impl Kept {
-    // WARNING: a box can build again in place from its record unless it culled or sits in a grid or table cell, whose
-    // call the record doesn't hold.
     pub(super) fn in_place(&self) -> Option<&Rc<[usize]>> {
         (!self.culled && self.call.cell.is_none()).then_some(&self.ancestors)
     }
@@ -211,7 +193,6 @@ fn parent_style<'b>(
         .and_then(|parent| styles.values[parent].get(prop))
 }
 
-// WARNING: a table cell without a background of its own shows the first one of its rows and row groups.
 fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(u32, u8)> {
     std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
         .take_while(|&row| {
@@ -248,7 +229,6 @@ fn parent_font(
     })
 }
 
-// WARNING: the nearest ancestor that makes a box, as `display: contents` makes none.
 fn box_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<usize> {
     let mut parent = doc.nodes[id].parent;
     while let Some(ancestor) = parent
@@ -272,7 +252,8 @@ fn starts_line(doc: &Document, id: usize) -> bool {
             .iter()
             .rfind(|&&child| {
                 let node = &doc.nodes[child];
-                node.tag != "#comment" && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
+                node.tag != "#comment"
+                    && !(node.tag == "#text" && node.text.trim_ascii().is_empty())
             })
             .is_none_or(|&child| doc.nodes[child].tag == "br")
     })
@@ -303,7 +284,6 @@ fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f
     })
 }
 
-// WARNING: the nearest opaque background from the box up, and how many boxes up it is.
 fn backdrop(styles: &ComputedStyles, ancestors: &[usize], id: usize) -> Option<(usize, u32)> {
     std::iter::once(id)
         .chain(ancestors.iter().rev().copied())
@@ -314,11 +294,8 @@ fn backdrop(styles: &ComputedStyles, ancestors: &[usize], id: usize) -> Option<(
         })
 }
 
-// WARNING: native controls draw these node states, which no revision covers.
 const LOOK: u16 = crate::dom::HOVER | crate::dom::ACTIVE;
 
-// WARNING: the select of an option, and whether the option shows inside the select's box as a drop-down's choice
-// instead of in a box of its own.
 fn boxless(doc: &Document, id: usize) -> Option<(usize, bool)> {
     std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
         .take(2)
@@ -340,8 +317,6 @@ fn content_editable(doc: &Document, id: usize) -> Option<usize> {
         .find(|&node| doc.nodes[node].attrs.contains_key("contenteditable"))
 }
 
-// WARNING: whether a grid without a set width shrinks to its content, and the farthest node the walk read. `first`
-// is false when the walk goes on from a box above the grid.
 fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (bool, usize) {
     let mut child = id;
     loop {
@@ -373,7 +348,6 @@ fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (
                 parent,
             );
         }
-        // WARNING: a column stretches to its own width, which can come from its content, as in a popup.
         if !matches!(display, "block" | "inline-block" | "flex" | "inline-flex")
             || style.get(Prop::WIDTH).is_some_and(|v| v != "auto")
         {
@@ -386,8 +360,6 @@ fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (
     }
 }
 
-// WARNING: what the `<use>` elements of an SVG take from the rest of the page, which its subtree revision does not
-// cover, or `None` without such elements.
 fn uses(
     doc: &Document,
     styles: &ComputedStyles,
@@ -441,8 +413,6 @@ fn scrolled(handle: Option<&renderer::ScrollHandle>) -> Option<[bool; 2]> {
     })
 }
 
-// WARNING: a raster image paints by node with `paint::Picture`, and an SVG image paints its source by node, so only
-// their sizes count, and a new video frame of the same size keeps the box.
 fn pictured(
     image: Option<&Arc<renderer::RenderImage>>,
     vector: Option<&(Rc<str>, [f32; 2])>,
@@ -468,8 +438,6 @@ fn baselines(doc: &Document, dom: Option<&crate::dom::State>, grid: usize) -> u6
 }
 
 impl<'a> Build<'a> {
-    // WARNING: `scope` is one more than the depth of the box whose subtree revision covers the read, or 0 when none
-    // does: `ancestors.len()` for the parent, one more for the reading box itself, which drops the read.
     #[inline(never)]
     fn log(&self, query: Query, scope: usize, value: u64) {
         self.reads.borrow_mut().push(Read {
@@ -486,8 +454,6 @@ impl<'a> Build<'a> {
         value
     }
 
-    // WARNING: the scope of a read of `node`, the box itself or one of its DOM ancestors: the nearest box of the chain
-    // that holds it.
     fn scope_of(&self, id: usize, node: usize) -> usize {
         std::iter::successors(Some(node), |&node| self.doc.nodes[node].parent)
             .find_map(|node| {
@@ -542,11 +508,12 @@ impl<'a> Build<'a> {
                 box_parent(doc, styles, id)
                     .map(|parent| padding_left(styles, parent, width).to_bits()),
             ),
-            Query::StickyParent => hashed(
-                self.ancestors
-                    .last()
-                    .map(|&parent| (parent, insets(styles, parent, true, width).map(f32::to_bits))),
-            ),
+            Query::StickyParent => hashed(self.ancestors.last().map(|&parent| {
+                (
+                    parent,
+                    insets(styles, parent, true, width).map(f32::to_bits),
+                )
+            })),
             Query::Break => hashed(starts_line(doc, id)),
             Query::UserSelect => hashed(styles.user_select[id].0 as u8),
             Query::Positioner(fixed) => hashed(positioner(
@@ -559,7 +526,6 @@ impl<'a> Build<'a> {
                 let Some(handles) = dom.map(|dom| &dom.scroll) else {
                     return Replay::Changed;
                 };
-                // WARNING: a box above the sticky one may be `<html>` or `<body>`, which scroll only with a handle.
                 let ancestors = self.ancestors.iter().rev().copied();
                 let scroller = if below {
                     scroller(doc, styles, std::iter::once(id).chain(ancestors), handles)
@@ -588,7 +554,8 @@ impl<'a> Build<'a> {
                     .map(|size| size.map(f32::to_bits)),
             ),
             Query::Track(node, axis) => {
-                // WARNING: prepaint draws again only for a size more than half a pixel off the one the tracks used.
+                // WARNING: the 0.5 px must match prepaint, which draws again only for a size more than half a pixel
+                // off.
                 let used = f32::from_bits(read.value as u32);
                 return match dom
                     .and_then(|dom| dom.cull.widths.get(&(node as usize)))
@@ -628,7 +595,6 @@ impl<'a> Build<'a> {
     }
 }
 
-// WARNING: an absolute box without such an ancestor takes the document, a fixed one the viewport (`None`).
 pub(super) fn positioner(
     position: &str,
     mut ancestors: impl Iterator<Item = usize>,
@@ -647,8 +613,7 @@ pub(super) fn positioner(
         .or((!fixed).then_some(0))
 }
 
-// WARNING: a sticky box sticks in its nearest scroll container by style, not in any box with a handle, since
-// scripts make handles for any box. `<html>` and `<body>` scroll the page unless they have their own handle.
+// WARNING: find the scroll container by style, not by handle, since scripts make handles for any box.
 pub(super) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
@@ -757,9 +722,8 @@ impl SvgSource<'_> {
         let parent = doc.nodes[element]
             .parent
             .map(|parent| &self.styles.values[parent]);
-        // WARNING: `vector-effect: non-scaling-stroke` draws strokes in screen pixels, which resvg doesn't do, so their
-        // widths and dashes scale back by the viewBox scale. resvg ignores `pathLength`, so dashes scale by the
-        // real length over it.
+        // WARNING: resvg ignores `vector-effect: non-scaling-stroke` and `pathLength`, so stroke widths and dashes are
+        // scaled here.
         let width = if element != root
             && self.scale != 1.
             && own.get(Prop::VECTOR_EFFECT) == Some("non-scaling-stroke")
@@ -909,7 +873,6 @@ pub(super) type Margins = (
     rustc_hash::FxHashMap<usize, ([f32; 2], [f32; 2], bool)>,
 );
 
-/// The geometry revision and width an `adjoining` result was made with.
 pub(super) type Adjoined = ((u64, u32), ([f32; 2], [f32; 2], bool));
 
 pub(super) type Walked = (
@@ -918,8 +881,8 @@ pub(super) type Walked = (
 );
 
 thread_local! {
-    // WARNING: the lowest stack address that building boxes may reach: a quarter of the stack stays
-    // for layout and paint, which recurse as deep.
+    // WARNING: building stops at this address, so a quarter of the stack stays for layout and paint, which recurse as
+    // deep.
     static STACK_LIMIT: usize = {
         let marker = 0u8;
         let here = &raw const marker as usize;
@@ -938,7 +901,7 @@ thread_local! {
             }
             (low as usize, size)
         };
-        // WARNING: Windows builds link a 64 MB main stack, see build.rs.
+        // WARNING: assumes the 64 MB main stack that build.rs links on Windows.
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let (low, size) = (here.saturating_sub(60 << 20), 64 << 20);
         (low + size / 4).min(here)
@@ -958,8 +921,6 @@ pub(super) fn element(
     #[cfg(debug_assertions)]
     let printed = build.prints.borrow().len();
     let text = build.doc.nodes[id].tag.starts_with('#');
-    // WARNING: a 3D parent resolves the box's transform with its own units, so such boxes build again. The others
-    // build from what no read records: animated values or their transforms.
     let storable = !text
         && build.perspective.is_none()
         && depth < 256
@@ -988,10 +949,8 @@ pub(super) fn element(
             (grid.baseline, grid.first_item.is_some(), tracks.finish())
         }),
     };
-    // WARNING: `Some` when the box's record still holds, with `true` when a read held only within prepaint's
-    // tolerance. The record goes into the log, so the boxes around a kept box keep its reads too.
-    // WARNING: a box whose style changed only in paint builds again, also inside a box built again around it. Debug
-    // checks build it too, but leave it to the build that the renderer takes.
+    // WARNING: debug checks must only look in `repaint`, not remove from it, or the build that the renderer takes would
+    // not build the box again.
     #[cfg(debug_assertions)]
     let repainted = if build.checking {
         build.view.repaint.borrow().contains(&id)
@@ -1014,10 +973,6 @@ pub(super) fn element(
             break 'keep None;
         };
         let cell = slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]);
-        // WARNING: a kept subtree culls only what its build culled. One that culled keeps its spacers, which build
-        // it again when they come near the visible range. Others are kept only while no box below them that a parent
-        // could cull lies wholly outside the culling margin, also inside scroll boxes and in subtrees built without
-        // culling.
         if !record.culled
             && let Some(zone) = &build.zone
         {
@@ -1095,8 +1050,6 @@ pub(super) fn element(
         Some(close)
     };
     if let Some(_close) = keep {
-        // WARNING: the record of a box with boxes below it that build in place holds their old paint, which the debug
-        // build after them renews, see `same_in_place`.
         #[cfg(debug_assertions)]
         if !_close && !build.view.around.borrow().contains(&id) {
             check(build, id, containing, container, slot, mark, printed);
@@ -1104,7 +1057,6 @@ pub(super) fn element(
         return Child::Kept(id.into());
     }
     let culls = build.culls.get();
-    // WARNING: a box that builds holds the ones below it that build in place, or culls them, see `render_page`.
     #[cfg(debug_assertions)]
     let checking = build.checking;
     #[cfg(not(debug_assertions))]
@@ -1132,9 +1084,6 @@ pub(super) fn element(
     {
         eprintln!("BUILT {name}");
     }
-    // WARNING: reads that the box's subtree revision covers leave the log, the others stay for the boxes around it. A
-    // read that boxes below repeat stays once, as it gave them all the same. Repeats come from neighbors, so a long
-    // record only looks back a few reads for them.
     let reads = {
         let depth = build.ancestors.len();
         let below = |read: &Read| usize::from(read.reader) > depth;
@@ -1199,9 +1148,6 @@ pub(super) fn element(
     child
 }
 
-// WARNING: a box whose style changed only in paint keeps its revision, so the boxes around it stay kept, and it
-// builds again from its record's call in place, see `render_page`. Its reads must stay those its record holds, which
-// the records around it hold too, or those records go, so the boxes around build again next time.
 pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
     let old = build.view.kept.borrow_mut().remove(&id)?;
     let (ancestors, containing, container, flex_parent) = (
@@ -1240,8 +1186,6 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
     }
 }
 
-// WARNING: debug builds build the page again without records after boxes built in place, and each such box must
-// build the same as there, and its kept children must be what their slots hold.
 #[cfg(debug_assertions)]
 pub(super) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &renderer::Tree) {
     fn find(child: &Child, id: renderer::ElementId) -> Option<&renderer::Node> {
@@ -1288,14 +1232,10 @@ pub(super) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &ren
     }
 }
 
-// WARNING: with `APPS_TRACE_BUILDS` set, debug builds print the `id` attribute of each box they build, so tests see
-// which boxes were kept.
 #[cfg(debug_assertions)]
 static TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("APPS_TRACE_BUILDS").is_some());
 
-// WARNING: debug builds build each kept box again, culling only the children its build culled, and it must read and
-// build the same, or its build reads something that no record holds.
 #[cfg(debug_assertions)]
 fn check(
     build: &Build<'_>,
@@ -1368,8 +1308,6 @@ fn check(
     prints.truncate(printed + 1);
 }
 
-// WARNING: a debug fingerprint of a box: its own style, what its hooks hold, and the fingerprints of the boxes built
-// under it since `from`.
 #[cfg(debug_assertions)]
 fn print(build: &Build<'_>, from: usize, child: &mut Child) -> u64 {
     use std::hash::Hasher;
@@ -1477,8 +1415,8 @@ fn create(
             } else {
                 "inline"
             });
-    // WARNING: like Chrome, a failed image with alt text is a box of a broken image icon and the text, which is an
-    // inline block that ignores its size when the image is inline, as Chrome's UA sheet makes it.
+    // WARNING: like Chrome, an inline broken image with alt text ignores its size, also when only the UA sheet made it
+    // an inline block.
     let broken = broken_image(node);
     let alt = broken
         .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
@@ -1555,7 +1493,6 @@ fn create(
                 let host = view.host.borrow();
                 let dom = host.dom.get(&view.id)?;
                 let rect = *dom.bounds.get(&id)?;
-                // WARNING: zones hold last frame's places, and the children moved by the box's scroll since.
                 let moved = dom.cull.scrolled.get(&id).copied().unwrap_or(0.);
                 Some(Rc::new(cull::Zone {
                     top: zone.top.max(rect[1]) + moved,
@@ -1590,7 +1527,11 @@ fn create(
         let scope = positioner
             .and_then(|block| ancestors.iter().rposition(|&ancestor| ancestor == block))
             .map_or(1, |index| index + 1);
-        reader.log(Query::Positioner(position == "fixed"), scope, hashed(positioner));
+        reader.log(
+            Query::Positioner(position == "fixed"),
+            scope,
+            hashed(positioner),
+        );
         reader.log(
             Query::FlatParent,
             depth,
@@ -1614,9 +1555,8 @@ fn create(
                 if block == 0 {
                     return viewport();
                 }
-                // WARNING: the block's last layout comes before the estimate of its build, which can miss its
-                // min and max sizes. Prepaint draws again when they differ, so an estimate first would draw
-                // again in every frame.
+                // WARNING: read the last layout before the estimate. The estimate can miss min and max sizes, and
+                // prepaint would then draw again in every frame.
                 let size = reader.block_size(view.host.borrow().dom.get(&view.id), block);
                 reader.log(
                     Query::Block(block as u32),
@@ -1632,11 +1572,11 @@ fn create(
         return renderer::node().hidden().into();
     }
     let opacity = parsed.opacity;
-    // WARNING: a box at opacity 0 draws nothing, so it takes the element opacity, which skips its primitives, and
-    // not a layer: hidden truncation copies in a file tree cost two render passes each. It still lays out and takes
-    // events.
-    let effect_layer = (made.layer || opacity > 0. && opacity < 1. && !node.children.is_empty() || composited)
-        .then_some(opacity);
+    // WARNING: a box at opacity 0 must use element opacity, not a layer: hidden copies are common and each layer costs
+    // two render passes.
+    let effect_layer =
+        (made.layer || opacity > 0. && opacity < 1. && !node.children.is_empty() || composited)
+            .then_some(opacity);
     let selection_colors = match styles.selections.get(&id) {
         Some(selection) => style::selection_colors(style, Some(selection)),
         None => parsed.selection,
@@ -1664,10 +1604,8 @@ fn create(
         renderer::Child::Node(node) => node.style_ref().align_self,
         renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => build.tree.align_self(*id),
     };
-    // WARNING: taffy moves an item that doesn't fit its line to a new line when any item is before it, even the
-    // zero-width strut, so the strut and the first item are one item, aligned like the item. Like browsers, a first
-    // item wider than its line then stays on the first line. A group that is not on the baseline takes the strut
-    // out of the line's baseline, so a second strut goes before the next item: true is returned for it.
+    // WARNING: taffy wraps an item that doesn't fit when any item is before it, even the zero-width strut, so the strut
+    // and the first item form one item.
     let with_strut = |mut element: renderer::Child| {
         let align = align_of(&mut element);
         let mut group = renderer::node()
@@ -1798,10 +1736,8 @@ fn create(
         _ => None,
     };
     let line_align = Some(renderer::AlignItems::Baseline);
-    // WARNING: like browsers, a canvas takes its natural size and ratio from its attributes, whatever it shows.
-    // An auto height comes from the in-flow picture, which keeps that ratio in the content box, also in a flex
-    // row, where taffy drops the box's own ratio for a percentage width. The drawing covers that picture, so it
-    // stays in the content box too. Pictures paint from the node, so a drawing or a frame changes no box.
+    // WARNING: in a flex row taffy drops the box's own ratio for a percentage width, so an auto height comes from the
+    // in-flow picture, which keeps the ratio.
     let (mut natural, mut natural_ratio) = match node.tag.as_str() {
         "img" | "video" => (None, None),
         _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
@@ -1810,11 +1746,8 @@ fn create(
     let checking = reader.checking;
     #[cfg(not(debug_assertions))]
     let checking = false;
-    // WARNING: boxes of common tags with a shareable plan build their style only from the plan, the call, their own
-    // reads and the facts of their children in `share`, never from what their children built. So a box whose key finds
-    // a style whose reads still give the same takes it and skips the code that builds it, all of which tests `hit`.
-    // Code that sets their style from anything else must add it to the key. Debug builds build each such box again
-    // through that code, and check the style and the reads.
+    // WARNING: a shared style may come only from the plan, the call, its own reads and the child facts in `share`. Code
+    // that sets it from anything else must add that to the key.
     let share = (parsed.shareable
         && !checking
         && slot.is_none()
@@ -1828,9 +1761,34 @@ fn create(
         && !top_layer.contains(&id)
         && matches!(
             node.tag.as_str(),
-            "div" | "span" | "a" | "p" | "section" | "article" | "header" | "footer" | "nav" | "main"
-                | "aside" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "b" | "i" | "strong" | "em"
-                | "small" | "label" | "ul" | "ol" | "li" | "code" | "form"
+            "div"
+                | "span"
+                | "a"
+                | "p"
+                | "section"
+                | "article"
+                | "header"
+                | "footer"
+                | "nav"
+                | "main"
+                | "aside"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "b"
+                | "i"
+                | "strong"
+                | "em"
+                | "small"
+                | "label"
+                | "ul"
+                | "ol"
+                | "li"
+                | "code"
+                | "form"
         ))
     .then(|| {
         use std::hash::{Hash, Hasher};
@@ -1868,15 +1826,17 @@ fn create(
                     reader.replay(id, containing, container, None, dom, &here(read)) == Replay::Same
                 })
         })?;
-        reads.borrow_mut().extend(found.reads.iter().map(|read| Read {
-            scope: if read.scope == 0 {
-                0
-            } else {
-                (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
-            },
-            reader: depth as u16,
-            ..here(read)
-        }));
+        reads
+            .borrow_mut()
+            .extend(found.reads.iter().map(|read| Read {
+                scope: if read.scope == 0 {
+                    0
+                } else {
+                    (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
+                },
+                reader: depth as u16,
+                ..here(read)
+            }));
         Some(found.style.clone())
     });
     let mut el = match &hit {
@@ -2013,7 +1973,6 @@ fn create(
             sized.style().aspect_ratio = natural_ratio;
             el = el.child(sized);
         } else if natural.is_none() && !sizeless {
-            // WARNING: images that are loading or failed to decode keep only their attribute size.
             for (name, prop, horizontal) in [
                 ("width", Prop::WIDTH, true),
                 ("height", Prop::HEIGHT, false),
@@ -2043,8 +2002,6 @@ fn create(
             .h(px(16.))
             .flex_shrink_0()
         };
-        // WARNING: like Chrome, a failed image with both sizes and no alt text has a silver frame, and its icon
-        // shows only when 18 pixels fit.
         let framed = alt.is_none()
             && natural.is_some_and(|size| size != [0., 0.])
             && [("width", Prop::WIDTH), ("height", Prop::HEIGHT)]
@@ -2053,8 +2010,6 @@ fn create(
                     style.get(prop).is_some_and(|value| value != "auto")
                         || node.attrs.contains_key(name)
                 });
-        // WARNING: the icon is out of flow, so the text gives the box its baseline. Like Chrome's floated icon, it
-        // moves only the first line, or the text goes below it when the first word doesn't fit beside it.
         el = if let Some(alt) = alt {
             let mut text = renderer::text(
                 alt.clone(),
@@ -2121,9 +2076,6 @@ fn create(
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         }
         .map(|value| value.clamp(1., 4096.));
-        // WARNING: a source embeds the SVG's subtree with the SVG properties of each element, so it is built
-        // again when a node, the size or one of those values changes. The `<svg>` itself passes only inherited
-        // values, so its own animated transform or opacity keeps the source.
         let mut scope = id;
         while let Some(parent) = doc.nodes[scope].parent {
             scope = parent;
@@ -2246,8 +2198,6 @@ fn create(
                 source.push_str(&doc.serialize_svg(*child, true, &attrs));
             }
             source.push_str("</svg>");
-            // WARNING: marks count from 0 in the source, so a picture has one source on all nodes and shares its
-            // raster. `names` starts with their nodes.
             let mut names = Vec::new();
             let mut counted = String::with_capacity(source.len());
             let mut rest = &*source;
@@ -2292,7 +2242,7 @@ fn create(
         let mut host = view.host.borrow_mut();
         let state = host.dom.entry(view.id).or_default();
         if built || !state.svg_sources.contains_key(&id) {
-            // WARNING: paint only checks the raster size of inline SVGs, so a changed source drops the raster here.
+            // WARNING: paint checks only the raster size of inline SVGs, so a changed source must drop the raster here.
             if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
                 && let Some((_, image)) = state.svgs.remove(&id)
                 && Arc::strong_count(&image) == 1
@@ -2308,8 +2258,6 @@ fn create(
             .h(px(height))
             .child(svg_layer(id, true, view.clone()));
     }
-    // WARNING: a flex line stretches an item with an auto size across it, also a replaced element or a control, so
-    // their natural size gives way in that axis.
     let stretched = |axis: usize| {
         let [size, start, end] = [
             [Prop::WIDTH, Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
@@ -2340,7 +2288,6 @@ fn create(
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
     let editable = text_field(node);
-    // WARNING: controls draw from the system theme when their `color-scheme` allows both, which no style holds.
     let dark = || {
         if style
             .get(Prop::COLOR_SCHEME)
@@ -2404,7 +2351,6 @@ fn create(
             el = el.w(px(layout_ceil((zero * 34.).max(content), pixel_ratio)));
         }
     }
-    // WARNING: an AppKit control covers the box, so the page draws none of it. A button is as wide as its title.
     if appkit == Some(renderer::ControlKind::Button) {
         let [padding, height] = super::native::size(renderer::ControlKind::Button);
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
@@ -2456,7 +2402,6 @@ fn create(
         );
     }
     if editable {
-        // WARNING: a field sized by its content lays out from its value, which no revision covers.
         if style.get(Prop::FIELD_SIZING) == Some("content") {
             reader.log(Query::Value(id as u32), 0, hashed(&node.value));
         }
@@ -2509,7 +2454,6 @@ fn create(
             sizer.style().visibility = renderer::Visibility::Hidden;
             el = el.child(sizer);
         }
-        // WARNING: the box that clips the text scrolls with the field's handle, so the field itself does not track it.
         let handle = view
             .host
             .borrow_mut()
@@ -2645,7 +2589,6 @@ fn create(
         _ if boxed => renderer::Overflow::Scroll,
         _ => renderer::Overflow::Visible,
     });
-    // WARNING: a form field's text clips and scrolls in its own box, so the field keeps its outline unclipped.
     if hit.is_none() && overflow != [renderer::Overflow::Visible; 2] && !editable {
         el.style().overflow.x = overflow[0];
         el.style().overflow.y = overflow[1];
@@ -2718,7 +2661,6 @@ fn create(
         flex_parent,
         slot.is_some(),
     );
-    // WARNING: a grid item's margins come only from its style and call, so it has no read of them to replay.
     if slot.is_none() {
         reader.log(Query::Margins, depth, hashed(margin.map(f32::to_bits)));
     }
@@ -2748,7 +2690,6 @@ fn create(
             };
         }
     }
-    // WARNING: right-to-left blocks put an over-constrained child at the right, so its left margin gives way.
     if hit.is_none()
         && !flex_parent
         && slot.is_none()
@@ -2770,9 +2711,9 @@ fn create(
     {
         el = el.ml_auto();
     }
-    let ink = parsed
-        .ink
-        .map_or(rgba(0x000000ff), |(ink, alpha)| rgba(ink << 8 | alpha as u32));
+    let ink = parsed.ink.map_or(rgba(0x000000ff), |(ink, alpha)| {
+        rgba(ink << 8 | alpha as u32)
+    });
     let mut borders = parsed.borders.unwrap_or_else(|| {
         style::BORDERS.map(|[width, kind, _]| {
             if style
@@ -2793,7 +2734,8 @@ fn create(
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
     if inline_box {
         let [above, below] = [padding[0] + borders[0], padding[2] + borders[2]];
-        // WARNING: like browsers, padding and borders of an inline box hang outside its line.
+        // WARNING: like browsers, padding and borders of an inline box hang outside its line, hence the negative
+        // margins.
         margin[0] = -above;
         margin[2] = -below;
         if hit.is_none() {
@@ -3145,8 +3087,6 @@ fn create(
             padding[0] + padding[2] + borders[0] + borders[2] - reserved[0],
         ]
     };
-    // WARNING: a flex item does not shrink below its natural size in its main axis while its minimum is `auto`, and
-    // that minimum stays within its maximum.
     let floor = |axis: usize, size: f32| {
         let [min, max] = [
             [Prop::MIN_WIDTH, Prop::MAX_WIDTH],
@@ -3188,7 +3128,6 @@ fn create(
             None,
         );
         if auto[0] {
-            // WARNING: like a block, a field stretches between both insets when it is absolute.
             if !stretched(0)
                 && !(matches!(position, "absolute" | "fixed")
                     && [Prop::LEFT, Prop::RIGHT]
@@ -3197,7 +3136,6 @@ fn create(
             {
                 el = el.w(px(width + chrome[0]));
             }
-            // WARNING: a textarea scrolls, so as a flex item it can shrink below its natural size.
             if let Some(min) = floor(0, width + chrome[0]).filter(|_| node.tag != "textarea") {
                 el = el.min_w(px(min));
             }
@@ -3311,7 +3249,6 @@ fn create(
                     };
                     let size = layout_ceil((size - margin[1] - margin[3]).max(0.), pixel_ratio);
                     intrinsic_width = Some(size);
-                    // WARNING: `containing` is only an estimate, so layout keeps a `fit-content` box inside its parent.
                     if value == "fit-content" && style.get(Prop::MAX_WIDTH).is_none() {
                         el = el.max_w(renderer::Length::Calc(1., px(-margin[1] - margin[3])));
                     }
@@ -3340,7 +3277,6 @@ fn create(
                 el.style().box_shadow = units.shadows(value, false);
                 inner_shadows = units.shadows(value, true);
             }
-            // WARNING: `auto <ratio>` keeps a replaced element's natural ratio.
             Prop::ASPECT_RATIO => {
                 if !(value.contains("auto") && natural_ratio.is_some())
                     && let Some(ratio) = aspect_ratio(value)
@@ -3428,8 +3364,8 @@ fn create(
                 let align = match value {
                     "center" => renderer::AlignContent::Center,
                     "flex-end" => renderer::AlignContent::FlexEnd,
-                    // WARNING: these ignore flex-direction reversal. `Start` is the left or top
-                    // edge (rtl rows are `RowReverse`), and `left`/`right` act as `start` on a column.
+                    // WARNING: taffy's `Start` and `End` ignore flex-direction reversal: `Start` is the left or top
+                    // edge, rtl rows are `RowReverse`, and `left`/`right` act as `start` on a column.
                     "start" | "end" | "left" | "right" => {
                         if match value {
                             "left" => false,
@@ -3525,16 +3461,12 @@ fn create(
             _ => {}
         }
     }
-    // WARNING: a replaced element or a control takes its natural size for an auto size, in the content box like its
-    // natural ratio, unless a flex line stretches it. The ratio turns a set or stretched height into the width, and
-    // the in-flow picture turns the used width into an auto height.
     if let Some(natural) = natural {
         let chrome = [
             padding[1] + padding[3] + borders[1] + borders[3],
             padding[0] + padding[2] + borders[0] + borders[2],
         ];
         let props = [Prop::WIDTH, Prop::HEIGHT];
-        // WARNING: the size attributes of images and videos only hint a size that no rule sets.
         let hint = [0, 1].map(|axis| {
             node.attrs
                 .get(["width", "height"][axis])
@@ -3568,7 +3500,6 @@ fn create(
         });
         let stretch = [stretched(0), stretched(1)];
         let css = el.style().aspect_ratio.is_some();
-        // WARNING: the line of a single-line row with a set height is definite, so it carries the ratio.
         let line = (stretch[1]
             && reader
                 .parent(id, Prop::FLEX_WRAP)
@@ -3600,17 +3531,20 @@ fn create(
                 el = only_auto_ratio(el, style);
             }
         }
-        // WARNING: a line that is not definite takes its height from its items, so a stretched item keeps its
-        // natural height as a minimum. An absolute box would stretch to both its insets, so it takes the height
-        // of its ratio too.
         if let Some(height) = match natural_ratio {
             _ if set[1] || line.is_some() || css => None,
             None => Some(natural[1]),
-            Some(ratio) if matches!(position, "absolute" | "fixed") => width.map(|width| width / ratio),
+            Some(ratio) if matches!(position, "absolute" | "fixed") => {
+                width.map(|width| width / ratio)
+            }
             Some(_) => None,
         } {
             let height = height + chrome[1];
-            if stretch[1] && style.get(Prop::MIN_HEIGHT).is_none_or(|value| value == "auto") {
+            if stretch[1]
+                && style
+                    .get(Prop::MIN_HEIGHT)
+                    .is_none_or(|value| value == "auto")
+            {
                 el = el.min_h(px(height));
             } else {
                 el = el.h(px(height));
@@ -3643,7 +3577,6 @@ fn create(
             }
         }
     }
-    // WARNING: like replaced elements, controls keep their own width as blocks.
     let replaced = natural.is_some()
         || symbol.is_some()
         || matches!(
@@ -3700,8 +3633,6 @@ fn create(
         && display.starts_with("inline")
         && let Some(parent) = node.parent
     {
-        // WARNING: like shrink-to-fit, an inline block of auto width gets no wider than its line, which is always a
-        // flex row, so its text wraps.
         if display != "inline"
             && el.style().size.width == renderer::Length::Auto
             && (!replaced || node.tag == "button")
@@ -3803,7 +3734,6 @@ fn create(
                 doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
             })
         {
-            // WARNING: like Chrome, an empty button has its baseline at the bottom of its content box.
             -padding[2] - borders[2]
         } else if native.is_some() {
             0.
@@ -3843,7 +3773,6 @@ fn create(
                 _ if display == "inline" => below(style, units.font),
                 _ => padding[2] + borders[2] + below(style, units.font),
             };
-        // WARNING: the margin reserves the shift so the line box grows instead of overlapping its neighbors.
         if !style::makes_no_line(doc, styles, id)
             && (raise != 0. || reserve > margin[0] || margin[2] < floor)
         {
@@ -4111,8 +4040,6 @@ fn create(
         el = el.child(super::control::layer(id, look, view.clone()));
     }
     let overscroll = overscroll(style);
-    // WARNING: `overflow: hidden` boxes track a scroll handle only once a script scrolls them, or
-    // when `overscroll-behavior` stops scrolling at them.
     let handle = {
         let mut host = view.host.borrow_mut();
         let scroll = &mut host.dom.entry(view.id).or_default().scroll;
@@ -4123,7 +4050,11 @@ fn create(
         {
             Some(scroll.entry(id).or_default().clone())
         } else if overflow.contains(&renderer::Overflow::Hidden) {
-            reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(scroll.get(&id))));
+            reader.log(
+                Query::Scroll(id as u32),
+                0,
+                hashed(scrolled(scroll.get(&id))),
+            );
             scroll.get(&id).cloned()
         } else {
             None
@@ -4345,7 +4276,6 @@ fn create(
         }
         el = el.child(marker_box);
     }
-    // WARNING: an estimate of the content box, for a box that the last layout did not size.
     let content_box = || {
         let mut content = containing;
         for (axis, (prop, min, max)) in [
@@ -4409,9 +4339,6 @@ fn create(
         }
         content
     };
-    // WARNING: pseudo-elements query their originating element, so a container records its size even without
-    // children, and its pseudo-elements and children resolve container units against it. The size from the last
-    // layout wins over the estimate.
     let own = style
         .get(Prop::CONTAINER_TYPE)
         .is_some_and(|v| matches!(v, "inline-size" | "size"))
@@ -4785,9 +4712,8 @@ fn create(
         && (hit_test || node.tag == "#text")
         && !drag
         && {
-            // WARNING: an inherited mode is the same in all boxes from the one that sets it down, so a box above
-            // replays it as its own. A box that sets its own mode reads its parent too, because an ancestor in an
-            // exit transition gets `display: none` and hides the box with no new revision.
+            // WARNING: a box that sets its own mode still reads its parent, because an ancestor in an exit transition
+            // gets `display: none` with no new revision.
             let (mode, origin) = styles.user_select[id];
             let origin = if origin == id {
                 node.parent.unwrap_or(id)
@@ -4861,7 +4787,6 @@ fn create(
                 }
             })
             .collect();
-        // WARNING: `text-box` trims the block by moving its text with negative margins, so the glyphs stay where they would be.
         let text_box = style.get(Prop::TEXT_BOX).unwrap_or("");
         let trim = style.get(Prop::TEXT_BOX_TRIM).unwrap_or(text_box);
         let edge = style.get(Prop::TEXT_BOX_EDGE).unwrap_or(text_box);
@@ -4911,8 +4836,6 @@ fn create(
                         .is_some_and(|value| value == "justify")
                 }),
         });
-        // WARNING: a block that holds only its paragraph, set at the start of its lines, is the paragraph's box itself,
-        // while nothing clips, scrolls, moves or paints around the text in it.
         let alone = !el.has_children()
             && data.atoms.is_empty()
             && trim_top == 0.
@@ -5060,9 +4983,6 @@ fn create(
                 let [min, max] =
                     [min, max].map(|value| (value - horizontal - margin[1] - margin[3]).max(0.));
                 widest = Some([min, max]);
-                // WARNING: tracks size the untransformed box, so they read its laid-out size, not its window bounds.
-                // New content makes the last size meaningless. Most content fits, so tracks take its full width,
-                // and prepaint draws again when the layout disagrees.
                 let last = {
                     let mut host = view.host.borrow_mut();
                     let dom = host.dom.entry(view.id).or_default();
@@ -5080,8 +5000,6 @@ fn create(
                 });
                 tracked[0] = Some((last.unwrap_or(content[0]), horizontal));
             }
-            // WARNING: `containing` is an estimate that doesn't know flex siblings. A grid that fills its parent lets
-            // layout size it, and its tracks read that width from the last layout. Prepaint draws again when it changes.
             if fills {
                 if let Some(last) = view
                     .host
@@ -5094,7 +5012,6 @@ fn create(
                 }
                 tracked[0] = Some((content[0], horizontal));
             }
-            // WARNING: a positioned box with both insets takes its height from its containing block, as with a set height.
             let inset = |prop| {
                 style
                     .get(prop)
@@ -5118,15 +5035,22 @@ fn create(
                 } else {
                     None
                 };
-            // WARNING: entries stay while the grid is kept, so its size is checked in each frame.
             let mut host = view.host.borrow_mut();
             let dom = host.dom.entry(view.id).or_default();
             for (axis, track) in tracked.iter().enumerate() {
                 if let Some((used, _)) = track {
-                    reader.log(Query::Track(id as u32, axis as u8), 0, used.to_bits().into());
+                    reader.log(
+                        Query::Track(id as u32, axis as u8),
+                        0,
+                        used.to_bits().into(),
+                    );
                 }
             }
-            reader.log(Query::Baselines(id as u32), 0, baselines(doc, Some(&*dom), id));
+            reader.log(
+                Query::Baselines(id as u32),
+                0,
+                baselines(doc, Some(&*dom), id),
+            );
             if tracked.iter().any(Option::is_some) {
                 dom.flexed_grids.insert(id, tracked);
             } else {
@@ -5269,7 +5193,6 @@ fn create(
                     && inline_element(index.checked_sub(1).and_then(|index| children.get(index)))
                     && inline_element(children.get(index + 1))
         };
-        // WARNING: wrapped lines are culled whole, and only when the container's height is its content's, so `align-content` has no space to share.
         let wrap = display == "flex"
             && style.get(Prop::FLEX_DIRECTION).is_none_or(|v| v == "row")
             && style.get(Prop::FLEX_WRAP).is_some_and(|v| v == "wrap")
@@ -5298,14 +5221,12 @@ fn create(
                     .get(Prop::FLEX_DIRECTION)
                     .is_some_and(|v| v == "column")
                     && style.get(Prop::FLEX_WRAP).is_none_or(|v| v == "nowrap")
-                    && style.get(Prop::JUSTIFY_CONTENT).is_none_or(|v| {
-                        matches!(v, "normal" | "flex-start" | "start" | "stretch")
-                    })
+                    && style
+                        .get(Prop::JUSTIFY_CONTENT)
+                        .is_none_or(|v| matches!(v, "normal" | "flex-start" | "start" | "stretch"))
             } else {
                 flow && !children.iter().any(|&child| floated(child))
             };
-        // WARNING: how this box culls its children, for `PageState::reach`: 1 as blocks, 2 as a flex column, which
-        // keeps boxes with a set height, and none below a box that moves its content, whose subtree never culls.
         plans = if info[id].flags & cull::MOVES_CONTENT != 0 {
             u8::MAX
         } else if grid.is_some() || stacks && (!flexbox || wrap) {
@@ -5314,7 +5235,6 @@ fn create(
             2 * u8::from(stacks)
         };
         let stack = build.zone.clone().filter(|_| stacks);
-        // WARNING: a debug check builds a kept box again without culling, so it leaves out what the kept build culled.
         #[cfg(debug_assertions)]
         let checked = build
             .checking
@@ -5408,7 +5328,6 @@ fn create(
                         }
                     }
                 }
-                // WARNING: the first and last box of a run collapse their margins with siblings outside it, which may have changed.
                 if !flexbox {
                     let collapsed = |child: usize, side: usize| {
                         let mut units = styles.lengths[child];
@@ -5542,7 +5461,6 @@ fn create(
                 .get(Prop::TEXT_WRAP)
                 .is_none_or(|value| !value.contains("nowrap"));
         el.reserve(children.len());
-        // WARNING: the margins of grid items by style, as items with one style have the same lengths in a pass.
         let mut item_margins = rustc_hash::FxHashMap::<*const style::Style, [f32; 4]>::default();
         for (index, &child) in children.iter().enumerate() {
             if index != joined && shown(index) {
@@ -5590,8 +5508,6 @@ fn create(
                         *grid.cells.get(index)?;
                     bounds[0] += padding[3];
                     bounds[1] += padding[0];
-                    // WARNING: only a subgrid reads the tracks of its area, so other items get none, which spares two
-                    // lists per item in each frame that builds the grid.
                     let [columns, rows] = [
                         (
                             Prop::GRID_TEMPLATE_COLUMNS,
@@ -5649,9 +5565,6 @@ fn create(
                     .get(Prop::POSITION)
                     .is_some_and(|value| matches!(value, "absolute" | "fixed"));
                 let child_style = &styles.values[child];
-                // WARNING: like browsers, a collapsible space after an inline box hangs at the end of its line instead
-                // of starting the next one, so it joins the box in one item and shrinks first. There it doesn't move
-                // a centered or end aligned line (`Inline::Hangs`).
                 let child_element = match children.get(index + 1) {
                     Some(&next)
                         if hangs
@@ -6005,7 +5918,11 @@ fn create(
                 && let Some(parent) = parent
             {
                 let left = padding_left(styles, parent, containing[0]);
-                reader.log(Query::FlatParentPadding, depth, hashed(Some(left.to_bits())));
+                reader.log(
+                    Query::FlatParentPadding,
+                    depth,
+                    hashed(Some(left.to_bits())),
+                );
                 el = el.left(px(left));
             }
             anchor = Some((axes, block, [margin[3], margin[0]]));
@@ -6048,8 +5965,8 @@ fn create(
             }))
         })
         .flatten();
-    // WARNING: blocks lay out as a stretched flex column, so a replaced element or a control, and a block whose width
-    // comes from its ratio and a set height, must not stretch, and they start at the right in right-to-left blocks.
+    // WARNING: blocks lay out as a stretched flex column, so replaced elements, controls and ratio-sized blocks must
+    // set their own alignment, or they stretch.
     if hit.is_none()
         && !flex_parent
         && slot.is_none()
@@ -6253,12 +6170,14 @@ fn create(
                 hooks.boxless,
                 hooks.text,
                 hooks.fixed,
-                hooks.sticky.as_ref().map(|sticky| (sticky.border, sticky.block)),
+                hooks
+                    .sticky
+                    .as_ref()
+                    .map(|sticky| (sticky.border, sticky.block)),
             ),
         )
     )));
     let mut element = el.hooks(hooks);
-    // WARNING: `z-index` does nothing in the top layer, whose boxes paint in their own order.
     if hit.is_none()
         && layered
         && let Some(order) = order.filter(|order| *order != 0)
@@ -6308,7 +6227,6 @@ fn create(
                 "box {id} <{}> sets its style after it took a shared one",
                 node.tag
             );
-            // WARNING: built again without the memo, the box must build the style it took and read what it read.
             let start = reads.borrow().len();
             let printed = reader.prints.borrow().len();
             let culls = std::cell::Cell::new(0);
@@ -6428,10 +6346,8 @@ pub(super) fn pseudo_content(
     text
 }
 
-/// The ratio of an `aspect-ratio` value, like `5/4`, `1.25` or `auto 5 / 4`.
-/// WARNING: taffy passes min and max sizes through the aspect ratio even when the other side is set.
-/// CSS does that only for an auto size, so `max-width: 100%` must not limit the height of a sized image.
-/// A set limit replaces these in the style loop.
+// WARNING: taffy passes min and max sizes through the aspect ratio even when the other side is set, unlike CSS, so
+// `max-width: 100%` must not limit the height of a sized image.
 fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::Node {
     let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
     let limited = |prop| style.get(prop).is_some_and(|value| value != "none");
@@ -6512,9 +6428,6 @@ pub(super) fn text_field(node: &crate::dom::Node) -> bool {
             .any(|other| node.input_type().eq_ignore_ascii_case(other))
 }
 
-// WARNING: an image without a picture stays a replaced element only with both size attributes, which give its
-// natural size and ratio, or with neither a source nor alt text, at size 0. An object shows its children unless it
-// has neither data nor fallback content. Sizes are in the content box.
 pub(super) fn natural_size(
     doc: &Document,
     id: usize,
@@ -6527,7 +6440,12 @@ pub(super) fn natural_size(
             .and_then(|value| dimension(value, node.tag == "canvas"))
             .unwrap_or(default)
     };
-    let pictured = |size: [f32; 2]| (size, (size[0] > 0. && size[1] > 0.).then(|| size[0] / size[1]));
+    let pictured = |size: [f32; 2]| {
+        (
+            size,
+            (size[0] > 0. && size[1] > 0.).then(|| size[0] / size[1]),
+        )
+    };
     let kind = if node.tag == "input" {
         node.input_type()
     } else {
@@ -6539,13 +6457,10 @@ pub(super) fn natural_size(
     {
         return Some((super::native::size(native), None));
     }
-    // WARNING: a failed image keeps the size of the last picture it decoded, which it no longer shows.
     match (node.tag.as_str(), decoded.filter(|_| !broken_image(node))) {
         ("canvas", _) => Some(pictured([attr("width", 300.), attr("height", 150.)])),
         ("img" | "video", Some(size)) => Some(pictured(size)),
         ("video", None) => Some(([300., 150.], None)),
-        // WARNING: like Chrome, a failed image with alt text has no natural size, and one without shows a broken
-        // image icon only when it has a source and no alt attribute.
         ("img", None) => {
             let (broken, alt) = (broken_image(node), node.attrs.get("alt"));
             match ["width", "height"].map(|name| {
@@ -6584,14 +6499,12 @@ pub(super) fn natural_size(
     }
 }
 
-// WARNING: like Chrome, an image without a source counts as failed.
 pub(super) fn broken_image(node: &crate::dom::Node) -> bool {
     node.tag == "img"
         && (node.state & crate::dom::BROKEN != 0
             || !node.attrs.contains_key("src") && !node.attrs.contains_key("srcset"))
 }
 
-// WARNING: one raster per thread and scale, never freed, like a UA resource.
 fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut renderer::Window) {
     thread_local! {
         static ICON: RefCell<Option<(u32, Arc<renderer::RenderImage>)>> = const { RefCell::new(None) };
@@ -6729,13 +6642,10 @@ pub(super) fn field_size(
     ]
 }
 
-// WARNING: rounds a size up to layout units, so the content it was measured from doesn't wrap.
 fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
     (size * pixel_ratio * 64.).ceil() / 64. / pixel_ratio
 }
 
-// WARNING: a grid item's place, the left and top of its margin box in the grid's padding box and the size of its
-// border box, is set on the item by its grid, so the item's build and record hold neither.
 pub(super) fn place(
     child: Child,
     [top, right, bottom, left]: [f32; 4],
@@ -6789,8 +6699,8 @@ pub(super) fn margins(
         let collapses = container(build, parent);
         let open =
             [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
-        // WARNING: animated values aren't in the revisions. Fonts, the viewport and container units change these
-        // margins without a new revision, so `render_page` clears the kept walks with its measurements.
+        // WARNING: the key misses animated values, fonts, the viewport and container units, so animated boxes skip it
+        // and `render_page` clears the walks when the others change.
         let key = (build.info[parent].revision, width.to_bits(), open);
         let animated = build.info[parent].flags & cull::ANIMATED != 0;
         if let Some((old, used)) = build.view.walked.borrow().get(&parent)
@@ -6920,8 +6830,6 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
             Prop::BORDER_BOTTOM_STYLE,
         ]
     };
-    // WARNING: replaced elements and form controls have content of their own, so margins never collapse through
-    // them or into their fallback children.
     id != 0
         && doc.nodes[id].sf_symbol().is_none()
         && !matches!(
@@ -6966,7 +6874,6 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
 }
 
-// WARNING: `None` when `min()` or `max()` inside make the value not linear in the base.
 fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
     if !value.starts_with("calc(") || !value.contains('%') {
         return None;
@@ -6984,7 +6891,6 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
     if let Some(&sets) = build.margins.borrow().1.get(&id) {
         return sets;
     }
-    // WARNING: like the kept walks, this keys on the geometry revision, which animated values don't move.
     let key = (build.info[id].revision, width.to_bits());
     let animated = build.info[id].flags & cull::ANIMATED != 0;
     if !animated
@@ -7452,8 +7358,8 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 && let Some(entry) = state.svg_boxes.get_mut(&id)
             {
                 if entry.0 != *source {
-                    // WARNING: paint draws the tree parsed here, so a changed source is parsed once.
-                    // WARNING: a draw that repeats skips paint, so a tree of the old source can still wait here.
+                    // WARNING: a repeated draw skips paint, so a tree of the old source can still wait in `svg_trees`
+                    // and must go here.
                     state.svg_trees.remove(&id);
                     let (size, content, boxes) = match state.svg_cache.get(source) {
                         Some((geometry, _)) => geometry.clone(),
@@ -7559,7 +7465,6 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 };
                 match image {
                     Ok(image) => {
-                        // WARNING: only icon sizes stay, so at most 256 of them hold under 10 MB.
                         if inline && shared.is_none() && raster[0] <= 96 && raster[1] <= 96 {
                             if let Some((_, images)) = state.svg_cache.get_mut(source) {
                                 images.push(image.clone());

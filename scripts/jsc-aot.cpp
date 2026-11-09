@@ -196,8 +196,6 @@ extern "C" JS_EXPORT bool JSLoadAOT(const uint8_t* bytes, size_t size, char* err
     return true;
 }
 
-// Locks the built-ins that compiled code relies on, once per context, after the host installed its globals and before
-// compiled code runs, like Bun after it creates a realm.
 extern "C" JS_EXPORT void JSAttachAOT(JSContextRef ctx)
 {
     auto* global = toJS(ctx);

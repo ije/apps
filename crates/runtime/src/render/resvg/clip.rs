@@ -40,7 +40,6 @@ fn draw_children(
                     continue;
                 }
 
-                // We could use any values here. They will not be used anyway.
                 let ctx = Context {
                     max_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
                 };
@@ -54,9 +53,6 @@ fn draw_children(
                 let transform = transform.pre_concat(group.transform());
 
                 if let Some(clip) = group.clip_path() {
-                    // If a `clipPath` child also has a `clip-path`
-                    // then we should render this child on a new canvas,
-                    // clip it, and only then draw it to the `clipPath`.
                     clip_group(group, clip, transform, pixmap);
                 } else {
                     draw_children(group, mode, transform, pixmap);

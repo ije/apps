@@ -62,22 +62,18 @@ pub(crate) struct Cull {
     pub(crate) offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) visible: Vec<bool>,
     pub(crate) walk: crate::dom::Walk,
-    /// The parent of each node in `walk`, or `u32::MAX`.
     pub(crate) parents: Vec<u32>,
-    /// Nodes whose info holds paint animation flags from a frame since the last info pass.
     pub(crate) painted: Vec<usize>,
-    // WARNING: only these nodes can hold per-frame flags, or any node while it is `None`, so a frame clears just these.
+    // WARNING: per-frame flags may be set only on nodes listed here, or on any node while `None`, since a frame clears
+    // just these.
     pub(crate) fresh: Option<Vec<usize>>,
     pub(crate) marked: Vec<bool>,
-    // WARNING: whether `visible` follows the cascade, not the painted `display` of exit transitions.
     pub(crate) cascaded: bool,
     pub(crate) cells: Vec<usize>,
     pub(crate) canvases: Vec<usize>,
     pub(crate) iframes: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
     pub(crate) subtrees: Subtrees,
-    // WARNING: how far each scroll handle moved since the last frame. Culling reads last frame's rects, which lie that
-    // far from where their boxes are now.
     pub(crate) scrolled: rustc_hash::FxHashMap<usize, f32>,
 }
 
@@ -215,15 +211,15 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
-    // WARNING: a form control's value and checked state draw like its text, and a failed image draws its alt text. A
-    // text field's value only fills the box, so a new one builds the field again in place, see `element::Patch`.
+    // WARNING: a text field's value is left out on purpose: a new value builds the field again in place, see
+    // `element::Patch`.
     if !super::element::text_field(node) {
         node.value.hash(&mut shape);
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
     let mut own = shape.finish();
-    // WARNING: `class` and `style` act only through the computed style, which renews a node by itself, so a class
-    // that changes only paint keeps the node's revision, see `render_page`.
+    // WARNING: `class` and `style` are left out on purpose. They act through the computed style, so a paint-only class
+    // change keeps the node's revision.
     let mut attrs = rustc_hash::FxHasher::default();
     for pair in node.attrs.iter() {
         let name = pair.0.as_str();
@@ -495,7 +491,6 @@ pub(super) fn shift(
     roots: &[usize],
     [x, y]: [f32; 2],
 ) {
-    // WARNING: a scroll moves every culled subtree, so their nodes are listed once per tree revision.
     if subtrees.0 != doc.nodes.tree() {
         subtrees.0 = doc.nodes.tree();
         subtrees.1.clear();
@@ -524,9 +519,6 @@ pub(super) fn shift(
     }
 }
 
-// WARNING: `path` is the box that culled and the boxes it was built in. A subtree that culled is kept with its spacers,
-// so a spacer that comes into view, or near it after it moved, drops the records along `path`, and the next pass
-// culls again from where the boxes are then.
 pub(super) fn spacer(
     run: Run,
     path: Rc<[usize]>,
@@ -555,14 +547,12 @@ pub(super) fn spacer(
             let [low, high] = zone.visible(&dom.bounds, window);
             let y = f32::from(bounds.top());
             let x = dom.bounds.get(&parent).map(|rect| rect[0]);
-            // WARNING: the members were laid out at the old parent width, so a new width lays them out again.
             let resized = x.is_none()
                 || dom
                     .cull
                     .widths
                     .get(&parent)
                     .is_none_or(|now| (now[0] - width).abs() > 0.01);
-            // WARNING: a changed box before a run of wrapped lines may move boxes to other lines, which the spacer cannot follow.
             let reflowed = watch.iter().any(|&(id, width)| {
                 dom.cull
                     .placed

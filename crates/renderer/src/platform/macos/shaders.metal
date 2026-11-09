@@ -792,7 +792,7 @@ fragment float4 monochrome_sprite_fragment(
     constant Globals &globals [[buffer(1)]],
     texture2d<float> atlas_texture [[texture(0)]]) {
   float4 sample = atlas_texture.sample(linear_sampler, input.tile_position);
-  // WARNING: alpha clip after using the derivatives.
+  // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
   }

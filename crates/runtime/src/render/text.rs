@@ -163,7 +163,6 @@ pub(super) fn paint_text(
                 start = end;
                 left = right;
             }
-            // WARNING: rows only grow downward, so painting starts at the first row that reaches the content mask.
             let Some(mut wrap) = (0..=wraps.len()).find(|&row| top(row) + tall > mask.top()) else {
                 return;
             };
@@ -337,8 +336,6 @@ fn row_extents<'a>(
         }
         offset += line.len() + 1;
     }
-    // WARNING: like Chrome, a `top` or `bottom` box taller than the rest of its row grows the row on the other side,
-    // the first of the tallest first, which leaves no room for the others.
     edges.sort_by(|a: &(usize, f32, bool), b| b.1.total_cmp(&a.1));
     for (row, height, bottom) in edges {
         let [above, below] = &mut rows[row];
@@ -567,7 +564,6 @@ pub(super) struct InlineText {
     pub(super) prepainted: std::cell::RefCell<Prepainted>,
 }
 
-// WARNING: what the last prepaint gave, so a kept paragraph gives it again, moved where its box moved.
 #[derive(Default)]
 pub(super) struct Prepainted {
     hitboxes: Vec<(renderer::Hitbox, renderer::CursorStyle)>,
@@ -694,7 +690,6 @@ impl From<InlineText> for renderer::Node {
                         cached,
                         baselines: kept_baselines,
                     } = kept;
-                    // WARNING: a kept paragraph can move under another text style, which measures it again.
                     if styled.borrow().as_ref() != Some(style) {
                         cached.set(None);
                         *styled.borrow_mut() = Some(style.clone());
@@ -733,8 +728,7 @@ impl From<InlineText> for renderer::Node {
                     for (index, line) in lines.iter().enumerate() {
                         let mut line_size = line.size(line_height);
                         if index == 0 && line.wrap_boundaries.is_empty() {
-                            line_size.width =
-                                (line_size.width + style.text_indent).max(px(0.));
+                            line_size.width = (line_size.width + style.text_indent).max(px(0.));
                         }
                         size.height += line_size.height;
                         size.width = size.width.max(line_size.width);
@@ -775,27 +769,29 @@ impl From<InlineText> for renderer::Node {
 }
 
 impl InlineText {
-    // WARNING: the areas of the paragraph's links that show a cursor: their text, or the rows between their ends.
     fn cursors<'a>(
         &'a self,
         layout: &'a renderer::TextLayout,
         rows: &'a crate::dom::Rows,
         bounds: Bounds<Pixels>,
     ) -> impl Iterator<Item = (Bounds<Pixels>, renderer::CursorStyle)> + 'a {
-        self.data.cursors.iter().filter_map(move |&(index, cursor)| {
-            let range = &self.data.ranges.get(index)?.1;
-            let (a, b) = text_position(layout, &self.data.text, rows, range.start)
-                .zip(text_position(layout, &self.data.text, rows, range.end))?;
-            let rect = if a.y == b.y {
-                Bounds::new(a, size(b.x - a.x, layout.line_height()))
-            } else {
-                Bounds::new(
-                    point(bounds.left(), a.y),
-                    size(bounds.size.width, b.y - a.y + layout.line_height()),
-                )
-            };
-            Some((rect, cursor))
-        })
+        self.data
+            .cursors
+            .iter()
+            .filter_map(move |&(index, cursor)| {
+                let range = &self.data.ranges.get(index)?.1;
+                let (a, b) = text_position(layout, &self.data.text, rows, range.start)
+                    .zip(text_position(layout, &self.data.text, rows, range.end))?;
+                let rect = if a.y == b.y {
+                    Bounds::new(a, size(b.x - a.x, layout.line_height()))
+                } else {
+                    Bounds::new(
+                        point(bounds.left(), a.y),
+                        size(bounds.size.width, b.y - a.y + layout.line_height()),
+                    )
+                };
+                Some((rect, cursor))
+            })
     }
 }
 
@@ -806,12 +802,14 @@ impl renderer::Hooks for InlineText {
 
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        // WARNING: a block that holds its paragraph itself sets its text inside its padding and border.
         let [top, right, bottom, left] = cx.inset;
         let inside = |bounds: Bounds<Pixels>| {
             Bounds::new(
                 bounds.origin + point(left, top),
-                size(bounds.size.width - left - right, bounds.size.height - top - bottom),
+                size(
+                    bounds.size.width - left - right,
+                    bounds.size.height - top - bottom,
+                ),
             )
         };
         let (bounds, exact, style) = (inside(cx.bounds), inside(cx.exact), cx.text.clone());
@@ -989,7 +987,12 @@ impl renderer::Hooks for InlineText {
         }
         let hitboxes = self
             .cursors(layout, &rows, bounds)
-            .map(|(rect, cursor)| (window.insert_hitbox(rect, renderer::HitboxBehavior::Normal), cursor))
+            .map(|(rect, cursor)| {
+                (
+                    window.insert_hitbox(rect, renderer::HitboxBehavior::Normal),
+                    cursor,
+                )
+            })
             .collect();
         let shift = exact.origin - bounds.origin;
         let view = &*self.view;
@@ -999,7 +1002,10 @@ impl renderer::Hooks for InlineText {
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
         let (mut layouts, mut rects) = {
             let mut prepainted = self.prepainted.borrow_mut();
-            (std::mem::take(&mut prepainted.layouts), std::mem::take(&mut prepainted.rects))
+            (
+                std::mem::take(&mut prepainted.layouts),
+                std::mem::take(&mut prepainted.rects),
+            )
         };
         layouts.clear();
         rects.clear();
@@ -1120,21 +1126,21 @@ impl renderer::Hooks for InlineText {
         };
     }
 
-    // WARNING: a paragraph with atoms or one it shapes itself places them in each pass.
     fn volatile(&self) -> bool {
         !self.atoms.is_empty()
             || self.data.first_line.is_some()
             || self.data.runs.iter().any(|run| run.font_size.is_some())
     }
 
-    // WARNING: the page drops its text layouts in each build, so a kept paragraph gives them again. One that moved with
-    // its box moves its rects and cursor areas along.
     fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
         let [top, right, bottom, left] = cx.inset;
         let bounds = Bounds::new(
             cx.bounds.origin + point(left, top),
-            size(cx.bounds.size.width - left - right, cx.bounds.size.height - top - bottom),
+            size(
+                cx.bounds.size.width - left - right,
+                cx.bounds.size.height - top - bottom,
+            ),
         );
         let origin = cx.exact.origin + point(left, top);
         let layout = cx.text_layout().cloned();
@@ -1149,7 +1155,10 @@ impl renderer::Hooks for InlineText {
         let moved = origin != *at;
         let window = &mut *cx.window;
         let places: Vec<_> = match &layout {
-            Some(layout) if moved => self.cursors(layout, rows, bounds).map(|(rect, _)| rect).collect(),
+            Some(layout) if moved => self
+                .cursors(layout, rows, bounds)
+                .map(|(rect, _)| rect)
+                .collect(),
             _ => hitboxes.iter().map(|(hitbox, _)| hitbox.bounds).collect(),
         };
         for ((hitbox, _), place) in hitboxes.iter_mut().zip(places) {
@@ -1172,7 +1181,6 @@ impl renderer::Hooks for InlineText {
         }
     }
 
-    // WARNING: the paragraph paints its own rows, so the text node's lines are not painted.
     fn paint_content(&self, cx: &mut renderer::NodeCx<'_>) -> bool {
         let node_layout = cx.text_layout().cloned();
         let text_style = cx.text.clone();

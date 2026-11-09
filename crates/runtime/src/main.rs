@@ -16,7 +16,6 @@ fn main() {
             home = home.parent().unwrap().join("Resources");
         }
         let packaged = home.join("app.bundle").is_file() || home.join("app.js").is_file();
-        // WARNING: like Electron, these flags come before the script and are not arguments of it.
         if std::env::var_os("ELECTRON_RUN_AS_NODE")
             .is_some_and(|value| !value.is_empty() && value != "0")
         {

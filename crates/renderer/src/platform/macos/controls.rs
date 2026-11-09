@@ -18,7 +18,6 @@ use std::{
 };
 
 const SHARED: &CStr = c"appsControls";
-// WARNING: the clip around a control is this much wider than its box, so the focus ring shows.
 const RING: f64 = 8.;
 
 struct Entry {
@@ -185,7 +184,6 @@ extern "C" fn action(this: &AnyObject, _: Sel, sender: *mut AnyObject) {
     let (value, done) = match kind {
         ControlKind::Button | ControlKind::Switch => (None, true),
         ControlKind::Slider => {
-            // WARNING: a slider sends its action while it tracks, and its edit ends with the release.
             let app: *mut AnyObject =
                 unsafe { msg_send![class!(NSApplication), sharedApplication] };
             let event: *mut AnyObject = unsafe { msg_send![app, currentEvent] };
@@ -357,7 +355,6 @@ fn create(kind: ControlKind, target: Option<&AnyObject>) -> Retained<AnyObject> 
                 let () = msg_send![&*control, setSendsWholeSearchString: Bool::YES];
             }
             ControlKind::Date => {
-                // WARNING: text with a stepper, for the year, month and day, in UTC on the Gregorian calendar.
                 let () = msg_send![&*control, setDatePickerStyle: 0usize];
                 let () = msg_send![&*control, setDatePickerElements: 0x00e0usize];
                 let () = msg_send![&*control, setBezeled: Bool::YES];
@@ -533,7 +530,8 @@ pub(crate) fn update(
             if fresh || old.enabled != state.enabled {
                 let () = msg_send![control, setEnabled: Bool::new(state.enabled)];
             }
-            // WARNING: the page's value waits until the page has taken every edit made here.
+            // WARNING: the page's value applies only after the page has taken every edit made here, or it would undo
+            // edits it has not seen.
             let current = shared
                 .entries
                 .get(&state.key)

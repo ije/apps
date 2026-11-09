@@ -11,7 +11,8 @@
     try { emitter[capture] = false; emitter.emit('error', error); } finally { emitter[capture] = previous; }
   };
   const caught = (emitter, result, name, args) => { if (result != null && typeof result.then === 'function') result.then(undefined, error => { const report = () => rejected(emitter, error, name, args); if (globalThis.process) process.nextTick(report); else queueMicrotask(report); }); };
-  // WARNING: listeners live in Node's string-keyed `_events` shape (a function, or an array for several), created on first use, because legacy subclasses skip the constructor and mixins copy the prototype by property names.
+  // WARNING: keep Node's string-keyed `_events` shape, made on first use: legacy subclasses skip the constructor and
+  // mixins copy the prototype by property names.
   function EventEmitter(options) {
     if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) { this._events = { __proto__: null }; this._eventsCount = 0; }
     this._maxListeners ||= undefined;

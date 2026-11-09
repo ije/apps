@@ -23,7 +23,6 @@ pub fn page(source: &str) -> Document {
     doc
 }
 
-// WARNING: packs a page for other threads, because its documents can't cross threads.
 pub(crate) fn pack_page(doc: &Document) -> Result<Vec<u8>> {
     Ok(postcard::to_allocvec(doc)?)
 }
@@ -52,8 +51,6 @@ pub struct Bundle {
     pub scripts: HashMap<String, bytes::Bytes>,
 }
 
-// `apps build --aot` replaces each script it compiles with a reference to its native code in app.dylib. The build ID
-// ties the reference to one app.dylib. Without native code, the reference throws.
 pub const AOT_PREFIX: &str = "\"apps:aot:";
 
 pub fn aot_source(build: &str, name: &str) -> String {
@@ -70,7 +67,7 @@ pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String
     let modules = js!("modules.js");
     let mut source = String::with_capacity(modules.len() + app.len() + 64);
     source.push_str("(()=>{");
-    source.push_str(&modules);
+    source.push_str(modules);
     source.push_str("})()(($appsDefine)=>{\n");
     source.push_str(app);
     source.push_str(if execute { "\n},true);" } else { "\n},false);" });
@@ -81,7 +78,6 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
     ensure!(package.is_object(), "Expected an object in package.json");
-    // WARNING: like electron-builder, `executableName` wins, because npm names like `@scope/app` can't name a file.
     let name = package
         .get("executableName")
         .or_else(|| package.get("name"))
@@ -301,8 +297,8 @@ pub fn write(
     );
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
-    // WARNING: JSC reads bytecode in place and needs it 8-byte aligned, so each one starts at such an offset of the
-    // file after the index of their URLs and sizes.
+    // WARNING: JSC reads bytecode in place and needs it 8-byte aligned, so each one starts at an 8-byte aligned file
+    // offset.
     if !bytecode.is_empty() {
         let index: Vec<_> = bytecode
             .iter()
@@ -322,16 +318,16 @@ pub fn write(
     Ok(bytes.len())
 }
 
-// WARNING: dev bundles are JSON from a file or stdin. Parsing them from one byte slice keeps one copy of the
-// bundle deserializer in the runtime instead of one per reader type.
+// WARNING: read the whole input into one slice before parsing, so the runtime has one copy of the bundle deserializer
+// instead of one per reader type.
 pub fn from_json(mut input: impl std::io::Read) -> Result<Bundle> {
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-// WARNING: `apps run` writes a bundle per line on stdin: the app's first, then one after each change that only pages
-// see. The pipe moves off fd 0, so child processes that inherit stdin never read the bundles or wait on the open pipe.
+// WARNING: the bundle pipe moves off fd 0 and /dev/null takes its place, so child processes that inherit stdin never
+// read bundles or hold the pipe open.
 pub fn from_stdin() -> Result<(Bundle, impl std::io::BufRead + Send + 'static)> {
     #[cfg(unix)]
     let input = unsafe {
@@ -424,7 +420,6 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             ..Bundle::default()
         };
         for (name, source) in mapped.files {
-            // WARNING: packed addons stay mapped next to the script chunks, keyed by their node_modules path.
             let duplicate = if name.starts_with("script-") || name.ends_with(".node") {
                 bundle
                     .scripts

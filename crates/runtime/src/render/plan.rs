@@ -4,9 +4,8 @@ use renderer::{Pixels, Radii, Rgba, rgba};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
-// WARNING: what `create` parses of a computed style, with its units and the pixel ratio, and nothing else, so a plan
-// reads no box and its memo hides no read. The cascade gives nodes that match alike one style, so the rows of a list
-// share a plan. A value that holds a percentage is `None`, and `create` resolves it against its containing block.
+// WARNING: a plan must come only from the computed style, its units and the pixel ratio, so it reads no box and its
+// memo hides no read.
 #[derive(PartialEq)]
 pub(super) struct Plan {
     pub(super) made: Establishes,
@@ -23,9 +22,6 @@ pub(super) struct Plan {
     pub(super) borders: Option<[f32; 4]>,
     pub(super) border_colors: [Rgba; 4],
     pub(super) radii: Option<Radii<renderer::Length>>,
-    // WARNING: whether the box style that `create` builds from this plan can be a function of the plan, the call, the
-    // reads and a few facts of the children, see `create`. Styles that size boxes by their content, place them out of
-    // flow or turn them read more of the subtree, so they are never shared.
     pub(super) shareable: bool,
 }
 
@@ -37,7 +33,9 @@ impl Plan {
                 .any(|&prop| style.get(prop).is_some_and(|value| value.contains('%')))
         };
         let ink = style.get(Prop::COLOR).and_then(style::color);
-        let text = ink.map_or(rgba(0x000000ff), |(ink, alpha)| rgba(ink << 8 | alpha as u32));
+        let text = ink.map_or(rgba(0x000000ff), |(ink, alpha)| {
+            rgba(ink << 8 | alpha as u32)
+        });
         let borders = style::BORDERS.map(|[width, kind, _]| {
             if style
                 .get(kind)
@@ -84,8 +82,11 @@ impl Plan {
                 .and_then(style::color)
                 .filter(|(_, alpha)| *alpha > 0),
             selection: style::selection_colors(style, None),
-            padding: (!relative(&style::PADDING))
-                .then(|| units.edges(style, style::PADDING, 0.).map(|value| value.max(0.))),
+            padding: (!relative(&style::PADDING)).then(|| {
+                units
+                    .edges(style, style::PADDING, 0.)
+                    .map(|value| value.max(0.))
+            }),
             borders: (!relative(&style::BORDERS.map(|[width, ..]| width))).then_some(borders),
             border_colors: style::BORDERS.map(|[_, _, name]| {
                 style
@@ -96,9 +97,13 @@ impl Plan {
             radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
             shareable: matches!(
                 style.get(Prop::DISPLAY),
-                None | Some("block" | "inline" | "inline-block" | "flex" | "inline-flex" | "flow-root")
-            ) && matches!(style.get(Prop::POSITION), None | Some("static" | "relative"))
-                && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
+                None | Some(
+                    "block" | "inline" | "inline-block" | "flex" | "inline-flex" | "flow-root"
+                )
+            ) && matches!(
+                style.get(Prop::POSITION),
+                None | Some("static" | "relative")
+            ) && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
                 && style
                     .get(Prop::WRITING_MODE)
                     .is_none_or(|mode| mode.starts_with("horizontal"))
@@ -112,16 +117,18 @@ impl Plan {
                     Prop::FLEX_BASIS,
                 ]
                 .iter()
-                .all(|&prop| style.get(prop).is_none_or(|value| !value.contains("content"))),
+                .all(|&prop| {
+                    style
+                        .get(prop)
+                        .is_none_or(|value| !value.contains("content"))
+                }),
         }
     }
 }
 
 type Stored = (Rc<Style>, Lengths, u32, Rc<Plan>);
 
-// WARNING: plans by style pointer, the last 8 units of each, which change as windows resize. An entry holds its style,
-// so the pointer is not reused while it lives, and entries whose style only the memo holds go when the memo grows. A
-// new scale or new fonts clear it, like kept boxes.
+// WARNING: keyed by style pointer, so each entry holds its style to keep the pointer from being reused.
 #[derive(Default)]
 pub(super) struct Plans {
     map: FxHashMap<*const Style, Vec<Stored>>,

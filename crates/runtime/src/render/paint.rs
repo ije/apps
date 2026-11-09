@@ -115,8 +115,6 @@ pub(super) enum Source {
     Drawn,
 }
 
-// WARNING: a picture reads its image when it paints, so video frames and canvas drawings change no box. The build
-// records only the image sizes, which lay the box out.
 pub(super) struct Picture {
     pub(super) id: usize,
     pub(super) view: Rc<super::PageState>,
@@ -134,7 +132,6 @@ impl Hooks for Picture {
         true
     }
 
-    // WARNING: the image paints under the box's children, like an image box's content.
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let view = &*self.view;
         let image = view.host.try_borrow().ok().and_then(|host| {
@@ -183,7 +180,6 @@ pub(super) struct DomBox {
     pub(super) plans: u8,
     pub(super) ids: Rc<super::effects::Ids>,
     pub(super) view: Rc<super::PageState>,
-    // WARNING: rare fields are boxed, so the box stays a small block of the runtime's allocator, see `malloc.rs`.
     pub(super) sticky: Option<Box<Sticky>>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
@@ -199,7 +195,6 @@ pub(super) struct DomBox {
     pub(super) revision: u64,
     pub(super) sides: [f32; 2],
     pub(super) margin: [f32; 4],
-    // WARNING: the grid that places the box.
     pub(super) cell: Option<usize>,
     pub(super) grid: Option<(usize, bool)>,
     pub(super) parts: Rc<[(usize, Vec<usize>)]>,
@@ -216,7 +211,6 @@ pub(super) struct DomBox {
 const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
 
 impl DomBox {
-    // WARNING: a box that positions absolute boxes records its padding box for them, translated with the box.
     fn block(&self, bounds: Bounds<Pixels>, translation: Point<Pixels>) {
         if let Some([top, right, bottom, left]) = self.block {
             let view = &*self.view;
@@ -259,7 +253,6 @@ impl DomBox {
         );
     }
 
-    // WARNING: an inline box spans the lines of its text, and a table part the cells in it.
     fn unions(&self) {
         let view = &*self.view;
         if let Some(([first, last], [above, below])) = self.text {
@@ -298,8 +291,6 @@ impl DomBox {
         }
     }
 
-    // WARNING: where the boxes below this one lie that a parent could cull: plain blocks in boxes that cull their
-    // children, see `element::element`.
     fn reached(&self, window_bounds: Bounds<Pixels>, flags: u16) {
         let view = &*self.view;
         let mut reaching = view.reaching.borrow_mut();
@@ -327,7 +318,6 @@ impl DomBox {
 }
 
 impl Hooks for DomBox {
-    // WARNING: a box with a transform or an effect paints through a layer that can reach past its bounds.
     fn bounded(&self) -> bool {
         self.placed.get().1.is_none() && self.effects.is_none()
     }
@@ -420,8 +410,8 @@ impl Hooks for DomBox {
                 })
             }
         {
-            // WARNING: the box was sized in last frame's block, so a block that changed size draws again, but once
-            // per mismatch: a size that the next pass builds the same way would draw again in every frame.
+            // WARNING: redraw once per mismatch only, or a size that the next pass builds the same way draws again in
+            // every frame.
             if let Some([width, height]) = self.sized
                 && ((f32::from(block.size.width) - width).abs() > 0.5
                     || (f32::from(block.size.height) - height).abs() > 0.5)
@@ -559,7 +549,6 @@ impl Hooks for DomBox {
                 self.mirror(&mut dom.bounds, window_bounds);
                 let width = f32::from(bounds.size.width);
                 let [top, right, bottom, left] = self.margin;
-                // WARNING: a grid item takes the unsnapped size of its cell in the grid it was last placed by.
                 let cell = self
                     .cell
                     .and_then(|grid| {
@@ -586,7 +575,6 @@ impl Hooks for DomBox {
                 view.reaching
                     .borrow_mut()
                     .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
-                // WARNING: a container's size starts from an estimate, so queries read the size that layout gave it.
                 if dom
                     .containers
                     .get(&self.id)
@@ -597,8 +585,6 @@ impl Hooks for DomBox {
                 }
                 if let Some((grid, aligned)) = self.grid {
                     let baselines = baselines.map(|value| value.map(f32::from));
-                    // WARNING: the grid's own baseline comes from its first item in the same layout, so only aligned
-                    // items, which the grid places from their last baselines, need another pass.
                     if dom.baselines.insert(self.id, baselines) != Some(baselines) {
                         dom.grids.remove(&grid);
                         if aligned {
@@ -611,7 +597,6 @@ impl Hooks for DomBox {
             if let Some((browser, _)) = view.browsers.borrow().get(&self.id)
                 && let Some((set, ..)) = view.frames.borrow_mut().get_mut(&self.id)
             {
-                // WARNING: native views are placed in window points, which the page zoom scales.
                 let zoom = window.zoom();
                 let bounds = [
                     window_bounds.origin.x,
@@ -640,7 +625,6 @@ impl Hooks for DomBox {
         self.placed.set((bounds, matrix));
         self.offset.set(offset);
     }
-    // WARNING: boxes placed from other boxes, the scroll, the viewport or the frame prepaint in every pass.
     fn volatile(&self) -> bool {
         self.anchor.is_some()
             || self.sticky.is_some()
@@ -652,8 +636,6 @@ impl Hooks for DomBox {
             || self.frame
     }
 
-    // WARNING: a box that moved, with its parent or the scroll, writes its place again; one with a transform that
-    // isn't a translation prepaints again, as its matrix holds its place.
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let (placed, matrix) = self.placed.get();
         let offset = self.offset.get();
@@ -777,8 +759,6 @@ impl DomBox {
             .find_map(|prop| style.get(prop))
             .filter(|value| !value.is_empty() && *value != "none");
         let mask = (shapes.is_some() || images.is_some()).then(|| {
-            // WARNING: building a mask's SVG costs more than drawing the box, so the bitmap is kept by its
-            // exact inputs: the mask properties and clip shape, then the box size and units as hex bits.
             let mut inputs = String::new();
             for part in [
                 Prop::MASK_IMAGE,
@@ -809,7 +789,6 @@ impl DomBox {
                             || u32::from(image.size().height) != raster[1]
                     })
             }) {
-                // WARNING: scroll areas keep gradient masks that are usually fully opaque, and a resize changes them in every frame, so these skip the SVG.
                 if shapes.is_none()
                     && let Some([across, down]) =
                         super::effects::axis_mask(style, &units, size, raster)

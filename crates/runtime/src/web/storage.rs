@@ -252,8 +252,8 @@ impl Database {
     }
 }
 
-// WARNING: writes an IndexedDB key as bytes whose order is the key order: numbers, dates, strings, binary, then arrays.
-// Strings and binary use Firefox's code unit encoding, which never starts a unit with 0, so 0 ends them.
+// WARNING: the bytes must sort like the keys: numbers, dates, strings, binary, then arrays. String and binary units
+// never start with 0, so a 0 byte ends them.
 fn encode_key(key: &Value, out: &mut Vec<u8>) -> Result<()> {
     let unit = |out: &mut Vec<u8>, unit: u32| {
         if unit < 0x7f {
@@ -513,7 +513,6 @@ impl State {
             database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name))",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS entries (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
-            // WARNING: older builds kept JSON keys in `records`, which SQL cannot order like IndexedDB.
             if !database
                 .query("SELECT 1 FROM sqlite_master WHERE name='records'", &[])?
                 .is_empty()

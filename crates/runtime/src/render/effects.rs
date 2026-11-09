@@ -7,8 +7,8 @@ use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, R
 
 pub(crate) type Matrix = [f32; 16];
 
-// WARNING: with a walk, the ids of the nodes in the page's flat tree: freed and removed nodes can't be referenced, and
-// the arena is many times longer than the page when rows are rebuilt every frame.
+// WARNING: find ids through the walk, not the node arena: removed nodes must not match, and the arena can be many times
+// longer than the page.
 #[derive(Default)]
 pub(crate) struct Ids {
     map: std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>,
@@ -21,7 +21,10 @@ impl Ids {
     }
 
     pub(crate) fn of(walk: std::rc::Rc<Vec<(u32, u32)>>) -> Self {
-        Self { map: Default::default(), walk: Some(walk) }
+        Self {
+            map: Default::default(),
+            walk: Some(walk),
+        }
     }
 }
 
@@ -1307,10 +1310,8 @@ pub(crate) struct Establishes {
     pub(crate) transformed: bool,
 }
 
-// WARNING: the one place that decides what a style makes its box, per CSS Positioned Layout, Transforms 2, Masking,
-// Compositing, Filter Effects, Containment and `will-change`: a stacking context, the containing block of absolute
-// and of fixed descendants, an effect layer, a transform. Building, culling and kept keys must agree on it.
-// `z-index` on flex and grid items depends on the parent, and an opacity layer on the children, so callers add those.
+// WARNING: building, culling and kept keys must all decide this here. Callers add what depends on other boxes:
+// `z-index` on flex and grid items, and opacity layers.
 pub(crate) fn establishes(style: &Style) -> Establishes {
     let set = |props: &[Prop]| {
         props
@@ -1347,7 +1348,6 @@ pub(crate) fn establishes(style: &Style) -> Establishes {
     }) || style
         .get(Prop::CONTENT_VISIBILITY)
         .is_some_and(|value| value != "visible");
-    // WARNING: a property in `will-change` acts as if any value that changes these was set.
     let (mut wills, mut will_stack, mut will_position) = (false, false, false);
     for name in style
         .get(Prop::WILL_CHANGE)

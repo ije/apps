@@ -14,7 +14,8 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const normalize = encoding => encoding == null ? 'utf8' : encodings[encoding] ?? encodings[String(encoding).toLowerCase()];
   const encodingOf = encoding => { const value = encoding === null ? undefined : normalize(encoding); if (!value) throw error(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`); return value; };
   const encode = (value, encoding = 'utf8') => {
-    // WARNING: well-formed text decodes natively. Node stops at the first bad hex pair and skips characters outside base64, so only text that the native decoders reject takes the slow cleanup.
+    // WARNING: Node stops at the first bad hex pair and skips characters outside base64, so text that the native
+    // decoders reject must take the slow cleanup.
     if (encoding === 'hex') { try { return Uint8Array.fromHex(value.length & 1 ? value.slice(0, -1) : value); } catch { return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]); } }
     if (encoding === 'base64' || encoding === 'base64url') { try { return Uint8Array.fromBase64(value, { alphabet: encoding }); } catch {} const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
     return codec.encode(value, encodeKinds[encoding]);
@@ -576,7 +577,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   files.writevSync = (fd, buffers, position) => { const data = Buffer.concat(vectors(buffers)); try { return sync('write', fd, data, offsetOrNull(position)); } catch (error) { throw failure(error, 'write', [fd]); } };
   files.readv = (fd, buffers, position, callback) => { if (typeof position === 'function') [position, callback] = [null, position]; const list = vectors(buffers); asyncCall('read', fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)).then(data => callback(null, scatter(list, bytes(data)), buffers), error => callback(failure(error, 'read', [fd]))); };
   files.writev = (fd, buffers, position, callback) => { if (typeof position === 'function') [position, callback] = [null, position]; asyncCall('write', fd, Buffer.concat(vectors(buffers)), offsetOrNull(position)).then(written => callback(null, written, buffers), error => callback(failure(error, 'write', [fd]))); };
-  // WARNING: like Node, globs match names case-insensitively on macOS and Windows, and wildcards and `**` skip names that start with a dot.
   const fold = windows || info.platform === 'darwin', split = text => text.split(windows ? /[\\/]+/ : /\/+/).filter(Boolean);
   const expand = text => { const brace = /\{([^{}]*,[^{}]*)\}/.exec(text); return brace ? brace[1].split(',').flatMap(part => expand(text.slice(0, brace.index) + part + text.slice(brace.index + brace[0].length))) : [text]; };
   const segment = text => {
@@ -656,7 +656,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (o.filter && !(yield ['filter', from, to])) return;
     const source = yield [o.dereference ? 'stat' : 'lstat', from];
     if (!nested) {
-      // WARNING: like Node, copying onto the source or into itself fails before anything is written.
       const target = (yield ['exists', to]) ? yield [o.dereference ? 'stat' : 'lstat', to] : null;
       if (target?.ino && target.dev && target.ino === source.ino && target.dev === source.dev) throw invalidCopy('src and dest cannot be the same', to);
       const parts = path.resolve(from).split(path.sep), inside = path.resolve(to).split(path.sep);
@@ -1091,7 +1090,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   };
   querystring.decode = querystring.parse; querystring.encode = querystring.stringify;
 
-  // WARNING: dns is made on first use, so the first engine runs less code at startup.
   let dnsMade;
   const dnsModule = () => dnsMade ??= (() => {
     let resultOrder = 'verbatim';
@@ -1115,7 +1113,6 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       return type === 'SOA' ? list[0] : list;
     };
     const systemServers = () => { try { return [...files.readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^\s*nameserver\s+([^\s%]+)/gm)].map(match => match[1]); } catch { return []; } };
-    // WARNING: queries go through the system resolver library, which takes only IPv4 servers from setServers().
     const PromiseResolver = class Resolver {
       #servers = null; #seconds; #tries; #generation = 0;
       constructor(o = {}) { this.#seconds = o.timeout > 0 ? Math.ceil(o.timeout / 1000) : null; this.#tries = o.tries ?? null; }
@@ -1197,10 +1194,8 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return { ReadStream, WriteStream };
   })())[name];
   const tty = { isatty: fd => Number.isInteger(fd) && sync('isatty', fd), get ReadStream() { return ttyStream('ReadStream'); }, get WriteStream() { return ttyStream('WriteStream'); } };
-  // WARNING: SIGWINCH is hooked only when a terminal stream gets its first `resize` listener.
   const resizing = new Set(), resizable = stream => stream.on('newListener', name => { if (name !== 'resize' || resizing.has(stream)) return; if (!resizing.size) sync('tty.watch'); resizing.add(stream); });
   let streams;
-  // WARNING: makes process.stdout and stderr terminal streams. They are created before `__apps.stream` exists.
   const terminal = (stream, modules) => { streams = modules; return resizable(Object.setPrototypeOf(stream, tty.WriteStream.prototype)); };
   return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, get dns() { return dnsModule(); }, tty, details, sync, asyncCall, poll, terminal };
 };

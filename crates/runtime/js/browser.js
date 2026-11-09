@@ -172,7 +172,6 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       if (event.type === 'did-finish-load' || event.type === 'did-fail-load') this.emit('did-stop-loading');
     }
   }
-  // WARNING: guests are system web views with no Chrome DevTools Protocol, so this answers only the commands that have a web view equivalent, and tools like Playwright can't connect.
   class Debugger extends EventEmitter {
     #contents; #attached = false;
     constructor(contents) { super(); this.#contents = contents; }
@@ -292,7 +291,6 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       } else contents.get(view)?._event(event);
     }
   };
-  // WARNING: a session needs a system web view only for its cookies and storage, so that one starts on first use.
   const sessions = new Map();
   class Session extends EventEmitter {
     #partition; #agent = null;
@@ -358,8 +356,6 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
   };
 };
 
-// WARNING: native state and its events belong to the process, so only main gets the main process modules. A preload
-// gets the clipboard and the shell, like Electron's.
 globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
   const native = (op, args = null) => call('native.' + op, args);
   const shortcuts = new Map(), notifications = new Map(), trays = new Map();
@@ -375,7 +371,6 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     };
     app.hasSingleInstanceLock = () => ownsInstance;
     app.releaseSingleInstanceLock = () => { native('app.releaseInstance'); ownsInstance = false; };
-    // WARNING: macOS only accepts schemes that the Info.plist lists, and `apps build` doesn't add them.
     app.setAsDefaultProtocolClient = scheme => process.platform === 'darwin' && native('app.protocolClient', { action: 'set', scheme: String(scheme) });
     app.isDefaultProtocolClient = scheme => process.platform === 'darwin' && native('app.protocolClient', { action: 'is', scheme: String(scheme) });
     app.removeAsDefaultProtocolClient = () => false;
@@ -453,7 +448,6 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
   };
   const nativeTheme = new EventEmitter();
   let themeSource = 'system';
-  // WARNING: only macOS reports the system theme, so other platforms read light defaults instead of throwing.
   const theme = () => { try { return native('theme.get'); } catch { return { themeSource, shouldUseDarkColors: themeSource === 'dark', shouldUseHighContrastColors: false, shouldUseDarkColorsForSystemIntegratedUI: themeSource === 'dark', shouldUseInvertedColorScheme: false, inForcedColorsMode: false, prefersReducedTransparency: false, shouldDifferentiateWithoutColor: false }; } };
   for (const method of ['on', 'addListener', 'prependListener', 'prependOnceListener']) nativeTheme[method] = function (...args) { theme(); observeTheme = true; return EventEmitter.prototype[method].apply(this, args); };
   for (const name of ['shouldUseDarkColors', 'shouldUseHighContrastColors', 'shouldUseDarkColorsForSystemIntegratedUI', 'shouldUseInvertedColorScheme', 'inForcedColorsMode', 'prefersReducedTransparency', 'shouldDifferentiateWithoutColor']) {
@@ -545,7 +539,6 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     append(item) { this.insert(this.items.length, item); }
     insert(position, item) { if (!(item instanceof MenuItem)) throw new TypeError('Expected a MenuItem'); item.menu = this; this.items.splice(position, 0, item); }
     getMenuItemById(id) { for (const item of this.items) { const found = item.id === id ? item : item.submenu?.getMenuItemById(id); if (found) return found; } return null; }
-    // WARNING: like Electron's, it returns at once, and the menu opens after the script returns.
     popup(options = {}) {
       const items = new Map(), template = serialize(this, items), request = ++nextNativeID;
       this.emit('menu-will-show', eventOf());
@@ -638,7 +631,6 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
   const defaultType = type => { if (!Object.hasOwn(defaults, type)) throw new TypeError(`Invalid type: ${type}`); return type; };
   const camel = name => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
   const color = (name, kind, selector) => { name = String(name); const value = /^[a-z]+(-[a-z]+)*$/.test(name) ? native('prefs.color', selector(camel(name))) : null; if (value === null) throw new Error(`Unknown ${kind}: ${name}`); return value; };
-  // WARNING: Electron emits systemPreferences events on Windows and Linux only, so on macOS nothing emits them either.
   const systemPreferences = Object.assign(new EventEmitter(), {
     getAccentColor: () => native('prefs.color', 'controlAccentColor').slice(1),
     getColor: name => color(name, 'color', name => name + 'Color'),

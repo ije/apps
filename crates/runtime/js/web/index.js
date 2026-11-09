@@ -9,7 +9,6 @@ globalThis.__appsWeb = (call, codec) => {
   const encodeBytes = value => value;
   const decodeBytes = value => typeof value === 'string' ? Uint8Array.fromBase64(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
   globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes, memory: body => memoryBodies.get(body) };
-  // WARNING: work that waits for a native wake without an event of its own, like an IndexedDB transaction on a busy database, runs again on each poll.
   const retries = globalThis.__appsRetries = new Set();
   class DOMException extends Error {
     constructor(message = '', name = 'Error') { super(String(message)); this.name = String(name); }
@@ -82,7 +81,8 @@ globalThis.__appsWeb = (call, codec) => {
           catch (error) { console.error(error); }
           state.passive = false;
         }
-        // WARNING: only own `on*` properties run here. Accessor handlers, like DOM ones, are listeners in their place.
+        // WARNING: only own `on*` properties run here; accessor handlers, like DOM ones, are already listeners and
+        // would run twice.
         try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!state.immediate && typeof handler === 'function') handler.call(this, event); }
         catch (error) { console.error(error); }
       } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
@@ -197,8 +197,6 @@ globalThis.__appsWeb = (call, codec) => {
   const params = new WeakMap(), urls = new WeakMap();
   const usv = value => { const text = String(value); return text.toWellFormed ? text.toWellFormed() : text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'); };
   const updateParams = value => { const state = params.get(value); state.update?.(); };
-  // WARNING: well-formed queries decode with decodeURIComponent. A bad percent escape throws there, and then the native parser
-  // keeps it and replaces bad UTF-8, as the URL standard does.
   const query = text => {
     const list = [];
     try {
@@ -240,7 +238,6 @@ globalThis.__appsWeb = (call, codec) => {
     [Symbol.iterator]() { return this.entries(); }
     toString() { return params.get(this).list.map(([name, value]) => `${form(name)}=${form(value)}`).join('&'); }
   }
-  // WARNING: like ada in Node and Bun, a URL keeps its href and the offsets of its parts (see `url` in jsc/encoding.rs), and getters slice them.
   const parseURL = (...args) => { try { return codec.url(...args.map(value => typeof value === 'string' ? usv(value) : value)); } catch (error) { throw new TypeError(error.message); } };
   const parts = {
     href: at => at[0],
@@ -686,7 +683,6 @@ globalThis.__appsWeb = (call, codec) => {
     onloadstart = null; onprogress = null; onabort = null; onerror = null; onload = null; ontimeout = null; onloadend = null;
   }
   class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {}
-  // WARNING: this runs on `fetch`, so upload progress reports only the start and the end, and synchronous requests are not possible.
   class XMLHttpRequest extends XMLHttpRequestEventTarget {
     static UNSENT = 0; static OPENED = 1; static HEADERS_RECEIVED = 2; static LOADING = 3; static DONE = 4;
     UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;

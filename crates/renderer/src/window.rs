@@ -128,7 +128,7 @@ pub struct WindowState {
 pub use crate::platform::WindowControl;
 
 #[cfg(not(target_os = "macos"))]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WindowControl(WindowId);
 
 #[cfg(not(target_os = "macos"))]
@@ -213,7 +213,6 @@ pub enum WindowChange {
     AspectRatio(f32, Size<Pixels>),
     Parent(Option<raw_window_handle::RawWindowHandle>, bool),
     Vibrancy(Option<isize>, isize),
-    // WARNING: the page has already ended its composition, so the input method only drops its own text.
     CancelComposition,
 }
 
@@ -503,8 +502,6 @@ fn round_corners(mask: &ContentMask<ScaledPixels>) -> [Bounds<ScaledPixels>; 4] 
     .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)))
 }
 
-// WARNING: by promoted layer, its first sample's time, the seconds between samples, the times they play and the
-// transforms, so hit tests can follow it.
 type Track = (u64, std::time::Instant, f32, f32, Vec<[f32; 16]>);
 
 pub struct Window {
@@ -665,7 +662,7 @@ impl Window {
         self.rebuild = true;
     }
 
-    // WARNING: the box builds again in place under its kept parents, so the node needs its element id.
+    // WARNING: the node needs its element id, or the patch is ignored.
     pub fn patch(&mut self, node: crate::Node) {
         self.patches.push(node);
     }
@@ -695,8 +692,7 @@ impl Window {
         self.tracks.clear();
     }
 
-    // WARNING: the samples start at `start`, `step` seconds apart, and play `repeat` times, so the last sample
-    // must equal the first when `repeat` is not 1.
+    // WARNING: when `repeat` is not 1, the last sample must equal the first.
     pub fn promote(
         &mut self,
         key: u64,
@@ -706,7 +702,6 @@ impl Window {
         opacities: &[f32],
         transforms: Option<&[[f32; 16]]>,
     ) -> bool {
-        // WARNING: a promoted layer costs a frame to set up, so frames that keep drawing don't promote.
         if self.will_draw() || self.drawn_at.elapsed() < std::time::Duration::from_millis(250) {
             return false;
         }
@@ -740,10 +735,8 @@ impl Window {
             None => Some(content),
         };
         let region = crate::frame::region(content);
-        // WARNING: the compositor draws the layer over the window without its clip, so it must stay
-        // inside the clip and nothing may paint over it there. Web views stay above it, as above the frame.
-        // The window clips its layers itself, so only the part in the window counts, and a layer that never
-        // shows in it needs nothing.
+        // WARNING: the compositor draws the layer over the window without its clip, so it must stay inside the clip
+        // with nothing painted over it there.
         let window = Bounds::new(Point::default(), self.viewport_size.scale(scale));
         let reach = reach.map(|reach| reach.intersect(&window));
         if reach.is_some_and(|reach| reach.is_empty()) {
@@ -903,10 +896,8 @@ impl Window {
         self.dirty || !self.next_frame_callbacks.is_empty()
     }
 
-    // WARNING: a caret that blinks by drawing keeps about 126 MB of Metal driver memory alive and wakes the GPU twice
-    // a second. Core Animation can blink a box alone, but it draws over the window, so the box must be at the top
-    // level, clear of round corners, with nothing painted over it. Otherwise this returns false, and the caller
-    // draws the blink. `painted` says that the caller then paints the caret in this frame.
+    // WARNING: a caret that blinks by drawing keeps about 126 MB of Metal driver memory alive. Core Animation blinks it
+    // only at the top level, clear of round corners, with nothing over it; else this returns false.
     pub fn overlay_caret(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -948,8 +939,6 @@ impl Window {
         }
     }
 
-    // WARNING: a native control shows above the page over the box that paints it in this frame, clipped by the
-    // current content mask. Only macOS has them, and `sink` gets their events on the main thread.
     pub fn native_control(&mut self, control: crate::NativeControl, sink: &crate::ControlSink) {
         #[cfg(target_os = "macos")]
         {
@@ -988,7 +977,6 @@ impl Window {
                 self.caret = None;
             }
             if self.redraw[1] {
-                // WARNING: the first pass moved its states out of `states`, so they go back for this one.
                 let states = mem::take(&mut self.next_states);
                 self.states.extend(states);
             } else {
@@ -1004,7 +992,6 @@ impl Window {
                     tree.layout(root, self.viewport_size, self);
                     tree.prepaint(root, self);
                     self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
-                    // WARNING: a pass that draws again replaces this scene, so it is not painted.
                     if !self.redraw[0] || self.redraw[1] {
                         tree.paint(root, self);
                     }
@@ -1032,7 +1019,6 @@ impl Window {
                 self.scene
                     .covers(caret.order + u32::from(caret.painted), caret.bounds)
             });
-            // WARNING: this frame left a covered caret out, so the next one has to paint it.
             if covered && caret.as_ref().is_some_and(|caret| caret.overlay) {
                 self.refresh();
             }
@@ -1109,7 +1095,6 @@ impl Window {
                 tree.prepaint(root, self);
             }
             self.tree = Some(tree);
-            // WARNING: the next draw starts from `states`, so states taken by this pass go back there.
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
             again = mem::take(&mut self.redraw[0]);
@@ -1216,8 +1201,6 @@ impl Window {
                 | PlatformInput::ScrollWheel(_)
         );
         if mouse {
-            // WARNING: the compositor turns promoted layers without frames, so hit testing takes their
-            // transform of now.
             for (key, start, step, repeat, transforms) in &self.tracks {
                 let count = transforms.len().saturating_sub(1).max(1);
                 let end = repeat * count as f32;
@@ -1290,7 +1273,7 @@ impl Window {
         self.scroll_chain = Some(chain);
     }
 
-    // WARNING: these keys pass the main thread's key filter like real ones, so this thread waits for main.
+    // WARNING: these keys pass main's key filter like real ones, so this blocks until main answers.
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
         let id = self.id;
         let filter = |input: PlatformInput| {
@@ -1344,8 +1327,6 @@ impl Window {
         hitbox
     }
 
-    // WARNING: ids grow across passes, so a hitbox kept from the last pass keeps its id, and hover with it, also when
-    // its box moved.
     pub fn place_hitbox(&mut self, hitbox: &Hitbox, bounds: Bounds<Pixels>) -> Hitbox {
         let hitbox = Hitbox {
             bounds,
@@ -1357,15 +1338,26 @@ impl Window {
         hitbox
     }
 
-    // WARNING: what places a box besides its layout: the offset, clip and hit transform it prepaints in.
     pub(crate) fn placement(&self) -> (Point<Pixels>, ContentMask<Pixels>, usize) {
-        let transform = self.hit_transform.as_ref().map_or(0, |transform| Rc::as_ptr(transform) as usize);
+        let transform = self
+            .hit_transform
+            .as_ref()
+            .map_or(0, |transform| Rc::as_ptr(transform) as usize);
         (self.element_offset(), self.content_mask(), transform)
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) fn hitbox_places(&self) -> Vec<(Bounds<Pixels>, ContentMask<Pixels>, HitboxBehavior, bool)> {
-        let place = |hitbox: &Hitbox| (hitbox.bounds, hitbox.content_mask, hitbox.behavior, hitbox.transform.is_some());
+    pub(crate) fn hitbox_places(
+        &self,
+    ) -> Vec<(Bounds<Pixels>, ContentMask<Pixels>, HitboxBehavior, bool)> {
+        let place = |hitbox: &Hitbox| {
+            (
+                hitbox.bounds,
+                hitbox.content_mask,
+                hitbox.behavior,
+                hitbox.transform.is_some(),
+            )
+        };
         self.next.hitboxes.iter().map(place).collect()
     }
 

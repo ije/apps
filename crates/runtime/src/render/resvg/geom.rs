@@ -1,7 +1,6 @@
 // Copyright 2023 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-/// Fits the current rect into the specified bounds.
 pub fn fit_to_rect(
     r: tiny_skia::IntRect,
     bounds: tiny_skia::IntRect,

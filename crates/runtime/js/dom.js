@@ -1,8 +1,8 @@
 (() => {
   const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask, json = JSON.parse;
   delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
-  // WARNING: records mirror the Rust tree for reads. Writes queue as `code, a, b, c` integers, with strings in `texts` and their lengths in place, and reach Rust in one `dom.batch` before any other host call and at the microtask checkpoint that ends the turn, so Rust never reads a stale page.
-  // WARNING: a Map per element costs hundreds of bytes and these lists are short, so attributes are a flat list in source order. Elements without attributes share `noAttrs`, and text and comments share `noKids`, so `setAttribute` must replace it and nothing may add to it.
+  // WARNING: queued writes must reach Rust in `dom.batch` before any other host call. `noAttrs` and `noKids` are
+  // shared, so replace them and never add to them.
   class Attrs {
     constructor(list = []) { this.list = list; }
     get size() { return this.list.length / 2; }
@@ -17,11 +17,8 @@
   class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : noAttrs; this.up = null; this.kids = tag === '#text' || tag === '#comment' ? noKids : []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
   const records = [], texts = [];
   let detached = false;
-  // WARNING: `changed` marks writes that can detach or create nodes since the last `dom.release`, so idle sweeps skip it.
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
-  // WARNING: `stale` marks writes since the last layout, so the next geometry read lays the page out first, like a browser's forced reflow.
   let stale = false, version = 0;
-  // WARNING: counts the `<base>` and `<title>` records ever made, so pages without them never walk the tree for their base URL or title.
   const rare = { base: 0, title: 0 };
   let retrying = false;
   const flush = () => {
@@ -29,7 +26,6 @@
     let errors;
     try { errors = host('dom.batch', texts.join(''), codes, size); }
     catch (error) {
-      // WARNING: a busy host applied nothing, so the writes stay queued and go again later. Other failures mean the page is gone.
       if (/Host is busy/.test(error?.message)) { if (!retrying) { retrying = true; setTimeout(() => { retrying = false; flush(); }); } return; }
       errors = [error?.message];
     }
@@ -48,22 +44,20 @@
   };
   let webviewScan = true, pickFiles;
   const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; version++; } return host(name, ...args); };
-  // WARNING: the layout mirror is Rust memory that frames and scrolls rewrite: per node 8 floats (box, scroll offset, scroll range) and one flag byte. A nonzero first float means Rust moved it to a bigger buffer. Page code must never reach the arrays, so the constructors are kept and no prototype getter such as `length` is read.
+  // WARNING: page code must never reach the layout mirror arrays, so the constructors are kept and no prototype getter
+  // such as `length` is read. A nonzero first float means Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0, flagged = -1; geometry[0] = 1;
-  // WARNING: observers measure the layout of the last frame, so the frame that follows their delivery lays the page out once.
   let observing = false;
   const layout = () => {
     if ((stale || geometry[3]) && !observing) { stale = false; call('dom.reflow'); }
     if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
     return geometry;
   };
-  // WARNING: removed and display:none nodes keep their last mirror values, but have no box.
   const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._linked !== version) { if (!node.isConnected) return -1; node._linked = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
-  // WARNING: client boxes are cached until the page writes or Rust counts a new layout in the mirror header.
-  // WARNING: while observers measure the last frame, the values come from its styles and are not kept for later reads.
-  // So observers check a target again after a new layout, not after a DOM change.
+  // WARNING: while observers measure the last frame, client boxes come from its styles and must not be cached for later
+  // reads.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   const offset = (node, axis) => {
     if (slot(node) < 0 || node === document.body) return 0;
@@ -79,7 +73,6 @@
     const id = pool.pop();
     records[id] = new Record(id, tag, text); op(0, id, tag, text); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
   };
-  // WARNING: returns whether the list has media elements, so callers skip looking for them otherwise.
   const load = list => {
     version++;
     let media = false;
@@ -94,7 +87,8 @@
     }
     return media;
   };
-  // WARNING: Rust skips a write that fails its checks, so after a failed batch the mirror reloads each tree it holds from Rust. Records stay the same objects, because wrappers point to them.
+  // WARNING: Rust skips writes that fail its checks, so a failed batch reloads the trees from Rust. Records must stay
+  // the same objects, because wrappers point to them.
   const resync = () => {
     const lists = [], seen = new Set();
     for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
@@ -115,11 +109,9 @@
     for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
   };
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
-  // WARNING: loops like `for (i < el.children.length) el.children[i]` read a list per step, so the last list stays until the
-  // next DOM change. Only one is kept, because a list holds the wrappers of its nodes, which keep removed nodes alive.
+  // WARNING: keep only one cached list: a list holds the wrappers of its nodes, which keep removed nodes alive.
   const listCache = { nodes: [null, null, -1], elements: [null, null, -1] };
   const cachedList = (cache, rec, make) => { if (cache[0] !== rec || cache[1] !== rec.kids || cache[2] !== version) { cache[0] = rec; cache[1] = rec.kids; cache[2] = version; cache[3] = make(); } return cache[3]; };
-  // WARNING: an id maps to its record, or to a list of them when elements share it. Lookups check that a record is current and in the tree, so stale entries cost nothing.
   const ids = new Map();
   const idAdd = (id, rec) => { const at = ids.get(id); if (!at) ids.set(id, rec); else if (Array.isArray(at)) { if (!at.includes(rec)) at.push(rec); } else if (at !== rec) ids.set(id, [at, rec]); };
   const idDrop = (id, rec) => { const at = ids.get(id); if (at === rec) ids.delete(id); else if (Array.isArray(at)) { const i = at.indexOf(rec); if (i >= 0) at.splice(i, 1); if (at.length === 1) ids.set(id, at[0]); } };
@@ -128,7 +120,6 @@
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
   const detach = rec => { version++; if (rec.kids.length) { for (const kid of rec.kids) kid.up = null; rec.kids = []; detached = true; } rec.text = ''; };
-  // WARNING: wrappers hold their wrapped parent and children so that listeners and expandos live as long as their tree.
   const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
   const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
   const release = node => { if (node._held) for (const child of node._held) child._parent = null; node._held = null; };
@@ -152,7 +143,8 @@
     return rec.tag[0] !== '#' || rec.tag === '#text' ? find(parent._shadow._m, slot => slot.tag === 'slot' && (slot.attrs.get('name') ?? '') === name) : null;
   };
   const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
-  // WARNING: observers key their targets by the wrapper's `WeakRef` and targets hold their observers, as in browsers, so observers that are never disconnected don't keep removed trees alive. The global sets hold `WeakRef`s too, and loops over them drop dead entries.
+  // WARNING: observers key targets by the wrapper's `WeakRef` and the global sets hold `WeakRef`s, so observers that
+  // are never disconnected don't keep removed trees alive.
   const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
   const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
   const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
@@ -178,7 +170,6 @@
     }
     if (!mutationQueued) {
       mutationQueued = true;
-      // WARNING: a throwing callback is reported and the other observers still get their records.
       queueMicrotask(() => { mutationQueued = false; for (const ref of observers) { const observer = ref.deref(), records = observer?.takeRecords(); if (records?.length) try { observer.callback(records, observer); } catch (error) { console.error(error); } } });
     }
   };
@@ -221,7 +212,6 @@
   const group = radio => { const name = radio.name, form = radio.form, root = radio.getRootNode(); return name && root !== radio ? [...root.querySelectorAll('input[name=' + quote(name) + ']')].filter(other => other.type === 'radio' && other.form === form) : [radio]; };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
-    // WARNING: 16 has no box, and 64 is inert or hidden by the cascade while an exit transition still paints it. Style passes mark 64, so a page that never drew (no window) runs one here after each write.
     layout();
     if (!geometry[2] && flagged !== version) { flagged = version; call('dom.layout', false, true); layout(); }
     if (marks[node._id] & 80) return false;
@@ -242,7 +232,6 @@
       else { toggles.set(element, { oldState: value === null ? 'open' : 'closed', newState }); setTimeout(() => { const state = toggles.get(element); toggles.delete(element); if (state.oldState !== state.newState) dispatch(element, new ToggleEvent('toggle', state)); }, 0); }
     }
   };
-  // WARNING: a click toggles checkboxes and radios before its listeners run and restores them when it is canceled, like the HTML legacy-pre-activation behavior.
   const fireClick = (target, init = {}, native = false) => {
     const event = new PointerEvent('click', { bubbles: true, cancelable: true, composed: true, pointerId: native ? 1 : -1, pointerType: native ? 'mouse' : '', ...init });
     if (native) trusted(event);
@@ -281,7 +270,6 @@
     if (rec.tag.startsWith('sf-symbol-') && voids.test(rec.tag)) return '<' + rec.tag + attrs + '/>';
     return '<' + rec.tag + attrs + '>' + (rec.tag === 'template' ? of(rec).innerHTML : rec.kids.map(serialize).join('') || own(rec)) + (voids.test(rec.tag) ? '' : '</' + rec.tag + '>');
   };
-  // WARNING: like CEReactions, custom element reactions queue per element while a DOM call runs and run when the outermost call returns, each in its own try/catch, so a throwing callback can't stop the change that queued it. A DOM call from a callback runs the reactions it queued when it returns.
   const reactionQueue = [];
   let reactionDepth = 0, reactionStart = 0;
   const report = error => { const event = Object.assign(new Event('error', { cancelable: true }), { error, message: String(error?.message ?? error) }); dispatch(globalThis, event); if (!event.defaultPrevented) console.error(error); };
@@ -300,7 +288,6 @@
     reactionQueue.length = reactionStart = start;
   };
   const scoped = fn => function (...args) { reactionDepth++; try { return fn.apply(this, args); } finally { leave(); } };
-  // WARNING: walks in shadow-including tree order. A defined element that is not upgraded queues its upgrade instead, unless it leaves the document; without `name` only upgrades queue, and `only` limits them to one tag.
   const reactions = (root, name, only) => {
     const stack = [root], leaving = name === 'disconnectedCallback';
     while (stack.length) {
@@ -314,7 +301,6 @@
       if (rec.shadow) stack.push(rec.shadow);
     }
   };
-  // WARNING: an upgrade that throws leaves the element failed for good, as in browsers. Its callbacks go to the end of its own queue, which the running `leave` drains next.
   const upgrade = (node, Type) => {
     if (node instanceof Type || node._failed) return;
     constructing = { node };
@@ -337,7 +323,8 @@
     if (self) test(rec);
     find(rec, test);
   };
-  // WARNING: ranges are live, so mutations move their boundary points. Garbage ranges stay until a GC, so ranges are indexed by the records of their boundary containers and a mutation visits only the ranges at the nodes it touches. Dead ranges leave when a visit or a sweep meets them.
+  // WARNING: garbage ranges stay until a GC, so a mutation must visit only the ranges indexed at the nodes it touches,
+  // never all ranges.
   const anchors = new Map();
   let rangeSync = false;
   const place = (range, start, node, offset) => {
@@ -358,7 +345,6 @@
     }
     if (!set.size) anchors.delete(rec);
   };
-  // WARNING: visits the ranges at `root` and below it, through the index while it is short and through the subtree otherwise.
   const inside = (root, fn) => {
     if (anchors.size <= 32) { for (const rec of anchors.keys()) { let up = rec; while (up && up !== root) up = up.up; if (up) each(rec, range => fn(range, rec)); } return; }
     const stack = [root];
@@ -374,7 +360,6 @@
   const rangesRemove = (parent, child, index) => { if (!anchors.size) return; inside(child._m, (range, rec) => shift(range, rec, always, parent, () => index)); each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at - 1)); };
   const rangesInsert = (parent, index, count) => { if (anchors.size) each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at + count)); };
   const rangesClear = node => { if (anchors.size) inside(node._m, (range, rec) => shift(range, rec, rec === node._m ? at => at > 0 : always, node, () => 0)); };
-  // WARNING: removing the focused element blurs it, and removing a pointer capture target releases the capture at the document, as in browsers.
   const forgetRemoved = () => {
     if (topLayer.length || dialogs.length) {
       if (fullscreens.some(node => !node.isConnected)) exitFullscreen(true);
@@ -386,7 +371,8 @@
     const previous = active; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true })); }
   };
   const ignore = () => {};
-  // WARNING: `replace` swaps the children of `node`; this runs what a DOM "replace all" does around it. A `replace` that inserts calls `removed` once the old children left both trees, so their disconnected callbacks run before re-inserted ones connect again.
+  // WARNING: a `replace` that inserts must call `removed` once the old children left both trees, so their disconnected
+  // callbacks run before re-inserted ones connect.
   const replaceAll = scoped((node, replace) => {
     const rec = node._m, observed = watched(node);
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
@@ -401,9 +387,7 @@
     if (observed && (old.length || rec.kids.length)) change({ type: 'childList', target: node, removedNodes: listOf(NodeList, old), addedNodes: node.childNodes });
   });
   const convert = children => children.map(child => child instanceof Node ? child : document.createTextNode(String(child)));
-  // WARNING: `before`, `after`, `prepend` and `replaceWith` move their nodes out before they insert them, so the reference is the first sibling that is not one of them.
   const viable = (node, nodes) => { while (node && nodes.includes(node)) node = node.nextSibling; return node; };
-  // WARNING: like the DOM's "convert nodes into a node", several nodes leave their parents first and then insert with one record, which also lists a replaced node.
   const insertNodes = scoped((parent, nodes, before, replaced = null) => {
     if (!observers.size || quiet || nodes.length < 2 && !replaced) {
       for (const node of nodes) parent.insertBefore(node, before);
@@ -417,9 +401,7 @@
     try { for (const node of nodes) parent.insertBefore(node, before); if (removed.length) parent.removeChild(replaced); } finally { quiet--; }
     if (nodes.length || removed.length) change({ type: 'childList', target: parent, addedNodes: listOf(NodeList, nodes), removedNodes: listOf(NodeList, removed), previousSibling, nextSibling: before });
   });
-  // WARNING: the parser knows only tag names, so an SVG context parses as `svg`, or as `body` when it is an HTML integration point. Without a context element the context is `body`.
   const contextTag = node => !node ? 'body' : node.namespaceURI === SVG ? /^(foreignObject|desc|title)$/.test(node.localName) ? 'body' : 'svg' : node.localName === 'svg' ? 'body' : node.localName;
-  // WARNING: top-level elements of a fragment parsed for an SVG context are SVG unless they broke out of foreign content, so `wrap` reads `_svg` on their fragment.
   const parseFragment = scoped((source, context) => {
     const fragment = document.createDocumentFragment(), tag = contextTag(context);
     if (tag === 'svg') fragment._svg = true;
@@ -457,7 +439,6 @@
     get length() { return tokens(rawList(this)).length; }
     item(index) { return tokens(rawList(this))[index] ?? null; }
     contains(value) { return tokens(rawList(this)).includes(String(value)); }
-    // WARNING: like the DOM's update steps, an empty set doesn't add a missing attribute.
     add(...values) { const list = rawList(this), next = tokens(list).slice(); for (const value of values.map(token)) if (!next.includes(value)) next.push(value); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
     remove(...values) { const list = rawList(this); values = values.map(token); const next = tokens(list).filter(value => !values.includes(value)); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
     toggle(value, force) { const list = rawList(this); value = token(value); const add = force === undefined ? !list.contains(value) : !!force; if (add) list.add(value); else list.remove(value); return add; }
@@ -492,8 +473,8 @@
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
       before ??= null;
       if (child.nodeType === 11) {
-        // WARNING: a wrapper keeps its subtree in the arena until a GC after it leaves, so children without one move as records.
-        // `wrap` infers a namespace from the parent, so SVG contexts, where moved children could change it, keep wrapping.
+        // WARNING: a wrapper keeps its subtree in the arena until a GC, so children without one move as records. `wrap`
+        // infers the namespace from the parent, so SVG contexts keep wrapping.
         if (!(observers.size > 0 && !quiet) && !anchors.size && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && child._m.kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
           const rec = this._m, ref = before?._m ?? null;
           if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
@@ -539,7 +520,6 @@
       if (parented) forgetRemoved();
       if (removal) change(removal);
       if (observed) change({ type: 'childList', target: this, addedNodes: listOf(NodeList, [child]), previousSibling: child.previousSibling, nextSibling: child.nextSibling });
-      // WARNING: only the bundler loads stylesheets and @pierre/apps never preloads, so these links fail when a script inserts them, like links that can't load.
       if (kid.tag === 'link' && kid.attrs.has('href') && /(^|\s)(stylesheet|preload|modulepreload)(\s|$)/i.test(kid.attrs.get('rel') ?? '') && child.isConnected) setTimeout(() => child.dispatchEvent(new Event('error')));
       return child;
     }
@@ -615,7 +595,6 @@
     get wholeText() { let node = this, text = ''; while (node.previousSibling?.nodeType === 3) node = node.previousSibling; for (; node?.nodeType === 3; node = node.nextSibling) text += node.data; return text; }
   }
   class Comment extends CharacterData { constructor(data = '', tag) { super(tag ? data : create('#comment', String(data)), '#comment'); } }
-  // WARNING: a doctype keeps its name, public id and system id in its text, joined by NULs when it has ids.
   class DocumentType extends Node {
     constructor(id, tag) { super(id, tag); this.nodeName = this.name; }
     get name() { return own(this._m).split('\0')[0]; } get publicId() { return own(this._m).split('\0')[1] ?? ''; } get systemId() { return own(this._m).split('\0')[2] ?? ''; }
@@ -801,7 +780,6 @@
           if (align === 'nearest') delta = before < 0 && after > 0 ? 0 : before < 0 ? (size <= extent ? before : after) : after > 0 ? (size <= extent ? after : before) : 0;
           if (delta) to[axis === 'Y' ? 1 : 0] = (axis === 'Y' ? p.scrollTop : p.scrollLeft) + delta;
         }
-        // WARNING: a smooth scroll moves later, so the target shifts by where the scroll stops, not by the offset now.
         if (to[0] !== null || to[1] !== null) {
           const previous = [p.scrollLeft, p.scrollTop], next = call('dom.scroll', p._id, to[0], to[1], options.behavior ?? null);
           left -= next[0] - previous[0]; top -= next[1] - previous[1];
@@ -834,7 +812,6 @@
     insertAdjacentText(position, text) { this.insertAdjacentElement(position, document.createTextNode(String(text))); }
     insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.insertAdjacentElement(position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context : null)); }
   }
-  // WARNING: these DOM calls are reaction scopes, see `leave`.
   for (const [Type, names] of [[Node, ['insertBefore', 'removeChild', 'replaceChild', 'cloneNode']], [Element, ['setAttribute', 'removeAttribute', 'insertAdjacentHTML']]]) for (const name of names) { const fn = Type.prototype[name]; Type.prototype[name] = { [name](a, b) { reactionDepth++; try { return fn.call(this, a, b); } finally { leave(); } } }[name]; }
   const attributeReaction = (node, name, oldValue, value) => { const Type = definitions.get(node._m.tag); if (Type && node instanceof Type && !node._failed && defined.get(Type).observed.has(name)) enqueue(node, ['attributeChangedCallback', name, oldValue, value]); };
   class HTMLElement extends Element {
@@ -862,13 +839,10 @@
     assignedNodes(options = {}) { return call('dom.assignedNodes', this._id, !!options.flatten).map(wrap); }
     assignedElements(options = {}) { return this.assignedNodes(options).filter(node => node.nodeType === 1); }
   }
-  // WARNING: form controls keep their current value and checkedness apart from the content attributes; Rust gets them through ops 7 (value) and 8 (checked, modal).
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
-  // WARNING: `ns-*` types show AppKit controls on macOS, and behave as their fallback type everywhere.
   const nativeTypes = new Map([['ns-button','button'],['ns-switch','checkbox'],['ns-range','range'],['ns-text','text'],['ns-search','search'],['ns-color','color'],['ns-date','date']]);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
   const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); };
-  // WARNING: a range's value is always sanitized: clamped to min and max and rounded to the step from min, so changing them changes the value, like in browsers.
   const rangeBounds = node => { const number = name => { const value = parseFloat(node.getAttribute(name)); return Number.isFinite(value) ? value : null; }, min = number('min') ?? 0, step = number('step'); return [min, Math.max(min, number('max') ?? 100), node.getAttribute('step')?.trim().toLowerCase() === 'any' ? 0 : step > 0 ? step : 1]; };
   const rangeValue = (node, raw) => {
     const [min, max, step] = rangeBounds(node); let value = String(raw ?? '').trim() ? Number(raw) : NaN;
@@ -922,7 +896,6 @@
     checkValidity() { if (!candidate(this) || validity(this).valid) return true; dispatch(this, new Event('invalid', { cancelable: true })); return false; },
     reportValidity() { if (this.checkValidity()) return true; this.focus(); return false; },
     get form() { return formOf(this); },
-    // WARNING: a label names its control by `for` or contains it, so only labels with this id and the ancestors are candidates.
     get labels() {
       const result = [], root = this.getRootNode(), id = this.getAttribute('id');
       if (id && root.querySelectorAll) for (const label of root.querySelectorAll('label[for=' + quote(id) + ']')) if (labelControl(label) === this) result.push(label);
@@ -978,7 +951,6 @@
   for (const name of ['selectionStart', 'selectionEnd', 'selectionDirection', 'setSelectionRange', 'select', 'setRangeText']) Object.defineProperty(HTMLTextAreaElement.prototype, name, Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, name));
   for (const attr of ['accept', 'alt', 'autocomplete', 'max', 'min', 'pattern', 'step']) Object.defineProperty(HTMLInputElement.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
   const options = select => { const result = []; for (const kid of select._m.kids) { if (kid.tag === 'option') result.push(of(kid)); else if (kid.tag === 'optgroup') for (const sub of kid.kids) if (sub.tag === 'option') result.push(of(sub)); } return result; };
-  // WARNING: a single select shows one option, the last selected one or else the first enabled one, unless `selectedIndex = -1` emptied it.
   const selectedness = select => {
     const list = options(select);
     if (select.multiple || select.size > 1) for (const option of list) option._current = option._selected ?? option.hasAttribute('selected');
@@ -1033,7 +1005,6 @@
   class HTMLOutputElement extends HTMLElement { get value() { return this.textContent; } set value(value) { this.textContent = value; } get defaultValue() { return this._default ?? this.textContent; } set defaultValue(value) { this._default = String(value); } get type() { return 'output'; } }
   for (const Type of [HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement]) for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(constraints))) if (!Object.hasOwn(Type.prototype, name)) Object.defineProperty(Type.prototype, name, descriptor);
   class HTMLFormControlsCollection extends HTMLCollection {}
-  // WARNING: there is no navigation, so a submit that is not canceled does nothing more, except `method=dialog`, which closes its dialog.
   const submitForm = (form, submitter) => {
     if (form._submitting || !form.isConnected) return;
     if (!form.noValidate && !submitter?.formNoValidate) { const invalid = [...form.elements].filter(control => !control.checkValidity()); if (invalid.length) { invalid[0].focus(); return; } }
@@ -1043,7 +1014,6 @@
     if (allowed && (submitter?.getAttribute('formmethod') ?? form.method) === 'dialog') form.closest('dialog')?.close(submitter?.value);
   };
   class HTMLFormElement extends HTMLElement {
-    // WARNING: controls outside the form name it with their `form` attribute, so only the form's subtree and those controls are walked.
     get elements() {
       const id = this.getAttribute('id'), root = this.getRootNode(), result = [], control = rec => listed.test(rec.tag) && !(rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() === 'image') && of(rec).form === this;
       find(this._m, rec => { if (control(rec)) result.push(of(rec)); return false; });
@@ -1080,11 +1050,11 @@
       return entries;
     }
   }
-  // WARNING: the top layer is mirrored in Rust in its order by op 9, and its boxes by state bits of op 8: 4 modal, 8 popover, 16 fullscreen.
+  // WARNING: Rust mirrors the top layer order through op 9 and its boxes through op 8 bits: 4 modal, 8 popover, 16
+  // fullscreen. Keep both sides in sync.
   const layer = (node, on) => { const i = topLayer.indexOf(node); if (i >= 0) topLayer.splice(i, 1); if (on) topLayer.push(node); op(9, node._id, on ? 1 : 0); };
   const flag = (node, bit, on) => formState(node, on ? node._bits | bit : node._bits & ~bit);
   const drop = (list, node) => { const i = list.indexOf(node); if (i >= 0) list.splice(i, 1); };
-  // WARNING: toggle events coalesce: a later change in the same task moves the queued event to the new state, keeping its old one.
   const toggled = (node, oldState, newState, source = null) => {
     if (node._toggle) { Object.assign(node._toggle, { newState, source }); return; }
     const state = node._toggle = { oldState, newState, source };
@@ -1138,7 +1108,6 @@
     dialog._focus = active; dialogs.push(dialog); watchers.push(dialog);
     if (modal) { dialog._modal = true; modals.push(dialog); flag(dialog, 4, true); layer(dialog, true); }
     hideUntil(ancestorPopover(dialog, hints, null) ?? ancestorPopover(dialog, autos, null) ?? document);
-    // WARNING: like Chrome, a dialog with nothing to focus takes the focus itself. It isn't in the tab order.
     ([...dialog.querySelectorAll('[autofocus]')].find(focusable) ?? [...dialog.querySelectorAll('*')].find(focusable) ?? dialog).focus();
   };
   class HTMLDialogElement extends HTMLElement {
@@ -1294,14 +1263,14 @@
     const response = await fetch(source); if (!response.ok) throw new Error(`${kind} request failed: ${response.status}`); return new Uint8Array(await response.arrayBuffer());
   };
   const decode = (node, data) => new Promise(resolve => decodes.set(call(typeof data === 'string' ? 'dom.imageURL' : 'dom.image', node._id, data), resolve));
-  // WARNING: decodes finish on workers that wake the loop, so the tick drains them only while one is pending.
   const decodes = new Map();
   globalThis.__appsDecoded = () => {
     if (decodes.size) for (const [request, result] of host('dom.decoded')) { decodes.get(request)?.(result); decodes.delete(request); }
     if (placeholders) for (const [node, width, height] of call('dom.frames')) { const canvas = wrap(node); if (canvas.width !== width) canvas.setAttribute('width', width); if (canvas.height !== height) canvas.setAttribute('height', height); }
   };
   globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
-  // WARNING: media elements play in the library of the video and audio features. Its threads wake the loop, and the tick polls their events while one is open. Playing elements stay alive, like in browsers.
+  // WARNING: `playing` holds playing elements on purpose, so they keep playing after the page drops them, like in
+  // browsers.
   const players = new Map(), playing = new Set(), mediaFeatures = globalThis.__appsMedia ?? {};
   delete globalThis.__appsMedia;
   const [PLAY, PAUSE, SEEK, VOLUME, MUTED, SPEED] = [0, 1, 2, 3, 4, 5];
@@ -1794,7 +1763,6 @@
   class DOMParser {
     parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(json(call('dom.html',doc._id,String(source))));return doc;}
   }
-  // WARNING: compares boundary points through records, so it costs the depth of the tree and builds no child lists.
   const comparePoints = (a, start, b, end) => {
     if (a === b) return Math.sign(start - end);
     const ra = a._m, rb = b._m;
@@ -1832,7 +1800,6 @@
     collapse(start = false) { if (start) this.setEnd(this._sc, this._so); else this.setStart(this._ec, this._eo); }
     cloneRange() { const range = new Range(); place(range, true, this._sc, this._so); place(range, false, this._ec, this._eo); return range; }
     toString() { if (this._sc === this._ec && this._sc.nodeType === 3) return this._sc.data.slice(this._so, this._eo); return this.cloneContents().textContent; }
-    // WARNING: only the nodes on the paths to the two boundary points are partly in the range, so both walks visit those paths and the children between them, not the tree.
     cloneContents() {
       const fragment = document.createDocumentFragment();
       if (this.collapsed) return fragment;
@@ -1983,7 +1950,6 @@
   }
   const resizeObservers = new Set();
   class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
-  // WARNING: these tags leave foreign content in the parser, so they are HTML at the top of a fragment parsed for an SVG context.
   const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
@@ -2000,8 +1966,8 @@
   let sweepAt = 0, cursor = 0, canary = new WeakRef({});
   globalThis.__appsDomSweep = (force = false) => {
     scheduled = false; flush();
-    // WARNING: removed trees without wrappers go at the next turn, so a page that rebuilds rows each frame doesn't fill the arena between timed sweeps.
-    // Wrappers die only in a GC, so the first sweep after one checks them all, and timed sweeps between GCs check a slice.
+    // WARNING: removed trees without wrappers must go at the next turn, or a page that rebuilds rows each frame fills
+    // the arena between timed sweeps.
     const collected = !canary.deref(), timed = force || collected || performance.now() >= sweepAt, dead = [];
     if (!timed && !detached) return;
     detached = false;
@@ -2011,7 +1977,6 @@
       for (const [rec, set] of anchors) { for (const ref of set) if (!ref.deref()) set.delete(ref); if (!set.size) anchors.delete(rec); }
     }
     if (force || collected) cursor = 0;
-    // WARNING: timed sweeps check a slice of the wrappers and continue where the last one stopped, so their cost doesn't grow with the page.
     for (let budget = force || collected ? wrapped.length : timed ? 4096 : 0; budget-- && wrapped.length;) {
       if (cursor >= wrapped.length) cursor = 0;
       const rec = wrapped[cursor];
@@ -2020,11 +1985,11 @@
     }
     if (!dead.length && !registered.length && !changed) return;
     changed = false;
-    // WARNING: Rust frees detached trees without live wrappers and lists their nodes, so their records go too.
     for (const id of call('dom.release', dead, registered.splice(0))[1]) { const rec = records[id]; if (!rec) continue; records[id] = undefined; const name = rec.attrs?.get('id'); if (name) idDrop(name, rec); }
   };
 
-  // WARNING: drawing queues `code, ...args` as f64, so far coordinates stay exact, and `Canvas::draw` in `render/canvas.rs` runs them with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.
+  // WARNING: op codes and argument counts must match `Canvas::draw` in `render/canvas.rs`. Arguments stay f64 so far
+  // coordinates stay exact.
   class CanvasRenderingContext2D {
     constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float64Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
     _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDash: [], lineDashOffset: 0, globalCompositeOperation: 'source-over', letterSpacing: '0px', wordSpacing: '0px', imageSmoothingEnabled: true, imageSmoothingQuality: 'low', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto', direction: 'inherit', lang: 'inherit' }; this._stack = []; }
@@ -2051,7 +2016,6 @@
     createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient([x0, y0, x1, y1]); } createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); return new CanvasGradient([x0, y0, r0, x1, y1, r1]); }
     setLineDash(list) { list = Array.from(list, Number); if (!list.every(v => Number.isFinite(v) && v >= 0)) return; if (list.length % 2) list = [...list, ...list]; this._state.lineDash = list; const text = list.join(); this._texts.push(text); this._op(35, text.length); } getLineDash() { return [...this._state.lineDash]; }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
-    // WARNING: the arguments are WebIDL `long`s, and a negative size extends the rectangle the other way.
     getImageData(x, y, width, height) { this._flush(); x |= 0; y |= 0; width |= 0; height |= 0; if (!width || !height) throw new DOMException('Image dimensions must be nonzero', 'IndexSizeError'); if (width < 0) { x += width; width = -width; } if (height < 0) { y += height; height = -height; } return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels', this.canvas._id, x, y, width, height)), width, height); }
     putImageData(data, x, y) { if (!(data instanceof ImageData)) throw new TypeError('Expected ImageData'); this._data.push(data.data.slice()); this._op(26, this._data.length - 1, x | 0, y | 0, data.width, data.height); }
     drawImage(image,...args) {
@@ -2060,7 +2024,6 @@
       image._context?._flush?.();
       const [iw, ih] = imageSize(image); if (!iw||!ih) throw new DOMException('Image is not loaded','InvalidStateError');
       let sx=0,sy=0,sw=iw,sh=ih,dx,dy,dw=iw,dh=ih; if(args.length===2) [dx,dy]=args; else if(args.length===4) [dx,dy,dw,dh]=args; else if(args.length===8) [sx,sy,sw,sh,dx,dy,dw,dh]=args; else throw new TypeError('Invalid drawImage arguments');
-      // WARNING: negative sizes don't flip, and the part of the source rectangle outside the image draws nothing, as in browsers.
       if (sw<0) { sx+=sw; sw=-sw; } if (sh<0) { sy+=sh; sh=-sh; } if (dw<0) { dx+=dw; dw=-dw; } if (dh<0) { dy+=dh; dh=-dh; }
       const left=Math.max(sx,0),top=Math.max(sy,0),right=Math.min(sx+sw,iw),bottom=Math.min(sy+sh,ih),kx=dw/sw,ky=dh/sh;
       if (right<=left||bottom<=top) return;
@@ -2088,7 +2051,6 @@
   for (const [name, code, valid] of [['miterLimit', 34, v => v > 0 && v < Infinity], ['lineDashOffset', 36, Number.isFinite]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { value = Number(value); if (valid(value)) { this._state[name] = value; this._op(code, value); } } });
   for (const [name, code] of [['letterSpacing', 38], ['wordSpacing', 39]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { const px = /^(-?[\d.]+)px$/.exec(String(value).trim()); if (px) { this._state[name] = `${+px[1]}px`; this._op(code, +px[1]); } } });
   Object.defineProperty(CanvasRenderingContext2D.prototype, 'imageSmoothingEnabled', { configurable: true, enumerable: true, get() { return this._state.imageSmoothingEnabled; }, set(value) { this._state.imageSmoothingEnabled = !!value; this._op(40, value ? 1 : 0); } });
-  // WARNING: these keep their values but draw nothing.
   for (const name of ['imageSmoothingQuality', 'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
   class CanvasGradient {
     constructor(shape) { this._shape = shape.map(Number); this._stops = []; }
@@ -2096,7 +2058,6 @@
     _spec() { return 'gradient:' + JSON.stringify([this._shape, [...this._stops].sort((a, b) => a[0] - b[0])]); }
   }
   class TextMetrics {}
-  // WARNING: Web Audio is a subset for playing whole sounds, through `<audio>`. Buffers keep the encoded file, so they have no samples and nodes other than gain don't exist.
   class AudioNode { constructor(context) { this.context = context; this._target = null; } connect(target) { this._target = target; return target; } disconnect() { this._target = null; } }
   class GainNode extends AudioNode { gain = { value: 1 }; }
   class AudioDestinationNode extends AudioNode {}
@@ -2130,7 +2091,8 @@
   class ImageData {
     constructor(data,width,height) { if (typeof data==='number') {height=width;width=data;data=new Uint8ClampedArray(width*height*4);} else {if (!(data instanceof Uint8ClampedArray)) throw new TypeError('Expected Uint8ClampedArray');height??=data.length/(width*4);} if(!Number.isInteger(width)||!Number.isInteger(height)||width<=0||height<=0||data.length!==width*height*4) throw new DOMException('Invalid image dimensions','IndexSizeError');Object.assign(this,{data,width,height,colorSpace:'srgb'}); }
   }
-  // WARNING: like `dimension()` in render, sizes parse as HTML non-negative integers: leading digits after whitespace and an optional `+`.
+  // WARNING: must parse like `dimension()` in render: HTML non-negative integers, leading digits after whitespace and
+  // an optional `+`.
   const canvasSize = (value, fallback) => { const digits = /^[\t\n\f\r ]*\+?(\d+)/.exec(value ?? '')?.[1], size = digits ? Number(digits) : NaN; return size <= 2147483647 ? size : fallback; };
   class HTMLCanvasElement extends HTMLElement {
     get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
@@ -2145,11 +2107,11 @@
   }
   const transferred = () => new DOMException('The canvas was transferred', 'InvalidStateError');
   const canvasContext = (canvas, type, options, Context2D) => { if (canvas._contextType && canvas._contextType !== type) return null; if (!['webgpu','2d','bitmaprenderer'].includes(type)) return null; canvas._contextType = type; return canvas._context ??= type === '2d' ? new Context2D(canvas, options) : type === 'bitmaprenderer' ? new ImageBitmapRenderingContext(canvas) : new GPUCanvasContext(canvas, canvas._id); };
-  // WARNING: bitmap draws wait in their context's queue, so closing a bitmap runs these first. Other canvases flush when they are drawn from, but sprites would redraw a whole canvas per draw that way.
+  // WARNING: bitmap draws wait in their context's queue, so closing a bitmap must run them first. Flushing per draw, as
+  // for other canvases, would redraw a whole canvas per sprite.
   const bitmapDraws = new Set();
   const drawable = image => image instanceof HTMLImageElement || image instanceof HTMLCanvasElement || image instanceof HTMLVideoElement || image instanceof OffscreenCanvas || image instanceof ImageBitmap;
   const imageSize = image => [image.videoWidth ?? image.naturalWidth ?? image.width, image.videoHeight ?? image.naturalHeight ?? image.height];
-  // WARNING: offscreen pixels live in a detached node like any canvas, which frees them when its wrapper dies. `apps-canvas` keeps no copy to show and needs no polling for GPU frames, unlike `canvas`.
   const canvasNode = (width, height) => { const node = document.createElement('apps-canvas'); node.setAttribute('width', width); node.setAttribute('height', height); return node; };
   const bitmapOf = node => Object.assign(Object.create(ImageBitmap.prototype), { _node: node });
   class ImageBitmap {
@@ -2189,16 +2151,13 @@
       const node = canvasNode(width, height); call('dom.canvasTake', this._id, node._id);
       return bitmapOf(node);
     }
-    // WARNING: PNG is the only encoder. As the standard says for an unknown type, others give a PNG, and the blob's `type` tells.
     async convertToBlob() {
       if (!this._node) throw transferred();
       if (!this.width || !this.height) throw new DOMException('The canvas has no pixels', 'IndexSizeError');
       this._context?._flush?.();
       return new Blob([call('dom.canvasURL', this._id, true)], { type: 'image/png' });
     }
-    // WARNING: frames wait for the next task, so several draws in one task show as one frame.
     _commit() { if (!this._linked || this._committing) return; this._committing = true; setTimeout(() => { this._committing = false; if (this._node) call('dom.canvasCommit', this._id); }, 0); }
-    // WARNING: a WebGPU frame reaches the CPU some time after its submit, so a worker asks for it until frames stop.
     _pump() {
       if (!this._linked) return;
       this._frameAt = performance.now();
@@ -2235,7 +2194,6 @@
     if (sw < 0) { sx += sw; sw = -sw; } if (sh < 0) { sy += sh; sh = -sh; }
     const width = resizeWidth ?? (resizeHeight ? Math.ceil(sw * resizeHeight / sh) : sw), height = resizeHeight ?? (resizeWidth ? Math.ceil(sh * resizeWidth / sw) : sh);
     const canvas = new OffscreenCanvas(width, height), context = canvas.getContext('2d');
-    // WARNING: smoothing would blur a flip at full size.
     context.imageSmoothingEnabled = resizeQuality !== 'pixelated' && (width !== sw || height !== sh);
     if (imageOrientation === 'flipY') { context.translate(0, height); context.scale(1, -1); }
     context.drawImage(source, sx, sy, sw, sh, 0, 0, width, height); context._flush();
@@ -2311,11 +2269,9 @@
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
   const ownSheet = node => { let inert = !node.isConnected; for (let rec = node._m.up; rec && !inert; rec = rec.up) inert = rec.tag === 'template' || rec.tag === 'noscript'; return inert ? node._sheet = null : node._sheet ??= new CSSStyleSheet({}, node); };
   Object.defineProperty(HTMLStyleElement.prototype, 'sheet', { configurable: true, get() { return ownSheet(this); } });
-  // WARNING: only stylesheet links of the page HTML have a sheet, with the CSS that the bundler compiled.
   Object.defineProperty(HTMLLinkElement.prototype, 'sheet', { configurable: true, get() { return /(^|\s)stylesheet(\s|$)/i.test(this.getAttribute('rel') ?? '') && (this._linked ??= call('dom.css', this._id) !== null) ? ownSheet(this) : null; } });
   Object.defineProperty(Node.prototype, 'baseURI', { configurable: true, get() { return document.baseURI; } });
   globalThis.Option = function Option(text = '', value, defaultSelected = false, selected = false) { const option = document.createElement('option'); if (text !== '') option.text = text; if (value !== undefined) option.value = value; option.defaultSelected = defaultSelected; if (selected) option.selected = true; return option; };
-  // WARNING: `on*` properties add one listener on first set, where it keeps its place among the others, and remove it when set to null, like browser event handlers.
   const handlers = new WeakMap();
   const handler = (target, name) => Object.defineProperty(target, 'on' + name, { configurable: true, enumerable: true,
     get() { return handlers.get(this)?.[name]?.value ?? null; },
@@ -2337,7 +2293,6 @@
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
   for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
-  // WARNING: bundled pages set the running classic `<script>` here, see `$appsClassic` in the bundler.
   globalThis.__appsScript = node => { currentScript = node ?? null; };
   globalThis.__appsLoaded = () => {
     readyState = 'interactive'; dispatch(document, trusted(new Event('readystatechange')));
@@ -2353,7 +2308,6 @@
   }
   class FontFaceSet extends EventTarget {
     constructor() {super();this._faces=new Set();this._css=[];}
-    // WARNING: `@font-face` faces load with the next frame, or in `dom.fonts` when the page asks for them, so fonts are ready before text is measured.
     _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;version++;}this._css=css.map(([family,source,range,status],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,range?{unicodeRange:range}:{});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
     add(face) {if(!(face instanceof FontFace))throw new TypeError('Expected FontFace');this._faces.add(face);return this;} delete(face){return this._faces.delete(face);} clear(){this._faces.clear();} has(face){return this._all().includes(face);} get size(){return this._all().length;} values(){return this._all().values();} keys(){return this.values();} entries(){return this._all().map(face=>[face,face]).values();} forEach(fn,thisArg){for(const face of this._all())fn.call(thisArg,face,face,this);} [Symbol.iterator](){return this.values();}
     get status() {return this._all().some(face=>face.status==='loading')?'loading':'loaded';}
@@ -2403,7 +2357,8 @@
   const easingOf = value => {
     value = String(value).trim();
     if (easings.has(value)) return value;
-    // WARNING: `animation-timing-function` takes a list, so commas outside functions are errors here.
+    // WARNING: `dom.supports` accepts a list for `animation-timing-function`, so commas outside functions must be
+    // rejected here.
     if (!value || value.replace(/\([^)]*\)/g, '').includes(',') || !call('dom.supports', 'animation-timing-function', value)) throw new TypeError(`'${value}' is not a valid easing`);
     if (easings.size > 256) easings.clear();
     easings.set(value, true);
@@ -2734,7 +2689,6 @@
     }
     #sync() {
       const effect = this.#effect && effects.get(this.#effect), target = effect?.target, time = this.#current();
-      // WARNING: only `::before` and `::after` animate among pseudo-elements.
       if (!target || effect.pseudo !== null && effect.pseudo !== '::before' && effect.pseudo !== '::after' || time === null || this.#replace === 'removed') { if (this.#synced) { this.#synced = false; call('dom.animation', this.#id, -1, null); } return; }
       const { timing } = effect, duration = timing.duration === 'auto' ? 0 : Math.min(timing.duration, 1e12);
       this.#synced = true;
@@ -2917,7 +2871,7 @@
   };
   globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
-  // WARNING: like the focus fixup of browsers, a focused element that a frame shows inert, hidden or disabled loses focus. It reads that frame's flags, as a forced layout here would cost every frame.
+  // WARNING: this reads the flags of the last frame with `observing` set; a forced layout here would cost every frame.
   globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
@@ -2971,7 +2925,6 @@
 
   globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
   const blockOf = (host, node) => { let block = node.nodeType === 3 ? node.parentNode : node; while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode; return block; };
-  // WARNING: like Chromium, Enter in a contenteditable splits the paragraph into a new `div` (or the block's own tag), and an empty line holds a `br`.
   const paragraph = (host, range) => {
     const block = blockOf(host, range.startContainer), tail = document.createRange();
     tail.setStart(range.startContainer, range.startOffset);
@@ -3007,9 +2960,9 @@
     if (typed && last?.typed && last.at + last.inserted.length === at) last.inserted += inserted;
     else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
   };
-  // WARNING: `[start, replaced text, marked text]` of the composition.
   let composed = null;
-  // WARNING: like Chromium, a composition whose field loses focus, or that a press or the window's blur ends, keeps its text and fires only `compositionend`, and the input method drops its own text. Focus changes call this before `active` changes.
+  // WARNING: focus changes must call this before `active` changes. Like Chromium, an ended composition keeps its text
+  // and fires only `compositionend`.
   const finishComposition = () => {
     if (composing === null) return;
     const target = active, [at, removed, text] = composed;
@@ -3121,7 +3074,6 @@
     queryCommandSupported: name => editCommands.has(String(name).toLowerCase()),
     queryCommandEnabled(name) { const command = editCommands.get(String(name).toLowerCase()); return !!command && enabled(command); },
   });
-  // WARNING: an AppKit control sends a press as a click, and its values as user edits. `done` ends an edit, which fires `change`.
   globalThis.__appsNativeControl = (id, value, done) => {
     const target = wrap(id);
     if (!target || disabled(target)) return;
@@ -3149,7 +3101,6 @@
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
-  // WARNING: the clipboard answers only while a page script runs from the app's event loop, and it holds text only.
   class ClipboardItem {
     constructor(items) { this._items = { ...items }; this.types = Object.keys(this._items); this.presentationStyle = 'unspecified'; }
     async getType(type) { if (!(type in this._items)) throw new DOMException('The type was not found', 'NotFoundError'); const value = await this._items[type]; return value instanceof Blob ? value : new Blob([value], { type }); }
@@ -3233,7 +3184,6 @@
     while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
     return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
   };
-  // WARNING: native presses follow the browser order: pointerdown, mousedown, focus and selection, contextmenu; a canceled pointerdown drops the mouse events of the press, and a canceled mousedown keeps focus and selection.
   let press = null, last = null, sliding = null;
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
@@ -3242,7 +3192,6 @@
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
     if (name === 'fullscreen:exit') { if (fullscreens.length) exitFullscreen(true, true); return true; }
-    // WARNING: like Chrome, the focused element keeps its focus while the window is not focused. It gets `blur` before the window and `focus` after it.
     if (name === 'window:focus' || name === 'window:blur') {
       const focused = name === 'window:focus', target = active;
       if (windowFocused === focused) return true;
@@ -3404,10 +3353,8 @@
         }
       }
     }
-    // WARNING: like browsers, a slider moves after the page's mouse listeners and sends `change` when the press ends.
     if (sliding && name !== 'pointerdown') { slide(sliding[0], data.clientX); if (ended) { if (sliding[0].value !== sliding[1]) dispatch(sliding[0], trusted(new Event('change', { bubbles: true }))); sliding = null; } }
     if (name === 'pointerdown' && !blocked && (button === 2 || button === 0 && data.ctrlKey && navigator.platform.includes('Mac')) && dispatch(target, trusted(new PointerEvent('contextmenu', { ...init, button: 2 })))) {
-      // WARNING: like Chromium, the main side's `context-menu` comes only when the page didn't cancel the DOM event.
       const element = target.nodeType === 1 ? target : target.parentElement, link = element?.closest?.('a[href]'), media = element?.closest?.('img,video,audio,canvas'), field = element?.closest?.('input,textarea,[contenteditable=""],[contenteditable="true"]'), selected = String(getSelection?.() ?? ''), kind = media?.localName;
       host('dom.contextMenu', { x: data.clientX, y: data.clientY, linkURL: link?.href ?? '', linkText: link?.textContent ?? '', pageURL: location.href, frameURL: location.href, srcURL: media?.currentSrc ?? media?.src ?? '', mediaType: kind === 'img' ? 'image' : kind ?? 'none', hasImageContents: kind === 'img', isEditable: !!field, selectionText: selected, titleText: element?.title ?? '', altText: media?.alt ?? '', misspelledWord: '', dictionarySuggestions: [], selectionRect: { x: 0, y: 0, width: 0, height: 0 }, frameCharset: 'UTF-8', formControlType: field?.localName === 'input' ? field.type : 'none', spellcheckEnabled: false, menuSourceType: 'mouse', mediaFlags: {}, editFlags: { canUndo: !!field, canRedo: !!field, canCut: !!field && !!selected, canCopy: !!selected, canPaste: !!field, canDelete: !!field && !!selected, canSelectAll: true, canEditRichly: false } });
     }

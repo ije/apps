@@ -146,7 +146,6 @@ impl Scene {
         self.active.is_empty() && self.layers[0].stack.is_empty()
     }
 
-    // The order a box at `bounds` takes now, one above all that overlaps it.
     #[cfg(target_os = "macos")]
     pub(crate) fn probe(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
         self.layers[0].tree.insert(bounds)
@@ -230,8 +229,6 @@ impl Scene {
             return;
         };
         let content_mask = effect.content_mask;
-        // WARNING: a keyed layer with a transform turns between frames, so in the window it is ordered by
-        // its whole clip: whatever paints before or after it there stays below or above it.
         let reach = (self.active.is_empty()
             && effect.transform.is_some()
             && self.keyed.iter().any(|(_, layer)| *layer == index))
@@ -365,7 +362,6 @@ pub(crate) fn transform_bounds(
         let [x, y] = [corner.x.0, corner.y.0];
         let w = matrix[3] * x + matrix[7] * y + matrix[15];
         if w <= 1e-4 {
-            // WARNING: a corner behind the viewer has no 2D position, so the effect may cover anything.
             return Bounds::new(
                 point(ScaledPixels(-1e6), ScaledPixels(-1e6)),
                 Size::new(ScaledPixels(2e6), ScaledPixels(2e6)),
@@ -491,6 +487,7 @@ pub struct Glass {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct GlassState {
     pub key: u64,
     pub bounds: Bounds<ScaledPixels>,

@@ -4,7 +4,6 @@ const devtools = this.__appsDevtools ?? globalThis.__appsCompile !== undefined;
 const compile = this.__appsCompile ?? ((source) => (0, eval)(source));
 const chunk = this.__appsChunk ?? globalThis.__appsChunk;
 const definitions = new Map(), modules = new Map(), starredBy = new Map(), chunks = new Map(), loaded = new Set(), bind = Object.defineProperties, slots = [];
-// WARNING: a flat module has no namespace until code needs one as a value, so it stays out of the heap otherwise. Its entries are a slot, `~slot` for a live binding, or `[module, name]`.
 const namespaceOf = module => {
   if (module.namespace) return module.namespace;
   const namespace = Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' }), table = module.definition.slots;
@@ -163,7 +162,6 @@ const load = (id, ancestors = new Set()) => {
     const dirname = filename && (globalThis.__apps?.path.dirname(filename) ?? (filename.replace(/[\\/][^\\/]*$/, '') || '/'));
     const commonjs = module.commonjs = { id: filename, path: dirname, exports: {}, filename, loaded: false, children: [], paths: [], require: requireFrom(definition) };
     if (filename !== undefined) cache[filename] = commonjs;
-    // WARNING: like Node, a module that throws leaves the cache, so the next require runs it again.
     try { definition.factory.call(commonjs.exports, commonjs.exports, commonjs.require, commonjs, filename, dirname, $appsRequire, $appsImport); }
     catch (error) { module.state = 0; if (cache[filename] === commonjs) delete cache[filename]; throw error; }
     commonjs.loaded = true;
@@ -191,7 +189,6 @@ const load = (id, ancestors = new Set()) => {
   };
   const failed = error => { module.state = 3; module.error = error; throw error; };
   let result;
-  // WARNING: a module that throws while it loads keeps the error, so a later import or entry fails instead of seeing it loaded.
   try {
     for (const dependency of module.definition.deps) {
       if (dependency === null) continue;

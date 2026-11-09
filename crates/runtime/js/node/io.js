@@ -191,7 +191,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     update(data, inputEncoding, outputEncoding) {
       if (this.#done) throw Object.assign(new Error('Unsupported state'), { code: 'ERR_CRYPTO_INVALID_STATE' });
       const bytes = input(data, inputEncoding), end = this.#size + bytes.length;
-      // WARNING: GCM encrypts with an AES-CTR keystream that does not depend on the data, so sealing zeros yields it. It grows by doubling, so the total work stays linear.
+      // WARNING: GCM's AES-CTR keystream doesn't depend on the data, so sealing zeros yields it. The pad grows by
+      // doubling to keep the total work linear.
       if (end > this.#pad.length) { const size = Math.max(end, this.#pad.length * 2, 4096); this.#pad = output(call('web.crypto.encrypt', this.#key, this.#iv, new Uint8Array(0), new Uint8Array(size))).subarray(0, size); }
       const out = Buffer.allocUnsafe(bytes.length);
       for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ this.#pad[this.#size + i];
@@ -227,7 +228,6 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   }
   const fail = (code, message, Type = Error) => { throw Object.assign(new Type(message), { code }); };
   const unsupported = () => fail('ERR_OSSL_UNSUPPORTED', 'error:1E08010C:DECODER routines::unsupported');
-  // WARNING: DER readers return [tag, value, next]. Key fields are views of a private copy of the input.
   const der = (bytes, at = 0) => {
     let length = bytes[at + 1], start = at + 2;
     if (length > 127) { const count = length & 127; length = 0; for (let i = 0; i < count; i++) length = length * 256 + bytes[start++]; }

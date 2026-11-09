@@ -23,7 +23,6 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", root.join("js").display());
-    // WARNING: app.dylib of `apps build --aot` holds native code of these scripts, so it runs only with the same ones.
     let mut scripts = 0u64;
     let mut hash = |path: &std::path::Path, text: &str| {
         let bytes = path.to_string_lossy().into_owned() + text;
@@ -36,8 +35,8 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                // WARNING: scripts lose only whitespace and comments, because the compressor drops the completion value
-                // of `napi.js`. napi.rs reads the lines of `napi.js`, so that one stays as written. JSC reads ASCII in place.
+                // WARNING: strip only whitespace and comments, because the compressor drops script completion values.
+                // `napi.js` stays as written, because napi.rs reads its lines.
                 let source = fs::read_to_string(&path).unwrap();
                 if path.ends_with("node/napi.js") {
                     hash(path.strip_prefix(&root).unwrap(), &source);

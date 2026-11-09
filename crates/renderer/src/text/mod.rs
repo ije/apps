@@ -234,15 +234,13 @@ impl Hash for RenderGlyphParams {
 pub struct Fonts {
     pub(crate) platform: platform::TextSystem,
     fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
-    // WARNING: the last fonts resolved, found by the pointers of their family and features, since runs share those
-    // and hashing a whole font for every run costs more than its shaping cache lookups.
+    // WARNING: found by the pointers of their family and features, since hashing a whole font for every run costs more
+    // than its shaping cache lookups.
     recent: RefCell<Vec<(Font, FontId)>>,
     metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
     generation: Cell<usize>,
 }
 
-// WARNING: fonts, metrics and shaped lines, used on the main thread only. Each window has its own
-// cache of shaped lines over the app's fonts.
 pub struct TextSystem {
     shared: Rc<Fonts>,
     font_runs: Cell<Vec<FontRun>>,
@@ -272,8 +270,6 @@ impl Default for TextSystem {
     }
 }
 
-// WARNING: CoreText takes milliseconds to find an installed family, and the platform keeps faces for the process, so
-// a thread finds the first installed family of each list before a page's first style pass asks for it.
 pub fn warm(lists: Vec<Vec<String>>) {
     #[cfg(target_os = "macos")]
     if !lists.is_empty() {
@@ -387,7 +383,6 @@ impl TextSystem {
                 })
             })
         });
-        // WARNING: a system without any of the fallback fonts has no text to show.
         let id = id.unwrap_or_default();
         self.fonts.borrow_mut().insert(font.clone(), Some(id));
         id
@@ -510,7 +505,7 @@ impl TextSystem {
     ) -> Option<[f32; 4]> {
         #[cfg(target_os = "macos")]
         let bounds = self.platform.glyph_bounds(font_id, glyph_id, font_size.0);
-        // WARNING: other platforms measure raster bounds at this scale, so the values are off by up to its inverse.
+        // WARNING: other platforms measure raster bounds at this scale, so the bounds are off by up to its inverse.
         #[cfg(not(target_os = "macos"))]
         let bounds = {
             const SCALE: f32 = 8.;

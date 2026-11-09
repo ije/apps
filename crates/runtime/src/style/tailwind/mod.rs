@@ -1543,8 +1543,8 @@ struct Config {
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
     expanding: std::cell::RefCell<Vec<usize>>,
-    // WARNING: `@apply` fans out, so each utility expands once per value and modifier. A result that a cycle
-    // or the depth cap cut short depends on where the expansion started, so `cut` keeps it out.
+    // WARNING: a result that a cycle or the depth cap cut short depends on where expansion started, so `cut` keeps it
+    // out of `expanded`.
     #[allow(clippy::type_complexity)]
     expanded: std::cell::RefCell<FxHashMap<(usize, Option<String>, Option<String>), Option<Body>>>,
     cut: std::cell::Cell<bool>,
@@ -1796,8 +1796,7 @@ impl Config {
         let mut new = BTreeSet::new();
         if !fresh.is_empty() {
             fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            // WARNING: keys keep Tailwind's order with gaps; a utility without a gap renumbers them all,
-            // which rebuilds every scope. Keys have 56 bits, so a selector index fits below them in 64.
+            // WARNING: keys must stay below 2^56, so a selector index fits below them in 64 bits.
             const KEYS: u64 = 1 << 56;
             let mut renumber = false;
             if fresh.len() <= 16 {
@@ -2110,7 +2109,6 @@ impl Config {
 
     fn compile(&self, class: &str, base: &str) -> Option<Compiled> {
         let mut parts = split(class, ':');
-        // WARNING: every variant multiplies the work, so long chains are rejected.
         if parts.len() > 16 {
             return None;
         }
@@ -2222,7 +2220,6 @@ impl Config {
     }
 
     fn variant(&self, name: &str, depth: u8) -> Option<(Rank, Variant)> {
-        // WARNING: compound variants nest, so their depth is capped.
         if depth > 8 {
             return None;
         }
@@ -2628,7 +2625,7 @@ impl Config {
                 };
                 let mut raw = raw.trim().to_owned();
                 let mut valid = true;
-                // WARNING: results come from the class, so they are never scanned again.
+                // WARNING: never scan substituted text again: it comes from the class and could hold more calls.
                 let mut from = 0;
                 while let Some(((start, open, close), function, input)) =
                     [("--value", value), ("--modifier", modifier)]
@@ -2780,7 +2777,6 @@ impl Config {
                 '"' | '\'' => quote = Some(character),
                 '(' => {
                     let before = &out[..out.len() - 1];
-                    // WARNING: `theme(` also ends `--theme(` and names like `x-theme(`.
                     let function = ["--spacing", "--alpha", "--theme", "theme"]
                         .into_iter()
                         .find(|name| {

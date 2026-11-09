@@ -63,7 +63,6 @@ pub fn run(
         Some(root) => crate::rust::build(root, entry, false, target),
         None => Ok(runtime.clone()),
     };
-    // WARNING: main loads its chunks by the names in app.js, and a chunk can name more chunks.
     let main_chunks = |files: &BBTreeMap<String, String>| {
         let mut chunks = BTreeSet::new();
         let mut pending = vec!["app.js".to_owned()];
@@ -185,7 +184,8 @@ pub fn run(
                         .arg("--")
                         .arg(entry);
                 }
-                // WARNING: without it the runtime starts itself again, see `malloc.rs`.
+                // WARNING: without MallocSpaceEfficient=1 the runtime starts itself again to set it, which costs about
+                // 10 ms.
                 #[cfg(target_os = "macos")]
                 cmd.env("MallocSpaceEfficient", "1");
                 if let Some(path) = &dev_bundle {
@@ -218,7 +218,6 @@ pub fn run(
                                     &bundle,
                                 )?;
                             }
-                            // WARNING: while watching, stdin stays open for the bundles of page reloads, so a new line ends each bundle.
                             let mut stdin = BufWriter::new(stdin);
                             serde_json::to_writer(&mut stdin, &bundle)?;
                             stdin.write_all(b"\n")?;
@@ -233,7 +232,6 @@ pub fn run(
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
-                // WARNING: without watching no bundle follows, so stdin closes like the end of a file.
                 input = watch.then_some(
                     writer
                         .take()
@@ -258,7 +256,6 @@ pub fn run(
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(event)) if !matches!(event.kind, notify::EventKind::Access(_)) => {
-                    // WARNING: created, removed or renamed files and package.json edits can change how imports resolve.
                     if let Some(cache) = &cache
                         && (!matches!(
                             event.kind,
@@ -296,7 +293,6 @@ pub fn run(
                         changed = Some(Instant::now());
                         fresh = true;
                     }
-                    // WARNING: only Cargo makes a new executable, so a Rust app restarts after it ran.
                     if event.paths.iter().any(cargo) {
                         binary = None;
                     }

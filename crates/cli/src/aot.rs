@@ -15,8 +15,6 @@ use std::{
     process::Command,
 };
 
-// Compiles the app's modules and the runtime scripts with Bun's AOT compiler, and links the native code with
-// JavaScriptCore into app.dylib in the returned directory. Each compiled script of `files` becomes a reference to it.
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
     let library = apps_runtime::jsc::library_path(runtime, "macos")?;
     let archive = library
@@ -173,7 +171,6 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             fs::write(directory.path().join(&name), bytes)?;
             wasm_paths.push(name);
         }
-        // WARNING: a Wasm-looking string can be ordinary data. Invalid modules must keep their runtime behavior.
         let validation = Command::new(&bun)
             .current_dir(directory.path())
             .args(["-e", "import {readFileSync} from 'node:fs'; console.log(JSON.stringify(process.argv.slice(1).map(path=>WebAssembly.validate(readFileSync(path)))));"])
@@ -215,7 +212,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         .arg(directory.path().join("unused"))
         .output()
         .context("Cannot run Bun. Set APPS_BUN to an AOT-enabled Bun compiler")?;
-    // WARNING: Bun may reject its own backend after writing valid IR for a standalone JSC host.
+    // WARNING: Bun can fail after it wrote valid IR for a standalone JSC host, so check for the IR file, not the exit
+    // status.
     ensure!(
         program.is_file(),
         "Bun did not emit AOT IR. Use the AOT-enabled Bun compiler {required} and set APPS_BUN.\n{}",

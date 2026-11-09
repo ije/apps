@@ -19,7 +19,6 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             .with_context(|| format!("Cannot find the script {script}"))?
             .into(),
     };
-    // WARNING: a headless script never runs the app's main bundle, and this string is the only copy that stays.
     drop(bundle.files.remove("app.js"));
     let (wake, wakes) = mpsc::channel();
     crate::host::Waker::install(move || {
@@ -62,7 +61,6 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     while engine.eval_page(crate::jsc::NEXT, "apps:node")? == "true" {}
     let code = loop {
         let delay = engine.tick()?;
-        // WARNING: like in Node, the process ends when only unreferenced handles are left.
         if delay != 0 && !engine.addons_pending() && engine.call("__appsAlive", &[])? != "true" {
             let code = engine.call("__appsFinish", &[])?;
             if code != "-1" {
@@ -71,7 +69,6 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
             continue;
         }
         crate::host::idle(true);
-        // WARNING: JSC's GC timers never fire on the generic event loop, so the VM is collected when it has been quiet for a second.
         let wait = if api.shrink_pending() && !(0..1000).contains(&delay) {
             1000
         } else {

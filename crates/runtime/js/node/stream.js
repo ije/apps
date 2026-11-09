@@ -152,7 +152,6 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
     }
     pipe(destination, { end = true } = {}) {
       const state = this._readableState;
-      // WARNING: like Node's awaitDrainWriters, the source resumes only after every destination that asked it to wait drains.
       const waiting = state.awaitDrain ??= new Set();
       const ondata = chunk => { if (destination.write(chunk) === false) { waiting.add(destination); this.pause(); } };
       const ondrain = () => { if (waiting.delete(destination) && !waiting.size && state.flowing === false) this.resume(); };

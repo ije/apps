@@ -56,7 +56,6 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
     const tx = transactions[0];
     const begin = () => {
       if (tx._done) { running = false; transactions.shift(); schedule(); return; }
-      // WARNING: a transaction that ends in this process wakes the loop, and the timer covers other processes.
       try { const result = native('begin', tx.db.name, tx.mode); if (result.busy) { retries.add(begin); setTimeout(() => { if (retries.delete(begin)) begin(); }, 50); return; } tx._id = result.id; tx._start?.(); tx._drain(); }
       catch (error) { tx._abort(error); }
     };
@@ -136,7 +135,6 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
       if (!['next', 'nextunique', 'prev', 'prevunique'].includes(direction)) throw new TypeError('Invalid cursor direction');
       const request = new IDBRequest(this, this.transaction), range = this._range(query), reverse = direction.startsWith('prev');
       const from = (wire, open) => { range[reverse ? 1 : 0] = JSON.stringify(wire); range[reverse ? 3 : 2] = open; };
-      // WARNING: each step reads the next row after the last key, so writes made during the walk show up like in browsers.
       const step = () => {
         const row = this._scan(range, keyOnly ? 'keys' : 'rows', 1, reverse)[0]; if (!row) return null;
         const key = keyOnly ? row : row[0], cursor = new IDBCursor(this, request, direction, keyValue(key), keyOnly ? undefined : codec.decode(JSON.parse(row[1])));

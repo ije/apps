@@ -143,7 +143,7 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
     AVRational aspect = av_guess_sample_aspect_ratio(m->format, m->video.stream, NULL);
     double width = m->video.stream->codecpar->width, height = m->video.stream->codecpar->height;
     if (aspect.num > 0 && aspect.den > 0) width *= av_q2d(aspect);
-    // WARNING: the file sets the size and the pixel aspect, so frames are scaled to fit 8192 pixels per side.
+    // WARNING: the file sets the size, so frames are scaled to fit 8192 pixels per side to bound their memory.
     double fit = fmin(1, 8192 / fmax(width, height));
     if (width > 0 && height > 0) {
       m->width = (int)fmax(1, lrint(width * fit));
@@ -168,7 +168,6 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
 fail:
   av_strerror(status, error, error_size);
   if (m) {
-    // WARNING: avformat_open_input frees the context when it fails.
     avformat_close_input(&m->format);
     if (m->io) av_freep(&m->io->buffer);
     avio_context_free(&m->io);
@@ -223,7 +222,6 @@ static int feed(AppsMedia *m, Track *track) {
     track->length--;
     track->bytes -= packet->size;
     av_packet_free(&packet);
-    // WARNING: a corrupt packet only drops its frame.
     return status < 0 && status != AVERROR_INVALIDDATA ? status : 1;
   }
   if (!m->read_end) return 0;
@@ -275,9 +273,6 @@ static int audio(AppsMedia *m, const float **samples, int *count, double *time) 
   return 2;
 }
 
-// WARNING: decodes the next frame of a wanted track (1 video, 2 audio). Returns 1 for a video frame (convert it with
-// apps_ffmpeg_pixels), 2 for interleaved float samples, 3 to call again, 4 when the wanted tracks wait behind
-// the full packet queue of the other track, 0 when the wanted tracks ended, or an error.
 int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *height, const float **samples, int *count) {
   for (;;) {
     int waiting = 0;

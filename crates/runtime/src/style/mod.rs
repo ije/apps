@@ -37,7 +37,6 @@ pub(crate) const SELECT_NONE: u8 = 8;
 pub(crate) const SELECT_ALL: u8 = 16;
 pub(crate) const SELECT_TEXT: u8 = 32;
 const COUNTED: u8 = 64;
-// WARNING: `display` comes from the UA sheet. Chrome's images are inline there, and h2o's are inline blocks.
 pub(crate) const AGENT_DISPLAY: u8 = 128;
 
 fn flags(style: &Style) -> u8 {
@@ -190,7 +189,8 @@ thread_local! {
     static FULLSCREEN_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("{UA}{FULLSCREEN_UA}")));
     #[cfg(target_os = "macos")]
     static GLASS_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(include_str!("tailwind/liquid-glass.css")));
-    // WARNING: resolved families are keyed by the address of the `font-family` value, which the entry holds.
+    // WARNING: keyed by the address of the `font-family` value, so the entry must hold it to keep the address from
+    // being reused.
     #[allow(clippy::type_complexity)]
     pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, FxHashMap<*const u8, (Option<Rc<str>>, renderer::SharedString)>)> = Default::default();
 }
@@ -310,11 +310,6 @@ fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {
         .map(|index| &vars[index].1)
 }
 
-// WARNING: the `::part()` rules that reach a host's shadow tree: its `:host::part()` rules, its own `::part()` rules
-// and, one tree further out, the outer tree's rules that its `exportparts` passes on. Each name of a rule becomes
-// each inner name that passes on as it, so a rule with several names reaches every combination, at most 64. As in
-// Chrome, `:host::part()` rules don't pass on. An equal list keeps the old one, which tells its tree that nothing
-// changed.
 fn exported_parts(
     hosted: Vec<Passed>,
     own: Option<&Shadowed>,
@@ -402,10 +397,6 @@ fn references(value: &str, names: &mut Option<Vec<Prop>>, missing: &mut Vec<Box<
     }
 }
 
-// WARNING: everything a node reads from its parent and the root besides custom properties, containers and
-// `::selection`. In the values key `parent` is what the parent passes on (see `StyleCache::heritage`), or with `true`
-// the parent itself, for nodes that inherit a property that is not inherited. Cached nodes compare their parent and a
-// hash of the units.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Inputs {
     parent: Option<(StyleRef, bool)>,
@@ -459,8 +450,6 @@ impl Container {
     }
 }
 
-// WARNING: each condition queries the nearest eligible container of `chain`, and its result is recorded so that
-// `set_containers` restyles what a new size flips.
 fn query_containers(
     conditions: &[(Option<String>, bool, MediaQuery)],
     chain: Option<&Container>,
@@ -504,12 +493,6 @@ fn query_containers(
         })
 }
 
-// WARNING: a rule from another tree: the `:host` rules of the node's shadow tree, and the `::slotted()` and
-// `::part()` rules that its slot or tree's host passes on. `kind` is the pseudo-element it styles (`ELEMENT` for the
-// node), and `context` the tree context of its normal declarations: -1 for the inner trees of `:host` and
-// `::slotted()`, 0 for `:host::part()` and the number of trees out for `::part()`; important ones negate it. A
-// pseudo-element rule in `@container` keeps its scope and order in `query` with its result for the node's
-// ancestors, since a node that is a container answers it again.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ShadowRule {
     kind: usize,
@@ -523,9 +506,6 @@ struct ShadowRule {
 
 const ELEMENT: usize = usize::MAX;
 
-// WARNING: a `::slotted()` or `::part()` rule that a slot or host passes on. `name` is the slotted compound or the
-// part name, and `compound` what the node must match: the slotted compound, or the pseudo-classes after
-// `::part()`. Its `@container` conditions (scope, order, query) query the ancestors of the node it reaches.
 #[derive(Clone)]
 pub(crate) struct Passed {
     name: Rc<str>,
@@ -546,8 +526,6 @@ impl PartialEq for Passed {
     }
 }
 
-// WARNING: `rules` compares by address, so equal lists must be one object: the scope's `lists` holds them. `inline`
-// is a hash of the `style` attribute, whose text the value holds and a hit compares.
 #[derive(Hash, PartialEq, Eq)]
 struct StyleKey {
     scope: usize,
@@ -573,8 +551,6 @@ struct CachedNode {
     units: u64,
     inherited: Option<Vars>,
     vars: Vars,
-    // WARNING: only nodes with `@container` rules or container units compare their containers, so a new
-    // container restyles just them.
     containers: Option<Option<Rc<Container>>>,
     rare: Option<Box<RareInputs>>,
     value: Rc<CachedStyle>,
@@ -628,7 +604,6 @@ struct CachedStyle {
     #[allow(clippy::type_complexity)]
     reads: Option<Box<[(Prop, Option<Rc<str>>)]>>,
     own: Box<[(Prop, Option<Rc<str>>)]>,
-    // WARNING: `var()` names that were never interned. A parent list can hold one only after it is interned.
     missing: Box<[Box<str>]>,
     flags: u8,
     lengths: Lengths,
@@ -655,8 +630,6 @@ struct Share {
     style: Option<u32>,
 }
 const PSEUDO: usize = 1 << (usize::BITS - 1);
-// WARNING: buckets hold one entry per selector of a rule, its order shifted by this and its index in the list, so a
-// node tests only the selectors whose key it has.
 const SELECTOR: usize = 32;
 struct StyleScope {
     id: usize,
@@ -666,7 +639,6 @@ struct StyleScope {
     rules: Vec<(SelectorList, Vec<Declared>, Layer)>,
     layers: Vec<(String, Vec<u32>)>,
     pseudos: Vec<(usize, Selector, usize, Key)>,
-    // WARNING: by `::slotted()` and `::part()` pseudo index, the name, compound and target of `Passed`.
     arguments: FxHashMap<usize, (Rc<str>, SelectorList, usize)>,
     elements: Vec<Vec<(usize, Key)>>,
     buckets: [FxHashMap<String, Vec<usize>>; 4],
@@ -677,12 +649,9 @@ struct StyleScope {
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     properties: Registry,
     states: u16,
-    // WARNING: by node id. Boxed, since the list is as long as the document's node arena in every scope.
     nodes: Vec<Option<MatchedRules>>,
     #[allow(clippy::type_complexity)]
     lists: RuleLists,
-    // WARNING: source order keys: a rule's sequence in the high 64 bits, and in the Tailwind block its
-    // generated key in the low 64 bits, so rules inserted later get keys between their neighbors.
     keys: Vec<u128>,
     block: Option<u64>,
     sequence: u64,
@@ -739,7 +708,6 @@ impl StyleScope {
                             } else {
                                 vec![classes]
                             });
-                            // WARNING: the slotted compound counts in the specificity, as in Chrome.
                             if kind == 12
                                 && let Some(own) =
                                     compound.iter().map(|selector| selector.specificity).max()
@@ -868,11 +836,7 @@ impl StyleScope {
 
 type RuleLists = rustc_hash::FxHashSet<Rc<[(usize, [usize; 3])]>>;
 
-// WARNING: values keys compare rule lists by address, so equal lists of a scope must be one object.
-fn intern(
-    lists: &mut RuleLists,
-    list: &[(usize, [usize; 3])],
-) -> Rc<[(usize, [usize; 3])]> {
+fn intern(lists: &mut RuleLists, list: &[(usize, [usize; 3])]) -> Rc<[(usize, [usize; 3])]> {
     if let Some(old) = lists.get(list) {
         return old.clone();
     }
@@ -884,7 +848,6 @@ fn intern(
     list
 }
 
-// WARNING: the `style` attribute holds the source of a node's inline style; a parsed one without it is set by tests.
 fn inline_source(node: &crate::dom::Node) -> Option<Cow<'_, str>> {
     node.attrs
         .get("style")
@@ -912,7 +875,6 @@ fn has_key(node: &crate::dom::Node, key: &Key) -> bool {
 struct MatchedRules {
     checked: std::cell::Cell<u64>,
     cached: Option<CachedNode>,
-    // WARNING: matching collects many duplicates before the dedup, so the list is boxed to its length.
     dependencies: Box<[crate::dom::Dependency]>,
     rules: Rc<[(usize, [usize; 3])]>,
     pseudos: Rc<[usize]>,
@@ -1000,20 +962,15 @@ pub(crate) struct StyleCache {
     next: usize,
     pass: u64,
     pub(crate) states: u16,
-    // WARNING: the last revision in the node's subtree lets a pass keep the sheet without comparing its text.
     #[allow(clippy::type_complexity)]
     sheets: HashMap<usize, (u64, Option<u64>, Rc<str>, Rc<Stylesheet>)>,
     pub(crate) cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: FxHashMap<u32, Rc<Stylesheet>>,
     derived: Derived,
     pub(crate) adopted: FxHashMap<usize, Vec<u32>>,
-    // WARNING: a key holds a few values, newest last, for nodes that read different custom properties of their parent.
     values: rustc_hash::FxHashMap<StyleKey, Vec<Rc<CachedStyle>>>,
     // WARNING: values keys hold tag names by these numbers, which are never freed: a page uses few tag names.
     tags: FxHashMap<String, u32>,
-    // WARNING: by parent style, what its children read of it: its inherited values, and `display: flex` for flex and
-    // grid parents, which blockify their children. Equal ones are one object in `inherited`, so the children of rows
-    // that differ only in other properties, like an inline `transform`, share their values.
     heritage: FxHashMap<*const Style, (Rc<Style>, Rc<Style>)>,
     inherited: rustc_hash::FxHashSet<Rc<Style>>,
     containers: FxHashMap<usize, [f32; 2]>,
@@ -1025,8 +982,8 @@ pub(crate) struct StyleCache {
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
-    // WARNING: keyed by the source list, which the entry holds; `None` when no property was filtered out, so
-    // an entry holds its source only once and `finish` drops it after the last node lets the source go.
+    // WARNING: keyed by the source list's address, so the entry must hold the source to keep the address from being
+    // reused.
     #[allow(clippy::type_complexity)]
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Option<Vars>)>,
     pub(crate) scripted: Registry,
@@ -1034,14 +991,11 @@ pub(crate) struct StyleCache {
     pub(crate) spare: Option<SpareStyles>,
     walk: Option<Rc<TreeWalk>>,
     shadows: Rc<Shadows>,
-    // WARNING: one cache for all scopes, since a pass styles every tree of the document in one walk.
     matches: SelectorCache,
-    // WARNING: an incremental pass starts from the last stored output, so `full` (set where all cached styles
-    // go) and `styled` (the walk of that output) must describe it.
+    // WARNING: an incremental pass starts from the last stored output, so `full` and `styled` must always describe that
+    // output.
     full: bool,
     styled: Option<Styled>,
-    // WARNING: debug builds check passes against one that matches every node itself and keys values by the parent
-    // itself, so shared matches and what parents pass on can't hide a read.
     unshared: bool,
     #[cfg(debug_assertions)]
     pub(crate) incremental: u64,
@@ -1058,8 +1012,7 @@ struct Environment {
     scheme: Option<Rc<str>>,
 }
 
-// WARNING: `scopes` holds (root, scope id, rule count) per tree, sorted by root. A tree that the stored pass
-// styled must use the same scope again; nodes of new trees style as new nodes.
+// WARNING: `scopes` must stay sorted by root, and a tree that the stored pass styled must use the same scope again.
 struct Styled {
     nodes: Rc<Vec<(u32, u32)>>,
     tree: Rc<Vec<u32>>,
@@ -1078,12 +1031,8 @@ struct MediaBlock {
 }
 type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, FontUnits)>;
-// WARNING: a cell's adjusted style by its own style and, per side, the border width and, when the cell takes the border
-// of another box, the style and color of that border.
 type CellKey = (StyleRef, [(u32, Option<[Option<Rc<str>>; 2]>); 4]);
 
-// WARNING: a row of a collapsed table with the styles that its adjustment reads: the row, its group and its cells with
-// their spans. Styles compare by address.
 #[derive(PartialEq)]
 struct Line {
     row: (usize, StyleRef),
@@ -1091,7 +1040,6 @@ struct Line {
     cells: Vec<(usize, StyleRef, usize)>,
 }
 
-// WARNING: `adjusted` holds, by line, the adjusted styles of its cells and the widths they give the outer edges.
 #[derive(Default)]
 struct CollapsedTable {
     pass: u64,
@@ -1114,8 +1062,7 @@ impl StyleCache {
             special: Vec::new(),
             tables: Vec::new(),
         });
-        // WARNING: the shadow map is new whenever the tree or its shadow roots change, so the same map at the
-        // same tree revision needs no compare.
+        // WARNING: this skip relies on a new shadow map whenever the tree or its shadow roots change.
         if !(walk.built.0 == doc.nodes.tree() && Rc::ptr_eq(&walk.built.1, shadows))
             && walk.walk.update(doc, &shadows.composed, None)
         {
@@ -1209,9 +1156,6 @@ impl StyleCache {
             self.containers = sizes.clone();
             return true;
         }
-        // WARNING: queries record their container even while it has no size yet, and container units are in
-        // `sized`, so new or removed containers that no query result depends on don't style again. A list
-        // that builds rows with containers as it scrolls would otherwise style and lay out every frame twice.
         let mut flipped = Vec::new();
         for (&(scope, order, index, container), &(inline, matched, font)) in &self.queries {
             let query = self
@@ -1237,8 +1181,6 @@ impl StyleCache {
         if flipped.is_empty() {
             return false;
         }
-        // WARNING: a query result reaches only the boxes inside its container. Other boxes keep their styles and
-        // recorded queries, or every flip in a long list would style the whole page again.
         self.queries
             .retain(|&(_, _, _, container), _| !flipped.contains(&container));
         let mut pending = flipped;
@@ -1481,8 +1423,7 @@ impl StyleCache {
         self.pass += 1;
     }
 }
-// WARNING: origins are in precedence order of their normal declarations. Important ones rank `IMPORTANT - origin`,
-// so they reverse: author, then user, then UA. Animations sit between the two halves.
+// WARNING: origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
 const AGENT: u8 = 0;
 const USER: u8 = 1;
 const HINT: u8 = 2;
@@ -1490,8 +1431,7 @@ const AUTHOR: u8 = 3;
 const ANIMATION: u8 = 4;
 const IMPORTANT: u8 = 8;
 
-// WARNING: fields compare in this order, which is the cascade's: origin and importance, shadow context,
-// inline style, layer (reversed for important), specificity, then source order.
+// WARNING: the derived `Ord` compares fields in declaration order, which must stay the cascade's order.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadeRank {
     level: u8,
@@ -1526,7 +1466,6 @@ impl CascadeRank {
         self.level > ANIMATION
     }
 
-    // WARNING: for `revert`, hints and animations count as author declarations.
     fn source(&self) -> (u8, u32) {
         let origin = if self.important() {
             IMPORTANT - self.level
@@ -2433,8 +2372,6 @@ pub(crate) fn resolved(
     container: &dyn Fn() -> [f32; 2],
     registry: &Registry,
 ) -> String {
-    // WARNING: the containing block costs a parse of the parent's padding, so only values with percentages read
-    // it, once per call.
     let cell = std::cell::OnceCell::new();
     let container = &|| *cell.get_or_init(container);
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
@@ -3527,7 +3464,6 @@ struct Collect<'a> {
     container: Option<ContainerQuery>,
     media: Option<MediaStack>,
     blocks: Vec<Rc<MediaBlock>>,
-    // WARNING: each layer's path of sibling indices; a layer's own rules rank after its sublayers.
     layers: Vec<(String, Vec<u32>)>,
     keyframes: HashMap<String, Vec<(f32, Declarations)>>,
     properties: Registry,
@@ -3612,10 +3548,7 @@ impl Rule {
                     }
                 }
             }
-            Self::Variant(..)
-            | Self::Utility(..)
-            | Self::FontFace(_)
-            | Self::Tailwind(_) => {}
+            Self::Variant(..) | Self::Utility(..) | Self::FontFace(_) | Self::Tailwind(_) => {}
             Self::Property(name, syntax, inherits, initial) => {
                 collected.properties.insert(
                     Prop::new(name),
@@ -3707,9 +3640,6 @@ impl Rule {
                     fixed,
                 });
                 collected.blocks.push(block.clone());
-                // WARNING: style rules under an `@media` that doesn't match join the scope with their
-                // condition, so a new result restyles only the nodes they match. Layers, keyframes and
-                // properties wait for the scope to be rebuilt.
                 if matched || !fixed {
                     let outer = collected.media.clone();
                     if !fixed {
@@ -3835,8 +3765,6 @@ pub(crate) struct StyleContext {
     pub previous: Option<Rc<ComputedStyles>>,
 }
 
-// WARNING: the pass styles the composed tree: a host's walk children are its shadow root, then its children
-// that no slot takes, and a slot's are its assigned nodes, then its own children. The root stands for the host.
 #[derive(Default)]
 pub(crate) struct Shadows {
     pub roots: FxHashMap<usize, usize>,
@@ -3848,8 +3776,6 @@ struct TreeWalk {
     walk: crate::dom::Walk,
     built: (u64, Rc<Shadows>),
     used: std::cell::Cell<u64>,
-    // WARNING: by node id, the index in `trees` of the tree that holds the node. `trees` holds (root, host),
-    // and the document comes first with no host.
     tree: Rc<Vec<u32>>,
     trees: Rc<Vec<(usize, usize)>>,
     special: Vec<Vec<usize>>,
@@ -3878,8 +3804,6 @@ impl From<ComputedStyles> for SpareStyles {
 }
 
 thread_local! {
-    // WARNING: unstyled and freed nodes share these, so the whole-arena copies and drops of a pass touch one object
-    // for them instead of one allocation each.
     static EMPTY: (Rc<Style>, Vars) = Default::default();
 }
 
@@ -3890,8 +3814,6 @@ pub(crate) fn empty() -> (Rc<Style>, Vars) {
 #[derive(Clone, Default)]
 pub(crate) struct ComputedStyles {
     blended: std::cell::Cell<Option<bool>>,
-    /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
-    /// that don't read it. Only nodes with animations or transitions keep theirs, for the keyframes.
     pub values: Chunked<Rc<Style>>,
     pub vars: Chunked<Vars>,
     pub flags: Chunked<u8>,
@@ -3901,14 +3823,10 @@ pub(crate) struct ComputedStyles {
     pub backdrops: FxHashMap<usize, Rc<Style>>,
     pub backdrop_starts: FxHashMap<usize, Rc<Style>>,
     pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
-    // WARNING: a node whose `::selection` equals its parent's shares the parent's, so values keys compare them by
-    // address.
     pub selections: FxHashMap<usize, Rc<Style>>,
     pub user_select: Vec<(UserSelect, usize)>,
     pub animations: FxHashMap<usize, Vec<Animation>>,
     pub children: FxHashMap<usize, Vec<usize>>,
-    // WARNING: `slotted` by slot and `parts` by element hold the rules they matched; `exported` by host holds
-    // the `::part()` rules that reach its shadow tree, its own and those that its `exportparts` passes on.
     pub slotted: FxHashMap<usize, Shadowed>,
     pub parts: FxHashMap<usize, Shadowed>,
     pub exported: FxHashMap<usize, Shadowed>,
@@ -3916,7 +3834,6 @@ pub(crate) struct ComputedStyles {
     pub list_items: FxHashMap<usize, i64>,
     pub registry: Rc<Registry>,
     pub authored: FxHashMap<usize, Rc<Style>>,
-    // WARNING: by node id, the containers that the node's children query.
     containers: Chunked<Option<Rc<Container>>>,
     counted: bool,
 }
@@ -3991,8 +3908,6 @@ pub(crate) fn compute_styles(
     out
 }
 
-// WARNING: the font lists that a page's bundled sheets name, read as it loads, so a thread can find those families
-// before its first style pass, which would wait milliseconds for CoreText.
 pub(crate) fn font_lists(doc: &Document) -> Vec<Vec<String>> {
     let mut lists = Vec::new();
     let mut pending: Vec<&Rule> = doc
@@ -4085,10 +4000,6 @@ pub(crate) fn cascade(
     style_cache.shadows = shadows.clone();
     let walk = style_cache.walk(doc, &shadows);
     let order = walk.walk.nodes.as_slice();
-    // WARNING: an incremental pass starts from `previous` and styles only dirty nodes, the children of nodes
-    // whose output changed, and everything after a new root font. So it needs the scopes, sheets, viewport and
-    // caches of that pass, and passes with their own outputs (counters) stay full. Collapsed tables adjust the styles of
-    // their cells after the walk, so a node that keeps the adjusted style of the last pass stands for its `authored` one.
     let stored = context.is_some_and(|context| context.animated.is_empty());
     let previous = context
         .and_then(|context| context.previous.as_deref())
@@ -4098,13 +4009,12 @@ pub(crate) fn cascade(
                 && previous.lengths.list_len() <= 4096
         });
     let mut fast = out.values.is_empty() && previous.is_some() && !style_cache.full;
-    // WARNING: the page sets a fullscreen state together with the top layer, so other pages skip this scan.
+    // WARNING: this scan relies on the page setting `top_layer` whenever a node is fullscreen.
     let fullscreen = context.is_none_or(|context| context.top_layer)
         && order
             .iter()
             .any(|&(id, _)| doc.nodes[id as usize].state & crate::dom::FULLSCREEN != 0);
     let inserted = context.map_or(&[][..], |context| &context.inserted[..]);
-    // WARNING: user origin rules rank between the UA's and the page's, and their `!important` beats the page's.
     let user = |sheet: &Rc<Stylesheet>| {
         inserted
             .iter()
@@ -4117,7 +4027,6 @@ pub(crate) fn cascade(
         || style_cache.reduced_motion != reduced_motion
         || style_cache.native_theme != native_theme
     {
-        // WARNING: font loads reset `metrics` to drop the values that used them, so the next stored pass is full.
         fast = false;
         style_cache.full = true;
         let resized = style_cache.metrics == metrics
@@ -4131,14 +4040,10 @@ pub(crate) fn cascade(
             values.retain(|value| resized && !value.viewport);
             !values.is_empty()
         });
-        // WARNING: kept nodes don't evaluate their container queries again, so their results stay
-        // for `set_containers`.
         if !resized {
             style_cache.queries.clear();
         }
-        // WARNING: a new `@media` result rebuilds the scopes that collected its rules, unless it holds
-        // style rules only: they stay in the scope and restyle the nodes they match. Scopes can share
-        // rules, so all results change after every scope saw them.
+        // WARNING: scopes can share `@media` blocks, so set new results only after every scope has checked them.
         let probe = blank();
         let mut flipped: Vec<Rc<MediaBlock>> = Vec::new();
         for block in style_cache.scopes.iter().flat_map(|scope| &scope.blocks) {
@@ -4200,7 +4105,6 @@ pub(crate) fn cascade(
     }
     let mut scheme = None;
     let mut theme = None;
-    // WARNING: trees with the same sheets share one scope. Later trees can drop unused scopes, so trees keep ids.
     let mut chosen = Vec::with_capacity(walk.trees.len());
     let mut lists: FxHashMap<Vec<usize>, usize> = FxHashMap::default();
     let (mut sheets, mut list) = (Vec::new(), Vec::new());
@@ -4325,7 +4229,8 @@ pub(crate) fn cascade(
         if tree == 0 {
             theme = tailwind.as_ref().map(|update| update.root.clone());
         }
-        // WARNING: author sheets establish layer order; the built-in rules still go first within those layers.
+        // WARNING: built-in sheets are collected last so author sheets set the layer order; built-in rules still go
+        // first within those layers.
         let builtin = usize::from(cfg!(target_os = "macos"));
         let sources = (builtin..sheets.len()).chain(0..builtin);
         let exact = style_cache.scopes.iter().position(|cached| {
@@ -4491,7 +4396,6 @@ pub(crate) fn cascade(
                         previous = next;
                     }
                 }
-                // WARNING: rules that join a scope in place can restyle nodes of any tree that uses it.
                 if room {
                     fast = false;
                     let start = cached.rules.len();
@@ -4569,7 +4473,6 @@ pub(crate) fn cascade(
                         });
                     }
                     if cached.keyframes != keyframes {
-                        // WARNING: cached styles hold animations built from the old keyframes.
                         let animated = |value: &CachedStyle| {
                             value.style.contains(Prop::ANIMATION)
                                 || value.style.contains(Prop::ANIMATION_NAME)
@@ -4591,7 +4494,6 @@ pub(crate) fn cascade(
                         });
                     }
                     cached.sheets = sheets.clone();
-                    // WARNING: kept rules hold the `@media` rules they were collected with, so those stay checked.
                     let mut seen = std::collections::HashSet::new();
                     cached.blocks = cached
                         .medias
@@ -4709,7 +4611,6 @@ pub(crate) fn cascade(
         .iter()
         .map(|id| indices.get(id).copied().unwrap_or_default())
         .collect();
-    // WARNING: `@property` in shadow trees is ignored, like in browsers.
     {
         let mut registry = style_cache.scopes[scopes[0]].properties.clone();
         registry.extend(
@@ -4827,9 +4728,6 @@ pub(crate) fn cascade(
     matches.set_hosts(&shadows.hosts);
     matches.update(doc, order);
     let mut candidates: Vec<usize> = Vec::new();
-    // WARNING: within a pass, the last matches that read only their node and its ancestors, by scope and the values of
-    // the node and its parent that selectors read. A sibling or cousin with the same values takes them when `share`
-    // finds the same values on its ancestors, so the cells of a long list's rows match once.
     let mut shares: FxHashMap<(usize, [u32; 7]), Share> = FxHashMap::default();
     let no_pseudos: Rc<[usize]> = Rc::new([]);
     let unshared = style_cache.unshared;
@@ -4870,10 +4768,6 @@ pub(crate) fn cascade(
             exported.remove(&$id);
         };
     }
-    // WARNING: `changed` marks nodes whose output differs from `previous` in what children read: style, custom
-    // properties, font units, containers, `::selection` and slotted rules. `DEEP` marks the composed subtree of a
-    // host whose `::part()` rules changed, since they reach any node of its shadow tree.
-    // WARNING: entries are stamped by pass in the high bits, so a pass neither clears nor copies the list.
     const CHANGED: u8 = 1;
     const DEEP: u8 = 2;
     let mut changed = std::mem::take(&mut style_cache.changed);
@@ -4887,7 +4781,6 @@ pub(crate) fn cascade(
             }
         };
     }
-    // WARNING: a fast pass starts from a pass without counters, so only the nodes it styles can bring them.
     let mut counters = false;
     let html: Vec<usize> = walk.special[0]
         .iter()
@@ -4903,7 +4796,6 @@ pub(crate) fn cascade(
             .as_ref()
             .filter(|old| !Rc::ptr_eq(&old.nodes, &walk.walk.nodes))
         {
-            // WARNING: a node with another walk parent or tree styles again, and a node that left drops its output.
             const GONE: u32 = u32::MAX - 1;
             const KEPT: u32 = u32::MAX - 2;
             let root = |tree: &[u32], trees: &[(usize, usize)], id: usize| {
@@ -4923,7 +4815,6 @@ pub(crate) fn cascade(
                     || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id)
                 {
                     matches.dirty[id] = true;
-                    // WARNING: a new shadow root brings its `:host` rules to the host.
                     if let Some(&host) = shadows.hosts.get(&id) {
                         matches.dirty[host] = true;
                     }
@@ -4950,7 +4841,6 @@ pub(crate) fn cascade(
     let last = context.and_then(|context| context.previous.as_deref());
     let address =
         |list: Option<&Option<Rc<Container>>>| list.map(|list| list.as_ref().map(Rc::as_ptr));
-    // WARNING: the `:host::part()` rules of the host being styled, which `settle!` passes to its shadow tree.
     let mut hosted: Vec<Passed> = Vec::new();
     let mut texts = FxHashMap::<_, (Rc<Style>, Vars, u8, Lengths)>::default();
     macro_rules! settle {
@@ -5006,8 +4896,8 @@ pub(crate) fn cascade(
             settle!(@changed id, $up);
         };
     }
-    // WARNING: a pass with animated values starts from the stored pass and styles the animated nodes too. It
-    // leaves the dirty marks to the next stored pass, which starts from that pass again.
+    // WARNING: a pass with animated values must leave the dirty marks, as the next stored pass starts again from the
+    // last stored one.
     let mut moving = Vec::new();
     if fast && !stored {
         moving.resize(doc.nodes.len(), false);
@@ -5061,10 +4951,6 @@ pub(crate) fn cascade(
             .filter(|_| !matches!(node.tag.as_str(), "#text" | "#comment"));
         let parent = up.map_or(FontUnits::new(16.), |up| lengths[up].font);
         let inputs = Inputs::new(parent, root);
-        // WARNING: a host takes the `:host` rules of its shadow tree, matched on the root that stands for it, and
-        // passes its `:host::part()` rules to that tree. Their `@container` conditions query the host's flat tree
-        // ancestors, and those of its pseudo-elements also the host, so these stay in `waiting` until the host's
-        // style shows whether it is a container.
         let mut waiting: Vec<(usize, usize, ContainerQuery)> = Vec::new();
         let mut shadow: Vec<ShadowRule> = Vec::new();
         hosted.clear();
@@ -5180,9 +5066,6 @@ pub(crate) fn cascade(
             }
         }
         let selection = up.and_then(|up| selections.get(&up));
-        // WARNING: `::slotted()` rules come from the slot that holds the node, and `::part()` rules from the host
-        // of the node's tree, for nodes with all of their names. Their `@container` conditions query the node's
-        // flat tree ancestors, like those of `:host` rules.
         let assigned = up
             .filter(|&up| node.parent != Some(up))
             .and_then(|up| slotted.get(&up));
@@ -5237,8 +5120,6 @@ pub(crate) fn cascade(
         }
         let shadow: Option<Rc<[ShadowRule]>> = (!shadow.is_empty()).then(|| shadow.into());
         let animated = context.and_then(|context| context.animated.get(&id));
-        // WARNING: text and comment nodes match nothing and take only what their parent passes on, so in a pass
-        // those with one scope, parent style, units and `::selection` get the same outputs.
         let text = (matches!(node.tag.as_str(), "#text" | "#comment")
             && shadow.is_none()
             && animated.is_none()
@@ -5290,8 +5171,6 @@ pub(crate) fn cascade(
             })
             .and_then(|node| node.cached.as_ref())
             .filter(|cached| {
-                // WARNING: children read only what a parent passes on, so its height or position can change
-                // without restyling the subtree.
                 let same = match (&cached.parent, parent_style) {
                     (None, None) => true,
                     (Some(old), Some(new)) => {
@@ -5338,7 +5217,6 @@ pub(crate) fn cascade(
                 {
                     (cached.rules.clone(), cached.pseudos.clone(), cached.columns)
                 } else if node.tag.starts_with('#') {
-                    // WARNING: text and comment nodes match no rules, so their matches read nothing.
                     let none = intern(&mut scoped.lists, &[]);
                     scoped.nodes[id] = Some(MatchedRules {
                         checked: std::cell::Cell::new(matches.epoch),
@@ -5386,8 +5264,6 @@ pub(crate) fn cascade(
                         }
                     }
                     let fresh = scoped.nodes[id].is_none();
-                    // WARNING: a selector whose ancestor compounds need features that no ancestor has fails without a
-                    // walk, and records the reads of a walk once per node.
                     let ancestors = matches.ancestors(doc, id);
                     let mut read = 0u16;
                     let mut test = |selector: &Selector, matches: &mut SelectorCache| {
@@ -5410,8 +5286,6 @@ pub(crate) fn cascade(
                                     selector.matches_reusing(doc, id, matches)
                                 }
                     };
-                    // WARNING: candidates come unsorted, so the matches are sorted by order and a rule that matched
-                    // with several selectors keeps the highest specificity.
                     let (mut matched, mut matched_pseudos) = (Vec::new(), Vec::new());
                     for &entry in candidates.iter() {
                         if entry >= PSEUDO {
@@ -5496,7 +5370,6 @@ pub(crate) fn cascade(
                     });
                     (shared, matched_pseudos, columns)
                 };
-                // WARNING: `::slotted()` and `::part()` rules query the containers of the nodes they reach.
                 let mut applies = |order: usize, passed: bool| {
                     if scoped.medias[order]
                         .as_ref()
@@ -5546,9 +5419,6 @@ pub(crate) fn cascade(
                         .collect(),
                     false => matched_pseudos,
                 };
-                // WARNING: only elements in an `<svg>` take presentation attributes, so other elements with
-                // such attributes, like `<font color>`, skip them.
-                // SVG graphics take `transform` as a hint and get the UA `transform-origin: 0 0`.
                 let graphic = matches!(
                     node.tag.as_str(),
                     "g" | "path"
@@ -5604,8 +5474,6 @@ pub(crate) fn cascade(
                         hints.push((Prop::TRANSFORM_ORIGIN, "0 0".into()));
                     }
                 }
-                // WARNING: the top layer gives `overlay: auto` and a backdrop, also to a box that is leaving it, so
-                // such boxes keep their own cached styles.
                 if node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0
                     && node.tag != "html"
                 {
@@ -5828,8 +5696,6 @@ pub(crate) fn cascade(
                 }
             }
         }
-        // WARNING: `:host` and `::slotted()` come from inner trees and `::part()` from outer ones. Normal
-        // declarations of the outer tree win, important ones of the inner tree.
         let ranked = |rule: &ShadowRule, important: bool| CascadeRank {
             context: if important {
                 -rule.context
@@ -5925,8 +5791,6 @@ pub(crate) fn cascade(
             .iter_mut()
             .filter(|(_, (_, value))| matches!(&**value, "revert" | "revert-layer"))
         {
-            // WARNING: `revert` rolls back to the origins below the declaration's, and `revert-layer` also
-            // to the other layers of its origin. Inline styles count as their own layer.
             let (revert, (origin, layer)) = (&**value == "revert", rank.source());
             let mut best: Option<(CascadeRank, &Rc<str>)> = None;
             for &(order, specificity) in key.rules.0.iter() {
@@ -5952,7 +5816,6 @@ pub(crate) fn cascade(
             }
             *value = best.map_or_else(|| "unset".into(), |(_, value)| value.clone());
         }
-        // WARNING: authors can't set `overlay`, only the top layer's hint and transitions do.
         if cascade
             .get(&Prop::OVERLAY)
             .is_some_and(|(rank, _)| !matches!(rank.level, HINT | ANIMATION))
@@ -5962,7 +5825,6 @@ pub(crate) fn cascade(
                 cascade.insert(Prop::OVERLAY, (CascadeRank::default(), value.clone()));
             }
         }
-        // WARNING: decorations propagate through inheritance: lines add up, keep the decorating box's color, and stop at atomic inlines, floats and out-of-flow boxes.
         const DECORATION: [Prop; 4] = [
             Prop::TEXT_DECORATION_LINE,
             Prop::TEXT_DECORATION_STYLE,
@@ -6198,7 +6060,6 @@ pub(crate) fn cascade(
             style_cache.sized.insert(container.id);
             units.container = style_cache.containers.get(&container.id).copied();
         }
-        // WARNING: container units without a container use the viewport, so a resize changes them.
         let viewport = queried && units.container.is_none()
             || [Prop::FONT_SIZE, Prop::LINE_HEIGHT]
                 .into_iter()
@@ -6316,9 +6177,6 @@ pub(crate) fn cascade(
         style.insert(Prop::FONT_SIZE, format!("{size}px"));
         let mut pseudo_cascade: [BBTreeMap<Prop, (CascadeRank, &Rc<str>)>; 17] = Default::default();
         let mut groups: [Vec<Passed>; 2] = Default::default();
-        // WARNING: pseudo-elements query their originating element first. The key holds the results of their
-        // `@container` conditions for the node's ancestors, so a container node checks them again, and then its
-        // styles are not shared.
         let own = Container::of(id, &style, seen.clone());
         let mut deferred = false;
         let mut query = |conditions: &ContainerQuery, key: (usize, usize)| {
@@ -6422,7 +6280,6 @@ pub(crate) fn cascade(
             }
             references(value, &mut reads, &mut missing);
         }
-        // WARNING: keyframes and transitions read custom properties from the styles, so animated nodes keep theirs.
         let keep = [
             Prop::ANIMATION,
             Prop::ANIMATION_NAME,
@@ -6505,7 +6362,6 @@ pub(crate) fn cascade(
                 values
             })
         };
-        // WARNING: `@starting-style` rules for `::backdrop` cascade with its other rules, for its first style.
         let layered =
             node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0 && node.tag != "html";
         if layered && !backdrop_starting.is_empty() {
@@ -6602,8 +6458,6 @@ pub(crate) fn cascade(
             if !keep {
                 values.set_vars(empty.clone());
             }
-            // WARNING: resolve_style gives an element without a color the root `canvastext`, but a
-            // `::selection` without one keeps the text color.
             if !colored {
                 values.remove(Prop::COLOR);
             }
@@ -6647,7 +6501,6 @@ pub(crate) fn cascade(
                 Rc::new([before, after].map(|cascade| derive(cascade).unwrap_or_default())),
             );
         }
-        // WARNING: only slots pass `::slotted()` rules on, so other elements keep none.
         if node.tag != "slot" {
             groups[0].clear();
         }
@@ -6664,7 +6517,6 @@ pub(crate) fn cascade(
             })
         };
         let shadowed = [store(inner, false), store(outer, true)];
-        // WARNING: an animated node keeps the animations of the stored pass that its values come from.
         let kept = previous.filter(|_| animated.is_some());
         let mut effects = match kept {
             Some(previous) => previous.animations.get(&id).cloned().unwrap_or_default(),
@@ -6695,8 +6547,8 @@ pub(crate) fn cascade(
         if !effects.is_empty() {
             animations.insert(id, effects);
         }
-        // WARNING: frame caches compare styles by pointer, so a node that gets the same values, lengths and
-        // pseudo-element styles keeps last frame's style. Rebuilt scopes then don't redo layout of the whole page.
+        // WARNING: frame caches compare styles by pointer, so reuse last frame's style when the values match, or
+        // rebuilt scopes lay out the whole page again.
         let units_bits = |units: &Lengths| {
             [units.font, units.root].map(|font| {
                 [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]
@@ -6725,7 +6577,7 @@ pub(crate) fn cascade(
             .map(|prop| (prop, var(&vars, prop).cloned()))
             .collect();
         style.set_vars(if keep { vars.clone() } else { empty.clone() });
-        style_flags[id] = flags(&style) | u8::from(agent_display) * AGENT_DISPLAY;
+        style_flags[id] = flags(&style) | (u8::from(agent_display) * AGENT_DISPLAY);
         let style = match context
             .and_then(|context| context.previous.as_deref())
             .and_then(|previous| {
@@ -6927,7 +6779,6 @@ pub(crate) fn cascade(
                 .collect();
             Some(parts.join(" "))
         };
-        // WARNING: each tree counts on its own.
         for &(root, _) in walk.trees.iter() {
             counters.clear();
             let mut pending = vec![(root, false)];
@@ -7016,9 +6867,7 @@ pub(crate) fn cascade(
             }
         }
     }
-    // Collapsed table borders (CSS 2.1 17.6.2): cells overlap by half their borders, so shared borders straddle
-    // the grid lines, and the table keeps half of the outer borders.
-    // WARNING: this changes the styles after caching, so cached styles stay unadjusted.
+    // WARNING: this adjusts styles after caching, so cached styles stay unadjusted.
     const SIDES: [[Prop; 4]; 4] = [
         [
             Prop::BORDER_TOP_STYLE,
@@ -7045,8 +6894,6 @@ pub(crate) fn cascade(
             Prop::PADDING_LEFT,
         ],
     ];
-    // WARNING: the edges of a style by its address. Nodes with one style have the same lengths within a pass, as the
-    // values key holds their font units.
     let mut edges = FxHashMap::<*const Style, (Rc<Style>, [(f32, u8); 4])>::default();
     let own_style = |styles: &Chunked<Rc<Style>>, id: usize| {
         let style = &styles[id];
@@ -7143,8 +6990,6 @@ pub(crate) fn cascade(
             (sides[side].0, sides[side].1, id, side)
         };
         let frame = [0, 1, 2, 3].map(|side| edge(&table_style, table, side));
-        // WARNING: the edges of a line's cells before it shares borders with its neighbors: their own, and those of
-        // its row and group by position.
         let mut own = |index: usize| -> Vec<[Edge; 4]> {
             let line = &lines[index];
             let group = line.group.as_ref().map(|group| group.0);
@@ -7178,8 +7023,6 @@ pub(crate) fn cascade(
                 })
                 .collect()
         };
-        // WARNING: cells share a horizontal border where their columns overlap, in column order, so a cell that spans
-        // several takes the widest of them.
         let share = |above: &mut [[Edge; 4]], a: &Line, below: &mut [[Edge; 4]], b: &Line| {
             let ends = |line: &Line| {
                 line.cells
@@ -7204,8 +7047,6 @@ pub(crate) fn cascade(
                 }
             }
         };
-        // WARNING: a line keeps its adjusted styles while it, its neighbors, the table and the viewport are the same as
-        // in the last pass, so a change of one row adjusts only it and its neighbors again.
         let mut old = style_cache.tables.remove(&table).unwrap_or_default();
         let whole = old.size != [width, height]
             || old
@@ -7278,8 +7119,6 @@ pub(crate) fn cascade(
                             }
                         }
                     }
-                    // WARNING: an adjusted style depends only on the cell's own style and, per side, the width of its
-                    // border and the style and color of a border it takes, so cells with equal keys share one.
                     let cells = lines[index]
                         .cells
                         .iter()
@@ -7387,8 +7226,6 @@ pub(crate) fn cascade(
             },
         );
     }
-    // WARNING: a table that no longer collapses its borders leaves the cells that this pass didn't style with their
-    // adjusted styles, so they take their own back.
     for (&table, old) in style_cache
         .tables
         .iter()
@@ -7406,8 +7243,6 @@ pub(crate) fn cascade(
             }
         }
     }
-    // WARNING: debug builds check each incremental pass against a full one with a fresh cache, so reused
-    // cached styles can't hide a missed input. Tailwind classes only grow, so the full pass borrows them.
     #[cfg(debug_assertions)]
     if fast {
         style_cache.incremental += 1;
@@ -7423,7 +7258,6 @@ pub(crate) fn cascade(
         };
         let full = compute_styles(doc, width, height, text_system, cache, &mut fresh, context);
         style_cache.tailwind = fresh.tailwind;
-        // WARNING: the fresh pass has other scopes, so passed rules compare by what they hold.
         let groups = |a: Option<&Shadowed>, b: Option<&Shadowed>| match (a, b) {
             (Some(a), Some(b)) => {
                 a.len() == b.len()
@@ -7669,7 +7503,6 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
                 let kind = kind.trim();
                 let value = value.trim();
                 let units = Lengths::new(16., 100., 100.);
-                // WARNING: only numbers and angles need the math parse, so keywords and functions skip it.
                 let math = || units.math(value, f32::NAN, &[]);
                 let number = |integer: bool| {
                     math().is_some_and(|(n, kind)| {
@@ -8117,7 +7950,6 @@ impl Declarations {
         let mut result = Style::new();
         for declaration in &self.0 {
             match declaration {
-                // WARNING: `@apply` only works with Tailwind, which expands it before the cascade.
                 Declaration::Apply(_) => {}
                 Declaration::Property(key, value) => {
                     let important = value.ends_with("!important");

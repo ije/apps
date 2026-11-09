@@ -26,12 +26,9 @@ pub(crate) struct Selector {
 
 const BLOOM: usize = 4;
 type Bloom = [u64; BLOOM];
-// WARNING: the features that the ancestors of a match must hold, for selectors whose compounds before the subject are
-// tags, ids, classes and attributes behind descendant and child combinators, and what matching reads: per ancestor
-// that a leading child combinator reaches, its kinds, and of all ancestors above, the kinds of the other compounds.
 pub(crate) type Ancestry = (Bloom, Box<[u16]>, u16);
 
-// WARNING: a feature sets two bits; tags and attribute names count lowercase, as selectors match them that way.
+// WARNING: node and selector sides must both lowercase tags and attribute names, or the filter rejects real matches.
 fn feature(bloom: &mut Bloom, kind: u8, value: &str) {
     let hash = rustc_hash::FxBuildHasher.hash_one((kind, value));
     for shift in [0, 32] {
@@ -61,8 +58,6 @@ enum SimpleSelector {
     NoNamespace,
 }
 
-// WARNING: page queries reject pseudo-classes and pseudo-elements outside these lists, as browsers
-// do; stylesheets keep unknown ones as selectors that never match.
 const PSEUDOS: [&str; 4] = [
     "active any-link autofill blank buffering checked closed default defined disabled empty enabled first-child first-of-type focus focus-visible focus-within fullscreen future has-slotted host hover in-range indeterminate invalid last-child last-of-type link local-link modal muted only-child only-of-type open optional out-of-range past paused picture-in-picture placeholder-shown playing popover-open read-only read-write required root scope seeking stalled target target-within user-invalid user-valid valid visited volume-locked -webkit-any-link -webkit-autofill -webkit-full-screen",
     "current dir has host host-context is lang not nth-child nth-last-child nth-last-of-type nth-of-type state where -webkit-any",
@@ -178,13 +173,6 @@ type NthPositions = Rc<(rustc_hash::FxHashMap<usize, usize>, Vec<Dependency>)>;
 
 pub(crate) type Dependency = (u32, u32);
 
-// WARNING: the `style` attribute has a kind of its own, so script that sets styles keeps the matches of the
-// subtree. Only the node's own style and `[style]` selectors depend on it.
-// WARNING: revisions come from one counter, so a freed node's snapshot can go: values that depended on it
-// never match a node that later takes its id.
-// WARNING: kind 7 is the class list, which only the node's own matches read. Kind 8 holds only the classes that
-// selectors test outside their subject compound, which other nodes' matches read, so a change of other classes,
-// like a row's `selected`, restyles that element alone and its children keep their matches.
 #[derive(Clone, Default)]
 struct Snapshot {
     values: [u32; KINDS],
@@ -192,8 +180,6 @@ struct Snapshot {
 }
 const KINDS: usize = 9;
 
-// WARNING: the attributes that selectors name, and of those the ones whose value they compare: a row's `data-line`
-// number changes nothing when selectors only test that it is present.
 #[derive(Default)]
 pub(crate) struct Named {
     names: rustc_hash::FxHashSet<String>,
@@ -214,17 +200,11 @@ pub(crate) struct SelectorCache {
     revision: u32,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<u32>)>,
-    // WARNING: `dirty` marks the nodes whose matches may have changed since a style pass last read them, and
-    // `dependents` lists, per node, the nodes whose matches read it (with stale entries, as a superset).
-    // An incremental pass styles only dirty nodes, so every recorded dependency must reach `dependents`.
+    // WARNING: an incremental pass styles only `dirty` nodes, so every recorded dependency must reach `dependents`.
     pub(crate) dirty: Vec<bool>,
-    // WARNING: `children` holds the nodes that read the children list, so a change of only the children walks just
-    // those: a list that rebuilds its rows changes its children every frame, and every row reads the list.
     dependents: Vec<(u32, Vec<u32>)>,
     children: Vec<(u32, Vec<u32>)>,
-    // WARNING: by shadow root, its host. In its own tree a root stands for its host, which only `:host` matches.
     hosts: Rc<rustc_hash::FxHashMap<usize, usize>>,
-    // WARNING: by node, the features of it and its ancestors, made once per pass where matching asks.
     blooms: Vec<(Bloom, u32)>,
     pass: u32,
     chain: Vec<usize>,
@@ -233,7 +213,6 @@ pub(crate) struct SelectorCache {
 }
 
 impl SelectorCache {
-    // WARNING: roots that join or leave the map match again, as their snapshots go.
     pub(crate) fn set_hosts(&mut self, hosts: &Rc<rustc_hash::FxHashMap<usize, usize>>) {
         if Rc::ptr_eq(&self.hosts, hosts) {
             return;
@@ -251,8 +230,7 @@ impl SelectorCache {
         self.hosts = hosts.clone();
     }
 
-    // WARNING: results are keyed by selector address, so they must go with the scopes that held the selectors.
-    // Positions of `:nth-child(An+B of S)` go as a children change of their parent, as in `update`.
+    // WARNING: results are keyed by selector address, so they must go whenever the scopes that held the selectors go.
     pub(crate) fn forget_selectors(&mut self) {
         self.values.clear();
         self.size = 0;
@@ -291,13 +269,12 @@ impl SelectorCache {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
             self.mark(id, false);
-            // WARNING: what read the node is marked, so its lists go, or a node that takes its id marks them again.
+            // WARNING: clear the lists of a forgotten node, or a node that reuses its id marks them again.
             self.dependents[id] = Default::default();
             self.children[id] = Default::default();
         }
     }
 
-    // WARNING: `id` is always marked, but with `children` only the nodes whose matches read its children are.
     pub(crate) fn mark(&mut self, id: usize, children: bool) {
         if let Some(dirty) = self.dirty.get_mut(id) {
             *dirty = true;
@@ -315,7 +292,7 @@ impl SelectorCache {
         }
     }
 
-    /// Records that `id` read the nodes in `dependencies`, which must be sorted.
+    // WARNING: `dependencies` must be sorted, as `chunk_by` groups them by node.
     pub(crate) fn register(&mut self, id: usize) {
         for group in self
             .dependencies
@@ -334,8 +311,8 @@ impl SelectorCache {
             if list.last() != Some(&entry) {
                 list.push(entry);
                 if list.len() >= 16.max(*compacted as usize * 2) {
-                    // WARNING: forgotten nodes go too, so a long-lived parent doesn't list every row it ever had.
-                    // WARNING: rows register again in every pass that matches them, so repeats go by a stamp, not a sort.
+                    // WARNING: compaction must also drop forgotten nodes, or a long-lived parent lists every row it
+                    // ever had.
                     self.stamp = self.stamp.wrapping_add(1);
                     if self.stamp == 0 {
                         self.stamps.fill(0);
@@ -408,8 +385,7 @@ impl SelectorCache {
             let attributes = node
                 .attrs
                 .iter()
-                // WARNING: only selectors read these, as pseudo-classes read none of them, so a list that recycles
-                // its rows keeps the matches of rows that changed only their labels.
+                // WARNING: these attributes count only when selectors name them, so no pseudo-class may read them.
                 .filter_map(|(key, value)| {
                     let selected = key.starts_with("data-")
                         || key.starts_with("aria-")
@@ -417,7 +393,13 @@ impl SelectorCache {
                     (key.as_str() != "style"
                         && (key.as_str() != "class" || self.attributes.names.contains("class"))
                         && (!selected || self.attributes.names.contains(key.as_str())))
-                        .then(|| (key, (!selected || self.attributes.valued.contains(key.as_str())).then_some(value)))
+                    .then(|| {
+                        (
+                            key,
+                            (!selected || self.attributes.valued.contains(key.as_str()))
+                                .then_some(value),
+                        )
+                    })
                 })
                 .fold(rustc_hash::FxHasher::default(), |mut state, pair| {
                     pair.hash(&mut state);
@@ -435,17 +417,20 @@ impl SelectorCache {
                 tag as u32,
                 u32::from(node.state),
                 hash.hash_one((node.attrs.get("style"), &node.inline)) as u32,
-                node.attrs.get("class").map_or(0, |classes| hash.hash_one(classes) as u32),
+                node.attrs
+                    .get("class")
+                    .map_or(0, |classes| hash.hash_one(classes) as u32),
                 match node.attrs.get("class") {
                     Some(classes) if !self.attributes.classes.is_empty() => classes
                         .split_ascii_whitespace()
                         .map(|class| hash.hash_one(class) as u32)
                         .filter(|class| self.attributes.classes.contains(class))
-                        .fold(0u32, |sum, class| sum.wrapping_add(class.wrapping_mul(0x9e37_79b9) | 1)),
+                        .fold(0u32, |sum, class| {
+                            sum.wrapping_add(class.wrapping_mul(0x9e37_79b9) | 1)
+                        }),
                     _ => 0,
                 },
             ];
-            // WARNING: the attribute and class hashes read only names that selectors use, so a new stylesheet changes them.
             debug_assert!(
                 fresh || new[1..8] == values[1..8],
                 "node {id} changed without a new revision"
@@ -472,7 +457,6 @@ impl SelectorCache {
                 }
             }
         }
-        // WARNING: sibling selectors depend only on the parent's children, so a tag change counts as one.
         for parent in retagged {
             if let Some(slot) = self.nodes.get_mut(parent) {
                 self.revision = self.revision.wrapping_add(1);
@@ -480,9 +464,7 @@ impl SelectorCache {
                 changes.push((parent * KINDS + 2) as u32);
             }
         }
-        // WARNING: `:nth-child(An+B of S)` results depend only on their parent's children, so a change to anything
-        // that S read on the siblings drops the cached positions and counts as a children change. Never drop
-        // positions without that change.
+        // WARNING: dropping cached `:nth-child(An+B of S)` positions must count as a children change of their parent.
         let mut checked = 0;
         while checked < changes.len() && !self.nth.is_empty() {
             let mut fresh = changes[checked..].to_vec();
@@ -554,9 +536,6 @@ impl SelectorCache {
         bloom
     }
 
-    // WARNING: a selector that the ancestors' features reject reads what matching it would at most: the parent link of
-    // `id`, the kinds of the ancestors that leading child combinators reach, and `rest` of each ancestor above them.
-    // `rest` holds only the kinds that no rejection read yet for this node.
     pub(crate) fn reject(
         &mut self,
         doc: &Document,
@@ -600,8 +579,6 @@ impl SelectorCache {
         self.dependencies.iter().any(|&(read, _)| read == key)
     }
 
-    // WARNING: the matches just made for `id` hold for a sibling with the same values only when they read nothing but
-    // `id` and its flat tree ancestors, and no children list of `id` or its parent, which positions and siblings read.
     pub(crate) fn shareable(&self, doc: &Document, id: usize) -> bool {
         let parent = doc.nodes[id].parent;
         let mut chain = [0usize; 64];
@@ -613,7 +590,9 @@ impl SelectorCache {
             }
             chain[length] = node;
             length += 1;
-            up = doc.nodes[node].parent.or_else(|| self.hosts.get(&node).copied());
+            up = doc.nodes[node]
+                .parent
+                .or_else(|| self.hosts.get(&node).copied());
         }
         self.dependencies.iter().all(|&(read, _)| {
             let (node, kind) = (read as usize / KINDS, read as usize % KINDS);
@@ -625,11 +604,6 @@ impl SelectorCache {
         })
     }
 
-    // WARNING: shareable matches of `from` hold for `to`, a sibling or a cousin, when both chains of flat tree ancestors
-    // meet at the same height and each read below that node has the same value at the same height above `to`. Parent
-    // links there only repeat the shape, and children lists there always differ. The children list of the node where
-    // they meet gives positions, which differ. The caller compares the `style` attribute of `from` only when its
-    // selectors read it. On success `dependencies` holds the reads as reads of `to`'s nodes at their revisions.
     pub(crate) fn share(
         &mut self,
         doc: &Document,
@@ -933,7 +907,6 @@ impl Selector {
             ))
         })?;
         let mut selector = self.clone();
-        // WARNING: a `::backdrop` rule in `@starting-style` is kind 16.
         if kind == 15
             && matches!(&self.simple[index + 1..], [SimpleSelector::Element(name, _)]
                 if name == "starting-style")
@@ -941,7 +914,6 @@ impl Selector {
             selector.simple.truncate(index);
             return Some((16, selector));
         }
-        // WARNING: `shadow_target()` reads what follows `::slotted()` and `::part()`.
         if matches!(kind, 12 | 13) {
             selector.simple.truncate(index);
             return Some((kind, selector));
@@ -950,7 +922,6 @@ impl Selector {
             selector.simple.remove(index);
             return Some((kind, selector));
         }
-        // WARNING: scrollbar parts keep only `:hover` on the thumb (kind 11); rules with other scrollbar states never match.
         let kind = match (kind, &self.simple[index + 1..]) {
             (11, []) => 8,
             (_, []) => kind,
@@ -961,10 +932,6 @@ impl Selector {
         Some((kind, selector))
     }
 
-    // WARNING: for `::slotted()` and `::part()`, the pseudo-element they style (`usize::MAX` for the element, 14 and 16
-    // in `@starting-style`) and the pseudo-classes that a part must match. As in Chrome, `::slotted()` takes `::before`,
-    // `::after`, `::marker`, `::placeholder` and `::backdrop`, and `::part()` also the other pseudo-elements and
-    // non-structural pseudo-classes.
     pub(crate) fn shadow_target(&self) -> Option<(usize, Self)> {
         let index = self
             .simple
@@ -1015,8 +982,8 @@ impl Selector {
         })
     }
 
-    // WARNING: matching an ancestor compound reads its classes alone (8) when it tests nothing else, its tag and
-    // attributes (0) otherwise, and the `style` attribute (6), as `matches_with` records.
+    // WARNING: the kinds read here must match what `matches_with` records for an ancestor compound: classes alone (8),
+    // else tag and attributes (0), plus `style` (6).
     pub(crate) fn ancestry(&self) -> Option<&Ancestry> {
         self.ancestry
             .get_or_init(|| {
@@ -1074,7 +1041,8 @@ impl Selector {
             .filter_map(|selector| match selector {
                 SimpleSelector::Id(id) => Some((0, id.as_str())),
                 SimpleSelector::Class(class) => Some((1, class.as_str())),
-                // WARNING: keys match node tags and attribute names exactly, so mixed-case names, which also match lowercase HTML ones, have none.
+                // WARNING: keys compare exactly, so mixed-case names, which also match lowercase HTML names, must get
+                // no key.
                 SimpleSelector::Tag(name) if !name.bytes().any(|c| c.is_ascii_uppercase()) => {
                     Some((2, name.as_str()))
                 }
@@ -1188,7 +1156,6 @@ impl Selector {
             .ok_or_else(|| anyhow::anyhow!("SyntaxError: '{source}' is not a valid selector"))
     }
 
-    // WARNING: lists past the nesting and length limits give no selectors instead of `None`.
     fn list(
         source: &str,
         parent: Option<&SelectorList>,
@@ -1467,15 +1434,16 @@ impl Selector {
         self.matches_cached(doc, id, None, memo)
     }
 
-    // WARNING: for elements with no matched rules yet, so no memo entry of their own: the entry would only serve a
-    // later pass in which none of the node's own values changed, and pages that build rows each frame never have one.
-    // Steps up the tree still use and fill the memo, which siblings share.
-    pub(crate) fn matches_fresh(&self, doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
+    pub(crate) fn matches_fresh(
+        &self,
+        doc: &Document,
+        id: usize,
+        memo: &mut SelectorCache,
+    ) -> bool {
         self.matches_with(doc, id, None, memo, false, true)
     }
 
-    // WARNING: like `matches_cached` on an element: only `*` and no combinator matches every element, so callers
-    // skip matching. A shadow root is featureless, so it must not take this.
+    // WARNING: a shadow root is featureless, so callers must not skip matching for it with this.
     pub(crate) fn always(&self) -> bool {
         self.previous.is_none()
             && self
@@ -1484,7 +1452,6 @@ impl Selector {
                 .all(|simple| matches!(simple, SimpleSelector::Universal))
     }
 
-    // WARNING: `:host` matches only the shadow root that stands for its host, never an element.
     pub(crate) fn host_only(&self) -> bool {
         self.previous.is_none()
             && self
@@ -1503,7 +1470,6 @@ impl Selector {
         self.matches_with(doc, id, scope, memo, true, true)
     }
 
-    // Matches a compound that is not the subject of the selector that the caller matches.
     fn matches_nested(
         &self,
         doc: &Document,
@@ -1539,14 +1505,14 @@ impl Selector {
             return *result;
         }
         let start = memo.dependencies.len();
-        // WARNING: a compound of only classes reads no other attributes, so `.dark .row` reads the classes of the
-        // ancestors it walks and nothing else of them.
-        let classes = self.simple.iter().any(|simple| matches!(simple, SimpleSelector::Class(_)));
+        let classes = self
+            .simple
+            .iter()
+            .any(|simple| matches!(simple, SimpleSelector::Class(_)));
         if !classes
-            || self
-                .simple
-                .iter()
-                .any(|simple| !matches!(simple, SimpleSelector::Class(_) | SimpleSelector::Universal))
+            || self.simple.iter().any(|simple| {
+                !matches!(simple, SimpleSelector::Class(_) | SimpleSelector::Universal)
+            })
         {
             memo.depend(id, 0);
         }
@@ -1566,8 +1532,6 @@ impl Selector {
                 .then(|| memo.hosts.get(&id).copied())
                 .flatten();
             if let Some(host) = host {
-                // WARNING: the host is featureless in its shadow tree: only `:host`, and lists that hold it,
-                // match the root.
                 let mut hosted = false;
                 for simple in &self.simple {
                     let matched = match simple {
@@ -1600,7 +1564,6 @@ impl Selector {
                 }
             } else if node.tag.starts_with('#')
                 || !self.simple.iter().all(|s| match s {
-                    // WARNING: HTML tags and attribute names are lowercase in the tree and match selectors ASCII case-insensitively; SVG ones keep their case and match as written.
                     SimpleSelector::Tag(tag) => {
                         node.tag == *tag
                             || node.tag.eq_ignore_ascii_case(tag)
@@ -1660,7 +1623,6 @@ impl Selector {
                             }
                         }),
                     SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
-                        // WARNING: a document scope matches its root element, as in browsers.
                         "scope" => scope.map_or(node.tag == "html", |scope| {
                             scope == id
                                 || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
@@ -1778,7 +1740,6 @@ impl Selector {
                                 "option" if node.state & super::DIRTY != 0 || node.checked() => {
                                     node.checked()
                                 }
-                                // WARNING: until a script syncs the selection, a single select without a selected option shows its first enabled one.
                                 "option" => {
                                     let mut select = node.parent.unwrap_or_default();
                                     memo.depend(select, 1);
@@ -1827,7 +1788,6 @@ impl Selector {
                                 }
                                 != 0
                         }
-                        // WARNING: for the UA sheet: a modal dialog keeps its place until it leaves the top layer.
                         "-internal-dialog-in-top-layer" => {
                             memo.depend(id, 5);
                             node.tag == "dialog"
@@ -2014,8 +1974,6 @@ impl Selector {
                                     {
                                         return false;
                                     }
-                                    // WARNING: siblings match S once per parent, and the result depends on the
-                                    // parent's children only; `update` turns changes of the positions into those.
                                     let key = (parsed.as_ptr() as usize, parent, scope);
                                     let positions = match memo.nth.get(&key) {
                                         Some(positions) => positions.clone(),
@@ -2108,8 +2066,8 @@ impl Selector {
                     let start = memo.dependencies.len();
                     let mut matched = false;
                     while let Some(id) = ancestor {
-                        // WARNING: an ancestor's entry holds what was read from it upward, not what the nodes below it
-                        // read, or siblings that reach it through the memo take reads of each other's branches.
+                        // WARNING: an ancestor's memo entry must hold only what was read from it upward, or siblings
+                        // that reach it take reads of each other's branches.
                         let from = memo.dependencies.len();
                         memo.depend(id, 1);
                         let key = (&**previous as *const Self as usize, id, scope, true);

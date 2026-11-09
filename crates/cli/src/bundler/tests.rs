@@ -2168,7 +2168,6 @@ fn node_builtin_exports_match_runtime_objects() {
     for (index, name) in modules.iter().enumerate() {
         source += &format!("import * as m{index} from '{name}';");
     }
-    // WARNING: both directions: every listed export exists at runtime, and every runtime name can be imported by name.
     source += "const require=__apps.module.createRequire(),problems=[];";
     for (index, name) in modules.iter().enumerate() {
         source += &format!(
@@ -3236,12 +3235,10 @@ fn watch_cache_reuses_modules_with_stable_ids() {
 fn production_slots_keep_module_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, source: &str| fs::write(dir.path().join(name), source).unwrap();
-    // A binding that a function writes after the body ended must stay live for importers.
     write(
         "live.js",
         "export let count = 0; export function bump() { count++; } export let set = 1; set = 2; export var state; (function (s) { state = s; })('ready');",
     );
-    // Reads follow a chain of barrels to the origin, and each barrel still runs its own side effects.
     write(
         "origin.js",
         "export const value = 'VALUE'; export default 'DEFAULT'; export function self() { return this === undefined; }",
@@ -3254,12 +3251,10 @@ fn production_slots_keep_module_semantics() {
         "stars.js",
         "globalThis.order.push('stars'); export const starred = 'STARRED';",
     );
-    // A namespace used as a value is a real object with live getters.
     write(
         "spread.js",
         "export const a = 1; export let b = 2; export function setB() { b = 3; }",
     );
-    // Modules in a cycle read each other's hoisted functions before their bodies end.
     write(
         "cycle-a.js",
         "import { fromB } from './cycle-b.js'; export function fromA() { return 'A'; } export const seen = fromB();",
@@ -3268,7 +3263,6 @@ fn production_slots_keep_module_semantics() {
         "cycle-b.js",
         "import { fromA } from './cycle-a.js'; export function fromB() { return fromA() + 'B'; }",
     );
-    // CommonJS interop in both directions.
     fs::create_dir_all(dir.path().join("node_modules/dep")).unwrap();
     write(
         "node_modules/dep/package.json",
@@ -3282,7 +3276,6 @@ fn production_slots_keep_module_semantics() {
         "node_modules/dep/required.mjs",
         "export const viaEsm = 'VIA_ESM';",
     );
-    // Dynamic import gets a namespace too.
     write(
         "later.js",
         "export const later = 'LATER'; export default 'LATER_DEFAULT';",

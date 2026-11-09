@@ -1846,10 +1846,16 @@ fn sf_symbols_parse_and_serialize_as_void_elements() {
         check('invalid suffix stays ordinary', () => invalid.outerHTML === '<sf-symbol-folder--fill></sf-symbol-folder--fill>');
         "#,
     );
-    let source = engine.eval("document.getElementById('symbols').outerHTML", "test").unwrap();
+    let source = engine
+        .eval("document.getElementById('symbols').outerHTML", "test")
+        .unwrap();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
-    let id = doc.nodes.iter().position(|node| node.attrs.get("id").is_some_and(|id| id == "symbols")).unwrap();
+    let id = doc
+        .nodes
+        .iter()
+        .position(|node| node.attrs.get("id").is_some_and(|id| id == "symbols"))
+        .unwrap();
     assert_eq!(doc.serialize(id), source);
 }
 

@@ -49,7 +49,6 @@ struct Subscriber {
 static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
     std::sync::LazyLock::new(Default::default);
 
-// WARNING: messages are `[json, ...bytes]` from `worker.js`, so their JSON is parsed once, by the receiving engine.
 struct Worker {
     input: mpsc::Sender<Payload>,
     events: mpsc::Receiver<Payload>,
@@ -249,11 +248,8 @@ impl State {
                         while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
-                            // WARNING: a native worker ends when only unreferenced timers are left, like in Node, so it checks before each wait.
                             if native && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
                             crate::host::idle(true);
-                            // WARNING: JSC's GC timers never fire on the generic event loop, so after real JS work the worker's VM
-                            // is collected once, when it has been quiet for a second, like the main thread's.
                             let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
                             let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };
                             if api.shrink_due() {

@@ -480,17 +480,15 @@ fn builtin_glass_survives_cssom_edits_and_serialization() {
     let bytes = postcard::to_allocvec(&sheet).unwrap();
     let mut sheet: Stylesheet = postcard::from_bytes(&bytes).unwrap();
     sheet.bind_parents().unwrap();
-    let mut doc = Document::parse("<style></style><div class='bg-glass bg-glass-interactive'></div>");
+    let mut doc =
+        Document::parse("<style></style><div class='bg-glass bg-glass-interactive'></div>");
     let style = element(&doc, "style");
     let glass = element(&doc, "div");
     doc.nodes[style].stylesheet = Some(Rc::new(sheet.clone()));
     let mut sheets = HashMap::new();
     let mut cache = StyleCache::default();
     let before = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(
-        before.values[glass].get(Prop::MACOS_GLASS),
-        Some("clear")
-    );
+    assert_eq!(before.values[glass].get(Prop::MACOS_GLASS), Some("clear"));
     assert_eq!(
         before.values[glass].get(Prop::MACOS_GLASS_INTERACTIVE),
         Some("false")
@@ -556,7 +554,10 @@ fn container_queries_parse_and_follow_container_sizes() {
         compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None).values
     };
     assert!(compute(&mut cache)[outer].get(Prop::COLOR) != Some("red"));
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 100.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 100.])]),
+        &doc
+    ));
     let values = compute(&mut cache);
     assert_eq!(&values[outer]["color"], "red");
     assert_eq!(&values[outer]["order"], "5");
@@ -564,8 +565,14 @@ fn container_queries_parse_and_follow_container_sizes() {
     assert_eq!(&values[inner]["color"], "red");
     assert_eq!(&values[inner]["width"], "1px");
     assert!(!values[inner].contains(Prop::ORDER) && !values[inner].contains(Prop::HEIGHT));
-    assert!(!cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [450., 50.]), (b, [200., 100.])]), &doc));
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [90., 50.]), (b, [200., 100.])]), &doc));
+    assert!(!cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [450., 50.]), (b, [200., 100.])]),
+        &doc
+    ));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [90., 50.]), (b, [200., 100.])]),
+        &doc
+    ));
     let values = compute(&mut cache);
     assert!(values[outer].get(Prop::COLOR) != Some("red"));
     assert_eq!(&values[outer]["z-index"], "3");
@@ -2700,7 +2707,10 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed
     };
     compute(&mut cache);
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(container, [500., 100.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(container, [500., 100.])]),
+        &doc
+    ));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2714,7 +2724,10 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed.values[element(&doc, "#v")].get(Prop::FONT_SIZE),
         Some("8px")
     );
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(container, [300., 100.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(container, [300., 100.])]),
+        &doc
+    ));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2970,8 +2983,6 @@ fn syntax_checks_never_split_multibyte_text() {
     assert!(!supports_condition("(width: aaéé)"));
 }
 
-// Turns `#root` into the shadow root of `#host`, and `#root2`, if there is one, into that of `#inner`, and gives the
-// host's children to the first slot.
 fn attach(doc: &mut Document) -> Rc<Shadows> {
     let mut pairs = Vec::new();
     for (host, root) in [("#host", "#root"), ("#inner", "#root2")] {
@@ -3108,12 +3119,18 @@ fn container_units_follow_each_container_and_the_viewport() {
         computed
     };
     compute(&mut cache, 800.);
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 50.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 50.])]),
+        &doc
+    ));
     let computed = compute(&mut cache, 800.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "8px");
     assert_eq!(&computed.values[v]["font-size"], "40px");
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]),
+        &doc
+    ));
     let computed = compute(&mut cache, 400.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "12px");
@@ -3135,14 +3152,23 @@ fn a_container_query_flip_restyles_only_inside_its_container() {
         computed
     };
     compute(&mut cache);
-    cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [300., 50.]), (b, [300., 50.])]), &doc);
+    cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [300., 50.]), (b, [300., 50.])]),
+        &doc,
+    );
     let before = compute(&mut cache);
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]),
+        &doc
+    ));
     let after = compute(&mut cache);
     assert_eq!(after.values[p].get(Prop::COLOR), Some("red"));
     assert_ne!(after.values[q].get(Prop::COLOR), Some("red"));
     assert!(Rc::ptr_eq(&before.values[q], &after.values[q]));
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [500., 50.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [500., 50.])]),
+        &doc
+    ));
     assert_eq!(compute(&mut cache).values[q].get(Prop::COLOR), Some("red"));
 }
 
@@ -3453,7 +3479,8 @@ fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
     );
     let [d, p, x] = ["#d", "#p", "#x"].map(|selector| element(&doc, selector));
     let (mut sheets, mut cache) = (HashMap::new(), StyleCache::default());
-    let mut styles = |doc: &Document| compute_styles(doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let mut styles =
+        |doc: &Document| compute_styles(doc, 800., 600., None, &mut sheets, &mut cache, None);
     let closed = styles(&doc);
     assert_eq!(
         [d, p, x].map(|id| closed.values[id].get(Prop::OVERLAY)),
@@ -3478,7 +3505,10 @@ fn leaving_top_layer_boxes_keep_their_place_and_backdrop() {
         [Some("none"); 2]
     );
     assert_eq!(
-        [&leaving.values[d]["position"], &leaving.values[d]["display"]],
+        [
+            &leaving.values[d]["position"],
+            &leaving.values[d]["display"]
+        ],
         ["fixed", "none"]
     );
     assert!(leaving.backdrops.contains_key(&d) && leaving.backdrops.contains_key(&p));
@@ -3701,7 +3731,10 @@ fn new_containers_restyle_the_descendants_that_query_them() {
     assert_ne!(color(&out).as_deref(), Some("red"));
     doc.nodes[wrap].attrs.set("class", "wrap on");
     incremental(&doc, &mut cache, &mut last, [800., 600.]);
-    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(wrap, [200., 50.])]), &doc));
+    assert!(cache.set_containers(
+        &rustc_hash::FxHashMap::from_iter([(wrap, [200., 50.])]),
+        &doc
+    ));
     let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
     assert_eq!(color(&out).as_deref(), Some("red"));
     assert!(!out.values[item].contains(Prop::WIDTH));
@@ -4324,7 +4357,6 @@ fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
 
 #[test]
 fn siblings_share_matches_only_when_they_read_no_position_or_neighbor() {
-    // WARNING: the siblings have no attributes of their own, so they are candidates to share matches.
     let doc = Document::parse(
         "<html><head><style>li:first-child{order:1}li+li{z-index:2}li:nth-child(3){opacity:.5}b:empty{width:1px}p:has(i){height:2px}[style*=red]{left:3px}.row span{top:4px}.row span+span{right:5px}[data-n]{bottom:6px}[data-n='2']{max-width:7px}</style></head><body><div id=n><i data-n=1></i><i data-n=2></i><i data-n=2></i></div><ul id=l><li></li><li></li><li></li></ul><div id=e><b></b><b>x</b></div><div id=p><p><i></i></p><p></p></div><div id=s><s style='color:red'></s><s style='color:blue'></s></div><div id=r class=row><span></span><span></span></div></body></html>",
     );
@@ -4360,7 +4392,11 @@ fn siblings_share_matches_only_when_they_read_no_position_or_neighbor() {
         ("#n", 1, "max-width", Some("7px")),
         ("#n", 2, "max-width", Some("7px")),
     ] {
-        assert_eq!(get(parent, index, name).as_deref(), value, "{parent} {index} {name}");
+        assert_eq!(
+            get(parent, index, name).as_deref(),
+            value,
+            "{parent} {index} {name}"
+        );
     }
 }
 

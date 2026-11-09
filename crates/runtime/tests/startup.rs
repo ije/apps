@@ -54,7 +54,6 @@ fn runs_runtime_scripts_and_app_code_from_bundled_bytecode() {
         });
         format!("$appsDefine({definition});")
     };
-    // Page chunks hold the module loader like bundled ones, which reads `this` of page scripts.
     let chunk = |code: &str| {
         apps_runtime::bundle::script_source(
             &bbtree::unsync::BBTreeMap::from([("app.js".into(), define(code))]),

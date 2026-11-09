@@ -745,7 +745,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 monochrome_sprite_fragment(MonochromeSpriteVertexOutput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    // WARNING: alpha clip after using the derivatives.
+    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
     if (any(input.clip_distance < 0.0)) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }

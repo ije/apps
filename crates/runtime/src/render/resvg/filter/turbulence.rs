@@ -6,10 +6,10 @@
 use super::{ImageRefMut, f32_bound};
 use usvg::ApproxZeroUlps;
 
-const RAND_M: i32 = 2147483647; // 2**31 - 1
-const RAND_A: i32 = 16807; // 7**5; primitive root of m
-const RAND_Q: i32 = 127773; // m / a
-const RAND_R: i32 = 2836; // m % a
+const RAND_M: i32 = 2147483647;
+const RAND_A: i32 = 16807;
+const RAND_Q: i32 = 127773;
+const RAND_R: i32 = 2836;
 const B_SIZE: usize = 0x100;
 const B_SIZE_32: i32 = 0x100;
 const B_LEN: usize = B_SIZE + B_SIZE + 2;
@@ -18,18 +18,12 @@ const PERLIN_N: i32 = 0x1000;
 
 #[derive(Clone, Copy)]
 struct StitchInfo {
-    width: i32, // How much to subtract to wrap for stitching.
+    width: i32,
     height: i32,
-    wrap_x: i32, // Minimum value to wrap.
+    wrap_x: i32,
     wrap_y: i32,
 }
 
-/// Applies a turbulence filter.
-///
-/// `dest` image pixels will have an **unpremultiplied alpha**.
-///
-/// - `offset_x` and `offset_y` indicate filter region offset.
-/// - `sx` and `sy` indicate canvas scale.
 pub fn apply(
     offset_x: f64,
     offset_y: f64,
@@ -155,10 +149,7 @@ fn turbulence(
     lattice_selector: &[usize],
     gradient: &[Vec<Vec<f64>>],
 ) -> f64 {
-    // Adjust the base frequencies if necessary for stitching.
     let mut stitch = if do_stitching {
-        // When stitching tiled turbulence, the frequencies must be adjusted
-        // so that the tile borders will be continuous.
         if !base_freq_x.approx_zero_ulps(4) {
             let lo_freq = (tile_width * base_freq_x).floor() / tile_width;
             let hi_freq = (tile_width * base_freq_x).ceil() / tile_width;
@@ -179,7 +170,6 @@ fn turbulence(
             }
         }
 
-        // Set up initial stitch values.
         let width = (tile_width * base_freq_x + 0.5) as i32;
         let height = (tile_height * base_freq_y + 0.5) as i32;
         let wrap_x = (tile_x * base_freq_x + PERLIN_N as f64 + width as f64) as i32;
@@ -209,8 +199,6 @@ fn turbulence(
         ratio *= 2.0;
 
         if let Some(ref mut stitch) = stitch {
-            // Update stitch values. Subtracting PerlinN before the multiplication and
-            // adding it afterward simplifies to subtracting it once.
             stitch.width *= 2;
             stitch.wrap_x = 2 * stitch.wrap_x - PERLIN_N;
             stitch.height *= 2;
@@ -240,7 +228,6 @@ fn noise2(
     let ry0 = t - t as i64 as f64;
     let ry1 = ry0 - 1.0;
 
-    // If stitching, adjust lattice points accordingly.
     if let Some(info) = stitch_info {
         if bx0 >= info.wrap_x {
             bx0 -= info.width;

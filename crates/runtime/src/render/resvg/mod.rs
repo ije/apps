@@ -19,12 +19,6 @@ mod mask;
 mod path;
 mod render;
 
-/// Renders a tree onto the pixmap.
-///
-/// `transform` will be used as a root transform.
-/// Can be used to position SVG inside the `pixmap`.
-///
-/// The produced content is in the sRGB color space.
 pub fn render(
     tree: &usvg::Tree,
     transform: tiny_skia::Transform,

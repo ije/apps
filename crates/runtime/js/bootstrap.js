@@ -28,12 +28,13 @@
   const nested = (value, depth) => {
     if (value === null || typeof value !== 'object') return false;
     if (depth > 32 || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
-    // WARNING: `for in` makes a string key per array index, which cost 14x more on a WebGPU frame's command list.
+    // WARNING: `for in` makes a string key per array index, which is many times slower on long arrays like a WebGPU
+    // command list.
     if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (nested(value[i], depth + 1)) return true; return false; }
     for (const key in value) if (nested(value[key], depth + 1)) return true;
     return false;
   };
-  // WARNING: primitives and top-level bytes go to Rust as JS values. Other arguments go as JSON, and a JSON.stringify replacer is slow in JSC, so only arguments that hold bytes use it.
+  // WARNING: a JSON.stringify replacer is slow in JSC, so only arguments that hold bytes go through `pack`.
   const call = (op, ...args) => {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
@@ -45,7 +46,6 @@
     return native(op, ...args);
   };
   Object.defineProperty(globalThis, '__appsBridgeReceiveBytes', { value: value => pack(__appsBridgeReceive(unpack(value))) });
-  // WARNING: a message from the other side of the app arrives in its own task, so its listeners run now.
   Object.defineProperty(globalThis, '__appsBridgeDeliver', { value: value => { __appsBridgeReceive(unpack(value)); __appsBridgeDrain(); } });
   const finalizers = new Set();
   let collected = new WeakRef({});
@@ -94,8 +94,8 @@
       write('log', [line('┌', '┬', '┐'), cells(header), line('├', '┼', '┤'), ...rows.map(row => cells(header.map(name => row[name] ?? ''))), line('└', '┴', '┘')].join('\n'));
     },
   });
-  // WARNING: `heap` orders timers by (at, id). A timer object never changes its `at`: a refresh or an interval run schedules a
-  // new object, and a heap entry is live only while `timers` maps its id to it. Timers use the monotonic `clock`, because the wall clock can jump.
+  // WARNING: a timer never changes its `at`: refresh and intervals schedule a new object, and a heap entry is live only
+  // while `timers` maps its id to it. Use the monotonic `clock`.
   const timers = new Map(), heap = [];
   let timerID = 0, refs = 0, nesting = 0, limit = 0;
   const before = (a, b) => a.at < b.at || (a.at === b.at && a.id < b.id);
@@ -112,7 +112,6 @@
     }
     return top;
   };
-  // WARNING: cleared timers stay in the heap until they reach the top, so it is rebuilt once they are most of it.
   const compact = () => { if (heap.length > 64 && heap.length > 2 * timers.size) { heap.length = 0; for (const timer of [...timers.values()].sort((a, b) => a.at - b.at || a.id - b.id)) heap.push(timer); } };
   const schedule = timer => {
     timers.set(timer.id, timer);
@@ -139,7 +138,6 @@
     const id = ++timerID;
     delay = Number(delay);
     delay = delay >= 0 && delay <= 2147483647 ? delay : delay > 0 ? 1 : 0;
-    // WARNING: like browsers, pages clamp timers nested more than 5 levels deep to 4 ms.
     if (nodeRole && delay < 1) delay = 1;
     else if (!nodeRole && nesting > 5 && delay < 4) delay = 4;
     refs++;
@@ -150,15 +148,12 @@
   globalThis.clearTimeout = id => remove(+id);
   globalThis.setInterval = (fn, delay = 0, ...args) => start(fn, delay, args, true);
   globalThis.clearInterval = clearTimeout;
-  // WARNING: internal tasks (IndexedDB events) are not timers, so they skip the timer clamps and reset the nesting level.
   const task = fn => { refs++; schedule({ id: ++timerID, fn, args: [], delay: 0, at: clock(), ref: true, level: 0, interval: 0 }); };
   const resolved = Promise.resolve();
-  // WARNING: errors that `fail` throws in main are thrown by the next tick, like a failed timer.
   globalThis.queueMicrotask = fn => {
     if (typeof fn !== 'function') throw new TypeError('The "callback" argument must be of type function');
     resolved.then(() => { try { fn(); } catch (error) { try { fail(error); } catch (error) { moduleErrors.push(error); } } });
   };
-  // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs, and the microtasks drain after them.
   const ticks = [], immediates = new Map();
   let phase = 0, now = 0, checks = [], checked = 0;
   const fail = error => { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } };
@@ -168,7 +163,6 @@
   };
   const pollWeb = globalThis.__appsWeb(call, codec);
   delete globalThis.__appsWeb;
-  // WARNING: runtime import() loads data: and blob: modules only with jsExecute, and http(s) modules only with httpImport.
   const download = globalThis.fetch;
   globalThis.__appsModuleLoader = (url, resolve, reject) => {
     const name = /^(?:data|blob):/.test(url) ? 'jsExecute' : /^https?:/.test(url) ? 'httpImport' : '';
@@ -193,14 +187,14 @@
   delete globalThis.__appsBridge;
   __appsSyncBridge();
   globalThis.__appsPending = () => modulesPending > 0 || moduleErrors.length > 0 || (children?.pending() ?? false) || (node?.poll.pending() ?? false) || (pty?.poll.pending() ?? false) || bridge.poll.pending() || workers.pending() || (net?.pending() ?? false);
-  // WARNING: one step runs one macrotask: pending ticks, one due timer, the I/O polls or one immediate (timers, poll and check phases, like Node).
   const step = () => {
     if (moduleErrors.length) throw moduleErrors.shift();
     if (ticks.length) { runTicks(); return -2; }
     if (phase === 0) {
       phase = 1; now = clock(); limit = timerID;
     }
-    // WARNING: timers that start in this phase have larger ids and are never earlier than `now`, so they wait for the next phase.
+    // WARNING: timers started in this phase have ids above `limit` and wait for the next phase, or a timer that starts
+    // a 0 ms timer would never end the phase.
     if (phase === 1 && earliest() <= now && heap[0].id <= limit) {
       const timer = pop();
       nesting = timer.level;
@@ -246,14 +240,12 @@
     phase = 0;
     return __appsDelay();
   };
-  // WARNING: like Bun's loop, one call runs a whole loop turn and drains the microtasks after each task, so tasks cost no engine round trip. It
-  // returns -2 once 1 s has passed, checked every 8 tasks because a clock read costs as much as a task, since the page watchdog stops one run of
-  // 10 s, and after each task without `codec.drain` (an older JavaScriptCore). The engine then drains the microtasks and calls again.
+  // WARNING: return -2 within about 1 s, or the 10 s page watchdog stops a long run of short tasks. Read the clock only
+  // every 8 tasks, since a read costs about one task.
   globalThis.__appsTick = () => { const start = clock(); for (let tasks = 1; ; tasks++) { const delay = step(); if (delay !== -2 || !codec.drain || (tasks % 8 === 0 && clock() - start > 1000)) return delay; codec.drain(); } };
   globalThis.__appsDelay = () => {
     if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
     const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - clock());
-    // WARNING: native producers wake the loop when they queue events and bridge replies arrive in a call, so only module errors poll here.
     return moduleErrors.length ? (delay < 0 ? 4 : Math.min(4, delay)) : browsers?.pending() ? (delay < 0 ? 16 : Math.min(16, delay)) : delay;
   };
   globalThis.__appsAlive = () => {
@@ -275,7 +267,6 @@
     bridge.ipcRenderer.invoke = (channel, ...args) => new Promise(resolve => resolve(bridge.rpc('main', { kind: 'rust', channel, args: stringify(args) })));
   }
   globalThis.global = globalThis;
-  // WARNING: V8 call sites are parsed from JSC's stack text, so getThis(), getFunction() and getTypeName() know nothing.
   const capture = Error.captureStackTrace;
   if (capture) Error.captureStackTrace = function captureStackTrace(object, constructor) {
     capture(object, constructor ?? captureStackTrace);
@@ -298,7 +289,6 @@
   }
   globalThis.setImmediate = (fn, ...args) => { callable(fn, 'callback'); const immediate = new Immediate(); immediates.set(immediate, [fn, args]); return immediate; };
   globalThis.clearImmediate = immediate => { immediates.delete(immediate); };
-  // WARNING: node modules that an app may never use are made on first use, so the first engine runs less code at startup.
   const once = make => { let made; return () => made ??= make(); };
   const { __appsFFI: installFFI, __appsFFINative: ffiNative, __appsSQLite: installSQLite, __appsNodeStreams: installStreams, __appsChildProcess: installChildren, __appsNodeIO: installIO, __appsNet: installNet, __appsHTTP: installHTTP, __appsPty: installPty, __appsNodeCompat: installCompat } = globalThis;
   for (const name of ['__appsFFI', '__appsFFINative', '__appsSQLite', '__appsNodeStreams', '__appsChildProcess', '__appsNodeIO', '__appsNet', '__appsHTTP', '__appsPty', '__appsNodeCompat']) delete globalThis[name];
@@ -315,7 +305,8 @@
   const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream()));
   let ioMade;
   const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
-  // WARNING: a KeyObject exists only after `crypto` was made, so this doesn't make it.
+  // WARNING: don't call `io()` here: a KeyObject exists only after `crypto` was made, and making it just for this check
+  // costs startup.
   node.util.types.isKeyObject = value => ioMade !== undefined && value instanceof ioMade.crypto.KeyObject;
   const bytes = globalThis.__appsBytes;
   delete globalThis.__appsBytes;
@@ -342,7 +333,6 @@
   delete globalThis.__appsBrowser;
   nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter, role !== 'main');
   delete globalThis.__appsNativeShell;
-  // WARNING: process.version reports the Node.js API level that the node: modules follow, and versions.electron the Electron release that uses it.
   const nodeVersion = '24.0.0', electronVersion = '40.0.0';
   let exiting = false;
   const finish = code => {
@@ -351,7 +341,8 @@
     return Number(process.exitCode ?? 0) | 0;
   };
   const quitApp = code => call('quit', finish(code));
-  // WARNING: a worker keeps running until the watchdog sees its stop flag, so the loop keeps code after exit() from running.
+  // WARNING: the endless loop is on purpose: it keeps code after exit() from running until the watchdog sees the stop
+  // flag and ends the worker.
   const exit = code => { call('process.exit', finish(code)); for (;;); };
   const env = new Proxy(info.env, {
     set: (target, name, value) => { target[name] = String(value); return true; },
@@ -418,7 +409,6 @@
     Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { value: tty || undefined, enumerable: true } });
     return tty ? node.terminal(writable, stream()) : writable;
   };
-  // WARNING: like Node, the standard output streams are made when first read.
   const outputs = [];
   for (const [fd, name] of [[1, 'stdout'], [2, 'stderr']]) Object.defineProperty(process, name, { enumerable: true, configurable: true, get: () => outputs[fd] ??= output(fd), set: value => { outputs[fd] = value; } });
   const fs = node.fs;
@@ -479,7 +469,6 @@
           step(0);
         }, done);
       }
-      // WARNING: like Node, chunks that queue while a write runs go out in one write, so each small write() costs no thread round trip.
       _writev(chunks, done) { this._write(Buffer.concat(chunks.map(entry => entry.chunk)), null, done); }
       _final(done) { this.opening.then(fd => this.flush ? fs.fsync(fd, done) : done(), done); }
       close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } if (this.writable) this.end(); else this.destroy(); }
@@ -538,7 +527,6 @@
       }
       return this._load('loadFile', target, url.href);
     }
-    // WARNING: pages that ship with the app are bundled, so only these URLs load here. Use WebContentsView or `shell.openExternal()` for websites.
     loadURL(url) {
       url = String(url);
       if (/^(apps|file):/i.test(url)) return this.loadFile(url);
@@ -550,7 +538,6 @@
       this.emit('did-fail-load', event(), failure.errno, failure.code, url, true, info.pid, 1);
       return Promise.reject(failure);
     }
-    // WARNING: main runs a script for the keys of a window only while it listens to its `before-input-event`.
     #input = false;
     #listen() { const on = this.listenerCount('before-input-event') > 0; if (on !== this.#input && !this.isDestroyed()) { this.#input = on; call('window', 'input', pages.get(this).win, on); } return this; }
     static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
@@ -598,7 +585,6 @@
     delete() { this.#edit('delete'); } selectAll() { this.#edit('selectAll'); } unselect() { this.#edit('unselect'); } replace(text) { this.#edit('replace', String(text)); }
     insertText(text) { this.#edit('insertText', String(text)); return Promise.resolve(); }
     capturePage(rect) { return pending(this.#page().win, 'capture', rect ?? null); }
-    // WARNING: like Chromium, the page draws at most 5x and at least 0.25x, while the getters keep the value that was set.
     #zoom(factor, level) { const page = this.#page(); page.zoom = [factor, level]; call('window', 'zoom', page.win, Math.min(Math.max(factor, 0.25), 5)); }
     setZoomFactor(factor) { if (typeof factor !== 'number' || !(factor > 0)) throw new Error("'zoomFactor' must be a double greater than 0.0"); this.#zoom(factor, Math.log(factor) / Math.log(1.2)); }
     getZoomFactor() { return pages.get(this).zoom[0]; }
@@ -618,7 +604,6 @@
     getOSProcessId() { return info.pid; }
     getProcessId() { return info.pid; }
   }
-  // WARNING: a page has one frame here, and `<iframe>` contents are system web views that main can't reach.
   const frames = new WeakMap();
   const frameOf = contents => {
     let frame = frames.get(contents);
@@ -632,7 +617,6 @@
     if (!history) histories.set(contents, history = { canGoBack: () => false, canGoForward: () => false, canGoToOffset: () => false, goBack() { contents.executeJavaScript('history.back()'); }, goForward() { contents.executeJavaScript('history.forward()'); }, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] });
     return history;
   };
-  // WARNING: the renderer is not Chromium, so there is no Chrome DevTools Protocol to attach to.
   const debuggers = new WeakMap();
   const debuggerOf = contents => {
     let item = debuggers.get(contents);
@@ -652,7 +636,6 @@
     const page = pages.get(win.webContents);
     page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
     for (const [id, request] of captures) if (request.win === win.id) { captures.delete(id); request.reject(destroyed()); }
-    // WARNING: a throwing listener must not stop the app from quitting after its last window.
     for (const [target, name] of [[win.webContents, 'destroyed'], [win, 'closed'], [app, 'window-close']]) try { target.emit(name); } catch (error) { hooks.report(error); }
     if (windows.size) return;
     if (closing) willQuit();
@@ -663,8 +646,6 @@
   hooks.contents = id => windows.get(id)?.webContents ?? null;
   // WARNING: results go to the page as data for a fixed page function, never as code.
   const deliver = (win, name, ...args) => { if (!win.isDestroyed()) call('window', 'deliver', win.id, name, args); };
-  // WARNING: pages call this while their `window.open()` waits, so it returns JSON: the new window's id, or whether a window it opened is closed.
-  // A `<webview>` is a WebContentsView that main keeps over the element, and its events go to the element.
   const webviews = new Map();
   const webview = (win, op, guestId, data) => {
     const entry = webviews.get(guestId), contents = win.webContents;
@@ -714,7 +695,6 @@
     const page = pages.get(opener.webContents), details = { url, frameName, features, disposition, referrer: { url: page.url, policy: 'strict-origin-when-cross-origin' }, postBody: undefined };
     try {
       const result = page.open ? page.open(details) : { action: 'allow' };
-      // WARNING: BrowserWindow loads only bundled pages and local files, so other URLs are denied.
       if (result?.action !== 'allow' || !/^(apps:\/\/\/|file:)/i.test(url)) return 'null';
       const options = {};
       for (const [, key, value] of features.matchAll(/(\w+)\s*=\s*([\d.]+)/g)) { const name = { width: 'width', height: 'height', left: 'x', top: 'y' }[key.toLowerCase()]; if (name) options[name] = Number(value); }
@@ -735,7 +715,6 @@
         properties: [directory ? 'openDirectory' : 'openFile', ...(multiple ? ['multiSelections'] : [])],
         ...(accept && !extensions.includes(null) ? { filters: [{ name: 'Files', extensions }] } : {}),
       });
-      // WARNING: as with dropped files, more than 64 MB is left out, because the bytes cross to the page as a string.
       if (!canceled) files = filePaths.flatMap(path => {
         const stat = __apps.fs.statSync(path);
         return stat.isFile() && stat.size <= 64 * 1024 * 1024 ? [{ name: path.split('/').at(-1), lastModified: stat.mtimeMs, data: __apps.fs.readFileSync(path).toString('base64') }] : [];
@@ -770,7 +749,6 @@
       super();
       if (!ready) throw Error('Call app.whenReady() before creating a window');
       options = { ...options, title: String(options.title ?? name) };
-      // WARNING: pages use the `preload` of package.json, and these have no effect here.
       for (const key of ['webPreferences', 'autoHideMenuBar', 'disableAutoHideCursor', 'titleBarOverlay', 'enableLargerThanScreen', 'tabbingIdentifier', 'acceptFirstMouse', 'thickFrame', 'paintWhenInitiallyHidden', 'roundedCorners']) delete options[key];
       if (typeof options.backgroundColor === 'string') options.backgroundColor = argb(options.backgroundColor);
       if (options.parent != null && !(options.parent instanceof BrowserWindow)) throw new TypeError('Expected a BrowserWindow for parent');
@@ -897,7 +875,6 @@
     setProgressBar(progress) { state(this); call('native.app.progress', num(progress, 'progress')); }
     flashFrame(flag) {
       const windowState = state(this);
-      // WARNING: request ids start at 0, and an active app gets -1, no request.
       if (flag) windowState.attention = call('native.app.attention', 'critical');
       else if (windowState.attention >= 0) { call('native.app.cancelAttention', windowState.attention); windowState.attention = -1; }
     }
@@ -1025,7 +1002,6 @@
     else if (name === 'state') {
       const windowState = win && states.get(win);
       if (!windowState) return;
-      // WARNING: the first state is the window's initial state, so it only reports focus.
       const old = windowState.native ?? { ...data, focused: false }, [x, y, width, height] = data.frame, [left, top, innerWidth, innerHeight] = data.content;
       windowState.native = data;
       Object.assign(windowState, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
@@ -1095,7 +1071,6 @@
   setTimeout[node.util.promisify.custom] = timerModule.promises.setTimeout;
   setImmediate[node.util.promisify.custom] = timerModule.promises.setImmediate;
   const outOfRange = (name, value) => Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 1 && <= 9007199254740991. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
-  // WARNING: values are counted in buckets of about 3 significant digits, so percentiles are approximate like HdrHistogram's.
   class RecordableHistogram {
     #counts = new Map(); #count = 0; #min = 9223372036854776000; #max = 0; #sum = 0; #squares = 0; #last;
     get count() { return this.#count; }
@@ -1172,7 +1147,6 @@
   Object.assign(builtins, { 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest, ReadableStreamDefaultController, ReadableByteStreamController, WritableStreamDefaultWriter, WritableStreamDefaultController, TransformStreamDefaultController }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict });
   lazy(builtins, 'readline/promises', () => io().readline.promises);
   lazy(builtins, 'dns/promises', () => node.dns.promises);
-  // WARNING: like Node, prefixed modules are built in only with `node:`.
   const prefixed = new Set(['sqlite', 'ffi', 'sea']), isBuiltin = name => { name = String(name); const key = name.replace(/^node:/, ''); return Object.hasOwn(builtins, key) && (key !== name || !prefixed.has(key)); };
   const missingModule = name => Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
   builtins.module = { builtinModules: Object.keys(builtins).map(name => prefixed.has(name) ? 'node:' + name : name), isBuiltin, createRequire: () => Object.assign(name => {
@@ -1181,11 +1155,9 @@
     if (value === undefined) throw missingModule(name);
     return value;
   }, { resolve: name => { if (isBuiltin(name) || /^(node-pty|ws|undici|electron)(\/|$)/.test(String(name))) return String(name); throw missingModule(name); } }) };
-  // WARNING: zoom is per window and lives on main, so a preload reads what main last told it.
   const webFrame = Object.freeze({ getZoomFactor: () => 1, getZoomLevel: () => 0, setZoomFactor() {}, setZoomLevel() {}, setVisualZoomLevelLimits() {}, insertCSS: () => '', removeInsertedCSS() {} });
   process.getBuiltinModule = name => isBuiltin(name) ? builtins[String(name).replace(/^node:/, '')] : undefined;
   if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
-  // WARNING: like Electron, preloads don't get the main process modules: windows, app and native state belong to main.
   const main = role === 'main' ? { app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer } : {};
   const apps = Object.defineProperties({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve }, Object.getOwnPropertyDescriptors(modules));
   Object.defineProperty(apps, 'net', { value: electronNet, enumerable: true, writable: true, configurable: true });

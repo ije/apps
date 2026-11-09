@@ -84,14 +84,13 @@ pub(crate) fn area_cells(row: &str) -> Vec<&str> {
 }
 
 pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
-    // WARNING: most values have no strings, escapes, comments or URLs, so a byte scan splits them like
-    // the tokenizer below at a fraction of the cost.
     let bytes = value.as_bytes();
     let mut parts = Vec::new();
     let (mut open, mut depth, mut start, mut closed) = (0u64, 0u32, 0, false);
     let simple = 'scan: {
         for (index, &byte) in bytes.iter().enumerate() {
-            // WARNING: the tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`.
+            // WARNING: the tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`, so this fast scan must
+            // give up there.
             if std::mem::take(&mut closed)
                 && separator == ' '
                 && !byte.is_ascii_whitespace()
@@ -205,7 +204,6 @@ fn tokenized(value: &str, separator: char) -> Vec<&str> {
 type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 16], Vec<renderer::BoxShadow>)>;
 
 thread_local! {
-    // WARNING: boxes that build again parse the same long shadow lists, like Tailwind's ring and shadow layers.
     static SHADOWS: std::cell::RefCell<ShadowMemo> = Default::default();
 }
 
@@ -663,8 +661,6 @@ pub(crate) fn write_number(value: f64, out: &mut String) {
     } else {
         (5 - value.abs().log10().floor() as i32).max(0) as usize
     };
-    // WARNING: the scaled value is below 2^21, so the product is off by less than 1e-9 and only near ties can it
-    // round unlike the exact formatter below.
     let scaled = value.abs() * 10f64.powi(digits as i32);
     if (1..=15).contains(&digits) && (scaled.fract() - 0.5).abs() > 1e-6 {
         let (whole, power) = (scaled.round() as u64, 10u64.pow(digits as u32));

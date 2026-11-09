@@ -5,9 +5,6 @@ use super::{ImageRefMut, f32_bound};
 use rgb::RGBA8;
 use usvg::filter::ColorMatrixKind as ColorMatrix;
 
-/// Applies a color matrix filter.
-///
-/// Input image pixels should have an **unpremultiplied alpha**.
 pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
     match matrix {
         ColorMatrix::Matrix(m) => {

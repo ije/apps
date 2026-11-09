@@ -109,19 +109,12 @@ struct State {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    // WARNING: the fonts from memory, which the process caches leave out.
     local: HashSet<FontId>,
     sized: HashMap<(FontId, u32), CTFont>,
-    // WARNING: the font of each shaped run's face, kept alive so its address stays unique.
+    // WARNING: keyed by the font's address, so each font stays alive here, or a new font could reuse the address.
     natives: HashMap<usize, (CTFont, FontId)>,
-    // WARNING: code repeats its words and indents across lines, so lines in a monospace font shape by runs of
-    // spaces and non-spaces, each once per font and size. Monospace fonts don't kern, so the line is the same.
     segments: HashMap<(FontId, u32), HashMap<Box<str>, Rc<LineLayout>>>,
     monospace: HashMap<FontId, bool>,
-    // WARNING: other lines of simple scripts shape by words and runs of spaces too, each once per font, size and
-    // whether a space comes before and after it, shaped next to those spaces. That holds while no character after a
-    // space kerns with it, which `Face::spaced` learns per character. Words keep each x in f64, so a line of them
-    // rounds like the whole line.
     faces: HashMap<(FontId, u32), Face>,
     words: usize,
     parts: Vec<Part>,
@@ -136,9 +129,6 @@ struct Face {
     numbers: Option<Box<Numbers>>,
 }
 
-// WARNING: after some missing words of digits, a font and size learn each digit's glyph and its advance before every
-// digit or space, from one line that holds each three of them in a row once. A digit word then shapes without
-// CoreText while the triples in it, and the pairs at its ends, which shape alone once, match those advances.
 struct Numbers {
     font: FontId,
     glyphs: [GlyphId; 11],
@@ -148,7 +138,6 @@ struct Numbers {
     edges: [[u8; 11]; 11],
 }
 
-// WARNING: a word or a run of spaces: its run, shaped size, range in the line, which sides have a space, and shape.
 type Part = (
     usize,
     Pixels,
@@ -157,11 +146,8 @@ type Part = (
     Option<Rc<Word>>,
 );
 
-// WARNING: each glyph's x in f64, as CoreText places it, then the width, and where each CoreText run starts in the
-// text and on the line.
 type Exact = (Vec<f64>, Vec<(usize, f64)>);
 
-// WARNING: each glyph's x, font, id, y and byte offset in the word, then the word's width.
 type Glyphs = Box<[(f64, FontId, GlyphId, f32, usize)]>;
 
 struct Word(Glyphs, f64);
@@ -181,11 +167,8 @@ static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
         .collect()
 });
 
-// WARNING: finding a system family's faces, a weight of a variable face, or its axes (which CoreText copies with
-// their localized names) takes milliseconds, the same in every window, so system faces by family, features and
-// fallbacks, their weights and default weights, and the names that have none, are kept for the process. Their
-// fonts stay alive here, so a face's address names it. Fonts from memory belong to their text system.
-// WARNING: each entry is found once, outside the map's lock, so threads that look up other entries meanwhile don't wait.
+// WARNING: fonts stay alive here, since a face's address names it. Each entry is found once outside the map's lock, so
+// lookups of other entries don't wait.
 type Shared<K, V> = std::sync::LazyLock<std::sync::Mutex<HashMap<K, Arc<OnceLock<V>>>>>;
 type Faces = Option<Vec<(FontKitFont, String)>>;
 type SystemKey = (String, Vec<(String, u32)>, Option<Vec<String>>);
@@ -304,10 +287,7 @@ impl TextSystem {
             },
         )?;
         let mut font_id = candidates[index];
-        // Like browsers, a variable font's weight axis takes the exact CSS weight, which differs from
-        // its named faces for weights like 500 and 600. A face at its default instance has no `wght`
-        // in its variation, so the axis default stands in.
-        // WARNING: old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their faces.
+        // WARNING: old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their named faces.
         let native = state.fonts[font_id.0].native_font();
         let axis = || {
             native
@@ -448,7 +428,6 @@ impl State {
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
-        // WARNING: families resolved before, maybe to system fonts, must be resolved again.
         self.font_selections.clear();
         self.font_ids_by_font_key.clear();
         Ok(())
@@ -849,7 +828,8 @@ impl State {
         parts.clear();
         let (mut start, mut nudged, mut missing) = (0, false, 0);
         for (index, run) in font_runs.iter().enumerate() {
-            // WARNING: like `layout_whole`, every other run shapes a hair larger.
+            // WARNING: every other run shapes a hair larger, as in `layout_whole`, or CoreText merges the runs and
+            // forms ligatures across them.
             let size = if nudged {
                 px(f32::from(run.font_size).next_up())
             } else {
@@ -955,7 +935,6 @@ impl State {
             let Some(Word(glyphs, width)) = word.as_deref() else {
                 continue;
             };
-            // WARNING: like `layout_whole`, a run takes the size of the line's run closest to its shaped size.
             if *index != last.0 {
                 let shaped = f32::from(*size);
                 let run_size = font_runs
@@ -1016,7 +995,6 @@ impl State {
         })
     }
 
-    // WARNING: keeps the parts that `layout`, shaped from `text` at `at`, holds whole and in one font.
     fn harvest(
         &mut self,
         text: &str,
@@ -1163,7 +1141,6 @@ impl State {
                     }
                     (numbers.font, numbers.glyphs[at], numbers.ends[at]) = (font, id, xs[1]);
                 }
-                // WARNING: a de Bruijn sequence holds each three of the characters in a row once.
                 let (mut lyndon, mut order) = (vec![-1isize], Vec::new());
                 while let Some(last) = lyndon.last_mut() {
                     *last += 1;
@@ -1435,11 +1412,8 @@ impl State {
 
         {
             let mut text = text;
-            // WARNING: CoreText merges adjacent runs that end up in equal fonts, including runs of
-            // different fonts that fall back to the same one, so every other run that inserts
-            // text is set a hair larger to keep ligatures from forming across them. The first
-            // run keeps its exact size: SF tracks by its exact point size, and a nudged size
-            // draws wider or narrower than AppKit sets the same text.
+            // WARNING: CoreText merges adjacent runs in equal fonts, so every other run is set a hair larger to stop
+            // ligatures across them. The first run keeps its exact size, since SF tracks by exact point size.
             let mut break_ligature = false;
             for run in font_runs {
                 let text_run;
@@ -1514,7 +1488,6 @@ impl State {
                 }
             };
             let is_emoji = self.is_emoji(font_id);
-            // Emoji take the advance of the size they draw at, see `rasterize_glyph`.
             // WARNING: the emoji font that system fonts fall back to has wider advances than Chromium's.
             let doubled = is_emoji
                 .then(|| {

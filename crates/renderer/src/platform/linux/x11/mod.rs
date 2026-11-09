@@ -403,7 +403,6 @@ impl Client {
                     Err(error) => {
                         eprintln!("apps: X11: {error}");
                         if matches!(error, ConnectionError::IoError(_)) {
-                            // WARNING: a lost display connection can't be recovered.
                             std::process::exit(1);
                         }
                         break;
@@ -487,8 +486,6 @@ impl Client {
             }
             None => None,
         };
-        // WARNING: the input method answers a key it took only by changing the text, so its first change after
-        // the press is the page's `Process` key.
         if let Some((window, ime)) = ime
             && let Some(window) = self.window(window)
         {
@@ -689,7 +686,6 @@ impl Client {
                     state.keyboard_focus = None;
                     state.pressed.clear();
                 }
-                // WARNING: like Chrome, the page ends its composition and keeps the text when the window goes.
                 self.reset_ime();
                 window.set_active(false);
             }

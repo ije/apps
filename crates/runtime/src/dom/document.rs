@@ -86,7 +86,7 @@ pub struct Node {
     pub children: Vec<usize>,
     pub parent: Option<usize>,
     pub(crate) stylesheet: Option<Rc<crate::style::Stylesheet>>,
-    // WARNING: the `style` attribute stays in `attrs`; this is its parse, kept only while the attribute is unchanged, so every write of `style` must clear it.
+    // WARNING: this is the parse of the `style` attribute in `attrs`, so every write of `style` must clear it.
     pub(crate) inline: Option<crate::style::Declarations>,
     #[serde(skip)]
     pub(crate) state: u16,
@@ -105,7 +105,6 @@ fn stamp() -> u64 {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-// WARNING: revisions are unique across documents, so a cache never mistakes one node for another.
 #[derive(Clone, Debug, Default)]
 pub struct Nodes {
     list: Vec<Node>,
@@ -146,8 +145,8 @@ impl Nodes {
         self.list.iter_mut()
     }
 
-    // WARNING: walks of the whole tree are kept until the tree revision changes, so the node's `parent` and
-    // `children` must stay. All other mutable accesses count as tree changes.
+    // WARNING: tree walks are cached by the tree revision, which `edit` doesn't change, so never change `parent` or
+    // `children` through it.
     pub(crate) fn edit(&mut self, id: usize) -> Option<&mut Node> {
         let node = self.list.get_mut(id)?;
         self.latest = stamp();
@@ -164,7 +163,6 @@ impl Nodes {
         std::mem::replace(&mut self.list[id].children, children)
     }
 
-    // WARNING: only for passes that change no other node, so nothing misses a real change.
     #[cfg(test)]
     pub(crate) fn restore(&mut self, revisions: &[(usize, u64)], latest: u64, tree: u64) {
         for &(id, revision) in revisions {
@@ -304,9 +302,6 @@ enum Content {
     Plain,
 }
 
-// WARNING: scope checks compare 1-based stack positions: the topmost open element of each tag
-// (`last`) against the topmost boundary element of each scope (`bound`), so a misnested or
-// unmatched tag costs O(1) and parsing stays linear.
 struct Builder {
     nodes: Vec<Node>,
     stack: Vec<Open>,
@@ -712,8 +707,6 @@ impl Builder {
         self.nodes[parent].children.push(child);
     }
 
-    // WARNING: it edits the stack in the middle, so the open elements from the formatting element up
-    // are taken off and pushed again, which recomputes the scope positions.
     fn adoption(&mut self, subject: &str) {
         let is = |builder: &Self, id: usize| builder.nodes[id].tag == subject;
         if let Some(open) = self.stack.last()
@@ -1795,7 +1788,6 @@ impl Document {
         } else {
             source
         };
-        // WARNING: fragments move into the page node by node, so their list may be oversized, unlike a document's.
         let mut nodes = Vec::with_capacity(context.map_or(1, |_| source.len() / 32 + 1));
         nodes.push(Node {
             tag: if context.is_some() {
@@ -2069,10 +2061,6 @@ impl Document {
         self.write(id, false, None)
     }
 
-    // WARNING: serializes the subtree for an SVG source, without comments because XML rejects `--` in them. With
-    // `mark`, each element without an id gets the id `apps-<node>`, so SVG geometry can be traced back to
-    // nodes. `attrs` gives the attributes that replace an element's own, like its `style`; an empty value
-    // drops the attribute. Elements never keep their own `style`.
     pub fn serialize_svg(
         &self,
         id: usize,
@@ -2379,7 +2367,10 @@ mod tests {
             let source = format!(
                 "<button>{symbol}<span>Open</span><sf-symbol-doc-text class='size-4'/><b>End</b></button>"
             );
-            for doc in [Document::parse(&source), Document::fragment(&source, "body")] {
+            for doc in [
+                Document::parse(&source),
+                Document::fragment(&source, "body"),
+            ] {
                 let button = find(&doc, "button");
                 assert_eq!(
                     doc.nodes[button]
@@ -2389,7 +2380,11 @@ mod tests {
                         .collect::<Vec<_>>(),
                     ["sf-symbol-folder", "span", "sf-symbol-doc-text", "b"]
                 );
-                assert!(doc.nodes[find(&doc, "sf-symbol-folder")].children.is_empty());
+                assert!(
+                    doc.nodes[find(&doc, "sf-symbol-folder")]
+                        .children
+                        .is_empty()
+                );
                 assert!(doc.matches(find(&doc, "sf-symbol-folder"), ":-internal-sf-symbol"));
                 assert!(!doc.matches(find(&doc, "span"), ":-internal-sf-symbol"));
                 let source = doc.serialize(button);
@@ -2401,7 +2396,9 @@ mod tests {
                 assert_eq!(tree(&doc, button), tree(&again, find(&again, "button")));
             }
         }
-        let doc = Document::parse("<x-card/><span>inside</span></x-card><sf-symbol-folder--fill/><b>inside</b></sf-symbol-folder--fill><i>after</i>");
+        let doc = Document::parse(
+            "<x-card/><span>inside</span></x-card><sf-symbol-folder--fill/><b>inside</b></sf-symbol-folder--fill><i>after</i>",
+        );
         assert_eq!(parent(&doc, "span"), "x-card");
         assert_eq!(parent(&doc, "b"), "sf-symbol-folder--fill");
         assert_eq!(parent(&doc, "i"), "body");

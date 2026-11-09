@@ -325,7 +325,6 @@ impl State {
                 };
                 #[cfg(unix)]
                 drop(std::mem::take(&mut builder_ends));
-                // WARNING: Small queues and batches keep paused output near the stream high water mark.
                 let (sender, receiver) = mpsc::sync_channel(8);
                 let mut process = Process {
                     child,
@@ -400,7 +399,6 @@ impl State {
                                     while gate.load(Ordering::Acquire) == PAUSED {
                                         std::thread::park();
                                     }
-                                    // WARNING: a destroyed stream closes its pipe here, so the child gets SIGPIPE like in Node.
                                     if gate.load(Ordering::Acquire) == CLOSED {
                                         break;
                                     }

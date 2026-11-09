@@ -41,7 +41,6 @@ pub(crate) struct TextState {
 
 type Probe = (Size<Pixels>, [Pixels; 2]);
 
-// WARNING: the unwrapped lines, which every width wraps, and how far the first and the other lines reach.
 type Base = (Rc<[WrappedLine]>, [Pixels; 2]);
 
 impl TextState {
@@ -72,8 +71,6 @@ impl TextState {
         )
     }
 
-    // WARNING: true when `new` measures like this state. Then the two swap their paint, and this state shapes again
-    // when it next paints, so its box keeps its layout.
     pub(crate) fn keep(&self, new: &TextState) -> bool {
         if self.text != new.text
             || self.scale != new.scale
@@ -186,8 +183,8 @@ impl TextState {
             }
             (lines, reach)
         };
-        // WARNING: one line of text that doesn't wrap and fits needs no ellipsis, so it shapes once, like other text,
-        // where `truncate_text` would shape it to find no cut and then the text would shape again.
+        // WARNING: one unwrapped line that fits skips `truncate_text`, which would shape it once to find no cut and
+        // then shape it again.
         let fits = truncate.as_ref().is_some_and(|(_, width)| {
             float == px(0.)
                 && wrap_width.is_none()
@@ -207,7 +204,6 @@ impl TextState {
                 false => wrap_width.map(|width| (width, style.line_clamp, style.text_wrap)),
             };
             let lines = match wrap {
-                // WARNING: lines that reach no further than the width don't wrap and keep their size.
                 Some((width, ..))
                     if *first <= width.min(width - style.text_indent) && *rest <= width =>
                 {
@@ -292,9 +288,6 @@ impl TextState {
                     )
                     .unwrap_or_default()
             };
-            // WARNING: like a CSS float, the float moves the first line, and the text goes below it when the first
-            // word doesn't fit beside it, as at the min-content size of text that wraps. The float doesn't widen the
-            // min-content size of the text, which is at least as wide as the float.
             let beside = (float > px(0.) && !(min_content && wraps))
                 .then(|| {
                     let mut runs = runs.to_vec();
@@ -317,7 +310,6 @@ impl TextState {
         let mut size = Size::<Pixels>::default();
         for (index, line) in lines.iter().enumerate() {
             let mut line_size = line.size(line_height);
-            // WARNING: like CSS, the indent widens a first line that doesn't wrap.
             if index == 0 && line.wrap_boundaries.is_empty() {
                 line_size.width = (line_size.width + style.text_indent).max(px(0.));
             }

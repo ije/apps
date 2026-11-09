@@ -272,7 +272,6 @@ impl Scrollbar {
             state.offset = Some(drawn);
         }
         let shown = look.shown(self.axes, max);
-        // WARNING: custom bars take layout space from last frame's overflow, so a change lays the frame out again.
         if look.space(shown) != self.reserved {
             window.redraw();
         }

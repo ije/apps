@@ -5,13 +5,6 @@ use super::{ImageRefMut, f32_bound};
 use rgb::RGBA8;
 use usvg::filter::{ConvolveMatrix, EdgeMode};
 
-/// Applies a convolve matrix.
-///
-/// Input image pixels should have a **premultiplied alpha** when `preserve_alpha=false`.
-///
-/// # Allocations
-///
-/// This method will allocate a copy of the `src` image as a back buffer.
 pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
     fn bound(min: i32, val: i32, max: i32) -> i32 {
         core::cmp::max(min, core::cmp::min(max, val))
@@ -106,6 +99,5 @@ pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
         }
     }
 
-    // Do not use `mem::swap` because `data` referenced via FFI.
     src.data.copy_from_slice(buf.data);
 }

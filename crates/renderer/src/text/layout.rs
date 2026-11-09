@@ -451,7 +451,6 @@ pub(crate) struct LineLayoutCache {
 const MAX_AGE: u32 = 60;
 const MAX_BYTES: usize = 4 << 20;
 
-// WARNING: entries are found by the hash of their key, which they keep to compare, so a key hashes once.
 type Entries<T> = FxHashMap<u64, (CacheKey, Rc<T>, Cell<u32>, usize)>;
 
 #[derive(Default)]

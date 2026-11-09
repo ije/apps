@@ -9,12 +9,9 @@ use std::collections::HashMap;
 pub(crate) struct Measurements {
     pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
     pub(crate) pixel_ratio: f32,
-    // WARNING: the sizes of decoded images and video frames, kept with `State::images` and `svg_images`.
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    // WARNING: by node, its inline text: measuring and building both read it, and a changed node drops it.
     pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
-    // WARNING: only while a grid lays out, the padding, margin and border of a style by its address and base. Nodes
-    // with one style have the same lengths within a pass, and the grid's styles outlive it.
+    // WARNING: keyed by style address, so set it only while a grid lays out, when its styles outlive the map.
     #[allow(clippy::type_complexity)]
     pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
 }
@@ -292,7 +289,6 @@ fn size(
         .collect();
     items.sort_by_key(group);
     let mut growable = vec![false; count];
-    // WARNING: grids have thousands of items, so the lists of each item's distribution are reused.
     let mut planned = vec![None::<f32>; count];
     let (mut targets, mut weights, mut caps, mut incurred, mut open) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -365,8 +361,6 @@ fn size(
                 };
                 let mut space =
                     value - (start..start + span).map(current).sum::<f32>() - gaps(span);
-                // WARNING: grids have thousands of items with one track to grow, which take what the loops below
-                // give them: the space up to the track's cap, then the rest where the track may grow beyond it.
                 if let [i] = targets[..]
                     && !flexible
                 {
@@ -589,8 +583,6 @@ pub(crate) fn intrinsic(
     let border_box = style
         .get(Prop::BOX_SIZING)
         .is_some_and(|v| v == "border-box");
-    // WARNING: like Chrome, a failed image with alt text holds a broken image icon and the text, and an inline one
-    // ignores its size. Only the UA sheet makes images inline blocks.
     let alt = super::element::broken_image(node)
         .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
         .flatten();
@@ -627,8 +619,6 @@ pub(crate) fn intrinsic(
         .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied()))
         .flatten();
     if let Some((natural, ratio)) = natural {
-        // WARNING: the size attributes of images and videos only hint a size that no rule sets, and a natural ratio
-        // turns the used width into the height, in the content box.
         let hint = [0, 1].map(|axis| {
             node.attrs
                 .get(["width", "height"][axis])
@@ -656,7 +646,6 @@ pub(crate) fn intrinsic(
                 .and_then(|v| super::element::dimension(v, false))
                 .unwrap_or(24.)
         });
-        // WARNING: like browsers, an svg with a set height and auto width takes its width from the viewBox ratio.
         let ratio = (!node.attrs.contains_key("width"))
             .then(|| node.attrs.get("viewBox"))
             .flatten()
@@ -723,7 +712,13 @@ pub(crate) fn intrinsic(
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(std::rc::Rc::new))
             .clone()
-            .map(|inline| (inline.text.clone(), inline.runs.to_vec(), inline.atoms.clone())),
+            .map(|inline| {
+                (
+                    inline.text.clone(),
+                    inline.runs.to_vec(),
+                    inline.atoms.clone(),
+                )
+            }),
     } {
         for atom in &atoms {
             let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
@@ -752,8 +747,6 @@ pub(crate) fn intrinsic(
             )
             .unwrap_or_default()
         };
-        // WARNING: like Chrome's floated icon, alt text goes below the icon when its first word doesn't fit beside
-        // it, and the icon doesn't widen the min-content width of the text.
         let float = if alt.is_some() { 16. } else { 0. };
         let beside = alt
             .is_some()
@@ -1044,7 +1037,6 @@ pub(crate) fn intrinsic(
             }
         }
     }
-    // WARNING: a select that shows one option is as tall as its font, like its box.
     if node.tag == "select"
         && !node.attrs.contains_key("multiple")
         && node
@@ -1074,7 +1066,9 @@ pub(crate) fn intrinsic(
         .is_none()
         .then(|| style.get(Prop::ASPECT_RATIO))
         .flatten()
-        .filter(|value| !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some())))
+        .filter(|value| {
+            !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some()))
+        })
         .and_then(super::element::aspect_ratio)
         .zip(available)
         .map(|(ratio, width)| {
@@ -1362,7 +1356,6 @@ pub(crate) fn layout(
         height: Option<&'a str>,
         subgrid: [bool; 2],
     }
-    // WARNING: large grids repeat a few styles over thousands of items, so each style is read once.
     let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
     let legend = (doc.nodes[id].tag == "fieldset")
         .then(|| super::element::legend(doc, styles, id))
@@ -1370,7 +1363,6 @@ pub(crate) fn layout(
         .map(|(legend, ..)| legend);
     let mut read = |child: usize| -> Item {
         let style = &styles.values[child];
-        // WARNING: grid items stretch by default, but replaced elements start, unlike controls.
         let replaced = doc.nodes[child].tag == "svg"
             || doc.nodes[child].tag != "input"
                 && super::element::natural_size(doc, child, measured.naturals.get(&child).copied())
@@ -1661,7 +1653,6 @@ pub(crate) fn layout(
             value
         }
     };
-    // WARNING: large grids have thousands of tracks, so track starts are summed once, in track order.
     let starts = |sizes: &[f32]| {
         let mut sum = 0f32;
         std::iter::once(0.)
@@ -1739,8 +1730,6 @@ pub(crate) fn layout(
                 }
             }
         }
-        // WARNING: tracks sized without content, like the `minmax(0, 1fr)` columns of a container with a definite size,
-        // take no contributions, so their items are measured only for the other axis.
         let sized = |cell: &[usize; 4]| {
             available[axis].is_some()
                 && definitions[axis]
