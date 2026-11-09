@@ -56,6 +56,14 @@ pub struct Desktop {
     scheduled: bool,
 }
 
+type Reloaded = (
+    Arc<HashMap<String, String>>,
+    Arc<HashMap<String, bytes::Bytes>>,
+);
+
+// The pages and script chunks of the last bundle that `apps run --watch` sent, which page loads use from then on.
+static RELOADED: std::sync::Mutex<Option<Reloaded>> = std::sync::Mutex::new(None);
+
 thread_local! {
     // WARNING: no destructor, because at exit it would run after `HOSTS`, which its drop needs.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
@@ -90,6 +98,39 @@ impl Desktop {
         )?;
         desktop.pages = bundle.pages;
         Ok(desktop)
+    }
+
+    // WARNING: the main side keeps running, so a bundle from `input` must change only pages and the chunks they load.
+    pub fn reload_from(&self, mut input: impl std::io::BufRead + Send + 'static) {
+        let link = self.link.clone();
+        let _ = std::thread::Builder::new()
+            .name("apps-reload".into())
+            .spawn(move || {
+                let mut line = Vec::new();
+                while input
+                    .read_until(b'\n', &mut line)
+                    .is_ok_and(|read| read > 0)
+                {
+                    match serde_json::from_slice::<crate::bundle::Bundle>(&line) {
+                        Ok(bundle) => {
+                            let mut pages = HashMap::new();
+                            let mut scripts = HashMap::new();
+                            for (name, source) in bundle.files.iter() {
+                                if name.ends_with(".html") {
+                                    pages.insert(name.clone(), source.clone());
+                                } else if name.starts_with("script-") {
+                                    scripts.insert(name.clone(), source.clone().into());
+                                }
+                            }
+                            *RELOADED.lock().unwrap_or_else(|error| error.into_inner()) =
+                                Some((Arc::new(pages), Arc::new(scripts)));
+                            link.page(ToPage::All(serde_json::json!({"op":"reload"})));
+                        }
+                        Err(error) => eprintln!("apps: cannot read the new bundle: {error}"),
+                    }
+                    line.clear();
+                }
+            });
     }
 
     pub(crate) fn dispatch(
@@ -283,6 +324,19 @@ impl Desktop {
                         } else if command["op"] == "logs" && !self.devtools.is_empty() {
                             self.main_logs
                                 .extend(command["args"].as_array().into_iter().flatten().cloned());
+                        } else if command["op"] == "reload" {
+                            let host = self.host.borrow();
+                            for &id in self.views.keys() {
+                                if let Some(url) =
+                                    host.dom.get(&id).and_then(|dom| dom.base.as_ref())
+                                    && url.as_str().starts_with("apps:///")
+                                {
+                                    self.link.page(ToPage::Window(
+                                        id,
+                                        serde_json::json!({"op":"window","args":["loadFile",id,url.as_str(),"page"]}),
+                                    ));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -450,6 +504,14 @@ impl Desktop {
                         }
                     }
                     "load" | "loadFile" => {
+                        if let Some((files, scripts)) = RELOADED
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone()
+                        {
+                            self.files = files;
+                            self.host.borrow_mut().scripts = scripts;
+                        }
                         let value = args[2].as_str().context("Expected HTML text or path")?;
                         let page = args[3] == "page";
                         let request = args[3].as_u64();

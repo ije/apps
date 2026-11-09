@@ -1,16 +1,18 @@
 use crate::bundler;
 use anyhow::{Context, Result};
 use apps_runtime::{
+    bundle::Bundle,
     host::Role,
     jsc::{JavaScriptCore, JsContext},
 };
+use bbtree::unsync::BBTreeMap;
 use notify::Watcher;
 use std::{
     cell::RefCell,
     collections::BTreeSet,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     rc::Rc,
     sync::{
         Arc,
@@ -40,7 +42,7 @@ pub fn run(
     let started = Instant::now();
     let target =
         crate::build_target::BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)?;
-    let compile = |files: Rc<RefCell<BTreeSet<PathBuf>>>| -> Result<_> {
+    let compile = |files: Rc<RefCell<BTreeSet<PathBuf>>>| {
         if rust.is_some() {
             files.borrow_mut().extend([
                 entry.to_owned(),
@@ -48,27 +50,47 @@ pub fn run(
                 root.join("Cargo.lock"),
             ]);
         }
-        let bundle = bundler::compile(
+        bundler::compile(
             entry,
             bundler::Realm::Main,
             None,
             files,
             false,
             cache.clone(),
-        )?;
-        let binary = match rust {
-            Some(root) => crate::rust::build(root, entry, false, target)?,
-            None => runtime.clone(),
-        };
-        Ok((binary, bundle))
+        )
     };
-    let mut bundle = match compile(files.clone()) {
-        Ok(bundle) => {
+    let build = || match rust {
+        Some(root) => crate::rust::build(root, entry, false, target),
+        None => Ok(runtime.clone()),
+    };
+    // WARNING: main loads its chunks by the names in app.js, and a chunk can name more chunks.
+    let main_chunks = |files: &BBTreeMap<String, String>| {
+        let mut chunks = BTreeSet::new();
+        let mut pending = vec!["app.js".to_owned()];
+        while let Some(name) = pending.pop() {
+            let source = files.get(&name).map_or("", String::as_str);
+            for (at, _) in source.match_indices("script-") {
+                let rest = &source[at + 7..];
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if digits > 0 && rest[digits..].starts_with(".js") {
+                    let chunk = format!("script-{}.js", &rest[..digits]);
+                    if chunks.insert(chunk.clone()) {
+                        pending.push(chunk);
+                    }
+                }
+            }
+        }
+        chunks
+    };
+    let mut binary = None;
+    let mut bundle = match compile(files.clone()).and_then(|bundle| Ok((build()?, bundle))) {
+        Ok((path, bundle)) => {
             println!(
                 "apps: compiled {} bytes in {} ms",
-                bundle.1.values().map(String::len).sum::<usize>(),
+                bundle.values().map(String::len).sum::<usize>(),
                 started.elapsed().as_millis()
             );
+            binary = Some(path);
             Some(bundle)
         }
         Err(error) if watch => {
@@ -93,6 +115,8 @@ pub fn run(
     let mut watched = BTreeSet::<PathBuf>::new();
     let mut child = None;
     let mut writer = None;
+    let mut input: Option<ChildStdin> = None;
+    let mut running: Option<BBTreeMap<String, String>> = None;
     let dev_bundle = rust
         .is_none()
         .then(|| std::env::temp_dir().join(format!("apps-bundle-{}.json", std::process::id())));
@@ -141,8 +165,8 @@ pub fn run(
             }
             if launch {
                 launch = false;
-                let (binary, files) = bundle.take().unwrap();
-                let mut cmd = Command::new(binary);
+                let files = bundle.take().unwrap();
+                let mut cmd = Command::new(binary.as_ref().unwrap());
                 if rust.is_some() {
                     cmd.env("APPS_RUST_DEV", "1")
                         .env("APPS_RUST_LIBRARIES", &runtime)
@@ -174,13 +198,14 @@ pub fn run(
                         .stdin(Stdio::piped())
                         .spawn()?,
                 );
-                let input = child.as_mut().unwrap().stdin.take().unwrap();
+                let stdin = child.as_mut().unwrap().stdin.take().unwrap();
                 let dev_bundle = dev_bundle.clone();
+                running = watch.then(|| files.clone());
                 writer = Some(
                     std::thread::Builder::new()
                         .name("apps-bundle".into())
-                        .spawn(move || -> Result<()> {
-                            let bundle = apps_runtime::bundle::Bundle {
+                        .spawn(move || -> Result<ChildStdin> {
+                            let bundle = Bundle {
                                 files,
                                 ..Default::default()
                             };
@@ -193,10 +218,11 @@ pub fn run(
                                     &bundle,
                                 )?;
                             }
-                            let mut input = BufWriter::new(input);
-                            serde_json::to_writer(&mut input, &bundle)?;
-                            input.flush()?;
-                            Ok(())
+                            // WARNING: while watching, stdin stays open for the bundles of page reloads, so a new line ends each bundle.
+                            let mut stdin = BufWriter::new(stdin);
+                            serde_json::to_writer(&mut stdin, &bundle)?;
+                            stdin.write_all(b"\n")?;
+                            Ok(stdin.into_inner()?)
                         })?,
                 );
                 if watch {
@@ -207,12 +233,15 @@ pub fn run(
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
-                writer
-                    .take()
-                    .unwrap()
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Bundle writer panicked")))
-                    .context("Cannot send the app bundle to the runtime")?;
+                // WARNING: without watching no bundle follows, so stdin closes like the end of a file.
+                input = watch.then_some(
+                    writer
+                        .take()
+                        .unwrap()
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Bundle writer panicked")))
+                        .context("Cannot send the app bundle to the runtime")?,
+                );
             }
             if let Some(process) = &mut child
                 && let Some(status) = process.try_wait()?
@@ -250,8 +279,14 @@ pub fn run(
                         }
                     }
                     let files = files.borrow();
+                    let cargo = |path: &PathBuf| {
+                        rust.is_some()
+                            && (path.extension().is_some_and(|e| e == "rs")
+                                || path.ends_with("Cargo.toml")
+                                || path.ends_with("Cargo.lock"))
+                    };
                     if event.paths.iter().any(|path| {
-                        rust.is_some() && path.extension().is_some_and(|e| e == "rs")
+                        cargo(path)
                             || files
                                 .range(path.clone()..)
                                 .next()
@@ -260,6 +295,10 @@ pub fn run(
                     }) {
                         changed = Some(Instant::now());
                         fresh = true;
+                    }
+                    // WARNING: only Cargo makes a new executable, so a Rust app restarts after it ran.
+                    if event.paths.iter().any(cargo) {
+                        binary = None;
                     }
                 }
                 Ok(Err(error)) => eprintln!("apps: watch error: {error}"),
@@ -271,34 +310,86 @@ pub fn run(
                 fresh = true;
                 let next_files = Rc::default();
                 let rebuild = Instant::now();
-                let rebuilt = compile(Rc::clone(&next_files)).and_then(|(binary, bundle)| {
-                    if rust.is_some() {
-                        return Ok((binary, bundle));
+                let rebuilt = compile(Rc::clone(&next_files)).and_then(|bundle| {
+                    if rust.is_none() {
+                        if validator.is_none() {
+                            validator = Some(JsContext::new(
+                                JavaScriptCore::load()?,
+                                Rc::default(),
+                                Role::Main,
+                            )?);
+                        }
+                        validator.as_ref().unwrap().validate_bundle(&bundle)?;
                     }
-                    if validator.is_none() {
-                        validator = Some(JsContext::new(
-                            JavaScriptCore::load()?,
-                            Rc::default(),
-                            Role::Main,
-                        )?);
-                    }
-                    validator.as_ref().unwrap().validate_bundle(&bundle)?;
-                    Ok((binary, bundle))
+                    Ok(bundle)
                 });
                 match rebuilt {
-                    Ok(next_bundle) => {
+                    Ok(next) => {
                         files = next_files;
-                        if let Some(mut process) = child.take() {
-                            let _ = process.kill();
-                            let _ = process.wait();
-                        }
-                        if let Some(writer) = writer.take() {
-                            let _ = writer.join();
-                        }
-                        bundle = Some(next_bundle);
                         failed = false;
-                        launch = true;
-                        println!("apps: restarted in {} ms", rebuild.elapsed().as_millis());
+                        // WARNING: the running main side keeps its code, so only pages and the chunks that only
+                        // pages load may change without a restart.
+                        let pages = child.is_some()
+                            && binary.is_some()
+                            && running.as_ref().is_some_and(|running| {
+                                let chunks: BTreeSet<_> = main_chunks(running)
+                                    .into_iter()
+                                    .chain(main_chunks(&next))
+                                    .collect();
+                                let main = |(name, _): &(&String, &String)| {
+                                    !name.ends_with(".html")
+                                        && (!name.starts_with("script-") || chunks.contains(*name))
+                                };
+                                running.iter().filter(main).eq(next.iter().filter(main))
+                            });
+                        if pages
+                            && running
+                                .as_ref()
+                                .is_some_and(|running| running.iter().eq(next.iter()))
+                        {
+                            continue;
+                        }
+                        let next = Bundle {
+                            files: next,
+                            ..Default::default()
+                        };
+                        if pages {
+                            if let Some(writer) = writer.take() {
+                                input = writer.join().ok().and_then(Result::ok);
+                            }
+                            let sent = input.as_mut().is_some_and(|input| {
+                                let mut input = BufWriter::new(input);
+                                serde_json::to_writer(&mut input, &next).is_ok()
+                                    && input.write_all(b"\n").and_then(|()| input.flush()).is_ok()
+                            });
+                            if sent {
+                                running = Some(next.files);
+                                println!(
+                                    "apps: reloaded pages in {} ms",
+                                    rebuild.elapsed().as_millis()
+                                );
+                                continue;
+                            }
+                        }
+                        match binary.take().map_or_else(build, Ok) {
+                            Ok(path) => {
+                                binary = Some(path);
+                                if let Some(mut process) = child.take() {
+                                    let _ = process.kill();
+                                    let _ = process.wait();
+                                }
+                                if let Some(writer) = writer.take() {
+                                    let _ = writer.join();
+                                }
+                                bundle = Some(next.files);
+                                launch = true;
+                                println!("apps: restarted in {} ms", rebuild.elapsed().as_millis());
+                            }
+                            Err(error) => {
+                                failed = true;
+                                eprintln!("apps: {error:#}");
+                            }
+                        }
                     }
                     Err(error) => {
                         files

@@ -3,7 +3,7 @@
 A tiny, fast, memory-safe Electron alternative with a compatible API.
  
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
-- `apps run --watch` / `-W`: Restart when the entry or its imports change. Watching is off by default.
+- `apps run --watch` / `-W`: Restart when the main code changes, and reload the pages when only page code changes. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.
 - `apps run --enable-devtools-mcp [--devtools-mcp-port <port>]`: Serve devtools to agents on `127.0.0.1`. The default port is `19876`, and `0` picks a free port. It is off by default.
 - `apps run main.js a b` or `apps run main.js -- --flag`: Pass arguments to the app. `process.argv` is `[execPath, entry, ...arguments]`.

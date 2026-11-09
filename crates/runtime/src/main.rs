@@ -57,22 +57,25 @@ fn main() {
                 directory = Some(std::path::PathBuf::from(&os));
             }
         }
-        let bundle = if bundle_stdin {
+        let (bundle, input) = if bundle_stdin {
             anyhow::ensure!(
                 directory.is_none(),
                 "Cannot use a directory with --bundle-stdin"
             );
-            let bundle = apps_runtime::bundle::from_json(std::io::stdin().lock())
+            let (bundle, input) = apps_runtime::bundle::from_stdin()
                 .context("Cannot read the app bundle from stdin")?;
             anyhow::ensure!(bundle.files.contains_key("app.js"), "Missing app.js");
-            bundle
+            (bundle, Some(input))
         } else {
             let directory = directory.unwrap_or(home);
             let mut bundle = apps_runtime::bundle::read(&directory)?;
             bundle.packaged |= packaged;
-            bundle
+            (bundle, None)
         };
         let app = apps_runtime::desktop::Desktop::from_bundle(bundle)?;
+        if let Some(input) = input {
+            app.reload_from(input);
+        }
         if check {
             app.check()
         } else {

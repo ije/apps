@@ -152,6 +152,10 @@ An `OffscreenCanvas` and an `ImageBitmap` keep their pixels in a detached `apps-
 bash scripts/build-ffmpeg.sh
 ```
 
+## Watch
+
+`apps run` sends the bundle to the app on stdin as one line of JSON. With `--watch`, it compiles the app again after a change and compares the new bundle with the running one. Pages and the script chunks that only pages load can change while the app runs: chunks that app.js names, and the chunks they name, belong to main. When only those changed, the new bundle goes on stdin as one more line, and each window loads its `apps:///` page again with the new files. Any other change restarts the app. A Rust app runs Cargo again only after a change to a `.rs` file, `Cargo.toml` or `Cargo.lock`. The runtime moves the pipe off fd 0 and puts `/dev/null` there, so child processes that inherit stdin get no bundles.
+
 ## FPS HUD
 
 `crates/perfhud` (`apps-perfhud`) is the FPS HUD that `apps run` shows on Cmd+Alt+F. The runtime loads the library next to its executable, and `apps build` never ships it, so built apps keep only the small hook in `crates/runtime/src/render/hud.rs`.

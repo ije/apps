@@ -136,16 +136,22 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
     };
     let dev =
         !resources.join("app.bundle").is_file() && std::env::var_os("APPS_RUST_DEV").is_some();
-    let bundle: Bundle = if dev {
+    let (bundle, input) = if dev {
         if let Some(path) = std::env::var_os("APPS_RUST_LIBRARIES") {
             let _ = DEV_LIBRARIES.set(path.into());
         }
-        crate::bundle::from_json(std::io::stdin().lock())
-            .context("Cannot read renderer bundle from apps run")?
+        let (bundle, input) =
+            crate::bundle::from_stdin().context("Cannot read renderer bundle from apps run")?;
+        (bundle, Some(input))
     } else {
-        crate::bundle::read(&resources).context("Start this app with apps run or apps build")?
+        let bundle = crate::bundle::read(&resources)
+            .context("Start this app with apps run or apps build")?;
+        (bundle, None)
     };
     let desktop = bootstrap(bundle, setup)?;
+    if let Some(input) = input {
+        desktop.reload_from(input);
+    }
     let mcp = if dev {
         std::env::var("APPS_RUST_MCP_PORT")
             .ok()

@@ -69,7 +69,7 @@ mod process {
             let root = directory.path().canonicalize().unwrap().join("project");
             fs::create_dir(&root).unwrap();
             let runtime = directory.path().join("runtime");
-            fs::write(&runtime, "#!/bin/sh\ncat > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$*\" >> \"$APPS_RUN_LOG\"\nexit \"${APPS_RUN_EXIT:-0}\"\n").unwrap();
+            fs::write(&runtime, "#!/bin/sh\nhead -n 1 > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$*\" >> \"$APPS_RUN_LOG\"\nexit \"${APPS_RUN_EXIT:-0}\"\n").unwrap();
             fs::set_permissions(runtime, fs::Permissions::from_mode(0o755)).unwrap();
             Self {
                 directory,
@@ -289,6 +289,50 @@ mod process {
     }
 
     #[test]
+    fn watch_reloads_pages_and_restarts_for_main_changes() {
+        let mut app = App::new();
+        let reloads = app.directory.path().join("reloads");
+        fs::write(
+            app.directory.path().join("runtime"),
+            "#!/bin/sh\nhead -n 1 > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$*\" >> \"$APPS_RUN_LOG\"\nexec cat > \"$APPS_RUN_RELOADS\"\n",
+        )
+        .unwrap();
+        let entry = app.root.join("index.js");
+        let main =
+            "import {BrowserWindow} from 'electron'; new BrowserWindow().loadFile('index.html');";
+        fs::write(&entry, main).unwrap();
+        fs::write(
+            app.root.join("index.html"),
+            "<script type=module src=./page.js></script>",
+        )
+        .unwrap();
+        fs::write(app.root.join("page.js"), "console.log('page 1');").unwrap();
+        app.child = Some(
+            app.command()
+                .arg("--watch")
+                .env("APPS_RUN_RELOADS", &reloads)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        app.wait(1);
+        fs::write(app.root.join("page.js"), "console.log('page 2');").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reloaded = loop {
+            let text = fs::read_to_string(&reloads).unwrap_or_default();
+            if let Some(line) = text.lines().next().filter(|_| text.ends_with('\n')) {
+                break serde_json::from_str::<apps_runtime::bundle::Bundle>(line).unwrap();
+            }
+            assert!(Instant::now() < deadline, "Expected a reload");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(reloaded.files.values().any(|code| code.contains("page 2")));
+        assert_eq!(app.launches().lines().count(), 1);
+        fs::write(&entry, format!("{main} console.log('main 2');")).unwrap();
+        app.wait(2);
+    }
+
+    #[test]
     fn watch_waits_for_a_fix_when_the_first_build_fails() {
         let mut app = App::new();
         let entry = app.root.join("index.js");
@@ -351,7 +395,7 @@ mod process {
             let mut app = App::new();
             fs::write(
                 app.directory.path().join("runtime"),
-                "#!/bin/sh\ncat > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$$\" >> \"$APPS_RUN_LOG\"\nexec sleep 30\n",
+                "#!/bin/sh\nhead -n 1 > \"$APPS_RUN_BUNDLE\"\nprintf '%s\\n' \"$$\" >> \"$APPS_RUN_LOG\"\nexec sleep 30\n",
             )
             .unwrap();
             let entry = app.root.join("index.js");

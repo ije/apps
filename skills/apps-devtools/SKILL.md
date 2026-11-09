@@ -16,7 +16,7 @@ apps run --enable-devtools-mcp --devtools-mcp-port 0
 ```
 
 Read the port from the output line `apps: devtools MCP server at http://127.0.0.1:<port>/mcp`.
-Add `--watch` to restart on file changes. The port stays the same after a restart.
+Add `--watch` to restart on main code changes and reload pages on page code changes. The port stays the same after a restart.
 Stop the app when you are done.
 
 ## Call a tool

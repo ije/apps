@@ -330,6 +330,29 @@ pub fn from_json(mut input: impl std::io::Read) -> Result<Bundle> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+// WARNING: `apps run` writes a bundle per line on stdin: the app's first, then one after each change that only pages
+// see. The pipe moves off fd 0, so child processes that inherit stdin never read the bundles or wait on the open pipe.
+pub fn from_stdin() -> Result<(Bundle, impl std::io::BufRead + Send + 'static)> {
+    #[cfg(unix)]
+    let input = unsafe {
+        use std::os::fd::FromRawFd;
+        let fd = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 64);
+        ensure!(fd >= 0, "Cannot read stdin");
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if null >= 0 {
+            libc::dup2(null, 0);
+            libc::close(null);
+        }
+        fs::File::from_raw_fd(fd)
+    };
+    #[cfg(not(unix))]
+    let input = std::io::stdin();
+    let mut input = std::io::BufReader::new(input);
+    let mut line = Vec::new();
+    std::io::BufRead::read_until(&mut input, b'\n', &mut line)?;
+    Ok((serde_json::from_slice(&line)?, input))
+}
+
 pub fn read(directory: &Path) -> Result<Bundle> {
     let directory = if directory.join("Contents/Resources").is_dir() {
         directory.join("Contents/Resources")
