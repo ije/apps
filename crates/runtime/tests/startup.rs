@@ -46,6 +46,58 @@ fn runs_a_streamed_bundle_with_project_assets_and_metadata() {
 }
 
 #[test]
+fn runs_runtime_scripts_and_app_code_from_bundled_bytecode() {
+    let directory = tempfile::tempdir().unwrap();
+    let define = |code: &str| {
+        let definition = serde_json::json!({
+            "id":0,"code":code,"imports":[],"exports":[],"stars":[],"commonjs":false
+        });
+        format!("$appsDefine({definition});")
+    };
+    // Page chunks hold the module loader like bundled ones, which reads `this` of page scripts.
+    let chunk = |code: &str| {
+        apps_runtime::bundle::script_source(
+            &bbtree::unsync::BBTreeMap::from([("app.js".into(), define(code))]),
+            true,
+        )
+    };
+    let files = bbtree::unsync::BBTreeMap::from([
+        ("app.js".into(), define("__apps.app.whenReady().then(() => new __apps.BrowserWindow().loadFile('apps:///page.html'));")),
+        ("page.html".into(), "<h1>Bytecode</h1><script type='preload' src='apps:///script-1.js'></script><script type='module' src='apps:///script-0.js'></script>".into()),
+        ("script-0.js".into(), chunk("if(document.querySelector('h1').textContent!=='Bytecode'||new URL('a','https://b.c/').href!=='https://b.c/a')throw Error('renderer');")),
+        ("script-1.js".into(), chunk("if(!new TextEncoder().encode('x').length)throw Error('preload');")),
+    ]);
+    let main = apps_runtime::bundle::script_source(&files, true);
+    let app = [
+        ("app.js", main.as_str()),
+        ("script-0.js", files["script-0.js"].as_str()),
+        ("script-1.js", files["script-1.js"].as_str()),
+    ];
+    let bytecode = apps_runtime::jsc::bytecode(0, &app).unwrap();
+    for name in [
+        "apps:bootstrap",
+        "apps:dom",
+        "apps:node",
+        "app.js",
+        "script-0.js",
+        "script-1.js",
+    ] {
+        assert!(bytecode.iter().any(|(script, _)| *script == name), "{name}");
+    }
+    apps_runtime::bundle::write(&directory.path().join("app.bundle"), &files, &bytecode).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_apps-runtime"))
+        .args([directory.path().to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("checked 1 window(s)"));
+}
+
+#[test]
 fn rejects_invalid_streamed_bundles_and_conflicting_arguments() {
     for (input, error) in [
         ("{", "Cannot read the app bundle from stdin"),

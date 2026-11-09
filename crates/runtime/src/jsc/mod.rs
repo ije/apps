@@ -17,13 +17,34 @@ use std::{
 pub(crate) type Ptr = *mut c_void;
 type Callback = unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr;
 
+// Runtime scripts that engines ran, by URL, and scripts of the app bundle, by name, with their bytecode once it is
+// built, and whether a thread builds it.
+type Scripts = (
+    Vec<(&'static str, &'static str, Option<&'static [u8]>)>,
+    bool,
+);
+static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new((Vec::new(), false));
+
 pub struct JavaScriptCore {
     _library: Library,
     group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: Option<unsafe extern "C" fn(Ptr)>,
-    evaluate_no_copy: Option<unsafe extern "C" fn(Ptr, *const c_char, usize, Ptr, *mut Ptr) -> Ptr>,
+    evaluate_latin1: Option<
+        unsafe extern "C" fn(
+            Ptr,
+            *const c_char,
+            usize,
+            Ptr,
+            Ptr,
+            *const u8,
+            usize,
+            *mut Ptr,
+        ) -> Ptr,
+    >,
+    create_bytecode:
+        Option<unsafe extern "C" fn(Ptr, *const c_char, usize, Ptr, *mut usize) -> *mut u8>,
     pub(crate) busy: std::cell::Cell<std::time::Duration>,
     busy_mark: std::cell::Cell<(std::time::Instant, std::time::Duration)>,
     burst: std::cell::Cell<bool>,
@@ -213,8 +234,9 @@ impl JavaScriptCore {
                     .get(b"JSContextGroupShrinkFootprint\0")
                     .ok()
                     .map(|s| *s),
-                evaluate_no_copy: library
-                    .get(b"JSEvaluateScriptLatin1NoCopy\0")
+                evaluate_latin1: library.get(b"JSEvaluateScriptLatin1\0").ok().map(|s| *s),
+                create_bytecode: library
+                    .get(b"JSScriptCreateBytecodeLatin1\0")
                     .ok()
                     .map(|s| *s),
                 busy: Default::default(),
@@ -377,6 +399,105 @@ impl Drop for JavaScriptCore {
     fn drop(&mut self) {
         unsafe { (self.group_release)(self.group) };
     }
+}
+
+// Compiles a script and all of its functions into bytecode, which is never freed, because decoded code points into it.
+fn create_bytecode(
+    api: &JavaScriptCore,
+    ctx: Ptr,
+    url: &str,
+    source: &str,
+) -> Result<&'static [u8]> {
+    let create = api
+        .create_bytecode
+        .context("This JavaScriptCore can't build bytecode")?;
+    let name = api.string(url);
+    let mut size = 0;
+    let data = unsafe { create(ctx, source.as_ptr().cast(), source.len(), name, &mut size) };
+    unsafe { (api.string_release)(name) };
+    Ok(if data.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, size) }
+    })
+}
+
+// Builds the bytecode of the runtime scripts that have none yet, in a VM of its own.
+fn build_bytecode() -> Result<()> {
+    let api = JavaScriptCore::load()?;
+    let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
+    loop {
+        let next = {
+            let mut scripts = SCRIPTS.lock().unwrap();
+            let next = scripts.0.iter().find(|script| script.2.is_none());
+            let next = next.map(|script| (script.0, script.1));
+            scripts.1 = next.is_some();
+            next
+        };
+        let Some((url, source)) = next else { break };
+        let bytecode = create_bytecode(&api, ctx, url, source)?;
+        let mut scripts = SCRIPTS.lock().unwrap();
+        if let Some(script) = scripts.0.iter_mut().find(|script| script.0 == url) {
+            script.2 = Some(bytecode);
+        }
+    }
+    unsafe { (api.release)(ctx) };
+    Ok(())
+}
+
+// The bytecode of the runtime scripts that apps with these disabled features run, and of the app's own ASCII scripts,
+// for `apps build --bytecode`.
+pub fn bytecode<'a>(
+    disabled: u32,
+    app: &[(&'a str, &'a str)],
+) -> Result<Vec<(&'a str, &'static [u8])>> {
+    SCRIPTS.lock().unwrap().1 = true;
+    let api = JavaScriptCore::load()?;
+    for role in [Role::Main, Role::Renderer(1)] {
+        let host = Rc::new(RefCell::new(Host {
+            disabled,
+            ..Host::default()
+        }));
+        let doc = crate::dom::Document::parse("<html><body></body></html>");
+        host.borrow_mut()
+            .pages
+            .insert(1, crate::host::Page { doc, dirty: false });
+        JsContext::new(api.clone(), host, role)?;
+    }
+    build_bytecode()?;
+    let mut bytecode: Vec<(&str, &[u8])> = SCRIPTS
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .filter_map(|script| Some((script.0, script.2?)))
+        .collect();
+    let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
+    for &(name, source) in app.iter().filter(|(_, source)| source.is_ascii()) {
+        bytecode.push((name, create_bytecode(&api, ctx, name, source)?));
+    }
+    unsafe { (api.release)(ctx) };
+    bytecode.retain(|(_, data)| !data.is_empty());
+    Ok(bytecode)
+}
+
+// WARNING: the source and the bytecode must live as long as the process, because JSC reads both in place.
+pub(crate) fn add_bytecode(name: &'static str, source: &'static str, bytecode: &'static [u8]) {
+    SCRIPTS
+        .lock()
+        .unwrap()
+        .0
+        .push((name, source, Some(bytecode)));
+}
+
+// The bytecode of a script of the app bundle, by where its source is.
+fn bundled(source: &[u8]) -> Option<&'static [u8]> {
+    let scripts = SCRIPTS.lock().unwrap();
+    let script = scripts
+        .0
+        .iter()
+        .find(|script| !source.is_empty() && ptr::eq(script.1.as_bytes(), source))?;
+    script.2.filter(|bytecode| !bytecode.is_empty())
 }
 
 type Binding = (
@@ -640,11 +761,27 @@ unsafe extern "C" fn chunk(
     // WARNING: `JSEvaluateScript` keeps its own copy of the source, as UTF-16 if it holds a NUL or any non-ASCII
     // byte. JSC points at these bytes instead, so they are never released. Mapped pages stay clean, so they don't
     // count in the footprint, and windows and workers share them.
-    let result = if let Some(evaluate) = api.evaluate_no_copy
+    let result = if let Some(evaluate) = api.evaluate_latin1
         && source.is_ascii()
     {
+        let bytecode = bundled(&source).unwrap_or_default();
         let source = std::mem::ManuallyDrop::new(source);
-        unsafe { evaluate(ctx, source.as_ptr().cast(), source.len(), url, exception) }
+        unsafe {
+            evaluate(
+                ctx,
+                source.as_ptr().cast(),
+                source.len(),
+                ptr::null_mut(),
+                url,
+                if bytecode.is_empty() {
+                    ptr::null()
+                } else {
+                    bytecode.as_ptr()
+                },
+                bytecode.len(),
+                exception,
+            )
+        }
     } else {
         let script = api.string(&String::from_utf8_lossy(&source));
         let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
@@ -1845,32 +1982,32 @@ impl JsContext {
                 );
                 (engine.api.string_release)(name);
             }
-            engine.eval(&js!("node/ffi.js"), "apps:ffi")?;
-            engine.eval(&js!("node/sqlite.js"), "apps:sqlite")?;
-            engine.eval(&js!("events.js"), "apps:events")?;
-            engine.eval(&js!("node/child_process.js"), "apps:child_process")?;
-            engine.eval(&js!("web/serve.js"), "apps:serve")?;
-            engine.eval(&js!("node/index.js"), "apps:node")?;
-            engine.eval(&js!("node/stream.js"), "apps:node-streams")?;
-            engine.eval(&js!("node/io.js"), "apps:node-io")?;
-            engine.eval(&js!("node/http.js"), "apps:node-http")?;
-            engine.eval(&js!("node/net.js"), "apps:net")?;
-            engine.eval(&js!("node/pty.js"), "apps:pty")?;
-            engine.eval(&js!("node/compat.js"), "apps:node-compat")?;
+            engine.run(js!("node/ffi.js"), "apps:ffi")?;
+            engine.run(js!("node/sqlite.js"), "apps:sqlite")?;
+            engine.run(js!("events.js"), "apps:events")?;
+            engine.run(js!("node/child_process.js"), "apps:child_process")?;
+            engine.run(js!("web/serve.js"), "apps:serve")?;
+            engine.run(js!("node/index.js"), "apps:node")?;
+            engine.run(js!("node/stream.js"), "apps:node-streams")?;
+            engine.run(js!("node/io.js"), "apps:node-io")?;
+            engine.run(js!("node/http.js"), "apps:node-http")?;
+            engine.run(js!("node/net.js"), "apps:net")?;
+            engine.run(js!("node/pty.js"), "apps:pty")?;
+            engine.run(js!("node/compat.js"), "apps:node-compat")?;
         }
-        engine.eval(&js!("web/streams.js"), "apps:streams")?;
-        engine.eval(&js!("web/crypto.js"), "apps:crypto")?;
-        engine.eval(&js!("web/index.js"), "apps:web")?;
-        engine.eval(&js!("web/platform.js"), "apps:platform")?;
-        engine.eval(&js!("bridge.js"), "apps:bridge")?;
-        engine.eval(&js!("browser.js"), "apps:browser")?;
-        engine.eval(&js!("electron.js"), "apps:electron")?;
-        engine.eval(&js!("web/worker.js"), "apps:worker")?;
-        engine.eval(&js!("web/environment.js"), "apps:browser-environment")?;
-        engine.eval(&js!("inspect.js"), "apps:inspect")?;
-        engine.eval(&js!("bootstrap.js"), "apps:bootstrap")?;
-        engine.eval(&js!("web/wasm.js"), "apps:wasm")?;
-        engine.eval(&js!("web/file_system.js"), "apps:file-system")?;
+        engine.run(js!("web/streams.js"), "apps:streams")?;
+        engine.run(js!("web/crypto.js"), "apps:crypto")?;
+        engine.run(js!("web/index.js"), "apps:web")?;
+        engine.run(js!("web/platform.js"), "apps:platform")?;
+        engine.run(js!("bridge.js"), "apps:bridge")?;
+        engine.run(js!("browser.js"), "apps:browser")?;
+        engine.run(js!("electron.js"), "apps:electron")?;
+        engine.run(js!("web/worker.js"), "apps:worker")?;
+        engine.run(js!("web/environment.js"), "apps:browser-environment")?;
+        engine.run(js!("inspect.js"), "apps:inspect")?;
+        engine.run(js!("bootstrap.js"), "apps:bootstrap")?;
+        engine.run(js!("web/wasm.js"), "apps:wasm")?;
+        engine.run(js!("web/file_system.js"), "apps:file-system")?;
         let name = engine.api.string("__appsRejection");
         unsafe {
             let callback = (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut());
@@ -1893,11 +2030,11 @@ impl JsContext {
         )?;
         if matches!(role, Role::Renderer(_)) {
             if enabled("webgpu") {
-                engine.eval(&js!("web/gpu.js"), "apps:gpu")?;
+                engine.run(js!("web/gpu.js"), "apps:gpu")?;
             }
-            engine.eval(&js!("dom.js"), "apps:dom")?;
+            engine.run(js!("dom.js"), "apps:dom")?;
             if !enabled("jsExecute") {
-                engine.eval(&js!("lockdown.js"), "apps:lockdown")?;
+                engine.run(js!("lockdown.js"), "apps:lockdown")?;
             }
         }
         Ok(engine)
@@ -1905,6 +2042,61 @@ impl JsContext {
 
     pub fn eval(&self, source: &str, url: &str) -> Result<String> {
         self.evaluate(source, url, ptr::null_mut())
+    }
+
+    // Runs a runtime script, which JSC reads in place. When a second engine runs it, a thread builds its bytecode, and
+    // later engines of the process decode that instead of compiling the script.
+    fn run(&self, source: &'static str, url: &'static str) -> Result<()> {
+        let Some(evaluate) = self.api.evaluate_latin1 else {
+            return self.eval(source, url).map(drop);
+        };
+        let (bytecode, build) = {
+            let mut scripts = SCRIPTS.lock().unwrap();
+            let found = scripts
+                .0
+                .iter()
+                .find(|script| script.0 == url)
+                .map(|script| script.2);
+            if found.is_none() {
+                scripts.0.push((url, source, None));
+            }
+            let build = found == Some(None) && !scripts.1;
+            scripts.1 |= build;
+            (found.flatten().unwrap_or_default(), build)
+        };
+        if build {
+            let _ = std::thread::Builder::new()
+                .name("apps-bytecode".into())
+                .spawn(build_bytecode);
+        }
+        let source_url = self.api.string(url);
+        let mut exception = ptr::null_mut();
+        let start = std::time::Instant::now();
+        let result = unsafe {
+            evaluate(
+                self.ctx,
+                source.as_ptr().cast(),
+                source.len(),
+                ptr::null_mut(),
+                source_url,
+                if bytecode.is_empty() {
+                    ptr::null()
+                } else {
+                    bytecode.as_ptr()
+                },
+                bytecode.len(),
+                &mut exception,
+            )
+        };
+        self.api.busy.set(self.api.busy.get() + start.elapsed());
+        unsafe { (self.api.string_release)(source_url) };
+        if !exception.is_null() {
+            let message = self.api.text(self.ctx, exception);
+            self.log(url, &message);
+            bail!("{message}");
+        }
+        anyhow::ensure!(!result.is_null(), "JSC returned no value");
+        Ok(())
     }
 
     pub fn eval_page(&self, source: &str, url: &str) -> Result<String> {
@@ -1936,17 +2128,33 @@ impl JsContext {
         {
             self.sources.borrow_mut().insert(url.into(), source.into());
         }
-        let script = self.api.string(source);
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
-        let result =
-            unsafe { (self.api.evaluate)(self.ctx, script, this, source_url, 1, &mut exception) };
+        let result = match (self.api.evaluate_latin1, bundled(source.as_bytes())) {
+            (Some(evaluate), Some(bytecode)) => unsafe {
+                evaluate(
+                    self.ctx,
+                    source.as_ptr().cast(),
+                    source.len(),
+                    this,
+                    source_url,
+                    bytecode.as_ptr(),
+                    bytecode.len(),
+                    &mut exception,
+                )
+            },
+            _ => {
+                let script = self.api.string(source);
+                let result = unsafe {
+                    (self.api.evaluate)(self.ctx, script, this, source_url, 1, &mut exception)
+                };
+                unsafe { (self.api.string_release)(script) };
+                result
+            }
+        };
         self.api.busy.set(self.api.busy.get() + start.elapsed());
-        unsafe {
-            (self.api.string_release)(script);
-            (self.api.string_release)(source_url);
-        }
+        unsafe { (self.api.string_release)(source_url) };
         if !exception.is_null() {
             let message = self.api.text(self.ctx, exception);
             self.log(url, &message);
@@ -2082,7 +2290,20 @@ impl JsContext {
 
     pub fn load_bundle(&self, files: &BBTreeMap<String, String>, entry: &str) -> Result<()> {
         self.install(files)?;
-        self.eval_page(&crate::bundle::script_source(files, true), entry)
+        let mut source: std::borrow::Cow<str> =
+            std::borrow::Cow::Owned(crate::bundle::script_source(files, true));
+        if let Some(script) = SCRIPTS
+            .lock()
+            .unwrap()
+            .0
+            .iter_mut()
+            .find(|script| script.0 == entry)
+        {
+            // WARNING: JSC reads the main script in place, from its bytecode, so it stays for the rest of the process.
+            script.1 = Box::leak(source.into_owned().into_boxed_str());
+            source = std::borrow::Cow::Borrowed(script.1);
+        }
+        self.eval_page(&source, entry)
             .context("Cannot execute the app bundle")?;
         while self.eval_page(NEXT, entry)? == "true" {}
         Ok(())

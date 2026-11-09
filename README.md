@@ -8,7 +8,8 @@ A tiny, fast, memory-safe Electron alternative with a compatible API.
 - `apps run --enable-devtools-mcp [--devtools-mcp-port <port>]`: Serve devtools to agents on `127.0.0.1`. The default port is `19876`, and `0` picks a free port. It is off by default.
 - `apps run main.js a b` or `apps run main.js -- --flag`: Pass arguments to the app. `process.argv` is `[execPath, entry, ...arguments]`.
 - `apps skill`: Print the agent skill that explains the devtools server.
-- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>]`: Create a production app with Bun's JavaScriptCore. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
+- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>] [--bytecode]`: Create a production app with Bun's JavaScriptCore. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
+- `apps build --bytecode`: Also pack the bytecode of the app's scripts and of the runtime, so the app starts faster and uses less memory. The bundle grows by about 2.6 MB plus about 1.5 times the size of the app's JavaScript, and the build must be for this machine.
 
 The devtools server gives agents screenshots, DOM, JavaScript evaluation, console, mouse and keyboard input, memory, CPU and frame profiles, and a breakpoint debugger that uses source maps.
 Agents call the tools with plain HTTP (`curl -s http://127.0.0.1:<port>/` lists them), or connect an MCP client to `http://127.0.0.1:<port>/mcp`.

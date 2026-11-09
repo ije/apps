@@ -12,6 +12,7 @@ pub fn run(
     runtime: &Path,
     rust: Option<&Path>,
     target: BuildTarget,
+    bytecode: bool,
 ) -> Result<()> {
     let started = Instant::now();
     if rust.is_none() {
@@ -57,8 +58,16 @@ pub fn run(
     if let Some(path) = &binary {
         target.validate_binary(path)?;
     }
-    let (bytes, _) =
-        packaging::package_app(out, &files, runtime, root, true, target, binary.as_deref())?;
+    let (bytes, _) = packaging::package_app(
+        out,
+        &files,
+        runtime,
+        root,
+        true,
+        target,
+        binary.as_deref(),
+        bytecode,
+    )?;
     println!(
         "apps: built {} bytes in {} ms → {}",
         bytes,

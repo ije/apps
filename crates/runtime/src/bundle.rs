@@ -219,7 +219,11 @@ fn check_entry(files: &BBTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
+pub fn write(
+    path: &Path,
+    files: &BBTreeMap<String, String>,
+    bytecode: &[(&str, &[u8])],
+) -> Result<usize> {
     #[derive(Serialize)]
     struct Packed<'a> {
         files: Vec<(&'a str, &'a [u8])>,
@@ -286,6 +290,19 @@ pub fn write(path: &Path, files: &BBTreeMap<String, String>) -> Result<usize> {
     );
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
+    // WARNING: JSC reads bytecode in place and needs it 8-byte aligned, so each one starts at such an offset of the
+    // file after the index of their URLs and sizes.
+    if !bytecode.is_empty() {
+        let index: Vec<_> = bytecode
+            .iter()
+            .map(|(url, data)| (*url, data.len()))
+            .collect();
+        bytes.extend(postcard::to_allocvec(&index)?);
+        for (_, data) in bytecode {
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+            bytes.extend_from_slice(data);
+        }
+    }
     // WARNING: running apps map app.bundle, so a new bundle replaces the file instead of rewriting it.
     let temporary = path.with_extension("bin.tmp");
     fs::write(&temporary, &bytes)
@@ -341,7 +358,25 @@ pub fn read(directory: &Path) -> Result<Bundle> {
         );
         let (mapped, rest): (Mapped, _) =
             postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.bundle data")?;
-        ensure!(rest.is_empty(), "Trailing app.bundle data");
+        let mut bytecode = Vec::new();
+        if !rest.is_empty() {
+            let (index, rest): (Vec<(&str, usize)>, _) =
+                postcard::take_from_bytes(rest).context("Invalid app.bundle data")?;
+            ensure!(!index.is_empty(), "Trailing app.bundle data");
+            let mut at = bytes.len() - rest.len();
+            for (name, size) in index {
+                at = at.next_multiple_of(8);
+                let data = bytes.get(at..).and_then(|data| data.get(..size));
+                let data = data.context("Invalid app.bundle data")?;
+                ensure!(
+                    data.as_ptr().cast::<u64>().is_aligned(),
+                    "Invalid app.bundle data"
+                );
+                bytecode.push((name, at..at + size));
+                at += size;
+            }
+            ensure!(at == bytes.len(), "Trailing app.bundle data");
+        }
         let mut bundle = Bundle {
             pages: mapped.pages,
             ..Bundle::default()
@@ -359,6 +394,18 @@ pub fn read(directory: &Path) -> Result<Bundle> {
                 bundle.files.insert(name, source).is_some()
             };
             ensure!(!duplicate, "Duplicate bundle key");
+        }
+        // WARNING: JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
+        let mapped = |data: &[u8]| unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        for (name, range) in bytecode {
+            let source = bundle.scripts.get(name).map(|source| mapped(source));
+            let source = source.and_then(|source| std::str::from_utf8(source).ok());
+            crate::jsc::add_bytecode(
+                Box::leak(name.into()),
+                source.unwrap_or(""),
+                mapped(&bytes[range]),
+            );
+            std::mem::forget(bytes.clone());
         }
         for (_, doc) in &mut bundle.pages {
             ensure!(!doc.nodes.is_empty(), "Missing document root");
@@ -779,7 +826,7 @@ mod tests {
             ("app.js".into(), "$appsDefine({id:0});".into()),
             ("page-0.html".into(), html.into()),
         ]);
-        write(&dir.path().join("app.bundle"), &files).unwrap();
+        write(&dir.path().join("app.bundle"), &files, &[]).unwrap();
         let mut bundle = read(dir.path()).unwrap();
         assert_eq!(bundle.files.len(), 1);
         let doc = bundle.pages.remove("page-0.html").unwrap();
@@ -849,7 +896,7 @@ mod tests {
             ("app.js".into(), String::new()),
             ("page-0.html".into(), html),
         ]);
-        let size = write(&dir.path().join("app.bundle"), &files).unwrap();
+        let size = write(&dir.path().join("app.bundle"), &files, &[]).unwrap();
         assert!(
             size < 10_000,
             "Nested parent selectors were duplicated: {size}"
@@ -871,14 +918,19 @@ mod tests {
             ("app.js".into(), "$appsDefine({id:0});".into()),
             ("script-0.js".into(), "globalThis.chunk = '你好';".into()),
         ]);
-        write(&path, &files).unwrap();
+        write(&path, &files, &[]).unwrap();
         let bundle = read(dir.path()).unwrap();
         assert_eq!(bundle.files.keys().collect::<Vec<_>>(), ["app.js"]);
         assert_eq!(
             &bundle.scripts["script-0.js"][..],
             files["script-0.js"].as_bytes()
         );
-        write(&path, &BBTreeMap::from([("app.js".into(), String::new())])).unwrap();
+        write(
+            &path,
+            &BBTreeMap::from([("app.js".into(), String::new())]),
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             &bundle.scripts["script-0.js"][..],
             files["script-0.js"].as_bytes()
@@ -893,7 +945,7 @@ mod tests {
             ("app.js".into(), "const x = '你好';".into()),
             ("page-0.html".into(), "<body>hello</body>".into()),
         ]);
-        write(&path, &files).unwrap();
+        write(&path, &files, &[]).unwrap();
         let bytes = fs::read(&path).unwrap();
         for length in 0..bytes.len() {
             fs::write(&path, &bytes[..length]).unwrap();

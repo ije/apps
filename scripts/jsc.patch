@@ -186,30 +186,93 @@ index a530e481c..aee05f9ac 100644
      JSAPIGlobalObject(VM&, Structure*);
  
 diff --git a/Source/JavaScriptCore/API/JSBase.cpp b/Source/JavaScriptCore/API/JSBase.cpp
-index f96eb07c4..63fc8a795 100644
+index f96eb07c4..023862c18 100644
 --- a/Source/JavaScriptCore/API/JSBase.cpp
 +++ b/Source/JavaScriptCore/API/JSBase.cpp
-@@ -91,6 +91,19 @@ JSValueRef JSEvaluateScript(JSContextRef ctx, JSStringRef script, JSObjectRef th
+@@ -29,6 +29,8 @@
+ #include "JSBasePrivate.h"
+ 
+ #include "APICast.h"
++#include "BytecodeCacheError.h"
++#include "CachedBytecode.h"
+ #include "Completion.h"
+ #include "GCActivityCallback.h"
+ #include "JSCInlines.h"
+@@ -36,6 +38,7 @@
+ #include "ObjectConstructor.h"
+ #include "OpaqueJSString.h"
+ #include "SourceCode.h"
++#include <wtf/FileHandle.h>
+ 
+ #if ENABLE(REMOTE_INSPECTOR)
+ #include "JSGlobalObjectInspectorController.h"
+@@ -91,6 +94,65 @@ JSValueRef JSEvaluateScript(JSContextRef ctx, JSStringRef script, JSObjectRef th
      return JSEvaluateScriptInternal(locker, ctx, thisObject, source, exception);
  }
  
-+// The bytes must be Latin-1 and must outlive the VM, because the source keeps pointing at them.
-+extern "C" JS_EXPORT JSValueRef JSEvaluateScriptLatin1NoCopy(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, JSValueRef* exception);
-+JSValueRef JSEvaluateScriptLatin1NoCopy(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, JSValueRef* exception)
++namespace {
++
++class BytecodeSourceProvider final : public StringSourceProvider {
++public:
++    BytecodeSourceProvider(const String& source, const URL& url, std::span<const uint8_t> bytecode)
++        : StringSourceProvider(source, SourceOrigin { url }, SourceTaintedOrigin::Untainted, String(url.string()), TextPosition(OrdinalNumber::fromOneBasedInt(1), OrdinalNumber()), SourceProviderSourceType::Program)
++        , m_bytecode(CachedBytecode::create(std::span { const_cast<uint8_t*>(bytecode.data()), bytecode.size() }, [](const void*) { }, { }))
++    {
++        // Decoded code points into the bytes instead of copying them.
++        m_bytecode->setPayloadIsPersistent();
++    }
++
++    RefPtr<CachedBytecode> cachedBytecode() const final { return m_bytecode.copyRef(); }
++
++private:
++    Ref<CachedBytecode> m_bytecode;
++};
++
++}
++
++// The bytes must be Latin-1 and must outlive the VM, because the source keeps pointing at them. The bytecode, from
++// JSScriptCreateBytecodeLatin1 or null, must outlive every VM. JSC compiles the source when the bytecode doesn't match it.
++extern "C" JS_EXPORT JSValueRef JSEvaluateScriptLatin1(JSContextRef ctx, const char* script, size_t length, JSObjectRef thisObject, JSStringRef sourceURLString, const uint8_t* bytecode, size_t bytecodeSize, JSValueRef* exception);
++JSValueRef JSEvaluateScriptLatin1(JSContextRef ctx, const char* script, size_t length, JSObjectRef thisObject, JSStringRef sourceURLString, const uint8_t* bytecode, size_t bytecodeSize, JSValueRef* exception)
 +{
 +    JSGlobalObject* globalObject = toJS(ctx);
 +    JSLockHolder locker(globalObject->vm());
 +
 +    auto sourceURL = sourceURLString ? URL({ }, sourceURLString->string()) : URL();
-+    SourceCode source = makeSource(String(StringImpl::createWithoutCopying(std::span { script, length })), SourceOrigin { sourceURL }, SourceTaintedOrigin::Untainted, sourceURL.string(), TextPosition(OrdinalNumber::fromOneBasedInt(1), OrdinalNumber()));
++    String text(StringImpl::createWithoutCopying(std::span { script, length }));
++    SourceCode source = bytecode
++        ? SourceCode(adoptRef(*new BytecodeSourceProvider(text, sourceURL, std::span { bytecode, bytecodeSize })))
++        : makeSource(text, SourceOrigin { sourceURL }, SourceTaintedOrigin::Untainted, sourceURL.string(), TextPosition(OrdinalNumber::fromOneBasedInt(1), OrdinalNumber()));
 +
-+    return JSEvaluateScriptInternal(locker, ctx, nullptr, source, exception);
++    return JSEvaluateScriptInternal(locker, ctx, thisObject, source, exception);
++}
++
++// Compiles the script and all of its functions, and returns their bytecode in a malloc() block, or null when the
++// script has a syntax error.
++extern "C" JS_EXPORT uint8_t* JSScriptCreateBytecodeLatin1(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, size_t* size);
++uint8_t* JSScriptCreateBytecodeLatin1(JSContextRef ctx, const char* script, size_t length, JSStringRef sourceURLString, size_t* size)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++
++    auto sourceURL = sourceURLString ? URL({ }, sourceURLString->string()) : URL();
++    SourceCode source = makeSource(String(StringImpl::createWithoutCopying(std::span { script, length })), SourceOrigin { sourceURL }, SourceTaintedOrigin::Untainted, sourceURL.string(), TextPosition(OrdinalNumber::fromOneBasedInt(1), OrdinalNumber()));
++    FileSystem::FileHandle memory;
++    BytecodeCacheError error;
++    RefPtr<CachedBytecode> bytecode = generateProgramBytecode(vm, source, memory, error);
++    if (!bytecode || error.isValid())
++        return nullptr;
++    auto* copy = static_cast<uint8_t*>(malloc(bytecode->size()));
++    memcpy(copy, bytecode->span().data(), bytecode->size());
++    *size = bytecode->size();
++    return copy;
 +}
 +
  bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourceURLString, int startingLineNumber, JSValueRef* exception)
  {
      if (!ctx) {
-@@ -99,6 +112,7 @@ bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourc
+@@ -99,6 +161,7 @@ bool JSCheckScriptSyntax(JSContextRef ctx, JSStringRef script, JSStringRef sourc
      }
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -217,7 +280,7 @@ index f96eb07c4..63fc8a795 100644
  
      startingLineNumber = std::max(1, startingLineNumber);
  
-@@ -133,7 +147,7 @@ void JSGarbageCollect(JSContextRef ctx)
+@@ -133,7 +196,7 @@ void JSGarbageCollect(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -226,7 +289,7 @@ index f96eb07c4..63fc8a795 100644
  
      vm.heap.reportAbandonedObjectGraph();
  }
-@@ -146,7 +160,7 @@ void JSReportExtraMemoryCost(JSContextRef ctx, size_t size)
+@@ -146,7 +209,7 @@ void JSReportExtraMemoryCost(JSContextRef ctx, size_t size)
      }
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -235,7 +298,7 @@ index f96eb07c4..63fc8a795 100644
  
      vm.heap.deprecatedReportExtraMemory(size);
  }
-@@ -161,6 +175,7 @@ void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx)
+@@ -161,6 +224,7 @@ void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -243,7 +306,7 @@ index f96eb07c4..63fc8a795 100644
  
      vm.heap.collectNow(Sync, CollectionScope::Full);
  }
-@@ -172,6 +187,7 @@ void JSSynchronousEdenCollectForDebugging(JSContextRef ctx)
+@@ -172,6 +236,7 @@ void JSSynchronousEdenCollectForDebugging(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -251,7 +314,7 @@ index f96eb07c4..63fc8a795 100644
  
      vm.heap.collectSync(CollectionScope::Eden);
  }
-@@ -201,7 +217,7 @@ JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx)
+@@ -201,7 +266,7 @@ JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx)
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();

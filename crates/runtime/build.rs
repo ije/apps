@@ -28,7 +28,18 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                let data = miniz_oxide::deflate::compress_to_vec(&fs::read(&path).unwrap(), 10);
+                // Escapes keep the scripts ASCII, which JSC reads in place.
+                let mut text = String::new();
+                for char in fs::read_to_string(&path).unwrap().chars() {
+                    if char.is_ascii() {
+                        text.push(char);
+                    } else {
+                        for unit in char.encode_utf16(&mut [0; 2]) {
+                            text += &format!("\\u{unit:04x}");
+                        }
+                    }
+                }
+                let data = miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 10);
                 fs::write(out.join(dir).join(path.file_name().unwrap()), data).unwrap();
             }
         }

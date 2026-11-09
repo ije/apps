@@ -14,6 +14,7 @@ pub fn package_app(
     production: bool,
     target: BuildTarget,
     app_binary: Option<&Path>,
+    bytecode: bool,
 ) -> Result<(usize, PathBuf)> {
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version, identifier) =
@@ -132,8 +133,30 @@ pub fn package_app(
         stage.path().to_owned()
     };
     fs::create_dir_all(&assets)?;
+    let jsc = apps_runtime::jsc::library_path(runtime, target.platform)?;
+    let main = (bytecode && files.contains_key("app.js"))
+        .then(|| apps_runtime::bundle::script_source(files, true));
+    let bytecode = if bytecode {
+        // WARNING: bytecode is only valid for the JavaScriptCore that built it.
+        ensure!(
+            jsc == apps_runtime::jsc::library_path(
+                &std::env::current_exe()?,
+                std::env::consts::OS
+            )?,
+            "--bytecode needs the runtime and JavaScriptCore next to apps, built for this machine"
+        );
+        let app: Vec<_> = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("script-"))
+            .map(|(name, source)| (name.as_str(), source.as_str()))
+            .chain(main.as_deref().map(|main| ("app.js", main)))
+            .collect();
+        apps_runtime::jsc::bytecode(disabled, &app)?
+    } else {
+        Vec::new()
+    };
     let mut bytes = if production {
-        apps_runtime::bundle::write(&assets.join("app.bundle"), files)?
+        apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?
     } else {
         for (name, source) in files {
             if name == "native.json" {
@@ -182,7 +205,6 @@ pub fn package_app(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     }
-    let jsc = apps_runtime::jsc::library_path(runtime, target.platform)?;
     target
         .validate_binary(&jsc)
         .context("JavaScriptCore does not match the build target")?;
@@ -397,6 +419,7 @@ mod tests {
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
+                    false,
                 )
                 .unwrap();
                 let filename = if cfg!(windows) {
@@ -556,6 +579,7 @@ mod tests {
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
+                    false,
                 )
                 .unwrap();
                 assert_eq!(executable.file_stem().unwrap(), name);
@@ -591,7 +615,16 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            package_app(&out, &files, &runtime, dir.path(), true, target, None)
+            package_app(
+                &out,
+                &files,
+                &runtime,
+                dir.path(),
+                true,
+                target,
+                None,
+                false,
+            )
         };
         let error = build(r#"["video"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
@@ -643,7 +676,16 @@ mod tests {
                     format!(r#"{{"features":{features}}}"#),
                 ),
             ]);
-            package_app(&out, &files, &runtime, dir.path(), true, target, None)
+            package_app(
+                &out,
+                &files,
+                &runtime,
+                dir.path(),
+                true,
+                target,
+                None,
+                false,
+            )
         };
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
@@ -688,6 +730,7 @@ mod tests {
             false,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert!(assets.join("app.js").is_file());
@@ -703,6 +746,7 @@ mod tests {
             true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert!(assets.join("app.bundle").is_file());
@@ -718,6 +762,7 @@ mod tests {
             false,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
+            false,
         )
         .unwrap();
         assert!(!assets.join("app.bundle").exists());
@@ -764,6 +809,7 @@ mod tests {
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -797,6 +843,7 @@ mod tests {
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
+                false,
             )
             .unwrap();
             assert!(!assets.join("data/message.txt").exists());
@@ -824,6 +871,7 @@ mod tests {
                 production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
+                false,
             )
             .unwrap();
             for name in [
@@ -845,6 +893,7 @@ mod tests {
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
+                    false,
                 )
                 .unwrap_err();
                 assert!(
@@ -873,6 +922,7 @@ mod tests {
                     production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
+                    false,
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("without backslashes"), "{error}");
@@ -887,6 +937,7 @@ mod tests {
             true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside data"), "{error}");

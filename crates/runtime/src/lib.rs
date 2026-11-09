@@ -1,17 +1,21 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// WARNING: build.rs embeds `js/` files deflated, so each use inflates them.
+// WARNING: build.rs embeds `js/` files deflated and ASCII. The first use inflates one, and the process keeps it,
+// because JSC reads runtime scripts in place.
 macro_rules! js {
-    ($path:literal) => {
-        $crate::inflate(include_bytes!(concat!(env!("OUT_DIR"), "/js/", $path)))
-    };
-}
-
-fn inflate(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 4);
-    std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(bytes), &mut text)
-        .unwrap();
-    text
+    ($path:literal) => {{
+        static SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+        *SOURCE.get_or_init(|| {
+            let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/js/", $path));
+            let mut text = String::with_capacity(bytes.len() * 4);
+            std::io::Read::read_to_string(
+                &mut flate2::read::DeflateDecoder::new(&bytes[..]),
+                &mut text,
+            )
+            .unwrap();
+            Box::leak(text.into_boxed_str())
+        })
+    }};
 }
 
 #[cfg(target_os = "macos")]

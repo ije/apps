@@ -514,7 +514,7 @@ fn html_and_css_images_become_bundled_assets() {
 
     let out = dir.path().join("out");
     fs::create_dir_all(&out).unwrap();
-    apps_runtime::bundle::write(&out.join("app.bundle"), &files).unwrap();
+    apps_runtime::bundle::write(&out.join("app.bundle"), &files, &[]).unwrap();
     assert_eq!(fs::read(out.join(&logo)).unwrap(), b"png");
     let bundle = apps_runtime::bundle::read(&out).unwrap();
     let resolved: std::collections::BTreeMap<String, PathBuf> =
@@ -1778,7 +1778,7 @@ fn resolved_html_survives_relocation() {
         assert!(files["page-0.html"].contains("#123456"));
         let output = tempfile::tempdir().unwrap();
         if production {
-            apps_runtime::bundle::write(&output.path().join("app.bundle"), &files).unwrap();
+            apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[]).unwrap();
         } else {
             for (name, source) in &files {
                 fs::write(output.path().join(name), source).unwrap();
@@ -1860,7 +1860,8 @@ fn nearest_package_version_reaches_dev_and_production_apps() {
                 );
             } else {
                 let output = tempfile::tempdir().unwrap();
-                apps_runtime::bundle::write(&output.path().join("app.bundle"), &files).unwrap();
+                apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[])
+                    .unwrap();
                 let bundle = apps_runtime::bundle::read(output.path()).unwrap();
                 assert_eq!(
                     apps_runtime::desktop::Desktop::from_bundle(bundle)
@@ -2502,6 +2503,7 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             crate::build_target::BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)
                 .unwrap(),
             None,
+            false,
         )
         .unwrap();
         let moved = dir.path().join("relocated");
